@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.16-alpha"
+VERSION = "0.9.17-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -9043,10 +9043,11 @@ def caddy_update():
                 shell=True, capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
-        # Reload so the new binary takes effect without dropping connections for long
+        # Restart (not reload) — apt replaced the binary; reload only re-reads config and
+        # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
-            'systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
-            shell=True, capture_output=True, text=True, timeout=30)
+            'systemctl restart caddy 2>&1',
+            shell=True, capture_output=True, text=True, timeout=90)
         return jsonify({'success': True, 'output': (r.stdout or '').strip()})
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'error': 'apt-get timed out'})
@@ -25541,6 +25542,69 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                             break
             if _hc_changed and plog:
                 plog("  ✓ Updated healthcheck start_period to 600s")
+
+        # v0.9.17: Redis service injection — installs deployed before Redis was added to
+        # the compose template are missing the redis: service entirely.  Without it,
+        # Authentik's dramatiq worker retries localhost:6379 on every task cycle,
+        # producing ~40-65% sustained CPU on the worker container.
+        _full_now = ''.join(lines)
+        _has_redis_svc = 'redis-cli ping' in _full_now
+        if not _has_redis_svc:
+            _redis_svc = (
+                '  redis:\n'
+                '    image: docker.io/library/redis:alpine\n'
+                '    command: --save 60 1 --loglevel warning\n'
+                '    restart: unless-stopped\n'
+                '    healthcheck:\n'
+                '      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]\n'
+                '      start_period: 20s\n'
+                '      interval: 30s\n'
+                '      retries: 5\n'
+                '      timeout: 3s\n'
+                '    volumes:\n'
+                '      - redis:/data\n'
+            )
+            _patched = []
+            _inserted = False
+            for _line in lines:
+                if not _inserted and re.match(r'^\s{2}server\s*:', _line):
+                    _patched.append(_redis_svc)
+                    _inserted = True
+                _patched.append(_line)
+            if _inserted:
+                lines = _patched
+                changed = True
+                if plog:
+                    plog("  ✓ Added Redis service to docker-compose.yml (was missing — Authentik worker was burning CPU retrying localhost:6379)")
+
+        # Add AUTHENTIK_REDIS__HOST: redis to server/worker environment if missing
+        if 'AUTHENTIK_REDIS__HOST' not in ''.join(lines):
+            _patched = []
+            for _line in lines:
+                _patched.append(_line)
+                if 'AUTHENTIK_POSTGRESQL__HOST:' in _line:
+                    _indent = _line[:len(_line) - len(_line.lstrip())]
+                    _patched.append(f'{_indent}AUTHENTIK_REDIS__HOST: redis\n')
+            if len(_patched) > len(lines):
+                lines = _patched
+                changed = True
+                if plog:
+                    plog("  ✓ Added AUTHENTIK_REDIS__HOST: redis to server and worker environment blocks")
+
+        # Add redis: to top-level volumes section if the Redis service is now present
+        if 'redis-cli ping' in ''.join(lines):
+            _vols_start = None
+            for _vi, _vl in enumerate(lines):
+                if re.match(r'^volumes:\s*$', _vl):
+                    _vols_start = _vi
+                    break
+            if _vols_start is not None:
+                _vol_block = ''.join(lines[_vols_start:])
+                if not re.search(r'^\s{2}redis\s*:', _vol_block, re.MULTILINE):
+                    lines.insert(_vols_start + 1, '  redis:\n')
+                    changed = True
+                    if plog:
+                        plog("  ✓ Added redis: to top-level volumes section")
 
         if changed:
             with open(compose_path, 'w') as f:
