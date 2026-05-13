@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.18-alpha"
+VERSION = "0.9.19-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -11222,9 +11222,20 @@ def generate_caddyfile(settings=None):
             lines.append(f"            transport http {{")
             lines.append(f"                tls_server_name {mtx_host}")
             lines.append(f"            }}")
+            lines.append(f"            @mtx_redirect status 3xx")
+            lines.append(f"            handle_response @mtx_redirect {{")
+            lines.append(f"                header +Set-Cookie {{http.reverse_proxy.header.Set-Cookie}}")
+            lines.append(f"                redir /hls-proxy{{http.reverse_proxy.header.Location}} 302")
+            lines.append(f"            }}")
             lines.append(f"        }}")
         else:
-            lines.append(f"        reverse_proxy {mtx_hls}")
+            lines.append(f"        reverse_proxy {mtx_hls} {{")
+            lines.append(f"            @mtx_redirect status 3xx")
+            lines.append(f"            handle_response @mtx_redirect {{")
+            lines.append(f"                header +Set-Cookie {{http.reverse_proxy.header.Set-Cookie}}")
+            lines.append(f"                redir /hls-proxy{{http.reverse_proxy.header.Location}} 302")
+            lines.append(f"            }}")
+            lines.append(f"        }}")
         lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route /watch/* {{")
