@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.17-alpha"
+VERSION = "0.9.18-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25762,6 +25762,74 @@ def _detect_authentik_ldap_spiral(plog=None):
     return spiraling, evidence
 
 
+def _rewrite_ldap_compose_to_fqdn(compose_text, fqdn):
+    """Rewrite the `ldap:` service block in docker-compose.yml so the LDAP outpost
+    routes via Caddy/FQDN: sets `AUTHENTIK_HOST: https://<fqdn>` and ensures
+    `extra_hosts: - "<fqdn>:host-gateway"` is present. Returns (new_text, image_seen).
+
+    Crash-safe and idempotent:
+      - Pre-scans the LDAP block in one pass to detect (a) block boundaries,
+        (b) whether `extra_hosts:` already exists, (c) whether the LDAP image line
+        exists at all. Only then does the rewrite pass run.
+      - If `extra_hosts:` already exists anywhere in the LDAP block, the rewriter
+        leaves it intact and does NOT inject a second one. (This was the v0.9.17
+        bug: a single-pass rewriter inserted a duplicate `extra_hosts:` right after
+        `image:` because it hadn't yet encountered the existing `extra_hosts:`
+        further down the block. Duplicate mapping keys made the file unparseable
+        for docker compose, pinning spiraling boxes — notably tak-10 — into a
+        forever repair-rollback loop. See docs/RELEASE-v0.9.18-alpha.md.)
+      - Returns image_seen=False when no LDAP image line is found inside the LDAP
+        block; callers MUST treat that as a fatal abort condition and leave the
+        compose untouched.
+
+    Block detection mirrors the original heuristic: the LDAP block opens with a
+    line that starts with `  ldap:` (2-space indent) and closes at the next
+    2-space `key:` line. Lines outside the block are passed through unchanged.
+    """
+    import re as _re
+    lines = compose_text.splitlines(keepends=True)
+    ldap_start = -1
+    ldap_end = len(lines)
+    in_ldap = False
+    ldap_has_extra_hosts = False
+    ldap_has_ldap_image = False
+    for i, line in enumerate(lines):
+        if line.startswith('  ldap:'):
+            in_ldap = True
+            ldap_start = i
+            continue
+        if in_ldap and _re.match(r'^  [a-z_-]+:\s*$', line):
+            ldap_end = i
+            break
+        if in_ldap:
+            if 'extra_hosts:' in line:
+                ldap_has_extra_hosts = True
+            if 'image: ghcr.io/goauthentik/ldap' in line:
+                ldap_has_ldap_image = True
+    if ldap_start < 0 or not ldap_has_ldap_image:
+        return compose_text, False
+
+    new_lines = []
+    extra_hosts_inserted = False
+    for i, line in enumerate(lines):
+        if i < ldap_start or i >= ldap_end:
+            new_lines.append(line)
+            continue
+        if 'image: ghcr.io/goauthentik/ldap' in line:
+            new_lines.append(line)
+            if not ldap_has_extra_hosts and not extra_hosts_inserted:
+                new_lines.append('    extra_hosts:\n')
+                new_lines.append(f'      - "{fqdn}:host-gateway"\n')
+                extra_hosts_inserted = True
+            continue
+        if 'AUTHENTIK_HOST:' in line:
+            indent = line[:len(line) - len(line.lstrip())]
+            new_lines.append(f'{indent}AUTHENTIK_HOST: https://{fqdn}\n')
+            continue
+        new_lines.append(line)
+    return ''.join(new_lines), True
+
+
 def _apply_authentik_ldap_routing_repair(ak_dir, plog):
     """v0.8.4: Reverse v0.8.0's LDAP outpost AUTHENTIK_HOST migration for boxes whose
     outpost is spiraling on the direct internal URL. v0.8.5: dual-signal detection
@@ -25828,39 +25896,11 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             _f.write(compose_text)
         plog(f"  routing repair: backed up compose to {backup_path}")
 
-        new_lines = []
-        in_ldap = False
-        ldap_image_seen = False
-        ldap_has_extra_hosts = False
-        for line in compose_text.splitlines(keepends=True):
-            if line.startswith('  ldap:'):
-                in_ldap = True
-                ldap_has_extra_hosts = False
-                new_lines.append(line)
-                continue
-            if in_ldap and re.match(r'^  [a-z_-]+:\s*$', line):
-                in_ldap = False
-            if in_ldap:
-                if 'extra_hosts:' in line:
-                    ldap_has_extra_hosts = True
-                if 'image: ghcr.io/goauthentik/ldap' in line:
-                    new_lines.append(line)
-                    if not ldap_has_extra_hosts:
-                        new_lines.append('    extra_hosts:\n')
-                        new_lines.append(f'      - "{fqdn}:host-gateway"\n')
-                    ldap_image_seen = True
-                    continue
-                if 'AUTHENTIK_HOST:' in line:
-                    indent = line[:len(line) - len(line.lstrip())]
-                    new_lines.append(f'{indent}AUTHENTIK_HOST: https://{fqdn}\n')
-                    continue
-            new_lines.append(line)
-
+        new_text, ldap_image_seen = _rewrite_ldap_compose_to_fqdn(compose_text, fqdn)
         if not ldap_image_seen:
             plog("  routing repair: LDAP image line not found in compose — aborting (no changes)")
             return
 
-        new_text = ''.join(new_lines)
         with open(compose_path, 'w') as _f:
             _f.write(new_text)
         plog(f"  routing repair: rewrote LDAP service → AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
@@ -25987,39 +26027,11 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
             _f.write(compose_text)
         plog(f"  proactive routing: backed up compose to {backup_path}")
 
-        new_lines = []
-        in_ldap = False
-        ldap_image_seen = False
-        ldap_has_extra_hosts = False
-        for line in compose_text.splitlines(keepends=True):
-            if line.startswith('  ldap:'):
-                in_ldap = True
-                ldap_has_extra_hosts = False
-                new_lines.append(line)
-                continue
-            if in_ldap and re.match(r'^  [a-z_-]+:\s*$', line):
-                in_ldap = False
-            if in_ldap:
-                if 'extra_hosts:' in line:
-                    ldap_has_extra_hosts = True
-                if 'image: ghcr.io/goauthentik/ldap' in line:
-                    new_lines.append(line)
-                    if not ldap_has_extra_hosts:
-                        new_lines.append('    extra_hosts:\n')
-                        new_lines.append(f'      - "{fqdn}:host-gateway"\n')
-                    ldap_image_seen = True
-                    continue
-                if 'AUTHENTIK_HOST:' in line:
-                    indent = line[:len(line) - len(line.lstrip())]
-                    new_lines.append(f'{indent}AUTHENTIK_HOST: https://{fqdn}\n')
-                    continue
-            new_lines.append(line)
-
+        new_text, ldap_image_seen = _rewrite_ldap_compose_to_fqdn(compose_text, fqdn)
         if not ldap_image_seen:
             plog("  proactive routing: LDAP image line not found in compose — aborting (no changes)")
             return
 
-        new_text = ''.join(new_lines)
         with open(compose_path, 'w') as _f:
             _f.write(new_text)
         plog(f"  proactive routing: rewrote LDAP service → AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
