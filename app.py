@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.19-alpha"
+VERSION = "0.9.20-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -40656,6 +40656,26 @@ def _post_update_auto_deploy():
                             pass
             except Exception as _final_orp_e:
                 print(f"Post-update: final orphan check error (non-fatal): {_final_orp_e}")
+
+            # v0.9.19: regenerate Caddyfile + reload Caddy after every version bump so
+            # Caddyfile template changes (e.g. MediaMTX HLS header_down rewrite) take
+            # effect on Update Now WITHOUT needing the operator to touch the Caddy page.
+            # Idempotent no-op when FQDN isn't set yet.
+            try:
+                _s_caddy = load_settings()
+                if (_s_caddy.get('fqdn') or '').strip() and os.path.exists(CADDYFILE_PATH):
+                    generate_caddyfile(_s_caddy)
+                    _r_caddy = subprocess.run(
+                        'systemctl reload caddy 2>&1', shell=True,
+                        capture_output=True, text=True, timeout=20
+                    )
+                    if _r_caddy.returncode == 0:
+                        print("Post-update: Caddyfile regenerated + reloaded", flush=True)
+                    else:
+                        _msg = (_r_caddy.stdout or _r_caddy.stderr or '').strip()[:200]
+                        print(f"Post-update: Caddy reload issue: {_msg}", flush=True)
+            except Exception as _ce:
+                print(f"Post-update: Caddyfile regen skipped: {_ce}", flush=True)
 
             print("Post-update: auto-deploy complete")
 
