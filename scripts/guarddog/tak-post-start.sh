@@ -28,7 +28,7 @@ _log "Waiting for TAK Server port 8089..."
 _t=0
 _msg_restarted=0
 while [ $_t -lt $MAX_WAIT_TAK ]; do
-  if nc -z 127.0.0.1 8089 2>/dev/null; then
+  if ss -ltn "sport = :8089" 2>/dev/null | grep -q LISTEN; then
     _log "TAK Server 8089 ready (${_t}s)"
     break
   fi

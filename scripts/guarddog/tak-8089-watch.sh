@@ -12,8 +12,6 @@ PORT=8089
 MAX_FAILS=5
 COOLDOWN_SECS=900
 MIN_UPTIME_SECS=900
-# TCP connect timeout for the liveness probe (seconds)
-CONNECT_TIMEOUT=5
 
 mkdir -p "$STATE_DIR"
 
@@ -51,28 +49,20 @@ if [ -f "$RESTART_LOCK" ]; then
 fi
 
 # ── Health check ──
-# Primary signal: can we TCP-connect to 8089 within CONNECT_TIMEOUT seconds?
-# A full queue from scanners does NOT mean TAK is broken — as long as TAK accepts
-# a real connection, the server is healthy. Only fall back to queue-depth if we
-# cannot even open a socket.
+# Signal: is port 8089 bound and listening?
+# Port 8089 uses mutual TLS (auth="x509") — a raw TCP connect via nc -z
+# reaches Netty, which immediately closes the connection on a non-TLS probe
+# and logs SSL errors on every check. The ss LISTEN check is sufficient:
+# if Netty is bound, the messaging process is accepting connections.
 LISTEN_OK=false
-CONNECT_OK=false
 
 LQ_LINE=$(ss -ltn "sport = :$PORT" | awk 'NR==2')
 if echo "$LQ_LINE" | grep -q LISTEN; then
   LISTEN_OK=true
 fi
 
+# Healthy: port is listening
 if $LISTEN_OK; then
-  # TCP connect: kernel-level accept is enough (TLS handshake not needed).
-  # nc -z is reliable on Ubuntu (netcat-openbsd, installed by default).
-  if nc -z -w "$CONNECT_TIMEOUT" 127.0.0.1 "$PORT" 2>/dev/null; then
-    CONNECT_OK=true
-  fi
-fi
-
-# Healthy: port is listening AND we can connect
-if $LISTEN_OK && $CONNECT_OK; then
   echo 0 > "$FAIL_FILE"
   exit 0
 fi
@@ -130,7 +120,7 @@ LOAD="$(cut -d' ' -f1-3 /proc/loadavg)"
 MEMFREE="$(free -h | awk '/Mem:/ {print $4}')"
 MSGPID="$(ps -ef | grep takserver.war | grep messaging | grep -v grep | awk '{print $2}' | head -n1)"
 
-DETAIL="listen=$LISTEN_OK connect=$CONNECT_OK"
+DETAIL="listen=$LISTEN_OK"
 echo "$TS | restart | 8089 unhealthy | $DETAIL | load=$LOAD | mem_free=$MEMFREE | msg_pid=${MSGPID:-na}" >> "$LOGFILE"
 
 # Send alerts
