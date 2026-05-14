@@ -644,7 +644,7 @@ MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
 # Authentik official brand icon (external URL)
-AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/main/web/icons/icon_left_brand.png"
+AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/main/website/static/img/icon_left_brand.svg"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
 CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
 FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/1087378?s=128&v=4"
