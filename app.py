@@ -26823,6 +26823,111 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog):
         plog(f"  Proxy external_hosts check error (non-fatal): {_e}")
 
 
+_channels_watchdog_started = False
+
+
+def _authentik_channels_pool_watchdog_loop():
+    """v0.9.21: Background daemon — auto-restart authentik-server-1 when idle connections
+    from the django_channels_postgres async pool exceed a threshold.
+
+    Upstream Authentik bug #20714 (present in 2026.2.x, upstream fix milestone 2026.8.0):
+    the async psycopg_pool's group_send path opens connections without properly releasing
+    them back to the pool. Leak rate: ~1 connection per 2-3 seconds post-server-restart.
+    At this rate max_connections=500 is exhausted in ~20 min, producing
+    "FATAL: sorry, too many clients already" and auth failures across all users.
+
+    Signature: blank application_name, state=idle, datname=authentik.
+    (Regular Django ORM connections, dramatiq workers, and LDAP outpost all have
+    non-blank application_name. The leaking pool connections are uniquely identifiable.)
+
+    Threshold: 250 (half of max_connections=500). At observed leak rates this gives
+    ~9 min of headroom to detect + restart before auth failures begin.
+    After restart, pool resets to ~28 connections. Checks every 5 min.
+
+    Override: set channels_pool_watchdog_threshold=N in settings to change the threshold,
+    or channels_pool_watchdog_disabled=true to disable entirely (e.g. if upstream fix ships
+    and you want to turn this off without a code change).
+    """
+    import time as _wt
+
+    _wt.sleep(90)  # Let Authentik finish starting up before first check
+    _consecutive_failures = 0
+
+    while True:
+        try:
+            _settings = load_settings()
+            if _settings.get('channels_pool_watchdog_disabled'):
+                _wt.sleep(300)
+                continue
+            if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                _wt.sleep(300)
+                continue
+
+            _threshold = int(_settings.get('channels_pool_watchdog_threshold') or 250)
+
+            _r = subprocess.run(
+                ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+                 '-U', 'authentik', '-d', 'authentik', '-tA', '-c',
+                 "SELECT COUNT(*) FROM pg_stat_activity "
+                 "WHERE datname='authentik' AND state='idle' AND application_name=''"],
+                capture_output=True, text=True, timeout=10
+            )
+            if _r.returncode != 0:
+                _consecutive_failures += 1
+                _wt.sleep(300)
+                continue
+
+            _count_str = (_r.stdout or '').strip()
+            if not _count_str.isdigit():
+                _wt.sleep(300)
+                continue
+
+            _count = int(_count_str)
+            _consecutive_failures = 0
+
+            if _count > _threshold:
+                print(
+                    f"[channels-watchdog] ALERT: {_count} idle blank-app-name PG connections "
+                    f"(threshold={_threshold}) — restarting authentik-server-1 to reset "
+                    f"django_channels_postgres pool (upstream Authentik #20714 workaround)",
+                    flush=True
+                )
+                _restart = subprocess.run(
+                    ['docker', 'restart', 'authentik-server-1'],
+                    capture_output=True, text=True, timeout=90
+                )
+                if _restart.returncode == 0:
+                    print(f"[channels-watchdog] authentik-server-1 restarted — pool reset", flush=True)
+                else:
+                    print(f"[channels-watchdog] restart failed: {(_restart.stderr or '')[:120]}", flush=True)
+                # Sleep longer after restart to let server recover before next check
+                _wt.sleep(180)
+            elif _count > 100:
+                print(
+                    f"[channels-watchdog] {_count} idle blank-app-name PG connections "
+                    f"(threshold={_threshold}) — pool leak in progress, monitoring",
+                    flush=True
+                )
+        except Exception:
+            pass  # Never crash the console process
+        _wt.sleep(300)
+
+
+def _start_channels_pool_watchdog():
+    """Start the channels pool watchdog daemon thread (idempotent — only starts once)."""
+    global _channels_watchdog_started
+    if _channels_watchdog_started:
+        return
+    _channels_watchdog_started = True
+    import threading as _thr
+    _t = _thr.Thread(
+        target=_authentik_channels_pool_watchdog_loop,
+        daemon=True,
+        name='channels-pool-watchdog'
+    )
+    _t.start()
+
+
 def _auto_remove_stale_docker_service_connections(label='Post-update'):
     """v0.9.16: Delete the local Docker service connection that Authentik's upstream
     quickstart creates by default.
@@ -39658,6 +39763,17 @@ def _startup_migrations():
             _ensure_authentik_proxy_external_hosts_canonical(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
+
+        # v0.9.21: Start channels pool watchdog — auto-restart authentik-server-1 when
+        # blank-app-name idle connections exceed threshold (default 250).
+        # Upstream Authentik #20714: group_send leaks ~1 connection/2-3s → hits
+        # max_connections=500 ceiling in ~20 min → auth failures. Workaround until 2026.8.0.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                _start_channels_pool_watchdog()
+                print("Startup: channels pool watchdog started (threshold=250, interval=5min)", flush=True)
+        except Exception as _wde:
+            print(f"Startup: channels pool watchdog start failed (non-fatal): {_wde}", flush=True)
 
         # v0.9.0: fail2ban post-install config migrations (only run if fail2ban is already installed
         # by the operator via the Marketplace — _fail2ban_install_and_configure is NOT auto-run).
