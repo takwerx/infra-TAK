@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.20-alpha"
+VERSION = "0.9.21-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25001,7 +25001,7 @@ entries:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
     shm_size: 256m
-    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -25242,44 +25242,21 @@ networks:
             with open(coreconfig_path, 'r') as f:
                 config_content = f.read()
 
-            auth_block = (
-                '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
-                f'        <ldap url="ldap://{host}:389" userstring="cn={{username}},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
-                + ldap_svc_pass
-                + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
-                '    </auth>'
-            )
-
-            new_content = re.sub(
-                r'<auth[^>]*>.*?</auth>',
-                auth_block,
-                config_content,
-                flags=re.DOTALL
-            )
-
-            if new_content != config_content:
-                with open(coreconfig_path, 'w') as f:
-                    f.write(new_content)
-                plog(f"✓ CoreConfig.xml updated — LDAP pointing to {host}:389")
-                plog("  Restarting TAK Server...")
-                r = subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-                if r.returncode == 0:
-                    plog("✓ TAK Server restarted")
-                else:
-                    plog(f"⚠ TAK Server restart issue: {r.stderr.strip()[:100]}")
-            else:
-                if _coreconfig_has_ldap():
+            # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
+            _et_ok, _et_msg = _apply_coreconfig_ldap_auth_et(coreconfig_path, host, ldap_svc_pass, plog)
+            if _et_ok:
+                if 'idempotent' in _et_msg:
                     plog("✓ CoreConfig.xml already has LDAP auth configured")
-                    cur_url_match = re.search(r'<ldap url="ldap://([^"]+)"', config_content)
-                    if cur_url_match and cur_url_match.group(1) != f'{host}:389':
-                        plog(f"  ⚠ Current LDAP URL points to {cur_url_match.group(1)}, updating to {host}:389")
-                        new_content = config_content.replace(cur_url_match.group(0), f'<ldap url="ldap://{host}:389"')
-                        with open(coreconfig_path, 'w') as f:
-                            f.write(new_content)
-                        subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-                        plog(f"✓ LDAP URL updated to {host}:389, TAK Server restarted")
                 else:
-                    plog("⚠ CoreConfig <auth> block not found — use Connect TAK Server to LDAP after deploy")
+                    plog(f"✓ CoreConfig.xml updated — LDAP pointing to {host}:389")
+                    plog("  Restarting TAK Server...")
+                    r = subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                    if r.returncode == 0:
+                        plog("✓ TAK Server restarted")
+                    else:
+                        plog(f"⚠ TAK Server restart issue: {r.stderr.strip()[:100]}")
+            else:
+                plog(f"⚠ CoreConfig LDAP patch failed: {_et_msg} — use Connect TAK Server to LDAP after deploy")
         else:
             plog("⚠ LDAP service password not available, skipping CoreConfig patch")
             plog("  Use Connect TAK Server to LDAP after deploy")
@@ -25476,9 +25453,14 @@ def _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog=None):
             plog(f"  \u26a0 Starter branding: {e}")
 
 
-def _ensure_authentik_compose_patches(compose_path, plog=None):
-    """Ensure docker-compose.yml has PostgreSQL tuning and proper healthchecks.
-    Safe to call multiple times (idempotent). Returns True if file was modified."""
+def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
+    """Legacy text-based compose patcher — kept as fallback if PyYAML cannot parse the file.
+    Used by _ensure_authentik_compose_patches when yaml.safe_load raises YAMLError.
+
+    WARNING: Text-based patching can emit duplicate YAML keys when the operator's YAML style
+    (e.g. folded-block-scalar command:) differs from infra-TAK's expected format. The
+    parse-and-mutate path (_ensure_authentik_compose_patches) is always preferred.
+    """
     if not compose_path or not os.path.exists(compose_path):
         return False
     try:
@@ -25486,28 +25468,18 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.20: max_connections bumped 300 → 500. Authentik 2026.2.x reliably saturates
-        # a 300-slot pool under heavy LDAP load (channels-postgres + django_postgres_cache +
-        # dramatiq + worker + server + outpost all share one Postgres). On tak-10 with
-        # CONN_MAX_AGE=0 (default), peak load produced 221 total conns + 75 idle-in-tx on
-        # django_postgres_cache_cacheentry and `FATAL: sorry, too many clients already`
-        # in worker logs. 500 leaves comfortable headroom; CONN_MAX_AGE=60 (set in .env via
-        # _ensure_authentik_pg_persistent_connections) keeps churn from reopening connections
-        # on every Django request. Refs: github.com/goauthentik/authentik#20714, #20644.
-        pg_cmd = 'postgres -c max_connections=500 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        # v0.9.21: removed idle_session_timeout=300s; added statement_timeout=120s.
+        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
-        # v0.8.8: catch ANY idle_in_transaction value other than 300s (was 30s in v0.8.4 — too
-        # aggressive on slow disks: Authentik startup migrations exceeded 30s in idle-in-tx
-        # state on 1795-IOPS storage, got killed mid-flight, leaving stale advisory locks and
-        # a permanent server crash loop. 300s tightly bounds zombie idle-in-tx sessions while
-        # tolerating slow-disk migrations.)
-        # v0.9.20: also catch max_connections < 500 and rewrite the whole pg command line.
         _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
         _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
+        _pg_st_match = re.search(r'statement_timeout=(\d+)s', _pg_full)
         _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
         _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
-        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs)
+        _st_needs = not _pg_st_match or _pg_st_match.group(1) != '120'
+        _ist_present = bool(re.search(r'idle_session_timeout=\d+', _pg_full))
+        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _ist_present)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -25519,7 +25491,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                 lines = patched
                 changed = True
                 if plog:
-                    plog("  ✓ Added PostgreSQL command-line tuning (max_connections=500, idle timeouts, tcp keepalives)")
+                    plog("  ✓ Added PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, idle_in_transaction, tcp keepalives)")
         elif needs_pg_update:
             for i, line in enumerate(lines):
                 if 'command: postgres' in line and 'max_connections' in line:
@@ -25528,8 +25500,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        _old_it = _pg_it_match.group(1) + 's' if _pg_it_match else '?'
-                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_in_transaction_session_timeout={_old_it}→300s)")
+                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, removed idle_session_timeout, added statement_timeout=120s) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -25543,7 +25514,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                 lines = patched
                 changed = True
                 if plog:
-                    plog("  ✓ Added healthchecks for server and worker")
+                    plog("  ✓ Added healthchecks for server and worker [legacy patcher]")
         else:
             _hc_changed = False
             for i, line in enumerate(lines):
@@ -25559,12 +25530,8 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                         if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
                             break
             if _hc_changed and plog:
-                plog("  ✓ Updated healthcheck start_period to 600s")
+                plog("  ✓ Updated healthcheck start_period to 600s [legacy patcher]")
 
-        # v0.9.17: Redis service injection — installs deployed before Redis was added to
-        # the compose template are missing the redis: service entirely.  Without it,
-        # Authentik's dramatiq worker retries localhost:6379 on every task cycle,
-        # producing ~40-65% sustained CPU on the worker container.
         _full_now = ''.join(lines)
         _has_redis_svc = 'redis-cli ping' in _full_now
         if not _has_redis_svc:
@@ -25593,9 +25560,8 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                 lines = _patched
                 changed = True
                 if plog:
-                    plog("  ✓ Added Redis service to docker-compose.yml (was missing — Authentik worker was burning CPU retrying localhost:6379)")
+                    plog("  ✓ Added Redis service to docker-compose.yml [legacy patcher]")
 
-        # Add AUTHENTIK_REDIS__HOST: redis to server/worker environment if missing
         if 'AUTHENTIK_REDIS__HOST' not in ''.join(lines):
             _patched = []
             for _line in lines:
@@ -25607,9 +25573,8 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                 lines = _patched
                 changed = True
                 if plog:
-                    plog("  ✓ Added AUTHENTIK_REDIS__HOST: redis to server and worker environment blocks")
+                    plog("  ✓ Added AUTHENTIK_REDIS__HOST: redis [legacy patcher]")
 
-        # Add redis: to top-level volumes section if the Redis service is now present
         if 'redis-cli ping' in ''.join(lines):
             _vols_start = None
             for _vi, _vl in enumerate(lines):
@@ -25622,7 +25587,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                     lines.insert(_vols_start + 1, '  redis:\n')
                     changed = True
                     if plog:
-                        plog("  ✓ Added redis: to top-level volumes section")
+                        plog("  ✓ Added redis: to top-level volumes section [legacy patcher]")
 
         if changed:
             with open(compose_path, 'w') as f:
@@ -25630,7 +25595,157 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
         return changed
     except Exception as e:
         if plog:
-            plog(f"  ⚠ Compose patching error: {e}")
+            plog(f"  ⚠ Compose patching error (legacy): {e}")
+        return False
+
+
+def _ensure_authentik_compose_patches(compose_path, plog=None):
+    """Ensure docker-compose.yml has PostgreSQL tuning and proper healthchecks.
+    Safe to call multiple times (idempotent). Returns True if file was modified.
+
+    v0.9.21: switched to parse-and-mutate (PyYAML) to eliminate duplicate-key emissions.
+    yaml.safe_load's last-wins semantics also self-heal any box that already accumulated
+    duplicate keys from v0.9.18's text-based patcher.
+
+    NOTE: yaml.safe_dump does not preserve YAML comments. Operators who commented their
+    compose file will lose those comments on first patching run. Deliberate trade-off:
+    correctness over comment preservation.
+
+    Falls back to _ensure_authentik_compose_patches_legacy if the file is not valid YAML.
+    """
+    if not compose_path or not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        if plog:
+            plog("  ⚠ PyYAML not available — falling back to legacy text patcher")
+        return _ensure_authentik_compose_patches_legacy(compose_path, plog)
+
+    try:
+        with open(compose_path, 'r') as f:
+            raw = f.read()
+    except Exception as e:
+        if plog:
+            plog(f"  ⚠ Compose read error: {e}")
+        return False
+
+    try:
+        data = _yaml.safe_load(raw)
+    except _yaml.YAMLError as e:
+        if plog:
+            plog(f"  ⚠ Compose file is not valid YAML ({str(e)[:80]}) — falling back to legacy text patcher")
+        return _ensure_authentik_compose_patches_legacy(compose_path, plog)
+
+    if not isinstance(data, dict):
+        if plog:
+            plog("  ⚠ Compose file did not parse as a dict — falling back to legacy text patcher")
+        return _ensure_authentik_compose_patches_legacy(compose_path, plog)
+
+    changed = False
+    services = data.setdefault('services', {})
+
+    # ── PostgreSQL command-line tuning ────────────────────────────────────────
+    # v0.9.21: removed idle_session_timeout=300s (killing channels_postgres LISTEN
+    # connections every 5 min × 4 worker pids — elevated CPU on tak-10).
+    # Added statement_timeout=120s (runaway query defense).
+    _pg_target_cmd = (
+        'postgres -c max_connections=500 -c statement_timeout=120s'
+        ' -c idle_in_transaction_session_timeout=300s'
+        ' -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+    )
+    pg = services.setdefault('postgresql', {})
+    _existing_pg_cmd = str(pg.get('command') or '')
+    _pg_mc_m = re.search(r'max_connections=(\d+)', _existing_pg_cmd)
+    if _pg_mc_m and _pg_mc_m.group(1).isdigit() and int(_pg_mc_m.group(1)) > 500:
+        if plog:
+            plog(f"  pg command: operator-set max_connections={_pg_mc_m.group(1)} > 500 — preserving existing command")
+    elif pg.get('command') != _pg_target_cmd:
+        _old_cmd = pg.get('command', '(none)')
+        pg['command'] = _pg_target_cmd
+        changed = True
+        if plog:
+            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, removed idle_session_timeout)")
+
+    # ── Server healthcheck ────────────────────────────────────────────────────
+    _target_hc = {
+        'test': ['CMD', 'ak', 'healthcheck'],
+        'start_period': '600s',
+        'interval': '30s',
+        'timeout': '10s',
+        'retries': 5,
+    }
+    for _svc_name in ('server', 'worker'):
+        _svc = services.setdefault(_svc_name, {})
+        _existing_hc = _svc.get('healthcheck') or {}
+        # Check if healthcheck is missing or has a non-600s start_period
+        _hc_needs_update = (
+            not _existing_hc or
+            'ak' not in str(_existing_hc.get('test', '')) or
+            _existing_hc.get('start_period') != '600s'
+        )
+        if _hc_needs_update:
+            _svc['healthcheck'] = _target_hc.copy()
+            changed = True
+            if plog:
+                plog(f"  ✓ Set {_svc_name} healthcheck (ak healthcheck, start_period=600s)")
+
+    # ── Redis service injection ───────────────────────────────────────────────
+    # v0.9.17: old installs are missing the redis: service (Authentik worker burned CPU retrying localhost:6379)
+    if 'redis' not in services:
+        services['redis'] = {
+            'image': 'docker.io/library/redis:alpine',
+            'command': '--save 60 1 --loglevel warning',
+            'restart': 'unless-stopped',
+            'healthcheck': {
+                'test': ['CMD-SHELL', 'redis-cli ping | grep PONG'],
+                'start_period': '20s',
+                'interval': '30s',
+                'retries': 5,
+                'timeout': '3s',
+            },
+            'volumes': ['redis:/data'],
+        }
+        changed = True
+        if plog:
+            plog("  ✓ Added Redis service to docker-compose.yml (was missing — Authentik worker was burning CPU)")
+
+    # ── AUTHENTIK_REDIS__HOST env var in server + worker ─────────────────────
+    for _svc_name in ('server', 'worker'):
+        _svc = services.setdefault(_svc_name, {})
+        _env = _svc.get('environment')
+        if isinstance(_env, dict):
+            if 'AUTHENTIK_REDIS__HOST' not in _env:
+                _env['AUTHENTIK_REDIS__HOST'] = 'redis'
+                changed = True
+                if plog:
+                    plog(f"  ✓ Added AUTHENTIK_REDIS__HOST: redis to {_svc_name} environment")
+        elif isinstance(_env, list):
+            if not any('AUTHENTIK_REDIS__HOST' in str(e) for e in _env):
+                _env.append('AUTHENTIK_REDIS__HOST=redis')
+                changed = True
+                if plog:
+                    plog(f"  ✓ Added AUTHENTIK_REDIS__HOST=redis to {_svc_name} environment list")
+
+    # ── Redis top-level volume entry ──────────────────────────────────────────
+    if 'redis' in services:
+        _volumes = data.setdefault('volumes', {})
+        if isinstance(_volumes, dict) and 'redis' not in _volumes:
+            _volumes['redis'] = None
+            changed = True
+            if plog:
+                plog("  ✓ Added redis: to top-level volumes section")
+
+    if not changed:
+        return False
+
+    try:
+        with open(compose_path, 'w') as f:
+            _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+        return True
+    except Exception as e:
+        if plog:
+            plog(f"  ⚠ Compose write error after YAML mutation: {e}")
         return False
 
 
@@ -25653,12 +25768,12 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         )
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
-            plog("  PostgreSQL tuning args changed — recreating container to apply new idle_in_transaction_session_timeout")
+            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, no idle_session_timeout)")
             subprocess.run(
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
             )
-            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=300s)")
+            plog("  ✓ PostgreSQL recreated with updated tuning (max_connections=500, statement_timeout=120s, idle_in_transaction_session_timeout=300s)")
         else:
             subprocess.run(
                 f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
@@ -26512,6 +26627,293 @@ def _authentik_apply_official_tunings(plog):
     return True
 
 
+def _ensure_embedded_outpost_authentik_host(plog):
+    """v0.9.21: Re-assert embedded outpost's config.authentik_host to the current public URL.
+
+    Defensive against: FQDN changes after first install, manual config edits, and boxes where
+    TAK Portal was never deployed (so the one-time bootstrap never ran this assertion).
+
+    Idempotent: issues one GET to check current value; issues a PATCH only when drift is
+    detected. Safe to call on every console restart from _startup_migrations.
+    """
+    import urllib.request as _req
+    import urllib.error
+    import json as _json
+
+    try:
+        _ak_env = os.path.expanduser('~/authentik/.env')
+        if not os.path.exists(_ak_env):
+            plog("  embedded outpost host: Authentik not installed — skip")
+            return
+        _settings = load_settings()
+        fqdn = (_settings.get('fqdn') or '').strip()
+        if not fqdn:
+            plog("  embedded outpost host: no FQDN configured — skip")
+            return
+        correct = _get_authentik_base_url(_settings)  # e.g. https://tak.<fqdn>
+        if not correct or 'localhost' in correct or '127.0.0.1' in correct:
+            plog(f"  embedded outpost host: base URL resolves to local ({correct}) — skip (Authentik not publicly reachable)")
+            return
+
+        _token = (
+            _get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+            _get_authentik_env_value(_settings, 'AUTHENTIK_TOKEN')
+        )
+        if not _token:
+            plog("  embedded outpost host: no API token — skip")
+            return
+        _api_url = _get_authentik_api_url(_settings)
+        _headers = {
+            'Authorization': f'Bearer {_token}',
+            'Content-Type': 'application/json',
+        }
+
+        # GET embedded outpost
+        try:
+            _r = _req.Request(f'{_api_url}/api/v3/outposts/instances/?search=embedded', headers=_headers)
+            _outposts = _json.loads(_req.urlopen(_r, timeout=10).read().decode()).get('results', [])
+        except Exception as _ge:
+            plog(f"  embedded outpost host: API unreachable ({_ge}) — skip")
+            return
+
+        _embedded = next(
+            (o for o in _outposts if 'embed' in (o.get('name') or '').lower() or o.get('type') == 'proxy'),
+            None
+        )
+        if not _embedded:
+            plog("  embedded outpost host: no embedded outpost found — skip")
+            return
+
+        _pk = _embedded.get('pk')
+        _full = _json.loads(_req.urlopen(
+            _req.Request(f'{_api_url}/api/v3/outposts/instances/{_pk}/', headers=_headers), timeout=10
+        ).read().decode())
+        _cfg = _full.get('config') or {}
+        _current_host = _cfg.get('authentik_host') or ''
+        if _current_host == correct and _cfg.get('authentik_host_insecure') == False:
+            plog(f"  embedded outpost host: already {correct} (idempotent — no-op)")
+            return
+
+        _cfg['authentik_host'] = correct
+        _cfg['authentik_host_insecure'] = False
+        _patch_body = _json.dumps({'config': _cfg}).encode()
+        try:
+            _req.urlopen(
+                _req.Request(f'{_api_url}/api/v3/outposts/instances/{_pk}/',
+                             data=_patch_body, headers=_headers, method='PATCH'),
+                timeout=10
+            )
+            plog(f"  ✓ Embedded outpost host: {_current_host!r} → {correct}")
+        except urllib.error.HTTPError as _pe:
+            plog(f"  ✗ Embedded outpost host PATCH failed: HTTP {_pe.code}")
+        except Exception as _pe2:
+            plog(f"  ✗ Embedded outpost host PATCH failed: {_pe2}")
+    except Exception as _e:
+        plog(f"  Embedded outpost host check error (non-fatal): {_e}")
+
+
+def _ensure_authentik_proxy_external_hosts_canonical(plog):
+    """v0.9.21: For each known infra-TAK proxy provider, assert external_host matches
+    https://<service-prefix>.<fqdn>.
+
+    Fixes brand-subdomain drift discovered on tak-10 (2026-05-13): Node-RED Proxy and
+    TAK Portal Proxy both had external_host=https://taktical.test12.taktical.net (brand
+    prefix) instead of https://nodered.* and https://takportal.*. Responder + ssdnodes
+    were correct — root cause tracked in Item 7.
+
+    Idempotent: GET all proxy providers → PATCH only those with non-canonical external_host.
+    Safe to call on every console restart from _startup_migrations.
+
+    Override: set disable_proxy_external_host_canonicalization=true in settings to bypass
+    (for operators who deliberately use a non-canonical external_host, e.g. white-labeling).
+    """
+    import urllib.request as _req
+    import urllib.error
+    import json as _json
+
+    try:
+        _ak_env = os.path.expanduser('~/authentik/.env')
+        if not os.path.exists(_ak_env):
+            plog("  proxy external_hosts: Authentik not installed — skip")
+            return
+        _settings = load_settings()
+        if _settings.get('disable_proxy_external_host_canonicalization'):
+            plog("  proxy external_hosts: disabled via settings override — skip")
+            return
+        fqdn = (_settings.get('fqdn') or '').strip()
+        if not fqdn:
+            plog("  proxy external_hosts: no FQDN configured — skip")
+            return
+        base = fqdn.split(':')[0]
+        canonical = {
+            'TAK Portal Proxy': f'https://takportal.{base}',
+            'Node-RED Proxy':   f'https://nodered.{base}',
+            'MediaMTX':         f'https://stream.{base}',
+            'infra-TAK':        f'https://infratak.{base}',
+            'Federation Hub Proxy': f'https://fedhub.{base}',
+        }
+
+        _token = (
+            _get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+            _get_authentik_env_value(_settings, 'AUTHENTIK_TOKEN')
+        )
+        if not _token:
+            plog("  proxy external_hosts: no API token — skip")
+            return
+        _api_url = _get_authentik_api_url(_settings)
+        _headers = {
+            'Authorization': f'Bearer {_token}',
+            'Content-Type': 'application/json',
+        }
+
+        # GET all proxy providers
+        try:
+            _r = _req.Request(f'{_api_url}/api/v3/providers/proxy/?page_size=100', headers=_headers)
+            _providers = _json.loads(_req.urlopen(_r, timeout=15).read().decode()).get('results', [])
+        except Exception as _ge:
+            plog(f"  proxy external_hosts: API unreachable ({_ge}) — skip")
+            return
+
+        _fixed = 0
+        for _prov in _providers:
+            _name = (_prov.get('name') or '').strip()
+            if _name not in canonical:
+                continue
+            _want = canonical[_name]
+            _pk = _prov.get('pk')
+            if not _pk:
+                continue
+            # Fetch full provider record (list endpoint omits some required PATCH fields)
+            try:
+                _full = _json.loads(_req.urlopen(
+                    _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/', headers=_headers), timeout=10
+                ).read().decode())
+            except Exception as _fe:
+                plog(f"  proxy external_hosts: failed to fetch provider {_name!r}: {_fe}")
+                continue
+            _current = (_full.get('external_host') or '').rstrip('/')
+            _want_clean = _want.rstrip('/')
+            if _current == _want_clean:
+                continue  # already canonical
+
+            # Derive correct cookie_domain from fqdn
+            _cookie_domain = base
+            _patch = {
+                'external_host': _want_clean + '/',
+                'cookie_domain': _cookie_domain,
+            }
+            try:
+                _req.urlopen(
+                    _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/',
+                                 data=_json.dumps(_patch).encode(), headers=_headers, method='PATCH'),
+                    timeout=10
+                )
+                plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean + '/'!r}")
+                _fixed += 1
+            except urllib.error.HTTPError as _pe:
+                plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: HTTP {_pe.code}")
+            except Exception as _pe2:
+                plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: {_pe2}")
+
+        if _fixed == 0:
+            plog("  proxy external_hosts: all canonical — no-op")
+        else:
+            plog(f"  proxy external_hosts: fixed {_fixed} provider(s)")
+    except Exception as _e:
+        plog(f"  Proxy external_hosts check error (non-fatal): {_e}")
+
+
+def _auto_remove_stale_docker_service_connections(label='Post-update'):
+    """v0.9.16: Delete the local Docker service connection that Authentik's upstream
+    quickstart creates by default.
+
+    infra-TAK stripped /var/run/docker.sock from the Authentik worker in v0.9.2
+    (CVE-2026-31431 hardening) but did not remove the corresponding service
+    connection from Authentik's database.  The worker's
+    outpost_service_connection_monitor task retries the dead socket connection
+    every 30 seconds, causing ~26% sustained CPU on the worker container.
+
+    This function calls the Authentik API to list all Docker service connections
+    with local=True (local socket) and deletes them.  infra-TAK uses a standalone
+    authentik-ldap-1 container managed by docker compose — not Docker-managed
+    outposts — so no local Docker service connection is needed or safe.
+
+    Idempotent: if no local Docker service connections exist, logs a one-liner
+    and returns.  Safe to run on every startup (wired into _startup_migrations
+    in v0.9.21) and on every Update Now.
+
+    v0.9.21: extracted to module level (was nested in post-update block) so it
+    can be called from _startup_migrations for guaranteed reach on boxes that
+    skipped v0.9.16's post-update hook. label kwarg controls log prefix.
+    """
+    import urllib.request as _req
+    import urllib.error
+    import json as _json
+
+    try:
+        _ak_env = os.path.expanduser('~/authentik/.env')
+        if not os.path.exists(_ak_env):
+            return  # Authentik not installed locally
+        _dsc_settings = load_settings()
+        _dsc_token = (
+            _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+            _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_TOKEN')
+        )
+        if not _dsc_token:
+            print(f"{label}: Authentik Docker SC cleanup — no token found, skipping")
+            return
+        _dsc_url = _get_authentik_api_url(_dsc_settings)
+        _dsc_headers = {
+            'Authorization': f'Bearer {_dsc_token}',
+            'Content-Type': 'application/json',
+        }
+
+        # Check Authentik is reachable before attempting API calls
+        try:
+            _probe = _req.Request(
+                f'{_dsc_url}/api/v3/outposts/service_connections/docker/',
+                headers=_dsc_headers
+            )
+            with _req.urlopen(_probe, timeout=10) as _resp:
+                _data = _json.loads(_resp.read())
+        except urllib.error.HTTPError as _he:
+            try:
+                _he_body = _he.read().decode('utf-8', errors='replace')[:200]
+            except Exception:
+                _he_body = '(unreadable)'
+            print(f"{label}: Authentik Docker SC cleanup — API returned {_he.code}: {_he_body}")
+            return
+        except Exception as _re:
+            print(f"{label}: Authentik Docker SC cleanup — API unreachable ({_re}), skipping")
+            return
+
+        _deleted = 0
+        for _conn in _data.get('results', []):
+            # local=True means "connect to /var/run/docker.sock on the worker host"
+            # That socket is intentionally not mounted in the worker (CVE-2026-31431).
+            if _conn.get('local'):
+                _pk = _conn.get('pk', '')
+                _name = _conn.get('name', _pk)
+                _del_req = _req.Request(
+                    f'{_dsc_url}/api/v3/outposts/service_connections/docker/{_pk}/',
+                    headers=_dsc_headers,
+                    method='DELETE'
+                )
+                try:
+                    _req.urlopen(_del_req, timeout=10)
+                    print(f"{label}: Authentik — deleted stale local Docker service connection '{_name}' ({_pk})")
+                    _deleted += 1
+                except urllib.error.HTTPError as _de:
+                    print(f"{label}: Authentik Docker SC — failed to delete '{_name}': HTTP {_de.code}")
+                except Exception as _de2:
+                    print(f"{label}: Authentik Docker SC — failed to delete '{_name}': {_de2}")
+
+        if _deleted == 0:
+            print(f"{label}: Authentik Docker SC cleanup — no local connections found (idempotent — no-op)")
+    except Exception as _dsc_e:
+        print(f"{label}: Authentik Docker SC cleanup error (non-fatal): {_dsc_e}")
+
+
 def _authentik_fix_trusted_proxy_cidrs(plog):
     """v0.8.9: Fix Authentik recording Docker bridge gateway IP instead of real client IP.
 
@@ -27220,13 +27622,16 @@ def _authentik_fix_pg_idle_timeout(plog):
         plog("  pg idle timeout: no idle_in_transaction_session_timeout found in compose — skipping (compose not yet patched)")
         return False
     current = int(m.group(1))
-    # v0.9.20: also check max_connections drift (<500) so the bump from v0.8.8-era 300 to
-    # v0.9.20 500 is detected on boxes whose idle timeout already passed the v0.8.8 fix.
+    # v0.9.20: also check max_connections drift (<500).
+    # v0.9.21: also check statement_timeout=120s absent, and idle_session_timeout still present.
     _mc = re.search(r'max_connections=(\d+)', compose_content)
     _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
     _mc_drift = _mc_current is not None and _mc_current < 500
-    if current == 300 and not _mc_drift:
-        plog("  pg idle timeout: already 300s + max_connections=500 (idempotent — no-op)")
+    _st = re.search(r'statement_timeout=(\d+)s', compose_content)
+    _st_ok = _st and _st.group(1) == '120'
+    _ist_still_present = bool(re.search(r'idle_session_timeout=\d+', compose_content))
+    if current == 300 and not _mc_drift and _st_ok and not _ist_still_present:
+        plog("  pg idle timeout: already 300s + max_connections=500 + statement_timeout=120s + no idle_session_timeout (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
@@ -27240,12 +27645,16 @@ def _authentik_fix_pg_idle_timeout(plog):
             pass
         return False
 
-    if current != 300 and _mc_drift:
-        plog(f"  pg tuning: found idle_in_transaction_session_timeout={current}s + max_connections={_mc_current} — bumping to 300s/500 (v0.9.20)")
-    elif current != 300:
-        plog(f"  pg idle timeout: found idle_in_transaction_session_timeout={current}s — bumping to 300s (slow-disk safe)")
-    else:
-        plog(f"  pg max_connections: found max_connections={_mc_current} — bumping to 500 (v0.9.20)")
+    _drift_parts = []
+    if current != 300:
+        _drift_parts.append(f"idle_in_transaction_session_timeout={current}s→300s")
+    if _mc_drift:
+        _drift_parts.append(f"max_connections={_mc_current}→500")
+    if not _st_ok:
+        _drift_parts.append("statement_timeout missing→120s")
+    if _ist_still_present:
+        _drift_parts.append("removing idle_session_timeout (was killing channels_postgres LISTEN)")
+    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.21 target config")
 
     try:
         changed = _ensure_authentik_compose_patches(compose_path, plog)
@@ -27918,38 +28327,9 @@ entries:
                 lines = patched
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
-            # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            # v0.9.20: max_connections=500 (was 300) — see _ensure_authentik_compose_patches for rationale.
-            pg_cmd = 'postgres -c max_connections=500 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
-            _pg_full_tmpl = ''.join(lines)
-            has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full_tmpl))
-        # v0.8.8: catch ANY idle_in_transaction value other than 300s (was 30s — too aggressive for slow-disk startup migrations)
-        # v0.9.20: also catch max_connections < 500
-        _pg_full = ''.join(lines)
-        _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
-        _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
-        _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
-        _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
-        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs)
-        if not has_pg_cmd:
-            patched = []
-            for line in lines:
-                patched.append(line)
-                if 'image: docker.io/library/postgres:' in line:
-                    indent = line[:len(line) - len(line.lstrip())]
-                    patched.append(f'{indent}command: {pg_cmd}\n')
-            lines = patched
-            needs_write = True
-            plog("  Added PostgreSQL command-line tuning (max_connections=500)")
-        elif needs_pg_update:
-            for i, line in enumerate(lines):
-                if 'command: postgres' in line and 'max_connections' in line:
-                    indent = line[:len(line) - len(line.lstrip())]
-                    lines[i] = f'{indent}command: {pg_cmd}\n'
-                    needs_write = True
-                    _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                    plog(f"  Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_in_transaction_session_timeout=300s)")
-                    break
+            # v0.9.21: PG tuning is now handled by _ensure_authentik_compose_patches (YAML parse-and-mutate).
+            # The inline text-based pg_cmd injection has been removed to avoid duplicate-key emissions.
+            # _ensure_authentik_compose_patches is called after the file is written (see below).
 
         # Pin AUTHENTIK_TAG to latest stable release
         ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
@@ -28016,6 +28396,9 @@ entries:
             plog("\u2713 Docker Compose patched")
         else:
             plog("\u2713 Docker Compose already patched")
+        # v0.9.21: apply PG tuning, healthchecks, and Redis injection via YAML parse-and-mutate.
+        # This replaces the inline text-based pg_cmd code that was removed above.
+        _ensure_authentik_compose_patches(compose_path, plog)
         if _patch_authentik_compose_network():
             plog("  \u2713 infratak network added to docker-compose.yml")
 
@@ -28132,42 +28515,23 @@ entries:
                 with open(coreconfig_path, 'r') as f:
                     config_content = f.read()
 
-                # Build the new auth block — matches TAK Portal reference exactly
-                auth_block = (
-                    '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
-                    '        <ldap url="ldap://127.0.0.1:389" userstring="cn={username},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
-                    + ldap_pass
-                    + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
-                    '    </auth>'
-                )
-
-                # Replace auth block using regex (match <auth>...</auth> regardless of indentation)
-                new_content = re.sub(
-                    r'<auth[^>]*>.*?</auth>',
-                    auth_block,
-                    config_content,
-                    flags=re.DOTALL
-                )
-
-                if new_content != config_content:
-                    with open(coreconfig_path, 'w') as f:
-                        f.write(new_content)
-                    plog("\u2713 CoreConfig.xml updated with LDAP auth")
-                    plog("  - Group cache enabled (x509useGroupCacheDefaultActive)")
-                    plog("  - Group prefix: tak_")
-
-                    # Restart TAK Server
-                    plog("  Restarting TAK Server...")
-                    r = subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-                    if r.returncode == 0:
-                        plog("\u2713 TAK Server restarted")
-                    else:
-                        plog(f"\u26a0 TAK Server restart issue: {r.stderr.strip()[:100]}")
-                else:
-                    if _coreconfig_has_ldap():
+                # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
+                _et_ok, _et_msg = _apply_coreconfig_ldap_auth_et(coreconfig_path, '127.0.0.1', ldap_pass, plog)
+                if _et_ok:
+                    if 'idempotent' in _et_msg:
                         plog("\u2713 CoreConfig.xml already has LDAP auth configured")
                     else:
-                        plog("\u26a0 CoreConfig <auth> block not found or format not recognized — use Connect TAK Server to LDAP after deploy")
+                        plog("\u2713 CoreConfig.xml updated with LDAP auth")
+                        plog("  - Group cache enabled (x509useGroupCacheDefaultActive)")
+                        plog("  - Group prefix: tak_")
+                        plog("  Restarting TAK Server...")
+                        r = subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                        if r.returncode == 0:
+                            plog("\u2713 TAK Server restarted")
+                        else:
+                            plog(f"\u26a0 TAK Server restart issue: {r.stderr.strip()[:100]}")
+                else:
+                    plog(f"\u26a0 CoreConfig LDAP patch failed: {_et_msg} — use Connect TAK Server to LDAP after deploy")
             else:
                 plog("\u26a0 LDAP service password not found, skipping CoreConfig patch")
         else:
@@ -29881,6 +30245,164 @@ document.addEventListener('DOMContentLoaded', function() {
 </script>
 </body></html>'''
 
+def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=None):
+    """v0.9.21: Apply LDAP auth configuration to CoreConfig.xml using ElementTree (parse-and-mutate).
+
+    Idempotent: finds or creates the <auth> element, finds or creates the <ldap> child,
+    then sets/updates attributes. Eliminates duplicate-element emissions from the previous
+    text-based approach (Issue #6 from SAM operator handoff).
+
+    Returns (success: bool, message: str). Falls back to text-based regex approach if
+    ElementTree parsing fails (defensive — CoreConfig.xml is critical).
+    """
+    import xml.etree.ElementTree as ET
+
+    _ldap_attrs = {
+        'url': f'ldap://{ldap_host}:389',
+        'userstring': 'cn={username},ou=users,dc=takldap',
+        'updateinterval': '30',
+        'groupprefix': 'cn=tak_',
+        'groupNameExtractorRegex': 'cn=tak_(.*?)(?:,|$)',
+        'serviceAccountDN': 'cn=adm_ldapservice,ou=users,dc=takldap',
+        'serviceAccountCredential': ldap_pass,
+        'groupBaseRDN': 'ou=groups,dc=takldap',
+        'userBaseRDN': 'ou=users,dc=takldap',
+        'dnAttributeName': 'DN',
+        'nameAttr': 'CN',
+        'adminGroup': 'ROLE_ADMIN',
+    }
+    _auth_attrs = {
+        'default': 'ldap',
+        'x509groups': 'true',
+        'x509addAnonymous': 'false',
+        'x509useGroupCache': 'true',
+        'x509useGroupCacheDefaultActive': 'true',
+        'x509checkRevocation': 'true',
+        'x509useGroupCacheRequiresExtKeyUsage': 'false',
+    }
+
+    try:
+        ET.register_namespace('', '')  # suppress spurious ns0: prefix on default namespace
+        tree = ET.parse(coreconfig_path)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        if plog:
+            plog(f"  ⚠ CoreConfig.xml parse error ({e}) — falling back to text-based patcher")
+        return _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog)
+    except Exception as e:
+        if plog:
+            plog(f"  ⚠ CoreConfig.xml read error ({e}) — falling back to text-based patcher")
+        return _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog)
+
+    # Handle possible XML namespace prefix on the root (TAK Server uses no namespace in practice,
+    # but be defensive — strip namespace from tag name for comparison).
+    def _tag(elem):
+        t = elem.tag
+        return t.split('}', 1)[1] if '}' in t else t
+
+    # Find or create <auth> element
+    ns_prefix = root.tag.split('}')[0] + '}' if '}' in root.tag else ''
+    auth_tag = f'{ns_prefix}auth' if ns_prefix else 'auth'
+    auth = root.find(auth_tag)
+    if auth is None:
+        # Also try without namespace (common for TAK CoreConfig.xml)
+        auth = root.find('auth')
+    _auth_existed = auth is not None
+
+    if auth is None:
+        auth = ET.SubElement(root, 'auth')
+        if plog:
+            plog("  CoreConfig.xml: created <auth> element")
+
+    # Update auth attributes (preserve any extra attributes the operator added)
+    for k, v in _auth_attrs.items():
+        auth.set(k, v)
+
+    # Find or create <ldap> child
+    ldap_tag = f'{ns_prefix}ldap' if ns_prefix else 'ldap'
+    ldap = auth.find(ldap_tag)
+    if ldap is None:
+        ldap = auth.find('ldap')
+    _ldap_existed = ldap is not None
+
+    if ldap is None:
+        ldap = ET.SubElement(auth, 'ldap')
+        if plog:
+            plog("  CoreConfig.xml: created <ldap> element")
+
+    # Check if any change is actually needed
+    _needs_update = not _auth_existed or not _ldap_existed
+    if not _needs_update:
+        for k, v in _ldap_attrs.items():
+            if ldap.get(k) != v:
+                _needs_update = True
+                break
+        if not _needs_update:
+            for k, v in _auth_attrs.items():
+                if auth.get(k) != v:
+                    _needs_update = True
+                    break
+
+    if not _needs_update:
+        return True, 'CoreConfig.xml already has correct LDAP auth (idempotent — no change needed)'
+
+    # Update ldap attributes
+    for k, v in _ldap_attrs.items():
+        ldap.set(k, v)
+
+    # Write back (to a temp file then sudo-copy to /opt/tak)
+    import tempfile
+    _patch_path = coreconfig_path + '.ldap-patch.xml'
+    try:
+        tree.write(_patch_path, xml_declaration=True, encoding='UTF-8', short_empty_elements=True)
+        # Re-read and verify the patch has adm_ldapservice (sanity check)
+        with open(_patch_path, 'r', encoding='utf-8') as f:
+            _check = f.read()
+        if 'adm_ldapservice' not in _check:
+            return False, 'BUG: ElementTree-patched CoreConfig.xml missing adm_ldapservice — aborting'
+        r = subprocess.run(
+            ['sudo', 'cp', os.path.abspath(_patch_path), coreconfig_path],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            return False, f'sudo cp failed: {r.stderr.strip()[:200]}'
+        return True, f'CoreConfig.xml updated with LDAP auth (ldap://{ldap_host}:389)'
+    except Exception as e:
+        return False, f'CoreConfig.xml write error: {e}'
+
+
+def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog=None):
+    """Legacy text-based LDAP auth writer for CoreConfig.xml — used as fallback by
+    _apply_coreconfig_ldap_auth_et when ElementTree parsing fails."""
+    import re as _re
+    auth_block = (
+        '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true"'
+        ' x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
+        f'        <ldap url="ldap://{ldap_host}:389" userstring="cn={{username}},ou=users,dc=takldap"'
+        f' updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
+        f' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="{ldap_pass}"'
+        f' groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap"'
+        f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
+        '    </auth>'
+    )
+    try:
+        with open(coreconfig_path, 'r') as f:
+            content = f.read()
+        new_content = _re.sub(r'<auth[^>]*>.*?</auth>', auth_block, content, flags=_re.DOTALL)
+        if new_content == content:
+            return False, 'CoreConfig <auth> block not found or format not recognized (text patcher)'
+        _patch_path = coreconfig_path + '.ldap-patch.xml'
+        with open(_patch_path, 'w') as f:
+            f.write(new_content)
+        r = subprocess.run(['sudo', 'cp', os.path.abspath(_patch_path), coreconfig_path],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False, f'sudo cp failed: {r.stderr.strip()[:200]}'
+        return True, f'CoreConfig.xml LDAP auth updated (text patcher, ldap://{ldap_host}:389)'
+    except Exception as e:
+        return False, f'CoreConfig.xml text patcher error: {e}'
+
+
 def _coreconfig_has_ldap():
     """True only when CoreConfig auth block is actually LDAP-default."""
     path = '/opt/tak/CoreConfig.xml'
@@ -30570,7 +31092,12 @@ def _remove_webadmin_from_userauth():
         pass
 
 def _apply_ldap_to_coreconfig():
-    """Patch CoreConfig.xml with LDAP auth and restart TAK Server. Returns (success, message)."""
+    """Patch CoreConfig.xml with LDAP auth and restart TAK Server. Returns (success, message).
+
+    v0.9.21: switched to _apply_coreconfig_ldap_auth_et (ElementTree parse-and-mutate) for
+    both the "LDAP absent" and "LDAP present, needs update" cases. Eliminates duplicate <ldap>
+    element emissions (Issue #6). Idempotent: no-op when already correct.
+    """
     coreconfig_path = '/opt/tak/CoreConfig.xml'
     settings = load_settings()
     ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
@@ -30578,100 +31105,28 @@ def _apply_ldap_to_coreconfig():
         return False, 'CoreConfig.xml not found'
     if not ldap_pass:
         return False, 'Authentik .env not found'
-    # Read current CoreConfig
-    with open(coreconfig_path, 'r') as f:
-        original = f.read()
-    if _coreconfig_has_ldap():
-        import re as _re
-        def _ensure_admin_group(text):
-            if 'adminGroup="ROLE_ADMIN"' in text:
-                return text
-            return _re.sub(r'(<ldap\s[^>]*?)(\s*/>)', r'\1 adminGroup="ROLE_ADMIN"\2', text, count=1, flags=_re.DOTALL)
-        m = _re.search(r'serviceAccountCredential="([^"]*)"', original)
-        existing_pass = m.group(1) if m else ''
-        needs_fix = False
-        updated = original
-        if existing_pass != ldap_pass:
-            updated = updated.replace(
-                f'serviceAccountCredential="{existing_pass}"',
-                f'serviceAccountCredential="{ldap_pass}"')
-            needs_fix = True
-        if 'adminGroup="ROLE_ADMIN"' not in updated:
-            updated = _ensure_admin_group(updated)
-            needs_fix = True
-        if needs_fix and updated != original:
-            patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-patch.xml')
-            with open(patch_path, 'w') as f:
-                f.write(updated)
-            r = subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), coreconfig_path],
-                capture_output=True, text=True, timeout=10)
-            if r.returncode != 0:
-                return False, f'CoreConfig fix: sudo cp failed: {r.stderr.strip()[:200]}'
-            r = subprocess.run('sudo systemctl restart takserver 2>&1',
-                shell=True, capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                return False, f'CoreConfig fixed but TAK Server restart failed: {r.stderr.strip()[:120]}'
-            return True, 'CoreConfig fixed (updated password / restored adminGroup) — TAK Server restarted.'
-        return True, 'CoreConfig already has LDAP (password matches .env)'
-    # Backup
+    # Backup (create once before any writes)
     backup_path = coreconfig_path + '.pre-ldap.bak'
     if not os.path.exists(backup_path):
         subprocess.run(['sudo', 'cp', coreconfig_path, backup_path], capture_output=True, timeout=10)
-    # Build the replacement auth block — use remote LDAP host if Authentik deployed remotely
-    settings = load_settings()
+    # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
+    # Use remote LDAP host if Authentik deployed remotely
     ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     ldap_host = '127.0.0.1'
     if ak_cfg.get('target_mode') == 'remote':
         remote_host = (ak_cfg.get('remote', {}).get('host') or '').strip()
         if remote_host:
             ldap_host = remote_host
-    ldap_line = '        <ldap'
-    ldap_line += f' url="ldap://{ldap_host}:389"'
-    ldap_line += ' userstring="cn={username},ou=users,dc=takldap"'
-    ldap_line += ' updateinterval="30"'
-    ldap_line += ' groupprefix="cn=tak_"'
-    ldap_line += ' groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
-    ldap_line += ' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap"'
-    ldap_line += ' serviceAccountCredential="' + ldap_pass + '"'
-    ldap_line += ' groupBaseRDN="ou=groups,dc=takldap"'
-    ldap_line += ' userBaseRDN="ou=users,dc=takldap"'
-    ldap_line += ' dnAttributeName="DN"'
-    ldap_line += ' nameAttr="CN"'
-    ldap_line += ' adminGroup="ROLE_ADMIN"/>'
-    auth_block = ''
-    auth_block += '    <auth default="ldap" x509groups="true" x509addAnonymous="false"'
-    auth_block += ' x509useGroupCache="true" x509useGroupCacheDefaultActive="true"'
-    auth_block += ' x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
-    auth_block += ldap_line + '\n'
-    auth_block += '    </auth>'
-    # Sanity check the block we built
-    if 'adm_ldapservice' not in auth_block:
-        return False, 'BUG: auth_block missing serviceAccountDN'
-    # Find <auth and </auth> in the file (case-insensitive, no regex)
-    lower = original.lower()
-    start = lower.find('<auth')
-    if start < 0:
-        return False, 'No <auth> tag found in CoreConfig.xml'
-    end_tag = lower.find('</auth>', start)
-    if end_tag < 0:
-        return False, 'No </auth> closing tag found in CoreConfig.xml'
-    end = end_tag + len('</auth>')
-    # Splice: everything before <auth> + our block + everything after </auth>
-    patched = original[:start] + auth_block + original[end:]
-    # Sanity check the patched content
-    if 'adm_ldapservice' not in patched:
-        return False, f'BUG: patched content missing LDAP. start={start} end={end} auth_block_len={len(auth_block)}'
-    # Write to a temp file we own, then sudo cp to /opt/tak
-    patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-patch.xml')
-    with open(patch_path, 'w') as f:
-        f.write(patched)
-    r = subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), coreconfig_path], capture_output=True, text=True, timeout=10)
-    if r.returncode != 0:
-        return False, f'sudo cp failed: {r.stderr.strip()[:200]}. Run manually: sudo cp {os.path.abspath(patch_path)} /opt/tak/CoreConfig.xml && sudo systemctl restart takserver'
-    # Verify the destination file has LDAP and adminGroup (required for 8446 admin UI and channel resolution)
+    _et_ok, _et_msg = _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass)
+    if not _et_ok:
+        return False, _et_msg
+    # No-op path — already correct, no restart needed
+    if 'idempotent' in _et_msg:
+        return True, 'CoreConfig already has LDAP (password and config match .env — no restart needed)'
+    # Verify the destination file has LDAP and adminGroup (post-write sanity check)
     check = subprocess.run(['grep', '-c', 'adm_ldapservice', coreconfig_path], capture_output=True, text=True, timeout=5)
     if check.returncode != 0 or check.stdout.strip() == '0':
-        return False, f'File not updated. Run manually: sudo cp {os.path.abspath(patch_path)} /opt/tak/CoreConfig.xml && sudo systemctl restart takserver'
+        return False, f'File not updated after ElementTree patch. Run: sudo grep adm_ldapservice /opt/tak/CoreConfig.xml'
     ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
     if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
         return False, 'CoreConfig was written but adminGroup="ROLE_ADMIN" is missing — 8446 would show WebTAK for everyone. Run Connect LDAP again.'
@@ -39177,6 +39632,33 @@ def _startup_migrations():
         except Exception as ak_proxy_err:
             print(f"Startup migration: trusted proxy CIDRs fix error (non-fatal): {ak_proxy_err}")
 
+        # v0.9.21 wiring-gap defense: docker.sock orphan cleanup.
+        # _auto_remove_stale_docker_service_connections was added in v0.9.16 but only wired
+        # into the version-gated post-update hook. Boxes that jumped from v0.9.15 → v0.9.20
+        # directly (or pulled a dev SHA without a VERSION bump) never ran the cleanup.
+        # Result: outpost_service_connection_monitor retries the dead /var/run/docker.sock
+        # every 30s → ~26% sustained CPU on the worker. Idempotent: no-ops on clean boxes.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _auto_remove_stale_docker_service_connections(label='Startup migration')
+        except Exception as ak_dock_err:
+            print(f"Startup migration: docker.sock orphan cleanup error (non-fatal): {ak_dock_err}")
+
+        # v0.9.21: Re-assert embedded outpost authentik_host to current public URL.
+        # Catches FQDN changes after first install and boxes where the one-time
+        # bootstrap never ran the assertion (e.g. pure proxy installs, manual edits).
+        try:
+            _ensure_embedded_outpost_authentik_host(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_eo_err:
+            print(f"Startup migration: embedded outpost host check error (non-fatal): {ak_eo_err}")
+
+        # v0.9.21: Ensure proxy provider external_hosts are canonical (e.g. nodered.<fqdn>,
+        # not taktical.<fqdn>). Closes tak-10 brand-prefix drift and generalizes to all boxes.
+        try:
+            _ensure_authentik_proxy_external_hosts_canonical(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_ph_err:
+            print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
+
         # v0.9.0: fail2ban post-install config migrations (only run if fail2ban is already installed
         # by the operator via the Marketplace — _fail2ban_install_and_configure is NOT auto-run).
         try:
@@ -40269,90 +40751,8 @@ def _post_update_auto_deploy():
 
             _authentik_tasklog_cleanup()
 
-            def _auto_remove_stale_docker_service_connections():
-                """v0.9.16: Delete the local Docker service connection that Authentik's upstream
-                quickstart creates by default.
-
-                infra-TAK stripped /var/run/docker.sock from the Authentik worker in v0.9.2
-                (CVE-2026-31431 hardening) but did not remove the corresponding service
-                connection from Authentik's database.  The worker's
-                outpost_service_connection_monitor task retries the dead socket connection
-                every 30 seconds, causing ~26% sustained CPU on the worker container.
-
-                This function calls the Authentik API to list all Docker service connections
-                with local=True (local socket) and deletes them.  infra-TAK uses a standalone
-                authentik-ldap-1 container managed by docker compose — not Docker-managed
-                outposts — so no local Docker service connection is needed or safe.
-
-                Idempotent: if no local Docker service connections exist, logs a one-liner
-                and returns.  Safe to run on every Update Now.
-                """
-                import urllib.request as _req
-                import urllib.error
-                import json as _json
-
-                try:
-                    _ak_env = os.path.expanduser('~/authentik/.env')
-                    if not os.path.exists(_ak_env):
-                        return  # Authentik not installed locally
-                    _dsc_settings = load_settings()
-                    _dsc_token = (
-                        _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
-                        _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_TOKEN')
-                    )
-                    if not _dsc_token:
-                        print("Post-update: Authentik Docker SC cleanup — no token found, skipping")
-                        return
-                    _dsc_url = _get_authentik_api_url(_dsc_settings)
-                    _dsc_headers = {
-                        'Authorization': f'Bearer {_dsc_token}',
-                        'Content-Type': 'application/json',
-                    }
-
-                    # Check Authentik is reachable before attempting API calls
-                    try:
-                        _probe = _req.Request(
-                            f'{_dsc_url}/api/v3/outposts/service_connections/docker/',
-                            headers=_dsc_headers
-                        )
-                        with _req.urlopen(_probe, timeout=10) as _resp:
-                            _data = _json.loads(_resp.read())
-                    except urllib.error.HTTPError as _he:
-                        try:
-                            _he_body = _he.read().decode('utf-8', errors='replace')[:200]
-                        except Exception:
-                            _he_body = '(unreadable)'
-                        print(f"Post-update: Authentik Docker SC cleanup — API returned {_he.code}: {_he_body}")
-                        return
-                    except Exception as _re:
-                        print(f"Post-update: Authentik Docker SC cleanup — API unreachable ({_re}), skipping")
-                        return
-
-                    _deleted = 0
-                    for _conn in _data.get('results', []):
-                        # local=True means "connect to /var/run/docker.sock on the worker host"
-                        # That socket is intentionally not mounted in the worker (CVE-2026-31431).
-                        if _conn.get('local'):
-                            _pk = _conn.get('pk', '')
-                            _name = _conn.get('name', _pk)
-                            _del_req = _req.Request(
-                                f'{_dsc_url}/api/v3/outposts/service_connections/docker/{_pk}/',
-                                headers=_dsc_headers,
-                                method='DELETE'
-                            )
-                            try:
-                                _req.urlopen(_del_req, timeout=10)
-                                print(f"Post-update: Authentik — deleted stale local Docker service connection '{_name}' ({_pk})")
-                                _deleted += 1
-                            except urllib.error.HTTPError as _de:
-                                print(f"Post-update: Authentik Docker SC — failed to delete '{_name}': HTTP {_de.code}")
-                            except Exception as _de2:
-                                print(f"Post-update: Authentik Docker SC — failed to delete '{_name}': {_de2}")
-
-                    if _deleted == 0:
-                        print("Post-update: Authentik Docker SC cleanup — no local connections found, nothing to do")
-                except Exception as _dsc_e:
-                    print(f"Post-update: Authentik Docker SC cleanup error (non-fatal): {_dsc_e}")
+            # v0.9.21: _auto_remove_stale_docker_service_connections extracted to module level
+            # (see ~line 26525). Called here via module-level function for deduplication.
 
             # MediaMTX RTSP Fail2ban jail — auto-install if mediamtx + fail2ban present
             try:
