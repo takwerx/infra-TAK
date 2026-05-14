@@ -26334,7 +26334,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         plog(f"  ⚠ gunicorn timeout error (no changes applied): {e}")
 
 
-def _ensure_authentik_pg_persistent_connections(plog, max_age=60, health_checks=True):
+def _ensure_authentik_pg_persistent_connections(plog, max_age=10, health_checks=True):
     """v0.9.20 PROACTIVE migration: enable Django persistent DB connections so Authentik
     doesn't open + close a new psycopg connection on every web/worker/dramatiq request.
 
@@ -26354,9 +26354,14 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=60, health_checks=
       issues #20714 and #20644 describe the same pattern on similar workloads.
 
     Fix (per Authentik docs https://docs.goauthentik.io/install-config/configuration/):
-      - `AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60` — reuse connections for up to 60 s.
-        Cuts handshake churn ~95% without leaving connections idle long enough to
-        mask real client crashes or block max_connections=500 (v0.9.20) headroom.
+      - `AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=10` — reuse connections for up to 10 s.
+        Cuts handshake churn ~95% while keeping the per-connection idle window short
+        enough that license-cache-miss accumulation stays bounded (see v0.9.21 note).
+        Originally set to 60 in v0.9.20; lowered to 10 in v0.9.21 after field analysis
+        showed that Community Authentik never caches the enterprise license key — so
+        every request generates a DB hit whose connection stays open for CONN_MAX_AGE
+        seconds. At 60 s and ~0.5 new connections/second, steady-state leaks to 500
+        (max_connections) in ~20 min. At 10 s, steady-state is ~5 connections — safe.
       - `AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS=true` — Django pings each pooled
         connection before reuse, drops dead ones (PG side restart, network blip).
         Strictly required when CONN_MAX_AGE > 0; without it, the first request after
@@ -26383,6 +26388,8 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=60, health_checks=
     connection-churn problem in place.
 
     Idempotent. Skip-on-precondition: ~/authentik missing, both env vars already set.
+    See also: _patch_authentik_conn_max_age_60_to_10 (startup migration that downgrades
+    existing =60 installs to =10 without a full reinstall).
     """
     ak_dir = os.path.expanduser('~/authentik')
     env_path = os.path.join(ak_dir, '.env')
@@ -26456,6 +26463,69 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=60, health_checks=
         return True
     except Exception as e:
         plog(f"  ⚠ pg persistent connections error (no changes applied): {e}")
+        return False
+
+
+def _patch_authentik_conn_max_age_60_to_10(plog=None):
+    """v0.9.21 migration: lower AUTHENTIK_POSTGRESQL__CONN_MAX_AGE from 60 → 10 on
+    installs deployed under v0.9.20.
+
+    Root cause (identified in field analysis of tak-10 and tak-12, May 2026):
+      Community Authentik has no enterprise license. The Django cache backend
+      (django_postgres_cache) stores the enterprise license at cache key
+      'public::1:goauthentik.io/enterprise/license'. Since the key is never written,
+      every gunicorn/daphne worker checks the cache and gets a DB miss on every
+      request. With CONN_MAX_AGE=60, each miss's connection stays idle for 60 s.
+      At ~0.5 new DB connections/second (from worker thread pool growth under
+      async-to-sync dispatch), steady-state idle count = 0.5 × 60 = 30/s → 500 in
+      ~20 min → FATAL: sorry, too many clients.
+
+      At CONN_MAX_AGE=10: steady-state = 0.5 × 10 = 5 connections. Safe.
+
+    _ensure_authentik_pg_persistent_connections now defaults to max_age=10 for new
+    installs, but it's idempotent (won't overwrite an already-set value). This
+    function handles the downgrade migration for existing =60 installs.
+
+    Idempotent: no-ops if CONN_MAX_AGE is absent, already ≤10, or not =60.
+    """
+    if plog is None:
+        plog = lambda m: None
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        return False
+    try:
+        with open(ak_env) as _f:
+            env_text = _f.read()
+        if 'AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60' not in env_text:
+            return False  # Not present or already changed
+
+        import time as _t
+        backup_path = f'{ak_env}.bak.conn-max-age-60to10.{int(_t.time())}'
+        with open(backup_path, 'w') as _f:
+            _f.write(env_text)
+
+        new_text = env_text.replace(
+            'AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60',
+            'AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=10'
+        )
+        # Also update the comment header if present
+        new_text = new_text.replace(
+            'CONN_MAX_AGE=60',
+            'CONN_MAX_AGE=10'
+        )
+        with open(ak_env, 'w') as _f:
+            _f.write(new_text)
+        plog(f"  ✓ conn_max_age: lowered CONN_MAX_AGE 60→10 in ~/authentik/.env (backup: {os.path.basename(backup_path)})")
+        plog("    Reason: enterprise license cache miss creates 1 idle PG conn/2s; at 60s retention → exhausts max_connections=500 in ~20 min")
+        plog("  conn_max_age: recreating Authentik server + worker to apply new CONN_MAX_AGE=10...")
+        ok = _recreate_authentik_server_worker(plog, reason='conn-max-age-60to10')
+        if ok:
+            plog("  ✓ conn_max_age: server + worker recreated with CONN_MAX_AGE=10")
+        else:
+            plog("  ⚠ conn_max_age: recreate reported failure — .env updated but restart manually if needed")
+        return True
+    except Exception as e:
+        plog(f"  ⚠ conn_max_age 60→10 patch error (non-fatal): {e}")
         return False
 
 
@@ -26827,26 +26897,29 @@ _channels_watchdog_started = False
 
 
 def _authentik_channels_pool_watchdog_loop():
-    """v0.9.21: Background daemon — auto-restart authentik-server-1 when idle connections
-    from the django_channels_postgres async pool exceed a threshold.
+    """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
+    PostgreSQL connections from the authentik database exceed a threshold.
 
-    Upstream Authentik bug #20714 (present in 2026.2.x, upstream fix milestone 2026.8.0):
-    the async psycopg_pool's group_send path opens connections without properly releasing
-    them back to the pool. Leak rate: ~1 connection per 2-3 seconds post-server-restart.
-    At this rate max_connections=500 is exhausted in ~20 min, producing
-    "FATAL: sorry, too many clients already" and auth failures across all users.
+    Root cause (confirmed field analysis, May 2026 — tak-10, tak-12, Authentik 2026.2.3):
+      Community Authentik has no enterprise license. Every gunicorn/daphne worker
+      checks django_postgres_cache_cacheentry for key
+      'public::1:goauthentik.io/enterprise/license' on every request. The key is
+      never written (no license), so every check is a DB miss. Under CONN_MAX_AGE>0,
+      each worker thread retains its connection after the miss. Thread pool growth
+      under async-to-sync dispatch opens new connections faster than they are
+      reclaimed, accumulating ~1 idle connection per 1-3 seconds.
+      At this rate max_connections=500 is exhausted in ~15-20 min.
 
-    Signature: blank application_name, state=idle, datname=authentik.
-    (Regular Django ORM connections, dramatiq workers, and LDAP outpost all have
-    non-blank application_name. The leaking pool connections are uniquely identifiable.)
+      NOTE: django_channels_postgres LISTEN connection (1 persistent) is normal and
+      NOT the source of the leak. Primary mitigation is CONN_MAX_AGE=10 (v0.9.21,
+      down from 60) which bounds steady-state accumulation to ~5 connections.
+      This watchdog is the secondary safety net.
 
-    Threshold: 250 (half of max_connections=500). At observed leak rates this gives
-    ~9 min of headroom to detect + restart before auth failures begin.
-    After restart, pool resets to ~28 connections. Checks every 5 min.
+    Threshold: 150 connections (~30% of max_connections=500). Checks every 2 min.
+    After restart, idle count resets to ~28 connections.
 
-    Override: set channels_pool_watchdog_threshold=N in settings to change the threshold,
-    or channels_pool_watchdog_disabled=true to disable entirely (e.g. if upstream fix ships
-    and you want to turn this off without a code change).
+    Override: set channels_pool_watchdog_threshold=N in settings to change the
+    threshold, or channels_pool_watchdog_disabled=true to disable entirely.
     """
     import time as _wt
 
@@ -26857,29 +26930,29 @@ def _authentik_channels_pool_watchdog_loop():
         try:
             _settings = load_settings()
             if _settings.get('channels_pool_watchdog_disabled'):
-                _wt.sleep(300)
+                _wt.sleep(120)
                 continue
             if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-                _wt.sleep(300)
+                _wt.sleep(120)
                 continue
 
-            _threshold = int(_settings.get('channels_pool_watchdog_threshold') or 250)
+            _threshold = int(_settings.get('channels_pool_watchdog_threshold') or 150)
 
             _r = subprocess.run(
                 ['docker', 'exec', 'authentik-postgresql-1', 'psql',
                  '-U', 'authentik', '-d', 'authentik', '-tA', '-c',
                  "SELECT COUNT(*) FROM pg_stat_activity "
-                 "WHERE datname='authentik' AND state='idle' AND application_name=''"],
+                 "WHERE datname='authentik' AND state='idle'"],
                 capture_output=True, text=True, timeout=10
             )
             if _r.returncode != 0:
                 _consecutive_failures += 1
-                _wt.sleep(300)
+                _wt.sleep(120)
                 continue
 
             _count_str = (_r.stdout or '').strip()
             if not _count_str.isdigit():
-                _wt.sleep(300)
+                _wt.sleep(120)
                 continue
 
             _count = int(_count_str)
@@ -26887,9 +26960,9 @@ def _authentik_channels_pool_watchdog_loop():
 
             if _count > _threshold:
                 print(
-                    f"[channels-watchdog] ALERT: {_count} idle blank-app-name PG connections "
-                    f"(threshold={_threshold}) — restarting authentik-server-1 to reset "
-                    f"django_channels_postgres pool (upstream Authentik #20714 workaround)",
+                    f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
+                    f"(threshold={_threshold}) — restarting authentik-server-1 "
+                    f"(enterprise license cache-miss accumulation workaround)",
                     flush=True
                 )
                 _restart = subprocess.run(
@@ -26897,20 +26970,20 @@ def _authentik_channels_pool_watchdog_loop():
                     capture_output=True, text=True, timeout=90
                 )
                 if _restart.returncode == 0:
-                    print(f"[channels-watchdog] authentik-server-1 restarted — pool reset", flush=True)
+                    print(f"[ak-pg-watchdog] authentik-server-1 restarted — idle connections reset", flush=True)
                 else:
-                    print(f"[channels-watchdog] restart failed: {(_restart.stderr or '')[:120]}", flush=True)
+                    print(f"[ak-pg-watchdog] restart failed: {(_restart.stderr or '')[:120]}", flush=True)
                 # Sleep longer after restart to let server recover before next check
                 _wt.sleep(180)
-            elif _count > 100:
+            elif _count > 80:
                 print(
-                    f"[channels-watchdog] {_count} idle blank-app-name PG connections "
-                    f"(threshold={_threshold}) — pool leak in progress, monitoring",
+                    f"[ak-pg-watchdog] {_count} idle PG connections "
+                    f"(threshold={_threshold}) — accumulation in progress, monitoring",
                     flush=True
                 )
         except Exception:
             pass  # Never crash the console process
-        _wt.sleep(300)
+        _wt.sleep(120)
 
 
 def _start_channels_pool_watchdog():
@@ -39707,6 +39780,13 @@ def _startup_migrations():
             _ensure_authentik_pg_persistent_connections(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pc_err:
             print(f"Startup migration: pg persistent connections fix error (non-fatal): {ak_pc_err}")
+        # v0.9.21: Downgrade CONN_MAX_AGE 60→10 on boxes deployed under v0.9.20.
+        # Root cause: enterprise license cache miss (~1 DB hit/req) + CONN_MAX_AGE=60
+        # → ~30 idle connections steady-state → exhausts max_connections=500 in ~20 min.
+        try:
+            _patch_authentik_conn_max_age_60_to_10(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_cma_err:
+            print(f"Startup migration: conn_max_age 60→10 patch error (non-fatal): {ak_cma_err}")
 
         # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
         # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
@@ -39764,14 +39844,15 @@ def _startup_migrations():
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
 
-        # v0.9.21: Start channels pool watchdog — auto-restart authentik-server-1 when
-        # blank-app-name idle connections exceed threshold (default 250).
-        # Upstream Authentik #20714: group_send leaks ~1 connection/2-3s → hits
-        # max_connections=500 ceiling in ~20 min → auth failures. Workaround until 2026.8.0.
+        # v0.9.21: Start PG connection watchdog — auto-restart authentik-server-1 when
+        # total idle connections exceed threshold (default 150).
+        # Root cause: enterprise license cache miss creates ~1 idle conn/1-3s under
+        # CONN_MAX_AGE>0 → exhausts max_connections=500 in ~15-20 min → auth failures.
+        # Primary fix is CONN_MAX_AGE=10 (bounds steady-state); this is secondary safety net.
         try:
             if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
                 _start_channels_pool_watchdog()
-                print("Startup: channels pool watchdog started (threshold=250, interval=5min)", flush=True)
+                print("Startup: PG connection watchdog started (threshold=150, interval=2min)", flush=True)
         except Exception as _wde:
             print(f"Startup: channels pool watchdog start failed (non-fatal): {_wde}", flush=True)
 
