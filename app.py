@@ -39129,6 +39129,25 @@ def _startup_migrations():
         except Exception as ak_pg_err:
             print(f"Startup migration: pg idle timeout fix error (non-fatal): {ak_pg_err}")
 
+        # v0.8.5 / v0.9.20 wiring-gap fix: gunicorn timeout + PG persistent connections
+        # also run as startup migrations, not just post-update. Discovered during v0.9.20
+        # tak-10 validation: when a VERSION string is burned by a partial commit (e.g. dev
+        # SHA bumps VERSION to 0.9.20-alpha for a Caddy-only fix, then a later commit on
+        # the same VERSION string adds Authentik migrations), the version-gated post-update
+        # hook short-circuits on the next Update Now and the new migrations never fire.
+        # Putting them in the startup-migration block ensures they run on every console
+        # boot, idempotently, regardless of version changes. Both helpers are no-ops when
+        # their env vars are already set or ~/authentik isn't installed — they're safe to
+        # call unconditionally on every restart.
+        try:
+            _ensure_authentik_gunicorn_timeout(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_gt_err:
+            print(f"Startup migration: gunicorn timeout fix error (non-fatal): {ak_gt_err}")
+        try:
+            _ensure_authentik_pg_persistent_connections(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pc_err:
+            print(f"Startup migration: pg persistent connections fix error (non-fatal): {ak_pc_err}")
+
         # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
         # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
         # is still present (i.e. boxes deployed before v0.8.8). On already-fixed boxes
