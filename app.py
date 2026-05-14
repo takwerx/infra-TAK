@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.19-alpha"
+VERSION = "0.9.20-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25486,15 +25486,28 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
-        has_pg_cmd = any('max_connections=300' in l for l in lines)
-        # v0.8.8: catch ANY value other than 300s (was 30s in v0.8.4 — too aggressive on slow disks:
-        # Authentik startup migrations exceeded 30s in idle-in-tx state on 1795-IOPS storage,
-        # got killed mid-flight, leaving stale advisory locks and a permanent server crash loop.
-        # 300s tightly bounds zombie idle-in-tx sessions while tolerating slow-disk migrations.)
+        # v0.9.20: max_connections bumped 300 → 500. Authentik 2026.2.x reliably saturates
+        # a 300-slot pool under heavy LDAP load (channels-postgres + django_postgres_cache +
+        # dramatiq + worker + server + outpost all share one Postgres). On tak-10 with
+        # CONN_MAX_AGE=0 (default), peak load produced 221 total conns + 75 idle-in-tx on
+        # django_postgres_cache_cacheentry and `FATAL: sorry, too many clients already`
+        # in worker logs. 500 leaves comfortable headroom; CONN_MAX_AGE=60 (set in .env via
+        # _ensure_authentik_pg_persistent_connections) keeps churn from reopening connections
+        # on every Django request. Refs: github.com/goauthentik/authentik#20714, #20644.
+        pg_cmd = 'postgres -c max_connections=500 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         _pg_full = ''.join(lines)
-        _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
-        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '300')
+        has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
+        # v0.8.8: catch ANY idle_in_transaction value other than 300s (was 30s in v0.8.4 — too
+        # aggressive on slow disks: Authentik startup migrations exceeded 30s in idle-in-tx
+        # state on 1795-IOPS storage, got killed mid-flight, leaving stale advisory locks and
+        # a permanent server crash loop. 300s tightly bounds zombie idle-in-tx sessions while
+        # tolerating slow-disk migrations.)
+        # v0.9.20: also catch max_connections < 500 and rewrite the whole pg command line.
+        _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
+        _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
+        _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
+        _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
+        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -25506,7 +25519,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                 lines = patched
                 changed = True
                 if plog:
-                    plog("  ✓ Added PostgreSQL command-line tuning (max_connections=300, idle timeouts, tcp keepalives)")
+                    plog("  ✓ Added PostgreSQL command-line tuning (max_connections=500, idle timeouts, tcp keepalives)")
         elif needs_pg_update:
             for i, line in enumerate(lines):
                 if 'command: postgres' in line and 'max_connections' in line:
@@ -25514,7 +25527,9 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
                     lines[i] = f'{indent}command: {pg_cmd}\n'
                     changed = True
                     if plog:
-                        plog("  ✓ Updated PostgreSQL tuning parameters")
+                        _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
+                        _old_it = _pg_it_match.group(1) + 's' if _pg_it_match else '?'
+                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_in_transaction_session_timeout={_old_it}→300s)")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -25663,6 +25678,8 @@ def _detect_authentik_ldap_spiral(plog=None):
       - 'outpost_general_markers': int (count of distinct general marker types — recorded but doesn't trip)
       - 'pg_idle_in_trans': int (idle-in-transaction connections from authentik-server)
       - 'pg_total_conns': int (total connections to authentik DB)
+      - 'channels_msg_rows': int (rows in django_channels_postgres_message — v0.9.20 informational)
+      - 'channels_msg_mb': int (size of django_channels_postgres_message in MB — informational)
       - 'reason': str (which signal(s) tripped, or why not)
 
     Spiral confirmed when EITHER:
@@ -25681,7 +25698,8 @@ def _detect_authentik_ldap_spiral(plog=None):
     """
     evidence = {'outpost_markers': {}, 'outpost_spiral_specific_markers': 0,
                 'outpost_general_markers': 0, 'pg_idle_in_trans': -1,
-                'pg_total_conns': -1, 'reason': ''}
+                'pg_total_conns': -1, 'channels_msg_rows': -1,
+                'channels_msg_mb': -1, 'reason': ''}
 
     # Outpost log signal — bumped --tail from 200 to 1000 (high-volume binds otherwise drown out
     # rare spiral markers; on ssdnodes during v0.8.4 testing, 14 markers existed in last 200 lines
@@ -25740,6 +25758,33 @@ def _detect_authentik_ldap_spiral(plog=None):
         evidence['pg_idle_in_trans'] = -1
         evidence['pg_total_conns'] = -1
 
+    # v0.9.20: django_channels_postgres_message bloat — informational only, does NOT trip
+    # the spiral gate. Authentik 2026.2.x's channel-layer backend writes one row per
+    # outbound websocket message + a TTL-based cleanup that doesn't keep up under heavy
+    # outpost flow load. Healthy boxes sit at 0-1k rows; observed on tak-10 during the
+    # connection-pool incident: 109,840 rows / 61 MB. The bloat itself isn't the spiral
+    # signal (table can be empty during a spiral, see tak-10's first incident), but
+    # surfacing the number in spiral evidence helps operators correlate symptoms. The
+    # primary mitigation is CONN_MAX_AGE=60 + max_connections=500 (v0.9.20 migrations);
+    # if rows climb >50k on a box, that's a strong indicator the cleanup task isn't
+    # running and operator action (manual TRUNCATE or worker restart) is warranted.
+    try:
+        _ch = subprocess.run(
+            'docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c '
+            '"SELECT '
+            '  (SELECT count(*) FROM django_channels_postgres_message),'
+            '  (SELECT pg_total_relation_size(\'django_channels_postgres_message\')/1024/1024);"',
+            shell=True, capture_output=True, text=True, timeout=8
+        )
+        _ch_out = (_ch.stdout or '').strip()
+        if '|' in _ch_out:
+            _ch_parts = _ch_out.split('|')
+            evidence['channels_msg_rows'] = int(_ch_parts[0]) if _ch_parts[0].strip().lstrip('-').isdigit() else -1
+            evidence['channels_msg_mb'] = int(_ch_parts[1]) if _ch_parts[1].strip().lstrip('-').isdigit() else -1
+    except Exception:
+        evidence['channels_msg_rows'] = -1
+        evidence['channels_msg_mb'] = -1
+
     outpost_signal = evidence['outpost_spiral_specific_markers'] >= 1
     pg_signal = evidence['pg_idle_in_trans'] >= 30
     spiraling = outpost_signal or pg_signal
@@ -25761,6 +25806,13 @@ def _detect_authentik_ldap_spiral(plog=None):
         if evidence['outpost_markers']:
             mk = ', '.join(f"{k}={v}" for k, v in evidence['outpost_markers'].items() if isinstance(v, int) and v > 0)
             plog(f"  outpost markers (last 1000 lines): {mk or '(none)'}")
+        # v0.9.20: always surface channels-postgres table size — informational, but loud
+        # above 50k rows since that's a strong indicator the cleanup task isn't running.
+        if evidence.get('channels_msg_rows', -1) >= 0:
+            if evidence['channels_msg_rows'] >= 50000:
+                plog(f"  ⚠ channels_postgres_message bloat: {evidence['channels_msg_rows']:,} rows / {evidence['channels_msg_mb']} MB (cleanup task may be stuck — consider worker restart)")
+            elif evidence['channels_msg_rows'] >= 5000:
+                plog(f"  channels_postgres_message: {evidence['channels_msg_rows']:,} rows / {evidence['channels_msg_mb']} MB (elevated but not critical)")
 
     return spiraling, evidence
 
@@ -26165,6 +26217,131 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
             plog(f"  ⚠ gunicorn timeout: server restarted but printenv didn't surface the value — non-fatal, will be picked up on next restart: {((_v.stdout or '') + (_v.stderr or ''))[:200]}")
     except Exception as e:
         plog(f"  ⚠ gunicorn timeout error (no changes applied): {e}")
+
+
+def _ensure_authentik_pg_persistent_connections(plog, max_age=60, health_checks=True):
+    """v0.9.20 PROACTIVE migration: enable Django persistent DB connections so Authentik
+    doesn't open + close a new psycopg connection on every web/worker/dramatiq request.
+
+    Background (Authentik 2026.2.x default = CONN_MAX_AGE=0):
+      With `CONN_MAX_AGE=0`, every Django request opens a fresh PG connection (3-way
+      handshake + Authentik's startup ALTER ROLE/SET timezone/etc. round-trips) and
+      closes it on response. Under heavy LDAP load (web + worker + dramatiq + outpost
+      all running flows), connection churn alone drives 100+ short-lived backends on
+      a 300-slot pool. Combined with django_channels_postgres' LISTEN/NOTIFY backend
+      and django_postgres_cache hitting the enterprise license cache table, the pool
+      saturates: `FATAL: sorry, too many clients already` in worker logs, idle-in-tx
+      pileup on `django_postgres_cache_cacheentry`, 502s from Caddy to authentik-server.
+
+      Observed on tak-10 after the v0.9.18 LDAP-routing fix dropped CPU but exposed
+      this underlying pool issue: 221 total backends + 75 idle-in-tx pinned to the
+      cache table query, 109k rows in `django_channels_postgres_message`. Upstream
+      issues #20714 and #20644 describe the same pattern on similar workloads.
+
+    Fix (per Authentik docs https://docs.goauthentik.io/install-config/configuration/):
+      - `AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60` — reuse connections for up to 60 s.
+        Cuts handshake churn ~95% without leaving connections idle long enough to
+        mask real client crashes or block max_connections=500 (v0.9.20) headroom.
+      - `AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS=true` — Django pings each pooled
+        connection before reuse, drops dead ones (PG side restart, network blip).
+        Strictly required when CONN_MAX_AGE > 0; without it, the first request after
+        a Postgres restart fails with `connection already closed`.
+
+    Mechanism: append both lines to ~/authentik/.env. Authentik picks them up at
+    Django startup. The double-underscore (`POSTGRESQL__CONN_MAX_AGE`, not single)
+    is the SAME gotcha as `AUTHENTIK_WEB__WORKERS` — see consult-upstream-docs rule;
+    single-underscore would be silently ignored.
+
+    Safety profile:
+      - On healthy/fast boxes: connection reuse only ever speeds up requests. No
+        behavioural change on request path.
+      - On heavy-load/saturated-pool boxes: 95% connection-churn reduction unblocks
+        `too many clients` cascade. This is the primary fix.
+      - On boxes that already set EITHER env var (operator override, future Authentik
+        defaults): idempotent no-op (we never overwrite).
+      - Operator-revertible: delete the lines + recreate server+worker. No state
+        coupling — connection age is a runtime knob, not a schema commitment.
+
+    Triggers `_recreate_authentik_server_worker` once if at least one var was appended.
+    Worker MUST be recreated alongside server because dramatiq workers also open
+    Django DB connections — leaving worker at CONN_MAX_AGE=0 would leave half the
+    connection-churn problem in place.
+
+    Idempotent. Skip-on-precondition: ~/authentik missing, both env vars already set.
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(env_path) or not os.path.exists(compose_path):
+        plog("  pg persistent connections: ~/authentik not installed — skipping")
+        return False
+
+    try:
+        with open(env_path) as _f:
+            env_text = _f.read()
+
+        has_max_age = 'AUTHENTIK_POSTGRESQL__CONN_MAX_AGE' in env_text
+        has_health = 'AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS' in env_text
+        if has_max_age and has_health:
+            plog("  pg persistent connections: both env vars already set in .env — skipping (idempotent)")
+            return False
+
+        import time as _t
+        backup_path = f'{env_path}.bak.pg-persistent-conn.{int(_t.time())}'
+        with open(backup_path, 'w') as _f:
+            _f.write(env_text)
+
+        appended = []
+        if not has_max_age:
+            appended.append(f'AUTHENTIK_POSTGRESQL__CONN_MAX_AGE={int(max_age)}')
+        if not has_health:
+            appended.append(f"AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS={'true' if health_checks else 'false'}")
+
+        sep = '' if env_text.endswith('\n') or not env_text else '\n'
+        header = '\n# v0.9.20: Django persistent DB connections — cuts handshake churn ~95% under heavy load.\n# Both keys use DOUBLE underscore between segments per Authentik docs (single is silently ignored).\n'
+        new_text = env_text + sep + header + '\n'.join(appended) + '\n'
+        with open(env_path, 'w') as _f:
+            _f.write(new_text)
+        plog(f"  pg persistent connections: appended {len(appended)} var(s) to ~/authentik/.env (backup: {os.path.basename(backup_path)})")
+        for line in appended:
+            plog(f"    + {line}")
+
+        plog("  pg persistent connections: recreating Authentik server + worker (dramatiq workers also open Django DB conns; LDAP/postgres untouched)...")
+        ok = _recreate_authentik_server_worker(plog, reason='pg-persistent-connections')
+        if not ok:
+            plog("  ⚠ pg persistent connections: server/worker recreate reported failure — env applied but may not be active yet")
+            return True
+
+        _t.sleep(15)
+        _v_server = subprocess.run(
+            'docker exec authentik-server-1 printenv AUTHENTIK_POSTGRESQL__CONN_MAX_AGE 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        _v_worker = subprocess.run(
+            'docker exec authentik-worker-1 printenv AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        server_ok = str(int(max_age)) in (_v_server.stdout or '')
+        worker_ok = ('true' if health_checks else 'false') in (_v_worker.stdout or '').lower()
+        if server_ok and worker_ok:
+            plog(f"  ✓ pg persistent connections: server has CONN_MAX_AGE={int(max_age)}, worker has CONN_HEALTH_CHECKS={'true' if health_checks else 'false'} (verified)")
+            try:
+                s = load_settings()
+                s['authentik_pg_persistent_conn_migration'] = {
+                    'ts': int(_t.time()),
+                    'outcome': 'success',
+                    'conn_max_age': int(max_age),
+                    'conn_health_checks': bool(health_checks),
+                }
+                save_settings(s)
+            except Exception:
+                pass
+        else:
+            plog(f"  ⚠ pg persistent connections: containers restarted but printenv didn't surface the value (server_ok={server_ok}, worker_ok={worker_ok}) — non-fatal, will be picked up on next restart")
+        return True
+    except Exception as e:
+        plog(f"  ⚠ pg persistent connections error (no changes applied): {e}")
+        return False
 
 
 def _recreate_authentik_server_worker(plog, reason):
@@ -27043,21 +27220,32 @@ def _authentik_fix_pg_idle_timeout(plog):
         plog("  pg idle timeout: no idle_in_transaction_session_timeout found in compose — skipping (compose not yet patched)")
         return False
     current = int(m.group(1))
-    if current == 300:
-        plog("  pg idle timeout: already 300s (idempotent — no-op)")
+    # v0.9.20: also check max_connections drift (<500) so the bump from v0.8.8-era 300 to
+    # v0.9.20 500 is detected on boxes whose idle timeout already passed the v0.8.8 fix.
+    _mc = re.search(r'max_connections=(\d+)', compose_content)
+    _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
+    _mc_drift = _mc_current is not None and _mc_current < 500
+    if current == 300 and not _mc_drift:
+        plog("  pg idle timeout: already 300s + max_connections=500 (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
             cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
             cfg['last_outcome'] = 'idempotent-noop'
             cfg['last_value'] = '300s'
+            cfg['last_max_conn'] = _mc_current or '?'
             s['authentik_pg_idle_timeout_fix'] = cfg
             save_settings(s)
         except Exception:
             pass
         return False
 
-    plog(f"  pg idle timeout: found idle_in_transaction_session_timeout={current}s — bumping to 300s (slow-disk safe)")
+    if current != 300 and _mc_drift:
+        plog(f"  pg tuning: found idle_in_transaction_session_timeout={current}s + max_connections={_mc_current} — bumping to 300s/500 (v0.9.20)")
+    elif current != 300:
+        plog(f"  pg idle timeout: found idle_in_transaction_session_timeout={current}s — bumping to 300s (slow-disk safe)")
+    else:
+        plog(f"  pg max_connections: found max_connections={_mc_current} — bumping to 500 (v0.9.20)")
 
     try:
         changed = _ensure_authentik_compose_patches(compose_path, plog)
@@ -27731,12 +27919,18 @@ entries:
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
-            has_pg_cmd = any('max_connections=300' in l for l in lines)
-        # v0.8.8: catch ANY value other than 300s (was 30s — too aggressive for slow-disk startup migrations)
+            # v0.9.20: max_connections=500 (was 300) — see _ensure_authentik_compose_patches for rationale.
+            pg_cmd = 'postgres -c max_connections=500 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            _pg_full_tmpl = ''.join(lines)
+            has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full_tmpl))
+        # v0.8.8: catch ANY idle_in_transaction value other than 300s (was 30s — too aggressive for slow-disk startup migrations)
+        # v0.9.20: also catch max_connections < 500
         _pg_full = ''.join(lines)
-        _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
-        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '300')
+        _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
+        _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
+        _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
+        _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
+        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -27746,14 +27940,15 @@ entries:
                     patched.append(f'{indent}command: {pg_cmd}\n')
             lines = patched
             needs_write = True
-            plog("  Added PostgreSQL command-line tuning")
+            plog("  Added PostgreSQL command-line tuning (max_connections=500)")
         elif needs_pg_update:
             for i, line in enumerate(lines):
                 if 'command: postgres' in line and 'max_connections' in line:
                     indent = line[:len(line) - len(line.lstrip())]
                     lines[i] = f'{indent}command: {pg_cmd}\n'
                     needs_write = True
-                    plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 300s")
+                    _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
+                    plog(f"  Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_in_transaction_session_timeout=300s)")
                     break
 
         # Pin AUTHENTIK_TAG to latest stable release
@@ -28800,6 +28995,10 @@ entries:
             _ensure_authentik_gunicorn_timeout(plog)
         except Exception as _e:
             plog(f"  ⚠ Gunicorn timeout migration skipped: {_e}")
+        try:
+            _ensure_authentik_pg_persistent_connections(plog)
+        except Exception as _e:
+            plog(f"  ⚠ PG persistent connections migration skipped: {_e}")
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -35247,6 +35446,10 @@ def run_takserver_deploy(config):
                 _ensure_authentik_gunicorn_timeout(log_step)
             except Exception as _e:
                 log_step(f"  ⚠ Gunicorn timeout migration skipped: {_e}")
+            try:
+                _ensure_authentik_pg_persistent_connections(log_step)
+            except Exception as _e:
+                log_step(f"  ⚠ PG persistent connections migration skipped: {_e}")
 
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
@@ -39134,6 +39337,18 @@ def _post_update_auto_deploy():
                 _ensure_authentik_gunicorn_timeout(lambda m: print(f"Post-update: {m}"))
             except Exception as _e:
                 print(f"Post-update: gunicorn timeout migration skipped: {_e}")
+
+            # v0.9.20: Django persistent DB connections (CONN_MAX_AGE=60 + CONN_HEALTH_CHECKS=true).
+            # Cuts handshake churn ~95% on heavy-LDAP-load boxes where Authentik default
+            # CONN_MAX_AGE=0 + Authentik 2026.2.x's combination of django_channels_postgres,
+            # django_postgres_cache, dramatiq workers, and outpost flows saturates a 300-slot
+            # PG pool (FATAL: sorry, too many clients already). Refs: goauthentik/authentik#20714,
+            # #20644. Pairs with max_connections=500 bumped in _ensure_authentik_compose_patches.
+            # Idempotent no-op on boxes where both env vars are already set.
+            try:
+                _ensure_authentik_pg_persistent_connections(lambda m: print(f"Post-update: {m}"))
+            except Exception as _e:
+                print(f"Post-update: pg persistent connections migration skipped: {_e}")
 
             # v0.8.4: Reactive routing repair — for boxes already actively spiraling on the
             # direct path. Spiral-signature gated (postgres + outpost log dual signal),
