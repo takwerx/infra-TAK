@@ -27271,15 +27271,24 @@ def _ensure_authentik_pgbouncer(plog):
             pass
         return None
 
-    plog("  pgbouncer install: starting pgbouncer container...")
-    r = subprocess.run(
-        f'cd {ak_dir} && docker compose up -d pgbouncer 2>&1',
-        shell=True, capture_output=True, text=True, timeout=240
-    )
-    if r.returncode != 0:
-        err = ((r.stderr or '') + (r.stdout or ''))[:300]
-        plog(f"  ✗ pgbouncer install: `docker compose up -d pgbouncer` failed: {err}")
-        plog("  pgbouncer install: rolling back compose + .env, leaving Authentik on direct PG")
+    def _dump_proc_output(label, proc):
+        """Helper: log up to 30 lines of stdout+stderr from a failed subprocess."""
+        _so = (proc.stdout or '').strip()
+        _se = (proc.stderr or '').strip()
+        plog(f"  ✗ pgbouncer install: {label} (rc={proc.returncode})")
+        if _so:
+            plog(f"  ✗ pgbouncer install: --- stdout ({len(_so)} chars) ---")
+            for _ln in _so.splitlines()[-20:]:
+                plog(f"  ✗   {_ln}")
+        if _se:
+            plog(f"  ✗ pgbouncer install: --- stderr ({len(_se)} chars) ---")
+            for _ln in _se.splitlines()[-20:]:
+                plog(f"  ✗   {_ln}")
+        if not _so and not _se:
+            plog("  ✗ pgbouncer install: (subprocess produced no output)")
+
+    def _rollback_compose_env(reason):
+        plog(f"  pgbouncer install: rolling back compose + .env ({reason}), leaving Authentik on direct PG")
         try:
             with open(compose_path, 'w') as f:
                 f.write(raw_compose)
@@ -27291,6 +27300,35 @@ def _ensure_authentik_pgbouncer(plog):
             )
         except Exception:
             pass
+
+    # Pull the image FIRST as a separate step. This makes the failure mode
+    # diagnosable: pull issues (DockerHub rate limits, slow network, bad image
+    # tag) get distinct errors from container-start issues (compose YAML
+    # errors, depends_on chain breaks, port conflicts). Without this split,
+    # `docker compose up -d pgbouncer` returns non-zero in ~1s on certain
+    # docker compose versions while only printing "Image edoburu/pgbouncer:1.25.1 Pulling"
+    # to stdout — the actual error gets buried (tak-10, May 2026).
+    # Note: stderr captured SEPARATELY (no shell-level 2>&1) so failure diagnosis
+    # can show both streams distinctly.
+    plog(f"  pgbouncer install: pulling {_AUTHENTIK_PGBOUNCER_IMAGE} (may take ~60s on first run)...")
+    _pull_r = subprocess.run(
+        ['docker', 'compose', 'pull', 'pgbouncer'],
+        cwd=ak_dir, capture_output=True, text=True, timeout=300
+    )
+    if _pull_r.returncode != 0:
+        _dump_proc_output(f"`docker compose pull pgbouncer` failed", _pull_r)
+        _rollback_compose_env('pull-failed')
+        return None
+    plog(f"  ✓ pgbouncer install: image pulled")
+
+    plog("  pgbouncer install: starting pgbouncer container...")
+    r = subprocess.run(
+        ['docker', 'compose', 'up', '-d', '--no-deps', 'pgbouncer'],
+        cwd=ak_dir, capture_output=True, text=True, timeout=180
+    )
+    if r.returncode != 0:
+        _dump_proc_output("`docker compose up -d pgbouncer` failed", r)
+        _rollback_compose_env('up-failed')
         return None
 
     pgbouncer_healthy = False
