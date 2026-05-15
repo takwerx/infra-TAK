@@ -232,10 +232,24 @@ UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
 
 
 def _ensure_gunicorn_upgrade(console_dir=None):
-    """Install gunicorn and upgrade systemd service if still using Flask dev server.
+    """Ensure the venv has gunicorn + PyYAML + any other deps required by the
+    post-update boot, and upgrade systemd service if still using Flask dev server.
 
-    Called automatically by the in-app update flow so users clicking
-    'Update Now' get gunicorn without any manual steps.
+    Called automatically by the in-app Update Now flow (`/api/update/apply`)
+    BEFORE the systemctl restart fires, so the venv is in the right shape by
+    the time the new code's `_startup_migrations` runs.
+
+    Deps managed here:
+      - `gunicorn` — added in v0.4.x; some legacy installs still use Flask dev server.
+      - `pyyaml`  — added in v0.9.23 Phase 6. The PgBouncer migration parses
+        and mutates ~/authentik/docker-compose.yml via PyYAML; on field
+        installs whose venv was built before PyYAML was needed
+        (tak-10, May 2026), the migration would skip with
+        "PyYAML not available". Installing it here as part of Update Now
+        means Phase 6 fires cleanly on the very first click.
+
+    Idempotent: `pip install --quiet` is a fast no-op when the package is
+    already satisfied (~1s on a hot pip cache).
     """
     console_dir = console_dir or BASE_DIR
     venv_pip = os.path.join(console_dir, '.venv', 'bin', 'pip')
@@ -245,6 +259,20 @@ def _ensure_gunicorn_upgrade(console_dir=None):
     if not os.path.exists(venv_gunicorn):
         subprocess.run([venv_pip, 'install', '--quiet', 'gunicorn'],
                        capture_output=True, timeout=60)
+
+    # v0.9.23 Phase 6: ensure PyYAML is in the venv before the PgBouncer
+    # migration runs in the post-restart startup chain. `pip show` first
+    # to keep the common-path (already-installed) cost near zero.
+    try:
+        _show = subprocess.run([venv_pip, 'show', 'pyyaml'],
+                               capture_output=True, text=True, timeout=10)
+        if _show.returncode != 0:
+            subprocess.run([venv_pip, 'install', '--quiet',
+                            '--disable-pip-version-check', 'pyyaml'],
+                           capture_output=True, timeout=120)
+    except Exception:
+        pass
+
     svc = '/etc/systemd/system/takwerx-console.service'
     if not os.path.exists(svc) or not os.path.exists(venv_gunicorn):
         return
