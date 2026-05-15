@@ -27214,6 +27214,234 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
 _channels_watchdog_started = False
 
 
+# ---------------------------------------------------------------------------
+# v0.9.23: MAX_REQUESTS auto-tune
+# ---------------------------------------------------------------------------
+# Self-tuning of AUTHENTIK_WEB__MAX_REQUESTS based on observed watchdog
+# behaviour. Different boxes have wildly different traffic profiles and the
+# leak rate (which scales with request volume) varies 2-3x between them
+# (Tom's anctakserver2: 0.17 conn/sec; tak-10: 0.37 conn/sec). One static
+# default cannot satisfy both ends of the fleet:
+#
+#   - Too HIGH (e.g. 1000) on busy boxes → workers don't recycle fast enough
+#     to flush the leak before idle hits 150 → watchdog fires → LDAP drops.
+#   - Too LOW (e.g. 100) on idle boxes → workers churn unnecessarily →
+#     more frequent LDAP outpost websocket reconnects for no benefit.
+#
+# Auto-tune watches `ak-pg-watchdog` fire events and adjusts MAX_REQUESTS
+# automatically:
+#
+#   - On fire: halve MAX_REQUESTS (toward floor of 100). More aggressive
+#     worker recycling on this box.
+#   - After 6 hours with no fire AND we're below ceiling: nudge up 25%.
+#     Slowly returns to a less-churny value as load drops or upstream fixes
+#     the leak.
+#
+# Rate-limited at 1 change per 30 min so we don't oscillate on transient
+# load spikes. Operator can disable via settings.authentik_max_requests_autotune_disabled.
+#
+# References:
+#   - docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md
+#   - https://github.com/goauthentik/authentik/issues/20714
+
+_AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT = 100
+_AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT = 2000
+_AUTHENTIK_MAX_REQUESTS_TUNE_COOLDOWN_S = 1800  # 30 min between tunes
+_AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S = 1800  # 30 min: "recent fire" window
+_AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S = 21600  # 6h: "no fire for a long time"
+_AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX = 50
+_AUTHENTIK_MAX_REQUESTS_TUNE_HISTORY_MAX = 50
+
+
+def _authentik_max_requests_get_current():
+    """Read current AUTHENTIK_WEB__MAX_REQUESTS from ~/authentik/.env.
+
+    Returns (max_requests:int, jitter:int) or (None, None) if either is
+    missing/unparseable. Used by both the auto-tune and the dashboard.
+    """
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        return None, None
+    try:
+        with open(ak_env) as _f:
+            _txt = _f.read()
+        _m = re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS=(\d+)\s*$', _txt, re.MULTILINE)
+        _j = re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=(\d+)\s*$', _txt, re.MULTILINE)
+        return (int(_m.group(1)) if _m else None,
+                int(_j.group(1)) if _j else None)
+    except Exception:
+        return None, None
+
+
+def _authentik_max_requests_autotune_record_fire():
+    """Append a watchdog-fire timestamp to settings.
+
+    Called by the watchdog loop every time it issues an ALERT/restart.
+    Keeps the last N events for trend analysis.
+    """
+    try:
+        import time as _t
+        _s = load_settings()
+        _hist = list(_s.get('authentik_max_requests_fire_history') or [])
+        _hist.append(int(_t.time()))
+        _hist = _hist[-_AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX:]
+        _s['authentik_max_requests_fire_history'] = _hist
+        save_settings(_s)
+    except Exception:
+        pass
+
+
+def _authentik_max_requests_autotune_evaluate(plog=None):
+    """Inspect fire history + current MAX_REQUESTS and decide if a tune is needed.
+
+    Returns (new_max_requests, new_jitter, reason) or (None, None, None) if no change.
+
+    Decision matrix:
+      - autotune disabled in settings              → no change
+      - last tune was less than cooldown ago       → no change (rate limit)
+      - fire in last 30 min AND current > floor    → halve (clamped to floor)
+      - no fire in 6h AND current < starting/ceiling → bump up 25%
+                                                     (clamped to ceiling)
+      - otherwise                                  → no change
+
+    The starting value baseline for "bump up" is min(starting_value, ceiling).
+    Starting value defaults to 1000 (the v0.9.23 migration default) but can
+    be overridden via settings.authentik_max_requests_baseline.
+    """
+    if plog is None:
+        plog = lambda m: None
+    try:
+        import time as _t
+        _now = int(_t.time())
+        _s = load_settings()
+        if _s.get('authentik_max_requests_autotune_disabled'):
+            return (None, None, None)
+
+        _current, _jitter_now = _authentik_max_requests_get_current()
+        if _current is None:
+            return (None, None, None)  # nothing to tune
+
+        _floor = int(_s.get('authentik_max_requests_floor') or _AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT)
+        _ceiling = int(_s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT)
+        _baseline = int(_s.get('authentik_max_requests_baseline') or 1000)
+
+        _last_tune_ts = int(_s.get('authentik_max_requests_last_tune_ts') or 0)
+        if _now - _last_tune_ts < _AUTHENTIK_MAX_REQUESTS_TUNE_COOLDOWN_S:
+            return (None, None, None)
+
+        _fires = list(_s.get('authentik_max_requests_fire_history') or [])
+        _last_fire_ts = max(_fires) if _fires else 0
+        _recent_fire = (_now - _last_fire_ts) < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S if _last_fire_ts else False
+        _quiet = (_now - _last_fire_ts) > _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S if _last_fire_ts else True
+
+        if _recent_fire and _current > _floor:
+            _new = max(_floor, _current // 2)
+            _new_jitter = max(5, _new // 20)
+            _fires_30min = len([_f for _f in _fires if _now - _f < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S])
+            _reason = (
+                f"watchdog fired {_fires_30min}x in last 30min "
+                f"(last fire {_now - _last_fire_ts}s ago) — MAX_REQUESTS too high for current load"
+            )
+            return (_new, _new_jitter, _reason)
+
+        if _quiet and _current < min(_baseline, _ceiling):
+            _new = min(_ceiling, _baseline, int(_current * 1.25))
+            if _new <= _current:
+                return (None, None, None)  # rounding edge — no actual change
+            _new_jitter = max(5, _new // 20)
+            _qmin = (_now - _last_fire_ts) // 60 if _last_fire_ts else 9999
+            _reason = (
+                f"no watchdog fire for {_qmin}min — bumping MAX_REQUESTS up "
+                f"(less worker churn) toward baseline {_baseline}"
+            )
+            return (_new, _new_jitter, _reason)
+
+        return (None, None, None)
+    except Exception as _e:
+        plog(f"[ak-mr-autotune] evaluate error: {_e}")
+        return (None, None, None)
+
+
+def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
+    """Update ~/authentik/.env to the new MAX_REQUESTS + JITTER values and
+    recreate the server+worker containers so gunicorn picks them up.
+
+    Records the tune event to settings.authentik_max_requests_tune_history
+    and updates settings.authentik_max_requests_last_tune_ts. Returns True
+    on success.
+
+    NOTE: this triggers a server container recreate, which drops the LDAP
+    outpost websocket for ~1-5s. Acceptable trade because the alternative
+    is a sustained watchdog-fire cycle, each of which drops the websocket
+    for longer (full restart) AND keeps the underlying problem unsolved.
+    """
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        plog("[ak-mr-autotune] ~/authentik/.env not found — skipping apply")
+        return False
+    try:
+        import time as _t
+        _now = int(_t.time())
+        with open(ak_env) as _f:
+            _txt = _f.read()
+        _old_max, _old_jitter = _authentik_max_requests_get_current()
+        if _old_max is None:
+            plog("[ak-mr-autotune] MAX_REQUESTS not in .env — skipping apply")
+            return False
+
+        _backup = f"{ak_env}.bak.autotune.{_now}"
+        with open(_backup, 'w') as _f:
+            _f.write(_txt)
+
+        _new_txt = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS={new_max}',
+            _txt, flags=re.MULTILINE
+        )
+        _new_txt = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS_JITTER={new_jitter}',
+            _new_txt, flags=re.MULTILINE
+        )
+        with open(ak_env, 'w') as _f:
+            _f.write(_new_txt)
+
+        plog(
+            f"[ak-mr-autotune] MAX_REQUESTS {_old_max}→{new_max}, "
+            f"JITTER {_old_jitter}→{new_jitter} | reason: {reason}"
+        )
+        plog(f"[ak-mr-autotune] backup: {os.path.basename(_backup)}")
+        plog("[ak-mr-autotune] recreating server+worker to apply new values...")
+
+        ok = _recreate_authentik_server_worker(plog, reason='max-requests-autotune')
+        if not ok:
+            plog("[ak-mr-autotune] WARN: recreate reported failure — .env updated, "
+                 "values will apply on next restart")
+
+        try:
+            _s = load_settings()
+            _s['authentik_max_requests_last_tune_ts'] = _now
+            _hist = list(_s.get('authentik_max_requests_tune_history') or [])
+            _hist.append({
+                'ts': _now,
+                'from_max': _old_max,
+                'to_max': new_max,
+                'from_jitter': _old_jitter,
+                'to_jitter': new_jitter,
+                'reason': reason,
+                'recreate_ok': bool(ok),
+            })
+            _hist = _hist[-_AUTHENTIK_MAX_REQUESTS_TUNE_HISTORY_MAX:]
+            _s['authentik_max_requests_tune_history'] = _hist
+            save_settings(_s)
+        except Exception:
+            pass
+        return True
+    except Exception as _e:
+        plog(f"[ak-mr-autotune] apply error (non-fatal): {_e}")
+        return False
+
+
 def _authentik_channels_pool_watchdog_loop():
     """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
     PostgreSQL connections from the authentik database exceed a threshold.
@@ -27302,16 +27530,16 @@ def _authentik_channels_pool_watchdog_loop():
             _consecutive_failures = 0
 
             if _count > _threshold:
+                _mr_cur, _ = _authentik_max_requests_get_current()
+                _mr_str = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
                 print(
                     f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
-                    f"(threshold={_threshold}) — restarting authentik-server-1. "
-                    f"This is the SAFETY NET firing. Primary mitigation is "
-                    f"AUTHENTIK_WEB__MAX_REQUESTS=1000 (gunicorn worker recycling) — "
-                    f"if you're seeing this often, check ~/authentik/.env for "
-                    f"AUTHENTIK_WEB__MAX_REQUESTS=0 and re-run the v0.9.23 "
-                    f"max_requests migration. Upstream: goauthentik/authentik#20714.",
+                    f"(threshold={_threshold}, {_mr_str}) — restarting authentik-server-1. "
+                    f"SAFETY NET firing. Auto-tune will lower MAX_REQUESTS on the next tick "
+                    f"if this is recurring. Upstream: goauthentik/authentik#20714.",
                     flush=True
                 )
+                _authentik_max_requests_autotune_record_fire()
                 _restart = subprocess.run(
                     ['docker', 'restart', 'authentik-server-1'],
                     capture_output=True, text=True, timeout=90
@@ -27328,6 +27556,29 @@ def _authentik_channels_pool_watchdog_loop():
                     f"(threshold={_threshold}) — accumulation in progress, monitoring",
                     flush=True
                 )
+
+            # v0.9.23: auto-tune MAX_REQUESTS based on fire history. Runs every
+            # tick (cheap — just settings read + math). Rate-limited internally
+            # to one actual change per 30 min. We do this AFTER the alert/
+            # restart path so the freshly-recorded fire timestamp is visible.
+            try:
+                _new_max, _new_jit, _reason = _authentik_max_requests_autotune_evaluate(
+                    plog=lambda m: print(m, flush=True)
+                )
+                if _new_max is not None:
+                    print(
+                        f"[ak-mr-autotune] decision: tune MAX_REQUESTS → {_new_max} "
+                        f"(jitter {_new_jit}) | {_reason}",
+                        flush=True
+                    )
+                    _authentik_max_requests_autotune_apply(
+                        lambda m: print(m, flush=True),
+                        _new_max, _new_jit, _reason
+                    )
+                    # After a tune, give the new workers a moment to ramp up
+                    _wt.sleep(60)
+            except Exception as _tune_e:
+                print(f"[ak-mr-autotune] tick error (non-fatal): {_tune_e}", flush=True)
         except Exception:
             pass  # Never crash the console process
         _wt.sleep(120)
@@ -32768,6 +33019,83 @@ def authentik_audit_log_scrape_now_api():
         return jsonify({'success': True, 'new_events': n})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)[:200]}), 500
+
+
+@app.route('/api/authentik/max-requests')
+@login_required
+def authentik_max_requests_api():
+    """v0.9.23 endpoint. Return the current MAX_REQUESTS value + auto-tune
+    state so the dashboard can surface 'Authentik worker recycle: every N
+    requests, auto-tuned 2h ago after watchdog fired' to operators.
+
+    Read-only.
+    """
+    s = load_settings()
+    cur_max, cur_jitter = _authentik_max_requests_get_current()
+    fires = list(s.get('authentik_max_requests_fire_history') or [])
+    tunes = list(s.get('authentik_max_requests_tune_history') or [])
+    import time as _t
+    _now = int(_t.time())
+    fires_last_24h = [f for f in fires if _now - f < 86400]
+    out = {
+        'current_max_requests': cur_max,
+        'current_jitter': cur_jitter,
+        'autotune_disabled': bool(s.get('authentik_max_requests_autotune_disabled')),
+        'floor': int(s.get('authentik_max_requests_floor') or _AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT),
+        'ceiling': int(s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT),
+        'baseline': int(s.get('authentik_max_requests_baseline') or 1000),
+        'last_tune_ts': int(s.get('authentik_max_requests_last_tune_ts') or 0),
+        'tune_history': tunes[-10:],
+        'fire_history_last_24h_count': len(fires_last_24h),
+        'last_fire_ts': max(fires) if fires else 0,
+    }
+    return jsonify(out)
+
+
+@app.route('/api/authentik/max-requests/autotune', methods=['POST'])
+@login_required
+def authentik_max_requests_autotune_api():
+    """v0.9.23 endpoint. Operator controls for the MAX_REQUESTS auto-tuner.
+
+    Accepts JSON body with optional keys:
+      - `disabled` (bool): set settings.authentik_max_requests_autotune_disabled
+      - `floor` (int): clamp the minimum the auto-tuner will set
+      - `ceiling` (int): clamp the maximum the auto-tuner will set
+      - `baseline` (int): the "happy path" value the auto-tuner returns to
+        after a long no-fire period
+
+    No body or missing keys = no-op for that field (read current settings only).
+
+    Returns the updated state. Read-only-style query is also supported via
+    GET on /api/authentik/max-requests.
+    """
+    data = request.get_json() or {}
+    s = load_settings()
+    if 'disabled' in data:
+        s['authentik_max_requests_autotune_disabled'] = bool(data['disabled'])
+    if 'floor' in data:
+        try:
+            s['authentik_max_requests_floor'] = max(50, int(data['floor']))
+        except (TypeError, ValueError):
+            pass
+    if 'ceiling' in data:
+        try:
+            s['authentik_max_requests_ceiling'] = min(10000, int(data['ceiling']))
+        except (TypeError, ValueError):
+            pass
+    if 'baseline' in data:
+        try:
+            s['authentik_max_requests_baseline'] = int(data['baseline'])
+        except (TypeError, ValueError):
+            pass
+    save_settings(s)
+    return jsonify({
+        'success': True,
+        'autotune_disabled': bool(s.get('authentik_max_requests_autotune_disabled')),
+        'floor': int(s.get('authentik_max_requests_floor') or _AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT),
+        'ceiling': int(s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT),
+        'baseline': int(s.get('authentik_max_requests_baseline') or 1000),
+    })
 
 
 @app.route('/api/authentik/recover-admin', methods=['POST'])
