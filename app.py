@@ -24826,6 +24826,7 @@ entries:
       name: LDAP Service account
       type: service_account
       path: users
+      password: !Context password
   - attrs:
       authentication: none
       denied_action: message_continue
@@ -28961,6 +28962,7 @@ entries:
       name: LDAP Service account
       type: service_account
       path: users
+      password: !Context password
   - attrs:
       authentication: none
       denied_action: message_continue
@@ -29551,16 +29553,19 @@ entries:
                         else:
                             plog(f"  ⚠ Could not create adm_ldapservice: {e.code}")
     
-                    if ldap_pk:
-                        try:
-                            req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{ldap_pk}/set_password/',
-                                data=json.dumps({'password': ldap_svc_password}).encode(),
-                                headers=ak_headers, method='POST')
-                            urllib.request.urlopen(req, timeout=10)
-                            plog(f"  ✓ Set adm_ldapservice password")
-                        except Exception as e:
-                            plog(f"  ⚠ Could not set adm_ldapservice password: {str(e)[:100]}")
-    
+                    # v0.9.23: REMOVED imperative set_password on adm_ldapservice.
+                    # The LDAP blueprint (tak-ldap-setup.yaml) now declares
+                    # `password: !Context password` on the user entry, which
+                    # resolves to AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD from
+                    # .env at blueprint apply time. .env is the single source of
+                    # truth; Authentik's blueprint engine owns the create.
+                    #
+                    # Matches TAK-NZ/auth-infra (Christian Elsen) — declarative
+                    # over imperative kills the mid-session SA password drift class.
+                    # Heal-on-fail fallback remains in
+                    # _ensure_authentik_ldap_service_account() (only fires when
+                    # ldapsearch tri-state verdict says 'fail').
+
                     # Create LDAP provider + outpost + inject token — ALWAYS RUN (required for MediaMTX, TAK Server, standalone)
                     try:
                         # Get default invalidation flow
@@ -29764,50 +29769,44 @@ entries:
                 else:
                     plog(f"  ✗ LDAP start failed: {(r.stderr or r.stdout or '').strip()[:300]}")
 
-        # Verify LDAP flow + service account bind after outpost is up
-        # Prevents "Invalid Credentials" drift after Update & Config
+        # Verify LDAP flow + service account bind after outpost is up.
+        # v0.9.23: REMOVED the imperative re-set_password call that previously
+        # lived here. The LDAP blueprint now declares the password via
+        # `password: !Context password` (resolved from
+        # AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD in .env at apply time), so
+        # the imperative POST was racing the blueprint engine and was the
+        # source of mid-session SA bind drift. This block is now READ-ONLY —
+        # it ldapsearches to confirm the blueprint applied cleanly and logs
+        # the verdict. Heal-on-fail is the watchdog's job, not deploy's.
         if os.path.exists(os.path.join(ak_dir, '.env')):
             plog("")
-            plog("  Verifying LDAP service account...")
+            plog("  Verifying LDAP service account bind (read-only check)...")
             try:
                 ok, err = _ensure_ldap_flow_authentication_none()
                 if ok:
                     plog("  ✓ LDAP flow authentication: none")
                 else:
                     plog(f"  ⚠ LDAP flow fix: {err}")
-                # Re-set password and verify bind
                 _ldap_pass = ''
                 with open(os.path.join(ak_dir, '.env')) as _f:
                     for _line in _f:
                         if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
                             _ldap_pass = _line.strip().split('=', 1)[1].strip()
+                            break
                 if _ldap_pass:
-                    _ak_token = ''
-                    with open(os.path.join(ak_dir, '.env')) as _f:
-                        for _line in _f:
-                            if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                                _ak_token = _line.strip().split('=', 1)[1].strip()
-                    if _ak_token:
-                        _ak_headers = {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'}
-                        try:
-                            req = urllib.request.Request(f'http://127.0.0.1:9090/api/v3/core/users/?search=adm_ldapservice', headers=_ak_headers)
-                            resp = urllib.request.urlopen(req, timeout=10)
-                            _results = json.loads(resp.read().decode()).get('results', [])
-                            _ldap_pk = next((u['pk'] for u in _results if u['username'] == 'adm_ldapservice'), None)
-                            if _ldap_pk:
-                                req = urllib.request.Request(f'http://127.0.0.1:9090/api/v3/core/users/{_ldap_pk}/set_password/',
-                                    data=json.dumps({'password': _ldap_pass}).encode(), headers=_ak_headers, method='POST')
-                                urllib.request.urlopen(req, timeout=10)
-                                time.sleep(3)
-                                r = subprocess.run(
-                                    f'ldapsearch -x -H ldap://127.0.0.1:389 -D "cn=adm_ldapservice,ou=users,dc=takldap" -w "{_ldap_pass}" -b "dc=takldap" -s base "(objectClass=*)" 2>&1',
-                                    shell=True, capture_output=True, text=True, timeout=15)
-                                if 'dn:' in (r.stdout or '').lower() or 'result: 0' in (r.stdout or '').lower():
-                                    plog("  ✓ LDAP bind verified")
-                                else:
-                                    plog(f"  ⚠ LDAP bind check inconclusive (service may still be starting)")
-                        except Exception as e:
-                            plog(f"  ⚠ LDAP verify: {str(e)[:100]}")
+                    # Give the blueprint engine a beat to apply on first deploy.
+                    time.sleep(3)
+                    r = subprocess.run(
+                        f'ldapsearch -x -H ldap://127.0.0.1:389 -D "cn=adm_ldapservice,ou=users,dc=takldap" -w "{_ldap_pass}" -b "dc=takldap" -s base "(objectClass=*)" 2>&1',
+                        shell=True, capture_output=True, text=True, timeout=15)
+                    _out = (r.stdout or '').lower()
+                    if 'dn:' in _out or 'result: 0' in _out:
+                        plog("  ✓ LDAP bind verified (blueprint applied — password from .env in DB)")
+                    elif 'invalid credentials' in _out:
+                        plog("  ⚠ LDAP bind INVALID — blueprint may not have applied yet or .env diverged from DB")
+                        plog("    Watchdog will retry within 5 min; or manually: cd ~/authentik && docker compose restart worker")
+                    else:
+                        plog("  ⚠ LDAP bind check inconclusive (outpost still starting)")
             except Exception as e:
                 plog(f"  ⚠ LDAP verify skipped: {str(e)[:80]}")
 
