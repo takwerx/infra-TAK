@@ -26487,21 +26487,47 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
     """v0.9.21 migration: lower AUTHENTIK_POSTGRESQL__CONN_MAX_AGE from 60 → 10 on
     installs deployed under v0.9.20.
 
-    Root cause (identified in field analysis of tak-10 and tak-12, May 2026):
+    HISTORICAL NOTE (post-v0.9.23, after Tom Andersen's anchortak analysis):
+      This migration is RETAINED for defense-in-depth but is NOT actually the
+      primary fix for the upstream Authentik 2026.2.x PG connection leak.
+
+      The original v0.9.21 hypothesis was that CONN_MAX_AGE=60 was holding
+      enterprise/license cache-miss connections open for 60s each, and that
+      lowering it to 10 would bound steady-state at ~5 idle connections.
+
+      Tom's May 2026 forensic capture (91-min, 1056 samples, anctakserver2)
+      proved that hypothesis incomplete: the leak is in django_postgres_cache,
+      which has its OWN connection pool that does NOT honor CONN_MAX_AGE.
+      Direct evidence from his data: 79.6% of leaked connections aged >60s
+      and 37.8% aged >5min, despite CONN_MAX_AGE=10 being set. Django's
+      `close_old_connections()` signal fires at request end on the ORM pool
+      only — the cache backend's connections are detached from that lifecycle.
+
+      The actual fix is `AUTHENTIK_WEB__MAX_REQUESTS=1000` (gunicorn worker
+      recycling), which closes ALL of a worker's connections on graceful
+      shutdown including the cache pool's. See
+      `_patch_authentik_web_max_requests_to_1000` and
+      `docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md` for the full analysis.
+
+      CONN_MAX_AGE=10 still does useful work on the ORM pool (smaller TCP
+      handshake amortisation), so we keep this migration as belt-and-braces
+      and continue defaulting new installs to 10 in
+      `_ensure_authentik_pg_persistent_connections`. We just don't claim
+      anymore that it stops the cache-pool leak.
+
+    Original v0.9.21 reasoning preserved below for historical context:
+
       Community Authentik has no enterprise license. The Django cache backend
       (django_postgres_cache) stores the enterprise license at cache key
-      'public::1:goauthentik.io/enterprise/license'. Since the key is never written,
-      every gunicorn/daphne worker checks the cache and gets a DB miss on every
-      request. With CONN_MAX_AGE=60, each miss's connection stays idle for 60 s.
-      At ~0.5 new DB connections/second (from worker thread pool growth under
-      async-to-sync dispatch), steady-state idle count = 0.5 × 60 = 30/s → 500 in
-      ~20 min → FATAL: sorry, too many clients.
-
-      At CONN_MAX_AGE=10: steady-state = 0.5 × 10 = 5 connections. Safe.
-
-    _ensure_authentik_pg_persistent_connections now defaults to max_age=10 for new
-    installs, but it's idempotent (won't overwrite an already-set value). This
-    function handles the downgrade migration for existing =60 installs.
+      'public::1:goauthentik.io/enterprise/license'. Since the key is never
+      written, every gunicorn/daphne worker checks the cache and gets a DB
+      miss on every request. With CONN_MAX_AGE=60 (the v0.9.20 default), we
+      assumed each miss's connection stayed idle for 60 s; under that
+      assumption, at ~0.5 new DB connections/second steady-state idle =
+      0.5 × 60 = 30 → exhausts max_connections=500 in ~20 min. Tom's data
+      later showed the cache pool ignores CONN_MAX_AGE entirely and the
+      leak ran regardless — but lowering 60→10 still reduces ORM-pool
+      retention so we keep the migration.
 
     Idempotent: no-ops if CONN_MAX_AGE is absent, already ≤10, or not =60.
     """
@@ -26543,6 +26569,139 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
         return True
     except Exception as e:
         plog(f"  ⚠ conn_max_age 60→10 patch error (non-fatal): {e}")
+        return False
+
+
+def _patch_authentik_web_max_requests_to_1000(plog=None):
+    """v0.9.23 migration: re-enable gunicorn worker recycling on installs that
+    deployed under v0.8.7+ with AUTHENTIK_WEB__MAX_REQUESTS=0.
+
+    Reverses the v0.8.7 decision in light of upstream Authentik 2026.2.x
+    regression #20714 (https://github.com/goauthentik/authentik/issues/20714).
+
+    Why this is the right call now:
+
+      v0.8.7 set MAX_REQUESTS=0 to "eliminate periodic LDAP websocket drops"
+      caused by gunicorn workers cycling and breaking the embedded outpost
+      websocket. That was correct at the time — no leak, no watchdog, so
+      worker recycling was pure cost with no benefit.
+
+      Authentik 2026.2 (after the Redis→PostgreSQL migration documented at
+      https://goauthentik.io/blog/2025-11-13-we-removed-redis/) introduced
+      an idle PG connection leak in the enterprise/license cache-miss code
+      path. The leak accumulates inside long-lived gunicorn worker processes
+      at ~0.17 idle conns/sec aggregate (Tom Andersen, anctakserver2,
+      May 15 2026, 91-min × 1056-sample anchortak capture — see
+      docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md for the full forensic
+      analysis).
+
+      Important context Tom's analysis surfaced: the leaked connections
+      are NOT in Django's standard ORM pool (which CONN_MAX_AGE governs).
+      They're in the django_postgres_cache backend's pool, which has its
+      own lifecycle and is NOT cleaned up by Django's close_old_connections()
+      signal at request end. CONN_MAX_AGE=10 (our v0.9.21 value) doesn't
+      reach this code path — Tom's data shows 79.6% of idle connections
+      aged >60s, proving the 10-second TTL isn't being honored on the
+      leaking class. Trying CONN_MAX_AGE=0 would not fix this either.
+
+      What DOES fix it: gunicorn's MAX_REQUESTS mechanism. When a worker
+      hits MAX_REQUESTS, gunicorn gracefully shuts it down and forks a
+      replacement. The shutdown closes all the worker's open file
+      descriptors — including the cache-backend's stuck PG connections.
+      Leak resets to zero on every worker recycle. Per-worker, not
+      whole-container.
+
+      Without MAX_REQUESTS: workers never reset → leak grows unbounded →
+      channels_pool_watchdog catches at idle≥150 and restarts the WHOLE
+      authentik-server-1 container every 5-10 min on busy boxes, dropping
+      the LDAP outpost websocket for 10-30s and losing TAK CoT channel
+      state for connected operators in the field.
+
+      With MAX_REQUESTS=1000 + JITTER=50: gunicorn recycles ONE worker
+      gracefully (1-5s) every ~15-30 min on typical traffic. Same LDAP
+      drop class as the watchdog, less frequent, much shorter, and only
+      affects 1/N of the worker pool at a time (others keep serving).
+
+    Upstream-supported pattern per Authentik config docs:
+    https://docs.goauthentik.io/install-config/configuration/#authentik_web__max_requests
+
+    Same env-var migration shape as _patch_authentik_conn_max_age_60_to_10:
+    only runs on existing operator-set values that are KNOWN-BAD (=0).
+    Idempotent: no-op if MAX_REQUESTS is absent (new-install path is handled
+    by _authentik_apply_official_tunings, which now defaults to 1000) or
+    already set to anything other than 0.
+
+    Triggers _recreate_authentik_server_worker on apply so gunicorn picks
+    up the new env. Returns True if any value was changed.
+    """
+    if plog is None:
+        plog = lambda m: None
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        return False
+    try:
+        with open(ak_env) as _f:
+            env_text = _f.read()
+
+        # Only migrate the legacy v0.8.7 "=0" value. Don't touch operator-set
+        # values (e.g. 500, 2000) — those are intentional.
+        _max_req_zero = bool(re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS=0\s*$',
+                                       env_text, re.MULTILINE))
+        _jitter_zero = bool(re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=0\s*$',
+                                      env_text, re.MULTILINE))
+        if not _max_req_zero and not _jitter_zero:
+            return False  # Either absent (new-install path will handle) or operator-set
+
+        import time as _t
+        backup_path = f'{ak_env}.bak.max-requests-1000.{int(_t.time())}'
+        with open(backup_path, 'w') as _f:
+            _f.write(env_text)
+
+        new_text = env_text
+        _changes = []
+        if _max_req_zero:
+            new_text = re.sub(
+                r'^AUTHENTIK_WEB__MAX_REQUESTS=0\s*$',
+                'AUTHENTIK_WEB__MAX_REQUESTS=1000',
+                new_text, flags=re.MULTILINE
+            )
+            _changes.append("MAX_REQUESTS=0→1000")
+        if _jitter_zero:
+            new_text = re.sub(
+                r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=0\s*$',
+                'AUTHENTIK_WEB__MAX_REQUESTS_JITTER=50',
+                new_text, flags=re.MULTILINE
+            )
+            _changes.append("MAX_REQUESTS_JITTER=0→50")
+
+        with open(ak_env, 'w') as _f:
+            _f.write(new_text)
+
+        plog(f"  ✓ max_requests: re-enabled gunicorn worker recycling ({', '.join(_changes)})")
+        plog("    Reason: upstream Authentik 2026.2.x enterprise/license cache-miss leak (#20714)")
+        plog("    Effect: leak now bounded by per-worker request count instead of by watchdog restart")
+        plog(f"    Backup: {os.path.basename(backup_path)}")
+        plog("  max_requests: recreating Authentik server + worker to apply new env vars...")
+        ok = _recreate_authentik_server_worker(plog, reason='max-requests-to-1000')
+        if ok:
+            plog("  ✓ max_requests: server + worker recreated with MAX_REQUESTS=1000")
+            try:
+                _s = load_settings()
+                _s['authentik_max_requests_to_1000_migration'] = {
+                    'ts': int(_t.time()),
+                    'outcome': 'success',
+                    'changes': _changes,
+                    'rationale': 'upstream Authentik 2026.2.x PG connection leak (#20714) mitigation',
+                    'reference_analysis': 'docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md',
+                }
+                save_settings(_s)
+            except Exception:
+                pass
+        else:
+            plog("  ⚠ max_requests: recreate reported failure — .env updated but restart manually if needed")
+        return True
+    except Exception as e:
+        plog(f"  ⚠ max_requests v0.9.23 patch error (non-fatal): {e}")
         return False
 
 
@@ -26661,8 +26820,29 @@ def _authentik_apply_official_tunings(plog):
 
     target_settings = [
         ('AUTHENTIK_WEB__WORKERS', '4', '4 web workers (vs default 2)'),
-        ('AUTHENTIK_WEB__MAX_REQUESTS', '0', 'disable gunicorn worker recycling — eliminates periodic LDAP websocket drops'),
-        ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '0', 'disable max_requests jitter (pair with MAX_REQUESTS=0)'),
+        # v0.9.23: re-enabled MAX_REQUESTS after upstream Authentik 2026.2.x regression
+        # made it necessary. Background:
+        #   - v0.8.7 set MAX_REQUESTS=0 to eliminate "periodic LDAP websocket drops"
+        #     caused by gunicorn workers cycling and breaking the embedded outpost ws.
+        #     Correct decision at the time (no leak, no watchdog yet).
+        #   - Authentik 2026.2 (after the Redis→Postgres migration) leaks ~0.17
+        #     idle PG conns/sec via the enterprise/license cache-miss code path
+        #     (upstream #20714, confirmed/open, assigned to rissson). The leak
+        #     accumulates inside long-lived gunicorn worker processes.
+        #   - Our channels_pool watchdog catches the leak at idle≥150 and fully
+        #     restarts authentik-server-1 every 5-10 min on busy boxes, which
+        #     drops the LDAP outpost websocket for 10-30s per restart.
+        #   - Enabling MAX_REQUESTS=1000 makes gunicorn recycle ONE worker
+        #     gracefully (1-5s) every ~15-30 min instead of restarting the whole
+        #     container every 5-10 min. Same LDAP drop class, less frequent,
+        #     much shorter, and only one worker at a time (the others keep
+        #     handling traffic). Confirmed via Tom Andersen's anchortak diagnostic
+        #     (anctakserver2, 91-min × 1056-sample run, 2026-05-15):
+        #     docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md.
+        #   - Upstream-supported pattern per Authentik config docs:
+        #     https://docs.goauthentik.io/install-config/configuration/#authentik_web__max_requests
+        ('AUTHENTIK_WEB__MAX_REQUESTS', '1000', 'recycle each gunicorn worker every 1000 requests — bounds enterprise/license cache-miss connection accumulation (upstream Authentik #20714 mitigation)'),
+        ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '50', 'jitter ±50 so workers do not recycle in lockstep'),
         ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
@@ -27038,23 +27218,48 @@ def _authentik_channels_pool_watchdog_loop():
     """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
     PostgreSQL connections from the authentik database exceed a threshold.
 
-    Root cause (confirmed field analysis, May 2026 — tak-10, tak-12, Authentik 2026.2.3):
-      Community Authentik has no enterprise license. Every gunicorn/daphne worker
-      checks django_postgres_cache_cacheentry for key
-      'public::1:goauthentik.io/enterprise/license' on every request. The key is
-      never written (no license), so every check is a DB miss. Under CONN_MAX_AGE>0,
-      each worker thread retains its connection after the miss. Thread pool growth
-      under async-to-sync dispatch opens new connections faster than they are
-      reclaimed, accumulating ~1 idle connection per 1-3 seconds.
-      At this rate max_connections=500 is exhausted in ~15-20 min.
+    STATUS as of v0.9.23: DEFENSE-IN-DEPTH SAFETY NET, not the primary mitigation.
 
-      NOTE: django_channels_postgres LISTEN connection (1 persistent) is normal and
-      NOT the source of the leak. Primary mitigation is CONN_MAX_AGE=10 (v0.9.21,
-      down from 60) which bounds steady-state accumulation to ~5 connections.
-      This watchdog is the secondary safety net.
+    Primary mitigation is now `AUTHENTIK_WEB__MAX_REQUESTS=1000` + `JITTER=50`,
+    which causes gunicorn to gracefully recycle workers (and their accumulated
+    cache-backend connections) on a per-worker rolling schedule, before they
+    ever pile up enough to trip this watchdog. See:
+      - _authentik_apply_official_tunings (sets the values on new installs)
+      - _patch_authentik_web_max_requests_to_1000 (migrates existing installs)
+      - docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md (Tom Andersen's forensic
+        analysis showing CONN_MAX_AGE never reached the leaking pool, but
+        worker recycling does)
+
+    Root cause (Authentik 2026.2.x, confirmed upstream — goauthentik/authentik#20714):
+      The 2025.10 release of Authentik [removed Redis entirely]
+      (https://goauthentik.io/blog/2025-11-13-we-removed-redis/) and routed
+      cache + channels + sessions + outpost store through PostgreSQL. Each
+      subsystem uses its own connection pool with its own lifecycle:
+        - `django.db.backends.postgresql` (ORM) → bound by CONN_MAX_AGE ✓
+        - `django_postgres_cache` (was Redis) → SEPARATE pool, NOT bound by
+          CONN_MAX_AGE — this is where the leak lives.
+        - `django_channels_postgres` (was Redis pub/sub) → persistent LISTEN
+          sockets (only 2-3, not the leak).
+        - `django_dramatiq_postgres` (was Celery+Redis) → persistent (worker
+          container only, also not the leak).
+
+      Community Authentik has no enterprise license, so EVERY HTTP request
+      (including the /-/health/live/ healthcheck) triggers a cache lookup
+      for `public::1:goauthentik.io/enterprise/license` via
+      `django_postgres_cache`. The lookup misses (key is never written
+      because no license), the misses' connections leak in the cache pool,
+      and accumulate at ~0.17 idle conn/sec aggregate steady-state on a
+      typical box (Tom Andersen's anchortak forensic, anctakserver2,
+      May 2026 — 91 min × 1056 samples, label `bug/confirmed`).
+
+      Without MAX_REQUESTS, accumulation is unbounded until something
+      triggers a worker reset. That's what this watchdog is for: catch
+      the runaway when MAX_REQUESTS isn't enabled (legacy installs) or
+      isn't keeping up (unexpected traffic spike).
 
     Threshold: 150 connections (~30% of max_connections=500). Checks every 2 min.
-    After restart, idle count resets to ~28 connections.
+    After restart, idle count resets to ~28 connections. With MAX_REQUESTS=1000
+    enabled, this watchdog should fire rarely or never.
 
     Override: set channels_pool_watchdog_threshold=N in settings to change the
     threshold, or channels_pool_watchdog_disabled=true to disable entirely.
@@ -27099,8 +27304,12 @@ def _authentik_channels_pool_watchdog_loop():
             if _count > _threshold:
                 print(
                     f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
-                    f"(threshold={_threshold}) — restarting authentik-server-1 "
-                    f"(enterprise license cache-miss accumulation workaround)",
+                    f"(threshold={_threshold}) — restarting authentik-server-1. "
+                    f"This is the SAFETY NET firing. Primary mitigation is "
+                    f"AUTHENTIK_WEB__MAX_REQUESTS=1000 (gunicorn worker recycling) — "
+                    f"if you're seeing this often, check ~/authentik/.env for "
+                    f"AUTHENTIK_WEB__MAX_REQUESTS=0 and re-run the v0.9.23 "
+                    f"max_requests migration. Upstream: goauthentik/authentik#20714.",
                     flush=True
                 )
                 _restart = subprocess.run(
@@ -28555,14 +28764,21 @@ def _authentik_fix_pg_idle_timeout(plog):
     # entries OUTRANK the command-line args we just set. Wipe them, reload, so
     # the command-line config wins. No-op on a clean box.
     plog("  pg idle timeout: ALTER SYSTEM RESET ALL → pg_reload_conf (defensive — kills stale postgresql.auto.conf overrides)")
+    # NOTE: ALTER SYSTEM cannot run inside a transaction block. psql -c
+    # "stmt1; stmt2" wraps both statements in an implicit transaction, which
+    # makes ALTER SYSTEM fail with:
+    #   ERROR: ALTER SYSTEM cannot run inside a transaction block
+    # Workaround: use two separate -c flags. psql runs each in its own
+    # autocommit txn. This was the v0.9.23 phase-3 bug seen on tak-10 prod
+    # logs — it caused this whole defensive block to silently fail.
     try:
         _alter = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "
-            "\"ALTER SYSTEM RESET ALL; SELECT pg_reload_conf();\"",
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik "
+            "-c \"ALTER SYSTEM RESET ALL\" -c \"SELECT pg_reload_conf()\"",
             shell=True, capture_output=True, text=True, timeout=15
         )
         if _alter.returncode == 0:
-            plog("  ✓ pg idle timeout: ALTER SYSTEM RESET ALL applied")
+            plog("  ✓ pg idle timeout: ALTER SYSTEM RESET ALL applied + config reloaded")
         else:
             plog(f"  ⚠ pg idle timeout: ALTER SYSTEM RESET failed: {(_alter.stderr or '')[:200]}")
     except Exception as e:
@@ -40537,10 +40753,29 @@ def _startup_migrations():
         # v0.9.21: Downgrade CONN_MAX_AGE 60→10 on boxes deployed under v0.9.20.
         # Root cause: enterprise license cache miss (~1 DB hit/req) + CONN_MAX_AGE=60
         # → ~30 idle connections steady-state → exhausts max_connections=500 in ~20 min.
+        # NOTE (v0.9.23, after Tom Andersen's anchortak analysis): this migration
+        # is RETAINED as defense-in-depth (it covers the Django ORM pool which
+        # CONN_MAX_AGE does govern), but the actual upstream Authentik 2026.2.x
+        # leak is in django_postgres_cache's separate pool which bypasses
+        # CONN_MAX_AGE entirely. The real fix is below
+        # (_patch_authentik_web_max_requests_to_1000). See
+        # docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md.
         try:
             _patch_authentik_conn_max_age_60_to_10(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_cma_err:
             print(f"Startup migration: conn_max_age 60→10 patch error (non-fatal): {ak_cma_err}")
+        # v0.9.23: Re-enable gunicorn worker recycling (MAX_REQUESTS 0→1000) on
+        # boxes deployed under v0.8.7+ that explicitly disabled it. The disable
+        # was correct at the time (pre-leak era), but upstream Authentik 2026.2.x
+        # introduced the enterprise/license cache-miss leak (#20714) which makes
+        # worker recycling the right shape of mitigation again. With MAX_REQUESTS=1000
+        # the channels_pool_watchdog should rarely or never fire — see Tom
+        # Andersen's 91-min × 1056-sample anchortak forensic analysis at
+        # docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md.
+        try:
+            _patch_authentik_web_max_requests_to_1000(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_mr_err:
+            print(f"Startup migration: max_requests 0→1000 patch error (non-fatal): {ak_mr_err}")
 
         # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
         # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
