@@ -26940,6 +26940,94 @@ def _authentik_apply_official_tunings(plog):
 # `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
 _AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
 
+
+def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
+    """Return a robust pg_stat_activity breakdown for the Authentik database.
+
+    Background: the original post-install probe (v0.9.23 Phase 6 first cut)
+    filtered by `application_name='pgbouncer'` to count "via PgBouncer" vs
+    "direct" connections. This was wrong — PgBouncer does NOT set
+    `application_name` by default (it propagates the client's
+    `application_name`, which for Authentik 2026.2.x is empty). As observed
+    on tak-10 (2026-05-15, 16:14 UTC):
+
+        client_addr | application_name | state  | count
+        ------------+------------------+--------+------
+         172.19.0.4 |                  | idle   |     6
+         172.19.0.3 |                  | idle   |     4
+                    | psql             | active |     1
+
+    Both 172.19.0.4 and 172.19.0.3 are container-internal Docker bridge IPs
+    (the second is the worker which keeps a persistent connection too) —
+    they're all going THROUGH pgbouncer. The empty `application_name` made
+    the original probe count zero connections via pgbouncer and warn
+    incorrectly.
+
+    Correct check: look up the pgbouncer container's IP via `docker inspect`,
+    then count rows in pg_stat_activity where client_addr matches. Treat
+    anything else with a non-null client_addr (i.e. another Docker container
+    bypassing pgbouncer) as "direct". Unix-socket / null client_addr is the
+    psql probe itself and is ignored.
+
+    Returns: dict with keys:
+      pgbouncer_ip      — str or None (resolution failed)
+      via_pgbouncer     — int (count of idle+active conns from pgbouncer IP)
+      direct            — int (count from any other non-null client_addr)
+      by_addr           — list of (client_addr, count) tuples, all rows
+      total             — int (sum of via_pgbouncer + direct)
+      error             — str or None
+    """
+    out = {
+        'pgbouncer_ip': None,
+        'via_pgbouncer': 0,
+        'direct': 0,
+        'by_addr': [],
+        'total': 0,
+        'error': None,
+    }
+    try:
+        ip_r = subprocess.run(
+            "docker inspect "
+            "--format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}' "
+            "authentik-pgbouncer-1 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        ips = [ln.strip() for ln in (ip_r.stdout or '').splitlines() if ln.strip()]
+        out['pgbouncer_ip'] = ips[0] if ips else None
+    except Exception as _ie:
+        out['error'] = f'docker inspect failed: {_ie}'
+
+    try:
+        r = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAF, -c "
+            "\"SELECT COALESCE(host(client_addr),''), count(*) FROM pg_stat_activity "
+            "WHERE datname='authentik' AND client_addr IS NOT NULL "
+            "GROUP BY client_addr ORDER BY count(*) DESC;\"",
+            shell=True, capture_output=True, text=True, timeout=timeout_s
+        )
+        if r.returncode != 0:
+            err = ((r.stderr or '') + (r.stdout or ''))[:160].strip()
+            out['error'] = (out['error'] or '') + f' | psql failed: {err}'
+            return out
+        for ln in (r.stdout or '').strip().splitlines():
+            if ',' not in ln:
+                continue
+            addr, cnt_str = ln.rsplit(',', 1)
+            addr = addr.strip()
+            try:
+                cnt = int(cnt_str.strip())
+            except ValueError:
+                continue
+            out['by_addr'].append((addr, cnt))
+            if out['pgbouncer_ip'] and addr == out['pgbouncer_ip']:
+                out['via_pgbouncer'] += cnt
+            else:
+                out['direct'] += cnt
+        out['total'] = out['via_pgbouncer'] + out['direct']
+    except Exception as _e:
+        out['error'] = (out['error'] or '') + f' | probe error: {_e}'
+    return out
+
 # Pool sizing knobs. These are conservative defaults chosen for the typical
 # infra-TAK fleet box (2-4 vCPU, ~50 concurrent ATAK + iTAK + WebTAK + portal
 # users + LDAP outpost binds). Operators can override via .env if needed but
@@ -27374,37 +27462,35 @@ def _ensure_authentik_pgbouncer(plog):
 
     time.sleep(15)
 
-    via_bouncer = 0
-    direct = 0
-    try:
-        r = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
-            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
-            "AND application_name='pgbouncer';\"",
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        try:
-            via_bouncer = int((r.stdout or '0').strip() or '0')
-        except ValueError:
-            via_bouncer = 0
-        r2 = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
-            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
-            "AND application_name!='pgbouncer';\"",
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        try:
-            direct = int((r2.stdout or '0').strip() or '0')
-        except ValueError:
-            direct = 0
-    except Exception as _e:
-        plog(f"  pgbouncer install: post-install probe error (non-fatal): {_e}")
+    # Use the robust client_addr-based probe. PgBouncer doesn't set
+    # application_name by default (the field-observed bug on tak-10's
+    # first install — see _authentik_pgbouncer_pg_activity_breakdown
+    # docstring for the forensic trace).
+    _probe = _authentik_pgbouncer_pg_activity_breakdown(timeout_s=10)
+    via_bouncer = _probe['via_pgbouncer']
+    direct = _probe['direct']
+    pgb_ip = _probe['pgbouncer_ip']
+    if _probe.get('error'):
+        plog(f"  pgbouncer install: post-install probe partial: {_probe['error']}")
 
-    plog(f"  pgbouncer install: pg_stat_activity → via_pgbouncer={via_bouncer}, direct={direct}")
-    if via_bouncer == 0:
-        plog("  ⚠ pgbouncer install: pg_stat_activity shows 0 connections from pgbouncer — "
-             "Authentik may still be initializing, or PgBouncer auth failed. Watch the next "
-             "ak-pg-watchdog cycle to confirm pool is being used.")
+    plog(f"  pgbouncer install: pg_stat_activity → via_pgbouncer={via_bouncer} "
+         f"(from {pgb_ip or 'unknown-ip'}), direct={direct}")
+    if _probe.get('by_addr'):
+        for _addr, _cnt in _probe['by_addr']:
+            _tag = '←pgbouncer' if pgb_ip and _addr == pgb_ip else ''
+            plog(f"  pgbouncer install:   client_addr={_addr or '(null)'}: {_cnt} {_tag}")
+    if pgb_ip is None:
+        plog("  ⚠ pgbouncer install: could not resolve pgbouncer container IP via docker "
+             "inspect — probe degraded but install otherwise succeeded.")
+    elif via_bouncer == 0 and direct == 0:
+        plog("  ⚠ pgbouncer install: pg_stat_activity shows 0 connections — Authentik may "
+             "still be initializing. Re-check in 60s with: docker exec authentik-postgresql-1 "
+             "psql -U authentik -d authentik -c \"SELECT client_addr, count(*) FROM "
+             "pg_stat_activity WHERE datname='authentik' GROUP BY 1;\"")
+    elif via_bouncer == 0 and direct > 0:
+        plog("  ⚠ pgbouncer install: pg_stat_activity shows direct connections but none from "
+             f"pgbouncer ({pgb_ip}) — PgBouncer auth or routing may have failed. Watch the next "
+             "ak-pg-watchdog cycle and inspect `docker logs authentik-pgbouncer-1` for clues.")
 
     try:
         try:
@@ -33447,33 +33533,12 @@ def authentik_pgbouncer_api():
         except Exception:
             stats_raw = None
 
-    via_bouncer = None
-    direct = None
-    try:
-        r = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
-            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
-            "AND application_name='pgbouncer';\"",
-            shell=True, capture_output=True, text=True, timeout=6
-        )
-        if r.returncode == 0:
-            try:
-                via_bouncer = int((r.stdout or '0').strip() or '0')
-            except ValueError:
-                via_bouncer = None
-        r2 = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
-            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
-            "AND application_name!='pgbouncer';\"",
-            shell=True, capture_output=True, text=True, timeout=6
-        )
-        if r2.returncode == 0:
-            try:
-                direct = int((r2.stdout or '0').strip() or '0')
-            except ValueError:
-                direct = None
-    except Exception:
-        pass
+    # Robust pg_stat_activity probe (client_addr-based, not application_name
+    # which PgBouncer doesn't set by default). See helper docstring for the
+    # field-observed reason this matters.
+    _probe = _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6)
+    via_bouncer = _probe['via_pgbouncer'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
+    direct = _probe['direct'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
 
     return jsonify({
         'installed': bool(cfg.get('installed')),
@@ -33488,11 +33553,373 @@ def authentik_pgbouncer_api():
         'compose_backup': cfg.get('compose_backup'),
         'env_backup': cfg.get('env_backup'),
         'container_state': container_state,
+        'pgbouncer_container_ip': _probe.get('pgbouncer_ip'),
         'pg_stat_activity_via_pgbouncer': via_bouncer,
         'pg_stat_activity_direct': direct,
+        'pg_stat_activity_by_addr': [{'addr': a, 'count': c} for (a, c) in (_probe.get('by_addr') or [])],
+        'pg_stat_activity_probe_error': _probe.get('error'),
         'live_pools_raw': pools_raw,
         'live_stats_raw': stats_raw,
         'last_outcome': cfg.get('last_outcome'),
+    })
+
+
+# ---------------------------------------------------------------------------
+# v0.9.23 Phase 6b — TAK Server zombie subscription diagnostic + sweep
+# ---------------------------------------------------------------------------
+# Field-observed problem (Tom Andersen, anctakserver2, 2026-05-15 morning,
+# v0.9.22 box pre-PgBouncer): TAK Server's DistributedSubscriptionManager
+# holds onto subscriptions whose user-info lookup failed during an Authentik
+# LDAP-outpost outage window (each ak-pg-watchdog restart = ~30-60s outage).
+# These "half-zombies" get a callsign from the client cert's CN but never
+# get user-attribution → no group membership → no CoT routing → no
+# `lastEventTime` update on the Marti API → they appear in clientEndPoints
+# with `lastEventTime` = epoch zero (1969-12-31).
+#
+# Tom's empirical bucket distribution (199 total subs on his box, after
+# ~1.5h uptime):
+#   <5 min       :   0   ← actively reporting (catastrophic — should be N)
+#   5-15 min     :   0
+#   15-60 min    :   4
+#   1-6 hours    :  11
+#   >6 hours     : 165   ← epoch zero = null user = zombie
+#   invalid/null :  19   ← also null user
+#
+# v0.9.23 Phase 6 (PgBouncer) PREVENTS new zombies from forming by
+# eliminating the watchdog-restart outage windows entirely. But existing
+# zombies that accumulated on customer boxes pre-upgrade need cleanup —
+# TAK Server has no self-heal path for them. The only reliable cleanup is
+# a JVM restart of the takserver container (`docker restart
+# takserver-takserver-1`), which clears the in-memory subscription pool;
+# clients then reconnect through the now-stable Authentik path with proper
+# user attribution.
+#
+# This module exposes two endpoints:
+#
+#   GET  /api/takserver/zombies        — read-only diagnostic. Returns
+#                                        bucket counts + sample of stalest
+#                                        subscriptions + advisory.
+#   POST /api/takserver/zombies/sweep  — manual operator action. Body:
+#                                        {strategy: "jvm_restart"}. Runs
+#                                        `docker restart
+#                                        takserver-takserver-1`. Logs
+#                                        intent + outcome. Records in
+#                                        settings.takserver_zombie_sweep.
+#
+# Detection uses the admin cert mounted inside the takserver container at
+# /opt/tak/certs/files/admin.pem|key (always present on a v0.6.2+ deploy).
+# The console process does NOT need its own copy of the cert — we
+# `docker exec ... curl` from inside the takserver container.
+#
+# No background loop / auto-sweep — sweeping has user-visible impact
+# (every legitimate client momentarily disconnects) and operators should
+# decide when to do it. The endpoint is the surface area.
+
+def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=40):
+    """Query Marti's `clientEndPoints` API and return zombie analysis.
+
+    Uses `docker exec takserver-takserver-1 curl --cert /opt/tak/certs/files/admin.pem
+    --key /opt/tak/certs/files/admin.key https://localhost:8443/Marti/api/clientEndPoints`
+    — the admin cert is always present in the takserver container at that
+    path on v0.6.2+ deploys. No console-side copy required.
+
+    Returns dict with:
+      total, buckets, cloudtak_total, cloudtak_stale, sample, advisory,
+      taken_at_utc, error
+    """
+    out = {
+        'total': 0,
+        'buckets': {
+            'lt_5min': 0,
+            '5_15min': 0,
+            '15_60min': 0,
+            '1_6hr': 0,
+            'gt_6hr': 0,
+            'invalid_or_null_time': 0,
+        },
+        'cloudtak_total': 0,
+        'cloudtak_stale': 0,
+        'sample': [],
+        'advisory': None,
+        'taken_at_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'error': None,
+    }
+
+    try:
+        r = subprocess.run(
+            "docker exec takserver-takserver-1 curl -sk "
+            "--cert /opt/tak/certs/files/admin.pem "
+            "--key /opt/tak/certs/files/admin.key "
+            "--max-time 8 "
+            "https://localhost:8443/Marti/api/clientEndPoints 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=timeout_s
+        )
+        if r.returncode != 0:
+            out['error'] = (
+                f"Marti API curl failed (rc={r.returncode}): "
+                + ((r.stderr or '') + (r.stdout or ''))[:200]
+            )
+            return out
+        body = (r.stdout or '').strip()
+        if not body:
+            out['error'] = 'Marti API returned empty response'
+            return out
+        payload = json.loads(body)
+    except subprocess.TimeoutExpired:
+        out['error'] = 'Marti API call timed out — takserver container may be unresponsive'
+        return out
+    except json.JSONDecodeError as je:
+        out['error'] = f'Marti API returned non-JSON (first 120 chars): {body[:120]!r} | {je}'
+        return out
+    except Exception as e:
+        out['error'] = f'Marti probe error: {e}'
+        return out
+
+    from datetime import timezone as _tz
+    subs = payload.get('data') or []
+    out['total'] = len(subs)
+    now = datetime.now(_tz.utc)
+
+    cloudtak_ages = []
+    aged_subs = []
+    for sub in subs:
+        t = sub.get('lastEventTime') or ''
+        callsign = sub.get('callsign') or ''
+        username = sub.get('username') or ''
+        uid = sub.get('uid') or ''
+        if not t:
+            out['buckets']['invalid_or_null_time'] += 1
+            aged_subs.append((float('inf'), callsign, username, uid, '(null)'))
+            continue
+        try:
+            dt = datetime.fromisoformat(t.replace('Z', '+00:00'))
+            age = (now - dt).total_seconds()
+        except Exception:
+            out['buckets']['invalid_or_null_time'] += 1
+            aged_subs.append((float('inf'), callsign, username, uid, t))
+            continue
+
+        if callsign == 'CloudTAK User':
+            cloudtak_ages.append(age)
+
+        if age < 300:
+            out['buckets']['lt_5min'] += 1
+        elif age < 900:
+            out['buckets']['5_15min'] += 1
+        elif age < 3600:
+            out['buckets']['15_60min'] += 1
+        elif age < 21600:
+            out['buckets']['1_6hr'] += 1
+        else:
+            out['buckets']['gt_6hr'] += 1
+
+        aged_subs.append((age, callsign, username, uid, t))
+
+    out['cloudtak_total'] = len(cloudtak_ages)
+    out['cloudtak_stale'] = sum(1 for a in cloudtak_ages if a >= 300)
+
+    aged_subs.sort(key=lambda x: x[0], reverse=True)
+    out['sample'] = [
+        {
+            'age_seconds': (None if a == float('inf') else int(a)),
+            'callsign': c,
+            'username': u,
+            'uid': uid,
+            'last_event_time': t,
+        }
+        for (a, c, u, uid, t) in aged_subs[:sample_size]
+    ]
+
+    zombies = out['buckets']['gt_6hr'] + out['buckets']['invalid_or_null_time']
+    stale = out['buckets']['1_6hr'] + out['buckets']['15_60min']
+    active = out['buckets']['lt_5min'] + out['buckets']['5_15min']
+
+    if out['total'] == 0:
+        out['advisory'] = 'No subscriptions reported. TAK Server may have just restarted, or no clients are connected.'
+    elif zombies == 0 and stale == 0:
+        out['advisory'] = f'Healthy: {active} active subs, no zombies, no stale subs.'
+    elif zombies > 0 and active == 0:
+        out['advisory'] = (
+            f'CRITICAL: {zombies} zombie/null-user subs and ZERO active subs. '
+            'Indicates clients are creating subscriptions but cannot route CoT — '
+            'almost always caused by Authentik LDAP outpost outage windows. '
+            'On v0.9.23+ (PgBouncer): run POST /api/takserver/zombies/sweep with '
+            '{"strategy":"jvm_restart"} to clear, then verify ak-pg-watchdog stays quiet. '
+            'On v0.9.22 or older: upgrade first — sweep alone will recur within hours.'
+        )
+    elif zombies > active:
+        out['advisory'] = (
+            f'DEGRADED: {zombies} zombie/null-user subs vs {active} active. '
+            'Recommend POST /api/takserver/zombies/sweep with {"strategy":"jvm_restart"} '
+            'after confirming Authentik is stable (PgBouncer installed, watchdog quiet).'
+        )
+    else:
+        out['advisory'] = (
+            f'OK with zombies: {active} active, {stale} stale, {zombies} zombies. '
+            'Sweep optional — zombies will not auto-clear without JVM restart but '
+            'they do not block new connections.'
+        )
+
+    return out
+
+
+@app.route('/api/takserver/zombies')
+@login_required
+def takserver_zombies_api():
+    """v0.9.23 Phase 6b. Read-only TAK Server zombie subscription diagnostic.
+
+    Queries Marti's clientEndPoints API via the admin cert mounted inside
+    the takserver container, parses `lastEventTime` per subscription,
+    buckets by age, and returns the analysis + advisory + sample of the
+    stalest 40 subscriptions.
+
+    Designed to power a dashboard tile + answer the operator question
+    "do I need to JVM-restart TAK Server right now to clean up zombies?"
+
+    Read-only. Returns 200 JSON even when probe fails (with `error` set
+    to the diagnostic string) so the dashboard can render the failure
+    state instead of throwing.
+    """
+    out = _takserver_subscriptions_breakdown(timeout_s=12, sample_size=40)
+    try:
+        s = load_settings()
+        last_sweep = (s.get('takserver_zombie_sweep') or {})
+        out['last_sweep'] = {
+            'ran_at_utc': last_sweep.get('ran_at_utc'),
+            'strategy': last_sweep.get('strategy'),
+            'outcome': last_sweep.get('outcome'),
+            'pre_total': last_sweep.get('pre_total'),
+            'pre_zombies': last_sweep.get('pre_zombies'),
+        }
+    except Exception:
+        out['last_sweep'] = None
+    return jsonify(out)
+
+
+@app.route('/api/takserver/zombies/sweep', methods=['POST'])
+@login_required
+def takserver_zombies_sweep_api():
+    """v0.9.23 Phase 6b. Manual operator action: clear zombie subscriptions.
+
+    Body (JSON): {"strategy": "jvm_restart", "confirm": true}
+
+    Strategy `jvm_restart` runs `docker restart takserver-takserver-1`.
+    This is the only universally-reliable sweep mechanism across TAK
+    Server versions — it clears the in-memory subscription pool entirely.
+    Side-effect: every connected client momentarily disconnects (~30-60s)
+    and reconnects. On a stable Authentik (PgBouncer installed) they will
+    reconnect with proper user attribution; on an unstable Authentik
+    (no PgBouncer, watchdog still firing) some will re-zombie within
+    minutes.
+
+    The endpoint REQUIRES `confirm=true` in the body to guard against
+    accidental sweep from a stray curl. It also captures the pre-sweep
+    breakdown so the operator can compare before/after counts.
+
+    Returns:
+      200 — sweep completed (strategy ran successfully).
+      400 — missing/invalid strategy or confirm.
+      500 — sweep failed (e.g. docker daemon unreachable).
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    strategy = (body.get('strategy') or '').strip().lower()
+    confirm = bool(body.get('confirm'))
+
+    if strategy != 'jvm_restart':
+        return jsonify({
+            'success': False,
+            'message': 'Only strategy="jvm_restart" is supported in v0.9.23. '
+                       'Per-subscription DELETE is deferred — Marti API endpoint '
+                       'shape varies across TAK Server versions.'
+        }), 400
+    if not confirm:
+        return jsonify({
+            'success': False,
+            'message': 'Body must include {"confirm": true}. The sweep momentarily '
+                       'disconnects every connected client (~30-60s reconnect window) '
+                       'so we require explicit confirmation.'
+        }), 400
+
+    pre = _takserver_subscriptions_breakdown(timeout_s=8, sample_size=0)
+    pre_total = pre.get('total', 0)
+    pre_zombies = pre.get('buckets', {}).get('gt_6hr', 0) + pre.get('buckets', {}).get('invalid_or_null_time', 0)
+
+    print(
+        f"[takserver-zombie-sweep] operator initiated jvm_restart "
+        f"(pre_total={pre_total}, pre_zombies={pre_zombies}); "
+        f"running `docker restart takserver-takserver-1`",
+        flush=True
+    )
+
+    try:
+        r = subprocess.run(
+            ['docker', 'restart', 'takserver-takserver-1'],
+            capture_output=True, text=True, timeout=120
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            'success': False,
+            'message': 'docker restart timed out (>120s) — investigate docker daemon health.'
+        }), 500
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'docker restart failed to invoke: {e}'
+        }), 500
+
+    if r.returncode != 0:
+        err = ((r.stderr or '') + (r.stdout or ''))[:300]
+        print(f"[takserver-zombie-sweep] FAILED (rc={r.returncode}): {err}", flush=True)
+        try:
+            s = load_settings()
+            s['takserver_zombie_sweep'] = {
+                'ran_at_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'strategy': 'jvm_restart',
+                'outcome': 'failed',
+                'pre_total': pre_total,
+                'pre_zombies': pre_zombies,
+                'error': err[:200],
+            }
+            save_settings(s)
+        except Exception:
+            pass
+        return jsonify({
+            'success': False,
+            'message': f'docker restart takserver-takserver-1 failed (rc={r.returncode}): {err[:200]}'
+        }), 500
+
+    print(
+        f"[takserver-zombie-sweep] SUCCESS: takserver container restarted "
+        f"(pre_total={pre_total}, pre_zombies={pre_zombies}). "
+        f"Clients will reconnect over the next ~30-60s.",
+        flush=True
+    )
+
+    try:
+        s = load_settings()
+        s['takserver_zombie_sweep'] = {
+            'ran_at_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'strategy': 'jvm_restart',
+            'outcome': 'ok',
+            'pre_total': pre_total,
+            'pre_zombies': pre_zombies,
+        }
+        save_settings(s)
+    except Exception:
+        pass
+
+    return jsonify({
+        'success': True,
+        'message': (
+            f'TAK Server container restarted. Pre-sweep had {pre_total} subscriptions '
+            f'({pre_zombies} zombies). Clients will reconnect over the next ~30-60s. '
+            f'Run GET /api/takserver/zombies after 2 minutes to confirm cleanup.'
+        ),
+        'pre_total': pre_total,
+        'pre_zombies': pre_zombies,
     })
 
 
