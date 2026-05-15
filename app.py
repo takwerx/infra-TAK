@@ -26894,6 +26894,470 @@ def _authentik_apply_official_tunings(plog):
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.23 Phase 6: PgBouncer connection pooler installation
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Image pin: edoburu/pgbouncer ships a tiny Alpine-based PgBouncer that supports
+# scram-sha-256 auth and auto-generates userlist.txt from DB_USER/DB_PASSWORD
+# env vars. v1.25.1 is the latest stable release as of Dec 2025 — pinning
+# rather than :latest avoids surprise version bumps on `docker compose pull`
+# during Update Now. Image is ~15MB so the pull cost is negligible.
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:1.25.1'
+
+# Pool sizing knobs. These are conservative defaults chosen for the typical
+# infra-TAK fleet box (2-4 vCPU, ~50 concurrent ATAK + iTAK + WebTAK + portal
+# users + LDAP outpost binds). Operators can override via .env if needed but
+# the defaults should comfortably absorb 99% of traffic.
+#   - DEFAULT_POOL_SIZE=25: real PG server connections per (db, user) pair.
+#     With Authentik's leak, the previous setting was ~500 (max_connections),
+#     hit by exhaustion every ~30 min on busy boxes. 25 is what
+#     TAK-NZ/auth-infra runs in production on managed RDS (Christian Elsen,
+#     PR #102) and is well below Authentik's natural concurrency.
+#   - MAX_CLIENT_CONN=1000: client-side virtual connection slots. Authentik
+#     workers + outposts can each "hold" idle connections without consuming
+#     real PG server slots — PgBouncer only checks out a server connection
+#     for the duration of each transaction (POOL_MODE=transaction).
+#   - RESERVE_POOL_SIZE=5: extra connections opened when DEFAULT_POOL_SIZE
+#     is saturated AND a client has been waiting >reserve_pool_timeout (5s).
+#     Provides headroom during traffic spikes without permanently inflating
+#     the steady-state connection count.
+#   - SERVER_IDLE_TIMEOUT=300s: PgBouncer-side idle reaper. Matches our
+#     Postgres idle_session_timeout=300s. Real PG connections close after
+#     5 min idle so we don't keep them open longer than the upstream.
+#   - SERVER_RESET_QUERY=DISCARD ALL: clears prepared statements, temp tables,
+#     and session state between checkouts. Required for transaction mode
+#     and recommended by both PgBouncer upstream and Authentik docs.
+_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 25
+_AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 1000
+_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 5
+_AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
+
+
+def _ensure_authentik_pgbouncer(plog):
+    """v0.9.23 Phase 6: Install PgBouncer between Authentik and Postgres.
+
+    BACKGROUND (Tom Andersen's 2026-05-15 anchortak forensics + observed
+    overnight behavior on tak-10):
+
+    The v0.9.23 stack already lands three mitigations against the upstream
+    Authentik 2026.2.x PostgreSQL connection leak (#20714):
+      1. MAX_REQUESTS=1000 (gunicorn worker recycling)
+      2. MAX_REQUESTS autotune (asymmetric cooldowns, fast tune-down)
+      3. ak-pg-watchdog circuit-breaker at idle≥150
+
+    On tak-10's leak rate (~2.0 conn/sec, 12x Tom's box) the autotune
+    converged to MAX_REQUESTS=100 (the floor) but the watchdog still fired
+    ~4x/hour. Each fire produced a ~30-60s window where TAK Server's user
+    lookups via the LDAP outpost would fail, creating "zombie subscriptions"
+    in TAK Server's DistributedSubscriptionManager (51 zombies observed on
+    Tom's v0.9.22 box: phantom tls:N entries with Last Report 1969-12-31).
+    TAK Server cannot self-heal these — they accumulate until JVM restart.
+
+    THE ARCHITECTURAL FIX (THIS FUNCTION):
+
+    Insert PgBouncer in transaction-pool mode between Authentik and Postgres.
+    PgBouncer maintains a small server-side pool of real PG connections
+    (DEFAULT_POOL_SIZE=25, RESERVE=5 → ~30 real connections steady-state)
+    regardless of how leaky Authentik's client-side psycopg pools become.
+    Authentik workers can "hold" thousands of client-side idle connections
+    but only borrow a real PG connection for the duration of each
+    transaction. Postgres `idle` count in pg_stat_activity drops from
+    ~150-300 (watchdog-firing territory) to ~30 (steady-state).
+
+    DOWNSTREAM EFFECTS:
+      - ak-pg-watchdog will essentially never fire again (defense-in-depth
+        only). The watchdog log goes quiet.
+      - MAX_REQUESTS autotune drifts back up to baseline=1000 over ~15h
+        of stable behavior (asymmetric cooldown: 30min tune-up). We
+        accelerate this by explicitly resetting to baseline on successful
+        install — see end of this function.
+      - LDAP outpost websocket no longer drops in waves of 10-30s every
+        5-10 min. TAK Server user lookups succeed consistently.
+      - Existing 51 zombies on tak-10 require a one-time `docker restart
+        takserver-takserver-1` to clear (TAK Server has no self-heal
+        path for them). Future zombies should not accumulate.
+
+    REFERENCES (consulted before implementing):
+      - https://docs.goauthentik.io/install-config/configuration/#using-a-postgresql-connection-pooler
+        (DISABLE_SERVER_SIDE_CURSORS=true REQUIRED for transaction mode;
+         USE_PGBOUNCER is deprecated)
+      - goauthentik/authentik#14148 + #14149 (April 2025 doc fix:
+        DISABLE_SERVER_SIDE_CURSORS=true, not false, is the correct value)
+      - https://github.com/edoburu/docker-pgbouncer (image we're pinning)
+      - https://github.com/TAK-NZ/auth-infra/pull/102 (Christian Elsen,
+        TAK-NZ running PgBouncer with Authentik 2026.2.0 on managed RDS)
+      - https://github.com/pounde/FastTAK/issues/31 (Erick Pound,
+        diagnosing this same class of leak in FastTAK)
+      - docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md (Tom's full writeup)
+
+    IMPLEMENTATION CONTRACT:
+      - Idempotent: if `pgbouncer` service already exists in compose AND
+        `AUTHENTIK_POSTGRESQL__HOST=pgbouncer` in .env, no-op.
+      - Atomic: backs up compose + .env to .bak.before-pgbouncer.<ts>
+        BEFORE any mutation. On any failure (compose write, pgbouncer
+        won't start, server+worker recreate fails, post-install probe
+        fails) the function restores both files and returns None.
+      - Skips installations where AUTHENTIK_POSTGRESQL__HOST is set to a
+        non-default value (e.g. external managed PG) — we only patch the
+        bundled in-compose Postgres path.
+      - Records outcome to settings.authentik_pgbouncer for operator audit.
+
+    Returns:
+      True  — installed (compose + .env modified, pgbouncer running,
+              server+worker recreated, post-install probe passed)
+      False — already installed, OR ~/authentik not present (no-op)
+      None  — failed (logged via plog, files rolled back where possible)
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    env_path = os.path.join(ak_dir, '.env')
+
+    if not os.path.exists(compose_path) or not os.path.exists(env_path):
+        plog("  pgbouncer install: ~/authentik not installed — skip")
+        return False
+
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  pgbouncer install: PyYAML not available — skip (compose patch unsafe without YAML)")
+        return None
+
+    try:
+        with open(compose_path, 'r') as f:
+            raw_compose = f.read()
+        data = _yaml.safe_load(raw_compose)
+        if not isinstance(data, dict):
+            plog("  pgbouncer install: compose did not parse as a dict — skip")
+            return None
+    except _yaml.YAMLError as e:
+        plog(f"  pgbouncer install: compose is not valid YAML ({str(e)[:80]}) — skip")
+        return None
+    except Exception as e:
+        plog(f"  pgbouncer install: compose read error: {e}")
+        return None
+
+    services = data.get('services') or {}
+    if 'postgresql' not in services:
+        plog("  pgbouncer install: compose has no `postgresql` service — skip (likely external PG, not our scenario)")
+        return False
+
+    try:
+        with open(env_path) as f:
+            env_content = f.read()
+    except Exception as e:
+        plog(f"  pgbouncer install: .env read error: {e}")
+        return None
+
+    env_lines = env_content.splitlines()
+    current_host = None
+    for ln in env_lines:
+        m = re.match(r'^\s*AUTHENTIK_POSTGRESQL__HOST\s*=\s*(.+?)\s*$', ln)
+        if m:
+            current_host = m.group(1).strip().strip('"').strip("'")
+            break
+
+    pgbouncer_in_compose = 'pgbouncer' in services
+    pgbouncer_in_env = (current_host == 'pgbouncer')
+    if pgbouncer_in_compose and pgbouncer_in_env:
+        plog("  pgbouncer install: already installed (compose + .env both wired) — idempotent no-op")
+        return False
+
+    if current_host is not None and current_host not in ('', 'postgresql', 'pgbouncer', 'authentik-postgresql-1'):
+        plog(f"  pgbouncer install: AUTHENTIK_POSTGRESQL__HOST={current_host!r} is operator-customized "
+             "(likely external PG) — skipping to avoid clobbering operator config")
+        return False
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    compose_bak = f"{compose_path}.bak.before-pgbouncer.{ts}"
+    env_bak = f"{env_path}.bak.before-pgbouncer.{ts}"
+    try:
+        with open(compose_bak, 'w') as f:
+            f.write(raw_compose)
+        with open(env_bak, 'w') as f:
+            f.write(env_content)
+        plog(f"  pgbouncer install: backups written ({compose_bak}, {env_bak})")
+    except Exception as e:
+        plog(f"  pgbouncer install: backup error (aborting before any mutation): {e}")
+        return None
+
+    services_root = data.setdefault('services', {})
+    if 'pgbouncer' not in services_root:
+        services_root['pgbouncer'] = {
+            'image': _AUTHENTIK_PGBOUNCER_IMAGE,
+            'restart': 'unless-stopped',
+            'depends_on': {
+                'postgresql': {'condition': 'service_healthy'},
+            },
+            'environment': {
+                'DB_USER': '${PG_USER:-authentik}',
+                'DB_PASSWORD': '${PG_PASS}',
+                'DB_HOST': 'postgresql',
+                'DB_NAME': '${PG_DB:-authentik}',
+                'AUTH_TYPE': 'scram-sha-256',
+                'POOL_MODE': 'transaction',
+                'ADMIN_USERS': '${PG_USER:-authentik}',
+                'MAX_CLIENT_CONN': _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN,
+                'DEFAULT_POOL_SIZE': _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE,
+                'RESERVE_POOL_SIZE': _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE,
+                'SERVER_RESET_QUERY': 'DISCARD ALL',
+                'SERVER_IDLE_TIMEOUT': _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S,
+            },
+            'healthcheck': {
+                'test': ['CMD', 'pg_isready', '-h', 'localhost', '-p', '5432'],
+                'interval': '30s',
+                'timeout': '5s',
+                'retries': 5,
+                'start_period': '20s',
+            },
+        }
+        plog("  pgbouncer install: added `pgbouncer` service to docker-compose.yml "
+             f"(image={_AUTHENTIK_PGBOUNCER_IMAGE}, pool=transaction, "
+             f"default_pool_size={_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE})")
+
+    for svc_name in ('server', 'worker'):
+        svc = services_root.get(svc_name)
+        if not isinstance(svc, dict):
+            continue
+        dep = svc.get('depends_on')
+        if isinstance(dep, dict):
+            if 'pgbouncer' not in dep:
+                dep['pgbouncer'] = {'condition': 'service_healthy'}
+                plog(f"  pgbouncer install: added pgbouncer to {svc_name}.depends_on")
+        elif isinstance(dep, list):
+            if 'pgbouncer' not in dep:
+                dep.append('pgbouncer')
+                plog(f"  pgbouncer install: added pgbouncer to {svc_name}.depends_on (list form)")
+        else:
+            svc['depends_on'] = {'pgbouncer': {'condition': 'service_healthy'}}
+            plog(f"  pgbouncer install: created {svc_name}.depends_on with pgbouncer")
+
+    try:
+        with open(compose_path, 'w') as f:
+            _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+    except Exception as e:
+        plog(f"  ✗ pgbouncer install: compose write error (rolling back): {e}")
+        try:
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+        except Exception:
+            pass
+        return None
+
+    targets = [
+        ('AUTHENTIK_POSTGRESQL__HOST', 'pgbouncer',
+         'route Authentik PG traffic through PgBouncer'),
+        ('AUTHENTIK_POSTGRESQL__PORT', '5432',
+         'PgBouncer listens on standard PG port'),
+        ('AUTHENTIK_POSTGRESQL__DISABLE_SERVER_SIDE_CURSORS', 'true',
+         'REQUIRED for PgBouncer transaction-pool mode — '
+         'server-side cursors maintain state across queries which '
+         'transaction-mode pooling breaks (Django/Authentik would throw '
+         'query_wait_timeout otherwise). See Authentik docs.'),
+        ('AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS', 'true',
+         'Django connection health check before reuse — recovers cleanly '
+         'when PgBouncer recycles a backend on the upstream side'),
+        ('AUTHENTIK_POSTGRESQL__CONN_MAX_AGE', '0',
+         'close-after-each-request on the client side; PgBouncer handles '
+         'real PG persistence'),
+    ]
+
+    new_env_lines = []
+    seen_keys = set()
+    for ln in env_lines:
+        replaced = False
+        for k, v, _desc in targets:
+            if re.match(rf'^\s*{re.escape(k)}\s*=', ln):
+                new_env_lines.append(f'{k}={v}')
+                seen_keys.add(k)
+                replaced = True
+                break
+        if not replaced:
+            new_env_lines.append(ln)
+
+    if new_env_lines and new_env_lines[-1].strip():
+        new_env_lines.append('')
+    if not any(ln.startswith('# ── v0.9.23 PgBouncer pooler') for ln in new_env_lines):
+        new_env_lines.append('# ── v0.9.23 PgBouncer pooler ─────────────────────────────────────────')
+        new_env_lines.append('# Authentik now connects to PgBouncer (transaction pool mode) instead of')
+        new_env_lines.append('# Postgres directly. PgBouncer caps real PG server connections at ~30')
+        new_env_lines.append('# (DEFAULT_POOL_SIZE=25 + RESERVE_POOL_SIZE=5) regardless of upstream')
+        new_env_lines.append('# Authentik 2026.2.x cache-pool leaks. This eliminates the')
+        new_env_lines.append('# ak-pg-watchdog firefighting class and the downstream TAK Server')
+        new_env_lines.append('# "User lookup failed" / phantom-subscription class.')
+        new_env_lines.append('#')
+        new_env_lines.append('# Upstream guidance:')
+        new_env_lines.append('#   docs.goauthentik.io/install-config/configuration/#using-a-postgresql-connection-pooler')
+        new_env_lines.append('#')
+        new_env_lines.append('# DO NOT change AUTHENTIK_POSTGRESQL__HOST unless you also remove the')
+        new_env_lines.append('# pgbouncer service from docker-compose.yml — Authentik will fail to')
+        new_env_lines.append('# resolve the host otherwise.')
+        new_env_lines.append('# ─────────────────────────────────────────────────────────────────────')
+    for k, v, _desc in targets:
+        if k not in seen_keys:
+            new_env_lines.append(f'{k}={v}')
+
+    new_env_content = '\n'.join(new_env_lines).rstrip('\n') + '\n'
+
+    try:
+        with open(env_path, 'w') as f:
+            f.write(new_env_content)
+        plog("  pgbouncer install: .env updated (5 keys: HOST→pgbouncer, PORT, "
+             "DISABLE_SERVER_SIDE_CURSORS=true, CONN_HEALTH_CHECKS=true, CONN_MAX_AGE=0)")
+    except Exception as e:
+        plog(f"  ✗ pgbouncer install: .env write error (rolling back compose + .env): {e}")
+        try:
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+            with open(env_path, 'w') as f:
+                f.write(env_content)
+        except Exception:
+            pass
+        return None
+
+    plog("  pgbouncer install: starting pgbouncer container...")
+    r = subprocess.run(
+        f'cd {ak_dir} && docker compose up -d pgbouncer 2>&1',
+        shell=True, capture_output=True, text=True, timeout=240
+    )
+    if r.returncode != 0:
+        err = ((r.stderr or '') + (r.stdout or ''))[:300]
+        plog(f"  ✗ pgbouncer install: `docker compose up -d pgbouncer` failed: {err}")
+        plog("  pgbouncer install: rolling back compose + .env, leaving Authentik on direct PG")
+        try:
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+            with open(env_path, 'w') as f:
+                f.write(env_content)
+            subprocess.run(
+                f'cd {ak_dir} && docker compose rm -sf pgbouncer 2>&1',
+                shell=True, capture_output=True, text=True, timeout=60
+            )
+        except Exception:
+            pass
+        return None
+
+    pgbouncer_healthy = False
+    for _ in range(24):
+        time.sleep(5)
+        h = subprocess.run(
+            "docker inspect --format '{{.State.Health.Status}}' authentik-pgbouncer-1 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        status = (h.stdout or '').strip()
+        if status == 'healthy':
+            pgbouncer_healthy = True
+            plog("  ✓ pgbouncer container healthy")
+            break
+    if not pgbouncer_healthy:
+        plog("  ⚠ pgbouncer install: container did not reach healthy within 120s — continuing anyway "
+             "(may stabilize once server+worker reconnect)")
+
+    ok = _recreate_authentik_server_worker(plog, reason='pgbouncer-install')
+    if not ok:
+        plog("  ✗ pgbouncer install: server+worker recreate failed — Authentik may be in a degraded state")
+        plog("  pgbouncer install: NOT rolling back .env+compose automatically — manual diagnosis required")
+        plog(f"  pgbouncer install: backups are at {compose_bak} and {env_bak}")
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_pgbouncer') or {}
+            cfg['installed'] = False
+            cfg['last_attempt_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['last_outcome'] = 'recreate-failed'
+            cfg['version'] = VERSION
+            s['authentik_pgbouncer'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+        return None
+
+    time.sleep(15)
+
+    via_bouncer = 0
+    direct = 0
+    try:
+        r = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
+            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
+            "AND application_name='pgbouncer';\"",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        try:
+            via_bouncer = int((r.stdout or '0').strip() or '0')
+        except ValueError:
+            via_bouncer = 0
+        r2 = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
+            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
+            "AND application_name!='pgbouncer';\"",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        try:
+            direct = int((r2.stdout or '0').strip() or '0')
+        except ValueError:
+            direct = 0
+    except Exception as _e:
+        plog(f"  pgbouncer install: post-install probe error (non-fatal): {_e}")
+
+    plog(f"  pgbouncer install: pg_stat_activity → via_pgbouncer={via_bouncer}, direct={direct}")
+    if via_bouncer == 0:
+        plog("  ⚠ pgbouncer install: pg_stat_activity shows 0 connections from pgbouncer — "
+             "Authentik may still be initializing, or PgBouncer auth failed. Watch the next "
+             "ak-pg-watchdog cycle to confirm pool is being used.")
+
+    try:
+        try:
+            with open(env_path) as f:
+                _cur = f.read()
+            _new = []
+            for ln in _cur.splitlines():
+                if re.match(r'^\s*AUTHENTIK_WEB__MAX_REQUESTS\s*=', ln):
+                    _new.append('AUTHENTIK_WEB__MAX_REQUESTS=1000')
+                elif re.match(r'^\s*AUTHENTIK_WEB__MAX_REQUESTS_JITTER\s*=', ln):
+                    _new.append('AUTHENTIK_WEB__MAX_REQUESTS_JITTER=50')
+                else:
+                    _new.append(ln)
+            with open(env_path, 'w') as f:
+                f.write('\n'.join(_new).rstrip('\n') + '\n')
+            plog("  pgbouncer install: reset MAX_REQUESTS to baseline=1000, JITTER=50 "
+                 "(autotune floor=100 is no longer load-bearing with PgBouncer in place)")
+        except Exception as _re:
+            plog(f"  pgbouncer install: MAX_REQUESTS reset skipped: {_re}")
+
+        s = load_settings()
+        s['authentik_max_requests_last_tune_ts'] = int(time.time())
+        s['authentik_max_requests_fire_history'] = []
+        save_settings(s)
+    except Exception:
+        pass
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_pgbouncer') or {}
+        cfg['installed'] = True
+        cfg['installed_at_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['version'] = VERSION
+        cfg['image'] = _AUTHENTIK_PGBOUNCER_IMAGE
+        cfg['pool_mode'] = 'transaction'
+        cfg['default_pool_size'] = _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE
+        cfg['reserve_pool_size'] = _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE
+        cfg['max_client_conn'] = _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN
+        cfg['server_idle_timeout_s'] = _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S
+        cfg['compose_backup'] = compose_bak
+        cfg['env_backup'] = env_bak
+        cfg['last_outcome'] = 'ok'
+        cfg['post_install_via_pgbouncer'] = via_bouncer
+        cfg['post_install_direct'] = direct
+        s['authentik_pgbouncer'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+
+    plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
+         "(transaction pool, ≤30 real PG conns)")
+    return True
+
+
 def _ensure_embedded_outpost_authentik_host(plog):
     """v0.9.21: Re-assert embedded outpost's config.authentik_host to the current public URL.
 
@@ -27545,12 +28009,34 @@ def _authentik_channels_pool_watchdog_loop():
     """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
     PostgreSQL connections from the authentik database exceed a threshold.
 
-    STATUS as of v0.9.23: DEFENSE-IN-DEPTH SAFETY NET, not the primary mitigation.
+    STATUS as of v0.9.23 Phase 6 (PgBouncer): DEEP DEFENSE-IN-DEPTH only.
+    PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=25 + RESERVE=5) caps the real
+    PG server-side idle count at ~30 regardless of how leaky Authentik's
+    cache-pool is, so this watchdog should essentially never fire on a v0.9.23+
+    box. If it DOES fire post-PgBouncer, it means either:
+      1. PgBouncer is mis-configured (e.g. POOL_MODE flipped to `session`),
+      2. The leak class has changed (new upstream code path), or
+      3. Some other workload is consuming PG connections directly
+         (not through PgBouncer) — possibly a manual `docker exec ... psql`
+         left dangling, or a custom integration.
 
-    Primary mitigation is now `AUTHENTIK_WEB__MAX_REQUESTS=1000` + `JITTER=50`,
-    which causes gunicorn to gracefully recycle workers (and their accumulated
-    cache-backend connections) on a per-worker rolling schedule, before they
-    ever pile up enough to trip this watchdog. See:
+    Operator action when this fires post-PgBouncer:
+      - Inspect `settings.authentik_pgbouncer` (was PgBouncer install OK?)
+      - Check `docker logs authentik-pgbouncer-1` for backend errors
+      - Run `docker exec authentik-pgbouncer-1 psql -U authentik
+        -d pgbouncer -c 'SHOW POOLS;'` to see live pool state.
+
+    Primary mitigations preceding this safety net (in order of effectiveness):
+      1. **PgBouncer transaction-pool** (v0.9.23 Phase 6) — caps real PG
+         conns at ~30 regardless of upstream leaks. THE architectural fix.
+      2. **AUTHENTIK_WEB__MAX_REQUESTS=1000** (v0.9.23 Phase 4) — gunicorn
+         worker recycle bounds in-process leak accumulation. Now mostly
+         redundant with PgBouncer but kept as defense-in-depth for memory.
+      3. **CONN_MAX_AGE=0** (v0.9.23 Phase 6) — Django closes connections
+         after each request; PgBouncer recycles them.
+
+    See:
+      - _ensure_authentik_pgbouncer (Phase 6 installer — THE fix)
       - _authentik_apply_official_tunings (sets the values on new installs)
       - _patch_authentik_web_max_requests_to_1000 (migrates existing installs)
       - docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md (Tom Andersen's forensic
@@ -27631,11 +28117,20 @@ def _authentik_channels_pool_watchdog_loop():
             if _count > _threshold:
                 _mr_cur, _ = _authentik_max_requests_get_current()
                 _mr_str = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
+                _pgb_installed = bool((_settings.get('authentik_pgbouncer') or {}).get('installed'))
+                _pgb_note = (
+                    "PgBouncer is INSTALLED — this should not fire unless PgBouncer itself is "
+                    "mis-configured, broken, or being bypassed. Check `docker logs "
+                    "authentik-pgbouncer-1` and `docker exec authentik-pgbouncer-1 psql -U authentik "
+                    "-d pgbouncer -c 'SHOW POOLS;'`."
+                ) if _pgb_installed else (
+                    "PgBouncer is NOT installed — the upstream Authentik #20714 cache-pool leak is "
+                    "unbounded on this box. Consider running the v0.9.23 PgBouncer migration."
+                )
                 print(
                     f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
                     f"(threshold={_threshold}, {_mr_str}) — restarting authentik-server-1. "
-                    f"SAFETY NET firing. Auto-tune will lower MAX_REQUESTS on the next tick "
-                    f"if this is recurring. Upstream: goauthentik/authentik#20714.",
+                    f"SAFETY NET firing. {_pgb_note}",
                     flush=True
                 )
                 _authentik_max_requests_autotune_record_fire(
@@ -32791,6 +33286,113 @@ def takserver_sync_webadmin():
     if ok:
         return jsonify({'success': True, 'message': 'Webadmin user synced to Authentik. Use the same password you set at TAK Server deploy to log in to 8446.'})
     return jsonify({'success': False, 'message': err or 'Sync failed'}), 400
+
+
+@app.route('/api/authentik/pgbouncer')
+@login_required
+def authentik_pgbouncer_api():
+    """v0.9.23 endpoint. Return PgBouncer install status + live pool state.
+
+    Sources:
+      - settings.authentik_pgbouncer (set by `_ensure_authentik_pgbouncer`)
+      - `docker exec authentik-pgbouncer-1 psql -U authentik -d pgbouncer
+        -c 'SHOW POOLS; SHOW STATS;'` for live counters when container is
+        running.
+      - `docker exec authentik-postgresql-1 psql ... pg_stat_activity` to
+        report how many real PG sessions are currently checked out by
+        PgBouncer vs anything else.
+
+    Read-only. Returns JSON. Designed to power a dashboard tile on the
+    Authentik admin page.
+    """
+    s = load_settings()
+    cfg = dict(s.get('authentik_pgbouncer') or {})
+
+    container_state = 'absent'
+    try:
+        r = subprocess.run(
+            "docker inspect --format '{{.State.Status}}|{{.State.Health.Status}}' "
+            "authentik-pgbouncer-1 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        out = (r.stdout or '').strip()
+        if out:
+            parts = out.split('|')
+            container_state = parts[0] or 'unknown'
+            if len(parts) > 1 and parts[1]:
+                container_state = f"{parts[0]} ({parts[1]})"
+    except Exception:
+        pass
+
+    pools_raw = None
+    stats_raw = None
+    if 'absent' not in container_state and 'unknown' not in container_state:
+        try:
+            r = subprocess.run(
+                "docker exec authentik-pgbouncer-1 psql -h 127.0.0.1 -U authentik "
+                "-d pgbouncer -tA -c 'SHOW POOLS;' 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=8
+            )
+            pools_raw = (r.stdout or '').strip() if r.returncode == 0 else None
+        except Exception:
+            pools_raw = None
+        try:
+            r2 = subprocess.run(
+                "docker exec authentik-pgbouncer-1 psql -h 127.0.0.1 -U authentik "
+                "-d pgbouncer -tA -c 'SHOW STATS;' 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=8
+            )
+            stats_raw = (r2.stdout or '').strip() if r2.returncode == 0 else None
+        except Exception:
+            stats_raw = None
+
+    via_bouncer = None
+    direct = None
+    try:
+        r = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
+            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
+            "AND application_name='pgbouncer';\"",
+            shell=True, capture_output=True, text=True, timeout=6
+        )
+        if r.returncode == 0:
+            try:
+                via_bouncer = int((r.stdout or '0').strip() or '0')
+            except ValueError:
+                via_bouncer = None
+        r2 = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
+            "\"SELECT count(*) FROM pg_stat_activity WHERE datname='authentik' "
+            "AND application_name!='pgbouncer';\"",
+            shell=True, capture_output=True, text=True, timeout=6
+        )
+        if r2.returncode == 0:
+            try:
+                direct = int((r2.stdout or '0').strip() or '0')
+            except ValueError:
+                direct = None
+    except Exception:
+        pass
+
+    return jsonify({
+        'installed': bool(cfg.get('installed')),
+        'installed_at_utc': cfg.get('installed_at_utc'),
+        'install_version': cfg.get('version'),
+        'image': cfg.get('image'),
+        'pool_mode': cfg.get('pool_mode'),
+        'default_pool_size': cfg.get('default_pool_size'),
+        'reserve_pool_size': cfg.get('reserve_pool_size'),
+        'max_client_conn': cfg.get('max_client_conn'),
+        'server_idle_timeout_s': cfg.get('server_idle_timeout_s'),
+        'compose_backup': cfg.get('compose_backup'),
+        'env_backup': cfg.get('env_backup'),
+        'container_state': container_state,
+        'pg_stat_activity_via_pgbouncer': via_bouncer,
+        'pg_stat_activity_direct': direct,
+        'live_pools_raw': pools_raw,
+        'live_stats_raw': stats_raw,
+        'last_outcome': cfg.get('last_outcome'),
+    })
 
 
 def _get_authentik_webadmin_status():
@@ -41256,6 +41858,28 @@ def _startup_migrations():
             _patch_authentik_web_max_requests_to_1000(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_mr_err:
             print(f"Startup migration: max_requests 0→1000 patch error (non-fatal): {ak_mr_err}")
+
+        # v0.9.23 Phase 6: Install PgBouncer between Authentik and Postgres.
+        # Architectural fix for the upstream Authentik 2026.2.x cache-pool
+        # leak (#20714). Even with MAX_REQUESTS=1000 + autotune + watchdog
+        # all working as designed, tak-10's overnight log (2026-05-15) showed
+        # the watchdog still firing ~4x/hour at the autotune floor, and Tom
+        # Andersen's TAK Server forensics showed those windows create zombie
+        # subscriptions in DistributedSubscriptionManager that TAK Server
+        # cannot self-heal. PgBouncer caps real PG connections at ~30
+        # regardless of upstream leaks → watchdog never fires → user lookups
+        # never fail → no zombies. Idempotent — re-running on a box that
+        # already has pgbouncer in compose AND .env is a fast no-op.
+        # Reference: docs.goauthentik.io/install-config/configuration/#using-a-postgresql-connection-pooler
+        try:
+            _pgb_changed = _ensure_authentik_pgbouncer(lambda m: print(f"Startup migration: {m}", flush=True))
+            if _pgb_changed is True:
+                # The pgbouncer install function already recreated server+worker
+                # so .env changes are live. Re-run runtime verify to record
+                # current state with PgBouncer in the loop.
+                _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pgb_err:
+            print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
 
         # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
         # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
