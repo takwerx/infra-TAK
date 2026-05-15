@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.22-alpha"
+VERSION = "0.9.23-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -27124,6 +27124,342 @@ def _start_channels_pool_watchdog():
     _t.start()
 
 
+# ---------------------------------------------------------------------------
+# v0.9.23: LDAP SA bind + webadmin admin-role continuous watchdog
+# ---------------------------------------------------------------------------
+# Closes the recovery gap between the boot-time _startup_resync_ldap_service_account
+# (one-shot at console start) and operator intervention. Field-observed drift recurs
+# mid-session (every ~hour or two) under bind_mode: cached because the cache masks
+# the underlying mutator until the 120s outpost cache expires. See:
+#   - docs/HANDOFF-LDAP-AUTHENTIK.md  (why bind_mode: cached is the correct arch)
+#   - docs/PLAN-v0.9.23-alpha.md       (this work)
+#
+# Two periodic invariants checked every 5 minutes:
+#
+#   Item 1 — adm_ldapservice fresh bind via ldapsearch tri-state verdict.
+#            Heal: _ensure_authentik_ldap_service_account (set_password + outpost recreate).
+#
+#   Item 2 — webadmin admin-role drift:
+#              (a) is_active = True
+#              (b) member of tak_ROLE_ADMIN
+#              (c) member of authentik Admins
+#              (d) CoreConfig.xml has adminGroup="ROLE_ADMIN"
+#            Heal: _ensure_authentik_webadmin(skip_bind_verify=True) +
+#                  _resync_ldap_credential_to_coreconfig().
+#
+# All checks are idempotent — no log spam on healthy ticks (one "ok" line every
+# ~50 minutes for liveness). Each heal records timestamp + counter in settings.json
+# so operators can spot a writer that's burning down the bind on a tight cadence.
+
+_ldap_sa_watchdog_started = False
+
+
+def _authentik_webadmin_role_check_and_heal(plog_fn=None):
+    """v0.9.23 (Item 2 of PLAN-v0.9.23-alpha.md). Verify webadmin admin-role
+    invariants in Authentik + CoreConfig; heal on drift.
+
+    Returns True if any heal was performed this tick, False if everything was
+    already in the expected shape. Never raises — exceptions are swallowed and
+    logged via plog_fn so callers (watchdog loop, startup migrations) can keep
+    running.
+    """
+    _log = plog_fn or (lambda m: print(m, flush=True))
+    _healed = False
+
+    if not os.path.exists('/opt/tak'):
+        return False  # No TAK Server on this box — webadmin admin role is N/A
+
+    try:
+        import urllib.request as _req
+        _settings = load_settings()
+        _token = (_get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                  or _get_authentik_env_value(_settings, 'AUTHENTIK_TOKEN'))
+        if not _token:
+            return False
+        _url = _get_authentik_api_url(_settings)
+        _headers = {'Authorization': f'Bearer {_token}', 'Content-Type': 'application/json'}
+
+        try:
+            _r = _req.Request(f'{_url}/api/v3/core/users/?search=webadmin', headers=_headers)
+            _users = json.loads(_req.urlopen(_r, timeout=10).read().decode()).get('results', [])
+            _wa = next((u for u in _users if u.get('username') == 'webadmin'), None)
+        except Exception as _e:
+            _log(f"webadmin role check: lookup error: {str(_e)[:120]}")
+            return False
+
+        if not _wa:
+            _log("webadmin role check: webadmin MISSING in Authentik — calling _ensure_authentik_webadmin")
+            try:
+                _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                if _ok:
+                    _healed = True
+                else:
+                    _log(f"webadmin recreate incomplete: {_msg}")
+            except Exception as _e:
+                _log(f"webadmin recreate error: {str(_e)[:120]}")
+            # Fall through to CoreConfig check below
+
+        _need_role_heal = False
+        _reasons = []
+
+        if _wa is not None:
+            if _wa.get('is_active') is not True:
+                _need_role_heal = True
+                _reasons.append('is_active=False')
+
+            # Group membership — Authentik returns groups_obj with name+pk on user lookup.
+            _groups = _wa.get('groups_obj') or []
+            if not _groups:
+                try:
+                    _r2 = _req.Request(f'{_url}/api/v3/core/users/{_wa["pk"]}/', headers=_headers)
+                    _full = json.loads(_req.urlopen(_r2, timeout=10).read().decode())
+                    _groups = _full.get('groups_obj') or []
+                except Exception:
+                    _groups = []
+            _gnames = {(g.get('name') or '') for g in _groups if isinstance(g, dict)}
+            if 'tak_ROLE_ADMIN' not in _gnames:
+                _need_role_heal = True
+                _reasons.append('not in tak_ROLE_ADMIN')
+            if 'authentik Admins' not in _gnames:
+                _need_role_heal = True
+                _reasons.append('not in authentik Admins')
+
+            if _need_role_heal:
+                _log(f"webadmin role drift detected ({', '.join(_reasons)}) — auto-healing")
+                try:
+                    _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                    if _ok:
+                        _log("webadmin role healed via _ensure_authentik_webadmin")
+                        _healed = True
+                    else:
+                        _log(f"webadmin role heal incomplete: {_msg}")
+                except Exception as _e:
+                    _log(f"webadmin role heal error: {str(_e)[:120]}")
+
+        # CoreConfig adminGroup invariant — even when Authentik says webadmin is
+        # in tak_ROLE_ADMIN, TAK Server 8446 only treats the bind as admin when
+        # CoreConfig <ldap groupBaseRDN ... adminGroup="ROLE_ADMIN"/> is present.
+        try:
+            _cc_path = '/opt/tak/CoreConfig.xml'
+            if os.path.exists(_cc_path):
+                with open(_cc_path, 'r', encoding='utf-8') as _f:
+                    _cc = _f.read()
+                if 'adm_ldapservice' in _cc and 'adminGroup="ROLE_ADMIN"' not in _cc:
+                    _log("CoreConfig.xml adminGroup attribute MISSING — calling _resync_ldap_credential_to_coreconfig")
+                    try:
+                        _changed, _msg = _resync_ldap_credential_to_coreconfig()
+                        if _changed:
+                            _log(f"CoreConfig adminGroup restored ({_msg})")
+                            _healed = True
+                        else:
+                            _log(f"CoreConfig adminGroup resync no-op: {_msg}")
+                    except Exception as _e:
+                        _log(f"CoreConfig adminGroup heal error: {str(_e)[:120]}")
+        except Exception:
+            pass
+
+        if _healed:
+            try:
+                _s2 = load_settings()
+                from datetime import datetime as _dt_now
+                _s2['authentik_webadmin_role_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
+                _s2['authentik_webadmin_role_repair_count'] = int(_s2.get('authentik_webadmin_role_repair_count') or 0) + 1
+                save_settings(_s2)
+            except Exception:
+                pass
+
+        return _healed
+    except Exception as _e:
+        _log(f"webadmin role check exception (non-fatal): {str(_e)[:120]}")
+        return False
+
+
+def _takportal_admin_guardrail(plog_fn=None):
+    """v0.9.23 (Item 3 of PLAN-v0.9.23-alpha.md). Module-level extraction of the
+    v0.9.15 _auto_harden_takportal_settings hook that previously only ran inside
+    the version-gated post-update block. Promoted so it also fires on every
+    console startup and (optionally) under the SA-bind watchdog, bounding
+    recovery for USERS_HIDDEN_PREFIXES / USERS_ACTIONS_HIDDEN_PREFIXES drift
+    between Update Now clicks.
+
+    Idempotent — no-op when both 'akadmin' and 'webadmin' are already present
+    in both fields. See v0.9.15 release notes for the original "accidental
+    Disable on akadmin" incident motivation.
+    """
+    _log = plog_fn or (lambda m: print(m, flush=True))
+    try:
+        _portal_dir = os.path.expanduser('~/TAK-Portal')
+        if not os.path.isdir(_portal_dir):
+            return
+        _ps = subprocess.run(
+            'docker ps --filter name=^tak-portal$ --format "{{.Names}}"',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if 'tak-portal' not in (_ps.stdout or ''):
+            return
+
+        _existing = _takportal_get_existing_settings()
+        _hidden = (_existing.get('USERS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
+        _locked = (_existing.get('USERS_ACTIONS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
+        _hidden_parts = {p.strip() for p in _hidden.split(',') if p.strip()}
+        _locked_parts = {p.strip() for p in _locked.split(',') if p.strip()}
+        _need_keys = {'akadmin', 'webadmin'}
+        if _need_keys.issubset(_hidden_parts) and _need_keys.issubset(_locked_parts):
+            return  # Idempotent — no log spam on healthy boot
+
+        _log(f"takportal admin guardrail: current hidden={_hidden!r} actions_hidden={_locked!r} — re-asserting")
+        _settings = load_settings()
+        _settings_json = _takportal_merged_settings_json(_settings)
+        _fd, _tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-guard-')
+        try:
+            with os.fdopen(_fd, 'w') as _tf:
+                _tf.write(_settings_json)
+            _cp = subprocess.run(
+                f'docker cp {shlex.quote(_tmp)} tak-portal:/usr/src/app/data/settings.json',
+                shell=True, capture_output=True, text=True, timeout=20
+            )
+        finally:
+            try:
+                os.remove(_tmp)
+            except OSError:
+                pass
+        if _cp.returncode != 0:
+            _log(f"takportal admin guardrail: docker cp failed: {((_cp.stderr or _cp.stdout) or '').strip()[:200]}")
+            return
+        _rs = subprocess.run(
+            'docker restart tak-portal',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        if _rs.returncode == 0:
+            _log("takportal admin guardrail: restarted — akadmin/webadmin hidden + action-locked")
+        else:
+            _log(f"takportal admin guardrail: restart returned {_rs.returncode}")
+    except Exception as _e:
+        _log(f"takportal admin guardrail error (non-fatal): {_e}")
+
+
+def _authentik_ldap_sa_bind_watchdog_loop():
+    """v0.9.23 (Item 1+2 of PLAN-v0.9.23-alpha.md). Background daemon — periodic
+    LDAP SA bind verification + webadmin admin-role drift heal.
+
+    Tick = 300s (5 minutes). Per tick:
+      1. Tri-state bind probe of cn=adm_ldapservice,ou=users,dc=takldap against
+         AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD from ~/authentik/.env. On
+         verdict='fail', call _ensure_authentik_ldap_service_account() (re-sets
+         the password in Authentik DB and force-recreates the LDAP outpost).
+      2. _authentik_webadmin_role_check_and_heal() (Item 2).
+
+    Liveness: one "ok" line every ~50 minutes (10 quiet ticks) so log readers
+    can confirm the daemon is alive without spam. Each heal records timestamp
+    + monotonically-increasing counter in settings.json
+    (authentik_ldap_sa_last_repair / authentik_ldap_sa_repair_count /
+    authentik_webadmin_role_last_repair / authentik_webadmin_role_repair_count)
+    so operators can grep for repeated-repair patterns (would indicate the
+    writer that's mutating these values mid-session is still active).
+
+    Override: ldap_sa_watchdog_disabled=true in infra-TAK settings disables.
+    """
+    import time as _wt
+    _wt.sleep(120)  # Let console finish _startup_migrations before first tick
+
+    _ok_log_interval = 10  # ~50 minutes between liveness lines
+    _ok_counter = 0
+
+    while True:
+        try:
+            _settings = load_settings()
+            if _settings.get('ldap_sa_watchdog_disabled'):
+                _wt.sleep(300)
+                continue
+            if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _wt.sleep(300)
+                continue
+            if not _coreconfig_has_ldap():
+                _wt.sleep(300)
+                continue
+
+            _env_pass = _get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+            if not _env_pass:
+                _wt.sleep(300)
+                continue
+
+            try:
+                _verdict = _test_ldap_bind_dn_verdict(
+                    'cn=adm_ldapservice,ou=users,dc=takldap', _env_pass)
+            except Exception:
+                _verdict = 'inconclusive'
+
+            _sa_healed = False
+            _role_healed = False
+
+            if _verdict == 'fail':
+                print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
+                try:
+                    _ok, _msg = _ensure_authentik_ldap_service_account()
+                    if _ok:
+                        print(f"[ldap-sa-watchdog] adm_ldapservice bind healed ({_msg})", flush=True)
+                        _sa_healed = True
+                        try:
+                            _s2 = load_settings()
+                            from datetime import datetime as _dt_now
+                            _s2['authentik_ldap_sa_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
+                            _s2['authentik_ldap_sa_repair_count'] = int(_s2.get('authentik_ldap_sa_repair_count') or 0) + 1
+                            save_settings(_s2)
+                        except Exception:
+                            pass
+                        # Belt + braces — also resync CoreConfig credential while we
+                        # know the env_pass is authoritative.
+                        try:
+                            _cc_changed, _cc_msg = _resync_ldap_credential_to_coreconfig()
+                            if _cc_changed:
+                                print(f"[ldap-sa-watchdog] CoreConfig credential resynced ({_cc_msg})", flush=True)
+                        except Exception:
+                            pass
+                    else:
+                        print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
+                except Exception as _se:
+                    print(f"[ldap-sa-watchdog] adm_ldapservice heal error: {str(_se)[:120]}", flush=True)
+            elif _verdict == 'inconclusive':
+                # Don't take action — could be transient (outpost restarting after
+                # operator-driven sync). The next tick will reassess.
+                pass
+
+            try:
+                _role_healed = _authentik_webadmin_role_check_and_heal(
+                    plog_fn=lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True)
+                )
+            except Exception as _re:
+                print(f"[ldap-sa-watchdog] webadmin role check error: {str(_re)[:120]}", flush=True)
+
+            if _verdict == 'ok' and not _sa_healed and not _role_healed:
+                _ok_counter += 1
+                if _ok_counter >= _ok_log_interval:
+                    print("[ldap-sa-watchdog] ok (SA bind verified, webadmin roles intact)", flush=True)
+                    _ok_counter = 0
+            else:
+                _ok_counter = 0
+        except Exception as _le:
+            print(f"[ldap-sa-watchdog] tick error (non-fatal): {str(_le)[:120]}", flush=True)
+
+        _wt.sleep(300)
+
+
+def _start_ldap_sa_bind_watchdog():
+    """Start the LDAP SA bind + webadmin role watchdog daemon thread
+    (idempotent — only starts once per process)."""
+    global _ldap_sa_watchdog_started
+    if _ldap_sa_watchdog_started:
+        return
+    _ldap_sa_watchdog_started = True
+    import threading as _thr
+    _t = _thr.Thread(
+        target=_authentik_ldap_sa_bind_watchdog_loop,
+        daemon=True,
+        name='ldap-sa-bind-watchdog'
+    )
+    _t.start()
+
+
 def _auto_remove_stale_docker_service_connections(label='Post-update'):
     """v0.9.16: Delete the local Docker service connection that Authentik's upstream
     quickstart creates by default.
@@ -40009,6 +40345,45 @@ def _startup_migrations():
         except Exception as _wde:
             print(f"Startup: channels pool watchdog start failed (non-fatal): {_wde}", flush=True)
 
+        # v0.9.23: TAK Portal admin-account guardrail re-assertion at every boot.
+        # Was version-gated post-update only (v0.9.15). Promoted to startup migration
+        # so USERS_HIDDEN_PREFIXES / USERS_ACTIONS_HIDDEN_PREFIXES drift between Update
+        # Now clicks gets bounded recovery on the next console restart. Idempotent —
+        # no-op on already-hardened boxes. See PLAN-v0.9.23-alpha.md (Item 3).
+        try:
+            _takportal_admin_guardrail(plog_fn=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _tge:
+            print(f"Startup migration: takportal admin guardrail error (non-fatal): {_tge}", flush=True)
+
+        # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
+        # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,
+        # or CoreConfig adminGroup attribute stripped — the class of drift that lands
+        # an operator on the WebTAK landing page when they meant the TAK Server admin
+        # UI at :8446. Heals via _ensure_authentik_webadmin (skip_bind_verify=True for
+        # speed; the LDAP outpost already gets reloaded by Item 1 on the same tick).
+        # See PLAN-v0.9.23-alpha.md (Item 2).
+        try:
+            _authentik_webadmin_role_check_and_heal(
+                plog_fn=lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _wae:
+            print(f"Startup migration: webadmin role check error (non-fatal): {_wae}", flush=True)
+
+        # v0.9.23: Continuous LDAP SA bind + webadmin role watchdog.
+        # Boot-time _startup_resync_ldap_service_account() and the two checks above
+        # only run once per console restart. Field-observed drift recurs mid-session
+        # every ~1–2 hours under bind_mode: cached (cache masks the underlying
+        # mutator). This daemon re-runs both checks every 5 min so recovery time
+        # is bounded under one tick instead of "until the next reboot". See
+        # PLAN-v0.9.23-alpha.md (Item 1).
+        try:
+            if (os.path.exists(os.path.expanduser('~/authentik/.env'))
+                    and _coreconfig_has_ldap()):
+                _start_ldap_sa_bind_watchdog()
+                print("Startup: LDAP SA bind watchdog started (interval=5min, checks SA bind + webadmin roles)", flush=True)
+        except Exception as _lwe:
+            print(f"Startup: LDAP SA bind watchdog start failed (non-fatal): {_lwe}", flush=True)
+
         # v0.9.0: fail2ban post-install config migrations (only run if fail2ban is already installed
         # by the operator via the Marketplace — _fail2ban_install_and_configure is NOT auto-run).
         try:
@@ -41461,88 +41836,12 @@ def _post_update_auto_deploy():
 
             _auto_harden_takportal()
 
-            def _auto_harden_takportal_settings():
-                """v0.9.15 — TAK Portal admin-account guardrail.
-
-                Ensures `akadmin` and `webadmin` are in both
-                USERS_HIDDEN_PREFIXES (hidden from the user list) and
-                USERS_ACTIONS_HIDDEN_PREFIXES (action-locked — cannot be
-                modified from TAK Portal's UI). Prevents the v0.9.13 incident
-                class where an operator accidentally clicked Disable on
-                `akadmin` from TAK Portal's user-management UI and locked
-                themselves out of Authentik entirely.
-
-                Idempotent — no-op if both prefixes are already present in
-                both fields. Otherwise pushes merged settings (preserves
-                BRAND_LOGO_URL / SSH onboarding flags via PRESERVE_TAKPORTAL_KEYS)
-                and restarts the tak-portal container to apply.
-
-                Skipped when TAK Portal isn't deployed locally (~/TAK-Portal
-                missing); remote-Portal installs apply the new defaults on
-                next "Update config & reconnect" click in the UI.
-
-                The /authentik Protected Admin Accounts panel (v0.9.13 +
-                v0.9.14 layered API → ak shell recovery) stays as the
-                last-resort recovery if this guardrail is ever bypassed.
-                """
-                try:
-                    _portal_dir = os.path.expanduser('~/TAK-Portal')
-                    if not os.path.isdir(_portal_dir):
-                        return
-                    _ps = subprocess.run(
-                        'docker ps --filter name=^tak-portal$ --format "{{.Names}}"',
-                        shell=True, capture_output=True, text=True, timeout=10
-                    )
-                    if 'tak-portal' not in (_ps.stdout or ''):
-                        return
-                    print("Post-update: TAK Portal admin-account guardrail (v0.9.15)...")
-
-                    _existing = _takportal_get_existing_settings()
-                    _hidden = (_existing.get('USERS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
-                    _locked = (_existing.get('USERS_ACTIONS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
-                    _hidden_parts = {p.strip() for p in _hidden.split(',') if p.strip()}
-                    _locked_parts = {p.strip() for p in _locked.split(',') if p.strip()}
-                    _need_keys = {'akadmin', 'webadmin'}
-                    _hidden_ok = _need_keys.issubset(_hidden_parts)
-                    _locked_ok = _need_keys.issubset(_locked_parts)
-                    if _hidden_ok and _locked_ok:
-                        print("  TAK Portal already guarded — akadmin/webadmin hidden + action-locked")
-                        return
-
-                    print(f"  TAK Portal current: hidden={_hidden!r} actions_hidden={_locked!r}")
-                    print("  TAK Portal pushing merged settings (preserves operator brand/SSH keys)")
-                    _settings = load_settings()
-                    _settings_json = _takportal_merged_settings_json(_settings)
-                    _fd, _tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-guard-')
-                    try:
-                        with os.fdopen(_fd, 'w') as _tf:
-                            _tf.write(_settings_json)
-                        _cp = subprocess.run(
-                            f'docker cp {shlex.quote(_tmp)} tak-portal:/usr/src/app/data/settings.json',
-                            shell=True, capture_output=True, text=True, timeout=20
-                        )
-                    finally:
-                        try:
-                            os.remove(_tmp)
-                        except OSError:
-                            pass
-                    if _cp.returncode != 0:
-                        print(f"  WARNING: docker cp failed: {((_cp.stderr or _cp.stdout) or '').strip()[:200]}")
-                        return
-                    _rs = subprocess.run(
-                        'docker restart tak-portal',
-                        shell=True, capture_output=True, text=True, timeout=30
-                    )
-                    if _rs.returncode == 0:
-                        print("  TAK Portal restarted — akadmin/webadmin now hidden + action-locked")
-                    else:
-                        print(f"  WARNING: TAK Portal restart returned {_rs.returncode}")
-
-                    print("Post-update: TAK Portal admin-account guardrail complete")
-                except Exception as _tge:
-                    print(f"Post-update: TAK Portal guardrail error (non-fatal): {_tge}")
-
-            _auto_harden_takportal_settings()
+            # v0.9.23: nested _auto_harden_takportal_settings (v0.9.15) extracted
+            # to module-level _takportal_admin_guardrail so the same logic also
+            # runs in _startup_migrations (every console boot) — see PLAN-v0.9.23-alpha.md Item 3.
+            print("Post-update: TAK Portal admin-account guardrail (v0.9.15)...")
+            _takportal_admin_guardrail(plog_fn=lambda m: print(f"Post-update: {m}", flush=True))
+            print("Post-update: TAK Portal admin-account guardrail complete")
 
             def _auto_harden_mediamtx():
                 """v0.9.12 — MediaMTX port hardening for existing local installs.
