@@ -27246,11 +27246,52 @@ _channels_watchdog_started = False
 
 _AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT = 100
 _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT = 2000
-_AUTHENTIK_MAX_REQUESTS_TUNE_COOLDOWN_S = 1800  # 30 min between tunes
+# Asymmetric cooldowns: converge FAST under fire (every watchdog tick can tune
+# down), and slowly back UP after a long no-fire window. Tak-10 dev box
+# (May 2026) showed the original symmetric 30-min cooldown was too slow to
+# converge — we'd eat 5-10 watchdog fires in one cooldown window while the
+# leak rate doubled what Tom's box measured. Pattern preferred everywhere:
+# escalate-fast-deescalate-slow.
+_AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S = 120   # 2 min — fast convergence under fire
+_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S = 1800    # 30 min — avoid oscillation on quiet → noisy transitions
 _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S = 1800  # 30 min: "recent fire" window
 _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S = 21600  # 6h: "no fire for a long time"
 _AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX = 50
 _AUTHENTIK_MAX_REQUESTS_TUNE_HISTORY_MAX = 50
+
+# Auto-tune dedicated log file. Operator can `tail -F` this to watch
+# convergence on a single screen without grepping journalctl. Format is
+# one event per line: '<ISO timestamp UTC> | <event type> | <detail>'.
+_AUTOTUNE_LOG_PATH = '/var/log/takguard/ak-mr-autotune.log'
+_AUTOTUNE_LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB rollover ceiling
+_AUTOTUNE_LOG_KEEP_LINES = 5000             # On rollover, keep this many most-recent lines
+
+
+def _autotune_log(msg):
+    """Append a single line to the auto-tune log file. Self-rolling at 5 MB.
+    Resilient — never raises. Used by the watchdog, fire recorder, evaluator
+    and applier so the whole story for a box is in one tailable file.
+    """
+    try:
+        os.makedirs(os.path.dirname(_AUTOTUNE_LOG_PATH), exist_ok=True)
+        import datetime as _dt
+        _ts = _dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        _line = f"{_ts} | {msg}\n"
+        # Lazy rollover: if file is over the cap, keep the last N lines and
+        # rewrite. Cheap because it only happens once per ~5 MB.
+        try:
+            if (os.path.exists(_AUTOTUNE_LOG_PATH)
+                    and os.path.getsize(_AUTOTUNE_LOG_PATH) > _AUTOTUNE_LOG_MAX_BYTES):
+                with open(_AUTOTUNE_LOG_PATH, 'r', errors='replace') as _f:
+                    _tail = _f.readlines()[-_AUTOTUNE_LOG_KEEP_LINES:]
+                with open(_AUTOTUNE_LOG_PATH, 'w') as _f:
+                    _f.writelines(_tail)
+        except Exception:
+            pass
+        with open(_AUTOTUNE_LOG_PATH, 'a') as _f:
+            _f.write(_line)
+    except Exception:
+        pass
 
 
 def _authentik_max_requests_get_current():
@@ -27273,20 +27314,35 @@ def _authentik_max_requests_get_current():
         return None, None
 
 
-def _authentik_max_requests_autotune_record_fire():
-    """Append a watchdog-fire timestamp to settings.
+def _authentik_max_requests_autotune_record_fire(idle_count=None, threshold=None, current_max=None):
+    """Record a watchdog-fire event.
+
+    Two side effects:
+      1. Appends timestamp to settings.authentik_max_requests_fire_history
+         (last 50). Used by autotune evaluate() to decide tune-down.
+      2. Writes a human-readable line to the auto-tune log so an operator
+         can review history without grepping journalctl.
 
     Called by the watchdog loop every time it issues an ALERT/restart.
-    Keeps the last N events for trend analysis.
     """
     try:
         import time as _t
+        _now = int(_t.time())
         _s = load_settings()
         _hist = list(_s.get('authentik_max_requests_fire_history') or [])
-        _hist.append(int(_t.time()))
+        _hist.append(_now)
         _hist = _hist[-_AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX:]
         _s['authentik_max_requests_fire_history'] = _hist
         save_settings(_s)
+    except Exception:
+        pass
+    try:
+        _ic = idle_count if idle_count is not None else '?'
+        _th = threshold if threshold is not None else '?'
+        _mr = current_max if current_max is not None else '?'
+        _autotune_log(
+            f"WATCHDOG_FIRE | idle={_ic} threshold={_th} MAX_REQUESTS={_mr}"
+        )
     except Exception:
         pass
 
@@ -27296,13 +27352,20 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
 
     Returns (new_max_requests, new_jitter, reason) or (None, None, None) if no change.
 
-    Decision matrix:
-      - autotune disabled in settings              → no change
-      - last tune was less than cooldown ago       → no change (rate limit)
-      - fire in last 30 min AND current > floor    → halve (clamped to floor)
-      - no fire in 6h AND current < starting/ceiling → bump up 25%
-                                                     (clamped to ceiling)
-      - otherwise                                  → no change
+    Decision matrix with ASYMMETRIC cooldowns (fast-down, slow-up):
+      - autotune disabled in settings                    → no change
+      - fire in last 30 min AND current > floor          → tune DOWN (halve,
+        clamped to floor). Cooldown: 2 min between down-tunes — converge
+        fast under fire.
+      - no fire in 6h AND current < min(baseline, ceiling) → tune UP (+25%,
+        clamped). Cooldown: 30 min between up-tunes — avoid oscillation.
+      - otherwise                                        → no change
+
+    The cooldown asymmetry matters: tak-10 (May 2026) showed the original
+    symmetric 30-min cooldown was too slow to converge — the box took 5+
+    fires inside a single cooldown window. With down-cooldown=2 min, the
+    box halves on every other watchdog tick under sustained pressure
+    (1000 → 500 → 250 → 125 → 100 floor in ~8 min).
 
     The starting value baseline for "bump up" is min(starting_value, ceiling).
     Starting value defaults to 1000 (the v0.9.23 migration default) but can
@@ -27326,39 +27389,61 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
         _baseline = int(_s.get('authentik_max_requests_baseline') or 1000)
 
         _last_tune_ts = int(_s.get('authentik_max_requests_last_tune_ts') or 0)
-        if _now - _last_tune_ts < _AUTHENTIK_MAX_REQUESTS_TUNE_COOLDOWN_S:
-            return (None, None, None)
+        _since_tune = _now - _last_tune_ts
 
         _fires = list(_s.get('authentik_max_requests_fire_history') or [])
         _last_fire_ts = max(_fires) if _fires else 0
         _recent_fire = (_now - _last_fire_ts) < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S if _last_fire_ts else False
         _quiet = (_now - _last_fire_ts) > _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S if _last_fire_ts else True
 
+        # ── Tune DOWN path ──
         if _recent_fire and _current > _floor:
+            if _since_tune < _AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S:
+                return (None, None, None)  # tune-down cooldown still in effect
             _new = max(_floor, _current // 2)
             _new_jitter = max(5, _new // 20)
             _fires_30min = len([_f for _f in _fires if _now - _f < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S])
             _reason = (
-                f"watchdog fired {_fires_30min}x in last 30min "
-                f"(last fire {_now - _last_fire_ts}s ago) — MAX_REQUESTS too high for current load"
+                f"DOWN: watchdog fired {_fires_30min}x in last 30min "
+                f"(last fire {_now - _last_fire_ts}s ago) — MAX_REQUESTS too high"
             )
+            try:
+                _autotune_log(
+                    f"DECISION_DOWN | from={_current} to={_new} jitter={_new_jitter} "
+                    f"fires_30min={_fires_30min} last_fire_age_s={_now - _last_fire_ts}"
+                )
+            except Exception:
+                pass
             return (_new, _new_jitter, _reason)
 
+        # ── Tune UP path ──
         if _quiet and _current < min(_baseline, _ceiling):
+            if _since_tune < _AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S:
+                return (None, None, None)  # tune-up cooldown still in effect
             _new = min(_ceiling, _baseline, int(_current * 1.25))
             if _new <= _current:
                 return (None, None, None)  # rounding edge — no actual change
             _new_jitter = max(5, _new // 20)
             _qmin = (_now - _last_fire_ts) // 60 if _last_fire_ts else 9999
             _reason = (
-                f"no watchdog fire for {_qmin}min — bumping MAX_REQUESTS up "
-                f"(less worker churn) toward baseline {_baseline}"
+                f"UP: no watchdog fire for {_qmin}min — easing back toward baseline {_baseline}"
             )
+            try:
+                _autotune_log(
+                    f"DECISION_UP | from={_current} to={_new} jitter={_new_jitter} "
+                    f"quiet_min={_qmin} baseline={_baseline}"
+                )
+            except Exception:
+                pass
             return (_new, _new_jitter, _reason)
 
         return (None, None, None)
     except Exception as _e:
         plog(f"[ak-mr-autotune] evaluate error: {_e}")
+        try:
+            _autotune_log(f"EVAL_ERROR | {_e}")
+        except Exception:
+            pass
         return (None, None, None)
 
 
@@ -27412,11 +27497,25 @@ def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
         )
         plog(f"[ak-mr-autotune] backup: {os.path.basename(_backup)}")
         plog("[ak-mr-autotune] recreating server+worker to apply new values...")
+        try:
+            _autotune_log(
+                f"APPLY_START | from={_old_max} to={new_max} "
+                f"jitter_from={_old_jitter} jitter_to={new_jitter} | {reason}"
+            )
+        except Exception:
+            pass
 
         ok = _recreate_authentik_server_worker(plog, reason='max-requests-autotune')
         if not ok:
             plog("[ak-mr-autotune] WARN: recreate reported failure — .env updated, "
                  "values will apply on next restart")
+        try:
+            _autotune_log(
+                f"APPLY_{'OK' if ok else 'WARN_NO_RECREATE'} | "
+                f"MAX_REQUESTS={new_max} JITTER={new_jitter}"
+            )
+        except Exception:
+            pass
 
         try:
             _s = load_settings()
@@ -27539,23 +27638,41 @@ def _authentik_channels_pool_watchdog_loop():
                     f"if this is recurring. Upstream: goauthentik/authentik#20714.",
                     flush=True
                 )
-                _authentik_max_requests_autotune_record_fire()
+                _authentik_max_requests_autotune_record_fire(
+                    idle_count=_count, threshold=_threshold, current_max=_mr_cur
+                )
                 _restart = subprocess.run(
                     ['docker', 'restart', 'authentik-server-1'],
                     capture_output=True, text=True, timeout=90
                 )
                 if _restart.returncode == 0:
                     print(f"[ak-pg-watchdog] authentik-server-1 restarted — idle connections reset", flush=True)
+                    try:
+                        _autotune_log("WATCHDOG_RESTART_OK | idle reset")
+                    except Exception:
+                        pass
                 else:
                     print(f"[ak-pg-watchdog] restart failed: {(_restart.stderr or '')[:120]}", flush=True)
+                    try:
+                        _autotune_log(f"WATCHDOG_RESTART_FAIL | {(_restart.stderr or '')[:160]}")
+                    except Exception:
+                        pass
                 # Sleep longer after restart to let server recover before next check
                 _wt.sleep(180)
             elif _count > 80:
+                _mr_cur, _ = _authentik_max_requests_get_current()
                 print(
                     f"[ak-pg-watchdog] {_count} idle PG connections "
                     f"(threshold={_threshold}) — accumulation in progress, monitoring",
                     flush=True
                 )
+                try:
+                    _autotune_log(
+                        f"ACCUMULATING | idle={_count} threshold={_threshold} "
+                        f"MAX_REQUESTS={_mr_cur if _mr_cur is not None else '?'}"
+                    )
+                except Exception:
+                    pass
 
             # v0.9.23: auto-tune MAX_REQUESTS based on fire history. Runs every
             # tick (cheap — just settings read + math). Rate-limited internally
@@ -33050,6 +33167,41 @@ def authentik_max_requests_api():
         'last_fire_ts': max(fires) if fires else 0,
     }
     return jsonify(out)
+
+
+@app.route('/api/authentik/max-requests/log')
+@login_required
+def authentik_max_requests_log_api():
+    """v0.9.23 endpoint. Tail the auto-tune log file.
+
+    Query params:
+      - lines (int, default 200, max 5000): number of trailing lines to return
+
+    Returns plain text (Content-Type: text/plain) so it can be `curl`'d into
+    less / piped through grep without JSON parsing overhead.
+
+    The log file is /var/log/takguard/ak-mr-autotune.log; tail it directly
+    with `tail -F` on the VPS for live monitoring.
+    """
+    try:
+        n = int(request.args.get('lines') or 200)
+    except (TypeError, ValueError):
+        n = 200
+    n = max(1, min(n, 5000))
+    try:
+        if not os.path.exists(_AUTOTUNE_LOG_PATH):
+            return ("(no events yet — auto-tune log file does not exist; "
+                    "will be created when the watchdog records its first event)\n"),  200, {
+                'Content-Type': 'text/plain; charset=utf-8'
+            }
+        with open(_AUTOTUNE_LOG_PATH, 'r', errors='replace') as f:
+            tail = f.readlines()[-n:]
+        body = ''.join(tail) or '(log file is empty)\n'
+        return body, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        return f"(error reading log: {e})\n", 500, {
+            'Content-Type': 'text/plain; charset=utf-8'
+        }
 
 
 @app.route('/api/authentik/max-requests/autotune', methods=['POST'])
