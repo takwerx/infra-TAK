@@ -25002,7 +25002,7 @@ entries:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
     shm_size: 256m
-    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -25469,20 +25469,28 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.22 hotfix: keep statement_timeout=120s but REMOVE idle_session_timeout.
-        # Real-world validation on tak-10 showed idle_session_timeout kills
-        # django_channels_postgres LISTEN sockets, causing reconnect storms/CPU spikes.
-        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        # v0.9.23: bring back idle_session_timeout AT 300s (Christian Elsen's
+        # production-proven value, confirmed by AJ's last-month notes; matches
+        # TAK-NZ/auth-infra-style PG config). The v0.9.22 hotfix removed the
+        # value entirely after v0.9.21's 30s was killing django_channels_postgres
+        # LISTEN sockets and storming reconnects. 300s is conservative enough
+        # that long-LISTEN connections survive (tcp_keepalives_idle=60s emits
+        # protocol-level activity well within the window), but short enough to
+        # reap the leaked async-thread connections that CONN_MAX_AGE never
+        # closes — the actual root cause of the ak-pg-watchdog 5-minute restart
+        # cycle we've been observing on tak-10.
+        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
         _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
         _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
         _pg_st_match = re.search(r'statement_timeout=(\d+)s', _pg_full)
+        _pg_is_match = re.search(r'idle_session_timeout=(\d+)s', _pg_full)
         _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
         _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
         _st_needs = not _pg_st_match or _pg_st_match.group(1) != '120'
-        _ist_present = bool(re.search(r'idle_session_timeout=\d+', _pg_full))
-        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _ist_present)
+        _is_needs = not _pg_is_match or _pg_is_match.group(1) != '300'  # v0.9.23: enforce 300, not absent
+        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _is_needs)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -25503,7 +25511,8 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, removed idle_session_timeout, statement_timeout=120s) [legacy patcher]")
+                        _old_is = _pg_is_match.group(1) if _pg_is_match else '(absent)'
+                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_session_timeout={_old_is}s→300s, statement_timeout=120s) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -25649,11 +25658,16 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     services = data.setdefault('services', {})
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
-    # v0.9.22 hotfix: REMOVE idle_session_timeout after real-world validation showed
-    # it kills django_channels_postgres LISTEN sockets and causes reconnect storms.
-    # Keep statement_timeout=120s and idle_in_transaction_session_timeout=300s.
+    # v0.9.23: bring back idle_session_timeout AT 300s. v0.9.21 set it to 30s
+    # which killed django_channels_postgres LISTEN sockets (reconnect storms).
+    # v0.9.22 reverted to "absent" entirely, but absent means async-thread
+    # connections leaked by CONN_MAX_AGE never get reaped server-side, causing
+    # the ak-pg-watchdog to restart authentik-server-1 every ~5 minutes on
+    # tak-10. 300s is Christian Elsen's production value and matches
+    # TAK-NZ/auth-infra; tcp_keepalives_idle=60s keeps LISTEN sockets alive.
     _pg_target_cmd = (
         'postgres -c max_connections=500 -c statement_timeout=120s'
+        ' -c idle_session_timeout=300s'
         ' -c idle_in_transaction_session_timeout=300s'
         ' -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
     )
@@ -25668,7 +25682,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
         pg['command'] = _pg_target_cmd
         changed = True
         if plog:
-            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, no idle_session_timeout)")
+            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, idle_session_timeout=300s)")
 
     # ── Server healthcheck ────────────────────────────────────────────────────
     _target_hc = {
@@ -25771,7 +25785,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         )
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
-            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, no idle_session_timeout)")
+            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, idle_session_timeout=300s)")
             subprocess.run(
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
@@ -27556,6 +27570,18 @@ def _authentik_audit_scrape_recent(usernames=('adm_ldapservice', 'webadmin'),
                          f"{len(_events)} historical events skipped)")
                     continue
 
+                # v0.9.23 hotfix: filter to MUTATING actions only. The LDAP
+                # outpost generates a `login` event for every successful bind
+                # against adm_ldapservice (cached or not) — dozens per minute
+                # on a busy box. Logging those tells us nothing about who is
+                # mutating the user; they just fill the journal. Keep events
+                # that change state (password_set, model_updated/created/deleted,
+                # user_write, configuration_error), drop everything else.
+                _MUTATING_ACTIONS = {
+                    'password_set', 'model_created', 'model_updated',
+                    'model_deleted', 'user_write', 'configuration_error',
+                    'permission_denied', 'suspicious_request',
+                }
                 _new_events = []
                 for _ev in _events:
                     _pk = str(_ev.get('pk') or '')
@@ -27563,9 +27589,18 @@ def _authentik_audit_scrape_recent(usernames=('adm_ldapservice', 'webadmin'),
                         continue
                     if _pk == _last_seen:
                         break  # Reached previous high-water mark
+                    _action = (_ev.get('action') or '').strip()
+                    if _action not in _MUTATING_ACTIONS:
+                        continue  # noise (e.g. action=login from outpost binds)
                     _new_events.append(_ev)
 
                 if not _new_events:
+                    # No mutating events this tick — still advance the high-water
+                    # mark past whatever noise was returned, so the next scrape
+                    # doesn't re-walk + re-filter the same login spam.
+                    if _newest_pk and _newest_pk != _last_seen:
+                        _settings[_last_seen_key] = _newest_pk
+                        _settings_dirty = True
                     continue
 
                 # Log chronologically (oldest new event first)
@@ -28423,16 +28458,19 @@ def _authentik_fix_pg_idle_timeout(plog):
         return False
     current = int(m.group(1))
     # v0.9.20: also check max_connections drift (<500).
-    # v0.9.22 hotfix: also check statement_timeout=120s absent, and ensure
-    # idle_session_timeout is NOT present (LISTEN-socket reconnect storm regression).
+    # v0.9.22 hotfix: also check statement_timeout=120s absent.
+    # v0.9.23: enforce idle_session_timeout=300s (was: ensure absent). 300s reaps
+    # leaked async-thread connections without killing LISTEN sockets.
     _mc = re.search(r'max_connections=(\d+)', compose_content)
     _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
     _mc_drift = _mc_current is not None and _mc_current < 500
     _st = re.search(r'statement_timeout=(\d+)s', compose_content)
     _st_ok = _st and _st.group(1) == '120'
-    _ist_still_present = bool(re.search(r'idle_session_timeout=\d+', compose_content))
-    if current == 300 and not _mc_drift and _st_ok and not _ist_still_present:
-        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + no idle_session_timeout (idempotent — no-op)")
+    _is_match = re.search(r'idle_session_timeout=(\d+)s', compose_content)
+    _is_current = int(_is_match.group(1)) if _is_match else None
+    _is_ok = _is_current == 300
+    if current == 300 and not _mc_drift and _st_ok and _is_ok:
+        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + idle_session_timeout=300s (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
@@ -28453,9 +28491,12 @@ def _authentik_fix_pg_idle_timeout(plog):
         _drift_parts.append(f"max_connections={_mc_current}→500")
     if not _st_ok:
         _drift_parts.append("statement_timeout missing→120s")
-    if _ist_still_present:
-        _drift_parts.append("removing idle_session_timeout (kills channels LISTEN sockets / causes reconnect storm)")
-    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.21 target config")
+    if not _is_ok:
+        _drift_parts.append(
+            f"idle_session_timeout={'absent' if _is_current is None else str(_is_current)+'s'}→300s "
+            f"(reaps leaked async-thread connections; v0.9.21's 30s caused LISTEN-socket storms — 300s is safe)"
+        )
+    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.23 target config")
 
     try:
         changed = _ensure_authentik_compose_patches(compose_path, plog)
@@ -28509,6 +28550,24 @@ def _authentik_fix_pg_idle_timeout(plog):
     else:
         plog("  ⚠ pg idle timeout: Postgres pg_isready did not confirm ready in 60s — proceeding anyway")
 
+    # v0.9.23: ALTER SYSTEM RESET ALL defensively — if a past run (or extension,
+    # or stray manual command) wrote anything to postgresql.auto.conf, those
+    # entries OUTRANK the command-line args we just set. Wipe them, reload, so
+    # the command-line config wins. No-op on a clean box.
+    plog("  pg idle timeout: ALTER SYSTEM RESET ALL → pg_reload_conf (defensive — kills stale postgresql.auto.conf overrides)")
+    try:
+        _alter = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "
+            "\"ALTER SYSTEM RESET ALL; SELECT pg_reload_conf();\"",
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        if _alter.returncode == 0:
+            plog("  ✓ pg idle timeout: ALTER SYSTEM RESET ALL applied")
+        else:
+            plog(f"  ⚠ pg idle timeout: ALTER SYSTEM RESET failed: {(_alter.stderr or '')[:200]}")
+    except Exception as e:
+        plog(f"  ⚠ pg idle timeout: ALTER SYSTEM RESET exception: {e}")
+
     plog("  pg idle timeout: restarting authentik-server-1 and authentik-worker-1 (clears any crash-loop state — LDAP outpost untouched)")
     restart_ok = True
     for cn in ('authentik-server-1', 'authentik-worker-1'):
@@ -28524,8 +28583,8 @@ def _authentik_fix_pg_idle_timeout(plog):
             plog(f"  ✗ pg idle timeout: {cn} restart exception: {e}")
             restart_ok = False
 
-    # v0.9.22 follow-up: verify runtime idle_session_timeout after recreate/restart so
-    # operators do not need manual CLI checks.
+    # v0.9.23 verifier: after recreate, runtime SHOW idle_session_timeout should
+    # be '5min' (PG normalises 300s as '5min'). Accept any 300-equivalent.
     runtime_idle = ''
     verify_ok = False
     for _verify_attempt in range(6):
@@ -28537,16 +28596,17 @@ def _authentik_fix_pg_idle_timeout(plog):
             )
             if _v.returncode == 0:
                 runtime_idle = (_v.stdout or '').strip()
-                if runtime_idle in ('0', '0s'):
+                # PG prints 300s as '5min'; accept either form.
+                if runtime_idle in ('5min', '300000', '300s', '300'):
                     verify_ok = True
                     break
         except Exception:
             pass
     if verify_ok:
-        plog("  ✓ pg idle timeout: runtime verified (SHOW idle_session_timeout=0)")
+        plog(f"  ✓ pg idle timeout: runtime verified (SHOW idle_session_timeout={runtime_idle})")
     else:
         _idle_dbg = runtime_idle or 'unknown'
-        plog(f"  ⚠ pg idle timeout: runtime verification did not confirm 0 (SHOW idle_session_timeout={_idle_dbg})")
+        plog(f"  ⚠ pg idle timeout: runtime verification did not confirm 300s (SHOW idle_session_timeout={_idle_dbg})")
 
     try:
         s = load_settings()
@@ -28554,7 +28614,7 @@ def _authentik_fix_pg_idle_timeout(plog):
         cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         cfg['last_outcome'] = 'fixed' if (restart_ok and verify_ok) else ('fixed-restart-failed' if not restart_ok else 'fixed-verify-failed')
         cfg['last_previous_value'] = f'{current}s'
-        cfg['last_new_value'] = '300s + no idle_session_timeout'
+        cfg['last_new_value'] = '300s + idle_session_timeout=300s'
         cfg['last_runtime_idle_session_timeout'] = runtime_idle or 'unknown'
         s['authentik_pg_idle_timeout_fix'] = cfg
         save_settings(s)
