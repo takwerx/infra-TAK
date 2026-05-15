@@ -27049,21 +27049,26 @@ def _ensure_authentik_pgbouncer(plog):
     # missing PyYAML — `_ensure_authentik_compose_patches` falls back to a
     # legacy text patcher in that case, but adding a whole new compose
     # service via text-mangling is too fragile, so we install PyYAML on
-    # the fly. One-time cost (~3s for a ~280KB wheel) and the install
-    # targets exactly the current venv via sys.executable.
+    # the fly. One-time cost (~3s for a ~280KB wheel). Locate the venv
+    # pip via BASE_DIR — matches the existing `_ensure_gunicorn_upgrade`
+    # pattern and avoids needing `sys` at module scope (it isn't).
     try:
         import yaml as _yaml
     except ImportError:
         plog("  pgbouncer install: PyYAML missing from venv — installing now (one-time bootstrap)")
+        _venv_pip = os.path.join(BASE_DIR, '.venv', 'bin', 'pip')
+        if not os.path.exists(_venv_pip):
+            plog(f"  ✗ pgbouncer install: venv pip not found at {_venv_pip} — manual investigation required")
+            return None
         try:
             _pip_r = subprocess.run(
-                [sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', 'pyyaml'],
+                [_venv_pip, 'install', '--quiet', '--disable-pip-version-check', 'pyyaml'],
                 capture_output=True, text=True, timeout=180
             )
             if _pip_r.returncode != 0:
                 _err = ((_pip_r.stderr or '') + (_pip_r.stdout or ''))[:300]
                 plog(f"  ✗ pgbouncer install: `pip install pyyaml` failed (rc={_pip_r.returncode}): {_err}")
-                plog(f"  ✗ pgbouncer install: install manually with `sudo -u takwerx {sys.executable} -m pip install pyyaml` and restart takwerx-console")
+                plog(f"  ✗ pgbouncer install: install manually with `sudo -u takwerx {_venv_pip} install pyyaml` and restart takwerx-console")
                 return None
             import yaml as _yaml
             plog(f"  ✓ pgbouncer install: PyYAML {getattr(_yaml, '__version__', '?')} installed + imported")
