@@ -26784,7 +26784,7 @@ def _ensure_embedded_outpost_authentik_host(plog):
         plog(f"  Embedded outpost host check error (non-fatal): {_e}")
 
 
-def _ensure_authentik_proxy_external_hosts_canonical(plog):
+def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry_delay_s=5):
     """v0.9.21: For each known infra-TAK proxy provider, assert external_host matches
     https://<service-prefix>.<fqdn>.
 
@@ -26838,59 +26838,107 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog):
             'Content-Type': 'application/json',
         }
 
-        # GET all proxy providers
+        # v0.9.22 follow-up: startup may race Authentik API readiness. Retry the
+        # full canonicalization pass so Update Now converges without operator CLI.
+        # Also persist outcome in settings for support diagnostics.
+        _last_err = ''
+        _fixed_total = 0
+        _final_state = 'no-op'
+        _providers_seen = 0
+        for _attempt in range(max(1, int(max_attempts))):
+            if _attempt > 0:
+                try:
+                    plog(f"  proxy external_hosts: retry {_attempt + 1}/{max_attempts} after API warmup delay")
+                except Exception:
+                    pass
+                time.sleep(max(1, int(retry_delay_s)))
+
+            # GET all proxy providers
+            try:
+                _r = _req.Request(f'{_api_url}/api/v3/providers/proxy/?page_size=100', headers=_headers)
+                _providers = _json.loads(_req.urlopen(_r, timeout=15).read().decode()).get('results', [])
+                _providers_seen = len(_providers or [])
+            except Exception as _ge:
+                _last_err = str(_ge)
+                if _attempt >= max(1, int(max_attempts)) - 1:
+                    plog(f"  proxy external_hosts: API unreachable ({_ge}) — skip")
+                    _final_state = 'api-unreachable'
+                    break
+                continue
+
+            _fixed = 0
+            _patch_failures = 0
+            for _prov in _providers:
+                _name = (_prov.get('name') or '').strip()
+                if _name not in canonical:
+                    continue
+                _want = canonical[_name]
+                _pk = _prov.get('pk')
+                if not _pk:
+                    continue
+                # Fetch full provider record (list endpoint omits some required PATCH fields)
+                try:
+                    _full = _json.loads(_req.urlopen(
+                        _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/', headers=_headers), timeout=10
+                    ).read().decode())
+                except Exception as _fe:
+                    plog(f"  proxy external_hosts: failed to fetch provider {_name!r}: {_fe}")
+                    _patch_failures += 1
+                    continue
+                _current = (_full.get('external_host') or '').rstrip('/')
+                _want_clean = _want.rstrip('/')
+                if _current == _want_clean:
+                    continue  # already canonical
+
+                # Derive correct cookie_domain from fqdn
+                _cookie_domain = base
+                _patch = {
+                    'external_host': _want_clean + '/',
+                    'cookie_domain': _cookie_domain,
+                }
+                try:
+                    _req.urlopen(
+                        _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/',
+                                     data=_json.dumps(_patch).encode(), headers=_headers, method='PATCH'),
+                        timeout=10
+                    )
+                    plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean + '/'!r}")
+                    _fixed += 1
+                except urllib.error.HTTPError as _pe:
+                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: HTTP {_pe.code}")
+                    _patch_failures += 1
+                except Exception as _pe2:
+                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: {_pe2}")
+                    _patch_failures += 1
+
+            _fixed_total += _fixed
+            if _patch_failures == 0:
+                if _fixed == 0:
+                    plog("  proxy external_hosts: all canonical — no-op")
+                    _final_state = 'no-op'
+                else:
+                    plog(f"  proxy external_hosts: fixed {_fixed} provider(s)")
+                    _final_state = 'fixed'
+                break
+            if _attempt >= max(1, int(max_attempts)) - 1:
+                _final_state = 'partial-failure'
+                break
+
         try:
-            _r = _req.Request(f'{_api_url}/api/v3/providers/proxy/?page_size=100', headers=_headers)
-            _providers = _json.loads(_req.urlopen(_r, timeout=15).read().decode()).get('results', [])
-        except Exception as _ge:
-            plog(f"  proxy external_hosts: API unreachable ({_ge}) — skip")
-            return
-
-        _fixed = 0
-        for _prov in _providers:
-            _name = (_prov.get('name') or '').strip()
-            if _name not in canonical:
-                continue
-            _want = canonical[_name]
-            _pk = _prov.get('pk')
-            if not _pk:
-                continue
-            # Fetch full provider record (list endpoint omits some required PATCH fields)
-            try:
-                _full = _json.loads(_req.urlopen(
-                    _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/', headers=_headers), timeout=10
-                ).read().decode())
-            except Exception as _fe:
-                plog(f"  proxy external_hosts: failed to fetch provider {_name!r}: {_fe}")
-                continue
-            _current = (_full.get('external_host') or '').rstrip('/')
-            _want_clean = _want.rstrip('/')
-            if _current == _want_clean:
-                continue  # already canonical
-
-            # Derive correct cookie_domain from fqdn
-            _cookie_domain = base
-            _patch = {
-                'external_host': _want_clean + '/',
-                'cookie_domain': _cookie_domain,
-            }
-            try:
-                _req.urlopen(
-                    _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/',
-                                 data=_json.dumps(_patch).encode(), headers=_headers, method='PATCH'),
-                    timeout=10
-                )
-                plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean + '/'!r}")
-                _fixed += 1
-            except urllib.error.HTTPError as _pe:
-                plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: HTTP {_pe.code}")
-            except Exception as _pe2:
-                plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: {_pe2}")
-
-        if _fixed == 0:
-            plog("  proxy external_hosts: all canonical — no-op")
-        else:
-            plog(f"  proxy external_hosts: fixed {_fixed} provider(s)")
+            _s = load_settings()
+            _cfg = _s.get('authentik_proxy_external_hosts_canonicalization') or {}
+            _cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            _cfg['last_outcome'] = _final_state
+            _cfg['fixed_count'] = int(_fixed_total)
+            _cfg['providers_seen'] = int(_providers_seen)
+            if _last_err:
+                _cfg['last_error'] = _last_err[:200]
+            elif 'last_error' in _cfg:
+                del _cfg['last_error']
+            _s['authentik_proxy_external_hosts_canonicalization'] = _cfg
+            save_settings(_s)
+        except Exception:
+            pass
     except Exception as _e:
         plog(f"  Proxy external_hosts check error (non-fatal): {_e}")
 
@@ -39868,7 +39916,11 @@ def _startup_migrations():
         # v0.9.21: Ensure proxy provider external_hosts are canonical (e.g. nodered.<fqdn>,
         # not taktical.<fqdn>). Closes tak-10 brand-prefix drift and generalizes to all boxes.
         try:
-            _ensure_authentik_proxy_external_hosts_canonical(lambda m: print(f"Startup migration: {m}", flush=True))
+            _ensure_authentik_proxy_external_hosts_canonical(
+                lambda m: print(f"Startup migration: {m}", flush=True),
+                max_attempts=12,
+                retry_delay_s=5
+            )
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
 
@@ -40193,6 +40245,25 @@ def _post_update_auto_deploy():
                             print(f"Post-update: Authentik reconfigure error: {e}")
                         finally:
                             _auto_deploy_active.pop('authentik', None)
+                        # v0.9.22 follow-up: re-run proxy external_host canonicalization
+                        # after reconfigure, with retries. Startup pass can race API warmup.
+                        try:
+                            _s_ak = load_settings()
+                            _token_ak = (
+                                _get_authentik_env_value(_s_ak, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                                _get_authentik_env_value(_s_ak, 'AUTHENTIK_TOKEN')
+                            )
+                            _ak_url = _get_authentik_api_url(_s_ak)
+                            if _token_ak and _ak_url:
+                                _headers_ak = {'Authorization': f'Bearer {_token_ak}', 'Content-Type': 'application/json'}
+                                if _wait_for_authentik_api(_ak_url, _headers_ak, max_attempts=60, plog=lambda m: print(f"Post-update: {m}", flush=True)):
+                                    _ensure_authentik_proxy_external_hosts_canonical(
+                                        lambda m: print(f"Post-update: {m}", flush=True),
+                                        max_attempts=12,
+                                        retry_delay_s=5
+                                    )
+                        except Exception as _akph_e:
+                            print(f"Post-update: proxy external_hosts canonicalization skipped: {_akph_e}")
                         # v0.9.12: self-heal LDAP service account password drift.
                         # The reconfigure flow fixes the LDAP flow + provider but does
                         # NOT re-PATCH the adm_ldapservice user's password to match
