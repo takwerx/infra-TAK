@@ -27904,13 +27904,38 @@ def _authentik_fix_pg_idle_timeout(plog):
             plog(f"  ✗ pg idle timeout: {cn} restart exception: {e}")
             restart_ok = False
 
+    # v0.9.22 follow-up: verify runtime idle_session_timeout after recreate/restart so
+    # operators do not need manual CLI checks.
+    runtime_idle = ''
+    verify_ok = False
+    for _verify_attempt in range(6):
+        time.sleep(5)
+        try:
+            _v = subprocess.run(
+                "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c \"SHOW idle_session_timeout\"",
+                shell=True, capture_output=True, text=True, timeout=12
+            )
+            if _v.returncode == 0:
+                runtime_idle = (_v.stdout or '').strip()
+                if runtime_idle in ('0', '0s'):
+                    verify_ok = True
+                    break
+        except Exception:
+            pass
+    if verify_ok:
+        plog("  ✓ pg idle timeout: runtime verified (SHOW idle_session_timeout=0)")
+    else:
+        _idle_dbg = runtime_idle or 'unknown'
+        plog(f"  ⚠ pg idle timeout: runtime verification did not confirm 0 (SHOW idle_session_timeout={_idle_dbg})")
+
     try:
         s = load_settings()
         cfg = s.get('authentik_pg_idle_timeout_fix') or {}
         cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_outcome'] = 'fixed' if restart_ok else 'fixed-restart-failed'
+        cfg['last_outcome'] = 'fixed' if (restart_ok and verify_ok) else ('fixed-restart-failed' if not restart_ok else 'fixed-verify-failed')
         cfg['last_previous_value'] = f'{current}s'
-        cfg['last_new_value'] = '300s'
+        cfg['last_new_value'] = '300s + no idle_session_timeout'
+        cfg['last_runtime_idle_session_timeout'] = runtime_idle or 'unknown'
         s['authentik_pg_idle_timeout_fix'] = cfg
         save_settings(s)
     except Exception:
