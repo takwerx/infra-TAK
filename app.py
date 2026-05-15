@@ -26928,10 +26928,17 @@ def _authentik_apply_official_tunings(plog):
 
 # Image pin: edoburu/pgbouncer ships a tiny Alpine-based PgBouncer that supports
 # scram-sha-256 auth and auto-generates userlist.txt from DB_USER/DB_PASSWORD
-# env vars. v1.25.1 is the latest stable release as of Dec 2025 — pinning
+# env vars. v1.25.1-p0 is the latest stable release as of Dec 2025 — pinning
 # rather than :latest avoids surprise version bumps on `docker compose pull`
 # during Update Now. Image is ~15MB so the pull cost is negligible.
-_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:1.25.1'
+#
+# Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
+# through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
+# from July 2024 onward. The `-pN` suffix is the image build (patch level)
+# for that pgbouncer version. Tags MUST be the exact DockerHub tag —
+# `edoburu/pgbouncer:1.25.1` (no `v`, no `-p0`) returns 404. Verified against
+# `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
 
 # Pool sizing knobs. These are conservative defaults chosen for the typical
 # infra-TAK fleet box (2-4 vCPU, ~50 concurrent ATAK + iTAK + WebTAK + portal
@@ -27306,7 +27313,7 @@ def _ensure_authentik_pgbouncer(plog):
     # tag) get distinct errors from container-start issues (compose YAML
     # errors, depends_on chain breaks, port conflicts). Without this split,
     # `docker compose up -d pgbouncer` returns non-zero in ~1s on certain
-    # docker compose versions while only printing "Image edoburu/pgbouncer:1.25.1 Pulling"
+    # docker compose versions while only printing "Image edoburu/pgbouncer:v1.25.1-p0 Pulling"
     # to stdout — the actual error gets buried (tak-10, May 2026).
     # Note: stderr captured SEPARATELY (no shell-level 2>&1) so failure diagnosis
     # can show both streams distinctly.
