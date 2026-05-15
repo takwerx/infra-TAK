@@ -27431,6 +27431,18 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             except Exception as _re:
                 print(f"[ldap-sa-watchdog] webadmin role check error: {str(_re)[:120]}", flush=True)
 
+            # v0.9.23 Phase 1: forensic audit-log scrape AFTER any heal. This
+            # captures both (a) external writers that triggered the heal AND
+            # (b) our own password_set from _ensure_authentik_ldap_service_account
+            # so the high-water mark advances past our writes and we don't
+            # mistake them for the mystery mutator on the next tick.
+            try:
+                _new_events = _authentik_audit_scrape_recent(plog_fn=lambda m: print(m, flush=True))
+                if _new_events:
+                    _ok_counter = 0  # Activity on this tick — reset liveness
+            except Exception as _ae:
+                print(f"[ldap-sa-watchdog] audit scrape error: {str(_ae)[:120]}", flush=True)
+
             if _verdict == 'ok' and not _sa_healed and not _role_healed:
                 _ok_counter += 1
                 if _ok_counter >= _ok_log_interval:
@@ -27458,6 +27470,156 @@ def _start_ldap_sa_bind_watchdog():
         name='ldap-sa-bind-watchdog'
     )
     _t.start()
+
+
+# ---------------------------------------------------------------------------
+# v0.9.23 Phase 1 (FORENSIC): Authentik audit-log scraper
+# ---------------------------------------------------------------------------
+# Stop healing what we don't understand. The boot+watchdog self-healers (above)
+# silently re-set the adm_ldapservice password and re-add webadmin to groups
+# every time drift is detected, but they never tell us WHO is mutating the
+# state mid-session. As long as we don't know, every release is another
+# band-aid on top of a writer we haven't identified.
+#
+# Authentik already records every credential change, group update, and user
+# state change in its events API (/api/v3/events/events/) with the actor's
+# username, client IP, user agent, and context. We just have never queried it.
+#
+# This helper pulls events that mention the protected admin usernames
+# (adm_ldapservice, webadmin) since the last-seen high-water mark, logs each
+# new event as a single structured line, and stores the last 20 per user in
+# settings.json (authentik_audit_recent_<username>) so the operator can grep
+# `journalctl -u infra-tak-console -e | grep "\[audit:"` or read settings.json
+# from /authentik to see exactly who wrote what, when, from where.
+#
+# Called at:
+#   - _startup_migrations (sets initial high-water mark, no spam on first boot)
+#   - _authentik_ldap_sa_bind_watchdog_loop (end of every 5-min tick)
+#
+# Identifying the mutator: events from our own self-healer will show
+# actor=akadmin client_ip=<docker bridge>. Mystery writers will show some
+# other actor / IP / user_agent. ONE drift cycle and we will know.
+
+def _authentik_audit_scrape_recent(usernames=('adm_ldapservice', 'webadmin'),
+                                   max_per_user=20, plog_fn=None):
+    """v0.9.23 Phase 1 forensic scraper. Read Authentik /api/v3/events/events/
+    filtered by username, log new events since last-seen PK, persist rolling
+    list to settings.json for UI surfacing.
+
+    Returns count of new events seen across all usernames. Never raises;
+    callers (watchdog tick, startup migrations) must keep running on any
+    failure here.
+
+    First-call-per-username behavior: if no last-seen PK exists yet, scans the
+    current top of the event list, records the newest PK as high-water mark,
+    and does NOT log the historical events (otherwise we'd dump 50 entries on
+    every console restart). One quiet line is logged confirming initialization.
+    """
+    _log = plog_fn or (lambda m: print(m, flush=True))
+    _total_new = 0
+    try:
+        import urllib.request as _req
+        import urllib.parse as _up
+        _settings = load_settings()
+        _token = (_get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                  or _get_authentik_env_value(_settings, 'AUTHENTIK_TOKEN'))
+        if not _token:
+            return 0
+        _url = _get_authentik_api_url(_settings)
+        _headers = {'Authorization': f'Bearer {_token}'}
+
+        _settings_dirty = False
+        for _username in usernames:
+            try:
+                _last_seen_key = f'authentik_audit_last_seen_{_username}'
+                _last_seen = (_settings.get(_last_seen_key) or '').strip()
+                _q = _up.urlencode({
+                    'search': _username,
+                    'ordering': '-created',
+                    'page_size': 50,
+                })
+                _r = _req.Request(f'{_url}/api/v3/events/events/?{_q}', headers=_headers)
+                _resp = json.loads(_req.urlopen(_r, timeout=15).read().decode())
+                _events = _resp.get('results', []) or []
+                if not _events:
+                    continue
+
+                _newest_pk = str(_events[0].get('pk') or '')
+
+                if not _last_seen:
+                    # First run for this username — set high-water mark, don't spam.
+                    if _newest_pk:
+                        _settings[_last_seen_key] = _newest_pk
+                        _settings_dirty = True
+                    _log(f"[audit:{_username}] scraper initialized (high-water pk={_newest_pk[:8]}, "
+                         f"{len(_events)} historical events skipped)")
+                    continue
+
+                _new_events = []
+                for _ev in _events:
+                    _pk = str(_ev.get('pk') or '')
+                    if not _pk:
+                        continue
+                    if _pk == _last_seen:
+                        break  # Reached previous high-water mark
+                    _new_events.append(_ev)
+
+                if not _new_events:
+                    continue
+
+                # Log chronologically (oldest new event first)
+                for _ev in reversed(_new_events):
+                    _action = _ev.get('action') or '?'
+                    _created = _ev.get('created') or ''
+                    _user_obj = _ev.get('user') or {}
+                    _actor = (_user_obj.get('username')
+                              if isinstance(_user_obj, dict) else str(_user_obj))
+                    _client_ip = _ev.get('client_ip') or ''
+                    _ctx = _ev.get('context') or {}
+                    _ctx_bits = []
+                    if isinstance(_ctx, dict):
+                        for _k in ('model', 'http_request', 'auth_method', 'flow', 'message'):
+                            _v = _ctx.get(_k)
+                            if _v:
+                                _ctx_bits.append(f"{_k}={str(_v)[:80]}")
+                    _ctx_summary = ' '.join(_ctx_bits)[:240]
+                    _log(f"[audit:{_username}] {_created} action={_action} "
+                         f"actor={_actor!r} ip={_client_ip} {_ctx_summary}")
+
+                _total_new += len(_new_events)
+                if _newest_pk:
+                    _settings[_last_seen_key] = _newest_pk
+                    _settings_dirty = True
+
+                # Rolling list for UI surfacing (newest first)
+                _key = f'authentik_audit_recent_{_username}'
+                _rolling = _settings.get(_key) or []
+                if not isinstance(_rolling, list):
+                    _rolling = []
+                for _ev in _new_events:
+                    _user_obj = _ev.get('user') or {}
+                    _rolling.insert(0, {
+                        'pk': str(_ev.get('pk') or ''),
+                        'created': _ev.get('created') or '',
+                        'action': _ev.get('action') or '',
+                        'actor': (_user_obj.get('username')
+                                  if isinstance(_user_obj, dict) else str(_user_obj)),
+                        'client_ip': _ev.get('client_ip') or '',
+                        'user_agent': _ev.get('user_agent') or '',
+                        'context': _ev.get('context') or {},
+                    })
+                _settings[_key] = _rolling[:max_per_user]
+                _settings_dirty = True
+            except Exception as _e:
+                _log(f"[audit:{_username}] scrape error (non-fatal): {str(_e)[:160]}")
+                continue
+
+        if _settings_dirty:
+            save_settings(_settings)
+        return _total_new
+    except Exception as _e:
+        _log(f"audit scrape exception (non-fatal): {str(_e)[:160]}")
+        return 0
 
 
 def _auto_remove_stale_docker_service_connections(label='Post-update'):
@@ -32283,6 +32445,54 @@ def authentik_admin_accounts_api():
     has been deactivated (typically via TAK Portal user management).
     """
     return jsonify(_get_authentik_admin_accounts_status())
+
+
+@app.route('/api/authentik/audit-log')
+@login_required
+def authentik_audit_log_api():
+    """v0.9.23 Phase 1 forensic endpoint. Return the rolling audit events the
+    watchdog has scraped from Authentik for the protected admin accounts.
+
+    Useful for identifying mid-session mutators without SSH'ing to the box:
+        curl -s -H "Cookie: $C" https://<host>/api/authentik/audit-log | jq
+
+    Read-only. No mutations. Returns last 20 events per username plus repair
+    counters and last-repair timestamps so operators can correlate the audit
+    events (who/when/from-where) to our self-healer's writes.
+    """
+    s = load_settings()
+    out = {
+        'usernames': ['adm_ldapservice', 'webadmin'],
+        'repair_counters': {
+            'authentik_ldap_sa_repair_count': int(s.get('authentik_ldap_sa_repair_count') or 0),
+            'authentik_ldap_sa_last_repair': s.get('authentik_ldap_sa_last_repair') or '',
+            'authentik_webadmin_role_repair_count': int(s.get('authentik_webadmin_role_repair_count') or 0),
+            'authentik_webadmin_role_last_repair': s.get('authentik_webadmin_role_last_repair') or '',
+        },
+        'events': {
+            'adm_ldapservice': s.get('authentik_audit_recent_adm_ldapservice') or [],
+            'webadmin': s.get('authentik_audit_recent_webadmin') or [],
+        },
+        'high_water': {
+            'adm_ldapservice': s.get('authentik_audit_last_seen_adm_ldapservice') or '',
+            'webadmin': s.get('authentik_audit_last_seen_webadmin') or '',
+        },
+    }
+    return jsonify(out)
+
+
+@app.route('/api/authentik/audit-log/scrape-now', methods=['POST'])
+@login_required
+def authentik_audit_log_scrape_now_api():
+    """v0.9.23 Phase 1. Force an immediate audit-log scrape (don't wait for the
+    next 5-min watchdog tick). Useful when an operator just witnessed a drift
+    event and wants to see who wrote to the user RIGHT NOW.
+    """
+    try:
+        n = _authentik_audit_scrape_recent(plog_fn=lambda m: print(m, flush=True))
+        return jsonify({'success': True, 'new_events': n})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)[:200]}), 500
 
 
 @app.route('/api/authentik/recover-admin', methods=['POST'])
@@ -40383,6 +40593,24 @@ def _startup_migrations():
                 print("Startup: LDAP SA bind watchdog started (interval=5min, checks SA bind + webadmin roles)", flush=True)
         except Exception as _lwe:
             print(f"Startup: LDAP SA bind watchdog start failed (non-fatal): {_lwe}", flush=True)
+
+        # v0.9.23 Phase 1 (FORENSIC): seed the Authentik audit-log scraper. On
+        # first-ever run per box this sets the high-water mark silently (no log
+        # spam for historical events). On subsequent boots it logs any events
+        # that landed while the console was down — so an overnight reboot will
+        # show us any password_set / model_updated on adm_ldapservice or webadmin
+        # that happened during the outage. After this, the 5-min watchdog tick
+        # re-scrapes continuously. See PLAN-v0.9.23-alpha.md Phase 1.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _new_at_boot = _authentik_audit_scrape_recent(
+                    plog_fn=lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+                if _new_at_boot:
+                    print(f"Startup migration: audit scraper logged {_new_at_boot} new events "
+                          f"since last console run (grep '[audit:' for details)", flush=True)
+        except Exception as _ase:
+            print(f"Startup migration: audit scraper seed error (non-fatal): {_ase}", flush=True)
 
         # v0.9.0: fail2ban post-install config migrations (only run if fail2ban is already installed
         # by the operator via the Marketplace — _fail2ban_install_and_configure is NOT auto-run).
