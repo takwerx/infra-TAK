@@ -33589,10 +33589,17 @@ def authentik_pgbouncer_api():
 # eliminating the watchdog-restart outage windows entirely. But existing
 # zombies that accumulated on customer boxes pre-upgrade need cleanup —
 # TAK Server has no self-heal path for them. The only reliable cleanup is
-# a JVM restart of the takserver container (`docker restart
-# takserver-takserver-1`), which clears the in-memory subscription pool;
-# clients then reconnect through the now-stable Authentik path with proper
-# user attribution.
+# a restart of the TAK Server JVM, which clears the in-memory subscription
+# pool; clients then reconnect through the now-stable Authentik path with
+# proper user attribution.
+#
+# IMPORTANT: infra-TAK runs TAK Server as a HOST systemd service
+# (`takserver.service` + 5 sub-services: api/config/messaging/plugins/
+# retention) — NOT in a Docker container. So:
+#   - Probe runs as `sudo curl --cert /opt/tak/certs/files/admin.pem ...
+#     https://localhost:8443/Marti/api/clientEndPoints` directly on the
+#     host. The cert lives in the host filesystem (root-owned).
+#   - Sweep runs `sudo systemctl restart takserver`, NOT `docker restart`.
 #
 # This module exposes two endpoints:
 #
@@ -33601,15 +33608,9 @@ def authentik_pgbouncer_api():
 #                                        subscriptions + advisory.
 #   POST /api/takserver/zombies/sweep  — manual operator action. Body:
 #                                        {strategy: "jvm_restart"}. Runs
-#                                        `docker restart
-#                                        takserver-takserver-1`. Logs
-#                                        intent + outcome. Records in
+#                                        `sudo systemctl restart takserver`.
+#                                        Logs intent + outcome. Records in
 #                                        settings.takserver_zombie_sweep.
-#
-# Detection uses the admin cert mounted inside the takserver container at
-# /opt/tak/certs/files/admin.pem|key (always present on a v0.6.2+ deploy).
-# The console process does NOT need its own copy of the cert — we
-# `docker exec ... curl` from inside the takserver container.
 #
 # No background loop / auto-sweep — sweeping has user-visible impact
 # (every legitimate client momentarily disconnects) and operators should
@@ -33618,10 +33619,16 @@ def authentik_pgbouncer_api():
 def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=40):
     """Query Marti's `clientEndPoints` API and return zombie analysis.
 
-    Uses `docker exec takserver-takserver-1 curl --cert /opt/tak/certs/files/admin.pem
-    --key /opt/tak/certs/files/admin.key https://localhost:8443/Marti/api/clientEndPoints`
-    — the admin cert is always present in the takserver container at that
-    path on v0.6.2+ deploys. No console-side copy required.
+    infra-TAK runs TAK Server as a HOST systemd service (`takserver.service`
+    + 5 sub-services: api/config/messaging/plugins/retention), NOT in a
+    Docker container. The Java process listens on the host's 0.0.0.0:8443
+    (Marti REST API, mTLS-protected). Both admin cert files
+    (`/opt/tak/certs/files/admin.pem` and `admin.key`) live directly on
+    the host filesystem owned by root.
+
+    Probe: `sudo curl --cert ... --key ... https://localhost:8443/Marti/api/clientEndPoints`
+    — wrapped via `_sudo_wrap` because the takwerx console process runs
+    unprivileged and cannot read root-owned cert files without sudo.
 
     Returns dict with:
       total, buckets, cloudtak_total, cloudtak_stale, sample, advisory,
@@ -33645,14 +33652,22 @@ def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=40):
         'error': None,
     }
 
+    if not os.path.isfile('/opt/tak/certs/files/admin.pem'):
+        out['error'] = (
+            "TAK Server admin cert not found at /opt/tak/certs/files/admin.pem. "
+            "Either TAK Server is not deployed on this host, or the cert path differs. "
+            "The zombie diagnostic is only applicable on hosts running takserver.service."
+        )
+        return out
     try:
         r = subprocess.run(
-            "docker exec takserver-takserver-1 curl -sk "
-            "--cert /opt/tak/certs/files/admin.pem "
-            "--key /opt/tak/certs/files/admin.key "
-            "--max-time 8 "
-            "https://localhost:8443/Marti/api/clientEndPoints 2>/dev/null",
-            shell=True, capture_output=True, text=True, timeout=timeout_s
+            _sudo_wrap([
+                'curl', '-sk', '--max-time', '8',
+                '--cert', '/opt/tak/certs/files/admin.pem',
+                '--key', '/opt/tak/certs/files/admin.key',
+                'https://localhost:8443/Marti/api/clientEndPoints',
+            ]),
+            capture_output=True, text=True, timeout=timeout_s
         )
         if r.returncode != 0:
             out['error'] = (
@@ -33662,11 +33677,11 @@ def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=40):
             return out
         body = (r.stdout or '').strip()
         if not body:
-            out['error'] = 'Marti API returned empty response'
+            out['error'] = 'Marti API returned empty response (TAK Server may not be running)'
             return out
         payload = json.loads(body)
     except subprocess.TimeoutExpired:
-        out['error'] = 'Marti API call timed out — takserver container may be unresponsive'
+        out['error'] = 'Marti API call timed out — takserver.service may be unresponsive'
         return out
     except json.JSONDecodeError as je:
         out['error'] = f'Marti API returned non-JSON (first 120 chars): {body[:120]!r} | {je}'
@@ -33803,9 +33818,12 @@ def takserver_zombies_sweep_api():
 
     Body (JSON): {"strategy": "jvm_restart", "confirm": true}
 
-    Strategy `jvm_restart` runs `docker restart takserver-takserver-1`.
-    This is the only universally-reliable sweep mechanism across TAK
-    Server versions — it clears the in-memory subscription pool entirely.
+    Strategy `jvm_restart` runs `sudo systemctl restart takserver` (the host
+    systemd service). infra-TAK runs TAK Server as `takserver.service` on the
+    host — NOT in a Docker container — so the cleanup is a systemd unit
+    restart, which transitively restarts api/config/messaging/plugins/
+    retention sub-services and clears the JVM's in-memory subscription pool.
+
     Side-effect: every connected client momentarily disconnects (~30-60s)
     and reconnects. On a stable Authentik (PgBouncer installed) they will
     reconnect with proper user attribution; on an unstable Authentik
@@ -33817,9 +33835,9 @@ def takserver_zombies_sweep_api():
     breakdown so the operator can compare before/after counts.
 
     Returns:
-      200 — sweep completed (strategy ran successfully).
+      200 — sweep completed (systemctl restart succeeded).
       400 — missing/invalid strategy or confirm.
-      500 — sweep failed (e.g. docker daemon unreachable).
+      500 — sweep failed (e.g. sudo/systemctl path unavailable).
     """
     try:
         body = request.get_json(force=True, silent=True) or {}
@@ -33850,24 +33868,24 @@ def takserver_zombies_sweep_api():
     print(
         f"[takserver-zombie-sweep] operator initiated jvm_restart "
         f"(pre_total={pre_total}, pre_zombies={pre_zombies}); "
-        f"running `docker restart takserver-takserver-1`",
+        f"running `sudo systemctl restart takserver`",
         flush=True
     )
 
     try:
         r = subprocess.run(
-            ['docker', 'restart', 'takserver-takserver-1'],
+            _sudo_wrap(['systemctl', 'restart', 'takserver']),
             capture_output=True, text=True, timeout=120
         )
     except subprocess.TimeoutExpired:
         return jsonify({
             'success': False,
-            'message': 'docker restart timed out (>120s) — investigate docker daemon health.'
+            'message': 'systemctl restart timed out (>120s) — TAK Server may be hung on shutdown.'
         }), 500
     except Exception as e:
         return jsonify({
             'success': False,
-            'message': f'docker restart failed to invoke: {e}'
+            'message': f'systemctl restart failed to invoke: {e}'
         }), 500
 
     if r.returncode != 0:
@@ -33888,11 +33906,11 @@ def takserver_zombies_sweep_api():
             pass
         return jsonify({
             'success': False,
-            'message': f'docker restart takserver-takserver-1 failed (rc={r.returncode}): {err[:200]}'
+            'message': f'systemctl restart takserver failed (rc={r.returncode}): {err[:200]}'
         }), 500
 
     print(
-        f"[takserver-zombie-sweep] SUCCESS: takserver container restarted "
+        f"[takserver-zombie-sweep] SUCCESS: takserver.service restarted "
         f"(pre_total={pre_total}, pre_zombies={pre_zombies}). "
         f"Clients will reconnect over the next ~30-60s.",
         flush=True
