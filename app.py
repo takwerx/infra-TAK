@@ -33659,12 +33659,25 @@ def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=40):
             "The zombie diagnostic is only applicable on hosts running takserver.service."
         )
         return out
+    # admin.key is passphrase-encrypted on every infra-TAK deploy. The
+    # passphrase is the operator's `tak_cert_password` (default `atakatak`)
+    # stored in settings — set at TAK Server deploy time and used for every
+    # operator-issued client cert as well. curl supports `--pass <pw>` for
+    # SSL client cert key decryption; without it the process would block
+    # on a "Enter PEM pass phrase:" stdin prompt forever (no TTY in the
+    # Flask worker thread).
+    try:
+        _ts = load_settings()
+        _cert_pass = _get_tak_cert_password(_ts)
+    except Exception:
+        _cert_pass = 'atakatak'
     try:
         r = subprocess.run(
             _sudo_wrap([
                 'curl', '-sk', '--max-time', '8',
                 '--cert', '/opt/tak/certs/files/admin.pem',
                 '--key', '/opt/tak/certs/files/admin.key',
+                '--pass', _cert_pass,
                 'https://localhost:8443/Marti/api/clientEndPoints',
             ]),
             capture_output=True, text=True, timeout=timeout_s
