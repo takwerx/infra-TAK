@@ -26802,6 +26802,7 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
     import urllib.request as _req
     import urllib.error
     import json as _json
+    import base64 as _b64
 
     try:
         _ak_env = os.path.expanduser('~/authentik/.env')
@@ -26845,6 +26846,55 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
         _fixed_total = 0
         _final_state = 'no-op'
         _providers_seen = 0
+        _api_patch_failures_total = 0
+
+        def _apply_via_ak_shell():
+            """Fallback patch path when Authentik REST API is unavailable or PATCH fails.
+            Returns (ok: bool, fixed_count: int, err: str)."""
+            try:
+                _cookie = f'.{base}'
+                _py_lines = [
+                    "from authentik.providers.proxy.models import ProxyProvider",
+                    f"targets = {canonical!r}",
+                    f"cookie = {_cookie!r}",
+                    "fixed = 0",
+                    "for name, want in targets.items():",
+                    "    p = ProxyProvider.objects.filter(name=name).first()",
+                    "    if not p:",
+                    "        print(f'AK-PROXY|{name}|MISSING')",
+                    "        continue",
+                    "    cur = (p.external_host or '').rstrip('/')",
+                    "    want_clean = (want or '').rstrip('/')",
+                    "    cur_cookie = (p.cookie_domain or '')",
+                    "    if cur != want_clean or cur_cookie != cookie:",
+                    "        p.external_host = want_clean + '/'",
+                    "        p.cookie_domain = cookie",
+                    "        p.save(update_fields=['external_host', 'cookie_domain'])",
+                    "        fixed += 1",
+                    "        print(f'AK-PROXY|{name}|FIXED|{cur}|{p.external_host}|{cur_cookie}|{p.cookie_domain}')",
+                    "    else:",
+                    "        print(f'AK-PROXY|{name}|OK|{cur}|{cur_cookie}')",
+                    "print(f'AK-PROXY-SUMMARY|{fixed}')",
+                ]
+                _py = "\n".join(_py_lines) + "\n"
+                _b64_text = _b64.b64encode(_py.encode()).decode()
+                _cmd = f"docker exec authentik-server-1 sh -c 'echo {_b64_text} | base64 -d | ak shell' 2>&1"
+                _r = subprocess.run(_cmd, shell=True, capture_output=True, text=True, timeout=45)
+                _out = ((_r.stdout or '') + (_r.stderr or '')).strip()
+                if _r.returncode != 0 or 'AK-PROXY-SUMMARY|' not in _out:
+                    return False, 0, (_out[:240] or f"ak shell rc={_r.returncode}")
+                _fixed = 0
+                for _line in _out.splitlines():
+                    _line = _line.strip()
+                    if _line.startswith('AK-PROXY-SUMMARY|'):
+                        try:
+                            _fixed = int((_line.split('|', 1)[1] or '0').strip())
+                        except Exception:
+                            _fixed = 0
+                return True, _fixed, ''
+            except Exception as _e_sh:
+                return False, 0, str(_e_sh)[:240]
+
         for _attempt in range(max(1, int(max_attempts))):
             if _attempt > 0:
                 try:
@@ -26912,6 +26962,7 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                     _patch_failures += 1
 
             _fixed_total += _fixed
+            _api_patch_failures_total += _patch_failures
             if _patch_failures == 0:
                 if _fixed == 0:
                     plog("  proxy external_hosts: all canonical — no-op")
@@ -26923,6 +26974,28 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
             if _attempt >= max(1, int(max_attempts)) - 1:
                 _final_state = 'partial-failure'
                 break
+
+        # v0.9.22 follow-up: if API path couldn't converge, fall back to ak shell so
+        # Update Now can self-heal in-field without manual CLI intervention.
+        _needs_shell_fallback = (
+            _final_state in ('api-unreachable', 'partial-failure') or
+            (_providers_seen == 0 and _fixed_total == 0) or
+            (_api_patch_failures_total > 0)
+        )
+        if _needs_shell_fallback:
+            _ok_sh, _fixed_sh, _err_sh = _apply_via_ak_shell()
+            if _ok_sh:
+                _fixed_total += int(_fixed_sh)
+                if _fixed_sh > 0:
+                    plog(f"  ✓ proxy external_hosts: ak-shell fallback fixed {_fixed_sh} provider(s)")
+                    _final_state = 'fixed-via-ak-shell'
+                elif _final_state in ('api-unreachable', 'partial-failure'):
+                    # Shell path succeeded and found nothing to change.
+                    plog("  proxy external_hosts: ak-shell fallback confirms all canonical")
+                    _final_state = 'no-op'
+            else:
+                plog(f"  ✗ proxy external_hosts: ak-shell fallback failed: {_err_sh}")
+                _last_err = _err_sh or _last_err
 
         try:
             _s = load_settings()
