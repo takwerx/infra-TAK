@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.21-alpha"
+VERSION = "0.9.22-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25001,7 +25001,7 @@ entries:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
     shm_size: 256m
-    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=30s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -25468,10 +25468,10 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.21: removed idle_session_timeout=300s; added statement_timeout=120s.
-        # v0.9.21 (rev): re-added idle_session_timeout=30s — server-side cleanup for
-        # abandoned async-thread connections that Django never closes (CONN_MAX_AGE ignored).
-        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=30s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        # v0.9.22 hotfix: keep statement_timeout=120s but REMOVE idle_session_timeout.
+        # Real-world validation on tak-10 showed idle_session_timeout kills
+        # django_channels_postgres LISTEN sockets, causing reconnect storms/CPU spikes.
+        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
         _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
@@ -25480,8 +25480,8 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
         _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
         _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
         _st_needs = not _pg_st_match or _pg_st_match.group(1) != '120'
-        _ist_correct = bool(re.search(r'idle_session_timeout=30s', _pg_full))
-        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or not _ist_correct)
+        _ist_present = bool(re.search(r'idle_session_timeout=\d+', _pg_full))
+        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _ist_present)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -25502,7 +25502,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_session_timeout=30s, statement_timeout=120s) [legacy patcher]")
+                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, removed idle_session_timeout, statement_timeout=120s) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -25648,14 +25648,11 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     services = data.setdefault('services', {})
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
-    # v0.9.21: removed idle_session_timeout=300s (too-long interval caused burst CPU spike
-    # when many connections expired simultaneously). Added statement_timeout=120s.
-    # v0.9.21 (rev): re-added idle_session_timeout=30s — shorter interval distributes
-    # expirations evenly; required for server-side cleanup of abandoned async-thread
-    # connections that Django CONN_MAX_AGE never closes (thread pool abandonment pattern).
+    # v0.9.22 hotfix: REMOVE idle_session_timeout after real-world validation showed
+    # it kills django_channels_postgres LISTEN sockets and causes reconnect storms.
+    # Keep statement_timeout=120s and idle_in_transaction_session_timeout=300s.
     _pg_target_cmd = (
         'postgres -c max_connections=500 -c statement_timeout=120s'
-        ' -c idle_session_timeout=30s'
         ' -c idle_in_transaction_session_timeout=300s'
         ' -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
     )
@@ -25670,7 +25667,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
         pg['command'] = _pg_target_cmd
         changed = True
         if plog:
-            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, idle_session_timeout=30s)")
+            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, no idle_session_timeout)")
 
     # ── Server healthcheck ────────────────────────────────────────────────────
     _target_hc = {
@@ -25773,12 +25770,12 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         )
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
-            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, idle_session_timeout=30s)")
+            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, no idle_session_timeout)")
             subprocess.run(
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
             )
-            plog("  ✓ PostgreSQL recreated with updated tuning (max_connections=500, statement_timeout=120s, idle_session_timeout=30s, idle_in_transaction_session_timeout=300s)")
+            plog("  ✓ PostgreSQL recreated with updated tuning (max_connections=500, statement_timeout=120s, idle_in_transaction_session_timeout=300s)")
         else:
             subprocess.run(
                 f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
@@ -27806,15 +27803,16 @@ def _authentik_fix_pg_idle_timeout(plog):
         return False
     current = int(m.group(1))
     # v0.9.20: also check max_connections drift (<500).
-    # v0.9.21: also check statement_timeout=120s absent, and idle_session_timeout=30s present.
+    # v0.9.22 hotfix: also check statement_timeout=120s absent, and ensure
+    # idle_session_timeout is NOT present (LISTEN-socket reconnect storm regression).
     _mc = re.search(r'max_connections=(\d+)', compose_content)
     _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
     _mc_drift = _mc_current is not None and _mc_current < 500
     _st = re.search(r'statement_timeout=(\d+)s', compose_content)
     _st_ok = _st and _st.group(1) == '120'
-    _ist_correct = bool(re.search(r'idle_session_timeout=30s', compose_content))
-    if current == 300 and not _mc_drift and _st_ok and _ist_correct:
-        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + idle_session_timeout=30s (idempotent — no-op)")
+    _ist_still_present = bool(re.search(r'idle_session_timeout=\d+', compose_content))
+    if current == 300 and not _mc_drift and _st_ok and not _ist_still_present:
+        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + no idle_session_timeout (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
@@ -27835,8 +27833,8 @@ def _authentik_fix_pg_idle_timeout(plog):
         _drift_parts.append(f"max_connections={_mc_current}→500")
     if not _st_ok:
         _drift_parts.append("statement_timeout missing→120s")
-    if not _ist_correct:
-        _drift_parts.append("idle_session_timeout missing→30s (server-side cleanup for abandoned async-thread connections)")
+    if _ist_still_present:
+        _drift_parts.append("removing idle_session_timeout (kills channels LISTEN sockets / causes reconnect storm)")
     plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.21 target config")
 
     try:
