@@ -27017,11 +27017,34 @@ def _ensure_authentik_pgbouncer(plog):
         plog("  pgbouncer install: ~/authentik not installed — skip")
         return False
 
+    # PyYAML bootstrap. On tak-10 (May 2026) the takwerx-console venv was
+    # missing PyYAML — `_ensure_authentik_compose_patches` falls back to a
+    # legacy text patcher in that case, but adding a whole new compose
+    # service via text-mangling is too fragile, so we install PyYAML on
+    # the fly. One-time cost (~3s for a ~280KB wheel) and the install
+    # targets exactly the current venv via sys.executable.
     try:
         import yaml as _yaml
     except ImportError:
-        plog("  pgbouncer install: PyYAML not available — skip (compose patch unsafe without YAML)")
-        return None
+        plog("  pgbouncer install: PyYAML missing from venv — installing now (one-time bootstrap)")
+        try:
+            _pip_r = subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', 'pyyaml'],
+                capture_output=True, text=True, timeout=180
+            )
+            if _pip_r.returncode != 0:
+                _err = ((_pip_r.stderr or '') + (_pip_r.stdout or ''))[:300]
+                plog(f"  ✗ pgbouncer install: `pip install pyyaml` failed (rc={_pip_r.returncode}): {_err}")
+                plog(f"  ✗ pgbouncer install: install manually with `sudo -u takwerx {sys.executable} -m pip install pyyaml` and restart takwerx-console")
+                return None
+            import yaml as _yaml
+            plog(f"  ✓ pgbouncer install: PyYAML {getattr(_yaml, '__version__', '?')} installed + imported")
+        except ImportError:
+            plog("  ✗ pgbouncer install: PyYAML still unimportable after pip install — manual investigation required")
+            return None
+        except Exception as _be:
+            plog(f"  ✗ pgbouncer install: PyYAML bootstrap error: {_be}")
+            return None
 
     try:
         with open(compose_path, 'r') as f:
