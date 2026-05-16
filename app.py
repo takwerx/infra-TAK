@@ -363,7 +363,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.24-alpha"
+VERSION = "0.9.25-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -33575,6 +33575,112 @@ def _apply_ldap_to_coreconfig():
         return False, f'CoreConfig patched but TAK Server restart failed: {r.stderr.strip()[:120]}'
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
 
+
+# v0.9.25: Authentik docker-compose.yml helpers — duplicate-key dedupe + pre-flight validate.
+#
+# Background: v0.9.x's Phase 2 hardening injector (`_auto_harden_containers`) used a
+# whole-file literal-substring guard to add `cap_drop`/`security_opt` before
+# `command: server\n`. If an older release wrote the existing cap_drop block in a
+# slightly different position, the literal substring wasn't found anywhere, the guard
+# returned False, and the hardening pass inserted a SECOND cap_drop block. YAML rejects
+# duplicate mapping keys, which broke every subsequent `docker compose` invocation —
+# notably the LDAP outpost recreate inside `_ensure_authentik_webadmin`, blocking the
+# Sync webadmin button from recovering 8446 login. See `docs/PLAN-v0.9.25-alpha.md`.
+def _dedupe_authentik_capdrop(_ak):
+    """Strip duplicate consecutive cap_drop/security_opt blocks from each Authentik
+    service section in a compose-file string.
+
+    Idempotent and safe: only de-duplicates within a known service section
+    (`server`, `worker`, `ldap`) and only when the same `cap_drop:` mapping key
+    appears more than once inside that section. A clean file is returned byte-identical.
+
+    Returns (cleaned_ak: str, deduped_sections: list[str]).
+    """
+    import re as _re_d
+    _deduped = []
+    _hardening_block = (
+        '    cap_drop:\n      - ALL\n'
+        '    security_opt:\n      - no-new-privileges:true\n'
+    )
+    _bare_capdrop = '    cap_drop:\n      - ALL\n'
+    for _svc in ('server', 'worker', 'ldap'):
+        _anchor = f'\n  {_svc}:\n'
+        _start = _ak.find(_anchor)
+        if _start == -1:
+            continue
+        # Bound the section: next top-level service key (two-space indent, name, colon)
+        # or top-level 'volumes:' / 'networks:' at column 0.
+        _end_m = _re_d.search(
+            r'\n  [A-Za-z_][\w-]*:\n|\nvolumes:\n|\nnetworks:\n',
+            _ak[_start + 1:]
+        )
+        _end = _start + 1 + (_end_m.start() if _end_m else len(_ak))
+        _block = _ak[_start:_end]
+        _orig_block = _block
+        # First try the full hardening block (cap_drop + security_opt together).
+        # Keep the first occurrence, strip subsequent ones inside this section only.
+        if _block.count(_hardening_block) > 1:
+            _first = _block.index(_hardening_block) + len(_hardening_block)
+            _head = _block[:_first]
+            _tail = _block[_first:].replace(_hardening_block, '')
+            _block = _head + _tail
+        # Then handle bare `cap_drop:` mapping keys (without trailing security_opt)
+        # that may still appear after the dedupe above.
+        if _block.count('    cap_drop:\n') > 1:
+            _first = _block.index('    cap_drop:\n')
+            _first_end = _first + len(_bare_capdrop)
+            _head = _block[:_first_end]
+            _tail = _block[_first_end:].replace(_bare_capdrop, '')
+            _block = _head + _tail
+        if _block != _orig_block:
+            _ak = _ak[:_start] + _block + _ak[_end:]
+            _deduped.append(_svc)
+    return _ak, _deduped
+
+
+def _validate_authentik_compose(_ak):
+    """Validate that a candidate Authentik compose-file string parses with
+    `docker compose config`. Writes the string to a temp file, runs the validator,
+    captures stderr.
+
+    Returns (ok: bool, err: str). On `docker` not being available, returns
+    (True, 'docker not available — skipped validation') so non-docker hosts
+    (CI, lint) don't false-fail.
+    """
+    import tempfile as _tempfile
+    try:
+        _r_which = subprocess.run(
+            ['which', 'docker'], capture_output=True, text=True, timeout=5
+        )
+        if _r_which.returncode != 0:
+            return True, 'docker not available — skipped validation'
+    except Exception:
+        return True, 'docker not available — skipped validation'
+    _tmp = None
+    try:
+        _fd, _tmp = _tempfile.mkstemp(prefix='infratak-authentik-validate-', suffix='.yml')
+        with os.fdopen(_fd, 'w') as _f:
+            _f.write(_ak)
+        _r = subprocess.run(
+            ['docker', 'compose', '-f', _tmp, 'config'],
+            capture_output=True, text=True, timeout=30
+        )
+        if _r.returncode != 0:
+            _err = (_r.stderr or _r.stdout or 'unknown compose validation error').strip()
+            return False, _err
+        return True, ''
+    except subprocess.TimeoutExpired:
+        return False, 'docker compose config timed out after 30s'
+    except Exception as _e:
+        return False, f'compose validate exception: {_e}'
+    finally:
+        if _tmp:
+            try:
+                os.remove(_tmp)
+            except Exception:
+                pass
+
+
 def _ensure_authentik_webadmin(skip_bind_verify=False):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
@@ -33656,15 +33762,41 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
             return True, None
         # Restart LDAP outpost to clear bind cache (password change would otherwise be ignored until cache expires)
         ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        # v0.9.25: surface the full compose error (no 120-char truncation) and append a
+        # remediation hint when the error matches the duplicate-mapping-key signature.
+        # The single most common cause of this LDAP-recreate failing in the field is the
+        # duplicate `cap_drop:` block injected by older releases — Update Now in v0.9.25+
+        # auto-strips it via `_dedupe_authentik_capdrop`, so the hint points operators
+        # toward that path before any manual SSH editing.
+        def _format_ldap_restart_err(_remote, _err_text):
+            _err = (_err_text or '').strip()
+            _msg = ('Password set in Authentik but LDAP outpost restart failed on remote host'
+                    if _remote else 'Password set but LDAP restart failed')
+            if _err:
+                _msg += ': ' + _err[:1000]
+            _err_low = _err.lower()
+            if 'mapping key' in _err_low and 'already defined' in _err_low:
+                _msg += (
+                    '  Likely cause: duplicate cap_drop or security_opt block in '
+                    '~/authentik/docker-compose.yml. Click Update Now — v0.9.25+ auto-strips '
+                    'duplicate blocks. To inspect manually: '
+                    'docker compose -f ~/authentik/docker-compose.yml config'
+                )
+            elif 'yaml:' in _err_low or 'failed to parse' in _err_low:
+                _msg += (
+                    '  YAML parse failure. Run on the Authentik host: '
+                    'docker compose -f ~/authentik/docker-compose.yml config'
+                )
+            return _msg
         if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
-            ok_ldap, _ = _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
+            ok_ldap, out_ldap = _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
             if not ok_ldap:
-                return False, 'Password set in Authentik but LDAP outpost restart failed on remote host. SSH to the Authentik server and run: cd ~/authentik && docker compose up -d --force-recreate ldap'
+                return False, _format_ldap_restart_err(True, out_ldap)
         elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
             r = subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                 shell=True, capture_output=True, text=True, timeout=90)
             if r.returncode != 0:
-                return False, 'Password set but LDAP restart failed: ' + (r.stderr or r.stdout or '')[:120]
+                return False, _format_ldap_restart_err(False, r.stderr or r.stdout)
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
@@ -40893,7 +41025,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span id="sync-webadmin-msg" style="font-size:12px;color:var(--text-dim)"></span><span id="resync-ldap-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <p style="font-size:11px;color:var(--text-dim);margin-top:6px;margin-bottom:4px"><strong>Resync LDAP</strong> — Re-runs the full flow (fix blueprint if needed, restart Authentik worker, ensure service account &amp; webadmin, sync CoreConfig). Use after pulling console updates or if QR/login fails.</p>
-<p style="font-size:11px;color:var(--text-dim);margin-top:0;margin-bottom:4px"><strong>Sync webadmin</strong> — Only pushes the 8446 password from settings into Authentik. Does not restart anything.</p>
+<p style="font-size:11px;color:var(--text-dim);margin-top:0;margin-bottom:4px"><strong>Sync webadmin</strong> — Pushes the 8446 password from settings into Authentik and recreates the LDAP outpost so the new password is honored immediately (flushes bind cache). Use after changing the webadmin password.</p>
 <div style="margin-top:14px;padding:12px 14px;background:rgba(59,130,246,.06);border:1px solid var(--border);border-radius:8px">
 <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px"><strong>Change webadmin password</strong> (for 8446 login)</div>
 <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
@@ -40902,7 +41034,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button type="button" id="set-webadmin-pw-btn" onclick="setWebadminPassword()" style="padding:8px 16px;background:rgba(59,130,246,.25);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">Save password</button>
 <span id="set-webadmin-pw-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Saving updates TAK Server flat-file (8446 login). Click <strong>Sync webadmin</strong> to also update Authentik.</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Saving updates TAK Server flat-file (8446 login). Click <strong>Sync webadmin</strong> to also update Authentik and recreate the LDAP outpost.</div>
 </div>
 <div id="resync-notice" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--yellow)">TAK Portal user list may take a short moment to repopulate.</div>
 </div>
@@ -43469,6 +43601,11 @@ def _post_update_auto_deploy():
                                 1
                             )
                             print("Post-update: Node-RED compose — adding restart: unless-stopped")
+                        # Whole-file `'cap_drop:' not in content` check is intentionally safe
+                        # here because Node-RED's compose only ever has one service (`nodered`).
+                        # In contrast, the Authentik compose has multiple services (`server`,
+                        # `worker`, `ldap`) and required a section-bounded check — see
+                        # `_dedupe_authentik_capdrop` and v0.9.25 plan.
                         if 'cap_drop:' not in content and 'container_name: nodered' in content:
                             content = content.replace(
                                 'container_name: nodered\n',
@@ -43529,6 +43666,17 @@ def _post_update_auto_deploy():
                         with open(ak_compose) as _f:
                             _ak = _f.read()
                         _ak_orig = _ak
+                        # v0.9.25: dedupe duplicate cap_drop blocks first. Older releases'
+                        # whole-file substring guard on the `server:` injector could insert
+                        # a second cap_drop/security_opt block when the existing one was in
+                        # a slightly different position, producing a YAML file that fails to
+                        # parse with "mapping key 'cap_drop' already defined". This blocked
+                        # every downstream `docker compose` call — notably the LDAP outpost
+                        # recreate inside the Sync webadmin flow (`_ensure_authentik_webadmin`).
+                        # See `docs/PLAN-v0.9.25-alpha.md`.
+                        _ak, _deduped = _dedupe_authentik_capdrop(_ak)
+                        for _svc in _deduped:
+                            print(f"Post-update: Authentik — removed duplicate cap_drop in {_svc} section")
                         if '/var/run/docker.sock' in _ak:
                             # Line-filter removal — handles any indentation level
                             _ak = ''.join(
@@ -43553,11 +43701,28 @@ def _post_update_auto_deploy():
                                 _ak = _ak[:_pg_img_pos] + _pg_img_token + '    shm_size: 256m\n' + _ak[_pg_img_pos + len(_pg_img_token):]
                                 _shm_added = True
                                 print("Post-update: Authentik — added shm_size: 256m to postgresql service")
-                        for _old, _new in (
-                            ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
-                        ):
-                            if _old in _ak and _new not in _ak:
-                                _ak = _ak.replace(_old, _new, 1)
+                        # v0.9.25: section-bounded check, mirroring the LDAP pattern below.
+                        # The prior whole-file substring guard (`if _new not in _ak`) was the
+                        # root cause of duplicate cap_drop injections: any drift in the
+                        # existing server-block layout vs the literal `_new` substring caused
+                        # the guard to fail open and inject a second block. Now we look only
+                        # inside the `server:` section.
+                        _srv_start = _ak.find('\n  server:\n')
+                        if _srv_start != -1:
+                            import re as _re_srv
+                            _srv_end_m = _re_srv.search(
+                                r'\n  [A-Za-z_][\w-]*:\n|\nvolumes:\n|\nnetworks:\n',
+                                _ak[_srv_start + 1:]
+                            )
+                            _srv_end = _srv_start + 1 + (_srv_end_m.start() if _srv_end_m else len(_ak))
+                            _srv_block = _ak[_srv_start:_srv_end]
+                            if 'cap_drop:' not in _srv_block and 'restart: unless-stopped' in _srv_block:
+                                _srv_new = _srv_block.replace(
+                                    '    restart: unless-stopped\n',
+                                    '    restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n',
+                                    1
+                                )
+                                _ak = _ak[:_srv_start] + _srv_new + _ak[_srv_end:]
                         # Remove any previous worker hardening — worker must run as root (upstream design)
                         for _bad in (
                             'cap_drop:\n      - ALL\n    cap_add:\n      - CHOWN\n      - SETUID\n      - SETGID\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n',
@@ -43593,9 +43758,22 @@ def _post_update_auto_deploy():
                             if _pg_insp.returncode == 0 and _pg_shm_val != 268435456:
                                 _shm_needs_pg_recreate = True
                                 print(f"Post-update: Authentik postgresql ShmSize is {_pg_shm_val // (1024*1024)} MB — recreating to apply shm_size: 256m")
+                        # v0.9.25: pre-flight YAML/compose validation. Refuse to overwrite
+                        # ~/authentik/docker-compose.yml if our edited string doesn't parse —
+                        # past releases shipped silent breakage that surfaced hours later as
+                        # "LDAP restart failed" in the Sync webadmin UI.
                         if _ak != _ak_orig:
-                            with open(ak_compose, 'w') as _f:
-                                _f.write(_ak)
+                            _valid, _verr = _validate_authentik_compose(_ak)
+                            if not _valid:
+                                print(
+                                    'Post-update: Authentik compose validation FAILED — '
+                                    'refusing to overwrite ~/authentik/docker-compose.yml. '
+                                    f'Error: {_verr[:600]}'
+                                )
+                                _ak = _ak_orig
+                            else:
+                                with open(ak_compose, 'w') as _f:
+                                    _f.write(_ak)
                         if _shm_needs_pg_recreate:
                             # Record all UID-70 postgres PIDs before stopping so we can kill
                             # any that survive the container recreate (docker's default 10s stop
