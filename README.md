@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: [v0.9.22-alpha](docs/RELEASE-v0.9.22-alpha.md)** — Drop-in update. See the [release notes](docs/RELEASE-v0.9.22-alpha.md) for details. Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: [v0.9.23-alpha](docs/RELEASE-v0.9.23-alpha.md)** — Drop-in update. Closes the Authentik PG connection-leak class structurally via PgBouncer (transaction-pool mode); rewrites the TAK Server connection-state diagnostic against the actual cot DB schema. See the [release notes](docs/RELEASE-v0.9.23-alpha.md) for details. Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -334,6 +334,23 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.23-alpha — 2026-05-15 — PGBOUNCER ARCHITECTURAL FIX + TAK SERVER CONNECTION-STATE DIAGNOSTIC
+
+**Headline: Authentik PG connection-leak class closed structurally via PgBouncer (transaction-pool, 30-connection ceiling). Tak-10 measured at 4:1 client→server multiplexing post-fix; `maxwait=0` under load.**
+
+- **Phase 6 — PgBouncer install.** New `_ensure_authentik_pgbouncer(plog)` adds `edoburu/pgbouncer:v1.25.1-p0` as a service to `~/authentik/docker-compose.yml` (transaction pool mode, scram-sha-256 auth, `DEFAULT_POOL_SIZE=25 + RESERVE_POOL_SIZE=5 = 30 real PG conn ceiling`, `MAX_CLIENT_CONN=1000`, `SERVER_RESET_QUERY=DISCARD ALL`, `pg_isready` healthcheck). Five Authentik env vars wired into `~/authentik/.env`: `AUTHENTIK_POSTGRESQL__HOST=pgbouncer`, `__PORT=5432`, `__DISABLE_SERVER_SIDE_CURSORS=true` (REQUIRED for transaction mode per [Authentik docs](https://docs.goauthentik.io/install-config/configuration/#using-a-postgresql-connection-pooler)), `__CONN_HEALTH_CHECKS=true`, `__CONN_MAX_AGE=0`. Backups written to `*.bak.before-pgbouncer.<ts>` before any mutation; rolls back on pull/start/recreate failure.
+- **v2.2 — compose precedence fix (the part that actually makes it work).** The upstream Authentik compose template hardcodes `AUTHENTIK_POSTGRESQL__HOST: postgresql` directly in `services.{server,worker}.environment`. Per Docker Compose semantics, `environment:` takes **precedence over `env_file:`** — so rewriting `.env` alone was silently overridden every time those containers were recreated. v1 of this install shipped with that bug; v2.2 detects it (`PARTIAL INSTALL DETECTED` in the migration log) and patches `services.{server,worker}.environment.AUTHENTIK_POSTGRESQL__HOST` from `postgresql` → `pgbouncer` during install. Idempotency gate now reads per-service compose env. Post-install probe records `last_outcome='bypassed'` (not `'ok'`) if traffic still flows direct after recreate.
+- **Phase 6b — TAK Server connection-state diagnostic (v2).** New `_takserver_connection_state` helper + `GET /api/takserver/zombies` (kept as alias) and `GET /api/takserver/connection-state` (canonical). Queries the local cot DB directly via `sudo -u postgres psql cot` — no mTLS, no admin cert passphrase, no Marti API. Returns derived state: `currently_connected` / `currently_disconnected` from last event per identity, `events_last_5min` / `1h` / `24h` from audit log, `total_identities` / `total_events`, top-10 currently-connected sample, advisory in `HEALTHY` / `IDLE` / `QUIET` / `DORMANT` / `INACTIVE`. **Original v1 "zombie subscription" framing was a misdiagnosis** kept as cautionary tale in the release notes: `client_endpoint` is TAK Server's immortal audit log (`ON DELETE RESTRICT` FK), NOT a runtime subscription pool. Marti's `lastEventTime: null` means "currently disconnected", not "zombie". `sudo systemctl restart takserver` does not clear these rows because the data is persistent in Postgres. `POST /api/takserver/zombies/sweep` retired → returns 410 Gone.
+- **v2.1 advisory correction.** First v2 run on tak-10 fired `ATTENTION` on a healthy box because audit-log silence in last 5 min was treated as a routing-impairment signal — but `client_endpoint_event` records state transitions only, not CoT traffic. Stably-connected clients generate zero rows during their session. v2.1 simplifies: if `currently_connected > 0`, advisory is `HEALTHY` (no further checks).
+- **Standalone operator scripts.** `ops/diagnostics/anchortak/zombies.sh` + `zombies.py` ship paste-free DB-backed diagnostic for operators. Same v2 output, no cert handling, no passphrase prompts.
+- **Watchdog repositioned.** `_authentik_channels_pool_watchdog_loop` docstring + alert message updated — PgBouncer is now THE fix; watchdog is defense-in-depth for catastrophic regressions, not the primary lever. Will fire much less often (and for the right reasons) now that the connection ceiling is enforced architecturally.
+- **Operator surface.** `GET /api/authentik/pgbouncer` returns install status + container state + `SHOW POOLS` / `SHOW STATS` output + `pg_stat_activity` split by `via_pgbouncer` vs `direct`. `settings.authentik_pgbouncer.last_outcome` exposes `'ok'` / `'bypassed'` / `'probe-too-early'` / `'probe-degraded'`.
+- **Drop-in update.** No operator pre-flight required. Update Now triggers the migration on next console restart; existing v1-bug boxes self-heal via the v2.2 idempotency gate.
+
+Full notes: [docs/RELEASE-v0.9.23-alpha.md](docs/RELEASE-v0.9.23-alpha.md).
+
+---
 
 ### v0.9.16-alpha — 2026-05-13 — AUTHENTIK WORKER CPU HOTFIX + UI POLISH
 
