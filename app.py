@@ -33565,393 +33565,332 @@ def authentik_pgbouncer_api():
 
 
 # ---------------------------------------------------------------------------
-# v0.9.23 Phase 6b — TAK Server zombie subscription diagnostic + sweep
+# v0.9.23 Phase 6b — TAK Server connection-state diagnostic (corrected v2)
 # ---------------------------------------------------------------------------
-# Field-observed problem (Tom Andersen, anctakserver2, 2026-05-15 morning,
-# v0.9.22 box pre-PgBouncer): TAK Server's DistributedSubscriptionManager
-# holds onto subscriptions whose user-info lookup failed during an Authentik
-# LDAP-outpost outage window (each ak-pg-watchdog restart = ~30-60s outage).
-# These "half-zombies" get a callsign from the client cert's CN but never
-# get user-attribution → no group membership → no CoT routing → no
-# `lastEventTime` update on the Marti API → they appear in clientEndPoints
-# with `lastEventTime` = epoch zero (1969-12-31).
+# CORRECTED MODEL — the original Phase 6b "zombie subscription" framing was
+# based on a misunderstanding of TAK Server's data model. Forensic
+# investigation on tak-10 (2026-05-15 afternoon) revealed:
 #
-# Tom's empirical bucket distribution (199 total subs on his box, after
-# ~1.5h uptime):
-#   <5 min       :   0   ← actively reporting (catastrophic — should be N)
-#   5-15 min     :   0
-#   15-60 min    :   4
-#   1-6 hours    :  11
-#   >6 hours     : 165   ← epoch zero = null user = zombie
-#   invalid/null :  19   ← also null user
+# 1. `client_endpoint` in the cot DB is an IMMORTAL audit log (intentional —
+#    ON DELETE RESTRICT FK from client_endpoint_event), NOT a runtime
+#    subscription pool. Rows persist across JVM restarts forever.
 #
-# v0.9.23 Phase 6 (PgBouncer) PREVENTS new zombies from forming by
-# eliminating the watchdog-restart outage windows entirely. But existing
-# zombies that accumulated on customer boxes pre-upgrade need cleanup —
-# TAK Server has no self-heal path for them. The only reliable cleanup is
-# a restart of the TAK Server JVM, which clears the in-memory subscription
-# pool; clients then reconnect through the now-stable Authentik path with
-# proper user attribution.
+# 2. `client_endpoint_event` records Connected/Disconnected events with
+#    `created_ts`. Only TWO event types: id=1 Connected, id=2 Disconnected.
 #
-# IMPORTANT: infra-TAK runs TAK Server as a HOST systemd service
-# (`takserver.service` + 5 sub-services: api/config/messaging/plugins/
-# retention) — NOT in a Docker container. So:
-#   - Probe runs as `sudo curl --cert /opt/tak/certs/files/admin.pem ...
-#     https://localhost:8443/Marti/api/clientEndPoints` directly on the
-#     host. The cert lives in the host filesystem (root-owned).
-#   - Sweep runs `sudo systemctl restart takserver`, NOT `docker restart`.
+# 3. Marti's `/api/clientEndPoints` API field `lastEventTime: null` does
+#    NOT mean "zombie" or "no events" — it means **the client is currently
+#    in the Disconnected state**. Proof: device `D8985041-...` was reported
+#    as `lastEventTime: null` at 13:31 PT, then connected 60 seconds later
+#    (reflected in client_endpoint_event with type=1). The same device had
+#    7+ connect/disconnect cycles earlier that day.
 #
-# This module exposes two endpoints:
+# 4. Tak-10's `client_endpoint_event` has 1,801 events across 35 days for
+#    47 unique identities — a healthy, active audit log. The "30 zombies"
+#    that the original Phase 6b code reported were just identities ever
+#    seen, NOT operational problems.
 #
-#   GET  /api/takserver/zombies        — read-only diagnostic. Returns
-#                                        bucket counts + sample of stalest
-#                                        subscriptions + advisory.
-#   POST /api/takserver/zombies/sweep  — manual operator action. Body:
-#                                        {strategy: "jvm_restart"}. Runs
-#                                        `sudo systemctl restart takserver`.
-#                                        Logs intent + outcome. Records in
-#                                        settings.takserver_zombie_sweep.
+# 5. `sudo systemctl restart takserver` does NOT clear the persisted
+#    client_endpoint rows — we proved this on tak-10 (27 pre-restart,
+#    27 post-restart, same UIDs, just bumped timestamps from new events).
+#    So the original `jvm_restart` sweep strategy was a no-op.
 #
-# No background loop / auto-sweep — sweeping has user-visible impact
-# (every legitimate client momentarily disconnects) and operators should
-# decide when to do it. The endpoint is the surface area.
+# What this means for v0.9.23:
+#
+#   - The PgBouncer fix (Phase 6) is GOOD and stays. Authentik leak ⇒ PG
+#     conn exhaustion ⇒ ak-pg-watchdog restarts ⇒ LDAP-outpost outages is
+#     a real upstream class that PgBouncer architecturally closes.
+#
+#   - The "downstream zombie accumulation" framing was wrong. PgBouncer
+#     stability protects against new auth-disruption-during-connect events
+#     (which were never showing up as "zombies" anyway — see point 3).
+#
+#   - The diagnostic must report ACTUAL connection state, not bucket the
+#     Marti API's misleading `lastEventTime` field. Source of truth:
+#     `client_endpoint_event.created_ts` joined to the latest event per
+#     identity (Connected vs Disconnected).
+#
+# infra-TAK access pattern: cot DB is local PostgreSQL on every TAK Server
+# host (the `takserver` systemd unit + the `postgresql` systemd unit run on
+# the same box). Console queries via `sudo -u postgres psql cot -tAF$'\t' -c ...`
+# — same pattern as `_authentik_pgbouncer_pg_activity_breakdown`.
+#
+# Endpoint: GET /api/takserver/zombies — kept as a URL alias since it was
+# shipped earlier today; returns the new accurate v2 response shape.
+# Endpoint: POST /api/takserver/zombies/sweep — kept for back-compat but
+# returns 410 GONE because there's nothing to sweep under the corrected
+# model.
 
-def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=40):
-    """Query Marti's `clientEndPoints` API and return zombie analysis.
+def _takserver_connection_state(timeout_s=10, sample_size=10):
+    """Query the cot DB directly for actual TAK Server connection state.
 
-    infra-TAK runs TAK Server as a HOST systemd service (`takserver.service`
-    + 5 sub-services: api/config/messaging/plugins/retention), NOT in a
-    Docker container. The Java process listens on the host's 0.0.0.0:8443
-    (Marti REST API, mTLS-protected). Both admin cert files
-    (`/opt/tak/certs/files/admin.pem` and `admin.key`) live directly on
-    the host filesystem owned by root.
+    Replaces the broken Marti-API-based bucket logic (see v2 module header
+    for forensic detail). Returns ACTUAL signals:
 
-    Probe: `sudo curl --cert ... --key ... https://localhost:8443/Marti/api/clientEndPoints`
-    — wrapped via `_sudo_wrap` because the takwerx console process runs
-    unprivileged and cannot read root-owned cert files without sudo.
+      total_identities       — row count of client_endpoint (all-time)
+      currently_connected    — identities whose most recent event is type=1
+      currently_disconnected — identities whose most recent event is type=2
+      total_events           — row count of client_endpoint_event
+      events_last_5min       — events created in the last 5 minutes
+      events_last_1h         — events created in the last hour
+      events_last_24h        — events created in the last day
+      earliest_event_utc     — oldest audit row
+      latest_event_utc       — newest audit row (== "is anything happening?")
+      sample_connected       — top N currently-connected clients (callsign,
+                               uid, username, since_utc)
+      advisory               — human-readable verdict
+      taken_at_utc           — when this snapshot was taken
+      error                  — string if probe failed, else None
 
-    Returns dict with:
-      total, buckets, cloudtak_total, cloudtak_stale, sample, advisory,
-      taken_at_utc, error
+    Probe: `sudo -u postgres psql cot -tAF$'\\t' -c <sql>` — same access
+    pattern as the rest of app.py's local-DB integrations. The takwerx
+    console process runs unprivileged and reaches `postgres` via the
+    standard `sudo -u postgres psql ...` peer-auth path. The `cot` DB and
+    its tables are created by TAK Server deploy and remain stable across
+    TAK Server versions on infra-TAK boxes; if the table layout ever
+    changes we degrade gracefully via the `error` field.
     """
     out = {
-        'total': 0,
-        'buckets': {
-            'lt_5min': 0,
-            '5_15min': 0,
-            '15_60min': 0,
-            '1_6hr': 0,
-            'gt_6hr': 0,
-            'invalid_or_null_time': 0,
-        },
-        'cloudtak_total': 0,
-        'cloudtak_stale': 0,
-        'sample': [],
+        'model': 'v2',
+        'total_identities': 0,
+        'currently_connected': 0,
+        'currently_disconnected': 0,
+        'total_events': 0,
+        'events_last_5min': 0,
+        'events_last_1h': 0,
+        'events_last_24h': 0,
+        'earliest_event_utc': None,
+        'latest_event_utc': None,
+        'sample_connected': [],
         'advisory': None,
         'taken_at_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
         'error': None,
     }
 
-    if not os.path.isfile('/opt/tak/certs/files/admin.pem'):
+    if not os.path.isdir('/opt/tak'):
         out['error'] = (
-            "TAK Server admin cert not found at /opt/tak/certs/files/admin.pem. "
-            "Either TAK Server is not deployed on this host, or the cert path differs. "
-            "The zombie diagnostic is only applicable on hosts running takserver.service."
+            "TAK Server not installed on this host (/opt/tak missing). "
+            "Connection-state diagnostic is only applicable on hosts running takserver.service."
         )
         return out
-    # admin.key is passphrase-encrypted on every infra-TAK deploy. The
-    # passphrase is the operator's `tak_cert_password` (default `atakatak`)
-    # stored in settings — set at TAK Server deploy time and used for every
-    # operator-issued client cert as well. curl supports `--pass <pw>` for
-    # SSL client cert key decryption; without it the process would block
-    # on a "Enter PEM pass phrase:" stdin prompt forever (no TTY in the
-    # Flask worker thread).
-    try:
-        _ts = load_settings()
-        _cert_pass = _get_tak_cert_password(_ts)
-    except Exception:
-        _cert_pass = 'atakatak'
+
+    sql_stats = (
+        "WITH last_event_per_id AS ("
+        "  SELECT DISTINCT ON (client_endpoint_id) "
+        "    client_endpoint_id, connection_event_type_id, created_ts "
+        "  FROM client_endpoint_event "
+        "  ORDER BY client_endpoint_id, created_ts DESC"
+        ") "
+        "SELECT "
+        "  (SELECT COUNT(*) FROM client_endpoint) AS total_identities, "
+        "  COUNT(*) FILTER (WHERE connection_event_type_id = 1) AS connected, "
+        "  COUNT(*) FILTER (WHERE connection_event_type_id = 2) AS disconnected, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event) AS total_events, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event WHERE created_ts > NOW() - INTERVAL '5 minutes') AS events_5min, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event WHERE created_ts > NOW() - INTERVAL '1 hour') AS events_1h, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event WHERE created_ts > NOW() - INTERVAL '24 hours') AS events_24h, "
+        "  (SELECT MIN(created_ts) FROM client_endpoint_event) AS earliest, "
+        "  (SELECT MAX(created_ts) FROM client_endpoint_event) AS latest "
+        "FROM last_event_per_id"
+    )
+
     try:
         r = subprocess.run(
-            _sudo_wrap([
-                'curl', '-sk', '--max-time', '8',
-                '--cert', '/opt/tak/certs/files/admin.pem',
-                '--key', '/opt/tak/certs/files/admin.key',
-                '--pass', _cert_pass,
-                'https://localhost:8443/Marti/api/clientEndPoints',
-            ]),
+            _sudo_wrap(['sudo', '-u', 'postgres', 'psql', 'cot',
+                        '-tAF', '\t', '-c', sql_stats]),
             capture_output=True, text=True, timeout=timeout_s
         )
-        if r.returncode != 0:
-            out['error'] = (
-                f"Marti API curl failed (rc={r.returncode}): "
-                + ((r.stderr or '') + (r.stdout or ''))[:200]
-            )
-            return out
-        body = (r.stdout or '').strip()
-        if not body:
-            out['error'] = 'Marti API returned empty response (TAK Server may not be running)'
-            return out
-        payload = json.loads(body)
     except subprocess.TimeoutExpired:
-        out['error'] = 'Marti API call timed out — takserver.service may be unresponsive'
-        return out
-    except json.JSONDecodeError as je:
-        out['error'] = f'Marti API returned non-JSON (first 120 chars): {body[:120]!r} | {je}'
+        out['error'] = 'cot DB query timed out — postgresql.service may be unresponsive'
         return out
     except Exception as e:
-        out['error'] = f'Marti probe error: {e}'
+        out['error'] = f'cot DB probe error: {e}'
         return out
 
-    from datetime import timezone as _tz
-    subs = payload.get('data') or []
-    out['total'] = len(subs)
-    now = datetime.now(_tz.utc)
-
-    cloudtak_ages = []
-    aged_subs = []
-    for sub in subs:
-        t = sub.get('lastEventTime') or ''
-        callsign = sub.get('callsign') or ''
-        username = sub.get('username') or ''
-        uid = sub.get('uid') or ''
-        if not t:
-            out['buckets']['invalid_or_null_time'] += 1
-            aged_subs.append((float('inf'), callsign, username, uid, '(null)'))
-            continue
-        try:
-            dt = datetime.fromisoformat(t.replace('Z', '+00:00'))
-            age = (now - dt).total_seconds()
-        except Exception:
-            out['buckets']['invalid_or_null_time'] += 1
-            aged_subs.append((float('inf'), callsign, username, uid, t))
-            continue
-
-        if callsign == 'CloudTAK User':
-            cloudtak_ages.append(age)
-
-        if age < 300:
-            out['buckets']['lt_5min'] += 1
-        elif age < 900:
-            out['buckets']['5_15min'] += 1
-        elif age < 3600:
-            out['buckets']['15_60min'] += 1
-        elif age < 21600:
-            out['buckets']['1_6hr'] += 1
+    if r.returncode != 0:
+        err = ((r.stderr or '') + (r.stdout or ''))[:240]
+        if 'does not exist' in err.lower() and ('client_endpoint' in err.lower() or 'cot' in err.lower()):
+            out['error'] = (
+                "cot DB or client_endpoint table not found. TAK Server may not be deployed "
+                "on this host, or the schema differs from the standard TAK Server layout."
+            )
         else:
-            out['buckets']['gt_6hr'] += 1
+            out['error'] = f'psql failed (rc={r.returncode}): {err}'
+        return out
 
-        aged_subs.append((age, callsign, username, uid, t))
+    line = (r.stdout or '').strip().splitlines()
+    if not line:
+        out['error'] = 'cot DB returned no rows from stats query'
+        return out
+    parts = line[0].split('\t')
+    if len(parts) < 9:
+        out['error'] = f'cot DB stats output malformed (got {len(parts)} fields): {line[0][:120]!r}'
+        return out
 
-    out['cloudtak_total'] = len(cloudtak_ages)
-    out['cloudtak_stale'] = sum(1 for a in cloudtak_ages if a >= 300)
+    def _int(s):
+        try:
+            return int((s or '0').strip() or '0')
+        except ValueError:
+            return 0
 
-    aged_subs.sort(key=lambda x: x[0], reverse=True)
-    out['sample'] = [
-        {
-            'age_seconds': (None if a == float('inf') else int(a)),
-            'callsign': c,
-            'username': u,
-            'uid': uid,
-            'last_event_time': t,
-        }
-        for (a, c, u, uid, t) in aged_subs[:sample_size]
-    ]
+    out['total_identities']     = _int(parts[0])
+    out['currently_connected']  = _int(parts[1])
+    out['currently_disconnected'] = _int(parts[2])
+    out['total_events']         = _int(parts[3])
+    out['events_last_5min']     = _int(parts[4])
+    out['events_last_1h']       = _int(parts[5])
+    out['events_last_24h']      = _int(parts[6])
+    out['earliest_event_utc']   = (parts[7] or '').strip() or None
+    out['latest_event_utc']     = (parts[8] or '').strip() or None
 
-    zombies = out['buckets']['gt_6hr'] + out['buckets']['invalid_or_null_time']
-    stale = out['buckets']['1_6hr'] + out['buckets']['15_60min']
-    active = out['buckets']['lt_5min'] + out['buckets']['5_15min']
-
-    if out['total'] == 0:
-        out['advisory'] = 'No subscriptions reported. TAK Server may have just restarted, or no clients are connected.'
-    elif zombies == 0 and stale == 0:
-        out['advisory'] = f'Healthy: {active} active subs, no zombies, no stale subs.'
-    elif zombies > 0 and active == 0:
-        out['advisory'] = (
-            f'CRITICAL: {zombies} zombie/null-user subs and ZERO active subs. '
-            'Indicates clients are creating subscriptions but cannot route CoT — '
-            'almost always caused by Authentik LDAP outpost outage windows. '
-            'On v0.9.23+ (PgBouncer): run POST /api/takserver/zombies/sweep with '
-            '{"strategy":"jvm_restart"} to clear, then verify ak-pg-watchdog stays quiet. '
-            'On v0.9.22 or older: upgrade first — sweep alone will recur within hours.'
+    if sample_size > 0 and out['currently_connected'] > 0:
+        sql_sample = (
+            "WITH last_event_per_id AS ("
+            "  SELECT DISTINCT ON (client_endpoint_id) "
+            "    client_endpoint_id, connection_event_type_id, created_ts "
+            "  FROM client_endpoint_event "
+            "  ORDER BY client_endpoint_id, created_ts DESC"
+            ") "
+            "SELECT ce.callsign, ce.uid, COALESCE(ce.username, ''), le.created_ts "
+            "FROM last_event_per_id le "
+            "JOIN client_endpoint ce ON ce.id = le.client_endpoint_id "
+            f"WHERE le.connection_event_type_id = 1 "
+            "ORDER BY le.created_ts DESC "
+            f"LIMIT {int(sample_size)}"
         )
-    elif zombies > active:
+        try:
+            sr = subprocess.run(
+                _sudo_wrap(['sudo', '-u', 'postgres', 'psql', 'cot',
+                            '-tAF', '\t', '-c', sql_sample]),
+                capture_output=True, text=True, timeout=timeout_s
+            )
+            if sr.returncode == 0:
+                for ln in (sr.stdout or '').strip().splitlines():
+                    sp = ln.split('\t')
+                    if len(sp) >= 4:
+                        out['sample_connected'].append({
+                            'callsign': sp[0],
+                            'uid': sp[1],
+                            'username': sp[2],
+                            'connected_since_utc': sp[3].strip() or None,
+                        })
+        except Exception:
+            pass
+
+    connected = out['currently_connected']
+    disconnected = out['currently_disconnected']
+    e5 = out['events_last_5min']
+    e1h = out['events_last_1h']
+    e24h = out['events_last_24h']
+    total_ev = out['total_events']
+
+    if total_ev == 0:
         out['advisory'] = (
-            f'DEGRADED: {zombies} zombie/null-user subs vs {active} active. '
-            'Recommend POST /api/takserver/zombies/sweep with {"strategy":"jvm_restart"} '
-            'after confirming Authentik is stable (PgBouncer installed, watchdog quiet).'
+            'INACTIVE: no events recorded. TAK Server may be freshly installed '
+            'or has never had a client connect.'
+        )
+    elif connected > 0 and e5 > 0:
+        out['advisory'] = (
+            f'HEALTHY: {connected} client(s) currently connected, {e5} event(s) '
+            f'in last 5 min. Audit log holds {total_ev} events across {out["total_identities"]} '
+            'identities.'
+        )
+    elif connected > 0 and e5 == 0:
+        out['advisory'] = (
+            f'ATTENTION: {connected} client(s) currently connected but NO events in last 5 min. '
+            'CoT routing may be impaired, OR clients are connected but idle. Watch '
+            'events_last_1h — if that\'s also 0 for >30 min, investigate TAK Server health.'
+        )
+    elif connected == 0 and e1h > 0:
+        out['advisory'] = (
+            f'IDLE: no clients currently connected, but {e1h} event(s) in last hour. '
+            'Recently active — normal for boxes between sessions.'
+        )
+    elif connected == 0 and e24h > 0:
+        out['advisory'] = (
+            f'QUIET: no recent activity. {e24h} event(s) in last 24h. '
+            'Normal for test/standby boxes.'
         )
     else:
         out['advisory'] = (
-            f'OK with zombies: {active} active, {stale} stale, {zombies} zombies. '
-            'Sweep optional — zombies will not auto-clear without JVM restart but '
-            'they do not block new connections.'
+            f'DORMANT: no events in last 24h, {disconnected} identities currently disconnected. '
+            'Test/idle box, or TAK Server is up but no clients have connected lately. '
+            'Verify takserver.service is healthy if this is a production box.'
         )
 
     return out
 
 
+def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=10):
+    """Back-compat shim: now delegates to the corrected v2 connection-state probe.
+
+    The original Marti-API-based implementation reported `lastEventTime: null` as
+    "zombie" when it actually means "currently disconnected" — see v2 module
+    header for the forensic trace. Kept as a name alias because earlier code in
+    this release wired the symbol into the (now retired) sweep endpoint and the
+    `/api/takserver/zombies` endpoint.
+    """
+    return _takserver_connection_state(timeout_s=timeout_s, sample_size=sample_size)
+
+
 @app.route('/api/takserver/zombies')
+@app.route('/api/takserver/connection-state')
 @login_required
 def takserver_zombies_api():
-    """v0.9.23 Phase 6b. Read-only TAK Server zombie subscription diagnostic.
+    """v0.9.23 Phase 6b (v2 corrected model). TAK Server connection-state diagnostic.
 
-    Queries Marti's clientEndPoints API via the admin cert mounted inside
-    the takserver container, parses `lastEventTime` per subscription,
-    buckets by age, and returns the analysis + advisory + sample of the
-    stalest 40 subscriptions.
+    URL `/api/takserver/zombies` is kept as a back-compat alias (the route
+    was published earlier in v0.9.23 development under the old "zombie"
+    framing); `/api/takserver/connection-state` is the canonical name now
+    that the underlying model has been corrected.
 
-    Designed to power a dashboard tile + answer the operator question
-    "do I need to JVM-restart TAK Server right now to clean up zombies?"
+    Queries the local cot PostgreSQL DB directly (the source of truth for
+    TAK Server's audit log + current connection state) instead of the
+    Marti REST API's `clientEndPoints` endpoint, which reports
+    `lastEventTime: null` for currently-disconnected clients in a way
+    that misled the original "zombie bucket" logic.
 
-    Read-only. Returns 200 JSON even when probe fails (with `error` set
-    to the diagnostic string) so the dashboard can render the failure
-    state instead of throwing.
+    Read-only. Returns 200 JSON even when the probe fails (with `error`
+    set to the diagnostic string) so dashboards can render the failure
+    state cleanly. See v2 module header for the corrected mental model.
     """
-    out = _takserver_subscriptions_breakdown(timeout_s=12, sample_size=40)
-    try:
-        s = load_settings()
-        last_sweep = (s.get('takserver_zombie_sweep') or {})
-        out['last_sweep'] = {
-            'ran_at_utc': last_sweep.get('ran_at_utc'),
-            'strategy': last_sweep.get('strategy'),
-            'outcome': last_sweep.get('outcome'),
-            'pre_total': last_sweep.get('pre_total'),
-            'pre_zombies': last_sweep.get('pre_zombies'),
-        }
-    except Exception:
-        out['last_sweep'] = None
-    return jsonify(out)
+    return jsonify(_takserver_connection_state(timeout_s=12, sample_size=10))
 
 
 @app.route('/api/takserver/zombies/sweep', methods=['POST'])
 @login_required
 def takserver_zombies_sweep_api():
-    """v0.9.23 Phase 6b. Manual operator action: clear zombie subscriptions.
+    """v0.9.23 Phase 6b — RETIRED. Returns 410 Gone.
 
-    Body (JSON): {"strategy": "jvm_restart", "confirm": true}
+    The original `jvm_restart` strategy assumed `sudo systemctl restart takserver`
+    would clear leaked subscription state from TAK Server's in-memory pool. Field
+    forensic on tak-10 (2026-05-15 afternoon) proved this assumption wrong:
+    `client_endpoint` rows are persisted to the cot DB by TAK Server's normal
+    audit-log mechanism and survive every JVM restart (we ran one and counted
+    27 rows pre-restart, 27 rows post-restart, same UIDs, just bumped
+    timestamps). The "zombies" the original endpoint reported are not a runtime
+    leak — they're durable audit log entries.
 
-    Strategy `jvm_restart` runs `sudo systemctl restart takserver` (the host
-    systemd service). infra-TAK runs TAK Server as `takserver.service` on the
-    host — NOT in a Docker container — so the cleanup is a systemd unit
-    restart, which transitively restarts api/config/messaging/plugins/
-    retention sub-services and clears the JVM's in-memory subscription pool.
+    No replacement strategy is offered because there is nothing to sweep under
+    the corrected model. Operators wanting a clean dashboard view should use
+    GET /api/takserver/zombies (alias /api/takserver/connection-state) which
+    now reports actual connection state instead of misclassified audit rows.
 
-    Side-effect: every connected client momentarily disconnects (~30-60s)
-    and reconnects. On a stable Authentik (PgBouncer installed) they will
-    reconnect with proper user attribution; on an unstable Authentik
-    (no PgBouncer, watchdog still firing) some will re-zombie within
-    minutes.
-
-    The endpoint REQUIRES `confirm=true` in the body to guard against
-    accidental sweep from a stray curl. It also captures the pre-sweep
-    breakdown so the operator can compare before/after counts.
-
-    Returns:
-      200 — sweep completed (systemctl restart succeeded).
-      400 — missing/invalid strategy or confirm.
-      500 — sweep failed (e.g. sudo/systemctl path unavailable).
+    Optional audit-log pruning (delete client_endpoint_event rows older than N
+    days) may be added in a future release if operators report needing it.
     """
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-    except Exception:
-        body = {}
-    strategy = (body.get('strategy') or '').strip().lower()
-    confirm = bool(body.get('confirm'))
-
-    if strategy != 'jvm_restart':
-        return jsonify({
-            'success': False,
-            'message': 'Only strategy="jvm_restart" is supported in v0.9.23. '
-                       'Per-subscription DELETE is deferred — Marti API endpoint '
-                       'shape varies across TAK Server versions.'
-        }), 400
-    if not confirm:
-        return jsonify({
-            'success': False,
-            'message': 'Body must include {"confirm": true}. The sweep momentarily '
-                       'disconnects every connected client (~30-60s reconnect window) '
-                       'so we require explicit confirmation.'
-        }), 400
-
-    pre = _takserver_subscriptions_breakdown(timeout_s=8, sample_size=0)
-    pre_total = pre.get('total', 0)
-    pre_zombies = pre.get('buckets', {}).get('gt_6hr', 0) + pre.get('buckets', {}).get('invalid_or_null_time', 0)
-
-    print(
-        f"[takserver-zombie-sweep] operator initiated jvm_restart "
-        f"(pre_total={pre_total}, pre_zombies={pre_zombies}); "
-        f"running `sudo systemctl restart takserver`",
-        flush=True
-    )
-
-    try:
-        r = subprocess.run(
-            _sudo_wrap(['systemctl', 'restart', 'takserver']),
-            capture_output=True, text=True, timeout=120
-        )
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            'success': False,
-            'message': 'systemctl restart timed out (>120s) — TAK Server may be hung on shutdown.'
-        }), 500
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'systemctl restart failed to invoke: {e}'
-        }), 500
-
-    if r.returncode != 0:
-        err = ((r.stderr or '') + (r.stdout or ''))[:300]
-        print(f"[takserver-zombie-sweep] FAILED (rc={r.returncode}): {err}", flush=True)
-        try:
-            s = load_settings()
-            s['takserver_zombie_sweep'] = {
-                'ran_at_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'strategy': 'jvm_restart',
-                'outcome': 'failed',
-                'pre_total': pre_total,
-                'pre_zombies': pre_zombies,
-                'error': err[:200],
-            }
-            save_settings(s)
-        except Exception:
-            pass
-        return jsonify({
-            'success': False,
-            'message': f'systemctl restart takserver failed (rc={r.returncode}): {err[:200]}'
-        }), 500
-
-    print(
-        f"[takserver-zombie-sweep] SUCCESS: takserver.service restarted "
-        f"(pre_total={pre_total}, pre_zombies={pre_zombies}). "
-        f"Clients will reconnect over the next ~30-60s.",
-        flush=True
-    )
-
-    try:
-        s = load_settings()
-        s['takserver_zombie_sweep'] = {
-            'ran_at_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'strategy': 'jvm_restart',
-            'outcome': 'ok',
-            'pre_total': pre_total,
-            'pre_zombies': pre_zombies,
-        }
-        save_settings(s)
-    except Exception:
-        pass
-
     return jsonify({
-        'success': True,
+        'success': False,
+        'gone': True,
         'message': (
-            f'TAK Server container restarted. Pre-sweep had {pre_total} subscriptions '
-            f'({pre_zombies} zombies). Clients will reconnect over the next ~30-60s. '
-            f'Run GET /api/takserver/zombies after 2 minutes to confirm cleanup.'
+            'This endpoint is retired. The original "jvm_restart" sweep was a no-op '
+            'under the corrected model — TAK Server\'s client_endpoint rows are '
+            'persistent audit-log entries, not leaked subscriptions, and survive '
+            'every systemctl restart. Use GET /api/takserver/zombies (or its '
+            'canonical alias /api/takserver/connection-state) to see real connection '
+            'state. See docs/PLAN-v0.9.23-alpha.md Item 7 for the forensic detail.'
         ),
-        'pre_total': pre_total,
-        'pre_zombies': pre_zombies,
-    })
+    }), 410
 
 
 def _get_authentik_webadmin_status():
