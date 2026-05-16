@@ -33891,8 +33891,34 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
             r = subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                 shell=True, capture_output=True, text=True, timeout=90)
+            # v0.9.25 hotfix #3: retry-after-heal. If the first recreate
+            # failed with a YAML parse error (most commonly the duplicate-
+            # cap_drop signature observed on tak-10), run the self-heal
+            # again and retry once. The heal call above this block already
+            # ran preemptively (hotfix #2), but the retry catches the case
+            # where heal returned None (e.g. file was canonical at the
+            # preemptive call but somehow got re-broken before recreate,
+            # or the heal returned a status string but no actual write
+            # happened because validate rejected the result). Cheap belt-
+            # and-suspenders that closes the door on "Sync still fails
+            # with the same banner after Update Now ran the heal."
             if r.returncode != 0:
-                return False, _format_ldap_restart_err(False, r.stderr or r.stdout)
+                _err_combined = (r.stderr or '') + (r.stdout or '')
+                _err_low = _err_combined.lower()
+                if ('yaml' in _err_low or 'mapping key' in _err_low or
+                        'failed to parse' in _err_low or 'already defined' in _err_low):
+                    print(f"Sync webadmin: LDAP recreate failed with YAML error — running self-heal and retrying once", flush=True)
+                    try:
+                        _retry_heal_msg = _self_heal_authentik_compose()
+                        print(f"Sync webadmin: retry heal result: {_retry_heal_msg!r}", flush=True)
+                    except Exception as _rhe:
+                        print(f"Sync webadmin: retry heal error (non-fatal): {_rhe}", flush=True)
+                    r = subprocess.run(
+                        'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
+                        shell=True, capture_output=True, text=True, timeout=90
+                    )
+                if r.returncode != 0:
+                    return False, _format_ldap_restart_err(False, r.stderr or r.stdout)
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
@@ -42806,6 +42832,69 @@ def _startup_migrations():
                 print(f"Startup migration: Guard Dog stamped at {VERSION}")
             except Exception as gu_err:
                 print(f"Startup migration: Guard Dog stamp error: {gu_err}")
+
+        # v0.9.25 hotfix #3 (2026-05-16 12:55 PT, after tak-10 fail-loop):
+        # Run the Authentik compose YAML self-heal FIRST, before any other
+        # migration tries to docker-compose against it. This MUST be the
+        # first Authentik-touching call in _startup_migrations because:
+        #   - _authentik_apply_official_tunings (below) calls
+        #     `docker compose up -d --force-recreate server worker` which
+        #     hard-fails on YAML parse errors;
+        #   - `_recreate_authentik_server_worker`, `_ensure_authentik_pgbouncer`,
+        #     `_authentik_fix_ldap_flow_recursion` etc. all do the same.
+        # Heal is idempotent, never raises, no-op when the file is already
+        # canonical. _post_update_auto_deploy below ALSO calls heal in its
+        # same-version branch (hotfix #2), but startup-migrations runs
+        # UNCONDITIONALLY on every console restart while _post_update is
+        # gated on a separate locks/version state — this is the
+        # belt-and-suspenders home for the heal.
+        #
+        # Diagnostic: print VERSION + git rev at startup so the operator
+        # can grep for the revision that's actually loaded. tak-10 fail
+        # loop (2026-05-16) was hard to diagnose because we couldn't tell
+        # whether the running console had the hotfix code or not.
+        try:
+            _boot_rev = ''
+            try:
+                _rev = subprocess.run(
+                    ['git', '-C', os.path.dirname(os.path.abspath(__file__)),
+                     'rev-parse', '--short=10', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if _rev.returncode == 0:
+                    _boot_rev = (_rev.stdout or '').strip()
+            except Exception:
+                pass
+            print(
+                f"Startup migration: console boot — VERSION={VERSION} "
+                f"git={_boot_rev or 'unknown'} (v0.9.25 hotfix #3 active)",
+                flush=True
+            )
+            _heal_msg = _self_heal_authentik_compose()
+            if _heal_msg:
+                print(f"Startup migration: {_heal_msg}", flush=True)
+                # If heal actually rewrote the file, recreate the LDAP outpost
+                # so the bind cache is flushed. Without this, 8446 might still
+                # land on WebTAK because the outpost is serving cached group
+                # memberships from before the YAML was healed. The
+                # _authentik_webadmin_role_check_and_heal call later in this
+                # function uses skip_bind_verify=True and does NOT recreate
+                # the outpost — that has to happen here.
+                if 'normalized YAML' in _heal_msg:
+                    try:
+                        _r_ldap = subprocess.run(
+                            'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
+                            shell=True, capture_output=True, text=True, timeout=90
+                        )
+                        if _r_ldap.returncode == 0:
+                            print("Startup migration: LDAP outpost recreated after YAML heal — bind cache flushed", flush=True)
+                        else:
+                            _out = (_r_ldap.stderr or _r_ldap.stdout or '').strip()
+                            print(f"Startup migration: LDAP recreate after heal FAILED: {_out[:600]}", flush=True)
+                    except Exception as _re_err:
+                        print(f"Startup migration: LDAP recreate after heal exception: {_re_err}", flush=True)
+        except Exception as _shc_err:
+            print(f"Startup migration: compose self-heal error (non-fatal): {_shc_err}", flush=True)
 
         # v0.8.7: Apply Authentik official tunings (env var name fix + cache + log level).
         # The function is idempotent: returns False if no changes needed (every startup
