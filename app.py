@@ -33742,46 +33742,65 @@ def _dedupe_authentik_capdrop(_ak):
 
 
 def _validate_authentik_compose(_ak):
-    """Validate that a candidate Authentik compose-file string parses with
-    `docker compose config`. Writes the string to a temp file, runs the validator,
-    captures stderr.
+    """Validate that a candidate Authentik compose-file string is structurally
+    valid YAML with NO duplicate mapping keys — mirroring docker compose's Go
+    YAML parser strictness on that specific check.
 
-    Returns (ok: bool, err: str). On `docker` not being available, returns
-    (True, 'docker not available — skipped validation') so non-docker hosts
-    (CI, lint) don't false-fail.
+    v0.9.25 hotfix #6 (2026-05-16 14:38 PT, after tak-10 stamp evidence):
+    PREVIOUSLY this function ran `docker compose -f <tmp> config` against
+    a temp file in /tmp/. That command tries to interpolate env vars from
+    a `.env` file in the same directory as the `-f` argument. On a real
+    Authentik install ~/authentik/.env exists, but /tmp/.env does not, so
+    docker compose returned a non-zero exit code with:
+        error while interpolating services.postgresql.environment.POSTGRES_PASSWORD:
+        required variable PG_PASS is missing a value
+    …even though the YAML itself was perfectly fine. The heal aborted
+    every time and left the (still-broken) original file on disk. tak-10
+    stamp on 2026-05-16T21:14:16Z proved this exact failure mode.
+
+    The right validation for our use case is: does the candidate YAML
+    parse with strict semantics (no duplicate keys)? Docker compose's
+    runtime interpolation is a SEPARATE concern that any operator who
+    edited `.env` could also break, and is not what we're guarding
+    against here. We use PyYAML with a duplicate-detecting constructor —
+    same approach as the v0.9.25 hotfix smoke tests at
+    /tmp/v25_hotfix_smoketest.py.
+
+    Returns (ok: bool, err: str).
     """
-    import tempfile as _tempfile
     try:
-        _r_which = subprocess.run(
-            ['which', 'docker'], capture_output=True, text=True, timeout=5
-        )
-        if _r_which.returncode != 0:
-            return True, 'docker not available — skipped validation'
+        import yaml as _yaml
     except Exception:
-        return True, 'docker not available — skipped validation'
-    _tmp = None
+        return True, 'PyYAML not available — skipped validation'
+
+    class _StrictLoader(_yaml.SafeLoader):
+        pass
+
+    def _no_dupe_construct_mapping(loader, node, deep=False):
+        _keys = []
+        for _kn, _ in node.value:
+            _k = loader.construct_object(_kn, deep=deep)
+            if _k in _keys:
+                raise _yaml.constructor.ConstructorError(
+                    None, None,
+                    f'duplicate mapping key: {_k!r}',
+                    _kn.start_mark
+                )
+            _keys.append(_k)
+        return _yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+    _StrictLoader.add_constructor(
+        _yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        _no_dupe_construct_mapping
+    )
+
     try:
-        _fd, _tmp = _tempfile.mkstemp(prefix='infratak-authentik-validate-', suffix='.yml')
-        with os.fdopen(_fd, 'w') as _f:
-            _f.write(_ak)
-        _r = subprocess.run(
-            ['docker', 'compose', '-f', _tmp, 'config'],
-            capture_output=True, text=True, timeout=30
-        )
-        if _r.returncode != 0:
-            _err = (_r.stderr or _r.stdout or 'unknown compose validation error').strip()
-            return False, _err
+        _yaml.load(_ak, Loader=_StrictLoader)
         return True, ''
-    except subprocess.TimeoutExpired:
-        return False, 'docker compose config timed out after 30s'
+    except _yaml.YAMLError as _e:
+        return False, f'strict YAML parse: {str(_e)[:300]}'
     except Exception as _e:
-        return False, f'compose validate exception: {_e}'
-    finally:
-        if _tmp:
-            try:
-                os.remove(_tmp)
-            except Exception:
-                pass
+        return False, f'validation error: {_e}'
 
 
 def _self_heal_authentik_compose(_path=None):
