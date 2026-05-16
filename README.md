@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: [v0.9.23-alpha](docs/RELEASE-v0.9.23-alpha.md)** — Drop-in update. Closes the Authentik PG connection-leak class structurally via PgBouncer (transaction-pool mode); rewrites the TAK Server connection-state diagnostic against the actual cot DB schema. See the [release notes](docs/RELEASE-v0.9.23-alpha.md) for details. Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: [v0.9.24-alpha](docs/RELEASE-v0.9.24-alpha.md)** — Drop-in hotfix. Adds an Update Now single-flight lock (closes the test8 double-click race that left containers in Exited state), a post-update service recovery sweep, and bumps PgBouncer `DEFAULT_POOL_SIZE` from 25 → 35 after tak-10 field validation showed v0.9.23's pool fully saturated under modest load. See the [release notes](docs/RELEASE-v0.9.24-alpha.md) for details. Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -334,6 +334,20 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.24-alpha — 2026-05-16 — UPDATE NOW SINGLE-FLIGHT LOCK + SERVICE RECOVERY SWEEP + PGBOUNCER POOL HEADROOM
+
+**Headline: closes the test8 "double-click Update Now" race that left tak-portal + mediamtx Exited for 12+ min, adds a post-deploy service recovery sweep, and bumps PgBouncer DEFAULT_POOL_SIZE from 25 → 35 (40-conn ceiling) after tak-10 field validation showed v0.9.23's pool fully saturated.**
+
+- **Item 1 — Update Now single-flight lock.** `/api/update/apply` now writes a lock file at `/var/lib/takwerx-console/update-now.lock` (timestamp + PID + VERSION). A second concurrent click — including from a second browser tab on a different SSO session — returns `HTTP 409 {in_progress: true, started_seconds_ago: N, error: "..."}`. The UI handles the 409 by keeping the button disabled with `Update in progress…` and auto-reloads after 30 s. Lock is cleared in three places: `_run_post_update_guarded`'s finally (covers both normal completion AND migration crashes), the no-op early-return path in `_post_update_auto_deploy` (when version didn't change), and a 20-minute TTL (covers the rare wedged-process case). Roots out the exact race observed on test8 2026-05-16 where an operator clicked Update Now from two tabs; both POSTs ran in parallel, both scheduled `systemctl restart takwerx-console`, and the second restart killed the first deploy mid-bootstrap. Docker `restart: unless-stopped` does NOT restart explicitly stopped containers, so tak-portal + mediamtx stayed Exited for 12+ minutes.
+- **Item 2 — Post-update service recovery sweep.** New `_post_update_service_recovery_sweep(plog)` enumerates Docker containers (`docker ps -a`) and explicitly starts any in `exited` / `created` / `dead` state whose names match infra-TAK prefixes: `authentik-`, `cloudtak-`, `tak-portal`, `mediamtx`, `fedhub-`, `caddy`, `nodered`, etc. Also walks a conservative systemd unit list (`takserver.service`, `mediamtx.service`, `nodered.service`, `takmediamtxguard.timer`, `takremotedbguard.timer`, `takremotedbauthguard.timer`) and starts any that are `loaded; inactive` or `failed` but still `enabled`. Called from the end of `_run_post_update()` (normal flow) AND from the no-op early-return path when an Update Now lock is present on a same-version restart (covers killed-mid-deploy → console restart scenario). Idempotent — `docker start` on a running container and `systemctl start` on an active unit are both fast no-ops.
+- **Item 3 — PgBouncer pool headroom.** `_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE` bumped 25 → 35. With `RESERVE_POOL_SIZE=5` the ceiling moves from 30 → 40 real PG connections. Field rationale: tak-10's first full day on v0.9.23 PgBouncer (2026-05-16) showed `SHOW POOLS` saturated at `sv_active=29 / sv_idle=1` under modest concurrent load (84 client-side connections, `maxwait=0` for now but zero headroom for spikes). 40-conn ceiling is still ~12% of Postgres `max_connections=500`. New `_ensure_authentik_pgbouncer_pool_size` migration patches existing v0.9.23 installs in place (YAML edit + `docker compose up -d --force-recreate --no-deps pgbouncer`) — operator overrides above 35 are preserved.
+- **Server One UFW manual-fix note (related).** During v0.9.24 development on test8 we found the UFW rules on its Server One DB host (`190.102.110.222`) had `8080/tcp DENY Anywhere` at position 5 and `8080/tcp ALLOW from <test8_ip>` at position 6 — UFW evaluates top-to-bottom so the generic DENY blocked the scoped ALLOW. This is a v0.9.12 hardening side-effect on Server-One-style installs. **Manual fix on the Server One DB host:** `sudo ufw delete <N>; sudo ufw insert <N-1> allow from <consoleIP> to any port 8080 proto tcp`. No code change in this release — full code-level fix deferred so v0.9.24 stays focused.
+- **Drop-in update.** No operator pre-flight required. Update Now triggers all three items on next console restart; v0.9.23 installs self-heal via the pool-size migration.
+
+Full notes: [docs/RELEASE-v0.9.24-alpha.md](docs/RELEASE-v0.9.24-alpha.md).
+
+---
 
 ### v0.9.23-alpha — 2026-05-15 — PGBOUNCER ARCHITECTURAL FIX + TAK SERVER CONNECTION-STATE DIAGNOSTIC
 

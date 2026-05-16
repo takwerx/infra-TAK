@@ -363,7 +363,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.23-alpha"
+VERSION = "0.9.24-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -2128,6 +2128,63 @@ def _fetch_latest_tag_name():
 @app.route('/api/update/apply', methods=['POST'])
 @login_required
 def update_apply():
+    # v0.9.24 Item 1: Update Now single-flight lock.
+    # Field incident on test8 (2026-05-16): operator double-clicked "Update Now"
+    # from two browser tabs. Both POSTs to /api/update/apply ran concurrently
+    # in the same console process, both did git fetch+checkout, both scheduled
+    # `systemctl restart takwerx-console`. The second restart fired ~2s after
+    # the first and killed the first deploy mid-bootstrap. Docker `restart:
+    # unless-stopped` does NOT restart explicitly stopped containers, so
+    # tak-portal and mediamtx ended up in `Exited` state for 12+ minutes until
+    # operator manual recovery.
+    #
+    # The lock is a timestamped file at /var/lib/takwerx-console/update-now.lock.
+    # Lifecycle:
+    #   - written at the top of this endpoint
+    #   - cleared at the end of _post_update_auto_deploy (in _run_post_update_guarded
+    #     finally block, AND in the no-op early-return path)
+    #   - 20-min TTL covers the rare case where a deploy crashes without clearing it
+    #
+    # Item 2 below (post-update service recovery sweep) is the belt to this fix's
+    # suspenders — if anything still gets stopped mid-deploy, the sweep brings it back.
+    _update_lock = '/var/lib/takwerx-console/update-now.lock'
+    _update_lock_ttl_s = 1200
+    try:
+        os.makedirs(os.path.dirname(_update_lock), exist_ok=True)
+        if os.path.exists(_update_lock):
+            _age = int(time.time() - os.path.getmtime(_update_lock))
+            if _age < _update_lock_ttl_s:
+                _lock_info = ''
+                try:
+                    with open(_update_lock) as _lf:
+                        _lock_info = _lf.read().strip()
+                except Exception:
+                    pass
+                return jsonify({
+                    'success': False,
+                    'in_progress': True,
+                    'started_seconds_ago': _age,
+                    'error': (
+                        f'Update Now is already in progress (started ~{_age}s ago). '
+                        f'The console will restart automatically when complete — '
+                        f'wait 1–3 minutes then refresh this page. Avoid clicking '
+                        f'Update Now in multiple browser tabs.'
+                    ),
+                    'lock_info': _lock_info or None,
+                }), 409
+            print(f"Update Now: clearing stale lock (age={_age}s ≥ TTL={_update_lock_ttl_s}s)", flush=True)
+        with open(_update_lock, 'w') as _lf:
+            _lf.write(
+                f"version={VERSION}\n"
+                f"started_utc={datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"pid={os.getpid()}\n"
+            )
+    except Exception as _le:
+        # Lock-file IO failure is non-blocking. Single-flight is an availability
+        # optimization, not a correctness guarantee; we'd rather a degraded
+        # double-deploy than a wedged Update Now button on a misconfigured box.
+        print(f"Update Now: lock-file IO error (non-blocking, continuing): {_le}", flush=True)
+
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
@@ -27032,11 +27089,15 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
 # infra-TAK fleet box (2-4 vCPU, ~50 concurrent ATAK + iTAK + WebTAK + portal
 # users + LDAP outpost binds). Operators can override via .env if needed but
 # the defaults should comfortably absorb 99% of traffic.
-#   - DEFAULT_POOL_SIZE=25: real PG server connections per (db, user) pair.
+#   - DEFAULT_POOL_SIZE=35: real PG server connections per (db, user) pair.
 #     With Authentik's leak, the previous setting was ~500 (max_connections),
-#     hit by exhaustion every ~30 min on busy boxes. 25 is what
-#     TAK-NZ/auth-infra runs in production on managed RDS (Christian Elsen,
-#     PR #102) and is well below Authentik's natural concurrency.
+#     hit by exhaustion every ~30 min on busy boxes. v0.9.23 shipped =25
+#     (matching TAK-NZ/auth-infra on managed RDS, Christian Elsen PR #102).
+#     v0.9.24 bumps to 35 after tak-10 field validation (2026-05-16) showed
+#     `SHOW POOLS` running steady-state at sv_active=29/sv_idle=1 under modest
+#     concurrent load — saturated with zero headroom for spike absorption.
+#     35 + RESERVE=5 → 40-connection ceiling, still well below Postgres
+#     max_connections=500 and gives ~33% headroom for traffic bursts.
 #   - MAX_CLIENT_CONN=1000: client-side virtual connection slots. Authentik
 #     workers + outposts can each "hold" idle connections without consuming
 #     real PG server slots — PgBouncer only checks out a server connection
@@ -27051,7 +27112,7 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
 #   - SERVER_RESET_QUERY=DISCARD ALL: clears prepared statements, temp tables,
 #     and session state between checkouts. Required for transaction mode
 #     and recommended by both PgBouncer upstream and Authentik docs.
-_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 25
+_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 35
 _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 1000
 _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 5
 _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
@@ -27081,7 +27142,7 @@ def _ensure_authentik_pgbouncer(plog):
 
     Insert PgBouncer in transaction-pool mode between Authentik and Postgres.
     PgBouncer maintains a small server-side pool of real PG connections
-    (DEFAULT_POOL_SIZE=25, RESERVE=5 → ~30 real connections steady-state)
+    (DEFAULT_POOL_SIZE=35, RESERVE=5 → 40-connection ceiling, v0.9.24)
     regardless of how leaky Authentik's client-side psycopg pools become.
     Authentik workers can "hold" thousands of client-side idle connections
     but only borrow a real PG connection for the duration of each
@@ -27402,7 +27463,7 @@ def _ensure_authentik_pgbouncer(plog):
         new_env_lines.append('# ── v0.9.23 PgBouncer pooler ─────────────────────────────────────────')
         new_env_lines.append('# Authentik now connects to PgBouncer (transaction pool mode) instead of')
         new_env_lines.append('# Postgres directly. PgBouncer caps real PG server connections at ~30')
-        new_env_lines.append('# (DEFAULT_POOL_SIZE=25 + RESERVE_POOL_SIZE=5) regardless of upstream')
+        new_env_lines.append('# (DEFAULT_POOL_SIZE=35 + RESERVE_POOL_SIZE=5) regardless of upstream')
         new_env_lines.append('# Authentik 2026.2.x cache-pool leaks. This eliminates the')
         new_env_lines.append('# ak-pg-watchdog firefighting class and the downstream TAK Server')
         new_env_lines.append('# "User lookup failed" / phantom-subscription class.')
@@ -27628,7 +27689,148 @@ def _ensure_authentik_pgbouncer(plog):
         plog("  ✗ pgbouncer install: completed with BYPASSED state — see logs above for fix steps")
     else:
         plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
-             "(transaction pool, ≤30 real PG conns)")
+             "(transaction pool, ≤40 real PG conns)")
+    return True
+
+
+def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
+    """v0.9.24 Item 3: Bump PgBouncer DEFAULT_POOL_SIZE on existing installs.
+
+    v0.9.23 shipped the PgBouncer install with DEFAULT_POOL_SIZE=25, RESERVE_POOL_SIZE=5
+    (30-connection ceiling). Field validation on tak-10 (2026-05-16, single-day post-
+    install) showed `SHOW POOLS` running steady-state at sv_active=29 / sv_idle=1 under
+    modest concurrent load — fully saturated with zero headroom for traffic spikes,
+    OAuth-flow bursts, or LDAP outpost reconnect storms. Bumping to 35 + RESERVE=5 →
+    40-connection ceiling, restoring ~33% spike headroom while staying well below
+    Postgres max_connections=500.
+
+    Idempotency / safety:
+      - On fresh v0.9.24 installs, `_ensure_authentik_pgbouncer` already writes
+        DEFAULT_POOL_SIZE=35 (the bumped constant). This migration sees it and no-ops.
+      - On v0.9.23 installs (DEFAULT_POOL_SIZE=25 in compose), patches the YAML in
+        place and force-recreates the pgbouncer container only (server+worker keep
+        their existing connections; PgBouncer healthcheck cycling pools them).
+      - On boxes where an operator has manually raised it (e.g. DEFAULT_POOL_SIZE=50),
+        idempotent no-op — we never lower an operator override.
+      - On boxes without PgBouncer installed (very old, or external PG), no-op.
+      - Backs up the compose file before mutation and rolls back on write failure.
+
+    Returns:
+      True  — patched compose + recreated pgbouncer
+      False — already at/above target, no pgbouncer, or PyYAML unavailable (no-op)
+      None  — failure (logged via plog, compose rolled back on write error)
+    """
+    target = target if target is not None else _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  pgbouncer pool-size: PyYAML unavailable — skip "
+             "(will retry on next startup; `_ensure_authentik_pgbouncer` bootstraps it)")
+        return False
+
+    try:
+        with open(compose_path, 'r') as f:
+            raw = f.read()
+        data = _yaml.safe_load(raw)
+    except _yaml.YAMLError as e:
+        plog(f"  pgbouncer pool-size: compose YAML parse error ({str(e)[:80]}) — skip")
+        return None
+    except Exception as e:
+        plog(f"  pgbouncer pool-size: compose read error: {e}")
+        return None
+
+    if not isinstance(data, dict):
+        return False
+    pgb = (data.get('services') or {}).get('pgbouncer')
+    if not isinstance(pgb, dict):
+        return False
+    env = pgb.get('environment')
+    if not isinstance(env, dict):
+        plog("  pgbouncer pool-size: pgbouncer.environment is not dict-form — "
+             "skip (operator override or unusual compose layout)")
+        return False
+
+    cur = env.get('DEFAULT_POOL_SIZE')
+    try:
+        cur_int = int(cur) if cur is not None else None
+    except (TypeError, ValueError):
+        plog(f"  pgbouncer pool-size: DEFAULT_POOL_SIZE has non-integer value {cur!r} "
+             "— skip (operator override)")
+        return False
+
+    if cur_int is not None and cur_int >= target:
+        return False
+
+    backup_path = compose_path + f'.poolsize-bak-{int(time.time())}'
+    try:
+        with open(backup_path, 'w') as f:
+            f.write(raw)
+    except Exception as e:
+        plog(f"  pgbouncer pool-size: backup failed (refusing to mutate): {e}")
+        return None
+
+    env['DEFAULT_POOL_SIZE'] = target
+    try:
+        with open(compose_path, 'w') as f:
+            _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+        plog(f"  pgbouncer pool-size: patched docker-compose.yml "
+             f"DEFAULT_POOL_SIZE {cur_int} → {target} (backup at {backup_path})")
+    except Exception as e:
+        plog(f"  pgbouncer pool-size: compose write failed: {e} — rolling back")
+        try:
+            with open(compose_path, 'w') as f:
+                f.write(raw)
+        except Exception:
+            pass
+        return None
+
+    # Recreate only the pgbouncer container. server+worker keep their existing
+    # client-side connections; PgBouncer's transaction-pool semantics + healthcheck
+    # cycling re-establish server-side pooling within seconds.
+    r = subprocess.run(
+        ['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer'],
+        cwd=ak_dir, capture_output=True, text=True, timeout=120
+    )
+    if r.returncode != 0:
+        plog(f"  pgbouncer pool-size: pgbouncer recreate failed (rc={r.returncode}): "
+             f"{((r.stderr or '') + (r.stdout or ''))[:200]}")
+        return None
+
+    healthy = False
+    for _ in range(12):
+        time.sleep(2)
+        h = subprocess.run(
+            "docker inspect --format '{{.State.Health.Status}}' authentik-pgbouncer-1 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        if (h.stdout or '').strip() == 'healthy':
+            healthy = True
+            break
+    if healthy:
+        plog(f"  ✓ pgbouncer pool-size: pgbouncer recreated and healthy "
+             f"(DEFAULT_POOL_SIZE={target}, ceiling=40 with RESERVE=5)")
+    else:
+        plog(f"  ⚠ pgbouncer pool-size: pgbouncer recreated but not healthy within 24s "
+             f"— server+worker may briefly degrade; will stabilize as transactions cycle")
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_pgbouncer') or {}
+        cfg['default_pool_size'] = target
+        cfg['last_pool_size_migration_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['last_pool_size_migration_from'] = cur_int
+        cfg['last_pool_size_migration_to'] = target
+        cfg['last_pool_size_migration_version'] = VERSION
+        s['authentik_pgbouncer'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+
     return True
 
 
@@ -28283,9 +28485,9 @@ def _authentik_channels_pool_watchdog_loop():
     """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
     PostgreSQL connections from the authentik database exceed a threshold.
 
-    STATUS as of v0.9.23 Phase 6 (PgBouncer): DEEP DEFENSE-IN-DEPTH only.
-    PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=25 + RESERVE=5) caps the real
-    PG server-side idle count at ~30 regardless of how leaky Authentik's
+    STATUS as of v0.9.24 (PgBouncer pool bump): DEEP DEFENSE-IN-DEPTH only.
+    PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=35 + RESERVE=5) caps the real
+    PG server-side idle count at ~40 regardless of how leaky Authentik's
     cache-pool is, so this watchdog should essentially never fire on a v0.9.23+
     box. If it DOES fire post-PgBouncer, it means either:
       1. PgBouncer is mis-configured (e.g. POOL_MODE flipped to `session`),
@@ -40364,6 +40566,16 @@ async function applyUpdate(){
             status.textContent='OK Updated! Restarting console...';
             if(d.restart_message){status.innerHTML=status.textContent+'<br><small style=\"opacity:0.9;display:block;margin-top:6px\">'+d.restart_message+'</small>';}
             setTimeout(function(){window.location.reload()},12000);
+        }else if(d.in_progress){
+            // v0.9.24 Item 1: server-side single-flight lock detected an
+            // in-progress update (e.g. clicked from a second tab). Keep
+            // button disabled, show a friendlier waiting message, and
+            // auto-reload after a longer delay so the user lands on the
+            // post-update page once the deploy is done.
+            status.style.color='var(--cyan)';
+            status.textContent=d.error||'Update is already running on this server.';
+            btn.textContent='Update in progress…';
+            setTimeout(function(){window.location.reload()},30000);
         }else{
             status.style.color='var(--red)';status.textContent='Error: '+d.error;
             if(d.workaround){status.innerHTML=status.textContent+'<br><small style=\"opacity:0.9\">'+d.workaround+'</small>';}
@@ -42457,7 +42669,7 @@ def _startup_migrations():
         # the watchdog still firing ~4x/hour at the autotune floor, and Tom
         # Andersen's TAK Server forensics showed those windows create zombie
         # subscriptions in DistributedSubscriptionManager that TAK Server
-        # cannot self-heal. PgBouncer caps real PG connections at ~30
+        # cannot self-heal. PgBouncer caps real PG connections at ~40
         # regardless of upstream leaks → watchdog never fires → user lookups
         # never fail → no zombies. Idempotent — re-running on a box that
         # already has pgbouncer in compose AND .env is a fast no-op.
@@ -42471,6 +42683,20 @@ def _startup_migrations():
                 _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_err:
             print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
+
+        # v0.9.24 Item 3: Bump PgBouncer DEFAULT_POOL_SIZE on existing v0.9.23
+        # installs from 25 → 35. Field validation on tak-10 (2026-05-16, the
+        # day after v0.9.23 install) showed `SHOW POOLS` saturated at
+        # sv_active=29/sv_idle=1 under modest concurrent load — zero spike
+        # headroom. Bump to 35 + RESERVE=5 → 40-conn ceiling. Idempotent:
+        # fresh v0.9.24 installs already write 35 above (no-op here); existing
+        # v0.9.23 installs get patched + pgbouncer container recreated (server+
+        # worker keep their connections). Operator overrides (>35) are
+        # preserved. See `_ensure_authentik_pgbouncer_pool_size` docstring.
+        try:
+            _ensure_authentik_pgbouncer_pool_size(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pgb_pool_err:
+            print(f"Startup migration: pgbouncer pool-size bump error (non-fatal): {ak_pgb_pool_err}")
 
         # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
         # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
@@ -42631,6 +42857,144 @@ def _startup_migrations():
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
 
+def _post_update_service_recovery_sweep(plog):
+    """v0.9.24 Item 2: Bring up infra-TAK services that ended in Exited/inactive
+    state after a deploy.
+
+    BACKGROUND:
+    Docker's `restart: unless-stopped` policy does NOT restart explicitly stopped
+    containers (containers stopped via `docker stop`, `docker compose down`, or
+    a SIGTERM mid-bootstrap). On test8 (2026-05-16) a concurrent Update Now race
+    — operator double-clicked from two browser tabs — caused tak-portal and
+    mediamtx (Docker) to receive SIGTERM mid-bootstrap; both stayed in `Exited`
+    state for 12+ minutes until the operator noticed and manually recovered.
+
+    Item 1 (Update Now single-flight lock) PREVENTS the race that caused the
+    incident. This sweep is the belt to that suspenders — if any infra-TAK
+    service ever ends up explicitly stopped after a deploy completes for any
+    reason (mid-migration crash, OOM, manual `docker compose down` someone
+    forgot about), the next post-update or no-op-redeploy explicitly starts it.
+
+    WHAT IT SWEEPS:
+      - Docker containers in `exited` / `created` / `dead` state whose names
+        match known infra-TAK prefixes (authentik-, cloudtak-, tak-portal,
+        mediamtx, fedhub-, caddy, nodered, etc.). Uses `docker start <name>`
+        which preserves the existing container's config + volumes.
+      - systemd units that are `loaded; inactive` or `failed` for the small
+        set of services infra-TAK installs natively (takserver, native
+        mediamtx, nodered). Conservative list — we only start things infra-TAK
+        is opinionated about. Operator-managed units (apache, custom scripts)
+        are left alone.
+
+    IDEMPOTENT:
+      - `docker start` on a running container returns 0 immediately.
+      - `systemctl start` on an active unit returns 0 immediately.
+      - Safe to call from multiple post-update paths.
+
+    Returns: dict {'containers_started', 'units_started', 'errors'} with lists.
+    """
+    started_containers = []
+    started_units = []
+    errors = []
+
+    try:
+        r = subprocess.run(
+            ['docker', 'ps', '-a', '--format', '{{.Names}}\t{{.State}}'],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode == 0:
+            infra_prefixes = (
+                'authentik-', 'cloudtak-', 'tak-portal', 'takportal',
+                'mediamtx', 'takmediamtx',
+                'fedhub-', 'federation-hub', 'federationhub',
+                'caddy', 'takwerx-caddy',
+                'nodered', 'node-red',
+            )
+            for line in (r.stdout or '').splitlines():
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    continue
+                name, state = parts[0].strip(), parts[1].strip().lower()
+                if not name or not any(name.startswith(p) for p in infra_prefixes):
+                    continue
+                if state in ('exited', 'created', 'dead'):
+                    start_r = subprocess.run(
+                        ['docker', 'start', name], capture_output=True, text=True, timeout=60
+                    )
+                    if start_r.returncode == 0:
+                        started_containers.append(name)
+                        plog(f"  ✓ started container {name} (was {state})")
+                    else:
+                        err = ((start_r.stderr or '').strip() or (start_r.stdout or '').strip())[:160]
+                        errors.append(f"docker start {name}: {err}")
+                        plog(f"  ✗ failed to start container {name}: {err}")
+    except subprocess.TimeoutExpired:
+        errors.append("docker ps -a timed out (15s)")
+        plog("  ✗ docker enumerate timed out")
+    except Exception as e:
+        errors.append(f"docker enumerate: {e}")
+        plog(f"  ✗ docker enumerate error: {e}")
+
+    # Conservative systemd unit list. Only services infra-TAK itself installs
+    # and considers required when present. We never enable units here — only
+    # start units that are already enabled-but-inactive (operator's intent
+    # was for them to run).
+    units_to_check = (
+        'takserver.service',
+        'mediamtx.service',
+        'nodered.service',
+        'takmediamtxguard.timer',
+        'takremotedbguard.timer',
+        'takremotedbauthguard.timer',
+    )
+    for unit in units_to_check:
+        try:
+            is_enabled_r = subprocess.run(
+                ['systemctl', 'is-enabled', unit],
+                capture_output=True, text=True, timeout=5
+            )
+            enabled_state = (is_enabled_r.stdout or '').strip()
+            if is_enabled_r.returncode != 0 and enabled_state not in ('enabled', 'static', 'enabled-runtime', 'alias'):
+                continue
+            is_active_r = subprocess.run(
+                ['systemctl', 'is-active', unit],
+                capture_output=True, text=True, timeout=5
+            )
+            active_state = (is_active_r.stdout or '').strip()
+            if active_state in ('inactive', 'failed'):
+                start_r = subprocess.run(
+                    ['systemctl', 'start', unit],
+                    capture_output=True, text=True, timeout=60
+                )
+                if start_r.returncode == 0:
+                    started_units.append(unit)
+                    plog(f"  ✓ started systemd unit {unit} (was {active_state})")
+                else:
+                    err = ((start_r.stderr or '').strip() or (start_r.stdout or '').strip())[:160]
+                    errors.append(f"systemctl start {unit}: {err}")
+                    plog(f"  ✗ failed to start unit {unit}: {err}")
+        except subprocess.TimeoutExpired:
+            errors.append(f"systemctl {unit} timed out")
+        except Exception as e:
+            errors.append(f"systemd {unit}: {e}")
+
+    if not started_containers and not started_units:
+        plog("  ✓ all monitored services already running — nothing to recover")
+    else:
+        plog(
+            f"  summary: started {len(started_containers)} container(s) "
+            f"({', '.join(started_containers) or 'none'}), "
+            f"{len(started_units)} unit(s) "
+            f"({', '.join(started_units) or 'none'}), "
+            f"{len(errors)} error(s)"
+        )
+    return {
+        'containers_started': started_containers,
+        'units_started': started_units,
+        'errors': errors,
+    }
+
+
 def _post_update_auto_deploy():
     """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik.
 
@@ -42643,11 +43007,44 @@ def _post_update_auto_deploy():
     The next worker would see last_ver == VERSION and short-circuit; migrations
     silently never ran. Fix: only save last_console_version AFTER migrations
     complete, gated by a stale-tolerant lockfile so multiple workers don't race.
+
+    v0.9.24 (Item 2): at the end of the migration thread (and in the no-op
+    early-return path if an Update Now lock is present), _post_update_service_recovery_sweep
+    runs to bring up any infra-TAK service that ended up in Exited/inactive
+    state. Belt to Item 1's (single-flight lock) suspenders.
     """
     try:
         s = load_settings()
         last_ver = s.get('last_console_version', '')
         if last_ver == VERSION:
+            # v0.9.24 Items 1+2: even a no-op deploy (same VERSION) must
+            # release the Update Now single-flight lock — the operator did
+            # click the button and expects to be able to click it again.
+            # If the lock is present on a same-version restart, the previous
+            # deploy was likely interrupted (killed mid-bootstrap, OOM, manual
+            # restart, etc.) — run the service recovery sweep to bring up any
+            # service that ended in Exited/inactive state before clearing.
+            try:
+                _update_lock = '/var/lib/takwerx-console/update-now.lock'
+                if os.path.exists(_update_lock):
+                    print(
+                        "Post-update: same-version restart with active Update Now lock "
+                        "(prior deploy likely interrupted) — running service recovery sweep",
+                        flush=True
+                    )
+                    try:
+                        _post_update_service_recovery_sweep(
+                            lambda m: print(f"Post-update sweep: {m}", flush=True)
+                        )
+                    except Exception as _se:
+                        print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
+                    try:
+                        os.unlink(_update_lock)
+                        print("Post-update: cleared Update Now single-flight lock", flush=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             return
 
         lock_path = '/tmp/takwerx-post-update.lock'
@@ -44196,6 +44593,18 @@ def _post_update_auto_deploy():
             except Exception as _ce:
                 print(f"Post-update: Caddyfile regen skipped: {_ce}", flush=True)
 
+            # v0.9.24 Item 2: Service recovery sweep — at the very end of all
+            # migrations, explicitly start any infra-TAK service that ended
+            # up in Exited/inactive state. Belt to Item 1's (single-flight
+            # lock) suspenders. Idempotent.
+            try:
+                print("Post-update: running service recovery sweep (v0.9.24 Item 2)", flush=True)
+                _post_update_service_recovery_sweep(
+                    lambda m: print(f"Post-update sweep: {m}", flush=True)
+                )
+            except Exception as _se:
+                print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
+
             print("Post-update: auto-deploy complete")
 
         def _run_post_update_guarded():
@@ -44216,6 +44625,17 @@ def _post_update_auto_deploy():
                         os.unlink(lock_path)
                 except Exception:
                     pass
+                # v0.9.24 Item 1: Clear the Update Now single-flight lock so
+                # subsequent operator clicks are permitted. This runs even on
+                # migration crash (finally) so a wedged deploy doesn't lock
+                # the operator out of retrying.
+                try:
+                    _update_lock = '/var/lib/takwerx-console/update-now.lock'
+                    if os.path.exists(_update_lock):
+                        os.unlink(_update_lock)
+                        print("Post-update: cleared Update Now single-flight lock", flush=True)
+                except Exception as _ce:
+                    print(f"Post-update: failed to clear Update Now lock (non-fatal): {_ce}", flush=True)
 
         threading.Thread(target=_run_post_update_guarded, daemon=True).start()
     except Exception as e:
