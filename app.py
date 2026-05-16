@@ -33779,43 +33779,49 @@ def _takserver_connection_state(timeout_s=10, sample_size=10):
 
     connected = out['currently_connected']
     disconnected = out['currently_disconnected']
-    e5 = out['events_last_5min']
     e1h = out['events_last_1h']
     e24h = out['events_last_24h']
     total_ev = out['total_events']
 
+    # Advisory v2.1 (2026-05-15 PM): the original v2 advisory was over-eager
+    # because it interpreted `events_last_5min == 0 AND connected > 0` as a
+    # routing-impairment signal. That's wrong — `client_endpoint_event` only
+    # records STATE TRANSITIONS (Connect=1, Disconnect=2), not CoT traffic
+    # or heartbeats. A stably-connected client generates ZERO audit rows
+    # for the entire duration of its session (potentially hours or days).
+    # So "no transitions in the last N minutes" is the normal steady state
+    # for any well-behaved client, not a CoT outage.
+    #
+    # We don't try to alarm on "audit pipeline stalled" via these tables
+    # because (a) connected > 0 already proves the pipeline can write
+    # (each connect WAS an event) and (b) genuine routing problems show
+    # up in takserver-messaging.log, not here.
     if total_ev == 0:
         out['advisory'] = (
             'INACTIVE: no events recorded. TAK Server may be freshly installed '
             'or has never had a client connect.'
         )
-    elif connected > 0 and e5 > 0:
+    elif connected > 0:
         out['advisory'] = (
-            f'HEALTHY: {connected} client(s) currently connected, {e5} event(s) '
-            f'in last 5 min. Audit log holds {total_ev} events across {out["total_identities"]} '
-            'identities.'
-        )
-    elif connected > 0 and e5 == 0:
-        out['advisory'] = (
-            f'ATTENTION: {connected} client(s) currently connected but NO events in last 5 min. '
-            'CoT routing may be impaired, OR clients are connected but idle. Watch '
-            'events_last_1h — if that\'s also 0 for >30 min, investigate TAK Server health.'
+            f'HEALTHY: {connected} client(s) currently connected. '
+            f'{e1h} state-transition event(s) in last hour, {e24h} in last 24h. '
+            f'Audit log: {total_ev} events across {out["total_identities"]} identities.'
         )
     elif connected == 0 and e1h > 0:
         out['advisory'] = (
             f'IDLE: no clients currently connected, but {e1h} event(s) in last hour. '
-            'Recently active — normal for boxes between sessions.'
+            'Recently active — normal between sessions.'
         )
     elif connected == 0 and e24h > 0:
         out['advisory'] = (
-            f'QUIET: no recent activity. {e24h} event(s) in last 24h. '
+            f'QUIET: no clients connected, {e24h} event(s) in last 24h. '
             'Normal for test/standby boxes.'
         )
     else:
         out['advisory'] = (
             f'DORMANT: no events in last 24h, {disconnected} identities currently disconnected. '
-            'Test/idle box, or TAK Server is up but no clients have connected lately. '
-            'Verify takserver.service is healthy if this is a production box.'
+            'Test/idle box, or no clients have connected lately. Verify takserver.service '
+            'is healthy if this is a production box.'
         )
 
     return out
