@@ -27210,13 +27210,56 @@ def _ensure_authentik_pgbouncer(plog):
 
     pgbouncer_in_compose = 'pgbouncer' in services
     pgbouncer_in_env = (current_host == 'pgbouncer')
-    if pgbouncer_in_compose and pgbouncer_in_env:
-        plog("  pgbouncer install: already installed (compose + .env both wired) — idempotent no-op")
+
+    def _read_svc_pg_host(svc_dict):
+        """Return services.<svc>.environment.AUTHENTIK_POSTGRESQL__HOST as a string,
+        or None if absent/unsettable. Handles both dict and list forms of `environment:`.
+        """
+        if not isinstance(svc_dict, dict):
+            return None
+        env = svc_dict.get('environment')
+        if isinstance(env, dict):
+            v = env.get('AUTHENTIK_POSTGRESQL__HOST')
+            return None if v is None else str(v).strip().strip('"').strip("'")
+        if isinstance(env, list):
+            for item in env:
+                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
+                    return item.split('=', 1)[1].strip().strip('"').strip("'")
+        return None
+
+    server_compose_host = _read_svc_pg_host(services.get('server'))
+    worker_compose_host = _read_svc_pg_host(services.get('worker'))
+    compose_env_wired = (server_compose_host == 'pgbouncer' and worker_compose_host == 'pgbouncer')
+
+    # v2.2 (2026-05-15 PM): the v1 install was silently incomplete. The Authentik
+    # compose template hardcodes `AUTHENTIK_POSTGRESQL__HOST: postgresql` in
+    # `services.{server,worker}.environment` — and per Docker Compose semantics
+    # `environment:` takes PRECEDENCE over `env_file:`. So rewriting `.env`
+    # alone (which the v1 install did) is overridden every time those containers
+    # are (re)created. Field-observed on tak-10 2026-05-15 PM: `.env` correctly
+    # said `pgbouncer`, but live `docker exec authentik-server-1 env` showed
+    # `postgresql`, and pg_stat_activity confirmed 15 direct conns + 0 via
+    # PgBouncer. The fix: also patch services.{server,worker}.environment.
+    if pgbouncer_in_compose and pgbouncer_in_env and compose_env_wired:
+        plog("  pgbouncer install: already installed (compose + .env + "
+             "server/worker compose env all wired to pgbouncer) — idempotent no-op")
         return False
+    if pgbouncer_in_compose and pgbouncer_in_env and not compose_env_wired:
+        plog(f"  pgbouncer install: PARTIAL INSTALL DETECTED (v0.9.23-alpha v1 bug). "
+             f"pgbouncer container is present and .env is wired, but "
+             f"services.server.environment.AUTHENTIK_POSTGRESQL__HOST={server_compose_host!r} "
+             f"and services.worker.environment.AUTHENTIK_POSTGRESQL__HOST={worker_compose_host!r} "
+             f"(both should be 'pgbouncer'). Compose `environment:` overrides `env_file:` per "
+             f"Docker Compose semantics — Authentik is bypassing PgBouncer. Applying v2.2 "
+             f"compose env fixup + force-recreate now.")
 
     if current_host is not None and current_host not in ('', 'postgresql', 'pgbouncer', 'authentik-postgresql-1'):
         plog(f"  pgbouncer install: AUTHENTIK_POSTGRESQL__HOST={current_host!r} is operator-customized "
              "(likely external PG) — skipping to avoid clobbering operator config")
+        return False
+    if server_compose_host is not None and server_compose_host not in ('', 'postgresql', 'pgbouncer', 'authentik-postgresql-1'):
+        plog(f"  pgbouncer install: services.server.environment.AUTHENTIK_POSTGRESQL__HOST="
+             f"{server_compose_host!r} is operator-customized — skipping to avoid clobbering")
         return False
 
     ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
@@ -27282,6 +27325,33 @@ def _ensure_authentik_pgbouncer(plog):
         else:
             svc['depends_on'] = {'pgbouncer': {'condition': 'service_healthy'}}
             plog(f"  pgbouncer install: created {svc_name}.depends_on with pgbouncer")
+
+        # v2.2 fix: also rewrite services.{server,worker}.environment.AUTHENTIK_POSTGRESQL__HOST
+        # from 'postgresql' → 'pgbouncer'. The compose template hardcodes this in
+        # `environment:` which takes PRECEDENCE over `env_file:` — so rewriting .env
+        # alone is silently ignored. See idempotency gate comment above for the full
+        # forensic trace. This change is what makes the install actually take effect.
+        env = svc.setdefault('environment', {})
+        if isinstance(env, dict):
+            prev = env.get('AUTHENTIK_POSTGRESQL__HOST')
+            if prev != 'pgbouncer':
+                env['AUTHENTIK_POSTGRESQL__HOST'] = 'pgbouncer'
+                plog(f"  pgbouncer install: patched {svc_name}.environment."
+                     f"AUTHENTIK_POSTGRESQL__HOST {prev!r} → 'pgbouncer'")
+        elif isinstance(env, list):
+            new_env_list = []
+            replaced = False
+            for item in env:
+                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
+                    new_env_list.append('AUTHENTIK_POSTGRESQL__HOST=pgbouncer')
+                    replaced = True
+                else:
+                    new_env_list.append(item)
+            if not replaced:
+                new_env_list.append('AUTHENTIK_POSTGRESQL__HOST=pgbouncer')
+            svc['environment'] = new_env_list
+            plog(f"  pgbouncer install: patched {svc_name}.environment (list form) "
+                 f"AUTHENTIK_POSTGRESQL__HOST → 'pgbouncer'")
 
     try:
         with open(compose_path, 'w') as f:
@@ -27479,18 +27549,31 @@ def _ensure_authentik_pgbouncer(plog):
         for _addr, _cnt in _probe['by_addr']:
             _tag = '←pgbouncer' if pgb_ip and _addr == pgb_ip else ''
             plog(f"  pgbouncer install:   client_addr={_addr or '(null)'}: {_cnt} {_tag}")
+
+    post_install_outcome = 'ok'
     if pgb_ip is None:
         plog("  ⚠ pgbouncer install: could not resolve pgbouncer container IP via docker "
              "inspect — probe degraded but install otherwise succeeded.")
+        post_install_outcome = 'probe-degraded'
     elif via_bouncer == 0 and direct == 0:
         plog("  ⚠ pgbouncer install: pg_stat_activity shows 0 connections — Authentik may "
              "still be initializing. Re-check in 60s with: docker exec authentik-postgresql-1 "
              "psql -U authentik -d authentik -c \"SELECT client_addr, count(*) FROM "
              "pg_stat_activity WHERE datname='authentik' GROUP BY 1;\"")
+        post_install_outcome = 'probe-too-early'
     elif via_bouncer == 0 and direct > 0:
-        plog("  ⚠ pgbouncer install: pg_stat_activity shows direct connections but none from "
-             f"pgbouncer ({pgb_ip}) — PgBouncer auth or routing may have failed. Watch the next "
-             "ak-pg-watchdog cycle and inspect `docker logs authentik-pgbouncer-1` for clues.")
+        # v2.2: this is the silent-broken state the v1 install left tak-10 in.
+        # We log it as ✗ now (was ⚠) and record `last_outcome=bypassed` so the
+        # dashboard surfaces it and the next migration retry will detect+fix.
+        plog(f"  ✗ pgbouncer install: BYPASSED — {direct} conn(s) going direct to postgresql, "
+             f"0 via PgBouncer ({pgb_ip}). Most likely cause: compose `environment:` block "
+             f"overrides `.env` for AUTHENTIK_POSTGRESQL__HOST.")
+        plog("  ✗ pgbouncer install: Inspect with: "
+             "docker exec authentik-server-1 env | grep AUTHENTIK_POSTGRESQL__HOST")
+        plog("  ✗ pgbouncer install: If that shows 'postgresql' instead of 'pgbouncer', "
+             "the v2.2 compose env patch did not take effect — try `cd ~/authentik && "
+             "docker compose up -d --force-recreate --no-deps server worker` and re-probe.")
+        post_install_outcome = 'bypassed'
 
     try:
         try:
@@ -27532,16 +27615,20 @@ def _ensure_authentik_pgbouncer(plog):
         cfg['server_idle_timeout_s'] = _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S
         cfg['compose_backup'] = compose_bak
         cfg['env_backup'] = env_bak
-        cfg['last_outcome'] = 'ok'
+        cfg['last_outcome'] = post_install_outcome
         cfg['post_install_via_pgbouncer'] = via_bouncer
         cfg['post_install_direct'] = direct
+        cfg['post_install_pgbouncer_ip'] = pgb_ip
         s['authentik_pgbouncer'] = cfg
         save_settings(s)
     except Exception:
         pass
 
-    plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
-         "(transaction pool, ≤30 real PG conns)")
+    if post_install_outcome == 'bypassed':
+        plog("  ✗ pgbouncer install: completed with BYPASSED state — see logs above for fix steps")
+    else:
+        plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
+             "(transaction pool, ≤30 real PG conns)")
     return True
 
 
