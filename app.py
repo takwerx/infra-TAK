@@ -33817,20 +33817,62 @@ def _self_heal_authentik_compose(_path=None):
     migrations, watchdog ticks, etc. Designed to be a no-op when the
     file is already canonical.
     """
+    # v0.9.25 hotfix #5: write a stamp file on every heal attempt (success
+    # OR no-op OR failure) so the operator's error banner can show ground
+    # truth about whether the heal code ever ran on this box. The tak-10
+    # fail loop (2026-05-16) hit five iterations because we couldn't tell
+    # from the outside whether each fix was loaded into the running
+    # console. The stamp at /var/lib/takwerx-console/authentik-compose-heal.last
+    # is read by `_format_ldap_restart_err` and appended to the Sync
+    # webadmin error message when LDAP recreate fails with a YAML
+    # signature. If stamp is recent → heal ran but file is still broken
+    # (chase a different bug). If stamp is missing or stale → heal isn't
+    # running (chase the systemctl restart / git-pull path, not YAML).
+    _stamp_path = '/var/lib/takwerx-console/authentik-compose-heal.last'
+    def _write_stamp(_result_str):
+        try:
+            os.makedirs(os.path.dirname(_stamp_path), exist_ok=True)
+            _git_rev = ''
+            try:
+                _gr = subprocess.run(
+                    ['git', '-C', os.path.dirname(os.path.abspath(__file__)),
+                     'rev-parse', '--short=10', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if _gr.returncode == 0:
+                    _git_rev = (_gr.stdout or '').strip()
+            except Exception:
+                pass
+            with open(_stamp_path, 'w') as _sf:
+                _sf.write(
+                    f"timestamp_utc={datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                    f"version={VERSION}\n"
+                    f"git={_git_rev or 'unknown'}\n"
+                    f"result={_result_str or 'None (no-op)'}\n"
+                )
+        except Exception:
+            pass
+
     _path = _path or os.path.expanduser('~/authentik/docker-compose.yml')
     if not os.path.exists(_path):
+        _write_stamp('skipped: compose file does not exist')
         return None
     try:
         with open(_path) as _f:
             _orig = _f.read()
     except Exception as _e:
-        return f"compose self-heal: read failed ({_e})"
+        _msg = f"compose self-heal: read failed ({_e})"
+        _write_stamp(_msg)
+        return _msg
     if not _orig.strip():
+        _write_stamp('skipped: compose file is empty')
         return None
     try:
         import yaml as _yaml
     except Exception:
-        return "compose self-heal: PyYAML not importable — skipped"
+        _msg = "compose self-heal: PyYAML not importable — skipped"
+        _write_stamp(_msg)
+        return _msg
     try:
         _loaded = _yaml.safe_load(_orig)
     except Exception as _le:
@@ -33838,28 +33880,87 @@ def _self_heal_authentik_compose(_path=None):
         # tolerates duplicates via last-wins), so a real exception here means
         # the file has some other YAML defect (truncation, encoding, syntax)
         # that no round-trip can heal. Surface the parser error and bail.
-        return f"compose self-heal: PyYAML parse rejected the file ({_le}) — left disk file unchanged"
+        _msg = f"compose self-heal: PyYAML parse rejected the file ({_le}) — left disk file unchanged"
+        _write_stamp(_msg)
+        return _msg
     if _loaded is None:
+        _write_stamp('skipped: safe_load returned None')
         return None
     try:
         _renormalized = _yaml.safe_dump(
             _loaded, default_flow_style=False, sort_keys=False
         )
     except Exception as _de:
-        return f"compose self-heal: PyYAML dump failed ({_de})"
+        _msg = f"compose self-heal: PyYAML dump failed ({_de})"
+        _write_stamp(_msg)
+        return _msg
     if _renormalized == _orig:
-        return None  # already canonical — no-op
+        # File already canonical at the byte level. But — and this is the
+        # subtle point that bit us — if safe_load resolved duplicate keys
+        # via last-wins, the round-trip yields a SHORTER document. So if
+        # the byte-equal check passes, there are no duplicates to heal.
+        _write_stamp('no-op: file already canonical (no duplicate mapping keys)')
+        return None
     _valid, _verr = _validate_authentik_compose(_renormalized)
     if not _valid:
-        return (f"compose self-heal: canonical YAML failed validation "
+        _msg = (f"compose self-heal: canonical YAML failed validation "
                 f"({_verr[:300]}) — left disk file unchanged")
+        _write_stamp(_msg)
+        return _msg
     try:
         with open(_path, 'w') as _f:
             _f.write(_renormalized)
     except Exception as _we:
-        return f"compose self-heal: write failed ({_we})"
-    return ("compose self-heal: normalized YAML "
+        _msg = f"compose self-heal: write failed ({_we})"
+        _write_stamp(_msg)
+        return _msg
+    _msg = ("compose self-heal: normalized YAML "
             "(resolved any duplicate mapping keys via PyYAML last-wins)")
+    _write_stamp(_msg)
+    return _msg
+
+
+def _read_compose_heal_stamp():
+    """Read the stamp file written by `_self_heal_authentik_compose`. Returns
+    a one-line summary string suitable for inclusion in error messages, or
+    a 'no-stamp' string if heal has never run. Never raises."""
+    _stamp_path = '/var/lib/takwerx-console/authentik-compose-heal.last'
+    if not os.path.exists(_stamp_path):
+        return ('compose self-heal STAMP: never written on this box — heal '
+                'code has never run. Check `systemctl status takwerx-console` '
+                '+ `git log -1` in /opt/takwerx-console.')
+    try:
+        with open(_stamp_path) as _sf:
+            _content = _sf.read()
+        _data = {}
+        for _line in _content.splitlines():
+            if '=' in _line:
+                _k, _v = _line.split('=', 1)
+                _data[_k.strip()] = _v.strip()
+        _ts = _data.get('timestamp_utc', '?')
+        _ver = _data.get('version', '?')
+        _git = _data.get('git', '?')
+        _res = _data.get('result', '?')
+        # Compute age in seconds
+        _age_str = '?'
+        try:
+            _stamp_dt = datetime.strptime(_ts, '%Y-%m-%dT%H:%M:%SZ')
+            _age_s = int((datetime.utcnow() - _stamp_dt).total_seconds())
+            if _age_s < 60:
+                _age_str = f'{_age_s}s ago'
+            elif _age_s < 3600:
+                _age_str = f'{_age_s // 60}m ago'
+            elif _age_s < 86400:
+                _age_str = f'{_age_s // 3600}h ago'
+            else:
+                _age_str = f'{_age_s // 86400}d ago'
+        except Exception:
+            pass
+        return (f"compose self-heal STAMP: last run {_age_str} "
+                f"(timestamp_utc={_ts}, console version={_ver}, git={_git}, "
+                f"result='{_res}')")
+    except Exception as _e:
+        return f"compose self-heal STAMP: read error ({_e})"
 
 
 def _ensure_authentik_webadmin(skip_bind_verify=False):
@@ -33986,6 +34087,18 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                     '  YAML parse failure. Run on the Authentik host: '
                     'docker compose -f ~/authentik/docker-compose.yml config'
                 )
+            # v0.9.25 hotfix #5: surface the compose-heal stamp so the operator
+            # can tell at a glance whether the heal code has actually run on
+            # this box. If the heal ran recently and the file is still
+            # broken → race condition with another writer (chase that bug).
+            # If stamp is missing or hours/days old → new code didn't load
+            # (chase the systemctl restart / Update Now path, not YAML).
+            try:
+                _stamp_line = _read_compose_heal_stamp()
+                if _stamp_line:
+                    _msg += '  ' + _stamp_line
+            except Exception:
+                pass
             return _msg
         if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
             ok_ldap, out_ldap = _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
