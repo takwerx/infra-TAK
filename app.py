@@ -43666,17 +43666,42 @@ def _post_update_auto_deploy():
                         with open(ak_compose) as _f:
                             _ak = _f.read()
                         _ak_orig = _ak
-                        # v0.9.25: dedupe duplicate cap_drop blocks first. Older releases'
-                        # whole-file substring guard on the `server:` injector could insert
-                        # a second cap_drop/security_opt block when the existing one was in
-                        # a slightly different position, producing a YAML file that fails to
-                        # parse with "mapping key 'cap_drop' already defined". This blocked
-                        # every downstream `docker compose` call — notably the LDAP outpost
-                        # recreate inside the Sync webadmin flow (`_ensure_authentik_webadmin`).
-                        # See `docs/PLAN-v0.9.25-alpha.md`.
+                        # v0.9.25 hotfix (2026-05-16, after field test on tak-10): PyYAML
+                        # round-trip canonicalizes the compose file and resolves any
+                        # duplicate mapping keys via last-wins semantics. This is the same
+                        # strategy v0.9.21 already shipped in `_ensure_authentik_compose_patches`
+                        # (parse-and-mutate). The earlier-on-the-same-day substring-based
+                        # `_dedupe_authentik_capdrop` was brittle: tak-10 had a `server:`
+                        # block with TWO duplicate cap_drop blocks written in DIFFERENT
+                        # indentation styles ("- ALL" at 4-space vs 6-space dash indent),
+                        # both valid YAML but only one matched the literal substring. The
+                        # substring pass mis-stripped, the validator correctly rejected
+                        # the malformed result, the file stayed broken, and Sync webadmin
+                        # kept failing. PyYAML's safe_load treats both indent dialects as
+                        # equivalent and drops duplicate keys on load. The substring dedupe
+                        # below is now a defensive second pass for hosts without PyYAML.
+                        _yaml_normalized = False
+                        try:
+                            import yaml as _yaml_norm
+                            _ak_loaded = _yaml_norm.safe_load(_ak)
+                            if _ak_loaded is not None:
+                                _ak_renormalized = _yaml_norm.safe_dump(
+                                    _ak_loaded, default_flow_style=False, sort_keys=False
+                                )
+                                if _ak_renormalized != _ak:
+                                    _ak = _ak_renormalized
+                                    _yaml_normalized = True
+                        except Exception as _norm_e:
+                            print(f"Post-update: Authentik — YAML normalize skipped ({str(_norm_e)[:200]}); falling back to substring dedupe")
+                        # Defensive substring dedupe (belt-and-suspenders for hosts where
+                        # the PyYAML round-trip above didn't fire). Log lines for both
+                        # the normalize and the dedupe are deferred until after the
+                        # validator confirms the result actually parses — see the
+                        # validate-then-write gate below. This was the second bug surfaced
+                        # by the tak-10 field test: the old code logged "removed duplicate
+                        # cap_drop" optimistically before validate, so operators saw a
+                        # success message even when the heal had been rejected.
                         _ak, _deduped = _dedupe_authentik_capdrop(_ak)
-                        for _svc in _deduped:
-                            print(f"Post-update: Authentik — removed duplicate cap_drop in {_svc} section")
                         if '/var/run/docker.sock' in _ak:
                             # Line-filter removal — handles any indentation level
                             _ak = ''.join(
@@ -43774,6 +43799,16 @@ def _post_update_auto_deploy():
                             else:
                                 with open(ak_compose, 'w') as _f:
                                     _f.write(_ak)
+                                # v0.9.25 hotfix: log heal-action lines only AFTER the
+                                # validator confirms the result actually parses and the
+                                # file is written. Previously these fired optimistically
+                                # before validate, so operators saw "removed duplicate
+                                # cap_drop" success messages even when the heal was
+                                # rejected and the broken file stayed in place.
+                                if _yaml_normalized:
+                                    print("Post-update: Authentik — normalized compose YAML (resolved any duplicate mapping keys via PyYAML last-wins)")
+                                for _svc in _deduped:
+                                    print(f"Post-update: Authentik — removed duplicate cap_drop in {_svc} section")
                         if _shm_needs_pg_recreate:
                             # Record all UID-70 postgres PIDs before stopping so we can kill
                             # any that survive the container recreate (docker's default 10s stop
@@ -44221,6 +44256,20 @@ def _post_update_auto_deploy():
             _auto_authentik_ports_remote()
             _auto_nodered()
             _auto_harden_containers()
+
+            # v0.9.25 hotfix: synchronous webadmin role re-assert after the YAML
+            # heal + LDAP-outpost recreate inside _auto_harden_containers. The
+            # watchdog at app.py:28991 would catch any drift on its 5-min tick
+            # anyway, but operators who land on the WebTAK page seconds after
+            # Update Now shouldn't have to wait — call it here so the very next
+            # 8446 hit lands on the admin UI. skip_bind_verify=True skips a
+            # second LDAP recreate (the harden step already did it).
+            try:
+                _authentik_webadmin_role_check_and_heal(
+                    plog_fn=lambda m: print(f"Post-update: {m}", flush=True)
+                )
+            except Exception as _wre:
+                print(f"Post-update: webadmin role re-assert error (non-fatal): {_wre}")
 
             def _authentik_tasklog_cleanup():
                 """One-time migration: purge bloated Authentik task log tables on update.
