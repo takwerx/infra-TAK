@@ -33681,6 +33681,84 @@ def _validate_authentik_compose(_ak):
                 pass
 
 
+def _self_heal_authentik_compose(_path=None):
+    """v0.9.25 hotfix #2: idempotent self-heal pass on the Authentik compose
+    file. Reads `~/authentik/docker-compose.yml` (or `_path`), parses it with
+    PyYAML `safe_load` (which resolves duplicate mapping keys via last-wins),
+    re-emits with `safe_dump` in a single canonical indentation style, then
+    runs `_validate_authentik_compose` before writing to disk. Never raises.
+
+    Returns a one-line status string suitable for logging, or None if there
+    was nothing to do (file missing/empty, already-canonical, or PyYAML not
+    importable).
+
+    WHY THIS EXISTS — separate from `_auto_harden_containers`:
+    `_auto_harden_containers()` does the PyYAML round-trip AS PART OF a
+    bigger sequence of patches (docker.sock removal, shm_size, cap_drop
+    injection, etc), and is only reached when `_post_update_auto_deploy`
+    decides "this is a version-change deploy" — i.e. `last_console_version
+    != VERSION`. Field test on tak-10 (2026-05-16 11:08 PT) showed that
+    operator pulled `234c695` (hotfix #1, still labeled 0.9.25-alpha) onto
+    a box whose `last_console_version` was already `0.9.25-alpha` from the
+    prior push. The same-version branch in `_post_update_auto_deploy`
+    returned early at app.py:43180 and the YAML round-trip never executed.
+    Sync webadmin kept hitting the duplicate-cap_drop parse error.
+
+    The right architectural fix is to make compose YAML correctness a
+    invariant we maintain on EVERY post-update entrypoint AND on every
+    Sync webadmin click — not a side effect of a version-change deploy.
+    This helper is callable from multiple paths with no version gate.
+
+    Safe to call from: `_post_update_auto_deploy` (both branches),
+    `_ensure_authentik_webadmin` (before LDAP recreate), startup
+    migrations, watchdog ticks, etc. Designed to be a no-op when the
+    file is already canonical.
+    """
+    _path = _path or os.path.expanduser('~/authentik/docker-compose.yml')
+    if not os.path.exists(_path):
+        return None
+    try:
+        with open(_path) as _f:
+            _orig = _f.read()
+    except Exception as _e:
+        return f"compose self-heal: read failed ({_e})"
+    if not _orig.strip():
+        return None
+    try:
+        import yaml as _yaml
+    except Exception:
+        return "compose self-heal: PyYAML not importable — skipped"
+    try:
+        _loaded = _yaml.safe_load(_orig)
+    except Exception as _le:
+        # The duplicate-mapping-key case does NOT raise on safe_load (PyYAML
+        # tolerates duplicates via last-wins), so a real exception here means
+        # the file has some other YAML defect (truncation, encoding, syntax)
+        # that no round-trip can heal. Surface the parser error and bail.
+        return f"compose self-heal: PyYAML parse rejected the file ({_le}) — left disk file unchanged"
+    if _loaded is None:
+        return None
+    try:
+        _renormalized = _yaml.safe_dump(
+            _loaded, default_flow_style=False, sort_keys=False
+        )
+    except Exception as _de:
+        return f"compose self-heal: PyYAML dump failed ({_de})"
+    if _renormalized == _orig:
+        return None  # already canonical — no-op
+    _valid, _verr = _validate_authentik_compose(_renormalized)
+    if not _valid:
+        return (f"compose self-heal: canonical YAML failed validation "
+                f"({_verr[:300]}) — left disk file unchanged")
+    try:
+        with open(_path, 'w') as _f:
+            _f.write(_renormalized)
+    except Exception as _we:
+        return f"compose self-heal: write failed ({_we})"
+    return ("compose self-heal: normalized YAML "
+            "(resolved any duplicate mapping keys via PyYAML last-wins)")
+
+
 def _ensure_authentik_webadmin(skip_bind_verify=False):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
@@ -33762,6 +33840,24 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
             return True, None
         # Restart LDAP outpost to clear bind cache (password change would otherwise be ignored until cache expires)
         ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        # v0.9.25 hotfix #2: self-heal the local compose YAML before the recreate.
+        # The recreate uses `docker compose up -d --force-recreate ldap`, which
+        # hard-fails on any YAML parse error. Field-observed primary cause is a
+        # duplicate `cap_drop:` block left by older releases — PyYAML resolves
+        # those via last-wins on safe_load. This call has no version gate, so it
+        # heals even when the same-version branch in `_post_update_auto_deploy`
+        # short-circuited the bulk hardening pass. Remote-target installs have
+        # the compose file on a different host so the local heal is skipped
+        # there; the remote-side fix lives in _auto_harden_containers (its
+        # remote-Authentik counterpart) and the upstream release notes call out
+        # an SSH `Update Now` from the console as the recovery path.
+        if not (ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()):
+            try:
+                _heal_msg = _self_heal_authentik_compose()
+                if _heal_msg:
+                    print(f"Sync webadmin: {_heal_msg}", flush=True)
+            except Exception as _he:
+                print(f"Sync webadmin: compose self-heal error (non-fatal): {_he}", flush=True)
         # v0.9.25: surface the full compose error (no 120-char truncation) and append a
         # remediation hint when the error matches the duplicate-mapping-key signature.
         # The single most common cause of this LDAP-recreate failing in the field is the
@@ -43149,6 +43245,49 @@ def _post_update_auto_deploy():
         s = load_settings()
         last_ver = s.get('last_console_version', '')
         if last_ver == VERSION:
+            # v0.9.25 hotfix #2: same-version restart Authentik compose self-heal.
+            # Field test on tak-10 (2026-05-16): operator pulled hotfix #1 onto
+            # a box already at last_console_version=0.9.25-alpha. The early
+            # return below skipped `_auto_harden_containers` (which is where
+            # hotfix #1's PyYAML round-trip lived), so the duplicate-cap_drop
+            # parse error in ~/authentik/docker-compose.yml stayed on disk and
+            # the next Sync webadmin click failed with the same error message.
+            # The right answer is to make YAML self-heal an unconditional
+            # invariant on every post-update entrypoint, not a side-effect of
+            # a version-change deploy. If heal made an actual change (return
+            # value contains "normalized YAML"), recreate the LDAP outpost so
+            # the bind cache is flushed and 8446 lands on admin without the
+            # operator having to click Sync webadmin manually.
+            try:
+                _heal_msg = _self_heal_authentik_compose()
+                if _heal_msg:
+                    print(f"Post-update (same-version): {_heal_msg}", flush=True)
+                if _heal_msg and 'normalized YAML' in _heal_msg:
+                    # YAML actually changed on disk — recreate LDAP outpost to
+                    # flush stale bind cache. Same compose command the Sync
+                    # webadmin button uses. Hard-fail-safe: stderr is captured
+                    # and logged, never raised.
+                    if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                        _r_ldap = subprocess.run(
+                            'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
+                            shell=True, capture_output=True, text=True, timeout=90
+                        )
+                        if _r_ldap.returncode == 0:
+                            print("Post-update (same-version): LDAP outpost recreated to flush bind cache after YAML heal", flush=True)
+                        else:
+                            _out = (_r_ldap.stderr or _r_ldap.stdout or '').strip()
+                            print(f"Post-update (same-version): LDAP outpost recreate FAILED after heal: {_out[:600]}", flush=True)
+                    # Also re-assert webadmin role state so 8446 lands on
+                    # admin instead of WebTAK on the very next login.
+                    try:
+                        _authentik_webadmin_role_check_and_heal(
+                            plog_fn=lambda m: print(f"Post-update (same-version): {m}", flush=True)
+                        )
+                    except Exception as _wre:
+                        print(f"Post-update (same-version): webadmin role re-assert error (non-fatal): {_wre}", flush=True)
+            except Exception as _shce:
+                print(f"Post-update (same-version): compose self-heal error (non-fatal): {_shce}", flush=True)
+
             # v0.9.24 Items 1+2: even a no-op deploy (same VERSION) must
             # release the Update Now single-flight lock — the operator did
             # click the button and expects to be able to click it again.
