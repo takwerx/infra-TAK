@@ -24622,6 +24622,109 @@ def authentik_fix_ldap_token():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
+
+@app.route('/api/authentik/compose-heal', methods=['POST'])
+@login_required
+def authentik_compose_heal():
+    """v0.9.25 hotfix #4: operator-triggered on-demand heal of
+    ~/authentik/docker-compose.yml.
+
+    Calls `_self_heal_authentik_compose()` (PyYAML round-trip → validate →
+    write — same helper used by `_startup_migrations`, `_post_update_auto_deploy`,
+    `_auto_harden_containers`, and `_ensure_authentik_webadmin`). If the heal
+    actually rewrote the file, also recreates the LDAP outpost to flush the
+    bind cache so the very next 8446 login lands on admin.
+
+    Use case: the four automatic heal entry points all run on startup, post-
+    update, hardening, or Sync click — but if every one of those somehow
+    short-circuited (lock collision, exception in some other migration that
+    aborted startup, version-gating quirk), the operator still has a manual
+    lever via this endpoint. Curlable from the host:
+
+        curl -k -X POST -H "Cookie: <session-cookie>" \\
+             https://<host>:<console-port>/api/authentik/compose-heal
+
+    Local-target only. Remote-target installs need to be SSH'd into and the
+    same `_self_heal_authentik_compose()` logic applied there (via the
+    remote-Authentik counterpart in `_auto_harden_containers`).
+    """
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if not deploy_cfg.get('deployed'):
+        return jsonify({'success': False, 'error': 'Authentik is not deployed'}), 400
+    if deploy_cfg.get('target_mode') == 'remote':
+        return jsonify({
+            'success': False,
+            'error': ('Remote-target Authentik — this endpoint only heals the local '
+                      'compose file. SSH to the Authentik host and run Update Now '
+                      'there, or run `docker compose -f ~/authentik/docker-compose.yml config` '
+                      'to see the parse error.')
+        }), 400
+
+    _result = {
+        'success': True,
+        'heal_result': None,
+        'ldap_recreate': None,
+        'message': '',
+        'next_step': '',
+    }
+    try:
+        _heal_msg = _self_heal_authentik_compose()
+    except Exception as _he:
+        return jsonify({'success': False, 'error': f'self-heal raised: {_he}'}), 500
+    _result['heal_result'] = _heal_msg
+
+    if not _heal_msg:
+        _result['message'] = 'Compose file is already canonical — no heal needed.'
+        _result['next_step'] = ('If Sync webadmin is still failing with a YAML parse error, '
+                                'the file on disk is fine. Run `docker compose -f '
+                                '~/authentik/docker-compose.yml config` to confirm; the '
+                                'failure must be transient or somewhere else.')
+        return jsonify(_result)
+
+    if 'normalized YAML' not in _heal_msg:
+        _result['success'] = False
+        _result['message'] = f'Self-heal could not write a canonical compose file: {_heal_msg}'
+        _result['next_step'] = ('SSH to the Authentik host and run `docker compose -f '
+                                '~/authentik/docker-compose.yml config` to see the underlying '
+                                'parse error. The validator refused to overwrite the file '
+                                'because the canonicalized result still failed validation.')
+        return jsonify(_result), 500
+
+    try:
+        _r_ldap = subprocess.run(
+            'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
+            shell=True, capture_output=True, text=True, timeout=90
+        )
+        _out = (_r_ldap.stderr or _r_ldap.stdout or '').strip()
+        _result['ldap_recreate'] = {
+            'returncode': _r_ldap.returncode,
+            'output': _out[:1000],
+        }
+        if _r_ldap.returncode == 0:
+            _result['message'] = ('Compose YAML healed and LDAP outpost recreated. '
+                                  'Bind cache flushed; next 8446 login should land on admin.')
+            _result['next_step'] = ('Try logging into 8446. If you still land on WebTAK, '
+                                    'click Sync webadmin to re-assert the role state in '
+                                    'Authentik, then retry 8446.')
+        else:
+            _result['success'] = False
+            _result['message'] = (f'Compose healed, but LDAP outpost recreate failed: '
+                                  f'{_out[:300]}')
+            _result['next_step'] = ('SSH to the Authentik host and run `cd ~/authentik && '
+                                    'docker compose up -d --force-recreate ldap` manually '
+                                    'to see the full error.')
+    except subprocess.TimeoutExpired:
+        _result['success'] = False
+        _result['message'] = 'Compose healed, but LDAP outpost recreate timed out after 90s.'
+        _result['next_step'] = 'Check `docker ps` for the LDAP container state.'
+    except Exception as _re:
+        _result['success'] = False
+        _result['message'] = f'Compose healed, but LDAP recreate raised: {_re}'
+
+    return jsonify(_result)
+
+
 @app.route('/api/authentik/uninstall', methods=['POST'])
 @login_required
 def authentik_uninstall():
