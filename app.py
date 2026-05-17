@@ -27268,6 +27268,34 @@ _AUTHENTIK_POOL_AUTOTUNE_DEFAULT_SHARE = 5.0 / 6.0  # 5:1 default:reserve split
 _AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT = 250
 _AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE = 50
 
+# v0.9.27-alpha hotfix #3: continuous in-place remediation.
+#
+# Hotfix #2 added cl_waiting telemetry + the stuck-at-floor escape in the
+# autotune compute path. But that path only runs at console restart (Update
+# Now or service restart), so a quiet box that gets a sudden load spike
+# would emit query_wait_timeout for as long as the operator doesn't touch
+# the console. Hotfix #3 lets the watchdog itself trigger an in-place
+# pgbouncer recreate when it sees sustained starvation — same code path,
+# just no reboot required.
+#
+# Trigger conditions (all must be true):
+#   1. Last TRIGGER_TICKS samples all have cl_waiting > 0 (sustained,
+#      not a transient spike from e.g. a single slow query).
+#   2. Current DEFAULT_POOL_SIZE < COLD_START_DEFAULT (we're below the
+#      safe-constant — there's room to grow).
+#   3. ≥INPLACE_COOLDOWN_S elapsed since the last in-place resize (prevents
+#      flapping on a misbehaving downstream / chatty operator).
+#
+# Detection-to-remediation latency on a starved box:
+#   - tick 1: cl_waiting=N starts
+#   - tick 2: cl_waiting=N still
+#   - tick 3: cl_waiting=N still → TRIGGER fires
+#   - ≤30s later: pgbouncer recreate completes, pool is 250/50
+# Total: ~4 min from first cl_waiting > 0 to remediation. Compared to
+# "wait until next console restart" (unbounded).
+_AUTHENTIK_POOL_AUTOTUNE_INPLACE_TRIGGER_TICKS = 3
+_AUTHENTIK_POOL_AUTOTUNE_INPLACE_COOLDOWN_S = 900  # 15 min between in-place resizes
+
 
 def _authentik_pgbouncer_cl_waiting():
     """v0.9.27-alpha hotfix #2: read PgBouncer `SHOW POOLS` cl_waiting.
@@ -29400,6 +29428,138 @@ def _authentik_channels_pool_watchdog_loop():
             _authentik_pool_autotune_sample(
                 _count, _classes_for_sample, _cl_waiting_for_sample
             )
+
+            # v0.9.27-alpha hotfix #3: continuous in-place remediation.
+            #
+            # Eliminates the "wait for next console restart" latency that
+            # hotfix #2's compute-path escape inherited. If we observe
+            # sustained cl_waiting > 0 (TRIGGER_TICKS consecutive ticks),
+            # the current pool is below COLD_START_DEFAULT, and we haven't
+            # done an in-place resize in the past COOLDOWN_S, fire
+            # _ensure_authentik_pgbouncer_pool_size() directly — it patches
+            # docker-compose.yml + recreates pgbouncer in ~30s, no operator
+            # action required.
+            #
+            # Wrapped in a closure so any unexpected exception here NEVER
+            # blocks the watchdog's primary safety net (the _count > _threshold
+            # branch below). This is "best effort proactive remediation"; the
+            # reactive restart-server-1 path remains the floor.
+            try:
+                _inplace_triggered = False
+                _now_ts = int(_wt.time())
+                _autotune_cfg = (_settings.get('pool_autotune') or {})
+                _last_resize_ts = int(_autotune_cfg.get('last_inplace_resize_ts') or 0)
+                _cooldown_remaining = max(
+                    0,
+                    _AUTHENTIK_POOL_AUTOTUNE_INPLACE_COOLDOWN_S
+                    - (_now_ts - _last_resize_ts),
+                )
+
+                # Examine the trailing N samples for sustained starvation.
+                _samples_for_trigger = (_autotune_cfg.get('samples') or [])[
+                    -_AUTHENTIK_POOL_AUTOTUNE_INPLACE_TRIGGER_TICKS:
+                ]
+                _all_starved = (
+                    len(_samples_for_trigger) >= _AUTHENTIK_POOL_AUTOTUNE_INPLACE_TRIGGER_TICKS
+                    and all(
+                        isinstance(_smp.get('cl_waiting'), int)
+                        and _smp['cl_waiting'] > 0
+                        for _smp in _samples_for_trigger
+                    )
+                )
+
+                if _all_starved and _cooldown_remaining == 0:
+                    # Read current pool size from compose to confirm there's
+                    # room to grow. Cheap — single YAML parse.
+                    _cur_default = None
+                    try:
+                        import yaml as _yaml
+                        _compose_path = os.path.expanduser(
+                            '~/authentik/docker-compose.yml'
+                        )
+                        with open(_compose_path) as _f:
+                            _compose_data = _yaml.safe_load(_f)
+                        _pgb_env = (
+                            ((_compose_data or {}).get('services') or {})
+                            .get('pgbouncer', {})
+                            .get('environment') or {}
+                        )
+                        _cur_default_raw = _pgb_env.get('DEFAULT_POOL_SIZE')
+                        if _cur_default_raw is not None:
+                            _cur_default = int(_cur_default_raw)
+                    except Exception:
+                        _cur_default = None
+
+                    if (_cur_default is not None
+                            and _cur_default < _AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT):
+                        _max_clw = max(
+                            _smp.get('cl_waiting', 0)
+                            for _smp in _samples_for_trigger
+                        )
+                        def _wd_log(_msg):
+                            print(f"[ak-pg-watchdog] {_msg}", flush=True)
+                        _wd_log(
+                            f"IN-PLACE REMEDIATION: cl_waiting > 0 sustained over "
+                            f"{_AUTHENTIK_POOL_AUTOTUNE_INPLACE_TRIGGER_TICKS} consecutive "
+                            f"ticks (max cl_waiting={_max_clw}), current pool "
+                            f"DEFAULT_POOL_SIZE={_cur_default} < cold-start "
+                            f"{_AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT} — "
+                            f"forcing in-place pool resize to "
+                            f"{_AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT}/"
+                            f"{_AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE} "
+                            f"(no reboot required)"
+                        )
+                        # Force explicit target; bypass autotune compute. This
+                        # is hotfix #3's whole point: don't go through the
+                        # samples-based decision, we ALREADY know we're starved.
+                        try:
+                            _resize_result = _ensure_authentik_pgbouncer_pool_size(
+                                _wd_log,
+                                target=_AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT,
+                                target_reserve=_AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE,
+                            )
+                            _inplace_triggered = bool(_resize_result)
+                        except Exception as _re:
+                            _wd_log(f"IN-PLACE REMEDIATION error (non-fatal): {_re}")
+                            _inplace_triggered = False
+
+                        # Stamp the cooldown regardless of outcome — if the
+                        # resize failed, we don't want to retry every 2 min and
+                        # spam logs. Operator can clear via
+                        # `python3 -c "import json,os; ..."` if needed.
+                        try:
+                            _s2 = load_settings()
+                            _atc = _s2.get('pool_autotune') or {}
+                            _atc['last_inplace_resize_ts'] = _now_ts
+                            _atc['last_inplace_resize_result'] = (
+                                'ok' if _inplace_triggered else 'failed_or_noop'
+                            )
+                            _atc['last_inplace_resize_trigger_cl_waiting'] = _max_clw
+                            _s2['pool_autotune'] = _atc
+                            save_settings(_s2)
+                        except Exception:
+                            pass
+                elif _all_starved and _cooldown_remaining > 0:
+                    # Sustained starvation but we just resized — log once per
+                    # tick so operator can see we're aware but holding off.
+                    print(
+                        f"[ak-pg-watchdog] IN-PLACE REMEDIATION: cl_waiting > 0 "
+                        f"sustained but cooldown active "
+                        f"({_cooldown_remaining}s remaining of "
+                        f"{_AUTHENTIK_POOL_AUTOTUNE_INPLACE_COOLDOWN_S}s) — "
+                        f"holding. If problem persists, manually restart console "
+                        f"to force autotune recompute.",
+                        flush=True,
+                    )
+            except Exception as _outer_e:
+                # Hotfix #3 must NEVER prevent the watchdog from reaching the
+                # _count > _threshold safety net below. Any failure here gets
+                # swallowed.
+                print(
+                    f"[ak-pg-watchdog] IN-PLACE REMEDIATION outer error "
+                    f"(non-fatal, safety net still active): {_outer_e}",
+                    flush=True,
+                )
 
             if _count > _threshold:
                 _mr_cur, _ = _authentik_max_requests_get_current()
