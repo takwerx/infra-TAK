@@ -27941,6 +27941,156 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     return True
 
 
+def _ensure_vm_overcommit_memory(plog):
+    """v0.9.26-alpha hotfix #4: Persist `vm.overcommit_memory = 1` on the host.
+
+    BACKGROUND (Tom Endress's 2026-05-17 anchortak forensic report):
+
+    Authentik's Redis container logs this warning on every cold boot:
+
+        WARNING Memory overcommit must be enabled! Without it, a background
+        save or replication may fail under low memory condition.
+
+    When Redis forks for a BGSAVE (snapshot to disk) or replication, the Linux
+    kernel does a full virtual-memory accounting check at fork time. On hosts
+    with default `vm.overcommit_memory = 0` (heuristic), the kernel refuses
+    the fork unless 100% of the parent's RSS fits in free RAM. On busy hosts
+    that's almost never true — so the fork fails with ENOMEM. Redis then logs
+    "Background save failed" and (depending on tuning) STOPS ACCEPTING WRITES
+    via the `stop-writes-on-bgsave-error yes` default.
+
+    Authentik uses Redis for:
+      - session cache, OAuth token cache, license cache
+      - dramatiq middleware state, rate-limit counters
+      - Outpost websocket state mirrors
+
+    When Redis stops accepting writes, the Authentik server hangs on every
+    cache.set() call — gunicorn workers tie up backend connections waiting
+    for a Redis write that will never complete. That stacks with the
+    Channels-PG / dramatiq lock-race patterns from hotfixes #2 and #3, but
+    is a SEPARATE failure mode that we'd been masking with restarts.
+
+    THE FIX (Tom's universal remediation, applied to anchortak 2026-05-17):
+
+        echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
+        sysctl vm.overcommit_memory=1
+
+    Setting `1` tells the kernel: "always allow allocation, sort it out at
+    page-fault time." This is the upstream Redis recommendation since 2011
+    (https://redis.io/docs/management/admin/#additional-information). It is
+    safe on Linux servers because the kernel still kills processes that
+    actually exhaust memory (via the OOM killer), it just doesn't refuse
+    the fork preemptively.
+
+    Why not in compose / Redis container:
+      - `vm.overcommit_memory` is a HOST kernel parameter. Containers cannot
+        set it (the sysctl is read-only from inside an unprivileged container,
+        and Redis runs unprivileged). Must be set on the host kernel.
+
+    Idempotent / safe:
+      - Reads /proc/sys/vm/overcommit_memory first. If already `1`, no-op.
+      - Writes to /etc/sysctl.conf only if the line isn't already there
+        (matches both `vm.overcommit_memory = 1` and `vm.overcommit_memory=1`).
+      - Runs `sysctl -w` to apply live (no reboot required).
+      - All errors logged but never raised — startup_migrations is best-effort.
+
+    Returns:
+      True   — value was changed (now persistently 1)
+      False  — already at 1 (idempotent no-op)
+      None   — error (logged; sysctl read or write failed)
+    """
+    proc_path = '/proc/sys/vm/overcommit_memory'
+    sysctl_conf = '/etc/sysctl.conf'
+
+    # Step 1: read current value (kernel runtime, source of truth)
+    try:
+        with open(proc_path, 'r') as f:
+            current = (f.read() or '').strip()
+    except Exception as e:
+        plog(f"  vm.overcommit_memory: cannot read {proc_path}: {e} — skip "
+             "(non-Linux host, container, or unreadable proc)")
+        return None
+
+    # Step 2: apply runtime change if needed
+    runtime_changed = False
+    if current != '1':
+        r = subprocess.run(
+            ['sysctl', '-w', 'vm.overcommit_memory=1'],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            plog(f"  vm.overcommit_memory: sysctl -w failed (rc={r.returncode}): "
+                 f"{((r.stderr or '') + (r.stdout or ''))[:200]}")
+            return None
+        runtime_changed = True
+        # Verify the kernel actually applied it
+        try:
+            with open(proc_path, 'r') as f:
+                verify = (f.read() or '').strip()
+            if verify != '1':
+                plog(f"  vm.overcommit_memory: sysctl -w succeeded but kernel still reports {verify!r}")
+                return None
+        except Exception:
+            pass
+
+    # Step 3: ensure /etc/sysctl.conf has the line so the setting survives reboot
+    sysctl_persisted = False
+    try:
+        if os.path.exists(sysctl_conf):
+            with open(sysctl_conf, 'r') as f:
+                conf = f.read()
+        else:
+            conf = ''
+        # Tolerate either spaced or unspaced variants
+        has_line = any(
+            ln.strip().replace(' ', '') == 'vm.overcommit_memory=1'
+            for ln in conf.splitlines()
+            if ln.strip() and not ln.strip().startswith('#')
+        )
+        if not has_line:
+            # Comment out any existing non-`1` declarations so this is the active value
+            patched = []
+            for ln in conf.splitlines():
+                stripped = ln.strip()
+                if (stripped and not stripped.startswith('#')
+                        and stripped.replace(' ', '').startswith('vm.overcommit_memory=')):
+                    patched.append(f'# {ln}  # superseded by infra-TAK v0.9.26 hotfix #4')
+                else:
+                    patched.append(ln)
+            if patched and not patched[-1].endswith('\n') and patched[-1] != '':
+                patched.append('')
+            patched.append('# infra-TAK v0.9.26-alpha hotfix #4: Redis BGSAVE fork (Tom Endress 2026-05-17)')
+            patched.append('vm.overcommit_memory = 1')
+            patched.append('')
+            new_conf = '\n'.join(patched)
+            # Atomic write via tempfile + rename
+            tmp_path = sysctl_conf + '.infratak-tmp'
+            with open(tmp_path, 'w') as f:
+                f.write(new_conf)
+            os.rename(tmp_path, sysctl_conf)
+            sysctl_persisted = True
+    except Exception as e:
+        plog(f"  vm.overcommit_memory: /etc/sysctl.conf update failed: {e} "
+             "(runtime value is still set, but won't survive reboot)")
+
+    if runtime_changed and sysctl_persisted:
+        plog(f"  ✓ vm.overcommit_memory: {current} → 1 (runtime + persistent) "
+             "— Redis BGSAVE fork now safe")
+        return True
+    if runtime_changed and not sysctl_persisted:
+        plog(f"  ⚠ vm.overcommit_memory: {current} → 1 (runtime only — "
+             "/etc/sysctl.conf write skipped; will revert on reboot)")
+        return True
+    if not runtime_changed and not sysctl_persisted:
+        # Already at 1 and sysctl.conf already has the line — perfect steady state
+        return False
+    # not runtime_changed but sysctl_persisted: kernel was already 1, we just
+    # added the persistence line for safety
+    plog(f"  ✓ vm.overcommit_memory: kernel already 1; persisted to "
+         f"/etc/sysctl.conf so it survives reboot")
+    return True
+
+
 def _ensure_embedded_outpost_authentik_host(plog):
     """v0.9.21: Re-assert embedded outpost's config.authentik_host to the current public URL.
 
@@ -28698,6 +28848,38 @@ def _authentik_channels_pool_watchdog_loop():
             _count = int(_count_str)
             _consecutive_failures = 0
 
+            # v0.9.26-alpha hotfix #4: when the watchdog is about to fire or
+            # already accumulating, query the dominant idle-conn pattern so
+            # the operator can tell at a glance whether saturation is:
+            #   - Channels-class (django_channels_postgres_groupchannel SELECTs)
+            #   - dramatiq-class (django_dramatiq_postgres SELECT FOR UPDATE)
+            #   - cache-class (django_postgres_cache_cacheentry)
+            #   - "other" / generic ORM
+            # Only runs on the alert/accumulation paths to keep the hot loop cheap.
+            def _classify_idle_load():
+                try:
+                    _rb = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+                         '-U', 'authentik', '-d', 'authentik', '-tA', '-F', '|', '-c',
+                         "SELECT "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%groupchannel%'), "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%dramatiq%' OR query LIKE '%FOR UPDATE%'), "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%postgres_cache_cacheentry%'), "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%pg_advisory_lock%') "
+                         "FROM pg_stat_activity "
+                         "WHERE datname='authentik' AND state='idle'"],
+                        capture_output=True, text=True, timeout=8
+                    )
+                    if _rb.returncode == 0:
+                        _parts = (_rb.stdout or '').strip().split('|')
+                        if len(_parts) == 4 and all(p.isdigit() for p in _parts):
+                            _ch, _dr, _ca, _adv = (int(p) for p in _parts)
+                            _other = max(0, _count - _ch - _dr - _ca)
+                            return (_ch, _dr, _ca, _adv, _other)
+                except Exception:
+                    pass
+                return None
+
             if _count > _threshold:
                 _mr_cur, _ = _authentik_max_requests_get_current()
                 _mr_str = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
@@ -28711,10 +28893,26 @@ def _authentik_channels_pool_watchdog_loop():
                     "PgBouncer is NOT installed — the upstream Authentik #20714 cache-pool leak is "
                     "unbounded on this box. Consider running the v0.9.23 PgBouncer migration."
                 )
+                _cls = _classify_idle_load()
+                _cls_str = ""
+                if _cls is not None:
+                    _ch, _dr, _ca, _adv, _other = _cls
+                    _dom = max(
+                        ('Channels', _ch),
+                        ('dramatiq', _dr),
+                        ('cache', _ca),
+                        ('other', _other),
+                        key=lambda x: x[1],
+                    )[0]
+                    _cls_str = (
+                        f" idle-by-class: Channels={_ch} dramatiq={_dr} "
+                        f"cache={_ca} advisory_lock={_adv} other={_other} "
+                        f"(dominant={_dom})"
+                    )
                 print(
                     f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
                     f"(threshold={_threshold}, {_mr_str}) — restarting authentik-server-1. "
-                    f"SAFETY NET firing. {_pgb_note}",
+                    f"SAFETY NET firing.{_cls_str} {_pgb_note}",
                     flush=True
                 )
                 _authentik_max_requests_autotune_record_fire(
@@ -28740,15 +28938,27 @@ def _authentik_channels_pool_watchdog_loop():
                 _wt.sleep(180)
             elif _count > 80:
                 _mr_cur, _ = _authentik_max_requests_get_current()
+                _cls = _classify_idle_load()
+                _cls_str = ""
+                if _cls is not None:
+                    _ch, _dr, _ca, _adv, _other = _cls
+                    _cls_str = (
+                        f" [Channels={_ch} dramatiq={_dr} cache={_ca} "
+                        f"advisory_lock={_adv} other={_other}]"
+                    )
                 print(
                     f"[ak-pg-watchdog] {_count} idle PG connections "
-                    f"(threshold={_threshold}) — accumulation in progress, monitoring",
+                    f"(threshold={_threshold}) — accumulation in progress, monitoring{_cls_str}",
                     flush=True
                 )
                 try:
                     _autotune_log(
                         f"ACCUMULATING | idle={_count} threshold={_threshold} "
                         f"MAX_REQUESTS={_mr_cur if _mr_cur is not None else '?'}"
+                        + (
+                            f" classes:Channels={_ch}/dramatiq={_dr}/cache={_ca}/adv={_adv}/other={_other}"
+                            if _cls is not None else ""
+                        )
                     )
                 except Exception:
                     pass
@@ -43664,6 +43874,19 @@ def _startup_migrations():
         except Exception as ak_pgb_err:
             print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
 
+        # v0.9.26-alpha hotfix #4 (2026-05-17, Tom Endress's anchortak incident
+        # report): set `vm.overcommit_memory = 1` on the host kernel so Redis
+        # BGSAVE forks don't fail with ENOMEM and trigger
+        # `stop-writes-on-bgsave-error`. This is the upstream Redis
+        # recommendation and Tom confirmed it as a contributing factor to
+        # the 2026-05-17 anchortak full outage. Independent of pool sizing —
+        # applies to ALL infra-TAK boxes regardless of load.
+        # Idempotent: no-op when already 1 + persisted.
+        try:
+            _ensure_vm_overcommit_memory(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as vm_oc_err:
+            print(f"Startup migration: vm.overcommit_memory error (non-fatal): {vm_oc_err}")
+
         # v0.9.24 Item 3 + v0.9.26-alpha hotfix #3: Bump PgBouncer pool sizing
         # on existing installs. v0.9.23 shipped 25/5 (30-conn ceiling); v0.9.24
         # bumped to 35/5 (40-conn) after sv_active=29/sv_idle=1 saturation.
@@ -43674,6 +43897,15 @@ def _startup_migrations():
         # here); existing installs at 25/5 or 35/5 get both values patched +
         # pgbouncer container recreated (server+worker keep their connections).
         # Operator overrides are preserved. See `_ensure_authentik_pgbouncer_pool_size`.
+        #
+        # Hotfix #4 corroborating evidence (Tom Endress anchortak 2026-05-17):
+        # His box's dramatiq lock-race class of failure (36 consumer threads
+        # racing on `_fetch_pending_messages` SELECT FOR UPDATE without
+        # SKIP LOCKED) saturates pool=35+5 instantly. tak-10's class is
+        # different (Channels-PG long-poll) but the prescription is the
+        # same: more pool headroom. We ship 75/15 (90-ceiling) which
+        # exceeds Tom's 80/5 recommendation; operator overrides above
+        # this (e.g. tak-10's 150/30) are preserved.
         try:
             _ensure_authentik_pgbouncer_pool_size(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_pool_err:
