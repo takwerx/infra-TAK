@@ -363,7 +363,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.25-alpha"
+VERSION = "0.9.26-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -6487,36 +6487,11 @@ def guarddog_update():
         _ak_tl_script   = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
         _ak_compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
         if os.path.exists(_ak_compose_path) and not os.path.isfile(_ak_tl_tmr_path):
-            _ak_tl_script_content = (
-                '#!/bin/bash\n'
-                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
-                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
-                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
-                'set -euo pipefail\n'
-                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
-                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
-                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
-                'mkdir -p /var/log/takguard\n'
-                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
-                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
-                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
-                '  exit 0\n'
-                'fi\n'
-                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
-                'DELETE FROM authentik_tasks_tasklog\n'
-                'WHERE task_id IN (\n'
-                '  SELECT message_id FROM authentik_tasks_task\n'
-                "  WHERE mtime < NOW() - INTERVAL '30 days'\n"
-                ');\n'
-                'DELETE FROM authentik_tasks_task\n'
-                "WHERE mtime < NOW() - INTERVAL '30 days';\n"
-                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
-                '" >> "$LOG" 2>&1\n'
-                'echo "$TS" > "$STAMP_FILE"\n'
-                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
-            )
+            # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
+            # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
+            # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             with open(_ak_tl_script, 'w') as _f:
-                _f.write(_ak_tl_script_content)
+                _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
             os.chmod(_ak_tl_script, 0o755)
             with open(_ak_tl_svc_path, 'w') as _f:
                 _f.write('[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
@@ -7026,37 +7001,12 @@ def run_guarddog_deploy(alert_email):
                 ('takauthentikguard.timer', '[Unit]\nDescription=Run Authentik guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takauthentikguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
             # Authentik task log purge — weekly cleanup of authentik_tasks_task/tasklog tables
-            _ak_purge_script = (
-                '#!/bin/bash\n'
-                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
-                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
-                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
-                'set -euo pipefail\n'
-                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
-                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
-                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
-                'mkdir -p /var/log/takguard\n'
-                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
-                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
-                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
-                '  exit 0\n'
-                'fi\n'
-                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
-                'DELETE FROM authentik_tasks_tasklog\n'
-                'WHERE task_id IN (\n'
-                '  SELECT message_id FROM authentik_tasks_task\n'
-                "  WHERE mtime < NOW() - INTERVAL '30 days'\n"
-                ');\n'
-                'DELETE FROM authentik_tasks_task\n'
-                "WHERE mtime < NOW() - INTERVAL '30 days';\n"
-                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
-                '" >> "$LOG" 2>&1\n'
-                'echo "$TS" > "$STAMP_FILE"\n'
-                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
-            )
+            # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
+            # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
+            # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
             with open(_ak_purge_path, 'w') as _f:
-                _f.write(_ak_purge_script)
+                _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
             os.chmod(_ak_purge_path, 0o755)
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
@@ -33982,6 +33932,298 @@ def _read_compose_heal_stamp():
         return f"compose self-heal STAMP: read error ({_e})"
 
 
+# v0.9.26: Canonical content of the Authentik task-log purge script.
+# Shared by both embedded-write sites (lines ~6490 and ~7029 in app.py) AND
+# by `_ensure_authentik_tasklog_purge_script` which overwrites broken copies
+# on every console boot.
+#
+# v0.9.5 → v0.9.25 BUG: original script used `psql -c "DELETE;DELETE;VACUUM"`.
+# psql wraps multi-statement `-c` arguments in an IMPLICIT transaction, and
+# `VACUUM cannot run inside a transaction block`. Every Sunday 03:00 timer
+# fire on every install ended with exit code 1, silently. tak-10 evidence
+# (2026-05-17): script ran today at 03:00:06 UTC, log shows
+# `DELETE 0 / DELETE 0 / ERROR: VACUUM cannot run inside a transaction block`.
+#
+# v0.9.5 → v0.9.25 SECOND BUG: threshold was `mtime < NOW() - INTERVAL '30 days'`.
+# Console-restart churn (e.g. release day with 6+ Update Now cycles) can stuff
+# the tables with 2M rows that are all < 1 day old. Even when the VACUUM
+# transaction bug was avoided manually, the time window matched nothing.
+# tak-10 grew to 2,025,958 tasklog rows / 516 MB + 640,596 task rows / 442 MB
+# in under 24h. Three-tier escalation (7d → 24h → 1h) handles both the slow
+# steady-state growth case and the runaway-churn case.
+_AUTHENTIK_TASKLOG_PURGE_SCRIPT = (
+    '#!/bin/bash\n'
+    '# Guard Dog: Authentik task log purge (v0.9.26 — fixed VACUUM-in-transaction).\n'
+    '# Removes authentik_tasks_task + authentik_tasks_tasklog rows in tiers:\n'
+    '#   Tier 1: rows older than 7 days (gentle, keeps weekly audit trail)\n'
+    '#   Tier 2: rows older than 24h (if size still ≥ 100 MB after Tier 1)\n'
+    '#   Tier 3: rows older than 1h  (if size still ≥ 100 MB after Tier 2)\n'
+    '# Each tier runs in its own `psql -c` invocation; the final VACUUM ANALYZE\n'
+    '# also runs in a SEPARATE psql -c so it is NOT wrapped in a transaction.\n'
+    '# Old v0.9.5 single-call script failed every Sunday with\n'
+    '#   ERROR: VACUUM cannot run inside a transaction block\n'
+    '# v0.9.26 fix lives both here AND inline in app.py\n'
+    '# (_auto_authentik_tasklog_purge); the inline helper runs on every console\n'
+    '# boot regardless of the timer, so even if THIS script is broken the\n'
+    '# console boot path keeps the tables healthy.\n'
+    'set -u\n'
+    'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
+    'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
+    'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
+    'mkdir -p /var/log/takguard\n'
+    'echo "[$TS] Starting Authentik task log purge (v0.9.26 multi-tier)" >> "$LOG"\n'
+    '\n'
+    'if [ -z "$(docker ps -q --filter name=authentik-postgresql-1 2>/dev/null)" ]; then\n'
+    '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
+    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
+    '  exit 0\n'
+    'fi\n'
+    '\n'
+    'size_mb() {\n'
+    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
+    '    "SELECT (pg_total_relation_size(\'authentik_tasks_tasklog\') + pg_total_relation_size(\'authentik_tasks_task\')) / 1024 / 1024" 2>/dev/null \\\n'
+    '    | tr -dc "0-9" || echo 0\n'
+    '}\n'
+    '\n'
+    'row_counts() {\n'
+    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
+    '    "SELECT (SELECT count(*) FROM authentik_tasks_task) || \'/\' || (SELECT count(*) FROM authentik_tasks_tasklog)" 2>/dev/null || echo "?/?"\n'
+    '}\n'
+    '\n'
+    'delete_older_than() {\n'
+    '  local interval="$1"\n'
+    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
+    'DELETE FROM authentik_tasks_tasklog WHERE task_id IN (\n'
+    '  SELECT message_id FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\'\n'
+    ');\n'
+    'DELETE FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\';\n'
+    '" >> "$LOG" 2>&1\n'
+    '}\n'
+    '\n'
+    'INITIAL=$(size_mb)\n'
+    'INITIAL=${INITIAL:-0}\n'
+    'INITIAL_ROWS=$(row_counts)\n'
+    'THRESHOLD=100\n'
+    'echo "[$TS] Initial size: ${INITIAL} MB (task/tasklog rows: ${INITIAL_ROWS}), threshold ${THRESHOLD} MB" >> "$LOG"\n'
+    '\n'
+    'if [ "$INITIAL" -lt "$THRESHOLD" ] 2>/dev/null; then\n'
+    '  echo "[$TS] No cleanup needed — already healthy" >> "$LOG"\n'
+    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
+    '  exit 0\n'
+    'fi\n'
+    '\n'
+    'echo "[$TS] Tier 1 — DELETE rows older than 7 days" >> "$LOG"\n'
+    'delete_older_than "7 days" || echo "[$TS] Tier 1 returned non-zero (continuing)" >> "$LOG"\n'
+    'AFTER_7D=$(size_mb); AFTER_7D=${AFTER_7D:-$INITIAL}\n'
+    'echo "[$TS] After 7-day pass: ${AFTER_7D} MB" >> "$LOG"\n'
+    '\n'
+    'if [ "$AFTER_7D" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
+    '  echo "[$TS] Tier 2 — DELETE rows older than 24 hours" >> "$LOG"\n'
+    '  delete_older_than "24 hours" || echo "[$TS] Tier 2 returned non-zero (continuing)" >> "$LOG"\n'
+    'fi\n'
+    'AFTER_24H=$(size_mb); AFTER_24H=${AFTER_24H:-$AFTER_7D}\n'
+    'echo "[$TS] After 24h pass: ${AFTER_24H} MB" >> "$LOG"\n'
+    '\n'
+    'if [ "$AFTER_24H" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
+    '  echo "[$TS] Tier 3 (nuclear) — DELETE rows older than 1 hour" >> "$LOG"\n'
+    '  delete_older_than "1 hour" || echo "[$TS] Tier 3 returned non-zero (continuing)" >> "$LOG"\n'
+    'fi\n'
+    '\n'
+    'echo "[$TS] VACUUM ANALYZE (separate invocation — NOT in transaction)" >> "$LOG"\n'
+    'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c \\\n'
+    '  "VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;" >> "$LOG" 2>&1 || \\\n'
+    '  echo "[$TS] VACUUM returned non-zero (table sizes still updated)" >> "$LOG"\n'
+    '\n'
+    'FINAL=$(size_mb); FINAL=${FINAL:-0}\n'
+    'FINAL_ROWS=$(row_counts)\n'
+    'echo "[$TS] Final size: ${FINAL} MB (task/tasklog rows: ${FINAL_ROWS}), freed $(( INITIAL - FINAL )) MB" >> "$LOG"\n'
+    'echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
+    'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
+    'exit 0\n'
+)
+
+
+def _ensure_authentik_tasklog_purge_script(plog=None):
+    """v0.9.26: overwrite /opt/tak-guarddog/tak-authentik-tasklog-purge.sh with
+    the canonical (fixed) script content if it has drifted or is missing.
+
+    The original v0.9.5 script content was emitted ONCE at install time and
+    never updated — boxes deployed before v0.9.26 ship with a broken script
+    (VACUUM-in-transaction → silent weekly failure). This migration replaces
+    the on-disk script with the fixed canonical content on every console boot.
+
+    Idempotent: only writes when content differs. Silent no-op when the script
+    path doesn't exist (Authentik not installed, or Guard Dog directory absent).
+    """
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    _path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+    if not os.path.isdir('/opt/tak-guarddog'):
+        return
+    try:
+        _current = ''
+        if os.path.isfile(_path):
+            with open(_path) as _f:
+                _current = _f.read()
+        if _current == _AUTHENTIK_TASKLOG_PURGE_SCRIPT:
+            return  # Already canonical
+        with open(_path, 'w') as _f:
+            _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
+        os.chmod(_path, 0o755)
+        _log("Authentik tasklog purge script updated to v0.9.26 canonical version (fixes VACUUM-in-transaction bug)")
+    except Exception as _e:
+        _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
+
+
+def _auto_authentik_tasklog_purge(plog=None):
+    """v0.9.26: inline multi-tier cleanup of authentik_tasks_task + authentik_tasks_tasklog.
+
+    Runs on every console boot via `_startup_migrations` (no version gate,
+    no Update Now gate). Mirrors the on-disk weekly script's logic but is
+    executed by the Python console process so:
+      1. it runs MORE OFTEN than the weekly timer (every console restart),
+      2. it doesn't depend on the on-disk script being correct (the v0.9.5
+         script silently failed every Sunday for months until v0.9.26),
+      3. errors are surfaced into the console log alongside other migrations.
+
+    Threshold ladder (combined size of both tables):
+      < 100 MB → no-op (already healthy, silent).
+      ≥ 100 MB after Tier 1 (7 days)  → escalate to Tier 2.
+      ≥ 100 MB after Tier 2 (24 hours)→ escalate to Tier 3 (1 hour).
+
+    Each DELETE runs in its own `psql -c`. VACUUM ANALYZE runs in a SEPARATE
+    `psql -c`. NEVER use a single multi-statement -c arg because psql wraps
+    multi-statement `-c` in an implicit transaction and `VACUUM cannot run
+    inside a transaction block` — this is the bug that silently broke the
+    v0.9.5 weekly timer on every install for 6+ months.
+
+    Idempotent. Non-raising — exceptions are logged and swallowed.
+    """
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        return  # Authentik not installed on this host
+
+    try:
+        _up = subprocess.run(
+            ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+            capture_output=True, text=True, timeout=10
+        )
+        if _up.returncode != 0 or _up.stdout.strip() != 'true':
+            return
+
+        def _size_bytes():
+            r = subprocess.run(
+                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-t', '-A', '-c',
+                 "SELECT pg_total_relation_size('authentik_tasks_tasklog') + pg_total_relation_size('authentik_tasks_task')"],
+                capture_output=True, text=True, timeout=20
+            )
+            if r.returncode != 0:
+                return None
+            try:
+                return int((r.stdout or '0').strip())
+            except ValueError:
+                return None
+
+        def _row_counts():
+            r = subprocess.run(
+                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-t', '-A', '-c',
+                 "SELECT (SELECT count(*) FROM authentik_tasks_task) || '|' || (SELECT count(*) FROM authentik_tasks_tasklog)"],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode != 0:
+                return None, None
+            try:
+                parts = (r.stdout or '').strip().split('|')
+                return int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                return None, None
+
+        _initial = _size_bytes()
+        if _initial is None:
+            return
+        _initial_mb = _initial // (1024 * 1024)
+        _threshold_mb = 100
+
+        if _initial_mb < _threshold_mb:
+            return  # Healthy — silent no-op
+
+        _row_t0, _row_tl0 = _row_counts()
+        _log(
+            f"Authentik tasklog: {_initial_mb} MB "
+            f"(task={_row_t0} rows, tasklog={_row_tl0} rows) — running v0.9.26 cleanup"
+        )
+
+        def _delete_older_than(interval, tier_label):
+            sql = (
+                "DELETE FROM authentik_tasks_tasklog "
+                "WHERE task_id IN ("
+                "  SELECT message_id FROM authentik_tasks_task "
+                f"  WHERE mtime < NOW() - INTERVAL '{interval}'"
+                "); "
+                "DELETE FROM authentik_tasks_task "
+                f"WHERE mtime < NOW() - INTERVAL '{interval}';"
+            )
+            r = subprocess.run(
+                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-c', sql],
+                capture_output=True, text=True, timeout=600
+            )
+            if r.returncode != 0:
+                _log(f"Authentik tasklog: {tier_label} DELETE returned non-zero: {(r.stderr or '')[:200]}")
+            return r
+
+        _delete_older_than('7 days', 'Tier 1 (7-day)')
+        _after_7d = _size_bytes() or _initial
+        if (_after_7d // (1024 * 1024)) >= _threshold_mb:
+            _delete_older_than('24 hours', 'Tier 2 (24-hour)')
+        _after_24h = _size_bytes() or _after_7d
+        if (_after_24h // (1024 * 1024)) >= _threshold_mb:
+            _delete_older_than('1 hour', 'Tier 3 (1-hour, nuclear)')
+
+        # VACUUM ANALYZE in its own psql -c so it's NOT inside an implicit transaction.
+        # See the v0.9.5 weekly-timer-script bug history in the comment above.
+        _vac = subprocess.run(
+            ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+             '-d', 'authentik', '-c',
+             'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;'],
+            capture_output=True, text=True, timeout=900
+        )
+        if _vac.returncode != 0:
+            _log(f"Authentik tasklog: VACUUM ANALYZE returned non-zero: {(_vac.stderr or '')[:200]}")
+
+        _final = _size_bytes() or _initial
+        _final_mb = _final // (1024 * 1024)
+        _row_t1, _row_tl1 = _row_counts()
+        _freed_mb = max(0, _initial_mb - _final_mb)
+        _log(
+            f"Authentik tasklog: cleanup complete — "
+            f"{_initial_mb} MB → {_final_mb} MB (freed {_freed_mb} MB), "
+            f"task rows {_row_t0}→{_row_t1}, tasklog rows {_row_tl0}→{_row_tl1}"
+        )
+
+        # Update the Guard Dog stamp file so the dashboard's "last run" tile is current.
+        try:
+            _ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            os.makedirs('/opt/tak-guarddog', exist_ok=True)
+            with open('/opt/tak-guarddog/authentik_tasklog_purge_last.txt', 'w') as _f:
+                _f.write(_ts + '\n')
+        except Exception:
+            pass
+    except Exception as _e:
+        _log(f"Authentik tasklog purge error (non-fatal): {_e}")
+
+
 def _ensure_authentik_webadmin(skip_bind_verify=False):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
@@ -43130,6 +43372,40 @@ def _startup_migrations():
                         print(f"Startup migration: LDAP recreate after heal exception: {_re_err}", flush=True)
         except Exception as _shc_err:
             print(f"Startup migration: compose self-heal error (non-fatal): {_shc_err}", flush=True)
+
+        # v0.9.26 (2026-05-17, after tak-10 surfaced sustained ~80% Authentik
+        # server CPU with the symptom traced to the v0.9.5 weekly tasklog
+        # purge timer silently failing every Sunday for months):
+        #
+        #   - takauthentiktasklogpurge.service ran 03:00:06 UTC and exited 1
+        #     with `ERROR: VACUUM cannot run inside a transaction block`.
+        #     The script's single `psql -c "DELETE;DELETE;VACUUM"` got wrapped
+        #     in an implicit transaction by psql; VACUUM is forbidden inside
+        #     transactions. The DELETEs returned 0 rows anyway because the
+        #     hardcoded 30-day threshold didn't match recent restart-churn
+        #     bloat. authentik_tasks_tasklog grew to 2,025,958 rows / 516 MB
+        #     + authentik_tasks_task to 640,596 rows / 442 MB in <24h.
+        #     Every license-cache request through Django's middleware stack
+        #     timed out → asgiref CancelledError → authentik-server-1
+        #     pinned at ~80% CPU, exactly the pattern v0.9.21 already
+        #     documented for the upstream license cache leak — but caused
+        #     by THIS bloat, not the leak itself.
+        #
+        # Two-part fix on every console boot, both unconditional:
+        #   1. _ensure_authentik_tasklog_purge_script — overwrite the broken
+        #      v0.9.5 script on disk with the fixed multi-tier version. The
+        #      Sunday 03:00 timer will work correctly from then on.
+        #   2. _auto_authentik_tasklog_purge — inline purge from Python.
+        #      Runs immediately on every console boot, doesn't depend on
+        #      the on-disk script. Idempotent + silent if size < 100 MB.
+        try:
+            _ensure_authentik_tasklog_purge_script(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _atl_s_err:
+            print(f"Startup migration: tasklog script update error (non-fatal): {_atl_s_err}", flush=True)
+        try:
+            _auto_authentik_tasklog_purge(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _atl_e:
+            print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
 
         # v0.8.7: Apply Authentik official tunings (env var name fix + cache + log level).
         # The function is idempotent: returns False if no changes needed (every startup
