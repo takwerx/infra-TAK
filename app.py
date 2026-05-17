@@ -34212,6 +34212,103 @@ def _auto_authentik_tasklog_purge(plog=None):
             f"task rows {_row_t0}→{_row_t1}, tasklog rows {_row_tl0}→{_row_tl1}"
         )
 
+        # v0.9.26 hotfix #2 (2026-05-17, after tak-10 surfaced post-purge worker
+        # thrashing the SAME morning v0.9.26 shipped):
+        #
+        # `DELETE` + `VACUUM ANALYZE` clears live rows but does NOT shrink the
+        # heap file or rebuild bloated indexes. On a long-bloated box (tak-10
+        # at 13:00 UTC: 940 MB heap + 444 MB indexes for only ~1000 live rows
+        # post-DELETE), every INSERT/UPDATE traverses 50 MB indexes per write.
+        # PgBouncer kills those queries with `query_wait_timeout` (default 120s),
+        # which cascades to `OperationalError: the connection is closed` in the
+        # dramatiq broker, which pegs `authentik-worker-1` at ~46% CPU thrashing
+        # on PG retries, and ultimately leaves `authentik-server-1` `(unhealthy)`
+        # with the LDAP outpost getting 502 Bad Gateway → 228-second bind times
+        # → 8446 login + Sync webadmin operator-visible timeouts.
+        #
+        # Fix (one-shot per-install): detect "tiny live rows in a huge file"
+        # (bytes/live_row > 100 KB AND total > 50 MB) and escalate to
+        #   1. REINDEX TABLE CONCURRENTLY  (no lock — PG 12+)
+        #   2. VACUUM FULL                  (brief lock — sub-second on tiny tables)
+        #   3. _recreate_authentik_server_worker — flush stuck PG connections from
+        #      the cancellation storm. Required because gunicorn's MAX_REQUESTS=1000
+        #      recycling doesn't catch workers deadlocked on dead PG sockets, and
+        #      Authentik's healthcheck stays `unhealthy` until the process restarts.
+        #
+        # Safety: skipped when `live_rows > 100k` (the table is actively busy,
+        # don't take the VACUUM FULL lock) — those installs are healthy enough
+        # already that the time-based DELETE tiers will catch them next boot.
+        try:
+            _post_cleanup_size = _size_bytes() or _final
+            _live_rows = (_row_t1 or 0) + (_row_tl1 or 0)
+            _bytes_per_row = _post_cleanup_size // max(_live_rows, 1)
+            _bloat_size_min = 50 * 1024 * 1024       # 50 MB
+            _bloat_bpr_threshold = 100 * 1024        # 100 KB/row
+            _bloat_live_rows_max = 100_000           # safety: skip when tables are busy
+
+            if (_post_cleanup_size > _bloat_size_min
+                    and _bytes_per_row > _bloat_bpr_threshold
+                    and _live_rows < _bloat_live_rows_max):
+                _log(
+                    f"Authentik tasklog: post-DELETE bloat detected "
+                    f"({_post_cleanup_size // (1024*1024)} MB / {_live_rows} live rows "
+                    f"= {_bytes_per_row // 1024} KB/row) — running REINDEX CONCURRENTLY + VACUUM FULL"
+                )
+                _compact_t0 = time.time()
+                for _tbl in ('authentik_tasks_tasklog', 'authentik_tasks_task'):
+                    _r_idx = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                         '-d', 'authentik', '-c', f'REINDEX TABLE CONCURRENTLY {_tbl};'],
+                        capture_output=True, text=True, timeout=1800
+                    )
+                    if _r_idx.returncode != 0:
+                        _log(
+                            f"Authentik tasklog: REINDEX {_tbl} returned non-zero "
+                            f"(continuing): {(_r_idx.stderr or '')[:200]}"
+                        )
+                    _r_vf = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                         '-d', 'authentik', '-c', f'VACUUM FULL {_tbl};'],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    if _r_vf.returncode != 0:
+                        _log(
+                            f"Authentik tasklog: VACUUM FULL {_tbl} returned non-zero "
+                            f"(continuing): {(_r_vf.stderr or '')[:200]}"
+                        )
+
+                _post_compact_size = _size_bytes() or _post_cleanup_size
+                _compact_freed_mb = max(0, (_post_cleanup_size - _post_compact_size) // (1024 * 1024))
+                _log(
+                    f"Authentik tasklog: deep compaction complete in "
+                    f"{int(time.time() - _compact_t0)}s — "
+                    f"{_post_cleanup_size // (1024*1024)} MB → "
+                    f"{_post_compact_size // (1024*1024)} MB "
+                    f"(freed {_compact_freed_mb} MB on disk)"
+                )
+
+                # Recreate server + worker to flush stuck PG connections from the
+                # cancellation storm. LDAP outpost is preserved (it'll auto-reconnect
+                # to the new server via websocket — fresh state, no operator action).
+                _log("Authentik tasklog: recreating server+worker to flush stuck PG connections (LDAP preserved)")
+                try:
+                    _recreate_authentik_server_worker(
+                        plog=lambda m: _log(f"  {m}"),
+                        reason='post-tasklog-deep-compact'
+                    )
+                except Exception as _rec_err:
+                    _log(f"Authentik tasklog: post-compact server+worker recreate error (non-fatal): {_rec_err}")
+            else:
+                if _post_cleanup_size > _bloat_size_min:
+                    _log(
+                        f"Authentik tasklog: post-cleanup state "
+                        f"{_post_cleanup_size // (1024*1024)} MB / {_live_rows} live rows "
+                        f"= {_bytes_per_row // 1024} KB/row — within healthy bounds, "
+                        f"skipping deep compaction"
+                    )
+        except Exception as _bloat_err:
+            _log(f"Authentik tasklog: bloat-ratio check error (non-fatal): {_bloat_err}")
+
         # Update the Guard Dog stamp file so the dashboard's "last run" tile is current.
         try:
             _ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
