@@ -27142,32 +27142,45 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
 # infra-TAK fleet box (2-4 vCPU, ~50 concurrent ATAK + iTAK + WebTAK + portal
 # users + LDAP outpost binds). Operators can override via .env if needed but
 # the defaults should comfortably absorb 99% of traffic.
-#   - DEFAULT_POOL_SIZE=35: real PG server connections per (db, user) pair.
+#   - DEFAULT_POOL_SIZE=75: real PG server connections per (db, user) pair.
 #     With Authentik's leak, the previous setting was ~500 (max_connections),
 #     hit by exhaustion every ~30 min on busy boxes. v0.9.23 shipped =25
 #     (matching TAK-NZ/auth-infra on managed RDS, Christian Elsen PR #102).
-#     v0.9.24 bumps to 35 after tak-10 field validation (2026-05-16) showed
-#     `SHOW POOLS` running steady-state at sv_active=29/sv_idle=1 under modest
-#     concurrent load — saturated with zero headroom for spike absorption.
-#     35 + RESERVE=5 → 40-connection ceiling, still well below Postgres
-#     max_connections=500 and gives ~33% headroom for traffic bursts.
+#     v0.9.24 bumped to 35 after the steady-state pool saturated at sv_active=29.
+#     v0.9.26-alpha hotfix #3 bumps to 75 after tak-10 field validation
+#     (2026-05-17, post-bloat-cleanup): even with healthy task tables and 4
+#     gunicorn workers, the server hit `ProtocolViolation: query_wait_timeout`
+#     within ~10 min of every recreate. Root cause: Django Channels uses
+#     PG-backed `django_channels_postgres_groupchannel` long-polling SELECTs
+#     for the channels layer — `pg_stat_activity` showed 17 idle conns held
+#     by `SELECT DISTINCT FROM ... groupchannel` (one per active channel),
+#     leaving only ~18 of the 35-slot pool for HTTP requests. Under modest
+#     concurrent load (outpost API polls, healthchecks, OAuth flows) the
+#     pool exhausted, requests piled in PgBouncer's queue past query_wait
+#     timeout, gunicorn workers got stuck on `pg_advisory_lock(...)`, and
+#     LDAP searches started returning empty results → TAK Server 8446 login
+#     landed on WebTAK instead of admin page. 75 + RESERVE=15 → 90-connection
+#     ceiling gives ~57 slots after Channels overhead, comfortably absorbing
+#     spike load. Still well below Postgres max_connections=500.
 #   - MAX_CLIENT_CONN=1000: client-side virtual connection slots. Authentik
 #     workers + outposts can each "hold" idle connections without consuming
 #     real PG server slots — PgBouncer only checks out a server connection
 #     for the duration of each transaction (POOL_MODE=transaction).
-#   - RESERVE_POOL_SIZE=5: extra connections opened when DEFAULT_POOL_SIZE
+#   - RESERVE_POOL_SIZE=15: extra connections opened when DEFAULT_POOL_SIZE
 #     is saturated AND a client has been waiting >reserve_pool_timeout (5s).
-#     Provides headroom during traffic spikes without permanently inflating
-#     the steady-state connection count.
+#     Provides headroom during traffic spikes (OAuth-flow bursts, post-restart
+#     reconnect storms, blueprint reloads) without permanently inflating the
+#     steady-state connection count. Bumped 5 → 15 in v0.9.26-alpha hotfix #3
+#     alongside DEFAULT_POOL_SIZE.
 #   - SERVER_IDLE_TIMEOUT=300s: PgBouncer-side idle reaper. Matches our
 #     Postgres idle_session_timeout=300s. Real PG connections close after
 #     5 min idle so we don't keep them open longer than the upstream.
 #   - SERVER_RESET_QUERY=DISCARD ALL: clears prepared statements, temp tables,
 #     and session state between checkouts. Required for transaction mode
 #     and recommended by both PgBouncer upstream and Authentik docs.
-_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 35
+_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 75
 _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 1000
-_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 5
+_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 15
 _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
 
 
@@ -27195,7 +27208,8 @@ def _ensure_authentik_pgbouncer(plog):
 
     Insert PgBouncer in transaction-pool mode between Authentik and Postgres.
     PgBouncer maintains a small server-side pool of real PG connections
-    (DEFAULT_POOL_SIZE=35, RESERVE=5 → 40-connection ceiling, v0.9.24)
+    (DEFAULT_POOL_SIZE=75, RESERVE=15 → 90-connection ceiling, v0.9.26-alpha
+    hotfix #3 — see _AUTHENTIK_PGBOUNCER_* constants for sizing rationale)
     regardless of how leaky Authentik's client-side psycopg pools become.
     Authentik workers can "hold" thousands of client-side idle connections
     but only borrow a real PG connection for the duration of each
@@ -27515,8 +27529,8 @@ def _ensure_authentik_pgbouncer(plog):
     if not any(ln.startswith('# ── v0.9.23 PgBouncer pooler') for ln in new_env_lines):
         new_env_lines.append('# ── v0.9.23 PgBouncer pooler ─────────────────────────────────────────')
         new_env_lines.append('# Authentik now connects to PgBouncer (transaction pool mode) instead of')
-        new_env_lines.append('# Postgres directly. PgBouncer caps real PG server connections at ~30')
-        new_env_lines.append('# (DEFAULT_POOL_SIZE=35 + RESERVE_POOL_SIZE=5) regardless of upstream')
+        new_env_lines.append('# Postgres directly. PgBouncer caps real PG server connections at ~90')
+        new_env_lines.append('# (DEFAULT_POOL_SIZE=75 + RESERVE_POOL_SIZE=15) regardless of upstream')
         new_env_lines.append('# Authentik 2026.2.x cache-pool leaks. This eliminates the')
         new_env_lines.append('# ak-pg-watchdog firefighting class and the downstream TAK Server')
         new_env_lines.append('# "User lookup failed" / phantom-subscription class.')
@@ -27742,28 +27756,40 @@ def _ensure_authentik_pgbouncer(plog):
         plog("  ✗ pgbouncer install: completed with BYPASSED state — see logs above for fix steps")
     else:
         plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
-             "(transaction pool, ≤40 real PG conns)")
+             "(transaction pool, ≤90 real PG conns)")
     return True
 
 
-def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
-    """v0.9.24 Item 3: Bump PgBouncer DEFAULT_POOL_SIZE on existing installs.
+def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
+    """v0.9.24 Item 3 + v0.9.26-alpha hotfix #3: Bump PgBouncer pool sizing on
+    existing installs.
 
-    v0.9.23 shipped the PgBouncer install with DEFAULT_POOL_SIZE=25, RESERVE_POOL_SIZE=5
-    (30-connection ceiling). Field validation on tak-10 (2026-05-16, single-day post-
-    install) showed `SHOW POOLS` running steady-state at sv_active=29 / sv_idle=1 under
-    modest concurrent load — fully saturated with zero headroom for traffic spikes,
-    OAuth-flow bursts, or LDAP outpost reconnect storms. Bumping to 35 + RESERVE=5 →
-    40-connection ceiling, restoring ~33% spike headroom while staying well below
-    Postgres max_connections=500.
+    v0.9.23 shipped DEFAULT_POOL_SIZE=25, RESERVE_POOL_SIZE=5 (30-conn ceiling).
+    v0.9.24 bumped to 35/5 (40-conn ceiling) after tak-10 field validation
+    (2026-05-16) showed `SHOW POOLS` saturated at sv_active=29/sv_idle=1.
+
+    v0.9.26-alpha hotfix #3 (2026-05-17): bumps DEFAULT_POOL_SIZE 35 → 75 and
+    RESERVE_POOL_SIZE 5 → 15 (90-conn ceiling). After the v0.9.26 inline
+    tasklog purge cleaned the database, tak-10 STILL saturated the pool within
+    ~10 min of every recreate. Root cause was Django Channels' PG-backed channel
+    layer: `pg_stat_activity` showed 17 idle connections held by
+    `SELECT DISTINCT FROM ...django_channels_postgres_groupchannel`
+    (one per active channel, long-polling). That consumed almost half the
+    35-slot pool, leaving only ~18 slots for HTTP requests, outpost API polls,
+    OAuth flows, and healthchecks → `ProtocolViolation: query_wait_timeout` →
+    gunicorn workers stuck on `pg_advisory_lock` → LDAP searches returning
+    empty results → TAK Server 8446 login landing on WebTAK instead of admin.
+    See `_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE` for the full forensic trace.
 
     Idempotency / safety:
-      - On fresh v0.9.24 installs, `_ensure_authentik_pgbouncer` already writes
-        DEFAULT_POOL_SIZE=35 (the bumped constant). This migration sees it and no-ops.
-      - On v0.9.23 installs (DEFAULT_POOL_SIZE=25 in compose), patches the YAML in
-        place and force-recreates the pgbouncer container only (server+worker keep
-        their existing connections; PgBouncer healthcheck cycling pools them).
-      - On boxes where an operator has manually raised it (e.g. DEFAULT_POOL_SIZE=50),
+      - On fresh installs, `_ensure_authentik_pgbouncer` already writes the
+        current target values. This migration sees them and no-ops.
+      - On v0.9.23 (25/5) or v0.9.24-v0.9.26 initial (35/5) installs, patches
+        BOTH DEFAULT_POOL_SIZE and RESERVE_POOL_SIZE in the YAML and recreates
+        the pgbouncer container (server+worker keep their existing client-side
+        connections — PgBouncer's transaction-pool semantics re-pool within
+        seconds).
+      - On boxes where an operator manually raised either value (e.g. 100/20),
         idempotent no-op — we never lower an operator override.
       - On boxes without PgBouncer installed (very old, or external PG), no-op.
       - Backs up the compose file before mutation and rolls back on write failure.
@@ -27774,6 +27800,10 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
       None  — failure (logged via plog, compose rolled back on write error)
     """
     target = target if target is not None else _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE
+    target_reserve = (
+        target_reserve if target_reserve is not None
+        else _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE
+    )
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     if not os.path.exists(compose_path):
@@ -27808,15 +27838,27 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
              "skip (operator override or unusual compose layout)")
         return False
 
-    cur = env.get('DEFAULT_POOL_SIZE')
-    try:
-        cur_int = int(cur) if cur is not None else None
-    except (TypeError, ValueError):
-        plog(f"  pgbouncer pool-size: DEFAULT_POOL_SIZE has non-integer value {cur!r} "
-             "— skip (operator override)")
+    def _int_or_none(name):
+        v = env.get(name)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            plog(f"  pgbouncer pool-size: {name} has non-integer value {v!r} "
+                 "— treating as operator override (will not modify)")
+            return 'override'
+
+    cur_default = _int_or_none('DEFAULT_POOL_SIZE')
+    cur_reserve = _int_or_none('RESERVE_POOL_SIZE')
+
+    if cur_default == 'override' or cur_reserve == 'override':
         return False
 
-    if cur_int is not None and cur_int >= target:
+    needs_default = cur_default is not None and cur_default < target
+    needs_reserve = cur_reserve is not None and cur_reserve < target_reserve
+
+    if not needs_default and not needs_reserve:
         return False
 
     backup_path = compose_path + f'.poolsize-bak-{int(time.time())}'
@@ -27827,12 +27869,18 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
         plog(f"  pgbouncer pool-size: backup failed (refusing to mutate): {e}")
         return None
 
-    env['DEFAULT_POOL_SIZE'] = target
+    new_default = max(cur_default or 0, target)
+    new_reserve = max(cur_reserve or 0, target_reserve)
+    env['DEFAULT_POOL_SIZE'] = new_default
+    env['RESERVE_POOL_SIZE'] = new_reserve
+
     try:
         with open(compose_path, 'w') as f:
             _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
         plog(f"  pgbouncer pool-size: patched docker-compose.yml "
-             f"DEFAULT_POOL_SIZE {cur_int} → {target} (backup at {backup_path})")
+             f"DEFAULT_POOL_SIZE {cur_default} → {new_default}, "
+             f"RESERVE_POOL_SIZE {cur_reserve} → {new_reserve} "
+             f"(backup at {backup_path})")
     except Exception as e:
         plog(f"  pgbouncer pool-size: compose write failed: {e} — rolling back")
         try:
@@ -27866,7 +27914,8 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
             break
     if healthy:
         plog(f"  ✓ pgbouncer pool-size: pgbouncer recreated and healthy "
-             f"(DEFAULT_POOL_SIZE={target}, ceiling=40 with RESERVE=5)")
+             f"(DEFAULT_POOL_SIZE={new_default}, RESERVE_POOL_SIZE={new_reserve}, "
+             f"ceiling={new_default + new_reserve})")
     else:
         plog(f"  ⚠ pgbouncer pool-size: pgbouncer recreated but not healthy within 24s "
              f"— server+worker may briefly degrade; will stabilize as transactions cycle")
@@ -27874,10 +27923,15 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
     try:
         s = load_settings()
         cfg = s.get('authentik_pgbouncer') or {}
-        cfg['default_pool_size'] = target
+        cfg['default_pool_size'] = new_default
+        cfg['reserve_pool_size'] = new_reserve
         cfg['last_pool_size_migration_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_pool_size_migration_from'] = cur_int
-        cfg['last_pool_size_migration_to'] = target
+        cfg['last_pool_size_migration_from'] = {
+            'default': cur_default, 'reserve': cur_reserve,
+        }
+        cfg['last_pool_size_migration_to'] = {
+            'default': new_default, 'reserve': new_reserve,
+        }
         cfg['last_pool_size_migration_version'] = VERSION
         s['authentik_pgbouncer'] = cfg
         save_settings(s)
@@ -28538,10 +28592,11 @@ def _authentik_channels_pool_watchdog_loop():
     """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
     PostgreSQL connections from the authentik database exceed a threshold.
 
-    STATUS as of v0.9.24 (PgBouncer pool bump): DEEP DEFENSE-IN-DEPTH only.
-    PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=35 + RESERVE=5) caps the real
-    PG server-side idle count at ~40 regardless of how leaky Authentik's
-    cache-pool is, so this watchdog should essentially never fire on a v0.9.23+
+    STATUS as of v0.9.26-alpha hotfix #3 (PgBouncer pool re-bump 35→75): DEEP
+    DEFENSE-IN-DEPTH only. PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=75 +
+    RESERVE=15) caps the real PG server-side idle count at ~90 regardless of
+    how leaky Authentik's cache-pool is or how many Django Channels long-polls
+    are open, so this watchdog should essentially never fire on a v0.9.23+
     box. If it DOES fire post-PgBouncer, it means either:
       1. PgBouncer is mis-configured (e.g. POOL_MODE flipped to `session`),
       2. The leak class has changed (new upstream code path), or
@@ -43609,15 +43664,16 @@ def _startup_migrations():
         except Exception as ak_pgb_err:
             print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
 
-        # v0.9.24 Item 3: Bump PgBouncer DEFAULT_POOL_SIZE on existing v0.9.23
-        # installs from 25 → 35. Field validation on tak-10 (2026-05-16, the
-        # day after v0.9.23 install) showed `SHOW POOLS` saturated at
-        # sv_active=29/sv_idle=1 under modest concurrent load — zero spike
-        # headroom. Bump to 35 + RESERVE=5 → 40-conn ceiling. Idempotent:
-        # fresh v0.9.24 installs already write 35 above (no-op here); existing
-        # v0.9.23 installs get patched + pgbouncer container recreated (server+
-        # worker keep their connections). Operator overrides (>35) are
-        # preserved. See `_ensure_authentik_pgbouncer_pool_size` docstring.
+        # v0.9.24 Item 3 + v0.9.26-alpha hotfix #3: Bump PgBouncer pool sizing
+        # on existing installs. v0.9.23 shipped 25/5 (30-conn ceiling); v0.9.24
+        # bumped to 35/5 (40-conn) after sv_active=29/sv_idle=1 saturation.
+        # v0.9.26-alpha hotfix #3 bumps to 75/15 (90-conn) after tak-10 forensics
+        # (2026-05-17) showed Django Channels' PG-backed groupchannel SELECTs
+        # eating 17 of 35 slots, triggering query_wait_timeout under modest
+        # load. Idempotent: fresh installs write the new constants above (no-op
+        # here); existing installs at 25/5 or 35/5 get both values patched +
+        # pgbouncer container recreated (server+worker keep their connections).
+        # Operator overrides are preserved. See `_ensure_authentik_pgbouncer_pool_size`.
         try:
             _ensure_authentik_pgbouncer_pool_size(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_pool_err:
