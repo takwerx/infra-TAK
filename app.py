@@ -27242,6 +27242,32 @@ _AUTHENTIK_POOL_AUTOTUNE_SAFETY_FACTOR = 2.0  # target_ceiling = peak * 2.0
 _AUTHENTIK_POOL_AUTOTUNE_SAMPLES_KEEP = 30  # ~1 h at 2-min watchdog ticks
 _AUTHENTIK_POOL_AUTOTUNE_DEFAULT_SHARE = 5.0 / 6.0  # 5:1 default:reserve split
 
+# v0.9.27-alpha hotfix #1: cold-start safe constant.
+#
+# The original v0.9.27 implementation took a single-shot pg_stat_activity
+# read on cold-start (`_authentik_pool_autotune_seed_from_live_pg`) and
+# used it as the peak. That turned out to be unreliable: tak-10's first
+# v0.9.27 boot at 2026-05-17 20:38:18 UTC sampled idle=9 (Authentik mid-
+# restart, traffic momentarily lulled) and the autotune correctly
+# computed target=FLOOR 75/15 from that — which would have collapsed
+# the box under normal load (~180 idle steady-state).
+#
+# Fix: cold-start ALWAYS uses a known-safe fleet constant. Every box
+# reboots into this ceiling, then autotune samples accumulate over the
+# next ~6 min (≥3 samples) and on the next console restart the box
+# converges to its actual-load size. Worst case: a quiet box runs at
+# 300-conn ceiling for ~1 reboot cycle, costs ~250 KB pgbouncer memory.
+# Cheap insurance against under-sizing.
+#
+# Why 250/50 specifically: this is the value tak-10 (the canonical
+# heavy-Channels-load box) has been stable on for hours post-amendment,
+# and the value test8 needed to recover from the v0.9.26 fracture.
+# Also exactly = PG_MAX_CONN(500) * CAP_PCT(0.6) = 300 ceiling, so
+# cold-start sits at the cap and the autotune can ONLY shrink from
+# there (the grow direction is bounded by the same cap).
+_AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT = 250
+_AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE = 50
+
 
 def _authentik_pool_autotune_seed_from_live_pg():
     """v0.9.27-alpha: one-shot pg_stat_activity reading for cold-start.
@@ -27388,39 +27414,38 @@ def _authentik_pool_autotune_compute(plog=None):
         }
 
     if len(samples) < 3:
-        # v0.9.27 cold-start safety: on a fresh box OR on first v0.9.27 migration
-        # from v0.9.26 (where the ring buffer is empty but the box may have
-        # been running at a much higher pool because of an operator override —
-        # tak-10's 250/50 is the canonical case), take ONE live pg_stat_activity
-        # reading and treat it as a seed. Without this, autotune would drop
-        # tak-10 from 250/50 to FLOOR (75/15 = 90 ceiling) on first migration
-        # and trigger the exact query_wait_timeout storm we're trying to fix.
-        live_idle = _authentik_pool_autotune_seed_from_live_pg()
-        if live_idle is not None and live_idle > 0:
-            target_default, target_reserve, decision = _build_decision(
-                peak=live_idle,
-                peak_at=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-                samples_seen=len(samples),
-                reason_prefix=(f'cold-start with live pg_stat_activity seed '
-                               f'(samples={len(samples)}, ring buffer empty);'),
-            )
-            decision['seed_source'] = 'live_pg_stat_activity'
-            if plog:
-                plog(f"  pool autotune: cold-start seed from live pg_stat_activity "
-                     f"(idle={live_idle}) → target {target_default}/{target_reserve} "
-                     f"(ceiling={target_default + target_reserve})")
-            return target_default, target_reserve, decision
-        target_default, target_reserve, decision = _build_decision(
-            peak=0,
-            peak_at=None,
-            samples_seen=len(samples),
-            reason_prefix='cold-start: insufficient samples (<3), live seed unavailable — using FLOOR;',
-        )
-        decision['seed_source'] = 'floor'
+        # v0.9.27-alpha hotfix #1: cold-start to a known-safe FLEET CONSTANT
+        # (250/50, 300-conn ceiling). NOT a single-shot pg_stat_activity read
+        # — that was unreliable (see _AUTHENTIK_POOL_AUTOTUNE_COLD_START_*
+        # comment for forensics from tak-10's 20:38 UTC boot). Every box
+        # reboots into this ceiling, then autotune kicks in on the next
+        # reboot once ≥3 samples have accumulated.
+        target_default = _AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT
+        target_reserve = _AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE
+        target_ceiling = target_default + target_reserve
+        decision = {
+            'computed_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'version': VERSION,
+            'samples_seen': len(samples),
+            'peak_observed': None,
+            'peak_at': None,
+            'target_ceiling': target_ceiling,
+            'target_default': target_default,
+            'target_reserve': target_reserve,
+            'capped_at_pg_max': False,
+            'reason': (
+                f'cold-start: fleet safe-constant '
+                f'({target_default}/{target_reserve} = {target_ceiling} ceiling); '
+                f'samples_seen={len(samples)} (<3 required for normal autotune); '
+                f'autotune will recompute on next console restart once watchdog '
+                f'has logged ≥3 samples (~6 min after this boot)'
+            ),
+            'seed_source': 'fleet_cold_start_constant',
+        }
         if plog:
-            plog(f"  pool autotune: cold-start ({len(samples)} samples, no live seed) "
-                 f"→ FLOOR {target_default}/{target_reserve} "
-                 f"(ceiling={target_default + target_reserve})")
+            plog(f"  pool autotune: cold-start (samples={len(samples)}) → "
+                 f"fleet safe-constant {target_default}/{target_reserve} "
+                 f"(ceiling={target_ceiling})")
         return target_default, target_reserve, decision
 
     # Normal path: find peak idle across the window.
@@ -28271,28 +28296,13 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     except Exception:
         pass
 
-    # v0.9.26-alpha hotfix #4 (forensic discovery 2026-05-17 16:41 UTC on
-    # tak-10): the ak-pg-watchdog threshold (default 150) is compared against
-    # TOTAL idle PG connections, which includes PgBouncer's pre-warmed sv_idle
-    # pool. If pool ceiling (DEFAULT + RESERVE) ever exceeds the watchdog
-    # threshold, the watchdog mis-fires on NORMAL pre-warmed state — it sees
-    # ~178 idle conns (PgBouncer warming) and concludes the upstream
-    # license-cache leak is happening, restarting authentik-server-1 every
-    # 8-10 min. tak-10's manual operator override to pool 150/30 (180 ceiling)
-    # triggered this: watchdog at 150 thresh ALWAYS fired on warmed pool →
-    # constant server-1 restart cycle → MAX_REQUESTS autotuned to floor (100)
-    # → operator-visible 8446 + Sync webadmin outage every ~10 min during
-    # the restart window.
-    #
-    # Reconcile the watchdog threshold to sit ABOVE the pool ceiling (the
-    # watchdog should detect REAL leaks where conns grow past PgBouncer's
-    # configured maximum, NOT the prewarmed pool itself).
-    # Formula: threshold = ceiling + 50 (50-conn alert headroom above
-    # pre-warmed state). 50 is conservative — license-cache class leaks
-    # grew at ~2 conn/sec, so 50-conn headroom gives ~25 sec to detect
-    # before the watchdog fires.
-    # Operator overrides above the computed value are preserved.
-    _reconcile_watchdog_threshold(new_default, new_reserve)
+    # v0.9.27-alpha hotfix #1: removed duplicate _reconcile_watchdog_threshold
+    # call here (was `_reconcile_watchdog_threshold(new_default, new_reserve)`
+    # — a stale reference from the v0.9.26 implementation that caused a
+    # NameError on every successful pool change, e.g. tak-10's 20:38:38 UTC
+    # boot). The threshold reconciliation already happens at the correct
+    # point in the function — see the `_reconcile_watchdog_threshold(target,
+    # target_reserve)` call right after the pgbouncer recreate above.
 
     return True
 
