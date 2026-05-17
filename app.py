@@ -27376,6 +27376,108 @@ def _authentik_pgbouncer_cl_waiting():
         return None
 
 
+# v0.9.27-alpha hotfix #4: ghost-Channels-conn reaper.
+#
+# BACKGROUND (test8 forensic, 2026-05-17 22:14 UTC):
+#
+# test8 ran four v0.9.27-alpha hotfix iterations (initial → hotfix #1 →
+# hotfix #2 → hotfix #3). Each iteration cycled server-1 (either explicitly
+# via pgbouncer recreate cascade or implicitly via the watchdog safety
+# net firing). Each server-1 cycle leaked its open Channels long-poll
+# subscriptions:
+#
+#   1. Authentik server-1 opens `SELECT DISTINCT FROM
+#      django_channels_postgres_groupchannel WHERE expires > NOW()`
+#      long-poll subscriptions for every active websocket client.
+#   2. When server-1 is killed mid-poll (any restart), the listener
+#      Python process dies but the PostgreSQL backend doesn't see a
+#      disconnect (PgBouncer holds the socket).
+#   3. From PgBouncer's view, the upstream conn is between queries
+#      (sv_idle in transaction mode — normal state).
+#   4. From PostgreSQL's view, the backend is `state='idle'` running
+#      the unchanged Channels SELECT. It will stay this way until the
+#      socket eventually times out (default keepalive: hours).
+#   5. The new server-1 generation opens FRESH Channels conns for the
+#      same subscribers. Pool fills with the union of live + ghost
+#      conns.
+#
+# On test8 we directly observed 290 such ghost conns with `state_change`
+# age of 2h 2min — exactly matching the time since the pgbouncer recreate
+# during hotfix #0 deploy. Killing them with pg_terminate_backend
+# instantly restored the pool to healthy.
+#
+# This is an upstream Authentik + django_channels_postgres pattern, NOT
+# something v0.9.27 introduced. But v0.9.27 is the release where we
+# discovered + characterized it, so we ship the cleanup so operators
+# don't get the test8 pattern on their first Update Now.
+#
+# The reaper is narrow:
+#   - state = 'idle' (not killing active queries)
+#   - query LIKE '%groupchannel%' (only the Channels long-poll class)
+#   - state_change < NOW() - INTERVAL '5 minutes' (normal Channels polls
+#     return within ~60s; 5 min is generous tolerance for slow networks
+#     while still catching all ghosts from a server-1 restart)
+#
+# Cite: anchortak forensic 2026-05-17 22:14 UTC + test8 recovery action
+# (290 backends terminated, idle 299→11, all containers healthy in <60s).
+_AUTHENTIK_CHANNELS_GHOST_REAP_AGE_MIN = 5  # SQL `INTERVAL N minutes`
+
+
+def _authentik_reap_ghost_channels_conns(plog=None):
+    """v0.9.27-alpha hotfix #4: terminate ghost Channels backends.
+
+    Runs `pg_terminate_backend(pid)` on PostgreSQL backends matching:
+      - datname='authentik'
+      - state='idle'
+      - query LIKE '%groupchannel%'
+      - state_change < NOW() - INTERVAL '5 minutes'
+
+    Safe to call at any time (idempotent, narrow). Returns the number
+    of backends reaped, or None on PG-unreachable error.
+
+    Called from:
+      1. Startup migration (~once per console boot, post pool sizing).
+      2. Watchdog tick when cl_waiting > 0 is observed (proactive reap
+         on observed starvation — see _authentik_channels_pool_watchdog_
+         loop).
+    """
+    try:
+        r = subprocess.run(
+            ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+             '-U', 'authentik', '-d', 'authentik', '-tA', '-c',
+             "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) "
+             "FROM pg_stat_activity "
+             "WHERE datname='authentik' AND state='idle' "
+             "AND query LIKE '%groupchannel%' "
+             f"AND state_change < NOW() - INTERVAL '{_AUTHENTIK_CHANNELS_GHOST_REAP_AGE_MIN} minutes') t"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            if plog:
+                plog(f"  ghost-channels-reaper: PG query failed (rc={r.returncode}): "
+                     f"{(r.stderr or '')[:120]}")
+            return None
+        out = (r.stdout or '').strip()
+        if not out.isdigit():
+            if plog:
+                plog(f"  ghost-channels-reaper: unexpected PG response: {out[:80]}")
+            return None
+        n = int(out)
+        if plog:
+            if n > 0:
+                plog(f"  ✓ ghost-channels-reaper: terminated {n} idle Channels backends "
+                     f"older than {_AUTHENTIK_CHANNELS_GHOST_REAP_AGE_MIN} min "
+                     f"(see hotfix #4 docs — upstream django_channels_postgres "
+                     f"leak pattern on server-1 restart)")
+            else:
+                plog(f"  ghost-channels-reaper: no ghosts found (clean)")
+        return n
+    except Exception as e:
+        if plog:
+            plog(f"  ghost-channels-reaper: error (non-fatal): {e}")
+        return None
+
+
 def _authentik_pool_autotune_sample(idle_count, classes, cl_waiting=None):
     """v0.9.27-alpha: append one observation to the autotune sample ring buffer.
 
@@ -29428,6 +29530,65 @@ def _authentik_channels_pool_watchdog_loop():
             _authentik_pool_autotune_sample(
                 _count, _classes_for_sample, _cl_waiting_for_sample
             )
+
+            # v0.9.27-alpha hotfix #4: proactive ghost-Channels reap on
+            # observed starvation. Two trigger conditions, EITHER suffices:
+            #   1. cl_waiting > 0 — direct demand signal, pool is starved
+            #      RIGHT NOW.
+            #   2. Channels-class idle conns > pool ceiling / 2 — a quiet
+            #      box where Channels has accumulated to half the pool
+            #      without active load. Almost certainly ghosts.
+            # The reap is narrow (idle + groupchannel + age >5min) so a
+            # false positive can't kill an active poll. Limit one reap
+            # per 20 ticks (~40 min) to avoid log noise and minimize
+            # disruption — the startup-migration reap covers most cases.
+            try:
+                _channels_idle = (
+                    _classes_for_sample[0] if _classes_for_sample else 0
+                )
+                _pool_ceiling = (
+                    _AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT
+                    + _AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE
+                )  # 300 — sensible default for the trigger threshold
+                _starvation_signal = (
+                    (_cl_waiting_for_sample or 0) > 0
+                    or _channels_idle > (_pool_ceiling // 2)
+                )
+                _last_reap_ts = int(
+                    (_settings.get('pool_autotune') or {})
+                    .get('last_ghost_reap_ts') or 0
+                )
+                _now_ts = int(_wt.time())
+                if _starvation_signal and (_now_ts - _last_reap_ts) >= 2400:
+                    print(
+                        f"[ak-pg-watchdog] ghost-channels-reaper triggered: "
+                        f"cl_waiting={_cl_waiting_for_sample} channels_idle="
+                        f"{_channels_idle} (pool_ceiling={_pool_ceiling}) "
+                        f"→ scanning for ghosts...",
+                        flush=True,
+                    )
+
+                    def _wd_reap_log(_msg):
+                        print(f"[ak-pg-watchdog] {_msg}", flush=True)
+
+                    _reaped = _authentik_reap_ghost_channels_conns(_wd_reap_log)
+                    try:
+                        _s_reap = load_settings()
+                        _atc_reap = _s_reap.get('pool_autotune') or {}
+                        _atc_reap['last_ghost_reap_ts'] = _now_ts
+                        _atc_reap['last_ghost_reap_count'] = (
+                            _reaped if _reaped is not None else -1
+                        )
+                        _s_reap['pool_autotune'] = _atc_reap
+                        save_settings(_s_reap)
+                    except Exception:
+                        pass
+            except Exception as _reap_outer:
+                print(
+                    f"[ak-pg-watchdog] ghost reaper outer error (non-fatal): "
+                    f"{_reap_outer}",
+                    flush=True,
+                )
 
             # v0.9.27-alpha hotfix #3: continuous in-place remediation.
             #
@@ -44593,6 +44754,21 @@ def _startup_migrations():
             _ensure_authentik_pgbouncer_pool_size(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_pool_err:
             print(f"Startup migration: pgbouncer pool-size bump error (non-fatal): {ak_pgb_pool_err}")
+
+        # v0.9.27-alpha hotfix #4: reap ghost Channels backends left over
+        # from prior server-1 restarts. Critical on the v0.9.26 → v0.9.27
+        # Update Now path: the v0.9.26 install accumulates ghost conns
+        # whenever its server-1 cycles (which the watchdog safety net does
+        # on idle-conn accumulation). Without this reap, operators see
+        # test8's 290-ghost pattern → pool full → server-1 health check
+        # fails → "v0.9.27 broke my Authentik." With it, the very first
+        # Update Now self-heals.
+        try:
+            _authentik_reap_ghost_channels_conns(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ak_ghost_err:
+            print(f"Startup migration: ghost-channels-reaper error (non-fatal): {ak_ghost_err}")
 
         # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
         # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
