@@ -27269,43 +27269,100 @@ _AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT = 250
 _AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE = 50
 
 
-def _authentik_pool_autotune_seed_from_live_pg():
-    """v0.9.27-alpha: one-shot pg_stat_activity reading for cold-start.
+def _authentik_pgbouncer_cl_waiting():
+    """v0.9.27-alpha hotfix #2: read PgBouncer `SHOW POOLS` cl_waiting.
 
-    Used by _authentik_pool_autotune_compute() when the samples ring buffer
-    has fewer than 3 entries. Without this, the FIRST v0.9.27 migration on
-    a box that's currently running with an operator-bumped pool (e.g.
-    tak-10 at 250/50 due to v0.9.26-era manual override) would shrink the
-    pool to FLOOR (90 ceiling) and immediately re-trigger the
-    query_wait_timeout storm we're fixing.
+    BACKGROUND (the tak-10 stuck-at-floor incident, 2026-05-17 ~21:03 UTC):
 
-    Returns idle count (int) on success, None if PG isn't reachable.
+    Hotfix #1's cold-start fleet constant handled the cold-buffer case
+    correctly — but it didn't address a deeper architectural flaw in
+    autotune's measurement: sampling `pg_stat_activity` idle connections
+    measures pool HEADROOM, not pool DEMAND. A pool-starved box has
+    nearly all its conns checked out → low idle count → autotune
+    confirms the small pool is "fine." Self-reinforcing under-sizing.
+
+    On tak-10, hotfix #0 shrunk the pool to FLOOR (75/15) on first
+    v0.9.27 boot. By the time hotfix #1 arrived, the samples ring buffer
+    had 11 entries all showing idle=1-8 (Authentik was throttled by the
+    tiny pool, so it ran far fewer simultaneous queries, so idle stayed
+    low). `len(samples) >= 3` evaluated True → cold-start path skipped
+    → normal autotune ran on polluted samples → peak=8 → 75/15 confirmed.
+
+    The fix: sample PgBouncer's `cl_waiting` (clients literally waiting
+    for an upstream conn) alongside idle. `cl_waiting > 0` is unambiguous
+    direct evidence of unmet demand and CANNOT lie under starvation —
+    when the pool is too small, cl_waiting grows. The autotune compute
+    treats any non-zero cl_waiting in the sample window as a "wake up,
+    we're starved" signal that overrides the floor and forces cold-start.
+
+    Returns total cl_waiting + cl_waiting_cancel_req across all pools for
+    the authentik DB, summed (typically the only pool that matters), or
+    None on any failure. Non-raising.
+
+    SHOW POOLS columns (PgBouncer 1.25, verified live 2026-05-17 on test8):
+        0: database              1: user
+        2: cl_active             3: cl_waiting   ← demand signal
+        4: cl_active_cancel_req  5: cl_waiting_cancel_req  ← demand signal
+        6: sv_active             7: sv_active_cancel
+        8: sv_being_canceled     9: sv_idle
+       10: sv_used              11: sv_tested
+       12: sv_login             13: maxwait
+       14: maxwait_us           15: pool_mode
+
+    Auth: PgBouncer requires the admin password to query SHOW POOLS. The
+    `authentik` PG user is in ADMIN_USERS (see _ensure_authentik_pgbouncer)
+    and its password is in the container env as DB_PASSWORD. We invoke
+    psql via `sh -c` so PGPASSWORD=$DB_PASSWORD is set from the existing
+    container env without our shell needing to know the secret.
     """
     try:
         r = subprocess.run(
-            ['docker', 'exec', 'authentik-postgresql-1', 'psql',
-             '-U', 'authentik', '-d', 'authentik', '-tA', '-c',
-             "SELECT COUNT(*) FROM pg_stat_activity "
-             "WHERE datname='authentik' AND state='idle'"],
+            ['docker', 'exec', 'authentik-pgbouncer-1', 'sh', '-c',
+             'PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U authentik '
+             '-d pgbouncer -tA -F "|" -c "SHOW POOLS;"'],
             capture_output=True, text=True, timeout=8
         )
         if r.returncode != 0:
             return None
-        s = (r.stdout or '').strip()
-        if s.isdigit():
-            return int(s)
-        return None
+        total_waiting = 0
+        for line in (r.stdout or '').splitlines():
+            parts = line.split('|')
+            # PgBouncer ≥1.18 has ≥15 columns; older has ≥10. We only
+            # need col 0 (database), col 3 (cl_waiting), col 5
+            # (cl_waiting_cancel_req — may not exist on PgBouncer <1.18).
+            if len(parts) < 4:
+                continue
+            if parts[0] != 'authentik':
+                continue
+            try:
+                cl_waiting = int(parts[3])
+            except (ValueError, IndexError):
+                cl_waiting = 0
+            try:
+                cl_waiting_cancel = int(parts[5]) if len(parts) > 5 else 0
+            except (ValueError, IndexError):
+                cl_waiting_cancel = 0
+            total_waiting += max(0, cl_waiting) + max(0, cl_waiting_cancel)
+        return total_waiting
     except Exception:
         return None
 
 
-def _authentik_pool_autotune_sample(idle_count, classes):
+def _authentik_pool_autotune_sample(idle_count, classes, cl_waiting=None):
     """v0.9.27-alpha: append one observation to the autotune sample ring buffer.
 
     Called from the watchdog loop on every tick (every 2 min, regardless of
     whether load is in alert/accumulation range). `classes` is the
     (channels, dramatiq, cache, advisory_lock, other) tuple from
     `_classify_idle_load()` — pass None if classification failed.
+
+    v0.9.27-alpha hotfix #2: `cl_waiting` is the PgBouncer `SHOW POOLS`
+    cl_waiting + cl_waiting_cancel_req sum for the authentik DB (from
+    `_authentik_pgbouncer_cl_waiting()`). None if unreadable. This is the
+    direct demand signal — any non-zero value means clients were stuck
+    waiting for a conn at this tick. The compute path uses it as a
+    "wake up, we're starved" trigger that overrides the idle-based
+    floor calculation.
 
     Persists to settings.json under `pool_autotune.samples` as a list of
     dicts capped at SAMPLES_KEEP entries (FIFO oldest-eviction). Non-raising.
@@ -27321,6 +27378,11 @@ def _authentik_pool_autotune_sample(idle_count, classes):
             sample['cache'] = int(classes[2])
             sample['advisory_lock'] = int(classes[3])
             sample['other'] = int(classes[4])
+        if cl_waiting is not None:
+            try:
+                sample['cl_waiting'] = int(cl_waiting)
+            except (TypeError, ValueError):
+                pass
         s = load_settings()
         cfg = s.get('pool_autotune') or {}
         samples = cfg.get('samples') or []
@@ -27351,16 +27413,27 @@ def _authentik_pool_autotune_compute(plog=None):
           'samples_seen':    int (0 if cold start),
           'peak_observed':   int (max idle over the window),
           'peak_at':         ISO 8601 UTC (timestamp of the peak sample),
+          'peak_cl_waiting': int (max cl_waiting over the window),  # hotfix #2
+          'peak_cl_waiting_at': ISO 8601 UTC,                       # hotfix #2
+          'samples_with_cl_waiting': int (count w/ cl_waiting telemetry),
           'target_ceiling':  int (after floor + cap),
           'target_default':  int,
           'target_reserve':  int,
           'reason':          one-line human string,
+          'seed_source':     'fleet_cold_start_constant' (cold-start path)
+                          OR 'cl_waiting_escape' (hotfix #2 stuck-at-floor)
+                          OR absent (normal autotune path),
         }
 
-    Cold-start behavior (samples < 3): returns FLOOR (75/15) with reason
-    'cold-start: insufficient samples (<3) — using floor'. Once the watchdog
-    has logged at least 3 samples (~6 min after console boot), normal
-    compute applies.
+    Decision paths (in priority order):
+      1. Cold-start (samples < 3): returns fleet safe-constant (250/50,
+         ceiling 300). Every box reboots into this on a fresh ring buffer.
+      2. Stuck-at-floor escape (samples_with_cl_waiting >= 3 AND
+         peak_cl_waiting > 0): pool is provably under-sized regardless of
+         idle peak. Forces fleet safe-constant. Hotfix #2 fix for the
+         tak-10 self-reinforcing under-sizing trap.
+      3. Normal autotune: target_ceiling = max(FLOOR, peak * safety),
+         capped at PG_MAX_CONN * CAP_PCT, split 5:1 default:reserve.
 
     Idempotent + pure: never writes settings.
     """
@@ -27448,9 +27521,12 @@ def _authentik_pool_autotune_compute(plog=None):
                  f"(ceiling={target_ceiling})")
         return target_default, target_reserve, decision
 
-    # Normal path: find peak idle across the window.
+    # Normal path: find peak idle AND peak cl_waiting across the window.
     peak = 0
     peak_at = None
+    peak_cl_waiting = 0
+    peak_cl_waiting_at = None
+    samples_with_cl_waiting = 0
     for smp in samples:
         try:
             idle = int(smp.get('idle', 0))
@@ -27458,17 +27534,81 @@ def _authentik_pool_autotune_compute(plog=None):
                 peak = idle
                 peak_at = smp.get('t')
         except (TypeError, ValueError):
-            continue
+            pass
+        # v0.9.27-alpha hotfix #2: track cl_waiting (direct demand signal)
+        # separately from idle (headroom signal).
+        if 'cl_waiting' in smp:
+            samples_with_cl_waiting += 1
+            try:
+                clw = int(smp.get('cl_waiting', 0))
+                if clw > peak_cl_waiting:
+                    peak_cl_waiting = clw
+                    peak_cl_waiting_at = smp.get('t')
+            except (TypeError, ValueError):
+                continue
+
+    # v0.9.27-alpha hotfix #2: STUCK-AT-FLOOR ESCAPE.
+    #
+    # If any sample in the window had cl_waiting > 0, PgBouncer was
+    # literally rejecting client connections (clients queued waiting for
+    # an upstream conn) at that tick. This is unambiguous evidence of
+    # unmet demand — the pool was too small. Force cold-start constant.
+    #
+    # We only trip this when at least 3 samples have cl_waiting telemetry
+    # (i.e., samples taken AFTER hotfix #2 deployed) so we don't act on
+    # legacy samples that lack the field.
+    if samples_with_cl_waiting >= 3 and peak_cl_waiting > 0:
+        target_default = _AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT
+        target_reserve = _AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE
+        target_ceiling = target_default + target_reserve
+        decision = {
+            'computed_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'version': VERSION,
+            'samples_seen': len(samples),
+            'peak_observed': peak,
+            'peak_at': peak_at,
+            'peak_cl_waiting': peak_cl_waiting,
+            'peak_cl_waiting_at': peak_cl_waiting_at,
+            'samples_with_cl_waiting': samples_with_cl_waiting,
+            'target_ceiling': target_ceiling,
+            'target_default': target_default,
+            'target_reserve': target_reserve,
+            'capped_at_pg_max': False,
+            'reason': (
+                f'stuck-at-floor escape: peak_cl_waiting={peak_cl_waiting} '
+                f'> 0 ({samples_with_cl_waiting}/{len(samples)} samples '
+                f'had cl_waiting telemetry); pool is under-sized regardless '
+                f'of idle-count peak ({peak}); forcing fleet safe-constant '
+                f'{target_default}/{target_reserve} (ceiling={target_ceiling}); '
+                f'autotune will reconsider on next reboot once fresh samples '
+                f'reflect the larger pool'
+            ),
+            'seed_source': 'cl_waiting_escape',
+        }
+        if plog:
+            plog(f"  pool autotune: STUCK-AT-FLOOR ESCAPE — peak_cl_waiting="
+                 f"{peak_cl_waiting} > 0 over {samples_with_cl_waiting} samples "
+                 f"→ forcing fleet safe-constant {target_default}/{target_reserve} "
+                 f"(ceiling={target_ceiling})")
+        return target_default, target_reserve, decision
 
     target_default, target_reserve, decision = _build_decision(
         peak=peak,
         peak_at=peak_at,
         samples_seen=len(samples),
-        reason_prefix=f'autotune: {len(samples)} samples;',
+        reason_prefix=(
+            f'autotune: {len(samples)} samples '
+            f'(cl_waiting telemetry on {samples_with_cl_waiting}, '
+            f'peak_cl_waiting={peak_cl_waiting});'
+        ),
     )
+    decision['peak_cl_waiting'] = peak_cl_waiting
+    decision['peak_cl_waiting_at'] = peak_cl_waiting_at
+    decision['samples_with_cl_waiting'] = samples_with_cl_waiting
     if plog:
-        plog(f"  pool autotune: peak={peak} over {len(samples)} samples → "
-             f"target {target_default}/{target_reserve} "
+        plog(f"  pool autotune: peak_idle={peak} peak_cl_waiting={peak_cl_waiting} "
+             f"over {len(samples)} samples → target "
+             f"{target_default}/{target_reserve} "
              f"(ceiling={target_default + target_reserve})")
     return target_default, target_reserve, decision
 
@@ -29252,8 +29392,14 @@ def _authentik_channels_pool_watchdog_loop():
             # Done before the alert/accumulation branches so peak gets logged
             # even on quiet boxes (autotune still needs to know steady-state
             # load to size the pool).
+            # v0.9.27-alpha hotfix #2: also read PgBouncer cl_waiting (clients
+            # queued waiting for an upstream conn) — the direct demand signal
+            # that idle-count can't see when the pool is starved.
             _classes_for_sample = _classify_idle_load()
-            _authentik_pool_autotune_sample(_count, _classes_for_sample)
+            _cl_waiting_for_sample = _authentik_pgbouncer_cl_waiting()
+            _authentik_pool_autotune_sample(
+                _count, _classes_for_sample, _cl_waiting_for_sample
+            )
 
             if _count > _threshold:
                 _mr_cur, _ = _authentik_max_requests_get_current()
