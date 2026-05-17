@@ -363,7 +363,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.26-alpha"
+VERSION = "0.9.27-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -27183,6 +27183,270 @@ _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 1000
 _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 15
 _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
 
+# v0.9.27-alpha: pool-size autotune (fleet-deterministic).
+#
+# Why this exists: v0.9.26 shipped a single codified DEFAULT/RESERVE constant
+# (75/15 = 90-conn ceiling) and an _ensure_authentik_pgbouncer_pool_size
+# migration that used `max(cur, target)` to "never lower an operator override."
+# That semantic — praised as a feature in the release notes — caused the
+# fleet to fracture: tak-10 (operator-overridden 250/50) and test8 (no
+# override → 75/15) ended up at different runtime configs. tak-10 was
+# stable; test8 hit query_wait_timeout storms in ~5 min. I validated
+# tak-10 thinking it represented the codified default. It didn't.
+# See `.cursor/rules/fleet-uniform-config.mdc`.
+#
+# v0.9.27 architectural fix: pool size is a DETERMINISTIC FUNCTION of
+# observed load, computed identically on every box. The fleet converges
+# to whatever each box's traffic produces — same logic everywhere, no
+# operator-typed numbers persisted in compose YAML.
+#
+# How: the watchdog loop (already running every 2 min) samples idle
+# Authentik PG connections by query class (Channels / dramatiq / cache /
+# advisory_lock / other — same _classify_idle_load() helper Hotfix #4
+# added). Samples are appended to a ring buffer in settings.json
+# (settings.pool_autotune.samples, last 30 ≈ 1 h). On every console
+# boot, _ensure_authentik_pgbouncer_pool_size calls the autotuner,
+# which reads the samples, computes peak, applies the safety factor
+# and the floor/cap, and ALWAYS writes the result to compose
+# YAML — no max() with the current value.
+#
+# Sizing formula:
+#   peak              = max(idle_count) over the last N samples
+#   target_ceiling    = max(FLOOR_CEILING, ceil(peak * SAFETY_FACTOR))
+#   target_ceiling    = min(target_ceiling, ceil(PG_MAX_CONN * CAP_PCT))
+#   target_default    = ceil(target_ceiling * DEFAULT_SHARE)
+#   target_reserve    = target_ceiling - target_default
+#
+# Convergence behavior:
+#   - Fresh install (0-2 samples) → uses FLOOR (90-conn ceiling, same as v0.9.26).
+#   - Light steady-state load (peak ≤ 45) → stays at FLOOR.
+#   - tak-10-class load (Channels peak ~90) → autotunes to ~180 ceiling.
+#   - test8-class load (idle peak ~87) → autotunes to ~174 ceiling.
+#   - Heavy spike (peak > 150) → caps at PG_MAX_CONN * CAP_PCT = 300.
+#   - Load drops → pool shrinks on next console boot (peak window rolls
+#     over). Shrink is naturally rate-limited by the 1 h sample window.
+#
+# Operator visibility: every decision is recorded in
+# settings.pool_autotune.last_decision (peak_observed, target_default,
+# target_reserve, applied_at, evidence string). Drift between
+# settings.pool_autotune.last_applied and compose YAML indicates manual
+# tampering — autotune will reconcile on next boot.
+_AUTHENTIK_POOL_AUTOTUNE_FLOOR_DEFAULT = _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE  # 75
+_AUTHENTIK_POOL_AUTOTUNE_FLOOR_RESERVE = _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE  # 15
+_AUTHENTIK_POOL_AUTOTUNE_FLOOR_CEILING = (
+    _AUTHENTIK_POOL_AUTOTUNE_FLOOR_DEFAULT + _AUTHENTIK_POOL_AUTOTUNE_FLOOR_RESERVE
+)  # 90
+_AUTHENTIK_POOL_AUTOTUNE_PG_MAX_CONN = 500  # Postgres max_connections (Authentik default)
+_AUTHENTIK_POOL_AUTOTUNE_CAP_PCT = 0.6  # never use more than 60% of PG max_connections
+_AUTHENTIK_POOL_AUTOTUNE_SAFETY_FACTOR = 2.0  # target_ceiling = peak * 2.0
+_AUTHENTIK_POOL_AUTOTUNE_SAMPLES_KEEP = 30  # ~1 h at 2-min watchdog ticks
+_AUTHENTIK_POOL_AUTOTUNE_DEFAULT_SHARE = 5.0 / 6.0  # 5:1 default:reserve split
+
+
+def _authentik_pool_autotune_seed_from_live_pg():
+    """v0.9.27-alpha: one-shot pg_stat_activity reading for cold-start.
+
+    Used by _authentik_pool_autotune_compute() when the samples ring buffer
+    has fewer than 3 entries. Without this, the FIRST v0.9.27 migration on
+    a box that's currently running with an operator-bumped pool (e.g.
+    tak-10 at 250/50 due to v0.9.26-era manual override) would shrink the
+    pool to FLOOR (90 ceiling) and immediately re-trigger the
+    query_wait_timeout storm we're fixing.
+
+    Returns idle count (int) on success, None if PG isn't reachable.
+    """
+    try:
+        r = subprocess.run(
+            ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+             '-U', 'authentik', '-d', 'authentik', '-tA', '-c',
+             "SELECT COUNT(*) FROM pg_stat_activity "
+             "WHERE datname='authentik' AND state='idle'"],
+            capture_output=True, text=True, timeout=8
+        )
+        if r.returncode != 0:
+            return None
+        s = (r.stdout or '').strip()
+        if s.isdigit():
+            return int(s)
+        return None
+    except Exception:
+        return None
+
+
+def _authentik_pool_autotune_sample(idle_count, classes):
+    """v0.9.27-alpha: append one observation to the autotune sample ring buffer.
+
+    Called from the watchdog loop on every tick (every 2 min, regardless of
+    whether load is in alert/accumulation range). `classes` is the
+    (channels, dramatiq, cache, advisory_lock, other) tuple from
+    `_classify_idle_load()` — pass None if classification failed.
+
+    Persists to settings.json under `pool_autotune.samples` as a list of
+    dicts capped at SAMPLES_KEEP entries (FIFO oldest-eviction). Non-raising.
+    """
+    try:
+        sample = {
+            't': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'idle': int(idle_count) if idle_count is not None else 0,
+        }
+        if classes is not None and len(classes) == 5:
+            sample['channels'] = int(classes[0])
+            sample['dramatiq'] = int(classes[1])
+            sample['cache'] = int(classes[2])
+            sample['advisory_lock'] = int(classes[3])
+            sample['other'] = int(classes[4])
+        s = load_settings()
+        cfg = s.get('pool_autotune') or {}
+        samples = cfg.get('samples') or []
+        if not isinstance(samples, list):
+            samples = []
+        samples.append(sample)
+        if len(samples) > _AUTHENTIK_POOL_AUTOTUNE_SAMPLES_KEEP:
+            samples = samples[-_AUTHENTIK_POOL_AUTOTUNE_SAMPLES_KEEP:]
+        cfg['samples'] = samples
+        s['pool_autotune'] = cfg
+        save_settings(s)
+    except Exception:
+        pass  # Sampling never blocks the watchdog
+
+
+def _authentik_pool_autotune_compute(plog=None):
+    """v0.9.27-alpha: pure-ish function — read samples, compute target pool size.
+
+    Reads `settings.pool_autotune.samples` (recent observations from the
+    watchdog), computes the observed peak, applies the safety factor, and
+    returns `(target_default, target_reserve, evidence)`.
+
+    The evidence dict is auditable + persisted to
+    `settings.pool_autotune.last_decision` by the caller. Format:
+        {
+          'computed_at':     ISO 8601 UTC,
+          'version':         VERSION,
+          'samples_seen':    int (0 if cold start),
+          'peak_observed':   int (max idle over the window),
+          'peak_at':         ISO 8601 UTC (timestamp of the peak sample),
+          'target_ceiling':  int (after floor + cap),
+          'target_default':  int,
+          'target_reserve':  int,
+          'reason':          one-line human string,
+        }
+
+    Cold-start behavior (samples < 3): returns FLOOR (75/15) with reason
+    'cold-start: insufficient samples (<3) — using floor'. Once the watchdog
+    has logged at least 3 samples (~6 min after console boot), normal
+    compute applies.
+
+    Idempotent + pure: never writes settings.
+    """
+    try:
+        s = load_settings()
+    except Exception:
+        s = {}
+    cfg = (s.get('pool_autotune') or {}) if isinstance(s, dict) else {}
+    samples = cfg.get('samples') if isinstance(cfg, dict) else None
+    if not isinstance(samples, list):
+        samples = []
+
+    def _build_decision(peak, peak_at, samples_seen, reason_prefix):
+        target_ceiling = max(
+            _AUTHENTIK_POOL_AUTOTUNE_FLOOR_CEILING,
+            int(round(peak * _AUTHENTIK_POOL_AUTOTUNE_SAFETY_FACTOR)),
+        )
+        cap_ceiling = int(_AUTHENTIK_POOL_AUTOTUNE_PG_MAX_CONN * _AUTHENTIK_POOL_AUTOTUNE_CAP_PCT)
+        capped = target_ceiling > cap_ceiling
+        target_ceiling = min(target_ceiling, cap_ceiling)
+        target_default = int(round(target_ceiling * _AUTHENTIK_POOL_AUTOTUNE_DEFAULT_SHARE))
+        target_reserve = target_ceiling - target_default
+        # Safety: ensure reserve never goes below FLOOR_RESERVE (15) so PgBouncer
+        # always has spike headroom independent of DEFAULT_POOL_SIZE rounding.
+        if target_reserve < _AUTHENTIK_POOL_AUTOTUNE_FLOOR_RESERVE:
+            target_reserve = _AUTHENTIK_POOL_AUTOTUNE_FLOOR_RESERVE
+            target_default = max(
+                target_ceiling - target_reserve,
+                _AUTHENTIK_POOL_AUTOTUNE_FLOOR_DEFAULT,
+            )
+            target_ceiling = target_default + target_reserve
+        reason = (
+            f"{reason_prefix} peak={peak} × safety={_AUTHENTIK_POOL_AUTOTUNE_SAFETY_FACTOR} "
+            f"= {int(round(peak * _AUTHENTIK_POOL_AUTOTUNE_SAFETY_FACTOR))}; "
+            f"floor={_AUTHENTIK_POOL_AUTOTUNE_FLOOR_CEILING}; "
+            f"cap={cap_ceiling} ({'hit' if capped else 'not hit'}); "
+            f"split default:reserve = {target_default}:{target_reserve} "
+            f"(ceiling={target_ceiling})"
+        )
+        return target_default, target_reserve, {
+            'computed_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'version': VERSION,
+            'samples_seen': samples_seen,
+            'peak_observed': peak,
+            'peak_at': peak_at,
+            'target_ceiling': target_ceiling,
+            'target_default': target_default,
+            'target_reserve': target_reserve,
+            'capped_at_pg_max': capped,
+            'reason': reason,
+        }
+
+    if len(samples) < 3:
+        # v0.9.27 cold-start safety: on a fresh box OR on first v0.9.27 migration
+        # from v0.9.26 (where the ring buffer is empty but the box may have
+        # been running at a much higher pool because of an operator override —
+        # tak-10's 250/50 is the canonical case), take ONE live pg_stat_activity
+        # reading and treat it as a seed. Without this, autotune would drop
+        # tak-10 from 250/50 to FLOOR (75/15 = 90 ceiling) on first migration
+        # and trigger the exact query_wait_timeout storm we're trying to fix.
+        live_idle = _authentik_pool_autotune_seed_from_live_pg()
+        if live_idle is not None and live_idle > 0:
+            target_default, target_reserve, decision = _build_decision(
+                peak=live_idle,
+                peak_at=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                samples_seen=len(samples),
+                reason_prefix=(f'cold-start with live pg_stat_activity seed '
+                               f'(samples={len(samples)}, ring buffer empty);'),
+            )
+            decision['seed_source'] = 'live_pg_stat_activity'
+            if plog:
+                plog(f"  pool autotune: cold-start seed from live pg_stat_activity "
+                     f"(idle={live_idle}) → target {target_default}/{target_reserve} "
+                     f"(ceiling={target_default + target_reserve})")
+            return target_default, target_reserve, decision
+        target_default, target_reserve, decision = _build_decision(
+            peak=0,
+            peak_at=None,
+            samples_seen=len(samples),
+            reason_prefix='cold-start: insufficient samples (<3), live seed unavailable — using FLOOR;',
+        )
+        decision['seed_source'] = 'floor'
+        if plog:
+            plog(f"  pool autotune: cold-start ({len(samples)} samples, no live seed) "
+                 f"→ FLOOR {target_default}/{target_reserve} "
+                 f"(ceiling={target_default + target_reserve})")
+        return target_default, target_reserve, decision
+
+    # Normal path: find peak idle across the window.
+    peak = 0
+    peak_at = None
+    for smp in samples:
+        try:
+            idle = int(smp.get('idle', 0))
+            if idle > peak:
+                peak = idle
+                peak_at = smp.get('t')
+        except (TypeError, ValueError):
+            continue
+
+    target_default, target_reserve, decision = _build_decision(
+        peak=peak,
+        peak_at=peak_at,
+        samples_seen=len(samples),
+        reason_prefix=f'autotune: {len(samples)} samples;',
+    )
+    if plog:
+        plog(f"  pool autotune: peak={peak} over {len(samples)} samples → "
+             f"target {target_default}/{target_reserve} "
+             f"(ceiling={target_default + target_reserve})")
+    return target_default, target_reserve, decision
+
 
 def _ensure_authentik_pgbouncer(plog):
     """v0.9.23 Phase 6: Install PgBouncer between Authentik and Postgres.
@@ -27761,49 +28025,40 @@ def _ensure_authentik_pgbouncer(plog):
 
 
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
-    """v0.9.24 Item 3 + v0.9.26-alpha hotfix #3: Bump PgBouncer pool sizing on
-    existing installs.
+    """v0.9.27-alpha: deterministic-autotune pool sizing — fleet-uniform.
 
-    v0.9.23 shipped DEFAULT_POOL_SIZE=25, RESERVE_POOL_SIZE=5 (30-conn ceiling).
-    v0.9.24 bumped to 35/5 (40-conn ceiling) after tak-10 field validation
-    (2026-05-16) showed `SHOW POOLS` saturated at sv_active=29/sv_idle=1.
+    Replaces v0.9.26's max(cur, target) "preserve operator override" semantic
+    that fractured the fleet (tak-10 stayed at operator-typed 250/50 while
+    test8 got the codified 75/15 → test8 hit query_wait_timeout storms in
+    ~5 min). See `.cursor/rules/fleet-uniform-config.mdc` for the full
+    architectural rationale.
 
-    v0.9.26-alpha hotfix #3 (2026-05-17): bumps DEFAULT_POOL_SIZE 35 → 75 and
-    RESERVE_POOL_SIZE 5 → 15 (90-conn ceiling). After the v0.9.26 inline
-    tasklog purge cleaned the database, tak-10 STILL saturated the pool within
-    ~10 min of every recreate. Root cause was Django Channels' PG-backed channel
-    layer: `pg_stat_activity` showed 17 idle connections held by
-    `SELECT DISTINCT FROM ...django_channels_postgres_groupchannel`
-    (one per active channel, long-polling). That consumed almost half the
-    35-slot pool, leaving only ~18 slots for HTTP requests, outpost API polls,
-    OAuth flows, and healthchecks → `ProtocolViolation: query_wait_timeout` →
-    gunicorn workers stuck on `pg_advisory_lock` → LDAP searches returning
-    empty results → TAK Server 8446 login landing on WebTAK instead of admin.
-    See `_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE` for the full forensic trace.
-
-    Idempotency / safety:
-      - On fresh installs, `_ensure_authentik_pgbouncer` already writes the
-        current target values. This migration sees them and no-ops.
-      - On v0.9.23 (25/5) or v0.9.24-v0.9.26 initial (35/5) installs, patches
-        BOTH DEFAULT_POOL_SIZE and RESERVE_POOL_SIZE in the YAML and recreates
-        the pgbouncer container (server+worker keep their existing client-side
-        connections — PgBouncer's transaction-pool semantics re-pool within
-        seconds).
-      - On boxes where an operator manually raised either value (e.g. 100/20),
-        idempotent no-op — we never lower an operator override.
-      - On boxes without PgBouncer installed (very old, or external PG), no-op.
-      - Backs up the compose file before mutation and rolls back on write failure.
+    Behavior:
+      - Calls `_authentik_pool_autotune_compute()` to get
+        (target_default, target_reserve, decision) computed from
+        observed load on THIS box (watchdog samples in
+        settings.pool_autotune.samples). Same logic on every box ⇒ same
+        load produces same config ⇒ fleet-deterministic.
+      - ALWAYS writes the autotune output to ~/authentik/docker-compose.yml.
+        No max(cur, target). No operator-override preservation. An
+        operator-typed pool value will be reconciled to the autotune
+        decision on the next migration tick (Update Now or service restart).
+      - If `target` / `target_reserve` are explicitly passed (e.g. by an
+        admin API endpoint that wants to force a specific size for one
+        boot), those override the autotune decision for THIS call but
+        still get written without a max(). They land in
+        settings.pool_autotune.last_decision with reason="explicit override".
+      - Recreates the pgbouncer container only if the new value differs
+        from the runtime compose YAML (idempotent).
+      - Reconciles the watchdog threshold to ceiling + 50 (kept from
+        v0.9.26 hotfix #4 amendment).
 
     Returns:
       True  — patched compose + recreated pgbouncer
-      False — already at/above target, no pgbouncer, or PyYAML unavailable (no-op)
+      False — already at autotune target, no pgbouncer, or PyYAML
+              unavailable (no-op)
       None  — failure (logged via plog, compose rolled back on write error)
     """
-    target = target if target is not None else _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE
-    target_reserve = (
-        target_reserve if target_reserve is not None
-        else _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE
-    )
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     if not os.path.exists(compose_path):
@@ -27815,6 +28070,26 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
         plog("  pgbouncer pool-size: PyYAML unavailable — skip "
              "(will retry on next startup; `_ensure_authentik_pgbouncer` bootstraps it)")
         return False
+
+    # Compute target via autotune (unless caller passed explicit values).
+    autotune_decision = None
+    if target is None or target_reserve is None:
+        atune_default, atune_reserve, autotune_decision = (
+            _authentik_pool_autotune_compute(plog)
+        )
+        if target is None:
+            target = atune_default
+        if target_reserve is None:
+            target_reserve = atune_reserve
+    else:
+        autotune_decision = {
+            'computed_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'version': VERSION,
+            'reason': 'explicit override passed to _ensure_authentik_pgbouncer_pool_size',
+            'target_default': int(target),
+            'target_reserve': int(target_reserve),
+            'target_ceiling': int(target) + int(target_reserve),
+        }
 
     try:
         with open(compose_path, 'r') as f:
@@ -27835,7 +28110,7 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     env = pgb.get('environment')
     if not isinstance(env, dict):
         plog("  pgbouncer pool-size: pgbouncer.environment is not dict-form — "
-             "skip (operator override or unusual compose layout)")
+             "skip (unusual compose layout)")
         return False
 
     def _int_or_none(name):
@@ -27845,22 +28120,14 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
         try:
             return int(v)
         except (TypeError, ValueError):
-            plog(f"  pgbouncer pool-size: {name} has non-integer value {v!r} "
-                 "— treating as operator override (will not modify)")
-            return 'override'
+            return None
 
     cur_default = _int_or_none('DEFAULT_POOL_SIZE')
     cur_reserve = _int_or_none('RESERVE_POOL_SIZE')
 
-    if cur_default == 'override' or cur_reserve == 'override':
-        return False
-
-    # v0.9.26-alpha hotfix #4: regardless of whether we're bumping the pool
-    # in this call, ensure the ak-pg-watchdog threshold is above the current
-    # pool ceiling. This handles operator overrides above the codebase target
-    # (e.g., tak-10's manual 150/30 = 180 ceiling, where the default
-    # threshold of 150 would mis-fire on every pre-warmed pool). See the
-    # forensic comment in the pool-bump block below for full rationale.
+    # v0.9.26-alpha hotfix #4 amendment: watchdog threshold scales with pool
+    # ceiling so ak-pg-watchdog doesn't misfire on a healthy pre-warmed pool.
+    # Runs every migration tick — whether or not we end up touching compose.
     def _reconcile_watchdog_threshold(default_val, reserve_val):
         try:
             if default_val is None or reserve_val is None:
@@ -27869,7 +28136,11 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
             computed = ceiling + 50
             s = load_settings()
             cur_thresh = s.get('channels_pool_watchdog_threshold')
-            if not isinstance(cur_thresh, int) or cur_thresh < computed:
+            # v0.9.27: write threshold whenever it diverges from computed,
+            # in either direction. Previously we only raised it; that left
+            # operator-typed numbers (e.g. tak-10's 350) sitting above the
+            # autotuned ceiling+50 forever, breaking fleet uniformity.
+            if not isinstance(cur_thresh, int) or cur_thresh != computed:
                 s['channels_pool_watchdog_threshold'] = computed
                 save_settings(s)
                 plog(f"  ✓ watchdog threshold: {cur_thresh or 'unset (default 150)'} → "
@@ -27877,14 +28148,29 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
         except Exception:
             pass
 
-    needs_default = cur_default is not None and cur_default < target
-    needs_reserve = cur_reserve is not None and cur_reserve < target_reserve
+    # v0.9.27: deterministic write. If the YAML already matches the autotune
+    # target, no compose mutation + no pgbouncer recreate. If it differs in
+    # EITHER direction (operator-typed value above OR below target), we
+    # converge it to the target.
+    matches_target = (cur_default == target) and (cur_reserve == target_reserve)
 
-    if not needs_default and not needs_reserve:
-        # Pool is already at/above target. Still reconcile watchdog threshold —
-        # critical for boxes with operator-overridden pool (e.g., tak-10 at
-        # 150/30) where the codebase default 150 threshold mis-fires.
+    if matches_target:
+        # Pool YAML matches autotune. Still reconcile watchdog threshold and
+        # persist the autotune evidence so settings.json stays auditable.
         _reconcile_watchdog_threshold(cur_default, cur_reserve)
+        try:
+            s = load_settings()
+            cfg = s.get('pool_autotune') or {}
+            cfg['last_decision'] = autotune_decision
+            cfg['last_applied'] = {
+                'default': cur_default, 'reserve': cur_reserve,
+                'applied_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'noop': True, 'version': VERSION,
+            }
+            s['pool_autotune'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
         return False
 
     backup_path = compose_path + f'.poolsize-bak-{int(time.time())}'
@@ -27895,18 +28181,25 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
         plog(f"  pgbouncer pool-size: backup failed (refusing to mutate): {e}")
         return None
 
-    new_default = max(cur_default or 0, target)
-    new_reserve = max(cur_reserve or 0, target_reserve)
-    env['DEFAULT_POOL_SIZE'] = new_default
-    env['RESERVE_POOL_SIZE'] = new_reserve
+    env['DEFAULT_POOL_SIZE'] = target
+    env['RESERVE_POOL_SIZE'] = target_reserve
 
     try:
         with open(compose_path, 'w') as f:
             _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
-        plog(f"  pgbouncer pool-size: patched docker-compose.yml "
-             f"DEFAULT_POOL_SIZE {cur_default} → {new_default}, "
-             f"RESERVE_POOL_SIZE {cur_reserve} → {new_reserve} "
-             f"(backup at {backup_path})")
+        # Direction-aware log line — operators see whether we grew or shrunk.
+        if cur_default is not None and cur_default < target:
+            direction = "grew"
+        elif cur_default is not None and cur_default > target:
+            direction = "shrunk"
+        else:
+            direction = "set"
+        plog(f"  pgbouncer pool-size: {direction} docker-compose.yml "
+             f"DEFAULT_POOL_SIZE {cur_default} → {target}, "
+             f"RESERVE_POOL_SIZE {cur_reserve} → {target_reserve} "
+             f"(ceiling={target + target_reserve}, "
+             f"reason={autotune_decision.get('reason', 'autotune')[:120]})")
+        plog(f"  pgbouncer pool-size: backup at {backup_path}")
     except Exception as e:
         plog(f"  pgbouncer pool-size: compose write failed: {e} — rolling back")
         try:
@@ -27940,26 +28233,40 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
             break
     if healthy:
         plog(f"  ✓ pgbouncer pool-size: pgbouncer recreated and healthy "
-             f"(DEFAULT_POOL_SIZE={new_default}, RESERVE_POOL_SIZE={new_reserve}, "
-             f"ceiling={new_default + new_reserve})")
+             f"(DEFAULT_POOL_SIZE={target}, RESERVE_POOL_SIZE={target_reserve}, "
+             f"ceiling={target + target_reserve})")
     else:
         plog(f"  ⚠ pgbouncer pool-size: pgbouncer recreated but not healthy within 24s "
              f"— server+worker may briefly degrade; will stabilize as transactions cycle")
 
+    _reconcile_watchdog_threshold(target, target_reserve)
+
     try:
         s = load_settings()
+        # Mirror to authentik_pgbouncer (legacy key, kept for backwards-compat
+        # with older parts of the codebase that may still read it).
         cfg = s.get('authentik_pgbouncer') or {}
-        cfg['default_pool_size'] = new_default
-        cfg['reserve_pool_size'] = new_reserve
+        cfg['default_pool_size'] = target
+        cfg['reserve_pool_size'] = target_reserve
         cfg['last_pool_size_migration_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         cfg['last_pool_size_migration_from'] = {
             'default': cur_default, 'reserve': cur_reserve,
         }
         cfg['last_pool_size_migration_to'] = {
-            'default': new_default, 'reserve': new_reserve,
+            'default': target, 'reserve': target_reserve,
         }
         cfg['last_pool_size_migration_version'] = VERSION
         s['authentik_pgbouncer'] = cfg
+        # v0.9.27 canonical record: persist the autotune decision + last apply.
+        atc = s.get('pool_autotune') or {}
+        atc['last_decision'] = autotune_decision
+        atc['last_applied'] = {
+            'default': target, 'reserve': target_reserve,
+            'applied_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'noop': False, 'version': VERSION,
+            'from': {'default': cur_default, 'reserve': cur_reserve},
+        }
+        s['pool_autotune'] = atc
         save_settings(s)
     except Exception:
         pass
@@ -28897,14 +29204,16 @@ def _authentik_channels_pool_watchdog_loop():
             _count = int(_count_str)
             _consecutive_failures = 0
 
-            # v0.9.26-alpha hotfix #4: when the watchdog is about to fire or
-            # already accumulating, query the dominant idle-conn pattern so
-            # the operator can tell at a glance whether saturation is:
+            # v0.9.26-alpha hotfix #4 + v0.9.27-alpha autotune: classify idle
+            # connections by query class on EVERY tick (v0.9.26 ran it only on
+            # alert/accumulation paths). The query is a single
+            # pg_stat_activity SELECT with five COUNT FILTERs — sub-millisecond,
+            # cheap enough for the 2-min loop. Output feeds both the log
+            # breakdown AND the autotune sample ring buffer.
             #   - Channels-class (django_channels_postgres_groupchannel SELECTs)
             #   - dramatiq-class (django_dramatiq_postgres SELECT FOR UPDATE)
             #   - cache-class (django_postgres_cache_cacheentry)
             #   - "other" / generic ORM
-            # Only runs on the alert/accumulation paths to keep the hot loop cheap.
             def _classify_idle_load():
                 try:
                     _rb = subprocess.run(
@@ -28929,6 +29238,13 @@ def _authentik_channels_pool_watchdog_loop():
                     pass
                 return None
 
+            # v0.9.27-alpha: sample EVERY tick into the autotune ring buffer.
+            # Done before the alert/accumulation branches so peak gets logged
+            # even on quiet boxes (autotune still needs to know steady-state
+            # load to size the pool).
+            _classes_for_sample = _classify_idle_load()
+            _authentik_pool_autotune_sample(_count, _classes_for_sample)
+
             if _count > _threshold:
                 _mr_cur, _ = _authentik_max_requests_get_current()
                 _mr_str = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
@@ -28942,7 +29258,8 @@ def _authentik_channels_pool_watchdog_loop():
                     "PgBouncer is NOT installed — the upstream Authentik #20714 cache-pool leak is "
                     "unbounded on this box. Consider running the v0.9.23 PgBouncer migration."
                 )
-                _cls = _classify_idle_load()
+                # v0.9.27: reuse the classification we already ran for autotune.
+                _cls = _classes_for_sample
                 _cls_str = ""
                 if _cls is not None:
                     _ch, _dr, _ca, _adv, _other = _cls
@@ -28987,7 +29304,8 @@ def _authentik_channels_pool_watchdog_loop():
                 _wt.sleep(180)
             elif _count > 80:
                 _mr_cur, _ = _authentik_max_requests_get_current()
-                _cls = _classify_idle_load()
+                # v0.9.27: reuse the classification we already ran for autotune.
+                _cls = _classes_for_sample
                 _cls_str = ""
                 if _cls is not None:
                     _ch, _dr, _ca, _adv, _other = _cls
