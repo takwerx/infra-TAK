@@ -27855,10 +27855,36 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     if cur_default == 'override' or cur_reserve == 'override':
         return False
 
+    # v0.9.26-alpha hotfix #4: regardless of whether we're bumping the pool
+    # in this call, ensure the ak-pg-watchdog threshold is above the current
+    # pool ceiling. This handles operator overrides above the codebase target
+    # (e.g., tak-10's manual 150/30 = 180 ceiling, where the default
+    # threshold of 150 would mis-fire on every pre-warmed pool). See the
+    # forensic comment in the pool-bump block below for full rationale.
+    def _reconcile_watchdog_threshold(default_val, reserve_val):
+        try:
+            if default_val is None or reserve_val is None:
+                return
+            ceiling = default_val + reserve_val
+            computed = ceiling + 50
+            s = load_settings()
+            cur_thresh = s.get('channels_pool_watchdog_threshold')
+            if not isinstance(cur_thresh, int) or cur_thresh < computed:
+                s['channels_pool_watchdog_threshold'] = computed
+                save_settings(s)
+                plog(f"  ✓ watchdog threshold: {cur_thresh or 'unset (default 150)'} → "
+                     f"{computed} (pool ceiling {ceiling} + 50 margin)")
+        except Exception:
+            pass
+
     needs_default = cur_default is not None and cur_default < target
     needs_reserve = cur_reserve is not None and cur_reserve < target_reserve
 
     if not needs_default and not needs_reserve:
+        # Pool is already at/above target. Still reconcile watchdog threshold —
+        # critical for boxes with operator-overridden pool (e.g., tak-10 at
+        # 150/30) where the codebase default 150 threshold mis-fires.
+        _reconcile_watchdog_threshold(cur_default, cur_reserve)
         return False
 
     backup_path = compose_path + f'.poolsize-bak-{int(time.time())}'
@@ -27937,6 +27963,29 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
         save_settings(s)
     except Exception:
         pass
+
+    # v0.9.26-alpha hotfix #4 (forensic discovery 2026-05-17 16:41 UTC on
+    # tak-10): the ak-pg-watchdog threshold (default 150) is compared against
+    # TOTAL idle PG connections, which includes PgBouncer's pre-warmed sv_idle
+    # pool. If pool ceiling (DEFAULT + RESERVE) ever exceeds the watchdog
+    # threshold, the watchdog mis-fires on NORMAL pre-warmed state — it sees
+    # ~178 idle conns (PgBouncer warming) and concludes the upstream
+    # license-cache leak is happening, restarting authentik-server-1 every
+    # 8-10 min. tak-10's manual operator override to pool 150/30 (180 ceiling)
+    # triggered this: watchdog at 150 thresh ALWAYS fired on warmed pool →
+    # constant server-1 restart cycle → MAX_REQUESTS autotuned to floor (100)
+    # → operator-visible 8446 + Sync webadmin outage every ~10 min during
+    # the restart window.
+    #
+    # Reconcile the watchdog threshold to sit ABOVE the pool ceiling (the
+    # watchdog should detect REAL leaks where conns grow past PgBouncer's
+    # configured maximum, NOT the prewarmed pool itself).
+    # Formula: threshold = ceiling + 50 (50-conn alert headroom above
+    # pre-warmed state). 50 is conservative — license-cache class leaks
+    # grew at ~2 conn/sec, so 50-conn headroom gives ~25 sec to detect
+    # before the watchdog fires.
+    # Operator overrides above the computed value are preserved.
+    _reconcile_watchdog_threshold(new_default, new_reserve)
 
     return True
 
