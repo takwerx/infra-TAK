@@ -12817,6 +12817,18 @@ def takportal_uninstall():
         steps.append('Removed ~/TAK-Portal')
     takportal_deploy_log.clear()
     takportal_deploy_status.update({'running': False, 'complete': False, 'error': False})
+    # v0.9.31: regenerate Caddyfile so the takportal.<fqdn> vhost is removed.
+    # Without this the stale vhost remained, Caddy reverse-proxied to a dead
+    # upstream (or fell through to Authentik's forward-auth), and the operator
+    # saw the Authentik "Not Found" page on takportal.<fqdn> after Remove.
+    # Matches mediamtx_uninstall() which has done this correctly since v0.9.x.
+    try:
+        settings = load_settings()
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        steps.append('Regenerated Caddyfile + reloaded Caddy')
+    except Exception as caddy_err:
+        steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
     _update_boot_stagger_service()
     return jsonify({'success': True, 'steps': steps})
 
@@ -13644,6 +13656,14 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1', timeout=120)
     plog("✓ Python packages installed")
 
+    # v0.9.31: ensure `takwerx` system user exists on the remote host before
+    # any chown / unit install happens. See `_ensure_takwerx_system_user`
+    # docstring for the full backstory. Idempotent.
+    plog("  Ensuring takwerx system user on remote host...")
+    created = _ensure_takwerx_system_user_remote(deploy_cfg, plog=plog)
+    if not created:
+        plog("  ✓ takwerx system user already present on remote host")
+
     # Step 2: Version + arch on remote
     plog("")
     plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
@@ -14089,6 +14109,15 @@ def run_mediamtx_deploy():
             subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
         plog("✓ Python packages installed")
+
+        # v0.9.31: ensure `takwerx` system user exists before any chown / unit
+        # install happens. mediamtx.service + mediamtx-webeditor.service both
+        # run as `User=takwerx` (v0.9.29 hardening); missing user → 217/USER
+        # tight-loop on Restart=always. Idempotent.
+        plog("  Ensuring takwerx system user...")
+        created = _ensure_takwerx_system_user(plog=plog)
+        if not created:
+            plog("  ✓ takwerx system user already present")
 
         # Step 2: Detect architecture and latest version
         plog("")
@@ -24904,6 +24933,17 @@ def authentik_uninstall():
             steps.append('Removed ~/authentik')
         else:
             steps.append('~/authentik not found (already removed)')
+        # v0.9.31: also regenerate Caddyfile on local Authentik uninstall.
+        # The remote branch above already did this; the local branch did not,
+        # which left stale auth.<fqdn> + forward_auth proxy directives
+        # pointing at a dead upstream. Symptom matched the takportal bug.
+        try:
+            settings_now = load_settings()
+            generate_caddyfile(settings_now)
+            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            steps.append('Regenerated Caddyfile + reloaded Caddy')
+        except Exception as caddy_err:
+            steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
     authentik_deploy_log.clear()
     authentik_deploy_status.update({'running': False, 'complete': False, 'error': False})
     _update_boot_stagger_service()
@@ -27483,6 +27523,173 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
             plog(f"  server_ip auto-correct: error (non-fatal): {e}")
         except Exception:
             pass
+        return False
+
+
+def _ensure_takwerx_system_user(plog=None):
+    """v0.9.31: ensure the `takwerx` Linux system user exists.
+
+    BACKGROUND: v0.9.29 added `User=takwerx` + `SupplementaryGroups=caddy` to
+    both `mediamtx.service` and `mediamtx-webeditor.service` as part of the
+    Project Shakespear MediaMTX hardening — MediaMTX no longer runs as root.
+    But the corresponding user-creation step (originally in start.sh as
+    `provision_takwerx()` and in app.py as `_auto_provision_takwerx()`) was
+    reverted in v0.9.2-alpha commit `a6a7422` with the note 'defer to v0.9.3'
+    and never came back. Result: on any box where `takwerx` doesn't already
+    exist for unrelated reasons, both MediaMTX systemd units fail with
+    `status=217/USER` ("Failed to determine user credentials: No such
+    process") and tight-loop on `Restart=always` (636 restarts observed in
+    field on a SSDNodes fresh install 2026-05-18 before discovery).
+
+    This helper closes the gap. Called from:
+      - `run_mediamtx_deploy()` Step 1 (local) — fresh deploys
+      - `_run_mediamtx_deploy_remote()` Step 1 — fresh remote deploys
+      - `_heal_takwerx_user_missing_for_mediamtx()` startup migration —
+        existing broken boxes self-heal on next Update Now / console restart
+
+    Idempotent: `getent` guards both calls. Returns True if the user was
+    created in this call, False if it already existed.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        r = subprocess.run(['getent', 'passwd', 'takwerx'], capture_output=True, text=True, timeout=5)
+        if r.stdout.strip():
+            return False
+        # Create as a locked-down system user — no shell, no home directory
+        # creation, no password. Matches Debian/Ubuntu conventions for service
+        # accounts (e.g. www-data, postgres). System UID/GID auto-assigned.
+        subprocess.run(
+            'getent group  takwerx >/dev/null || groupadd --system takwerx',
+            shell=True, capture_output=True, timeout=10
+        )
+        subprocess.run(
+            'getent passwd takwerx >/dev/null || useradd  --system -g takwerx '
+            '-d /nonexistent -s /usr/sbin/nologin takwerx',
+            shell=True, capture_output=True, timeout=10
+        )
+        # Confirm
+        r2 = subprocess.run(['getent', 'passwd', 'takwerx'], capture_output=True, text=True, timeout=5)
+        if r2.stdout.strip():
+            _log("✓ takwerx system user created (--system -s /usr/sbin/nologin -d /nonexistent)")
+            return True
+        _log("⚠ takwerx user creation reported success but getent still empty")
+        return False
+    except Exception as e:
+        _log(f"⚠ takwerx user creation error (non-fatal): {e}")
+        return False
+
+
+def _ensure_takwerx_system_user_remote(deploy_cfg, plog=None):
+    """v0.9.31: same as `_ensure_takwerx_system_user` but for remote MediaMTX
+    deploys (over SSH). Idempotent — `getent` guards make repeat calls safe.
+    Returns True if created in this call, False if already present.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        ok_check, out_check = _module_run(deploy_cfg, 'getent passwd takwerx 2>/dev/null', timeout=10)
+        if ok_check and (out_check or '').strip():
+            return False
+        cmd = (
+            'getent group  takwerx >/dev/null || groupadd --system takwerx; '
+            'getent passwd takwerx >/dev/null || useradd  --system -g takwerx '
+            '-d /nonexistent -s /usr/sbin/nologin takwerx'
+        )
+        _module_run(deploy_cfg, cmd, timeout=15)
+        ok2, out2 = _module_run(deploy_cfg, 'getent passwd takwerx 2>/dev/null', timeout=10)
+        if ok2 and (out2 or '').strip():
+            _log("✓ takwerx system user created on remote host")
+            return True
+        _log("⚠ takwerx user creation on remote host reported success but getent still empty")
+        return False
+    except Exception as e:
+        _log(f"⚠ takwerx user creation on remote host error (non-fatal): {e}")
+        return False
+
+
+def _heal_takwerx_user_missing_for_mediamtx(plog=None):
+    """v0.9.31: self-heal MediaMTX fail-loop caused by missing `takwerx` user.
+
+    Gating (all must be true to apply):
+      - /etc/systemd/system/mediamtx.service exists (MediaMTX installed)
+      - getent passwd takwerx returns empty (user doesn't exist)
+
+    On apply: create the takwerx system user, re-apply the v0.9.29 chowns
+    (which were silently no-ops when the user didn't exist), re-apply
+    usermod -aG caddy takwerx, daemon-reload, restart mediamtx +
+    mediamtx-webeditor. Idempotent on healthy boxes (skips if user exists).
+
+    Closes the gap left by v0.9.29 Item 9 + Item 12 on existing-broken
+    boxes: those fixes assumed `takwerx` existed already. On a clean install
+    where it doesn't, the systemd units crash-loop with status=217/USER
+    before either heal can run. This migration creates the user first, then
+    the chowns actually take effect on the next service restart.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        if not os.path.exists('/etc/systemd/system/mediamtx.service'):
+            return False
+        r = subprocess.run(['getent', 'passwd', 'takwerx'], capture_output=True, text=True, timeout=5)
+        if r.stdout.strip():
+            return False  # user exists — nothing to do
+        _log("  mediamtx: takwerx user missing — creating + re-applying chowns + restarting services")
+        created = _ensure_takwerx_system_user(plog=plog)
+        if not created:
+            return False
+        # Re-apply the v0.9.29 chowns now that the user exists. They were
+        # silent no-ops on previous runs (chown to a non-existent user
+        # silently does nothing on most filesystems).
+        for path in (
+            '/opt/mediamtx-webeditor',
+            '/usr/local/etc/mediamtx_backups',
+            '/usr/local/etc/mediamtx.yml',
+        ):
+            if os.path.exists(path):
+                subprocess.run(f'chown -R takwerx:takwerx "{path}" 2>/dev/null; true',
+                               shell=True, capture_output=True, timeout=10)
+        # v0.9.29 item 9 LE-cert read-access (also silent no-op when user
+        # was missing) — re-apply.
+        subprocess.run('usermod -aG caddy takwerx 2>/dev/null; true',
+                       shell=True, capture_output=True, timeout=5)
+        for d in ('/var/lib/caddy',
+                  '/var/lib/caddy/.local',
+                  '/var/lib/caddy/.local/share',
+                  '/var/lib/caddy/.local/share/caddy',
+                  '/var/lib/caddy/.local/share/caddy/certificates'):
+            if os.path.exists(d):
+                subprocess.run(f'chmod g+rx "{d}" 2>/dev/null; true',
+                               shell=True, capture_output=True, timeout=5)
+        subprocess.run('systemctl daemon-reload 2>/dev/null; true',
+                       shell=True, capture_output=True, timeout=5)
+        subprocess.run(['systemctl', 'restart', 'mediamtx', 'mediamtx-webeditor'],
+                       capture_output=True, timeout=20)
+        # Verify
+        time.sleep(3)
+        r_mtx = subprocess.run(['systemctl', 'is-active', 'mediamtx'],
+                               capture_output=True, text=True, timeout=5)
+        r_ed = subprocess.run(['systemctl', 'is-active', 'mediamtx-webeditor'],
+                              capture_output=True, text=True, timeout=5)
+        if r_mtx.stdout.strip() == 'active' and r_ed.stdout.strip() == 'active':
+            _log("  ✓ takwerx heal complete: mediamtx + mediamtx-webeditor both active")
+            return True
+        _log(f"  ⚠ takwerx heal applied but services still mediamtx={r_mtx.stdout.strip()!r} editor={r_ed.stdout.strip()!r}")
+        return False
+    except Exception as e:
+        _log(f"  mediamtx: takwerx heal error (non-fatal): {e}")
         return False
 
 
@@ -39311,6 +39518,16 @@ def takserver_uninstall():
     # Reset deploy status
     deploy_log.clear()
     deploy_status.update({'running': False, 'complete': False, 'error': False})
+    # v0.9.31: regenerate Caddyfile so the webtak.<fqdn> vhost is removed.
+    # Same gap as takportal/authentik uninstall — without this the vhost
+    # remained and Caddy fell through to Authentik's "Not Found" page.
+    try:
+        settings = load_settings()
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        steps.append('Regenerated Caddyfile + reloaded Caddy')
+    except Exception as caddy_err:
+        steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
     return jsonify({'success': True, 'steps': steps})
 
 @app.route('/api/upload/takserver', methods=['POST'])
@@ -45824,6 +46041,23 @@ def _startup_migrations():
             )
         except Exception as ip_fix_err:
             print(f"Startup migration: server_ip auto-correct error (non-fatal): {ip_fix_err}")
+
+        # v0.9.31 — self-heal mediamtx fail-loop on boxes where the takwerx
+        # system user is missing entirely. v0.9.29 hardening added
+        # `User=takwerx` to both mediamtx.service + mediamtx-webeditor.service
+        # but never re-added the corresponding `useradd` (reverted in v0.9.2
+        # and never restored). On any box where the user doesn't already
+        # exist for unrelated reasons, both units fail with status=217/USER
+        # and tight-loop on Restart=always. MUST run BEFORE the
+        # mediamtx-webeditor perm-heal below — that heal does chowns to
+        # takwerx, which silently no-op when the user doesn't exist yet.
+        # Idempotent: skips if user already exists OR mediamtx not installed.
+        try:
+            _heal_takwerx_user_missing_for_mediamtx(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as wx_err:
+            print(f"Startup migration: takwerx user heal error (non-fatal): {wx_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
