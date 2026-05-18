@@ -27150,6 +27150,158 @@ def _estimate_cascade_recreates(cur_max, baseline):
         return 0
 
 
+def _ip_is_rfc1918_private(ip):
+    """True if ip is in RFC 1918 private ranges (10/8, 172.16/12, 192.168/16).
+    Also rejects loopback / link-local / invalid. Pure function — no side effects.
+    """
+    try:
+        if not ip:
+            return False
+        parts = ip.strip().split('.')
+        if len(parts) != 4:
+            return False
+        octets = [int(p) for p in parts]
+        if any(o < 0 or o > 255 for o in octets):
+            return False
+        a, b = octets[0], octets[1]
+        if a == 10:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 192 and b == 168:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _detect_cloud_public_ip():
+    """Return (public_ip, source) where source is 'azure' or 'aws' or None.
+
+    v0.9.29: Only returns definitive cloud-IMDS evidence. We deliberately do
+    NOT fall back to api.ipify.org / ifconfig.me here, because those echo
+    services return the carrier's WAN IP behind CGNAT — they cannot prove
+    "this VM has a public IP attached to its interface." Cloud IMDS endpoints
+    are the only sources that prove that, which is the precondition for
+    auto-rewriting an operator's settings.server_ip.
+
+    For the looser "best-effort public IP for cosmetic display" need, see
+    start.sh's detect_server_ip() (used at install time, where echo services
+    are fine because the operator is watching the bootstrap output).
+
+    Pure-function-ish: hits link-local 169.254.169.254 with 2-second timeouts;
+    returns (None, None) if both endpoints time out / 404 / return garbage.
+    """
+    import urllib.request as _ur
+    import urllib.error as _ue
+    _ipv4 = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+    # Azure Instance Metadata Service (no internet egress required, no auth)
+    try:
+        _req = _ur.Request(
+            'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress'
+            '?api-version=2021-02-01&format=text',
+            headers={'Metadata': 'true'},
+        )
+        with _ur.urlopen(_req, timeout=2) as r:
+            _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+        if _body and _ipv4.match(_body):
+            return _body, 'azure'
+    except Exception:
+        pass
+    # AWS IMDSv1 (still works on older AMIs; IMDSv2 requires token, falls through)
+    try:
+        with _ur.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=2) as r:
+            _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+        if _body and _ipv4.match(_body):
+            return _body, 'aws'
+    except Exception:
+        pass
+    return None, None
+
+
+def _patch_settings_server_ip_prefer_cloud_public(plog=None):
+    """v0.9.29: auto-correct settings.server_ip when a cloud VM has a private
+    IP stored but the cloud-metadata service definitively reports a public IP.
+
+    BACKGROUND (tak-test-4, fresh Azure deploy on v0.9.28 main, 2026-05-18):
+      start.sh used `hostname -I | awk '{print $1}'` at fresh-install time,
+      which on Azure/AWS/GCP returns the *private* interface IP (e.g.
+      10.0.0.x), not the public IP operators browse to. v0.9.29 fixed
+      start.sh for new installs, but Update Now doesn't re-run start.sh
+      — existing installs keep the private IP forever unless the operator
+      knows to paste in the public one via Settings → Server IP.
+
+      This migration closes that gap. It runs at startup with TIGHT gating
+      so it can never wrongly rewrite a deliberately-private deployment.
+
+    Gating (all must be true to apply):
+      - current settings.server_ip is in RFC 1918 private ranges
+        (10/8, 172.16/12, 192.168/16) — the symptom we're fixing
+      - Azure IMDS *or* AWS IMDS returns a valid IPv4 public IP — definitive
+        proof "this is a cloud VM and it has a public IP attached to its
+        interface." Echo services (ifconfig.me / api.ipify.org) are
+        deliberately NOT trusted here because they can return a carrier's
+        WAN IP behind CGNAT, which would falsely pass the gate on a
+        bare-metal-behind-NAT install.
+      - detected public IP differs from current settings.server_ip
+      - migration not previously applied on this box (settings key
+        `server_ip_auto_corrected_migration`)
+
+    On apply: rewrites settings.server_ip in-place, records audit blob in
+    settings.json with `from`, `to`, `source` (azure|aws), `applied_at`.
+    Logs loudly so operators can see it in journalctl. If they wanted the
+    private IP, they paste it back in Settings → Server IP and Save —
+    the migration won't re-run because the audit blob is recorded.
+
+    Idempotent: no-op on every subsequent startup once applied.
+    Safe to call on every console boot from `_startup_migrations`.
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        s = load_settings()
+        cur_ip = (s.get('server_ip') or '').strip()
+        if not cur_ip:
+            return False
+        # Idempotency: if we already auto-corrected this box, never touch again.
+        prev = s.get('server_ip_auto_corrected_migration')
+        if isinstance(prev, dict) and prev.get('applied'):
+            return False
+        if not _ip_is_rfc1918_private(cur_ip):
+            return False
+        public_ip, source = _detect_cloud_public_ip()
+        if not public_ip:
+            return False
+        if public_ip == cur_ip:
+            return False
+        plog(
+            f"  server_ip auto-correct: detected {source} public IP {public_ip}, "
+            f"current settings.server_ip is private ({cur_ip}) — updating"
+        )
+        s['server_ip'] = public_ip
+        s['server_ip_auto_corrected_migration'] = {
+            'applied': True,
+            'applied_at': datetime.utcnow().isoformat() + 'Z',
+            'from': cur_ip,
+            'to': public_ip,
+            'source': source,
+            'version': VERSION,
+        }
+        save_settings(s)
+        plog(
+            f"  server_ip auto-correct: applied. {cur_ip} → {public_ip} "
+            f"(source={source}). If you actually wanted the private IP, "
+            f"paste it back in Settings → Server IP — migration is one-shot."
+        )
+        return True
+    except Exception as e:
+        try:
+            plog(f"  server_ip auto-correct: error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
 def _recreate_authentik_server_worker(plog, reason):
     """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
 
@@ -45233,6 +45385,22 @@ def _startup_migrations():
             )
         except Exception as ak_snap_err:
             print(f"Startup migration: max-requests snap-to-baseline error (non-fatal): {ak_snap_err}")
+
+        # v0.9.29: auto-correct settings.server_ip on cloud VMs where start.sh
+        # had previously written the private interface IP (hostname -I) at
+        # fresh-install time. Tight gates: only fires if current server_ip is
+        # in RFC 1918 ranges AND cloud IMDS (Azure or AWS) definitively
+        # returns a different public IP. Idempotent — records the correction
+        # and never re-fires. If the operator actually wanted the private IP,
+        # they paste it back in Settings → Server IP and save. Field-
+        # discovered on tak-test-4 2026-05-18.
+        # See `_patch_settings_server_ip_prefer_cloud_public`.
+        try:
+            _patch_settings_server_ip_prefer_cloud_public(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ip_fix_err:
+            print(f"Startup migration: server_ip auto-correct error (non-fatal): {ip_fix_err}")
 
         # v0.9.27-alpha hotfix #4: reap ghost Channels backends left over
         # from prior server-1 restarts. Critical on the v0.9.26 → v0.9.27
