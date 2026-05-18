@@ -27745,17 +27745,19 @@ def _authentik_pool_autotune_compute(plog=None):
             except (TypeError, ValueError):
                 pass
         # v0.9.28-alpha: Channels-baseline telemetry (Authentik #20714 leak class).
-        try:
-            _classes = smp.get('classes')
-            if isinstance(_classes, (list, tuple)) and len(_classes) >= 1:
-                _ch = int(_classes[0])
+        # NOTE: _authentik_pool_autotune_sample() persists classification as
+        # flat keys (`channels`, `dramatiq`, `cache`, `advisory_lock`, `other`)
+        # — NOT nested under a `classes` list. Read the flat key directly.
+        if 'channels' in smp:
+            try:
+                _ch = int(smp['channels'])
                 samples_with_classes += 1
                 sum_channels_idle += _ch
                 if _ch > peak_channels_idle:
                     peak_channels_idle = _ch
                     peak_channels_idle_at = smp.get('t')
-        except (TypeError, ValueError):
-            continue
+            except (TypeError, ValueError):
+                pass
 
     # v0.9.27-alpha hotfix #2: STUCK-AT-FLOOR ESCAPE.
     #
@@ -27780,6 +27782,14 @@ def _authentik_pool_autotune_compute(plog=None):
             'peak_cl_waiting': peak_cl_waiting,
             'peak_cl_waiting_at': peak_cl_waiting_at,
             'samples_with_cl_waiting': samples_with_cl_waiting,
+            # v0.9.28-alpha: Channels-baseline telemetry on escape path too.
+            'peak_channels_idle': peak_channels_idle,
+            'peak_channels_idle_at': peak_channels_idle_at,
+            'avg_channels_idle': (
+                round(sum_channels_idle / samples_with_classes, 1)
+                if samples_with_classes > 0 else None
+            ),
+            'samples_with_classes': samples_with_classes,
             'target_ceiling': target_ceiling,
             'target_default': target_default,
             'target_reserve': target_reserve,
