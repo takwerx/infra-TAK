@@ -28513,6 +28513,13 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
 
     cur_default = _int_or_none('DEFAULT_POOL_SIZE')
     cur_reserve = _int_or_none('RESERVE_POOL_SIZE')
+    # v0.9.28-alpha: also reconcile MAX_CLIENT_CONN. This is a fleet
+    # constant (5000 in enterprise tier), not autotune-derived. Without
+    # this check, a v0.9.27 → v0.9.28 update on a box whose pool size
+    # didn't drift would never recreate pgbouncer, and MAX_CLIENT_CONN
+    # would stay stuck at the v0.9.27 value of 1000.
+    cur_max_client = _int_or_none('MAX_CLIENT_CONN')
+    target_max_client = _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN
 
     # v0.9.26-alpha hotfix #4 amendment: watchdog threshold scales with pool
     # ceiling so ak-pg-watchdog doesn't misfire on a healthy pre-warmed pool.
@@ -28541,7 +28548,14 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     # target, no compose mutation + no pgbouncer recreate. If it differs in
     # EITHER direction (operator-typed value above OR below target), we
     # converge it to the target.
-    matches_target = (cur_default == target) and (cur_reserve == target_reserve)
+    # v0.9.28-alpha: also include MAX_CLIENT_CONN in the match check so an
+    # update that only bumps the fleet constant (e.g. 1000 → 5000) triggers
+    # a pgbouncer recreate even when pool size is steady.
+    matches_target = (
+        (cur_default == target)
+        and (cur_reserve == target_reserve)
+        and (cur_max_client == target_max_client)
+    )
 
     if matches_target:
         # Pool YAML matches autotune. Still reconcile watchdog threshold and
@@ -28572,6 +28586,8 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
 
     env['DEFAULT_POOL_SIZE'] = target
     env['RESERVE_POOL_SIZE'] = target_reserve
+    # v0.9.28-alpha: fleet-uniform MAX_CLIENT_CONN reconciliation.
+    env['MAX_CLIENT_CONN'] = target_max_client
 
     try:
         with open(compose_path, 'w') as f:
@@ -28585,7 +28601,8 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
             direction = "set"
         plog(f"  pgbouncer pool-size: {direction} docker-compose.yml "
              f"DEFAULT_POOL_SIZE {cur_default} → {target}, "
-             f"RESERVE_POOL_SIZE {cur_reserve} → {target_reserve} "
+             f"RESERVE_POOL_SIZE {cur_reserve} → {target_reserve}, "
+             f"MAX_CLIENT_CONN {cur_max_client} → {target_max_client} "
              f"(ceiling={target + target_reserve}, "
              f"reason={autotune_decision.get('reason', 'autotune')[:120]})")
         plog(f"  pgbouncer pool-size: backup at {backup_path}")
@@ -28623,6 +28640,7 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     if healthy:
         plog(f"  ✓ pgbouncer pool-size: pgbouncer recreated and healthy "
              f"(DEFAULT_POOL_SIZE={target}, RESERVE_POOL_SIZE={target_reserve}, "
+             f"MAX_CLIENT_CONN={target_max_client}, "
              f"ceiling={target + target_reserve})")
     else:
         plog(f"  ⚠ pgbouncer pool-size: pgbouncer recreated but not healthy within 24s "
