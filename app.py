@@ -14521,6 +14521,36 @@ WantedBy=multi-user.target
         subprocess.run('systemctl enable mediamtx', shell=True, capture_output=True)
         if os.path.exists(editor_file):
             subprocess.run('systemctl enable mediamtx-webeditor', shell=True, capture_output=True)
+
+        # v0.9.29 — Pre-create writable dirs + chown for the takwerx-run web editor.
+        # The upstream mediamtx_config_editor.py (from mediamtx-installer) hardcodes:
+        #   BACKUP_DIR  = '/usr/local/etc/mediamtx_backups'
+        #   CONFIG_FILE = '/usr/local/etc/mediamtx.yml'
+        # and at IMPORT time (line ~93) calls `os.makedirs(BACKUP_DIR, exist_ok=True)`.
+        # If `/usr/local/etc/` is root-owned (default after `mkdir -p` for the .yml)
+        # AND the BACKUP_DIR doesn't exist, the import fails with PermissionError
+        # since the service runs as `User=takwerx`. Symptom seen on tak-test-4
+        # 2026-05-18: mediamtx-webeditor.service in fail-loop (264 restarts) with
+        #   `PermissionError: [Errno 13] Permission denied: '/usr/local/etc/mediamtx_backups'`
+        # Downstream: Caddy's stream.* vhost reverse-proxies to :5080 → nothing
+        # listening → Caddy returns 502 → browser sees authentik's "Not Found"
+        # page (because the forward_auth flow falls back to authentik on error).
+        # Same problem class as the LE-cert read-access fix earlier in this release.
+        if os.path.exists(editor_file):
+            try:
+                subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups', shell=True, capture_output=True, timeout=5)
+                subprocess.run('chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups', shell=True, capture_output=True, timeout=5)
+                # Editor writes theme_config.json, email_config.json, users_file,
+                # share_links, group_metadata, srt_passphrase_backup, pending_reg,
+                # reset_tokens, etc. into /opt/mediamtx-webeditor/. All as takwerx.
+                subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor', shell=True, capture_output=True, timeout=10)
+                # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
+                # the editor's Save-Config UI. takwerx ownership lets both work.
+                subprocess.run('chown takwerx:takwerx /usr/local/etc/mediamtx.yml', shell=True, capture_output=True, timeout=5)
+                plog("  ✓ Web editor writable paths chowned to takwerx (backups + /opt/mediamtx-webeditor + mediamtx.yml)")
+            except Exception as _pe:
+                plog(f"  ⚠ Could not chown web editor paths: {_pe}")
+
         subprocess.run('systemctl start mediamtx', shell=True, capture_output=True)
         if os.path.exists(editor_file):
             subprocess.run('systemctl start mediamtx-webeditor', shell=True, capture_output=True)
@@ -27440,6 +27470,88 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
     except Exception as e:
         try:
             plog(f"  server_ip auto-correct: error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _heal_mediamtx_webeditor_writable_paths(plog=None):
+    """v0.9.29: self-heal `mediamtx-webeditor.service` fail-loop caused by
+    PermissionError on `/usr/local/etc/mediamtx_backups`.
+
+    BACKGROUND (tak-test-4, fresh Azure deploy on v0.9.28 main, 2026-05-18):
+      The upstream mediamtx_config_editor.py (from mediamtx-installer) hard-codes
+        BACKUP_DIR  = '/usr/local/etc/mediamtx_backups'
+        CONFIG_FILE = '/usr/local/etc/mediamtx.yml'
+      and at IMPORT time calls `os.makedirs(BACKUP_DIR, exist_ok=True)`. The
+      systemd unit runs the editor as `User=takwerx`, but `/usr/local/etc/` is
+      `root:root 0755` and the BACKUP_DIR doesn't exist → PermissionError at
+      module import → service exits 1 → systemd Restart=always re-launches →
+      tight fail-loop (264 restarts seen on tak-test-4 before discovery).
+      Downstream: Caddy stream.* vhost reverse-proxies `/` to :5080 → nothing
+      listening → browser sees the Authentik "Not Found" page (forward_auth
+      falls back to the auth/caddy endpoint response on upstream-unreachable).
+      Same problem class as the LE-cert read-access bug fixed earlier in v0.9.29.
+
+      v0.9.29 fixes the deploy path (`deploy_mediamtx()`), but Update Now does
+      NOT re-run that flow. Operators on broken boxes would have to redeploy
+      MediaMTX from the console (a heavy step). This migration closes the gap:
+      on every console boot, if MediaMTX is installed AND the editor service is
+      NOT active, re-apply the chowns so the next service restart succeeds.
+
+    Gating (all must be true to apply):
+      - /opt/mediamtx-webeditor exists (MediaMTX installed)
+      - mediamtx-webeditor.service is loaded but not active (broken state)
+
+    On apply: chown /usr/local/etc/mediamtx_backups (mkdir if absent),
+      /opt/mediamtx-webeditor recursively, and /usr/local/etc/mediamtx.yml to
+      takwerx:takwerx, then `systemctl restart mediamtx-webeditor`. Idempotent
+      on healthy boxes (skips entirely if service is active).
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        if not os.path.exists('/opt/mediamtx-webeditor'):
+            return False
+        # Don't disturb healthy boxes
+        r_active = subprocess.run(
+            ['systemctl', 'is-active', 'mediamtx-webeditor'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r_active.stdout.strip() == 'active':
+            return False
+        # Confirm the unit file is actually installed (not just a stale heal target)
+        r_loaded = subprocess.run(
+            ['systemctl', 'list-unit-files', 'mediamtx-webeditor.service', '--no-legend'],
+            capture_output=True, text=True, timeout=5
+        )
+        if 'mediamtx-webeditor' not in (r_loaded.stdout or ''):
+            return False
+        plog("  mediamtx-webeditor: not active — applying perm-heal (v0.9.29)")
+        subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups',
+                       shell=True, capture_output=True, timeout=5)
+        subprocess.run('chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups',
+                       shell=True, capture_output=True, timeout=5)
+        subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor',
+                       shell=True, capture_output=True, timeout=10)
+        if os.path.exists('/usr/local/etc/mediamtx.yml'):
+            subprocess.run('chown takwerx:takwerx /usr/local/etc/mediamtx.yml',
+                           shell=True, capture_output=True, timeout=5)
+        subprocess.run(['systemctl', 'restart', 'mediamtx-webeditor'],
+                       capture_output=True, timeout=15)
+        # Give it a moment and re-check
+        time.sleep(3)
+        r2 = subprocess.run(['systemctl', 'is-active', 'mediamtx-webeditor'],
+                            capture_output=True, text=True, timeout=5)
+        if r2.stdout.strip() == 'active':
+            plog("  mediamtx-webeditor: perm-heal applied and service is now active")
+            return True
+        plog(f"  mediamtx-webeditor: perm-heal applied but service still {r2.stdout.strip()!r} "
+             f"— check journalctl -u mediamtx-webeditor")
+        return False
+    except Exception as e:
+        try:
+            plog(f"  mediamtx-webeditor: perm-heal error (non-fatal): {e}")
         except Exception:
             pass
         return False
@@ -45616,6 +45728,20 @@ def _startup_migrations():
             )
         except Exception as ip_fix_err:
             print(f"Startup migration: server_ip auto-correct error (non-fatal): {ip_fix_err}")
+
+        # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
+        # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
+        # hard-codes BACKUP_DIR=/usr/local/etc/mediamtx_backups and call os.makedirs()
+        # at module-import time. Running as User=takwerx with root-owned /usr/local/etc
+        # → PermissionError → fail-loop. Field discovered on tak-test-4 2026-05-18.
+        # Idempotent: only runs if MediaMTX is installed AND the editor service is
+        # NOT active (don't disturb healthy boxes).
+        try:
+            _heal_mediamtx_webeditor_writable_paths(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as mtx_perm_err:
+            print(f"Startup migration: mediamtx-webeditor perm-heal error (non-fatal): {mtx_perm_err}")
 
         # v0.9.27-alpha hotfix #4: reap ghost Channels backends left over
         # from prior server-1 restarts. Critical on the v0.9.26 → v0.9.27
