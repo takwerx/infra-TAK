@@ -27175,47 +27175,121 @@ def _ip_is_rfc1918_private(ip):
         return False
 
 
-def _detect_cloud_public_ip():
-    """Return (public_ip, source) where source is 'azure' or 'aws' or None.
+def _detect_cloud_environment():
+    """Return 'azure', 'aws', or None based on IMDS reachability.
 
-    v0.9.29: Only returns definitive cloud-IMDS evidence. We deliberately do
-    NOT fall back to api.ipify.org / ifconfig.me here, because those echo
-    services return the carrier's WAN IP behind CGNAT — they cannot prove
-    "this VM has a public IP attached to its interface." Cloud IMDS endpoints
-    are the only sources that prove that, which is the precondition for
-    auto-rewriting an operator's settings.server_ip.
+    IMDS at link-local 169.254.169.254 is the strongest "I am running on a
+    cloud VM" signal we can get without operator input. On bare-metal /
+    laptops / corp LANs, the link-local address either isn't routed or
+    times out within 2 s. On Azure / AWS the metadata service responds in
+    sub-100ms.
 
-    For the looser "best-effort public IP for cosmetic display" need, see
-    start.sh's detect_server_ip() (used at install time, where echo services
-    are fine because the operator is watching the bootstrap output).
-
-    Pure-function-ish: hits link-local 169.254.169.254 with 2-second timeouts;
-    returns (None, None) if both endpoints time out / 404 / return garbage.
+    Field-discovered necessity (tak-test-4, 2026-05-18): some Azure VMs
+    have NO public IP attached to the NIC — they're reached via an Azure
+    Load Balancer or NAT Gateway. IMDS correctly reports
+    ``publicIpAddress: ""`` on those, so `_detect_cloud_public_ip()` needs
+    a separate "are we on a cloud VM?" signal to know it's safe to fall
+    through to ifconfig.me / api.ipify.org (which would otherwise be too
+    permissive on CGNAT bare-metal hosts).
     """
     import urllib.request as _ur
-    import urllib.error as _ue
-    _ipv4 = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
-    # Azure Instance Metadata Service (no internet egress required, no auth)
+    # Azure: requires `Metadata: true` header and api-version
     try:
         _req = _ur.Request(
-            'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress'
-            '?api-version=2021-02-01&format=text',
+            'http://169.254.169.254/metadata/instance?api-version=2021-02-01',
             headers={'Metadata': 'true'},
         )
         with _ur.urlopen(_req, timeout=2) as r:
-            _body = (r.read() or b'').decode('utf-8', 'replace').strip()
-        if _body and _ipv4.match(_body):
-            return _body, 'azure'
+            if r.status == 200:
+                return 'azure'
     except Exception:
         pass
-    # AWS IMDSv1 (still works on older AMIs; IMDSv2 requires token, falls through)
+    # AWS IMDSv1 (token-less); IMDSv2 on newer AMIs would still respond to
+    # this endpoint with 401, which urllib raises — we accept "responded at
+    # all" via the explicit HTTPError check.
     try:
-        with _ur.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=2) as r:
-            _body = (r.read() or b'').decode('utf-8', 'replace').strip()
-        if _body and _ipv4.match(_body):
-            return _body, 'aws'
-    except Exception:
-        pass
+        with _ur.urlopen('http://169.254.169.254/latest/meta-data/', timeout=2) as r:
+            if r.status == 200:
+                return 'aws'
+    except Exception as _e:
+        # IMDSv2 returns 401 Unauthorized without a token → still proves
+        # "we're on AWS" for our purposes.
+        try:
+            if getattr(_e, 'code', None) in (401, 403):
+                return 'aws'
+        except Exception:
+            pass
+    return None
+
+
+def _detect_cloud_public_ip():
+    """Return (public_ip, source) on cloud VMs only.
+
+    Detection logic (v0.9.29):
+      1. Determine the cloud environment via IMDS reachability
+         (_detect_cloud_environment). If we're not on a cloud VM, return
+         (None, None) — we will NOT touch bare-metal / laptop / CGNAT
+         operator settings.
+      2. On Azure / AWS, first ask IMDS for a public IP directly attached
+         to the NIC. If present, that's the highest-confidence answer.
+      3. If IMDS reports no direct-attached public IP (which is the
+         tak-test-4 case — Azure VM behind Load Balancer / NAT Gateway),
+         fall through to public-IP echo services. This is safe BECAUSE we
+         already proved (step 1) we're on a cloud VM. Echo services would
+         be too permissive on bare-metal alone, but the cloud-VM
+         precondition rules that case out.
+
+    Source values:
+      'azure-imds-direct' — Azure IMDS returned a public IP attached to interface 0
+      'aws-imds-direct'   — AWS IMDS returned a public IP attached to the NIC
+      'azure-nat'         — Azure VM (IMDS responded) but no direct public IP;
+                            ifconfig.me / api.ipify.org returned a public IP
+                            (e.g. via Azure Load Balancer or NAT Gateway)
+      'aws-nat'           — Same pattern on AWS (e.g. via NAT Gateway)
+
+    Returns (None, None) if not on a cloud VM, or if all probes time out.
+    """
+    import urllib.request as _ur
+    _ipv4 = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+    cloud = _detect_cloud_environment()
+    if not cloud:
+        return None, None
+
+    # Step 2: try direct-attached public IP via IMDS first (highest confidence)
+    if cloud == 'azure':
+        try:
+            _req = _ur.Request(
+                'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress'
+                '?api-version=2021-02-01&format=text',
+                headers={'Metadata': 'true'},
+            )
+            with _ur.urlopen(_req, timeout=2) as r:
+                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+            if _body and _ipv4.match(_body):
+                return _body, 'azure-imds-direct'
+        except Exception:
+            pass
+    elif cloud == 'aws':
+        try:
+            with _ur.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=2) as r:
+                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+            if _body and _ipv4.match(_body):
+                return _body, 'aws-imds-direct'
+        except Exception:
+            pass
+
+    # Step 3: cloud VM with no direct public IP — fall through to echo services
+    # (safe because the cloud-VM precondition has already been established).
+    for _url in ('https://api.ipify.org', 'https://ifconfig.me'):
+        try:
+            with _ur.urlopen(_url, timeout=3) as r:
+                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+            if _body and _ipv4.match(_body):
+                return _body, f'{cloud}-nat'
+        except Exception:
+            continue
+
     return None, None
 
 
@@ -27237,12 +27311,14 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
     Gating (all must be true to apply):
       - current settings.server_ip is in RFC 1918 private ranges
         (10/8, 172.16/12, 192.168/16) — the symptom we're fixing
-      - Azure IMDS *or* AWS IMDS returns a valid IPv4 public IP — definitive
-        proof "this is a cloud VM and it has a public IP attached to its
-        interface." Echo services (ifconfig.me / api.ipify.org) are
-        deliberately NOT trusted here because they can return a carrier's
-        WAN IP behind CGNAT, which would falsely pass the gate on a
-        bare-metal-behind-NAT install.
+      - _detect_cloud_public_ip() returns a public IP. The function
+        proves cloud-VM environment via IMDS reachability first, then
+        tries direct-attached public IP via IMDS, then falls through to
+        ifconfig.me / api.ipify.org if the VM is on a cloud but has no
+        direct public IP (e.g. behind Azure Load Balancer / NAT Gateway —
+        tak-test-4's case). On bare-metal / laptop / CGNAT operator
+        installs, IMDS doesn't respond, so this function returns
+        (None, None) and the migration is a no-op.
       - detected public IP differs from current settings.server_ip
       - migration not previously applied on this box (settings key
         `server_ip_auto_corrected_migration`)
