@@ -37,6 +37,42 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ==========================================
+# Server IP detection (v0.9.29)
+# ==========================================
+# Prefer public/external IP for cloud deployments (Azure/AWS/GCP).
+# `hostname -I` on those VMs returns the private/internal IP, which is wrong for:
+#   - SSL self-signed cert SAN (CN/IP)
+#   - settings.server_ip used by TAK Server reachability + console "Access URL"
+#   - Caddy / SSL bootstrap that builds the public-facing console URL
+# Detection order (each step has its own timeout, falls through on failure):
+#   1. Azure Instance Metadata Service (no internet egress required)
+#   2. AWS Instance Metadata Service v1 (token-less, still works on older AMIs)
+#   3. External IP echo (api.ipify.org → ifconfig.me)
+#   4. Fallback: hostname -I (private/LAN — correct for on-prem / no public IP)
+detect_server_ip() {
+    local public_ip=""
+    public_ip=$(curl -s --max-time 2 -H "Metadata: true" \
+        "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" \
+        2>/dev/null || true)
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -s --max-time 2 \
+            http://169.254.169.254/latest/meta-data/public-ipv4 \
+            2>/dev/null || true)
+    fi
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null || true)
+    fi
+    if echo "$public_ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+        echo "$public_ip"
+    else
+        hostname -I 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# ==========================================
 # VPS Disk I/O Check
 # ==========================================
 check_disk_io() {
@@ -300,8 +336,11 @@ print(generate_password_hash(sys.argv[1]))
 EOF
     chmod 600 "$AUTH_FILE"
 
-    # Detect server IP
-    SERVER_IP=$(hostname -I | awk '{print $1}')
+    # Detect server IP — public-preferring (cloud-aware). See detect_server_ip()
+    # near the top of the script for the detection order. On Azure/AWS/GCP this
+    # picks the public IP from the cloud's metadata service; on on-prem hosts
+    # it falls back to the first interface from `hostname -I`.
+    SERVER_IP=$(detect_server_ip)
 
     # Save settings — always start in IP/self-signed mode
     # FQDN setup happens in the browser through the Caddy module
@@ -333,9 +372,11 @@ generate_self_signed_cert() {
 
     if [ ! -f "$CERT_DIR/console.key" ]; then
         echo -e "  Generating self-signed certificate..."
-        
-        SERVER_IP=$(hostname -I | awk '{print $1}')
-        
+
+        # v0.9.29: use the same public-preferring detection so the cert SAN
+        # matches the IP operators actually browse to on cloud VMs.
+        SERVER_IP=$(detect_server_ip)
+
         openssl req -x509 -newkey rsa:4096 \
             -keyout "$CERT_DIR/console.key" \
             -out "$CERT_DIR/console.crt" \

@@ -34406,7 +34406,15 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
 
 def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog=None):
     """Legacy text-based LDAP auth writer for CoreConfig.xml — used as fallback by
-    _apply_coreconfig_ldap_auth_et when ElementTree parsing fails."""
+    _apply_coreconfig_ldap_auth_et when ElementTree parsing fails.
+
+    v0.9.29: namespace-prefix tolerant. The substitution regex previously
+    matched only ``<auth ...>...</auth>`` and silently no-op'd on namespace-
+    prefixed canonical form ``<ns0:auth ...>...</ns0:auth>`` written by TAK
+    Server 5.7-RELEASE-32+. If ET parsing failed AND the existing file was
+    namespace-prefixed, the legacy fallback would return "format not recognized"
+    instead of patching. Same fix class as the v0.9.29 verifier fix.
+    """
     import re as _re
     auth_block = (
         '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true"'
@@ -34421,7 +34429,10 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
     try:
         with open(coreconfig_path, 'r') as f:
             content = f.read()
-        new_content = _re.sub(r'<auth[^>]*>.*?</auth>', auth_block, content, flags=_re.DOTALL)
+        new_content = _re.sub(
+            r'<(?:[A-Za-z][\w-]*:)?auth[^>]*>.*?</(?:[A-Za-z][\w-]*:)?auth\s*>',
+            auth_block, content, flags=_re.DOTALL | _re.IGNORECASE,
+        )
         if new_content == content:
             return False, 'CoreConfig <auth> block not found or format not recognized (text patcher)'
         _patch_path = coreconfig_path + '.ldap-patch.xml'
@@ -34437,21 +34448,37 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
 
 
 def _coreconfig_has_ldap():
-    """True only when CoreConfig auth block is actually LDAP-default."""
+    """True only when CoreConfig auth block is actually LDAP-default.
+
+    v0.9.29: namespace-prefix tolerant. TAK Server 5.7-RELEASE-32+ canonicalizes
+    CoreConfig.xml on restart and writes elements with the ``ns0:`` XML namespace
+    prefix (``<ns0:auth ...>``). The previous naive ``<auth`` substring lookup
+    failed on those installs even though the LDAP wiring itself was correct,
+    producing a misleading ``coreconfig=FAIL`` in the LDAP sync banner on every
+    fresh deploy. Discovered on tak-test-4 (Azure, 2026-05-18).
+    """
     path = '/opt/tak/CoreConfig.xml'
     if not os.path.exists(path):
         return False
     try:
         with open(path, 'r') as f:
             content = f.read()
-        lower = content.lower()
-        start = lower.find('<auth')
-        end = lower.find('</auth>', start) if start >= 0 else -1
-        if start < 0 or end < 0:
+        m_start = re.search(r'<(?:[A-Za-z][\w-]*:)?auth\b', content, re.IGNORECASE)
+        if not m_start:
             return False
-        block = content[start:end + len('</auth>')]
-        has_ldap_provider = bool(re.search(r'<ldap\b', block, re.IGNORECASE)) and ('adm_ldapservice' in block.lower())
-        m = re.search(r'<auth[^>]*\bdefault="([^"]+)"', block, re.IGNORECASE)
+        rest = content[m_start.start():]
+        m_end = re.search(r'</(?:[A-Za-z][\w-]*:)?auth\s*>', rest, re.IGNORECASE)
+        if not m_end:
+            return False
+        block = rest[:m_end.end()]
+        has_ldap_provider = (
+            bool(re.search(r'<(?:[A-Za-z][\w-]*:)?ldap\b', block, re.IGNORECASE))
+            and ('adm_ldapservice' in block.lower())
+        )
+        m = re.search(
+            r'<(?:[A-Za-z][\w-]*:)?auth[^>]*\bdefault="([^"]+)"',
+            block, re.IGNORECASE,
+        )
         default_auth = (m.group(1).strip().lower() if m else '')
         return bool(has_ldap_provider and default_auth == 'ldap')
     except Exception:
