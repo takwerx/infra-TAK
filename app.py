@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.29-alpha"
+VERSION = "0.9.30-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25106,7 +25106,8 @@ AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD={ldap_svc_pass}
 AUTHENTIK_BOOTSTRAP_LDAP_BASEDN=DC=takldap
 AUTHENTIK_BOOTSTRAP_LDAP_AUTHENTIK_HOST=http://authentik-server-1:9000/
 AUTHENTIK_HOST={ak_base}
-AUTHENTIK_TOKEN={bootstrap_token}{cookie_line}
+AUTHENTIK_TOKEN={bootstrap_token}
+AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128{cookie_line}
 """
 
     with open('/tmp/authentik_remote.env', 'w') as f:
@@ -25648,6 +25649,16 @@ networks:
         )
         plog("⚠ No console source IP set (Settings → Server IP) — 389/636 left public; 9090/9443 denied. Fill Server IP to enable source-scoping.")
     _module_run(deploy_cfg, _ufw_block, timeout=20)
+
+    # v0.9.30: stamp settings.authentik_trusted_proxy_cidrs_fix so the fail2ban
+    # Marketplace install can pass its prereq guard in the same session as this
+    # deploy (no console restart required). The .env above already bakes
+    # AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS in, so this call hits the
+    # idempotent-noop branch and records last_outcome='idempotent-noop'.
+    try:
+        _authentik_fix_trusted_proxy_cidrs(plog)
+    except Exception as _tpc_e:
+        plog(f"  ⚠ trusted-proxy CIDRs stamp skipped (non-fatal): {str(_tpc_e)[:120]}")
 
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -32512,6 +32523,10 @@ AUTHENTIK_BOOTSTRAP_LDAP_BASEDN=DC=takldap
 AUTHENTIK_BOOTSTRAP_LDAP_AUTHENTIK_HOST=http://authentik-server-1:9000/
 # Embedded outpost host — prevents 0.0.0.0:9000 redirect issue
 AUTHENTIK_HOST={_get_authentik_base_url(settings)}
+# v0.8.9 fix baked in (v0.9.30): trust Caddy → record real client IPs in audit log,
+# Reputation policy, and fail2ban — instead of the Docker bridge gateway (172.18.0.1).
+# 172.16.0.0/12 covers every Docker bridge subnet infra-TAK uses (172.17–172.21).
+AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128
 """ + (f"\n# Cookie domain so session is shared across subdomains (stream., infratak., etc.) — avoids redirect loop\nAUTHENTIK_COOKIE_DOMAIN=.{settings.get('fqdn').split(':')[0]}" if settings.get("fqdn") else "") + """
 # Email Configuration (uncomment and configure)
 # AUTHENTIK_EMAIL__HOST=smtp.example.com
@@ -33803,6 +33818,15 @@ entries:
             _ensure_authentik_pg_persistent_connections(plog)
         except Exception as _e:
             plog(f"  ⚠ PG persistent connections migration skipped: {_e}")
+        # v0.9.30: stamp settings.authentik_trusted_proxy_cidrs_fix so the fail2ban
+        # Marketplace install can pass its prereq guard in the same session as this
+        # deploy (no console restart required). The .env template above already bakes
+        # AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS in, so this call hits the
+        # idempotent-noop branch and records last_outcome='idempotent-noop'.
+        try:
+            _authentik_fix_trusted_proxy_cidrs(plog)
+        except Exception as _tpc_e:
+            plog(f"  ⚠ trusted-proxy CIDRs stamp skipped (non-fatal): {str(_tpc_e)[:120]}")
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
