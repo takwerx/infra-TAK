@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.30-alpha"
+VERSION = "0.9.31-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -39263,11 +39263,36 @@ def takserver_uninstall():
     # Kill any remaining processes
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
     steps.append('Killed remaining processes')
-    # Remove package
-    pkg_result = subprocess.run('dpkg -l | grep takserver', shell=True, capture_output=True, text=True)
-    if 'takserver' in pkg_result.stdout:
-        subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove -y takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
-        steps.append('Removed TAK Server package')
+    # Purge package — must complete BEFORE removing /opt/tak, otherwise the
+    # package can remain in 'ii' state with files gone, and the next
+    # `apt-get install` becomes a no-op ("already newest version") that leaves
+    # a half-installed system. See deploy Step 4 self-heal for the matching
+    # recovery path.
+    pkg_status = subprocess.run(
+        "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+        shell=True, capture_output=True, text=True
+    ).stdout.strip()
+    if pkg_status:
+        # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
+        # stderr so silent failures don't pretend success.
+        purge_ok = False
+        for cmd in (
+            'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+            'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+            'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+        ):
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+            after = subprocess.run(
+                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                shell=True, capture_output=True, text=True
+            ).stdout.strip()
+            if not after or 'not-installed' in after:
+                purge_ok = True
+                break
+        if purge_ok:
+            steps.append('Purged TAK Server package')
+        else:
+            steps.append('⚠ Could not purge takserver package (still registered with dpkg) — manual cleanup required')
     # Clean up /opt/tak
     if os.path.exists('/opt/tak'):
         subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
@@ -41505,6 +41530,29 @@ def run_takserver_deploy(config):
             if settings.get('pkg_mgr', 'apt') == 'apt':
                 wait_for_apt_lock(log_step, deploy_log)
             log_step(f"Installing {pkg_name}...")
+            # Pre-flight: if a prior Remove button run left the package marked
+            # installed (dpkg `ii`) but /opt/tak gone, `apt-get install` becomes
+            # a no-op ("already newest version") and we'd FATAL below. Detect
+            # that state and purge first so the install actually extracts.
+            _pre_status = subprocess.run(
+                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                shell=True, capture_output=True, text=True
+            ).stdout.strip()
+            if _pre_status and 'installed' in _pre_status and not os.path.exists('/opt/tak'):
+                log_step("  Detected half-removed takserver (package marked installed, /opt/tak missing) — purging before reinstall...")
+                for _cmd in (
+                    'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+                    'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+                    'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+                ):
+                    subprocess.run(_cmd, shell=True, capture_output=True, text=True, timeout=180)
+                    _after = subprocess.run(
+                        "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                        shell=True, capture_output=True, text=True
+                    ).stdout.strip()
+                    if not _after or 'not-installed' in _after:
+                        break
+                log_step("  ✓ Purge complete — proceeding with fresh install")
             r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y {pkg} 2>&1', check=False)
             if not r1:
                 log_step("  apt-get failed, trying dpkg + dependency fix...")
@@ -41515,8 +41563,16 @@ def run_takserver_deploy(config):
                 log_step("  Creating PostgreSQL 15 cluster...")
                 run_cmd('pg_createcluster 15 main --start 2>&1', check=False)
             run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
+            # Last-resort self-heal: if /opt/tak is still missing (e.g. apt
+            # decided the package was already installed and skipped extraction
+            # despite our pre-flight purge), force a reinstall from the .deb.
             if not os.path.exists('/opt/tak'):
-                log_step("✗ FATAL: /opt/tak not found after install"); deploy_status.update({'error': True, 'running': False}); return
+                log_step("  /opt/tak missing after install — forcing reinstall from .deb...")
+                run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install --reinstall -y {pkg} 2>&1', check=False)
+                run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
+            if not os.path.exists('/opt/tak'):
+                log_step("✗ FATAL: /opt/tak not found after install (even after forced reinstall) — run `dpkg --purge --force-all takserver && rm -rf /opt/tak` on the host and retry")
+                deploy_status.update({'error': True, 'running': False}); return
             log_step("✓ TAK Server installed")
 
         # For external_db: patch CoreConfig JDBC URL NOW, before first start,
@@ -42371,9 +42427,25 @@ def run_full_uninstall():
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
         subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
-        pkg_result = subprocess.run('dpkg -l | grep takserver', shell=True, capture_output=True, text=True)
-        if 'takserver' in (pkg_result.stdout or ''):
-            subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove -y takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        # Purge BEFORE removing /opt/tak — see takserver_uninstall() for why
+        # `apt-get remove` (no purge) + `rm -rf /opt/tak` is a footgun.
+        pkg_status = subprocess.run(
+            "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if pkg_status:
+            for _cmd in (
+                'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+            ):
+                subprocess.run(_cmd, shell=True, capture_output=True, text=True, timeout=180)
+                _after = subprocess.run(
+                    "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                    shell=True, capture_output=True, text=True
+                ).stdout.strip()
+                if not _after or 'not-installed' in _after:
+                    break
         if os.path.exists('/opt/tak'):
             subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
         subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
