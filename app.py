@@ -26845,6 +26845,213 @@ def _patch_authentik_web_max_requests_to_1000(plog=None):
         return False
 
 
+def _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(plog=None):
+    """v0.9.29: short-circuit the v0.9.23 autotune tune-UP cascade for boxes
+    that were stuck at the floor before PgBouncer landed.
+
+    BACKGROUND (test12 / tak-10, 2026-05-18):
+      The v0.9.23 MAX_REQUESTS autotuner uses asymmetric cooldowns: halve
+      on watchdog fire (down to floor=100, every 2 min) and +25% on quiet
+      (up to baseline=1000, every 30 min). On a box that hit the floor
+      during a real leak burst, the tune-UP cascade after pressure resolves
+      takes ~7 hours and produces 10 server+worker recreates (100 → 125 →
+      156 → 195 → 243 → 303 → 378 → 472 → 590 → 737 → 921 → 1000). Each
+      recreate drops the LDAP outpost websocket for 1-5s (visible as Caddy
+      502s on /api/v3/flows/executor/ldap-authentication-flow). Field
+      forensic on test12 2026-05-18 caught this in soak.
+
+      The v0.9.23 PgBouncer install function (line 28467-28491) already
+      RESETS MAX_REQUESTS to baseline as part of its post-install path
+      ("autotune floor=100 is no longer load-bearing with PgBouncer in
+      place"). But that path only fires on FRESH PgBouncer installs.
+      Boxes upgraded to PgBouncer while already-stuck-at-floor never
+      saw the reset — they took the 7-hour cascade instead.
+
+      This migration closes that gap. It runs every startup, but is
+      effectively a one-shot per box because it short-circuits once
+      MAX_REQUESTS == baseline.
+
+    Gating (all must be true to apply):
+      - ~/authentik/.env exists
+      - PgBouncer is installed in compose AND wired in .env (the
+        architectural protection that makes MAX_REQUESTS autotune
+        non-load-bearing)
+      - current MAX_REQUESTS < baseline (default 1000; settings override
+        via authentik_max_requests_baseline)
+      - no SAFETY NET firing in the last _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S
+        (default 6h) — if pressure is currently active we let the autotuner
+        do its job
+      - no autotune apply in the last _AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S
+        (default 30 min) — avoid colliding with an in-flight autotune cycle
+
+    On apply: write .env MAX_REQUESTS=baseline / JITTER=baseline//20, single
+    server+worker recreate, clear authentik_max_requests_fire_history,
+    record the snap in authentik_max_requests_tune_history with
+    reason='snap-to-baseline-pgbouncer-installed-quiet', set
+    authentik_max_requests_last_tune_ts=now.
+
+    Returns True if applied (cascade was short-circuited), False if
+    no-op (already at baseline, or gate condition not met), None on error.
+    """
+    if plog is None:
+        plog = lambda m: None
+    ak_dir = os.path.expanduser('~/authentik')
+    ak_env = os.path.join(ak_dir, '.env')
+    ak_compose = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(ak_env) or not os.path.exists(ak_compose):
+        return False
+    try:
+        import time as _t
+
+        _cur_max, _cur_jitter = _authentik_max_requests_get_current()
+        if _cur_max is None:
+            return False  # MAX_REQUESTS not in .env — nothing to do
+
+        _s = load_settings()
+        _baseline = int(_s.get('authentik_max_requests_baseline') or 1000)
+        _ceiling = int(_s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT)
+        if _cur_max >= _baseline:
+            return False  # at or above baseline — no cascade to short-circuit
+        if _baseline > _ceiling:
+            _baseline = _ceiling  # safety clamp
+
+        try:
+            with open(ak_env) as _f:
+                _env_text = _f.read()
+        except Exception as _re:
+            plog(f"  ⚠ snap-to-baseline: .env read error: {_re}")
+            return None
+
+        _has_pgbouncer_in_env = bool(
+            re.search(r'^\s*AUTHENTIK_POSTGRESQL__HOST\s*=\s*pgbouncer\s*$',
+                      _env_text, re.MULTILINE)
+        )
+        try:
+            with open(ak_compose) as _f:
+                _compose_text = _f.read()
+        except Exception:
+            _compose_text = ''
+        _has_pgbouncer_in_compose = bool(
+            re.search(r'^\s*pgbouncer\s*:\s*$', _compose_text, re.MULTILINE)
+        )
+        if not (_has_pgbouncer_in_env and _has_pgbouncer_in_compose):
+            return False  # No PgBouncer installed — let the autotuner cascade
+
+        _now = int(_t.time())
+        _fires = list(_s.get('authentik_max_requests_fire_history') or [])
+        _last_fire_ts = max(_fires) if _fires else 0
+        if _last_fire_ts and (_now - _last_fire_ts) < _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S:
+            _qmin = (_now - _last_fire_ts) // 60
+            plog(f"  snap-to-baseline: SAFETY NET fired {_qmin}min ago "
+                 f"(< {_AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S//60}min quiet window) "
+                 f"— deferring to autotuner")
+            return False
+
+        _last_tune_ts = int(_s.get('authentik_max_requests_last_tune_ts') or 0)
+        if _last_tune_ts and (_now - _last_tune_ts) < _AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S:
+            _tmin = (_now - _last_tune_ts) // 60
+            plog(f"  snap-to-baseline: autotune ran {_tmin}min ago "
+                 f"(< {_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S//60}min cooldown) "
+                 f"— deferring to avoid collision")
+            return False
+
+        _new_jitter = max(5, _baseline // 20)
+        _backup = f'{ak_env}.bak.snap-to-baseline.{_now}'
+        with open(_backup, 'w') as _f:
+            _f.write(_env_text)
+
+        _new_text = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS={_baseline}',
+            _env_text, flags=re.MULTILINE
+        )
+        _new_text = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS_JITTER={_new_jitter}',
+            _new_text, flags=re.MULTILINE
+        )
+        if _new_text == _env_text:
+            plog("  snap-to-baseline: regex did not match (.env shape unexpected) — skip")
+            try:
+                os.remove(_backup)
+            except Exception:
+                pass
+            return False
+
+        with open(ak_env, 'w') as _f:
+            _f.write(_new_text)
+
+        _saved_recreates = max(0, _estimate_cascade_recreates(_cur_max, _baseline))
+        plog(f"  ✓ snap-to-baseline: MAX_REQUESTS {_cur_max}→{_baseline}, "
+             f"JITTER {_cur_jitter}→{_new_jitter} "
+             f"(short-circuited ~{_saved_recreates} +25%/30min tune-UP recreates)")
+        plog(f"    Reason: PgBouncer installed, quiet for "
+             f"{(_now - _last_fire_ts) // 60 if _last_fire_ts else 9999}min — "
+             f"v0.9.23 cascade no longer needed")
+        plog(f"    Backup: {os.path.basename(_backup)}")
+        plog("  snap-to-baseline: recreating server+worker (single recreate) to apply new env...")
+
+        ok = _recreate_authentik_server_worker(plog, reason='snap-to-baseline-pgbouncer-installed')
+        if not ok:
+            plog("  ⚠ snap-to-baseline: recreate reported failure — .env updated, "
+                 "values will apply on next manual restart")
+
+        try:
+            _s = load_settings()
+            _s['authentik_max_requests_last_tune_ts'] = _now
+            _s['authentik_max_requests_fire_history'] = []  # post-PgBouncer, old fires irrelevant
+            _hist = list(_s.get('authentik_max_requests_tune_history') or [])
+            _hist.append({
+                'ts': _now,
+                'from_max': _cur_max,
+                'to_max': _baseline,
+                'from_jitter': _cur_jitter,
+                'to_jitter': _new_jitter,
+                'reason': 'snap-to-baseline-pgbouncer-installed-quiet',
+                'recreate_ok': bool(ok),
+                'saved_recreates_estimate': _saved_recreates,
+            })
+            _hist = _hist[-_AUTHENTIK_MAX_REQUESTS_TUNE_HISTORY_MAX:]
+            _s['authentik_max_requests_tune_history'] = _hist
+            _s['authentik_max_requests_snap_migration'] = {
+                'ts': _now,
+                'outcome': 'success' if ok else 'partial',
+                'from_max': _cur_max,
+                'to_max': _baseline,
+                'saved_recreates_estimate': _saved_recreates,
+                'rationale': 'v0.9.29: short-circuit v0.9.23 tune-UP cascade now that '
+                             'PgBouncer headroom makes the floor-state irrelevant',
+            }
+            save_settings(_s)
+        except Exception:
+            pass
+        return True
+    except Exception as _e:
+        plog(f"  ⚠ snap-to-baseline migration error (non-fatal): {_e}")
+        return None
+
+
+def _estimate_cascade_recreates(cur_max, baseline):
+    """How many +25%/30min tune-UP recreates would have been needed to climb
+    from cur_max to baseline? Used for reporting the cost-avoided in the
+    snap-to-baseline migration log line. Pure function — no side effects.
+    """
+    try:
+        _n = 0
+        _v = int(cur_max)
+        _b = int(baseline)
+        if _v >= _b or _v <= 0:
+            return 0
+        # Same arithmetic as _authentik_max_requests_autotune_evaluate tune-UP:
+        # _new = min(_baseline, int(_current * 1.25))
+        while _v < _b and _n < 30:
+            _v = min(_b, int(_v * 1.25))
+            _n += 1
+        return _n
+    except Exception:
+        return 0
+
+
 def _recreate_authentik_server_worker(plog, reason):
     """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
 
@@ -44881,6 +45088,22 @@ def _startup_migrations():
             _ensure_authentik_pgbouncer_pool_size(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_pool_err:
             print(f"Startup migration: pgbouncer pool-size bump error (non-fatal): {ak_pgb_pool_err}")
+
+        # v0.9.29: short-circuit the v0.9.23 MAX_REQUESTS tune-UP cascade for
+        # boxes that were stuck at the autotune floor (100) before PgBouncer
+        # absorbed the leak pressure. Without this migration, those boxes
+        # take a 7-hour, 10-recreate climb back to baseline=1000 (each
+        # recreate dropping the LDAP outpost websocket for 1-5s). Field
+        # forensic on test12 2026-05-18 caught this in soak. Idempotent:
+        # no-op on boxes already at baseline. Only fires when PgBouncer is
+        # installed AND no fires in last 6h AND no autotune in last 30min.
+        # See `_patch_authentik_max_requests_snap_to_baseline_if_pgbouncer`.
+        try:
+            _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ak_snap_err:
+            print(f"Startup migration: max-requests snap-to-baseline error (non-fatal): {ak_snap_err}")
 
         # v0.9.27-alpha hotfix #4: reap ghost Channels backends left over
         # from prior server-1 restarts. Critical on the v0.9.26 → v0.9.27
