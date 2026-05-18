@@ -32,7 +32,7 @@ fi
 # Get size of 'cot' database (TAK Server CoT data). Use postgres user on DB host, or SSH to Server One in two-server mode.
 COT_SIZE=0
 if [ "$TWO_SERVER" = "true" ] && [ -n "$DB_HOST" ] && [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
-  COT_SIZE=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+  COT_SIZE=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
     "${SSH_USER}@${DB_HOST}" \
     "sudo -u postgres psql -t -A -c \"SELECT COALESCE(pg_database_size('cot'), 0);\"" \
     2>/dev/null || echo "0")

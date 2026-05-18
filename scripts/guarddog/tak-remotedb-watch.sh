@@ -43,7 +43,7 @@ fi
 
 # Check 2: SSH to Server One and verify PG cluster is up + cot database exists
 if [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
-  SSH_OUT=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+  SSH_OUT=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
     "${SSH_USER}@${DB_HOST}" \
     'pg_isready -q 2>/dev/null && sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && echo REMOTE_PG_OK || echo REMOTE_PG_FAIL' \
     2>/dev/null)
@@ -71,12 +71,12 @@ fi
 # Try to restart PostgreSQL on Server One via SSH
 RESTARTED=false
 if [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
-  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
     "${SSH_USER}@${DB_HOST}" \
     'sudo pg_ctlcluster 15 main restart 2>/dev/null || sudo systemctl restart postgresql 2>/dev/null' \
     2>/dev/null
   sleep 5
-  SSH_OUT=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+  SSH_OUT=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
     "${SSH_USER}@${DB_HOST}" 'pg_isready -q 2>/dev/null && echo RESTARTED_OK' 2>/dev/null)
   [ "$SSH_OUT" = "RESTARTED_OK" ] && RESTARTED=true
 fi

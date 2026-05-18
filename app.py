@@ -221,8 +221,9 @@ def inject_cloudtak_icon():
     if not request.path.startswith('/api') and not request.path.startswith('/cloudtak/page.js'):
         _settings = load_settings()
         _banner = render_custom_banner(_settings)
+        _cert_pw_nag = render_default_cert_password_warning(_settings)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
-        d['sidebar_html'] = Markup(_banner + _sidebar)
+        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _sidebar)
     return d
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -345,10 +346,12 @@ def apply_security_headers(response):
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
     # Keep CSP compatible with existing templates (inline script/style, CDN assets, data URLs).
-    # We can tighten this later by removing inline JS/CSS and adding nonces.
+    # v0.9.29 (security audit LOW): dropped 'unsafe-eval' — codebase has no
+    # eval()/new Function()/string-form setTimeout. Inline scripts still
+    # require 'unsafe-inline' (template surgery deferred to nonces).
     csp = (
         "default-src 'self' https: data: blob:; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+        "script-src 'self' 'unsafe-inline' https:; "
         "style-src 'self' 'unsafe-inline' https:; "
         "img-src 'self' data: https:; "
         "font-src 'self' data: https:; "
@@ -363,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.28-alpha"
+VERSION = "0.9.29-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1008,6 +1011,58 @@ def render_custom_banner(settings):
         f'<span class="custom-banner-text">{text}{identity_html}</span>'
         f'{logo_img}'
         '</div>'
+    )
+
+
+def render_default_cert_password_warning(settings):
+    """v0.9.29 (security audit MED): show a dismissable banner while the TAK
+    cert export password is still the upstream default `atakatak`.
+
+    Renders only when:
+      - TAK Server is installed (avoid noise on bare consoles),
+      - `tak_cert_password` is unset or equals 'atakatak',
+      - operator has not dismissed it (`cert_pw_warning_dismissed`).
+    """
+    try:
+        if not (settings and os.path.exists('/opt/tak/CoreConfig.xml')):
+            return ''
+        if settings.get('cert_pw_warning_dismissed'):
+            return ''
+        pw = (settings.get('tak_cert_password') or '').strip()
+        if pw and pw != 'atakatak':
+            return ''
+    except Exception:
+        return ''
+    return (
+        '<style>'
+        '.cert-pw-nag{position:fixed;top:0;left:0;right:0;z-index:9998;'
+        'background:linear-gradient(90deg,#7c2d12,#9a3412);color:#fef3c7;'
+        'font-family:"JetBrains Mono",monospace;font-size:13px;'
+        'padding:10px 16px;display:flex;align-items:center;justify-content:center;'
+        'gap:14px;border-bottom:1px solid #fbbf24;flex-wrap:wrap}'
+        '.cert-pw-nag a{color:#fde68a;text-decoration:underline;font-weight:600}'
+        '.cert-pw-nag button{background:transparent;border:1px solid #fde68a;'
+        'color:#fde68a;padding:4px 10px;border-radius:6px;cursor:pointer;'
+        'font-family:inherit;font-size:12px}'
+        '.cert-pw-nag button:hover{background:#fde68a;color:#7c2d12}'
+        'body.has-cert-pw-nag{padding-top:44px}'
+        '</style>'
+        '<div class="cert-pw-nag" role="alert">'
+        '<span>'
+        '<strong>Security:</strong> TAK certificate password is still the '
+        'upstream default <code>atakatak</code>. '
+        '<a href="/takserver#cert-section">Change it on the TAK Server page</a>.'
+        '</span>'
+        '<button type="button" onclick="(function(){'
+        "fetch('/api/security/dismiss-cert-pw-warning',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},body:'{}'})"
+        ".then(function(){document.querySelector('.cert-pw-nag').remove();"
+        "document.body.classList.remove('has-cert-pw-nag');});"
+        '})()">Dismiss</button>'
+        '</div>'
+        '<script>document.body && document.body.classList.add("has-cert-pw-nag");'
+        'document.addEventListener("DOMContentLoaded",function(){'
+        'document.body.classList.add("has-cert-pw-nag");});</script>'
     )
 
 
@@ -1858,6 +1913,18 @@ def customization_settings_post():
     cust['banner_font'] = banner_font
     cust['banner_color'] = banner_color
     cust['banner_size'] = banner_size
+    save_settings(s)
+    return jsonify({'ok': True})
+
+@app.route('/api/security/dismiss-cert-pw-warning', methods=['POST'])
+@login_required
+def security_dismiss_cert_pw_warning():
+    """v0.9.29 (security audit MED): persist that the operator has acknowledged
+    the default `atakatak` cert password nag. Auto-clears when the password is
+    changed away from the default (handled at render time in
+    render_default_cert_password_warning)."""
+    s = load_settings()
+    s['cert_pw_warning_dismissed'] = True
     save_settings(s)
     return jsonify({'ok': True})
 
@@ -4253,6 +4320,24 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
             json.dump(gd_conf, f)
     except Exception as e:
         return False, f'guarddog.conf: {e}'
+
+    # v0.9.29 CRIT-08 fix: provision a pinned SSH known_hosts file for the
+    # watchdog scripts. Watchdog SSH calls use StrictHostKeyChecking=accept-new
+    # against this file, so first contact pins the DB host's key and any later
+    # MITM attempt fails. Empty file on first install — scripts append on first
+    # successful connect. Operators rotating the DB host key can clear this
+    # with `: > /opt/tak-guarddog/known_hosts`.
+    try:
+        kh_path = os.path.join(gd_dir, 'known_hosts')
+        if not os.path.exists(kh_path):
+            open(kh_path, 'a').close()
+        os.chmod(kh_path, 0o600)
+        try:
+            os.chown(kh_path, 0, 0)
+        except PermissionError:
+            pass
+    except Exception as e:
+        return False, f'known_hosts: {e}'
 
     cert_pass = _get_tak_cert_password(settings)
     external_db_flag = 'true' if is_external else ''
@@ -6855,6 +6940,19 @@ def run_guarddog_deploy(alert_email):
             return
         for d in ['/opt/tak-guarddog', '/var/lib/takguard', '/var/log/takguard']:
             os.makedirs(d, exist_ok=True)
+        # v0.9.29 CRIT-08 fix: provision pinned SSH known_hosts for watchdog
+        # scripts (used when StrictHostKeyChecking=accept-new is in effect).
+        try:
+            _kh = '/opt/tak-guarddog/known_hosts'
+            if not os.path.exists(_kh):
+                open(_kh, 'a').close()
+            os.chmod(_kh, 0o600)
+            try:
+                os.chown(_kh, 0, 0)
+            except PermissionError:
+                pass
+        except Exception:
+            pass
         plog("✓ Directories created")
         # Detect two-server mode
         settings = load_settings()
@@ -37017,6 +37115,10 @@ def takserver_set_cert_password():
         return jsonify({'success': False, 'error': 'Password contains unsupported characters (avoid $, `, ;, &, |, quotes, spaces, etc.)'}), 400
     settings = load_settings()
     settings['tak_cert_password'] = pw
+    # v0.9.29: if operator picks a non-default password, clear the dismiss flag
+    # so the nag can re-appear correctly if the password ever resets to default.
+    if pw != 'atakatak' and settings.get('cert_pw_warning_dismissed'):
+        settings.pop('cert_pw_warning_dismissed', None)
     save_settings(settings)
     return jsonify({'success': True, 'password': pw})
 
@@ -39514,7 +39616,7 @@ def _tak_snapshot(label, plog=None):
             _port = int(_snap_s1.get('ssh_port') or 22)
             _key  = (_snap_s1.get('ssh_key_path') or '').strip() or None
             _ssh_parts = [
-                'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+                'ssh', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes',
                 '-p', str(_port),
             ]
             if _key:
@@ -39688,7 +39790,7 @@ def _tak_rollback(label, plog=None):
             _rb_user = (_rb_s1.get('ssh_user') or 'root').strip() or 'root'
             _rb_port = int(_rb_s1.get('ssh_port') or 22)
             _rb_key  = (_rb_s1.get('ssh_key_path') or '').strip() or None
-            _rb_ssh  = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+            _rb_ssh  = ['ssh', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes',
                         '-p', str(_rb_port)]
             if _rb_key:
                 _rb_ssh += ['-i', _rb_key]

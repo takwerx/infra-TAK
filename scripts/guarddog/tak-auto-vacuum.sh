@@ -39,8 +39,14 @@ REMOTE_DB_HOST=""
 # db_port kept in sync with guarddog.conf (used by health checks elsewhere; psql over SSH is local on Server One)
 REMOTE_DB_PORT="5432"
 if [ -f "$GUARDDOG_CONF" ]; then
-  eval "$(python3 <<'PY'
-import json, os, shlex
+  # v0.9.29 CRIT-07: replaced `eval "$(python3 ...)"` with newline-delimited
+  # read so guarddog.conf values never reach a shell evaluator.
+  {
+    IFS= read -r TWO_SERVER_MODE
+    IFS= read -r REMOTE_DB_HOST
+    IFS= read -r REMOTE_DB_PORT
+  } < <(python3 - <<'PY'
+import json, os
 p = "/opt/tak-guarddog/guarddog.conf"
 two = "0"
 host = ""
@@ -56,11 +62,13 @@ if os.path.isfile(p):
             port = str(int(c.get("db_port")))
     except Exception:
         pass
-print("export TWO_SERVER_MODE=%s" % two)
-print("export REMOTE_DB_HOST=%s" % shlex.quote(host))
-print("export REMOTE_DB_PORT=%s" % shlex.quote(port))
+print(two)
+print(host)
+print(port)
 PY
-  )"
+  )
+  TWO_SERVER_MODE="${TWO_SERVER_MODE:-0}"
+  REMOTE_DB_PORT="${REMOTE_DB_PORT:-5432}"
 fi
 
 # Effective SSH target: JSON db_host first, then deployed placeholder
@@ -86,7 +94,7 @@ psql_scalar() {
       echo ""
       return 1
     fi
-    out=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+    out=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
       "${SSH_USER}@${SSH_TARGET}" \
       "sudo -u postgres psql -d cot -t -A -c $(printf '%q' "$sql")" 2>/dev/null) || return 1
   else
@@ -103,7 +111,7 @@ psql_exec() {
     if [ -z "$SSH_TARGET" ] || [ ! -f "$SSH_KEY" ]; then
       return 1
     fi
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
       "${SSH_USER}@${SSH_TARGET}" \
       "sudo -u postgres psql -d cot -c $(printf '%q' "$sql")" 2>/dev/null
   else

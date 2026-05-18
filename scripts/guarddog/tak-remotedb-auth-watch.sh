@@ -52,7 +52,7 @@ if [ -z "$DB_PASSWORD" ]; then
 fi
 [ -z "$DB_PASSWORD" ] && exit 0
 
-SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${SSH_USER}@${DB_HOST}"
+SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 ${SSH_USER}@${DB_HOST}"
 
 # Test current password
 AUTH_OUT=$($SSH_CMD \

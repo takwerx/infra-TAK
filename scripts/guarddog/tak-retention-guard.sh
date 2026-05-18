@@ -38,8 +38,13 @@ MAX_BATCHES=200
 TWO_SERVER_MODE=0
 REMOTE_DB_HOST=""
 if [ -f "$GUARDDOG_CONF" ]; then
-  eval "$(python3 <<'PY'
-import json, os, shlex
+  # v0.9.29 CRIT-07: replaced `eval "$(python3 ...)"` with newline-delimited
+  # read so guarddog.conf values never reach a shell evaluator.
+  {
+    IFS= read -r TWO_SERVER_MODE
+    IFS= read -r REMOTE_DB_HOST
+  } < <(python3 - <<'PY'
+import json, os
 p = "/opt/tak-guarddog/guarddog.conf"
 two = "0"; host = ""
 if os.path.isfile(p):
@@ -51,10 +56,11 @@ if os.path.isfile(p):
         host = str(c.get("db_host") or "")
     except Exception:
         pass
-print("export TWO_SERVER_MODE=%s" % two)
-print("export REMOTE_DB_HOST=%s" % shlex.quote(host))
+print(two)
+print(host)
 PY
-  )"
+  )
+  TWO_SERVER_MODE="${TWO_SERVER_MODE:-0}"
 fi
 
 SSH_TARGET="${REMOTE_DB_HOST:-$DB_HOST}"
@@ -71,7 +77,7 @@ psql_scalar() {
   local sql="$1"
   if [ "$TWO_SERVER_MODE" = "1" ]; then
     [ -z "$SSH_TARGET" ] || [ ! -f "$SSH_KEY" ] && return 1
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
       "${SSH_USER}@${SSH_TARGET}" \
       "sudo -u postgres psql -d cot -t -A -c $(printf '%q' "$sql")" 2>/dev/null
   else
@@ -84,7 +90,7 @@ psql_raw() {
   local sql="$1"
   if [ "$TWO_SERVER_MODE" = "1" ]; then
     [ -z "$SSH_TARGET" ] || [ ! -f "$SSH_KEY" ] && return 1
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
       "${SSH_USER}@${SSH_TARGET}" \
       "sudo -u postgres psql -d cot -c $(printf '%q' "$sql")" 2>/dev/null
   else

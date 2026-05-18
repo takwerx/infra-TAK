@@ -28,7 +28,7 @@ UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 
 [ -z "$FEDHUB_HOST" ] && exit 0
 
-SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${SSH_USER}@${FEDHUB_HOST}"
+SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 ${SSH_USER}@${FEDHUB_HOST}"
 
 HEALTHY=true
 DETAILS=""
