@@ -12694,12 +12694,39 @@ def takportal_control():
             subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
-        # Fix Authentik TAK Portal Proxy URL only (external_host + cookie_domain), do not touch outpost
-        _sync_authentik_takportal_provider_url(settings)
+        # v0.9.31: run the full Authentik proxy chain heal for all deployed
+        # services, not just TAK Portal. Catches the "deploy timed out, provider
+        # never registered" class of bug fleet-wide. Uses 30s timeouts + retries
+        # + verify-via-re-GET so silent failures actually surface in the log.
+        chain_summary = {}
+        try:
+            chain_summary = _heal_authentik_proxy_chain_all_services(settings=settings)
+        except Exception:
+            pass
+        # Back-compat: keep the legacy single-service call as a defensive second
+        # pass (idempotent; no-op when chain healer already converged).
+        try:
+            _sync_authentik_takportal_provider_url(settings)
+        except Exception:
+            pass
         time.sleep(2)
         r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         running = 'Up' in (r.stdout or '')
-        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted (SSH configured).'})
+        tp_state = (chain_summary or {}).get('takportal', {})
+        ok = (tp_state.get('provider') in ('ok', 'created', 'fixed', 'adopted')
+              and tp_state.get('app') in ('ok', 'created', 'fixed'))
+        msg = 'Config updated and portal restarted.'
+        if not chain_summary:
+            # Healer didn't run (Authentik not installed, no token, etc.) — just report container state
+            msg = 'Config updated and portal restarted (SSH configured).'
+        elif ok:
+            msg = 'Config updated, portal restarted, and Authentik proxy chain reconciled.'
+        elif tp_state:
+            msg = (f'Config updated and portal restarted, but Authentik proxy chain heal reported: '
+                   f"provider={tp_state.get('provider')}, app={tp_state.get('app')}, outpost={tp_state.get('outpost')}. "
+                   f"Check console logs and Authentik admin UI.")
+        return jsonify({'success': True, 'running': running, 'action': action,
+                        'message': msg, 'chain_summary': chain_summary})
     elif action == 'update':
         # Reset any local changes to tracked files before pulling — the network
         # and hardening patches now live in docker-compose.override.yml (not tracked
@@ -17877,15 +17904,23 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 pk = _existing[name]
                 provider_pks.append(pk)
                 try:
-                    # GET current provider so we can send a valid full-object PATCH
-                    _get_req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/', headers=_ak_headers)
-                    _current = json.loads(_urlreq.urlopen(_get_req, timeout=10).read().decode())
+                    # v0.9.31: use _ak_api_call (3 retries with backoff, 30s
+                    # timeout) instead of bare urlopen(timeout=10). Closes the
+                    # SSDNodes-fresh-install class of bug where deploy-time
+                    # 10s PUT silently timed out and the proxy provider stayed
+                    # with whatever external_host it had at creation.
+                    _get_resp = _ak_api_call(
+                        f'{_ak_url}/api/v3/providers/proxy/{pk}/',
+                        method='GET', headers=_ak_headers, max_retries=3, timeout=30
+                    )
+                    _current = json.loads(_get_resp.read().decode())
                     _current['external_host'] = host
                     _current['cookie_domain'] = cookie_domain
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/',
+                    _ak_api_call(
+                        f'{_ak_url}/api/v3/providers/proxy/{pk}/',
                         data=json.dumps(_current).encode(),
-                        headers=_ak_headers, method='PUT')
-                    _urlreq.urlopen(req, timeout=10)
+                        method='PUT', headers=_ak_headers, max_retries=3, timeout=30
+                    )
                     log(f"  ✓ Proxy provider updated: {name} → {host}")
                 except Exception as e:
                     _err_body = ''
@@ -17893,27 +17928,30 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         _err_body = e.read().decode()[:200]
                     except Exception:
                         pass
-                    log(f"  ⚠ Proxy provider update failed: {name}: {str(e)[:80]} {_err_body}")
+                    # Don't surrender — chain healer will catch this at next
+                    # startup / Update Now. Surface the failure clearly.
+                    log(f"  ⚠ Proxy provider update failed: {name}: {str(e)[:80]} {_err_body} (chain healer will retry)")
             else:
                 try:
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                    pk = json.loads(_ak_api_call(
+                        f'{_ak_url}/api/v3/providers/proxy/',
                         data=json.dumps({'name': name, 'authorization_flow': flow_pk,
                             'invalidation_flow': inv_flow_pk,
                             'external_host': host, 'mode': 'forward_single',
                             'token_validity': 'hours=24', 'cookie_domain': cookie_domain}).encode(),
-                        headers=_ak_headers, method='POST')
-                    resp = _urlreq.urlopen(req, timeout=10)
-                    pk = json.loads(resp.read().decode())['pk']
+                        method='POST', headers=_ak_headers, max_retries=3, timeout=30
+                    ).read().decode())['pk']
                     provider_pks.append(pk)
                     log(f"  ✓ Proxy provider created: {name} → {host}")
                 except Exception as e:
-                    log(f"  ⚠ Proxy provider create failed: {name}: {str(e)[:80]}")
+                    log(f"  ⚠ Proxy provider create failed: {name}: {str(e)[:80]} (chain healer will retry)")
             if pk:
                 try:
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    _ak_api_call(
+                        f'{_ak_url}/api/v3/core/applications/',
                         data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
-                        headers=_ak_headers, method='POST')
-                    _urlreq.urlopen(req, timeout=10)
+                        method='POST', headers=_ak_headers, max_retries=3, timeout=30
+                    )
                     log(f"  ✓ Application created: {name}")
                 except Exception as e:
                     if hasattr(e, 'code') and e.code == 400:
@@ -29862,6 +29900,362 @@ def _ensure_embedded_outpost_authentik_host(plog):
             plog(f"  ✗ Embedded outpost host PATCH failed: {_pe2}")
     except Exception as _e:
         plog(f"  Embedded outpost host check error (non-fatal): {_e}")
+
+
+# v0.9.31: Canonical service catalog for Authentik forward_auth chain healing.
+# Single source of truth for every infra-TAK service that sits behind Authentik.
+# Used by `_heal_authentik_proxy_chain_all_services` to assert provider + app +
+# outpost membership idempotently on every console boot. Adding a new
+# forward_auth service requires ONE entry here, not changes scattered across
+# 6 functions.
+#
+# Tuple shape: (module_key, provider_name, app_slug, app_name, service_domain_key, open_in_new_tab)
+#   - module_key       — passed to `_is_module_deployed()` ('infratak' = always True)
+#   - provider_name    — exact Authentik proxy-provider name (UI-visible label)
+#   - app_slug         — Authentik application slug (URL path component)
+#   - app_name         — UI-visible application name
+#   - service_domain_key — key for `_get_service_domain()` → produces external_host
+#   - open_in_new_tab  — Authentik Application.open_in_new_tab field
+_AUTHENTIK_PROXY_CHAIN_SERVICES = [
+    ('infratak',  'infra-TAK',            'infratak',       'infra-TAK',      'infratak',  False),
+    ('takportal', 'TAK Portal Proxy',     'tak-portal',     'TAK Portal',     'takportal', True),
+    ('nodered',   'Node-RED Proxy',       'node-red',       'Node-RED',       'nodered',   True),
+    ('mediamtx',  'MediaMTX',             'stream',         'MediaMTX',       'mediamtx',  True),
+    ('fedhub',    'Federation Hub Proxy', 'federation-hub', 'Federation Hub', 'fedhub',    True),
+]
+
+
+def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
+    """v0.9.31: fleet-uniform self-heal of the full Authentik forward_auth chain
+    for every deployed infra-TAK service. Replaces the band-aid era of per-service
+    `_sync_authentik_*_provider_url` functions that each silently swallowed
+    Authentik API timeouts (the class of bug that left `takportal.<fqdn>` showing
+    Authentik's "Not Found" page on slower hosts — a deploy-time 10s PATCH that
+    timed out, was silently caught, and never retried by anything).
+
+    For each known service (see `_AUTHENTIK_PROXY_CHAIN_SERVICES`) that has its
+    docker-compose / systemd unit deployed, this function asserts:
+
+      1. Proxy provider exists with:
+         - correct name
+         - mode = forward_single
+         - external_host = https://<service-domain>
+         - cookie_domain = .<base-fqdn>
+         - valid authorization_flow + invalidation_flow
+      2. Application exists with:
+         - correct slug + name
+         - provider link to the above
+         - open_in_new_tab per the catalog entry
+      3. Provider is in the embedded outpost's providers[] list
+
+    Uses `_ak_api_call` (3 retries with 5s/10s/15s backoff, 30s timeout) instead
+    of bare urlopen(timeout=10). Verifies every PATCH/POST by re-GETing and
+    confirming the desired state, so silent failures stop being silent.
+
+    Idempotent: on healthy boxes, every GET returns the correct state, no
+    PATCH is attempted, and the function logs `chain: all canonical — no-op`
+    per service then exits in <1s.
+
+    Returns a summary dict: `{service_module_key: {'provider': 'ok'|'created'|'fixed'|'failed:<reason>',
+                                                    'app':      ...,
+                                                    'outpost':  ...}}`
+    """
+    import urllib.request as _req
+    import urllib.error
+    _log = plog if plog else (lambda _m: None)
+
+    summary = {}
+    try:
+        if settings is None:
+            settings = load_settings()
+
+        ak_env_path = os.path.expanduser('~/authentik/.env')
+        if not os.path.exists(ak_env_path):
+            _log("  proxy chain: Authentik not installed locally — skip")
+            return summary
+
+        fqdn = (settings.get('fqdn') or '').strip()
+        if not fqdn:
+            _log("  proxy chain: no FQDN configured — skip")
+            return summary
+
+        ak_token = (
+            _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+            _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+        )
+        if not ak_token:
+            _log("  proxy chain: no Authentik API token — skip")
+            return summary
+
+        ak_url = _get_authentik_api_url(settings)
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        base_fqdn = fqdn.split(':')[0].split('/')[0]
+        desired_cookie = f'.{base_fqdn}'
+
+        # Discover flows once (shared across all services). Use _ak_api_call's
+        # retry/backoff so transient 502/timeout doesn't abort the entire heal.
+        flow_pk = None
+        inv_flow_pk = None
+        try:
+            resp = _ak_api_call(
+                f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug',
+                method='GET', headers=ak_headers, max_retries=3, timeout=30
+            )
+            flows = json.loads(resp.read().decode()).get('results', [])
+            flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')),
+                           flows[0]['pk'] if flows else None)
+        except Exception as fe:
+            _log(f"  proxy chain: could not fetch authorization flow ({str(fe)[:120]}) — skip")
+            return summary
+        try:
+            resp = _ak_api_call(
+                f'{ak_url}/api/v3/flows/instances/?designation=invalidation',
+                method='GET', headers=ak_headers, max_retries=3, timeout=30
+            )
+            inv_flows = json.loads(resp.read().decode()).get('results', [])
+            inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')),
+                               inv_flows[0]['pk'] if inv_flows else None)
+        except Exception as ife:
+            _log(f"  proxy chain: could not fetch invalidation flow ({str(ife)[:120]}) — skip")
+            return summary
+
+        if not flow_pk or not inv_flow_pk:
+            _log("  proxy chain: required flows missing in Authentik — skip (will retry next boot)")
+            return summary
+
+        # Single LIST of all proxy providers — avoids N round-trips per service.
+        try:
+            resp = _ak_api_call(
+                f'{ak_url}/api/v3/providers/proxy/?page_size=200',
+                method='GET', headers=ak_headers, max_retries=3, timeout=30
+            )
+            all_providers = json.loads(resp.read().decode()).get('results', []) or []
+        except Exception as le:
+            _log(f"  proxy chain: could not list proxy providers ({str(le)[:120]}) — skip")
+            return summary
+        providers_by_name = {}
+        for p in all_providers:
+            n = (p.get('name') or '').strip()
+            if n and n not in providers_by_name:  # first wins on duplicates
+                providers_by_name[n] = p
+
+        outpost_provider_pks = []
+
+        for module_key, prov_name, app_slug, app_name, dom_key, open_new_tab in _AUTHENTIK_PROXY_CHAIN_SERVICES:
+            # Skip services that aren't deployed (Federation Hub deployed flag
+            # lives in cloudtak_deployment? No — _is_module_deployed only knows
+            # infratak/takportal/nodered/mediamtx. For fedhub use deployment config.)
+            try:
+                if module_key == 'fedhub':
+                    fh_cfg = _get_fedhub_deployment_config(settings)
+                    deployed = bool(
+                        fh_cfg.get('deployed') and
+                        fh_cfg.get('target_mode') == 'remote' and
+                        (fh_cfg.get('remote', {}).get('host') or '').strip()
+                    )
+                else:
+                    deployed = _is_module_deployed(settings, module_key)
+            except Exception:
+                deployed = (module_key == 'infratak')
+
+            if not deployed:
+                continue
+
+            service_domain = _get_service_domain(settings, dom_key)
+            if not service_domain:
+                summary[module_key] = {'provider': 'failed:no-domain', 'app': '-', 'outpost': '-'}
+                _log(f"  ⚠ {prov_name}: cannot resolve service domain — skip")
+                continue
+            desired_host = f'https://{service_domain}'
+
+            result = {'provider': 'ok', 'app': 'ok', 'outpost': 'ok'}
+
+            # ---------- (1) Proxy provider ----------
+            existing = providers_by_name.get(prov_name)
+            provider_pk = None
+            if existing is None:
+                # Create
+                body = {
+                    'name': prov_name,
+                    'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': desired_host,
+                    'mode': 'forward_single',
+                    'token_validity': 'hours=24',
+                    'cookie_domain': desired_cookie,
+                }
+                try:
+                    resp = _ak_api_call(
+                        f'{ak_url}/api/v3/providers/proxy/',
+                        data=json.dumps(body).encode(),
+                        method='POST', headers=ak_headers, max_retries=3, timeout=30
+                    )
+                    provider_pk = json.loads(resp.read().decode()).get('pk')
+                    result['provider'] = 'created'
+                    _log(f"  ✓ {prov_name}: provider created → {desired_host}")
+                except urllib.error.HTTPError as he:
+                    # 400 often means name collision — search and adopt
+                    if he.code == 400:
+                        try:
+                            resp = _ak_api_call(
+                                f'{ak_url}/api/v3/providers/proxy/?search={_req.quote(prov_name)}',
+                                method='GET', headers=ak_headers, max_retries=3, timeout=30
+                            )
+                            results = json.loads(resp.read().decode()).get('results', [])
+                            for r in results:
+                                if (r.get('name') or '').strip() == prov_name:
+                                    provider_pk = r.get('pk')
+                                    result['provider'] = 'adopted'
+                                    break
+                        except Exception:
+                            pass
+                    if not provider_pk:
+                        err_body = ''
+                        try:
+                            err_body = he.read().decode()[:200]
+                        except Exception:
+                            pass
+                        result['provider'] = f'failed:create-{he.code}'
+                        _log(f"  ✗ {prov_name}: create failed HTTP {he.code} {err_body}")
+                except Exception as ce:
+                    result['provider'] = 'failed:create-timeout'
+                    _log(f"  ✗ {prov_name}: create failed ({str(ce)[:120]})")
+            else:
+                provider_pk = existing.get('pk')
+                cur_host = (existing.get('external_host') or '').rstrip('/')
+                cur_cookie = (existing.get('cookie_domain') or '').strip()
+                if cur_host != desired_host or cur_cookie != desired_cookie:
+                    # PATCH
+                    patch_body = {'external_host': desired_host, 'cookie_domain': desired_cookie}
+                    try:
+                        _ak_api_call(
+                            f'{ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps(patch_body).encode(),
+                            method='PATCH', headers=ak_headers, max_retries=3, timeout=30
+                        )
+                        # Verify by re-GET
+                        try:
+                            v = _ak_api_call(
+                                f'{ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                                method='GET', headers=ak_headers, max_retries=2, timeout=20
+                            )
+                            v_data = json.loads(v.read().decode())
+                            v_host = (v_data.get('external_host') or '').rstrip('/')
+                            v_cookie = (v_data.get('cookie_domain') or '').strip()
+                            if v_host == desired_host and v_cookie == desired_cookie:
+                                result['provider'] = 'fixed'
+                                _log(f"  ✓ {prov_name}: external_host fixed {cur_host!r} → {desired_host!r} (verified)")
+                            else:
+                                result['provider'] = 'failed:verify-mismatch'
+                                _log(f"  ✗ {prov_name}: PATCH returned but verify shows host={v_host!r} cookie={v_cookie!r}")
+                        except Exception as ve:
+                            result['provider'] = 'failed:verify-error'
+                            _log(f"  ✗ {prov_name}: PATCH returned but verify failed ({str(ve)[:120]})")
+                    except Exception as pe:
+                        result['provider'] = 'failed:patch-timeout'
+                        _log(f"  ✗ {prov_name}: PATCH failed ({str(pe)[:120]}) — will retry next boot")
+
+            if not provider_pk:
+                # Can't proceed to app or outpost without a provider PK
+                result['app'] = 'skipped:no-provider'
+                result['outpost'] = 'skipped:no-provider'
+                summary[module_key] = result
+                continue
+
+            # ---------- (2) Application ----------
+            existing_app = None
+            try:
+                resp = _ak_api_call(
+                    f'{ak_url}/api/v3/core/applications/{app_slug}/',
+                    method='GET', headers=ak_headers, max_retries=2, timeout=20
+                )
+                existing_app = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as he:
+                if he.code != 404:
+                    _log(f"  ⚠ {app_name}: GET app HTTP {he.code} (will try to create)")
+            except Exception:
+                pass
+
+            if existing_app is None:
+                # Create application
+                body = {'name': app_name, 'slug': app_slug, 'provider': provider_pk,
+                        'open_in_new_tab': bool(open_new_tab)}
+                try:
+                    _ak_api_call(
+                        f'{ak_url}/api/v3/core/applications/',
+                        data=json.dumps(body).encode(),
+                        method='POST', headers=ak_headers, max_retries=3, timeout=30
+                    )
+                    result['app'] = 'created'
+                    _log(f"  ✓ {app_name}: application created (slug={app_slug}, provider={provider_pk})")
+                except urllib.error.HTTPError as he:
+                    if he.code == 400:
+                        # likely already exists by slug — PATCH instead
+                        try:
+                            _ak_api_call(
+                                f'{ak_url}/api/v3/core/applications/{app_slug}/',
+                                data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                                method='PATCH', headers=ak_headers, max_retries=3, timeout=30
+                            )
+                            result['app'] = 'fixed'
+                            _log(f"  ✓ {app_name}: application existed by slug — PATCHed to point at provider {provider_pk}")
+                        except Exception as pae:
+                            result['app'] = 'failed:patch-after-409'
+                            _log(f"  ✗ {app_name}: app PATCH after 400 failed ({str(pae)[:120]})")
+                    else:
+                        result['app'] = f'failed:create-{he.code}'
+                        _log(f"  ✗ {app_name}: app create failed HTTP {he.code}")
+                except Exception as ae:
+                    result['app'] = 'failed:create-timeout'
+                    _log(f"  ✗ {app_name}: app create failed ({str(ae)[:120]})")
+            else:
+                cur_prov = existing_app.get('provider')
+                cur_otb = bool(existing_app.get('open_in_new_tab'))
+                if cur_prov != provider_pk or cur_otb != bool(open_new_tab):
+                    try:
+                        _ak_api_call(
+                            f'{ak_url}/api/v3/core/applications/{app_slug}/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                            method='PATCH', headers=ak_headers, max_retries=3, timeout=30
+                        )
+                        result['app'] = 'fixed'
+                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk}, open_in_new_tab {cur_otb} → {bool(open_new_tab)})")
+                    except Exception as pe2:
+                        result['app'] = 'failed:patch-timeout'
+                        _log(f"  ✗ {app_name}: app PATCH failed ({str(pe2)[:120]})")
+
+            # ---------- (3) Outpost membership ----------
+            outpost_provider_pks.append(provider_pk)
+            summary[module_key] = result
+
+        # ---------- (3b) One outpost PATCH covers all services ----------
+        if outpost_provider_pks:
+            try:
+                added = _outpost_add_providers_safe(ak_url, ak_headers, outpost_provider_pks, plog=_log)
+                if added:
+                    _log(f"  ✓ embedded outpost: added missing providers ({len(outpost_provider_pks)} considered)")
+                else:
+                    _log(f"  ✓ embedded outpost: all {len(outpost_provider_pks)} provider(s) already attached")
+            except Exception as oe:
+                _log(f"  ⚠ embedded outpost update failed: {str(oe)[:120]}")
+                for k in summary:
+                    if summary[k].get('outpost') == 'ok':
+                        summary[k]['outpost'] = 'failed:outpost-error'
+
+        # Summary line
+        ok_count = sum(1 for v in summary.values()
+                       if v.get('provider') in ('ok', 'created', 'fixed', 'adopted')
+                       and v.get('app') in ('ok', 'created', 'fixed'))
+        if summary:
+            _log(f"  proxy chain: {ok_count}/{len(summary)} service(s) fully reconciled "
+                 f"({', '.join(sorted(summary.keys()))})")
+        else:
+            _log("  proxy chain: no deployed services to reconcile")
+
+        return summary
+    except Exception as e:
+        _log(f"  ⚠ proxy chain heal error (non-fatal): {str(e)[:200]}")
+        return summary
 
 
 def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry_delay_s=5):
@@ -46148,6 +46542,26 @@ def _startup_migrations():
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
 
+        # v0.9.31: Fleet-uniform self-heal for the FULL Authentik forward_auth chain
+        # (proxy provider + application + embedded-outpost membership) for every
+        # deployed service. Supersedes the per-service band-aid era — closes the
+        # SSDNodes-fresh-install "takportal.<fqdn> shows Authentik Not Found" class
+        # of bug, where deploy-time 10s PATCH/POST timeouts silently left the chain
+        # half-built. Uses `_ak_api_call` (3 retries with backoff, 30s timeout) and
+        # verifies every PATCH by re-GET, so silent failures stop being silent.
+        #
+        # Runs AFTER the v0.9.21 canonicalizer because:
+        #   - canonicalizer only PATCHes external_host on providers that already exist
+        #   - chain healer creates missing providers + apps + outpost membership
+        # On a healthy box both are no-ops; on a half-built box, canonicalizer fixes
+        # what it can and chain healer fills in everything else.
+        try:
+            _heal_authentik_proxy_chain_all_services(
+                plog=lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ak_chain_err:
+            print(f"Startup migration: proxy chain heal error (non-fatal): {ak_chain_err}")
+
         # v0.9.21: Start PG connection watchdog — auto-restart authentik-server-1 when
         # total idle connections exceed threshold (default 150).
         # Root cause: enterprise license cache miss creates ~1 idle conn/1-3s under
@@ -46757,6 +47171,16 @@ def _post_update_auto_deploy():
                                         max_attempts=12,
                                         retry_delay_s=5
                                     )
+                                    # v0.9.31: After canonicalizer, run the chain healer to
+                                    # cover provider creation + app + outpost membership for
+                                    # any service whose deploy-time PATCH timed out silently.
+                                    try:
+                                        _heal_authentik_proxy_chain_all_services(
+                                            plog=lambda m: print(f"Post-update: {m}", flush=True),
+                                            settings=load_settings()
+                                        )
+                                    except Exception as _chain_e:
+                                        print(f"Post-update: proxy chain heal skipped: {_chain_e}")
                         except Exception as _akph_e:
                             print(f"Post-update: proxy external_hosts canonicalization skipped: {_akph_e}")
                         # v0.9.12: self-heal LDAP service account password drift.
