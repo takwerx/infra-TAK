@@ -30122,16 +30122,52 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                     _log(f"  ✗ {prov_name}: create failed ({str(ce)[:120]})")
             else:
                 provider_pk = existing.get('pk')
-                cur_host = (existing.get('external_host') or '').rstrip('/')
+                # v0.9.31 (post-field-debug 2026-05-18): compare EXACT strings.
+                # Previously rstrip('/') made `https://takportal.lutak.net/` and
+                # `https://takportal.lutak.net` look equal, but Authentik's
+                # strict-match redirect_uris list bakes in the exact form
+                # (with-slash vs without-slash) — so the OAuth flow's
+                # redirect_uri lookup mismatched, producing "Redirect URI Error".
+                # Trailing-slash drift is the bug we have to actively fix, not
+                # something to normalize away in the comparison.
+                cur_host = (existing.get('external_host') or '')
                 cur_cookie = (existing.get('cookie_domain') or '').strip()
                 if cur_host != desired_host or cur_cookie != desired_cookie:
-                    # PATCH
-                    patch_body = {'external_host': desired_host, 'cookie_domain': desired_cookie}
+                    # v0.9.31 (post-field-debug): use PUT with the full provider
+                    # body, NOT PATCH. Authentik validates the entire object
+                    # even on PATCH and rejects partial bodies with
+                    #   400 internal_host: "Internal host cannot be empty when
+                    #   forward auth is disabled."
+                    # Observed live on tak-portal proxy provider pk=3 on the
+                    # SSDNodes box (alexliveussdtakman). PUT with full body
+                    # round-trips cleanly.
+                    full_body = {
+                        'name': prov_name,
+                        'authorization_flow': flow_pk,
+                        'invalidation_flow': inv_flow_pk,
+                        'external_host': desired_host,
+                        'mode': 'forward_single',
+                        'token_validity': 'hours=24',
+                        'cookie_domain': desired_cookie,
+                        # Preserve operator-meaningful fields from the existing
+                        # record (Authentik only validates internal_host when
+                        # mode != forward_*, so empty string is fine here).
+                        'internal_host': existing.get('internal_host') or '',
+                        'internal_host_ssl_validation': existing.get(
+                            'internal_host_ssl_validation', True),
+                        'skip_path_regex': existing.get('skip_path_regex') or '',
+                        'basic_auth_enabled': existing.get('basic_auth_enabled', False),
+                        'basic_auth_password_attribute': existing.get(
+                            'basic_auth_password_attribute') or '',
+                        'basic_auth_user_attribute': existing.get(
+                            'basic_auth_user_attribute') or '',
+                        'intercept_header_auth': existing.get('intercept_header_auth', True),
+                    }
                     try:
                         _ak_api_call(
                             f'{ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                            data=json.dumps(patch_body).encode(),
-                            method='PATCH', headers=ak_headers, max_retries=3, timeout=30
+                            data=json.dumps(full_body).encode(),
+                            method='PUT', headers=ak_headers, max_retries=3, timeout=30
                         )
                         # Verify by re-GET
                         try:
@@ -30140,20 +30176,29 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                                 method='GET', headers=ak_headers, max_retries=2, timeout=20
                             )
                             v_data = json.loads(v.read().decode())
-                            v_host = (v_data.get('external_host') or '').rstrip('/')
+                            v_host = (v_data.get('external_host') or '')
                             v_cookie = (v_data.get('cookie_domain') or '').strip()
-                            if v_host == desired_host and v_cookie == desired_cookie:
+                            v_mode = (v_data.get('mode') or '').strip()
+                            if v_host == desired_host and v_cookie == desired_cookie and v_mode == 'forward_single':
                                 result['provider'] = 'fixed'
-                                _log(f"  ✓ {prov_name}: external_host fixed {cur_host!r} → {desired_host!r} (verified)")
+                                _log(f"  ✓ {prov_name}: PUT fixed {cur_host!r} → {desired_host!r} (verified, mode={v_mode})")
                             else:
                                 result['provider'] = 'failed:verify-mismatch'
-                                _log(f"  ✗ {prov_name}: PATCH returned but verify shows host={v_host!r} cookie={v_cookie!r}")
+                                _log(f"  ✗ {prov_name}: PUT returned but verify shows host={v_host!r} cookie={v_cookie!r} mode={v_mode!r}")
                         except Exception as ve:
                             result['provider'] = 'failed:verify-error'
-                            _log(f"  ✗ {prov_name}: PATCH returned but verify failed ({str(ve)[:120]})")
+                            _log(f"  ✗ {prov_name}: PUT returned but verify failed ({str(ve)[:120]})")
+                    except urllib.error.HTTPError as he:
+                        err_body = ''
+                        try:
+                            err_body = he.read().decode()[:240]
+                        except Exception:
+                            pass
+                        result['provider'] = f'failed:put-{he.code}'
+                        _log(f"  ✗ {prov_name}: PUT failed HTTP {he.code} {err_body}")
                     except Exception as pe:
-                        result['provider'] = 'failed:patch-timeout'
-                        _log(f"  ✗ {prov_name}: PATCH failed ({str(pe)[:120]}) — will retry next boot")
+                        result['provider'] = 'failed:put-timeout'
+                        _log(f"  ✗ {prov_name}: PUT failed ({str(pe)[:120]}) — will retry next boot")
 
             if not provider_pk:
                 # Can't proceed to app or outpost without a provider PK
@@ -30327,6 +30372,17 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
             Returns (ok: bool, fixed_count: int, err: str)."""
             try:
                 _cookie = f'.{base}'
+                # v0.9.31 (post-field-debug 2026-05-18): write WITHOUT trailing
+                # slash. Previously `want_clean + '/'` produced
+                # `external_host = 'https://takportal.lutak.net/'`, which made
+                # Authentik bake the with-slash form into the proxy provider's
+                # strict-match redirect_uris list. When Caddy/outpost later
+                # forward_auth'd the user, the OAuth flow's redirect_uri
+                # mismatched the strict-match entry and Authentik returned
+                # "Redirect URI Error" instead of the login page. Observed live
+                # on takportal.lutak.net (provider pk=3). Compare exact strings
+                # too — no rstrip on cur — so a stale with-slash row is fixed
+                # instead of silently treated as equal to the no-slash target.
                 _py_lines = [
                     "from authentik.providers.proxy.models import ProxyProvider",
                     f"targets = {canonical!r}",
@@ -30337,11 +30393,11 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                     "    if not p:",
                     "        print(f'AK-PROXY|{name}|MISSING')",
                     "        continue",
-                    "    cur = (p.external_host or '').rstrip('/')",
+                    "    cur = (p.external_host or '')",
                     "    want_clean = (want or '').rstrip('/')",
                     "    cur_cookie = (p.cookie_domain or '')",
                     "    if cur != want_clean or cur_cookie != cookie:",
-                    "        p.external_host = want_clean + '/'",
+                    "        p.external_host = want_clean",  # no trailing slash
                     "        p.cookie_domain = cookie",
                     "        p.save(update_fields=['external_host', 'cookie_domain'])",
                     "        fixed += 1",
@@ -30409,30 +30465,60 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                     plog(f"  proxy external_hosts: failed to fetch provider {_name!r}: {_fe}")
                     _patch_failures += 1
                     continue
-                _current = (_full.get('external_host') or '').rstrip('/')
+                # v0.9.31 (post-field-debug 2026-05-18): compare EXACT strings
+                # and write WITHOUT trailing slash. See ak-shell fallback above
+                # for the full story (Authentik bakes the with/without-slash
+                # form into the strict-match redirect_uris list; mixing them
+                # produces "Redirect URI Error" instead of the login page).
+                _current = (_full.get('external_host') or '')
                 _want_clean = _want.rstrip('/')
-                if _current == _want_clean:
+                _full_cookie = (_full.get('cookie_domain') or '').strip()
+                _cookie_domain = f'.{base}'
+                if _current == _want_clean and _full_cookie == _cookie_domain:
                     continue  # already canonical
 
-                # Derive correct cookie_domain from fqdn
-                _cookie_domain = base
-                _patch = {
-                    'external_host': _want_clean + '/',
+                # v0.9.31 (post-field-debug): PUT with the FULL provider body.
+                # Authentik validates the whole object even on PATCH and
+                # rejects partial bodies with "internal_host: Internal host
+                # cannot be empty when forward auth is disabled." (HTTP 400).
+                # Observed live on takportal proxy provider pk=3 (SSDNodes).
+                _put_body = {
+                    'name': _name,
+                    'authorization_flow': _full.get('authorization_flow'),
+                    'invalidation_flow': _full.get('invalidation_flow'),
+                    'external_host': _want_clean,
+                    'mode': _full.get('mode') or 'forward_single',
+                    'token_validity': _full.get('token_validity') or 'hours=24',
                     'cookie_domain': _cookie_domain,
+                    'internal_host': _full.get('internal_host') or '',
+                    'internal_host_ssl_validation': _full.get(
+                        'internal_host_ssl_validation', True),
+                    'skip_path_regex': _full.get('skip_path_regex') or '',
+                    'basic_auth_enabled': _full.get('basic_auth_enabled', False),
+                    'basic_auth_password_attribute': _full.get(
+                        'basic_auth_password_attribute') or '',
+                    'basic_auth_user_attribute': _full.get(
+                        'basic_auth_user_attribute') or '',
+                    'intercept_header_auth': _full.get('intercept_header_auth', True),
                 }
                 try:
                     _req.urlopen(
                         _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/',
-                                     data=_json.dumps(_patch).encode(), headers=_headers, method='PATCH'),
-                        timeout=10
+                                     data=_json.dumps(_put_body).encode(), headers=_headers, method='PUT'),
+                        timeout=30
                     )
-                    plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean + '/'!r}")
+                    plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean!r}")
                     _fixed += 1
                 except urllib.error.HTTPError as _pe:
-                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: HTTP {_pe.code}")
+                    _err_body = ''
+                    try:
+                        _err_body = _pe.read().decode()[:200]
+                    except Exception:
+                        pass
+                    plog(f"  ✗ Proxy external_host PUT failed for {_name!r}: HTTP {_pe.code} {_err_body}")
                     _patch_failures += 1
                 except Exception as _pe2:
-                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: {_pe2}")
+                    plog(f"  ✗ Proxy external_host PUT failed for {_name!r}: {_pe2}")
                     _patch_failures += 1
 
             _fixed_total += _fixed
