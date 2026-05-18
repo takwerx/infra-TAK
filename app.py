@@ -363,7 +363,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.27-alpha"
+VERSION = "0.9.28-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25140,7 +25140,7 @@ entries:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
     shm_size: 256m
-    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=2000 -c shared_buffers=12GB -c effective_cache_size=36GB -c work_mem=16MB -c maintenance_work_mem=2GB -c wal_buffers=64MB -c max_wal_size=4GB -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -25607,28 +25607,29 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.23: bring back idle_session_timeout AT 300s (Christian Elsen's
-        # production-proven value, confirmed by AJ's last-month notes; matches
-        # TAK-NZ/auth-infra-style PG config). The v0.9.22 hotfix removed the
-        # value entirely after v0.9.21's 30s was killing django_channels_postgres
-        # LISTEN sockets and storming reconnects. 300s is conservative enough
-        # that long-LISTEN connections survive (tcp_keepalives_idle=60s emits
-        # protocol-level activity well within the window), but short enough to
-        # reap the leaked async-thread connections that CONN_MAX_AGE never
-        # closes — the actual root cause of the ak-pg-watchdog 5-minute restart
-        # cycle we've been observing on tak-10.
-        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        # v0.9.28-alpha: enterprise PG tuning is now defined once at the top
+        # of app.py as _AUTHENTIK_PG_COMMAND_ENTERPRISE. The legacy patcher
+        # writes that canonical string unconditionally — no operator-override
+        # preservation (per .cursor/rules/fleet-uniform-config.mdc).
+        #
+        # Historical note: v0.9.23-v0.9.27 used a smaller command with
+        # max_connections=500 and no memory tuning. v0.9.28 raises this to
+        # max_connections=2000 + shared_buffers=12GB etc. to absorb the
+        # Authentik #20714 channels_postgres leak amplifier at production
+        # scale (100s of TAK clients per Authentik instance).
+        pg_cmd = _AUTHENTIK_PG_COMMAND_ENTERPRISE
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
-        _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
+        # Enterprise migration: detect any non-enterprise command line
+        # (anything missing shared_buffers, or max_connections < 2000,
+        # is treated as needing update). The detection is intentionally
+        # permissive — if any required enterprise arg is missing/lower,
+        # we rewrite the whole command to canonical.
         _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
-        _pg_st_match = re.search(r'statement_timeout=(\d+)s', _pg_full)
-        _pg_is_match = re.search(r'idle_session_timeout=(\d+)s', _pg_full)
-        _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
-        _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
-        _st_needs = not _pg_st_match or _pg_st_match.group(1) != '120'
-        _is_needs = not _pg_is_match or _pg_is_match.group(1) != '300'  # v0.9.23: enforce 300, not absent
-        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _is_needs)
+        _pg_sb_match = re.search(r'shared_buffers=(\d+)([KMG]?B)', _pg_full)
+        _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 2000)
+        _sb_needs = not _pg_sb_match  # enterprise requires shared_buffers tuning
+        needs_pg_update = has_pg_cmd and (_mc_needs or _sb_needs)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -25640,7 +25641,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                 lines = patched
                 changed = True
                 if plog:
-                    plog("  ✓ Added PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, idle_in_transaction, tcp keepalives)")
+                    plog(f"  ✓ Added enterprise PostgreSQL tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB)")
         elif needs_pg_update:
             for i, line in enumerate(lines):
                 if 'command: postgres' in line and 'max_connections' in line:
@@ -25649,8 +25650,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        _old_is = _pg_is_match.group(1) if _pg_is_match else '(absent)'
-                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_session_timeout={_old_is}s→300s, statement_timeout=120s) [legacy patcher]")
+                        plog(f"  ✓ Updated PostgreSQL to enterprise tuning (max_connections={_old_mc}→2000, +shared_buffers=12GB, +effective_cache_size=36GB) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -25796,31 +25796,33 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     services = data.setdefault('services', {})
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
-    # v0.9.23: bring back idle_session_timeout AT 300s. v0.9.21 set it to 30s
-    # which killed django_channels_postgres LISTEN sockets (reconnect storms).
-    # v0.9.22 reverted to "absent" entirely, but absent means async-thread
-    # connections leaked by CONN_MAX_AGE never get reaped server-side, causing
-    # the ak-pg-watchdog to restart authentik-server-1 every ~5 minutes on
-    # tak-10. 300s is Christian Elsen's production value and matches
-    # TAK-NZ/auth-infra; tcp_keepalives_idle=60s keeps LISTEN sockets alive.
-    _pg_target_cmd = (
-        'postgres -c max_connections=500 -c statement_timeout=120s'
-        ' -c idle_session_timeout=300s'
-        ' -c idle_in_transaction_session_timeout=300s'
-        ' -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
-    )
+    # v0.9.28-alpha: enterprise PG tuning (12-core / 48 GB hardware tier).
+    # The canonical command string is _AUTHENTIK_PG_COMMAND_ENTERPRISE at the
+    # top of app.py — referenced here so all migration paths converge to the
+    # same string. NO max(cur, target) override-preservation — fleet uniform
+    # config rule (.cursor/rules/fleet-uniform-config.mdc).
+    #
+    # Note on size deltas vs v0.9.27:
+    #   max_connections 500 → 2000  (maintainer-endorsed Authentik #20714 mitigation)
+    #   + shared_buffers=12GB, effective_cache_size=36GB (PG canonical 25%/75% of 48GB)
+    #   + work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB
+    #
+    # Memory budget on a 48 GB box at peak: ~35-38 GB (PG shared + 1500
+    # backends @ 10 MB + Authentik containers + OS), leaves ~10 GB headroom.
+    _pg_target_cmd = _AUTHENTIK_PG_COMMAND_ENTERPRISE
     pg = services.setdefault('postgresql', {})
     _existing_pg_cmd = str(pg.get('command') or '')
     _pg_mc_m = re.search(r'max_connections=(\d+)', _existing_pg_cmd)
-    if _pg_mc_m and _pg_mc_m.group(1).isdigit() and int(_pg_mc_m.group(1)) > 500:
-        if plog:
-            plog(f"  pg command: operator-set max_connections={_pg_mc_m.group(1)} > 500 — preserving existing command")
-    elif pg.get('command') != _pg_target_cmd:
-        _old_cmd = pg.get('command', '(none)')
+    _pg_sb_m = re.search(r'shared_buffers=', _existing_pg_cmd)
+    # Enterprise convergence: always write canonical command when current
+    # differs. Per fleet-uniform-config rule, no per-box override carve-out.
+    if pg.get('command') != _pg_target_cmd:
+        _old_mc = _pg_mc_m.group(1) if _pg_mc_m else '(none)'
+        _had_sb = 'yes' if _pg_sb_m else 'no'
         pg['command'] = _pg_target_cmd
         changed = True
         if plog:
-            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, idle_session_timeout=300s)")
+            plog(f"  ✓ Set enterprise PostgreSQL tuning (max_connections={_old_mc}→2000, shared_buffers tuned={_had_sb}→yes-12GB, +effective_cache_size=36GB +work_mem=16MB +maintenance_work_mem=2GB +wal_buffers=64MB +max_wal_size=4GB)")
 
     # ── Server healthcheck ────────────────────────────────────────────────────
     _target_hc = {
@@ -25923,12 +25925,12 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         )
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
-            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, idle_session_timeout=300s)")
+            plog("  PostgreSQL tuning args changed — recreating container to apply enterprise settings (max_connections=2000, shared_buffers=12GB, ...)")
             subprocess.run(
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
             )
-            plog("  ✓ PostgreSQL recreated with updated tuning (max_connections=500, statement_timeout=120s, idle_in_transaction_session_timeout=300s)")
+            plog("  ✓ PostgreSQL recreated with enterprise tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB, statement_timeout=120s, idle_session_timeout=300s)")
         else:
             subprocess.run(
                 f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
@@ -27178,9 +27180,56 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
 #   - SERVER_RESET_QUERY=DISCARD ALL: clears prepared statements, temp tables,
 #     and session state between checkouts. Required for transaction mode
 #     and recommended by both PgBouncer upstream and Authentik docs.
-_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 75
-_AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 1000
-_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 15
+# v0.9.28-alpha enterprise scaling (12-core / 48 GB minimum hardware).
+#
+# Canonical Postgres command-line tuning for enterprise tier. This is the
+# single source of truth — referenced by both the install-time compose
+# template AND the Update-Now compose patchers (legacy + modern). NEVER
+# inline these values; always reference _AUTHENTIK_PG_COMMAND_ENTERPRISE.
+#
+# Sized per pgtune-style recommendations for 12-core / 48 GB hardware:
+#   max_connections=2000      Capacity for ~1500-conn ceiling (75% cap)
+#                             Maintainer-endorsed for Authentik #20714.
+#   shared_buffers=12GB       25% of 48 GB — PG canonical guidance.
+#   effective_cache_size=36GB 75% of 48 GB — PG canonical guidance.
+#   work_mem=16MB             Per-operation sort/hash memory. 2000 conns *
+#                             16 MB = 32 GB worst case (never simultaneous
+#                             in Authentik workload — most are idle).
+#   maintenance_work_mem=2GB  Vacuum/index builds. Was 64 MB.
+#   wal_buffers=64MB          Larger commit batches. Was ~4 MB.
+#   max_wal_size=4GB          Checkpoint spacing. Was 1 GB.
+#   statement_timeout=120s    Authentik long-poll-tolerant.
+#   idle_session_timeout=300s Reap async-thread leaks; v0.9.23 default.
+#   idle_in_transaction_*=300s Christian Elsen production value.
+#   tcp_keepalives_*          Keep LISTEN sockets alive across NAT/idle.
+_AUTHENTIK_PG_COMMAND_ENTERPRISE = (
+    'postgres'
+    ' -c max_connections=2000'
+    ' -c shared_buffers=12GB'
+    ' -c effective_cache_size=36GB'
+    ' -c work_mem=16MB'
+    ' -c maintenance_work_mem=2GB'
+    ' -c wal_buffers=64MB'
+    ' -c max_wal_size=4GB'
+    ' -c statement_timeout=120s'
+    ' -c idle_session_timeout=300s'
+    ' -c idle_in_transaction_session_timeout=300s'
+    ' -c tcp_keepalives_idle=60'
+    ' -c tcp_keepalives_interval=10'
+    ' -c tcp_keepalives_count=6'
+)
+
+# v0.9.28-alpha: enterprise scaling — PgBouncer tier.
+#   DEFAULT_POOL_SIZE 75 → 300: with PG max_connections bumped to 2000, the
+#     pool floor can safely sit at 300 (still autotune-able upward, never
+#     shrinks below 300 even on quiet boxes — preserves burst headroom).
+#   MAX_CLIENT_CONN 1000 → 5000: enterprise deployments have many Authentik
+#     containers × workers × outposts × admin tabs simultaneously connecting
+#     to PgBouncer. 1000 was sized for Pi-tier installs.
+#   RESERVE_POOL_SIZE 15 → 60: scaled with DEFAULT (5:1 ratio preserved).
+_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 300
+_AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 5000
+_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 60
 _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
 
 # v0.9.27-alpha: pool-size autotune (fleet-deterministic).
@@ -27231,13 +27280,22 @@ _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
 # target_reserve, applied_at, evidence string). Drift between
 # settings.pool_autotune.last_applied and compose YAML indicates manual
 # tampering — autotune will reconcile on next boot.
-_AUTHENTIK_POOL_AUTOTUNE_FLOOR_DEFAULT = _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE  # 75
-_AUTHENTIK_POOL_AUTOTUNE_FLOOR_RESERVE = _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE  # 15
+_AUTHENTIK_POOL_AUTOTUNE_FLOOR_DEFAULT = _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE  # 300 (v0.9.28: was 75)
+_AUTHENTIK_POOL_AUTOTUNE_FLOOR_RESERVE = _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE  # 60 (v0.9.28: was 15)
 _AUTHENTIK_POOL_AUTOTUNE_FLOOR_CEILING = (
     _AUTHENTIK_POOL_AUTOTUNE_FLOOR_DEFAULT + _AUTHENTIK_POOL_AUTOTUNE_FLOOR_RESERVE
-)  # 90
-_AUTHENTIK_POOL_AUTOTUNE_PG_MAX_CONN = 500  # Postgres max_connections (Authentik default)
-_AUTHENTIK_POOL_AUTOTUNE_CAP_PCT = 0.6  # never use more than 60% of PG max_connections
+)  # 360 (v0.9.28: was 90)
+# v0.9.28-alpha enterprise tier (12-core / 48 GB minimum hardware):
+#   PG_MAX_CONN 500 → 2000 — bumped via _ensure_authentik_pg_capacity_enterprise()
+#     migration alongside shared_buffers=12GB, effective_cache_size=36GB, etc.
+#     Maintainer-endorsed mitigation for Authentik #20714 (channels_postgres
+#     leak amplifier hardcoded at layer.py:174 `max_size=4`). 6-month upstream
+#     fix horizon (2026.8.0) means we need capacity now.
+#   CAP_PCT 0.6 → 0.75 — let autotune actually use the new PG headroom.
+#     0.75 × 2000 = 1500-conn ceiling (5× v0.9.27's 300-conn cap). Comfortably
+#     absorbs a 1000-simultaneous-TAK-client auth burst per Authentik instance.
+_AUTHENTIK_POOL_AUTOTUNE_PG_MAX_CONN = 2000  # v0.9.28: Postgres max_connections bumped from 500 → 2000 (was Authentik default)
+_AUTHENTIK_POOL_AUTOTUNE_CAP_PCT = 0.75  # v0.9.28: 0.6 → 0.75 (use 75% of PG max_connections at ceiling)
 _AUTHENTIK_POOL_AUTOTUNE_SAFETY_FACTOR = 2.0  # target_ceiling = peak * 2.0
 _AUTHENTIK_POOL_AUTOTUNE_SAMPLES_KEEP = 30  # ~1 h at 2-min watchdog ticks
 _AUTHENTIK_POOL_AUTOTUNE_DEFAULT_SHARE = 5.0 / 6.0  # 5:1 default:reserve split
@@ -27265,8 +27323,8 @@ _AUTHENTIK_POOL_AUTOTUNE_DEFAULT_SHARE = 5.0 / 6.0  # 5:1 default:reserve split
 # Also exactly = PG_MAX_CONN(500) * CAP_PCT(0.6) = 300 ceiling, so
 # cold-start sits at the cap and the autotune can ONLY shrink from
 # there (the grow direction is bounded by the same cap).
-_AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT = 250
-_AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE = 50
+_AUTHENTIK_POOL_AUTOTUNE_COLD_START_DEFAULT = 750  # v0.9.28: enterprise tier (was 250)
+_AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE = 150  # v0.9.28: enterprise tier (was 50)
 
 # v0.9.27-alpha hotfix #3: continuous in-place remediation.
 #
@@ -27652,11 +27710,21 @@ def _authentik_pool_autotune_compute(plog=None):
         return target_default, target_reserve, decision
 
     # Normal path: find peak idle AND peak cl_waiting across the window.
+    # v0.9.28-alpha: also track peak + avg Channels-class baseline (the
+    # `django_channels_postgres_groupchannel` idle count) for forensic
+    # operator visibility. Upstream Authentik #20714 confirms this is the
+    # dominant leak class at scale; we want a persisted record of how
+    # large this baseline is on every box so we can detect drift over
+    # release cycles without chasing customer logs.
     peak = 0
     peak_at = None
     peak_cl_waiting = 0
     peak_cl_waiting_at = None
     samples_with_cl_waiting = 0
+    peak_channels_idle = 0
+    peak_channels_idle_at = None
+    sum_channels_idle = 0
+    samples_with_classes = 0
     for smp in samples:
         try:
             idle = int(smp.get('idle', 0))
@@ -27675,7 +27743,19 @@ def _authentik_pool_autotune_compute(plog=None):
                     peak_cl_waiting = clw
                     peak_cl_waiting_at = smp.get('t')
             except (TypeError, ValueError):
-                continue
+                pass
+        # v0.9.28-alpha: Channels-baseline telemetry (Authentik #20714 leak class).
+        try:
+            _classes = smp.get('classes')
+            if isinstance(_classes, (list, tuple)) and len(_classes) >= 1:
+                _ch = int(_classes[0])
+                samples_with_classes += 1
+                sum_channels_idle += _ch
+                if _ch > peak_channels_idle:
+                    peak_channels_idle = _ch
+                    peak_channels_idle_at = smp.get('t')
+        except (TypeError, ValueError):
+            continue
 
     # v0.9.27-alpha hotfix #2: STUCK-AT-FLOOR ESCAPE.
     #
@@ -27735,8 +27815,22 @@ def _authentik_pool_autotune_compute(plog=None):
     decision['peak_cl_waiting'] = peak_cl_waiting
     decision['peak_cl_waiting_at'] = peak_cl_waiting_at
     decision['samples_with_cl_waiting'] = samples_with_cl_waiting
+    # v0.9.28-alpha: Channels-baseline telemetry (forensic for Authentik #20714).
+    decision['peak_channels_idle'] = peak_channels_idle
+    decision['peak_channels_idle_at'] = peak_channels_idle_at
+    decision['avg_channels_idle'] = (
+        round(sum_channels_idle / samples_with_classes, 1)
+        if samples_with_classes > 0 else None
+    )
+    decision['samples_with_classes'] = samples_with_classes
     if plog:
-        plog(f"  pool autotune: peak_idle={peak} peak_cl_waiting={peak_cl_waiting} "
+        _ch_log = (
+            f" peak_channels_idle={peak_channels_idle}"
+            f" (avg={decision['avg_channels_idle']}/{samples_with_classes})"
+            if samples_with_classes > 0 else ''
+        )
+        plog(f"  pool autotune: peak_idle={peak} peak_cl_waiting={peak_cl_waiting}"
+             f"{_ch_log} "
              f"over {len(samples)} samples → target "
              f"{target_default}/{target_reserve} "
              f"(ceiling={target_default + target_reserve})")
@@ -29440,9 +29534,12 @@ def _authentik_channels_pool_watchdog_loop():
       the runaway when MAX_REQUESTS isn't enabled (legacy installs) or
       isn't keeping up (unexpected traffic spike).
 
-    Threshold: 150 connections (~30% of max_connections=500). Checks every 2 min.
-    After restart, idle count resets to ~28 connections. With MAX_REQUESTS=1000
-    enabled, this watchdog should fire rarely or never.
+    Threshold (v0.9.28-alpha): dynamically reconciled to (pool_ceiling + 50) by
+    _reconcile_watchdog_threshold(); typical value ~450 (= 300 floor pool + 150
+    headroom). Checks every 2 min. With max_connections=2000 enterprise tier
+    and PgBouncer caps in place, this watchdog mostly fires as a last-resort
+    safety net — autotune + cl_waiting demand signal + ghost-Channels reaper
+    catch most events first.
 
     Override: set channels_pool_watchdog_threshold=N in settings to change the
     threshold, or channels_pool_watchdog_disabled=true to disable entirely.
@@ -31171,16 +31268,18 @@ def _authentik_fix_pg_idle_timeout(plog):
     # v0.9.22 hotfix: also check statement_timeout=120s absent.
     # v0.9.23: enforce idle_session_timeout=300s (was: ensure absent). 300s reaps
     # leaked async-thread connections without killing LISTEN sockets.
+    # v0.9.28: enterprise tier — drift threshold raised to 2000 to absorb the
+    # Authentik #20714 channels_postgres leak at production scale.
     _mc = re.search(r'max_connections=(\d+)', compose_content)
     _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
-    _mc_drift = _mc_current is not None and _mc_current < 500
+    _mc_drift = _mc_current is not None and _mc_current < 2000
     _st = re.search(r'statement_timeout=(\d+)s', compose_content)
     _st_ok = _st and _st.group(1) == '120'
     _is_match = re.search(r'idle_session_timeout=(\d+)s', compose_content)
     _is_current = int(_is_match.group(1)) if _is_match else None
     _is_ok = _is_current == 300
     if current == 300 and not _mc_drift and _st_ok and _is_ok:
-        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + idle_session_timeout=300s (idempotent — no-op)")
+        plog("  pg idle timeout: enterprise tuning current (max_connections=2000, shared_buffers=12GB, idle_in_transaction=300s, statement_timeout=120s, idle_session_timeout=300s) (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
@@ -31198,7 +31297,7 @@ def _authentik_fix_pg_idle_timeout(plog):
     if current != 300:
         _drift_parts.append(f"idle_in_transaction_session_timeout={current}s→300s")
     if _mc_drift:
-        _drift_parts.append(f"max_connections={_mc_current}→500")
+        _drift_parts.append(f"max_connections={_mc_current}→2000 (v0.9.28 enterprise)")
     if not _st_ok:
         _drift_parts.append("statement_timeout missing→120s")
     if not _is_ok:
@@ -31206,7 +31305,7 @@ def _authentik_fix_pg_idle_timeout(plog):
             f"idle_session_timeout={'absent' if _is_current is None else str(_is_current)+'s'}→300s "
             f"(reaps leaked async-thread connections; v0.9.21's 30s caused LISTEN-socket storms — 300s is safe)"
         )
-    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.23 target config")
+    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.28 enterprise config (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB)")
 
     try:
         changed = _ensure_authentik_compose_patches(compose_path, plog)
