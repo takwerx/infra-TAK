@@ -11645,19 +11645,59 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         with open(core_config, 'r') as f:
             content = f.read()
         shutil.copy(core_config, core_config + '.bak-le')
+        # v0.9.29 — defense-in-depth: if CoreConfig has ns0: prefixes (leftover from a
+        # prior buggy _apply_coreconfig_ldap_auth_et run on an older release), strip
+        # them BEFORE patching the connector. The original regex below only matched
+        # `<connector ...>` and silently no-op'd on `<ns0:connector ...>`, leaving the
+        # LE cert install incomplete. We also fix the regex to be namespace-tolerant
+        # as a second layer of defense.
+        if '<ns0:' in content or 'xmlns:ns0=' in content:
+            log_fn("  ⚠ CoreConfig.xml has legacy ns0: prefixes — stripping before patch")
+            content = re.sub(r'<ns0:', '<', content)
+            content = re.sub(r'</ns0:', '</', content)
+            content = re.sub(r'\s+xmlns:ns0="[^"]+"', '', content)
+            if 'xmlns=' not in content:
+                content = re.sub(
+                    r'(<Configuration\b)',
+                    '\\1 xmlns="http://bbn.com/marti/xml/config"',
+                    content, count=1
+                )
         new_connector = (
             '<connector port="8446" clientAuth="false" _name="LetsEncrypt" '
             'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
             f'keystorePass="{cert_pass}" enableAdminUI="true" enableWebtak="true" '
             'enableNonAdminUI="false"/>'
         )
-        patched = re.sub(r'<connector port="8446"[^/]*/>', new_connector, content)
+        # Namespace-tolerant regex: matches `<connector ...>` AND `<ns0:connector ...>`
+        # (or any other prefix). The (?:[A-Za-z][\w-]*:)? group accepts an optional
+        # XML namespace prefix before the element name. Also accept `/ >` (with space)
+        # which ElementTree emits with short_empty_elements=True on some Python versions.
+        patched = re.sub(
+            r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
+            new_connector, content, count=1
+        )
         if patched != content:
             with open(core_config, 'w') as f:
                 f.write(patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to use LE cert")
+            # v0.9.29 — verify the patch actually landed by reading back. Critical
+            # because subtle whitespace differences or a stale file lock could leave
+            # the patch unwritten, and a silent no-op here means 8446 serves the
+            # cert_https default keystore instead of LE — making mobile/ATAK clients
+            # show cert warnings on enrollment.
+            try:
+                with open(core_config, 'r') as f:
+                    _verify = f.read()
+                if '_name="LetsEncrypt"' not in _verify or 'takserver-le.jks' not in _verify:
+                    log_fn("  ⚠ Post-patch verify FAILED — 8446 connector did not pick up LE attrs")
+                    log_fn("  ⚠ Restoring from .bak-le and aborting LE wire-up")
+                    shutil.copy(core_config + '.bak-le', core_config)
+                    return False
+            except Exception as _ve:
+                log_fn(f"  ⚠ Post-patch verify error: {_ve} (continuing — may need manual check)")
         else:
             log_fn("  ⚠ 8446 connector pattern not matched in CoreConfig.xml — check manually")
+            log_fn(f"  ⚠ First 200 chars: {content[:200]!r}")
     except Exception as ce:
         log_fn(f"  ⚠ CoreConfig patch error: {ce}")
 
@@ -34569,8 +34609,55 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
         'x509useGroupCacheRequiresExtKeyUsage': 'false',
     }
 
+    # v0.9.29 — CRITICAL FIX: properly register the TAK Server config namespace so
+    # tree.write() emits `<Configuration xmlns="...">` (clean) instead of
+    # `<ns0:Configuration xmlns:ns0="...">` (namespace-prefixed on every element).
+    #
+    # The previous `ET.register_namespace('', '')` was a no-op (maps empty URI to
+    # empty prefix). TAK Server's CoreConfig has `xmlns="http://bbn.com/marti/xml/config"`
+    # — without proper registration of that URI, ET.write() assigns a synthetic `ns0:`
+    # prefix to every element. The resulting `<ns0:auth>` / `<ns0:ldap>` elements are
+    # not recognized by TAK Server's Spring Security LDAP wiring (silent fail → 8446
+    # login returns 401 even with correct webadmin password). Symptom on fresh
+    # Azure/SSDNodes installs: "TAK webadmin login fails after deploy".
+    #
+    # Defense-in-depth: ALSO detect & strip any pre-existing `ns0:` prefixes from
+    # the file BEFORE parsing, so a CoreConfig left mangled by a prior buggy run
+    # self-heals on the next LDAP sync (Update Now path on existing installs).
+    import re as _re_ns
     try:
-        ET.register_namespace('', '')  # suppress spurious ns0: prefix on default namespace
+        with open(coreconfig_path, 'r', encoding='utf-8') as _f:
+            _cc_raw = _f.read()
+        # Detect the TAK config namespace URI from the root xmlns declaration
+        _m_ns = _re_ns.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', _cc_raw)
+        _ns_uri = _m_ns.group(1) if _m_ns else 'http://bbn.com/marti/xml/config'
+        # Strip any ns0: (or similar synthetic) prefixes left over from prior buggy runs
+        _had_ns0 = bool(_re_ns.search(r'<ns0:', _cc_raw))
+        if _had_ns0:
+            _cc_clean = _re_ns.sub(r'<ns0:', '<', _cc_raw)
+            _cc_clean = _re_ns.sub(r'</ns0:', '</', _cc_clean)
+            _cc_clean = _re_ns.sub(r'\s+xmlns:ns0="[^"]+"', '', _cc_clean)
+            if 'xmlns=' not in _cc_clean:
+                _cc_clean = _re_ns.sub(
+                    r'(<Configuration\b)',
+                    f'\\1 xmlns="{_ns_uri}"',
+                    _cc_clean, count=1
+                )
+            try:
+                with open(coreconfig_path, 'w', encoding='utf-8') as _f:
+                    _f.write(_cc_clean)
+            except PermissionError:
+                _clean_tmp = coreconfig_path + '.ns0-strip.xml'
+                with open(_clean_tmp, 'w', encoding='utf-8') as _f:
+                    _f.write(_cc_clean)
+                subprocess.run(
+                    ['sudo', 'cp', os.path.abspath(_clean_tmp), coreconfig_path],
+                    capture_output=True, text=True, timeout=10
+                )
+            if plog:
+                plog("  ✓ CoreConfig.xml: stripped legacy ns0: prefixes (was breaking LDAP auth)")
+        # Register the namespace URI to the empty prefix so ET.write() emits clean XML
+        ET.register_namespace('', _ns_uri)
         tree = ET.parse(coreconfig_path)
         root = tree.getroot()
     except ET.ParseError as e:
@@ -34598,7 +34685,12 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     _auth_existed = auth is not None
 
     if auth is None:
-        auth = ET.SubElement(root, 'auth')
+        # v0.9.29 — when creating new elements, use the SAME namespace-qualified tag
+        # as the parent root so ET.write() serializes them into the same default
+        # namespace. ET.SubElement(root, 'auth') would create an element WITHOUT the
+        # namespace, which would then be emitted with an extra `xmlns=""` declaration
+        # (breaking the document). Use `{ns}auth` to inherit the parent namespace.
+        auth = ET.SubElement(root, auth_tag)
         if plog:
             plog("  CoreConfig.xml: created <auth> element")
 
@@ -34614,7 +34706,8 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     _ldap_existed = ldap is not None
 
     if ldap is None:
-        ldap = ET.SubElement(auth, 'ldap')
+        # v0.9.29 — preserve the same namespace as the parent (see <auth> comment above).
+        ldap = ET.SubElement(auth, ldap_tag)
         if plog:
             plog("  CoreConfig.xml: created <ldap> element")
 
@@ -34648,12 +34741,31 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
             _check = f.read()
         if 'adm_ldapservice' not in _check:
             return False, 'BUG: ElementTree-patched CoreConfig.xml missing adm_ldapservice — aborting'
+        # v0.9.29 — verify the namespace fix is working. If ns0: prefixes leaked into
+        # the output, ABORT before touching /opt/tak/CoreConfig.xml (better to fail
+        # loud here than to silently break TAK Server's LDAP auth). The ns0: prefix
+        # comes from broken namespace handling and breaks Spring Security's auth
+        # bean wiring — login returns 401 even when LDAP itself is healthy.
+        if '<ns0:' in _check or 'xmlns:ns0=' in _check:
+            return False, ('BUG: ElementTree emitted ns0: prefixes (TAK Server LDAP auth would break). '
+                           'Falling back to text-based patcher.')
         r = subprocess.run(
             ['sudo', 'cp', os.path.abspath(_patch_path), coreconfig_path],
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
             return False, f'sudo cp failed: {r.stderr.strip()[:200]}'
+        # v0.9.29 — final post-cp verification: read /opt/tak/CoreConfig.xml back
+        # and confirm it has no ns0: prefixes. If it does (e.g. cp got partial write),
+        # log a loud warning so the operator can investigate.
+        try:
+            r2 = subprocess.run(['sudo', 'cat', coreconfig_path], capture_output=True, text=True, timeout=5)
+            if r2.returncode == 0 and ('<ns0:' in r2.stdout or 'xmlns:ns0=' in r2.stdout):
+                if plog:
+                    plog("  ⚠ /opt/tak/CoreConfig.xml STILL has ns0: prefixes after write — investigate")
+                return False, 'CoreConfig.xml has ns0: prefixes after write — TAK Server LDAP will fail'
+        except Exception:
+            pass
         return True, f'CoreConfig.xml updated with LDAP auth (ldap://{ldap_host}:389)'
     except Exception as e:
         return False, f'CoreConfig.xml write error: {e}'
