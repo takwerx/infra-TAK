@@ -61,6 +61,25 @@ if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   rm -f "$TMPF"
 fi
 
+# Re-apply read-access to Caddy's LE cert files before restart. Caddy renews certs
+# every ~60 days by atomic-rename, which resets perms back to 0600 caddy:caddy and
+# would leave MediaMTX (running as takwerx) unable to read them. Refreshing on every
+# guarddog-triggered restart self-heals this without operator intervention.
+CADDY_CERTS_BASE="/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
+if [ -d "$CADDY_CERTS_BASE" ]; then
+  usermod -aG caddy takwerx 2>/dev/null || true
+  for d in /var/lib/caddy /var/lib/caddy/.local /var/lib/caddy/.local/share \
+           /var/lib/caddy/.local/share/caddy /var/lib/caddy/.local/share/caddy/certificates \
+           "$CADDY_CERTS_BASE"; do
+    chmod g+rx "$d" 2>/dev/null || true
+  done
+  for d in "$CADDY_CERTS_BASE"/*/; do
+    [ -d "$d" ] || continue
+    chmod g+rx "$d" 2>/dev/null || true
+    find "$d" -type f \( -name '*.crt' -o -name '*.key' \) -exec chmod g+r {} \; 2>/dev/null || true
+  done
+fi
+
 systemctl restart mediamtx 2>&1
 echo 0 > "$FAIL_FILE"
 date +%s > "$COOLDOWN_FILE"

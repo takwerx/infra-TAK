@@ -14203,6 +14203,9 @@ paths:
         # Step 5: Create mediamtx systemd service
         plog("")
         plog("━━━ Step 5/7: Creating systemd Services ━━━")
+        # SupplementaryGroups=caddy lets takwerx read Caddy's LE cert/key files
+        # (Caddy writes 0600 caddy:caddy in /var/lib/caddy/.local/share/caddy/...).
+        # Without this, MediaMTX fails to start with "permission denied" on the cert.
         mediamtx_svc = """[Unit]
 Description=MediaMTX RTSP/HLS/SRT Streaming Server
 After=network.target
@@ -14213,6 +14216,7 @@ ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
 Restart=always
 RestartSec=5
 User=takwerx
+SupplementaryGroups=caddy
 
 [Install]
 WantedBy=multi-user.target
@@ -14534,6 +14538,29 @@ WantedBy=multi-user.target
                 subprocess.run(f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' {yml}", shell=True)
                 plog(f"✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
                 plog(f"  Cert: {cert_file}")
+
+                # Grant MediaMTX (running as takwerx) read access to Caddy's LE cert files.
+                # Caddy stores certs as 0600 caddy:caddy under /var/lib/caddy/.local/share/caddy/...
+                # We add takwerx to the caddy group (via SupplementaryGroups=caddy in the unit) and
+                # make the directory chain group-traversable + the cert/key files group-readable.
+                # Without this, mediamtx fails on startup with "permission denied" on the cert path.
+                try:
+                    subprocess.run('usermod -aG caddy takwerx 2>/dev/null', shell=True, capture_output=True)
+                    for d in ('/var/lib/caddy',
+                              '/var/lib/caddy/.local',
+                              '/var/lib/caddy/.local/share',
+                              '/var/lib/caddy/.local/share/caddy',
+                              '/var/lib/caddy/.local/share/caddy/certificates',
+                              cert_base,
+                              f'{cert_base}/{mtx_domain}'):
+                        subprocess.run(f'chmod g+rx "{d}" 2>/dev/null', shell=True, capture_output=True)
+                    subprocess.run(f'chmod g+r "{cert_file}" "{key_file}" 2>/dev/null', shell=True, capture_output=True)
+                    # daemon-reload so the SupplementaryGroups=caddy in the unit (written in Step 5) takes effect
+                    subprocess.run('systemctl daemon-reload', shell=True, capture_output=True)
+                    plog("  ✓ Cert read-access granted to MediaMTX (takwerx in caddy group)")
+                except Exception as _e:
+                    plog(f"  ⚠ Could not grant cert read-access: {_e}")
+
                 subprocess.run('systemctl restart mediamtx', shell=True, capture_output=True)
                 time.sleep(2)
             else:
