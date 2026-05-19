@@ -43004,6 +43004,270 @@ def kernel_patch_status_api():
     return jsonify(data)
 
 
+# v0.9.31 — one-click "Patch now" background-detached kernel/apt upgrade.
+#
+# WHY THIS EXISTS
+# ---------------
+# The kernel-update banner used to instruct operators to run
+# `apt update && apt full-upgrade && reboot`. Locally this is fine. Over SSH
+# it's a foot-gun: `apt full-upgrade` replaces systemd, networking, and
+# (often) openssh-server, which can drop the SSH session mid-transaction.
+# The chained command never reaches `reboot`; apt leaves an interrupted
+# transaction (Start-Date but no End-Date in /var/log/apt/history.log);
+# the box reboots later on the OLD kernel because the new one's initramfs
+# never finalized. Field-hit on the SSDNodes box 2026-05-18 — operator
+# followed the banner's instructions to the letter, ended up with the box
+# still on 5.15.0-177 and the banner still firing.
+#
+# WHAT IT DOES
+# ------------
+# The "Patch now" button POSTs to /api/system/kernel-patch/start. The server
+# fires `apt-get update && apt-get full-upgrade` as a TRANSIENT SYSTEMD UNIT
+# via `systemd-run --no-block`. This is critical because:
+#
+#   apt full-upgrade with NEEDRESTART_MODE=a auto-restarts services whose
+#   libraries got upgraded. takwerx-console.service is a Python gunicorn
+#   process linked against libpython3.x / libssl / libc — almost any apt
+#   full-upgrade will cause needrestart to `systemctl restart
+#   takwerx-console.service`. If our apt subprocess shared takwerx-console's
+#   cgroup, that restart would kill the apt job mid-flight — same disaster
+#   as the original SSH-drop scenario, just from a different cause.
+#
+# `systemd-run --no-block --unit=infratak-kernel-patch` creates a transient
+# .service unit in its OWN cgroup, completely decoupled from
+# takwerx-console.service. When needrestart restarts the console, our apt
+# job sails on. Bonus: full journalctl integration + clean systemctl
+# status query for done/error/running state.
+#
+# Reboot is a SEPARATE explicit operator click — we never auto-reboot.
+# Banner clears naturally within 60s of post-reboot once
+# `apt list --upgradable | grep linux-image` returns 0.
+#
+# FLEET-UNIFORM COMPLIANCE
+# ------------------------
+# Same code path on every box. No per-customer state. systemd-run is part
+# of systemd itself — always present on every box we deploy on (Ubuntu
+# 22.04+). dpkg force-conf flags + DEBIAN_FRONTEND=noninteractive +
+# NEEDRESTART_MODE=a are CONSTANTS baked into the unit definition — no
+# operator override knob. If a box hits a class of upgrade that needs
+# different flags, that's a code change pushed to the fleet.
+_KERNEL_PATCH_UNIT = 'infratak-kernel-patch.service'
+_KERNEL_PATCH_LOGFILE = '/var/log/takguard/kernel-patch.log'
+
+
+def _kernel_patch_unit_state():
+    """Return (active_state, sub_state, result, main_pid).
+      active_state: 'active' | 'inactive' | 'activating' | 'deactivating' | 'failed' | ''
+      sub_state:    'running' | 'exited' | 'dead' | 'failed' | ...
+      result:       'success' | 'exit-code' | 'signal' | '' (only meaningful when inactive/failed)
+      main_pid:     int or 0 (0 = no main PID)
+    Empty strings on any error.
+    """
+    try:
+        r = subprocess.run(
+            ['systemctl', 'show', '-p', 'ActiveState,SubState,Result,MainPID',
+             _KERNEL_PATCH_UNIT],
+            capture_output=True, text=True, timeout=5
+        )
+        out = r.stdout or ''
+        active = sub = result = ''
+        pid = 0
+        for line in out.splitlines():
+            if line.startswith('ActiveState='):
+                active = line.split('=', 1)[1].strip()
+            elif line.startswith('SubState='):
+                sub = line.split('=', 1)[1].strip()
+            elif line.startswith('Result='):
+                result = line.split('=', 1)[1].strip()
+            elif line.startswith('MainPID='):
+                try:
+                    pid = int(line.split('=', 1)[1].strip())
+                except ValueError:
+                    pid = 0
+        return (active, sub, result, pid)
+    except Exception:
+        return ('', '', '', 0)
+
+
+def _kernel_patch_start_job():
+    """Fire `apt-get update && apt-get full-upgrade` as a transient systemd
+    unit. Returns (ok, message, pid_or_None).
+
+    Why systemd-run vs subprocess.Popen: needrestart inside the apt run will
+    almost certainly restart takwerx-console.service (any libpython/libssl/
+    libc upgrade triggers it with NEEDRESTART_MODE=a). A plain Popen child
+    shares the parent's cgroup and would get killed. systemd-run creates a
+    transient unit in a separate cgroup that survives takwerx-console's
+    restart, daemon-reexec, etc.
+
+    Idempotent: if the transient unit is already active, refuses to spawn
+    another and returns the existing pid. If the unit is failed or
+    inactive, accepts the new request (and resets failed-state first so
+    systemd allows the re-start).
+    """
+    if not (os.path.exists('/usr/bin/systemd-run') or os.path.exists('/bin/systemd-run')):
+        return (False, "systemd-run not found — cannot detach safely", None)
+    active, sub, result, pid = _kernel_patch_unit_state()
+    if active in ('active', 'activating') and pid:
+        return (False, f"kernel patch already running (pid {pid})", pid)
+    # If unit is in a failed state from a previous run, reset so systemd
+    # accepts a fresh start request with the same unit name.
+    if active == 'failed':
+        try:
+            subprocess.run(['systemctl', 'reset-failed', _KERNEL_PATCH_UNIT],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+    try:
+        os.makedirs(os.path.dirname(_KERNEL_PATCH_LOGFILE), exist_ok=True)
+    except Exception:
+        pass
+    # Bash script body. Written to a tmp file rather than inlined into the
+    # systemd-run argv to keep the unit definition compact.
+    script = (
+        '#!/bin/bash\n'
+        'set -o pipefail\n'
+        'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a\n'
+        'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
+        'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) ==="\n'
+        'echo "[$(TS)] apt-get update"\n'
+        'apt-get update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
+        'echo "[$(TS)] apt-get full-upgrade -y"\n'
+        'apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
+        '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
+        'echo "[$(TS)] === DONE — safe to reboot ==="\n'
+    )
+    _script_path = '/var/lib/infratak-kernel-patch.sh'
+    try:
+        with open(_script_path, 'w') as _sf:
+            _sf.write(script)
+        os.chmod(_script_path, 0o755)
+    except Exception as _we:
+        return (False, f"could not write script to {_script_path}: {_we}", None)
+    cmd = [
+        'systemd-run',
+        '--unit=' + _KERNEL_PATCH_UNIT.replace('.service', ''),
+        '--description=infra-TAK Kernel Patch Job (detached)',
+        '--property=StandardOutput=append:' + _KERNEL_PATCH_LOGFILE,
+        '--property=StandardError=append:' + _KERNEL_PATCH_LOGFILE,
+        '--setenv=DEBIAN_FRONTEND=noninteractive',
+        '--setenv=NEEDRESTART_MODE=a',
+        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        '--no-block',
+        '/bin/bash', _script_path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except Exception as _se:
+        return (False, f"systemd-run spawn failed: {_se}", None)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or '').strip()[:300]
+        return (False, f"systemd-run returned {r.returncode}: {err}", None)
+    # Poll briefly for the unit to enter active state and have a MainPID
+    import time as _ktime
+    new_pid = 0
+    for _ in range(20):  # up to ~2 sec
+        a, s, _res, p = _kernel_patch_unit_state()
+        if a in ('active', 'activating') and p:
+            new_pid = p
+            break
+        _ktime.sleep(0.1)
+    # Bust the kernel-patch status cache so the banner reflects fresh state
+    _kernel_patch_cache.update({'ts': 0, 'data': None})
+    return (True, f"started (unit {_KERNEL_PATCH_UNIT}, pid {new_pid or 'pending'})", new_pid or None)
+
+
+def _kernel_patch_job_state():
+    """Return current state of the background kernel-patch transient unit.
+    Returns a dict suitable for jsonify:
+      {
+        'running': bool,
+        'pid': int|None,
+        'done': bool,
+        'error': bool,
+        'log_tail': str (last ~4 KB),
+        'log_present': bool,
+        'unit_state': str (e.g. 'active/running', 'inactive/dead', 'failed/failed')
+      }
+    """
+    active, sub, result, pid = _kernel_patch_unit_state()
+    running = (active in ('active', 'activating'))
+    log_tail = ''
+    log_present = False
+    if os.path.exists(_KERNEL_PATCH_LOGFILE):
+        log_present = True
+        try:
+            r = subprocess.run(
+                ['tail', '-c', '4096', _KERNEL_PATCH_LOGFILE],
+                capture_output=True, text=True, timeout=5
+            )
+            log_tail = (r.stdout or '')[-4000:]
+        except Exception:
+            log_tail = ''
+    # Use systemd's own Result= field as the authoritative success/fail
+    # signal — don't depend on log_tail content (log may be rotated, wiped,
+    # or empty if the unit died before writing anything). The log-tail
+    # banner string is just operator-visible confirmation.
+    done = (not running) and (result == 'success')
+    err = (not running) and (active == 'failed' or (result not in ('', 'success')))
+    # If the job clearly completed (success or failure), bust the kernel
+    # patch status cache so the post-reboot banner check picks up reality.
+    if (done or err) and _kernel_patch_cache.get('ts'):
+        _kernel_patch_cache.update({'ts': 0, 'data': None})
+    return {
+        'running': running,
+        'pid': (pid or None) if running else None,
+        'done': done,
+        'error': err,
+        'log_tail': log_tail,
+        'log_present': log_present,
+        'unit_state': f"{active or 'unknown'}/{sub or 'unknown'}" + (f" ({result})" if result else ''),
+    }
+
+
+@app.route('/api/system/kernel-patch/start', methods=['POST'])
+@login_required
+def kernel_patch_start_api():
+    """Start the detached kernel-patch background job. Idempotent — if a
+    job is already running, returns the existing pid + a 200."""
+    try:
+        ok, msg, pid = _kernel_patch_start_job()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {e}'}), 500
+    return jsonify({'ok': ok, 'message': msg, 'pid': pid})
+
+
+@app.route('/api/system/kernel-patch/job-status')
+@login_required
+def kernel_patch_job_status_api():
+    """Return live state of the kernel-patch background job (running/done/
+    error/log_tail). Distinct from /api/system/kernel-patch-status which
+    reports whether ANY apt linux-image upgrade is available — this one
+    reports the job spawned by THIS console session."""
+    try:
+        return jsonify(_kernel_patch_job_state())
+    except Exception as e:
+        return jsonify({'running': False, 'error': True, 'log_tail': f'job-status error: {e}', 'pid': None, 'done': False, 'log_present': False}), 500
+
+
+@app.route('/api/system/kernel-patch/reboot', methods=['POST'])
+@login_required
+def kernel_patch_reboot_api():
+    """Schedule a system reboot. Detached so the response can still complete
+    before the box goes down. Operator MUST have explicitly clicked the
+    'Reboot now' button — this endpoint is intentionally unguarded beyond
+    login_required; the UI confirm dialog is the only gate."""
+    try:
+        subprocess.Popen(
+            ['systemctl', 'reboot'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True
+        )
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'reboot spawn failed: {e}'}), 500
+    return jsonify({'ok': True, 'message': 'reboot scheduled'})
+
+
 @app.route('/api/metrics')
 @login_required
 def api_metrics():
@@ -44009,11 +44273,41 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
-<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Run: <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">apt update &amp;&amp; apt full-upgrade &amp;&amp; reboot</code></div></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">apt-get full-upgrade</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
 </div></div>
+<div id="kpatch-running" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Kernel patch in progress &mdash; <span id="kpatch-pid"></span></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Detached from console &mdash; safe to close this tab. Job runs to completion regardless. Typical time: 2-5 min.</div></div>
+</div>
+<pre id="kpatch-log" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="kpatch-done" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--green)">&#10003; Kernel patch complete &mdash; reboot required to boot the new kernel</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get full-upgrade finished cleanly. The new kernel is staged but the running system is still on the old one. Reboot when ready.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="rebootForKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I&#39;ll reboot later</button>
+</div></div>
+<pre id="kpatch-log-done" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:10px;font-size:10px;color:var(--text-dim);max-height:140px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="kpatch-error" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--red)">&#10007; Kernel patch FAILED &mdash; see log below</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get exited non-zero. No reboot will run. Investigate the log and either retry or fix manually over SSH.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Retry</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div></div>
+<pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+</div>
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
@@ -44271,19 +44565,127 @@ if(document.getElementById('fedhub-card-cert-expiry')){
   setInterval(loadFedHubCardCertExpiry,60000);
 }
 loadCaddyCertDays();
+var _kpatchPollTimer=null;
+function _kpatchShowState(state){
+    ['kpatch-idle','kpatch-running','kpatch-done','kpatch-error'].forEach(function(id){
+        var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
+    });
+}
 async function checkKernelPatch(){
     var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
     var dismissed=localStorage.getItem('kernel-patch-dismissed');
+    // First: check if a background patch job is in flight (started in a prior
+    // session — UI reload, browser refresh, etc.). If so, jump straight into
+    // the live polling state instead of showing the idle banner.
+    try{
+        var jr=await fetch('/api/system/kernel-patch/job-status',{credentials:'same-origin',cache:'no-store'});
+        var jd=await jr.json();
+        if(jd && jd.running){
+            banner.style.display='block';
+            _kpatchShowState('running');
+            document.getElementById('kpatch-pid').textContent='pid '+(jd.pid||'?');
+            document.getElementById('kpatch-log').textContent=jd.log_tail||'(no output yet)';
+            _kpatchStartPolling();
+            return;
+        }
+        if(jd && jd.done){
+            banner.style.display='block';
+            _kpatchShowState('done');
+            document.getElementById('kpatch-log-done').textContent=jd.log_tail||'';
+            return;
+        }
+        if(jd && jd.error){
+            banner.style.display='block';
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent=jd.log_tail||'';
+            return;
+        }
+    }catch(e){}
+    // No in-flight job — fall back to the "is there a kernel update available?" check
     try{
         var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
-        if(d.patched){localStorage.removeItem('kernel-patch-dismissed');return;}
-        if(!dismissed){banner.style.display='block';}
+        if(d.patched){localStorage.removeItem('kernel-patch-dismissed');banner.style.display='none';return;}
+        if(!dismissed){banner.style.display='block';_kpatchShowState('idle');}
     }catch(e){}
 }
 function dismissKernelBanner(){
     var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
     localStorage.setItem('kernel-patch-dismissed','1');
+    // Don't kill the polling timer if a job is running in the background —
+    // we just hide the UI. The job continues to run regardless.
+}
+async function startKernelPatch(){
+    if(!confirm('Start kernel patch?\n\nThis will run apt-get full-upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\'s a separate explicit click.\n\nContinue?'))return;
+    var banner=document.getElementById('kernel-patch-banner');
+    _kpatchShowState('running');
+    document.getElementById('kpatch-pid').textContent='starting...';
+    document.getElementById('kpatch-log').textContent='Spawning detached background job...';
+    try{
+        var r=await fetch('/api/system/kernel-patch/start',{method:'POST',credentials:'same-origin'});
+        var d=await r.json();
+        if(!d.ok && !d.message){
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent='start failed: '+(d.error||'unknown error');
+            return;
+        }
+        document.getElementById('kpatch-pid').textContent='pid '+(d.pid||'?')+(d.ok?'':' (already running)');
+        _kpatchStartPolling();
+    }catch(e){
+        _kpatchShowState('error');
+        document.getElementById('kpatch-log-error').textContent='start failed: network error - '+e;
+    }
+}
+function _kpatchStartPolling(){
+    if(_kpatchPollTimer)return;
+    _kpatchPollTimer=setInterval(_kpatchPollOnce,3000);
+    _kpatchPollOnce();
+}
+async function _kpatchPollOnce(){
+    try{
+        var r=await fetch('/api/system/kernel-patch/job-status',{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        var logEl=document.getElementById('kpatch-log');
+        if(logEl && d.log_tail){
+            var atBottom=(logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight)<10;
+            logEl.textContent=d.log_tail;
+            if(atBottom)logEl.scrollTop=logEl.scrollHeight;
+        }
+        if(d.done){
+            clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            _kpatchShowState('done');
+            document.getElementById('kpatch-log-done').textContent=d.log_tail||'';
+            return;
+        }
+        if(d.error){
+            clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent=d.log_tail||'';
+            return;
+        }
+        if(!d.running && !d.done && !d.error){
+            // Job is no longer running, log doesn't show DONE or FATAL — could
+            // be the apt subprocess got killed by the OS, an unexpected exit,
+            // or we polled in the tiny window between Popen returning and the
+            // log getting its first line. Wait one more cycle before deciding.
+            // The next poll will either flip to done/error (apt actually
+            // finished while we were polling) or stay in this limbo state,
+            // in which case we treat it as error.
+            // For now: leave the UI in 'running' state, the next poll resolves.
+        }
+    }catch(e){}
+}
+async function rebootForKernelPatch(){
+    if(!confirm('Reboot now?\n\nThis will reboot the server immediately. The console will be unavailable until the box comes back (usually 1-3 min).\n\nContinue?'))return;
+    var logEl=document.getElementById('kpatch-log-done');
+    if(logEl)logEl.textContent+='\n[browser] reboot requested...';
+    try{
+        await fetch('/api/system/kernel-patch/reboot',{method:'POST',credentials:'same-origin'});
+    }catch(e){}
+    // Either way the box is going down; show a friendly message
+    var bn=document.getElementById('kpatch-done');
+    if(bn)bn.innerHTML='<div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Reboot in progress &mdash; the console will reload automatically when the box is back up...</div>';
+    setTimeout(function(){location.reload();},45000);
 }
 checkKernelPatch();
 var updateBody='';
