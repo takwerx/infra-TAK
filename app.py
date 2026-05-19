@@ -43056,24 +43056,39 @@ _KERNEL_PATCH_LOGFILE = '/var/log/takguard/kernel-patch.log'
 
 
 def _kernel_patch_unit_state():
-    """Return (active_state, sub_state, result, main_pid).
+    """Return (load_state, active_state, sub_state, result, main_pid).
+      load_state:   'loaded' | 'not-found' | 'masked' | 'error' | ''
+                    NB: 'not-found' is the post-reboot state for transient
+                    units (they do not survive reboot). 'masked' / 'error'
+                    are rare but possible on hand-broken systemd setups.
       active_state: 'active' | 'inactive' | 'activating' | 'deactivating' | 'failed' | ''
       sub_state:    'running' | 'exited' | 'dead' | 'failed' | ...
-      result:       'success' | 'exit-code' | 'signal' | '' (only meaningful when inactive/failed)
+      result:       'success' | 'exit-code' | 'signal' | ''
+                    NB: when LoadState != 'loaded', `systemctl show -p Result`
+                    returns the DEFAULT property value `success` — NOT a real
+                    outcome. Callers MUST gate on load_state before treating
+                    `result == 'success'` as meaningful. This is the v0.9.32
+                    "reboot-loop banner" bug: post-reboot the transient unit
+                    is gone, but `systemctl show` still returns Result=success
+                    as a default, which `_kernel_patch_job_state` was reading
+                    as "the patch job completed successfully" → banner stuck
+                    in done/Reboot-now state forever.
       main_pid:     int or 0 (0 = no main PID)
     Empty strings on any error.
     """
     try:
         r = subprocess.run(
-            ['systemctl', 'show', '-p', 'ActiveState,SubState,Result,MainPID',
+            ['systemctl', 'show', '-p', 'LoadState,ActiveState,SubState,Result,MainPID',
              _KERNEL_PATCH_UNIT],
             capture_output=True, text=True, timeout=5
         )
         out = r.stdout or ''
-        active = sub = result = ''
+        load = active = sub = result = ''
         pid = 0
         for line in out.splitlines():
-            if line.startswith('ActiveState='):
+            if line.startswith('LoadState='):
+                load = line.split('=', 1)[1].strip()
+            elif line.startswith('ActiveState='):
                 active = line.split('=', 1)[1].strip()
             elif line.startswith('SubState='):
                 sub = line.split('=', 1)[1].strip()
@@ -43084,9 +43099,9 @@ def _kernel_patch_unit_state():
                     pid = int(line.split('=', 1)[1].strip())
                 except ValueError:
                     pid = 0
-        return (active, sub, result, pid)
+        return (load, active, sub, result, pid)
     except Exception:
-        return ('', '', '', 0)
+        return ('', '', '', '', 0)
 
 
 def _kernel_patch_start_job():
@@ -43107,12 +43122,14 @@ def _kernel_patch_start_job():
     """
     if not (os.path.exists('/usr/bin/systemd-run') or os.path.exists('/bin/systemd-run')):
         return (False, "systemd-run not found — cannot detach safely", None)
-    active, sub, result, pid = _kernel_patch_unit_state()
+    load, active, sub, result, pid = _kernel_patch_unit_state()
     if active in ('active', 'activating') and pid:
         return (False, f"kernel patch already running (pid {pid})", pid)
     # If unit is in a failed state from a previous run, reset so systemd
-    # accepts a fresh start request with the same unit name.
-    if active == 'failed':
+    # accepts a fresh start request with the same unit name. Only meaningful
+    # if LoadState=loaded — a transient unit that doesn't exist post-reboot
+    # has LoadState=not-found and reset-failed would be a no-op anyway.
+    if load == 'loaded' and active == 'failed':
         try:
             subprocess.run(['systemctl', 'reset-failed', _KERNEL_PATCH_UNIT],
                            capture_output=True, timeout=5)
@@ -43167,7 +43184,7 @@ def _kernel_patch_start_job():
     import time as _ktime
     new_pid = 0
     for _ in range(20):  # up to ~2 sec
-        a, s, _res, p = _kernel_patch_unit_state()
+        _ld, a, s, _res, p = _kernel_patch_unit_state()
         if a in ('active', 'activating') and p:
             new_pid = p
             break
@@ -43189,8 +43206,29 @@ def _kernel_patch_job_state():
         'log_present': bool,
         'unit_state': str (e.g. 'active/running', 'inactive/dead', 'failed/failed')
       }
+
+    v0.9.32 fix: post-reboot the transient unit `infratak-kernel-patch.service`
+    is gone from systemd's memory (transient units do not survive reboot).
+    But `systemctl show -p Result` on a non-existent unit returns
+    `Result=success` as the DEFAULT property value — not as a real outcome.
+    The prior code treated that default as "patch completed successfully" and
+    left the dashboard banner stuck on "Kernel patch complete — reboot
+    required" forever. Operator clicks Reboot, box reboots, banner is back,
+    infinite loop. Two-layer fix here:
+
+      1. Hard gate on `load_state == 'loaded'`. If the unit was never loaded
+         this boot (i.e. doesn't exist), Result is meaningless — return
+         done=False, error=False, running=False. checkKernelPatch() then
+         falls through to the apt-list status check, which correctly says
+         "patched" once the new kernel is running.
+
+      2. Defense in depth: even if LoadState=loaded but the apt-list probe
+         says no kernel update is pending, downgrade done→False. The "done"
+         state's only purpose is to surface "you should reboot to boot the
+         new kernel" — if there's no new kernel to boot, the banner has
+         nothing to assert.
     """
-    active, sub, result, pid = _kernel_patch_unit_state()
+    load, active, sub, result, pid = _kernel_patch_unit_state()
     running = (active in ('active', 'activating'))
     log_tail = ''
     log_present = False
@@ -43204,12 +43242,57 @@ def _kernel_patch_job_state():
             log_tail = (r.stdout or '')[-4000:]
         except Exception:
             log_tail = ''
+
+    # Layer 1: gate on LoadState=loaded.
+    # Transient unit gone (post-reboot, never-spawned, masked, etc.) →
+    # don't infer done/err from the default Result property value.
+    if load != 'loaded':
+        return {
+            'running': False,
+            'pid': None,
+            'done': False,
+            'error': False,
+            'log_tail': log_tail,
+            'log_present': log_present,
+            'unit_state': f"not-loaded/{load or 'unknown'}",
+        }
+
     # Use systemd's own Result= field as the authoritative success/fail
     # signal — don't depend on log_tail content (log may be rotated, wiped,
     # or empty if the unit died before writing anything). The log-tail
     # banner string is just operator-visible confirmation.
     done = (not running) and (result == 'success')
     err = (not running) and (active == 'failed' or (result not in ('', 'success')))
+
+    # Layer 2: cross-check `done` against the apt-list status. If no kernel
+    # update is pending on the box, there is nothing for the "reboot required"
+    # banner to say — downgrade done→False so the JS falls through to the
+    # apt-list check and hides the banner. Cheap: reuses the cached
+    # /api/system/kernel-patch-status response when fresh.
+    if done:
+        try:
+            import time as _kpat
+            _now = _kpat.time()
+            _cache = _kernel_patch_cache.get('data') if _kernel_patch_cache.get('data') else None
+            if _cache and (_now - _kernel_patch_cache.get('ts', 0)) < 60:
+                _patched = bool(_cache.get('patched'))
+            else:
+                _r = subprocess.run(
+                    'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
+                    shell=True, capture_output=True, text=True, timeout=15
+                )
+                _up = (_r.stdout or '').strip()
+                _patched = (_up.isdigit() and int(_up) == 0)
+            if _patched:
+                # No kernel update pending → there is nothing to reboot for.
+                # Don't keep firing the "Reboot now" banner.
+                done = False
+        except Exception:
+            # Best-effort cross-check; if the apt probe blows up, fall back
+            # to the prior behavior (Layer 1 already protects against the
+            # post-reboot default-Result-success case).
+            pass
+
     # If the job clearly completed (success or failure), bust the kernel
     # patch status cache so the post-reboot banner check picks up reality.
     if (done or err) and _kernel_patch_cache.get('ts'):
