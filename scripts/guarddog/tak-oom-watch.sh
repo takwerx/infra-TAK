@@ -77,12 +77,16 @@ Consider reviewing Data Retention settings in TAK Server UI.
     fi
     echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
 
-    # Clean restart: stop → kill orphan Java processes → clear Ignite cache → start
+    # Clean restart: stop → kill orphan Java processes → clear Ignite cache → rotate log → start
     systemctl stop $SERVICE
     sleep 2
     pkill -9 -u tak 2>/dev/null || true
     sleep 1
     rm -rf /opt/tak/work
+    # Rotate the messaging log before restart so post-restart OOM check comes up clean.
+    # TAK writes to a new file on startup; keep last 3 pre-OOM logs for forensics.
+    mv /opt/tak/logs/takserver-messaging.log "/opt/tak/logs/takserver-messaging.log.pre-oom-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    ls -t /opt/tak/logs/takserver-messaging.log.pre-oom-* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
     systemctl start $SERVICE
   fi
 else

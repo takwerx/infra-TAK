@@ -524,6 +524,15 @@ docker exec "$CONTAINER" node -e "
     echo "    Certs: chmod 644 $HOST_FILE"
   fi
 done
+# nodered.pem/key are referenced directly in function code (existsSync/readFileSync),
+# not in a tls-config node, so they aren't caught by the loop above. Ensure they're
+# readable by the Node-RED container user on every deploy.
+for _NR_CERT in "$CERT_HOST_DIR/nodered.pem" "$CERT_HOST_DIR/nodered.key"; do
+  if [ -f "$_NR_CERT" ]; then
+    chmod 644 "$_NR_CERT"
+    echo "    Certs: chmod 644 $_NR_CERT"
+  fi
+done
 
 # ── Patch settings.js on the HOST before the stop/start cycle ────────────────
 # settings.js lives at ~/node-red/settings.js on the host and is volume-mounted

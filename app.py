@@ -5991,11 +5991,31 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             return r.returncode == 0 and r.stdout.strip().isdigit()
         if monitor_id == 'oom':
-            # Only check the active messaging log; only last 10k lines so old OOMs don't keep status red forever
+            # Only count OOM entries logged after TAK's last start so a pre-restart OOM
+            # doesn't keep the monitor permanently red after a successful recovery.
             log_path = '/opt/tak/logs/takserver-messaging.log'
             if not os.path.isfile(log_path):
                 return None
-            r = subprocess.run(f'tail -n 10000 "{log_path}" | grep -c "OutOfMemoryError" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            tr = subprocess.run(
+                'systemctl show takserver --property=ActiveEnterTimestamp --value 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=3)
+            tak_ts = tr.stdout.strip()  # e.g. "Tue 2026-05-19 14:32:38 UTC"
+            tak_prefix = ''
+            try:
+                parts = tak_ts.split()  # ['Tue', '2026-05-19', '14:32:38', 'UTC']
+                if len(parts) >= 3:
+                    tak_prefix = f'{parts[1]}-{parts[2]}'  # "2026-05-19-14:32:38"
+            except Exception:
+                pass
+            if tak_prefix:
+                # awk: track timestamped lines >= TAK start, count OOM in that window only
+                r = subprocess.run(
+                    f'awk -v s="{tak_prefix}" \'/^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}-/{{a=($0>=s)}} a&&/OutOfMemoryError/{{c++}} END{{print c+0}}\' "{log_path}" 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=10)
+            else:
+                r = subprocess.run(
+                    f'tail -n 10000 "{log_path}" | grep -c "OutOfMemoryError" 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=5)
             return (r.stdout.strip() or '0') == '0'
         if monitor_id == 'disk':
             r = subprocess.run("df / --output=pcent 2>/dev/null | tail -1", shell=True, capture_output=True, text=True, timeout=3)
