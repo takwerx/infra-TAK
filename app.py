@@ -37079,6 +37079,87 @@ def _auto_authentik_tasklog_purge(plog=None):
         _log(f"Authentik tasklog purge error (non-fatal): {_e}")
 
 
+def _heal_takauthentik_tasklog_purge_stale_failed_state(plog=None):
+    """v0.9.31: clear stale `failed` state on `takauthentiktasklogpurge.service`
+    when the on-disk script is already the v0.9.26+ fixed version.
+
+    BACKGROUND (test6 + test8, validated 2026-05-18):
+      The v0.9.5 weekly purge script hit `VACUUM cannot run inside a transaction
+      block` every Sunday 03:00 UTC until v0.9.26 fixed it (separate `psql -c`
+      for the VACUUM step). On boxes deployed before v0.9.26, the Sunday timer
+      fired the OLD script — systemd marked the unit `failed` (exit 1) — then
+      a later Update Now dropped the FIXED canonical script on disk via
+      `_ensure_authentik_tasklog_purge_script`. The failed-state accounting is
+      now stale: the underlying bug is fixed, but `systemctl --failed` still
+      shows the unit until either (a) the next Sunday timer fires successfully
+      or (b) someone manually `reset-failed`s it.
+
+      Data hygiene is NOT affected — `_auto_authentik_tasklog_purge` (inline,
+      Python) runs on every console boot regardless of the timer/unit and
+      keeps the tables compact. This migration is purely about clearing the
+      cosmetic systemd accounting so `systemctl --failed` stops lying.
+
+    Gating (all must be true to apply):
+      - /etc/systemd/system/takauthentiktasklogpurge.service exists (unit installed)
+      - `systemctl is-failed` reports `failed` (don't disturb non-failed states)
+      - On-disk script at /opt/tak-guarddog/tak-authentik-tasklog-purge.sh
+        contains the `v0.9.26 multi-tier` marker (i.e. the fix is actually on disk)
+
+    On apply: `systemctl reset-failed takauthentiktasklogpurge.service`. Idempotent
+    — once cleared, future runs are no-ops (is-failed != failed). If a future
+    failure recurs with the fixed script on disk, this heal will catch and clear
+    it too — but since the v0.9.26 fix has been field-validated, that should
+    not happen. If it does, the recurrence itself is real signal worth investigating.
+
+    Never raises. All errors logged + swallowed.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        _unit_path = '/etc/systemd/system/takauthentiktasklogpurge.service'
+        if not os.path.exists(_unit_path):
+            return False
+        r_failed = subprocess.run(
+            ['systemctl', 'is-failed', 'takauthentiktasklogpurge.service'],
+            capture_output=True, text=True, timeout=5
+        )
+        if (r_failed.stdout or '').strip() != 'failed':
+            return False
+        _script_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+        if not os.path.isfile(_script_path):
+            _log("  tasklog-purge: failed-state present but on-disk script missing — leaving alone (re-deploy needed)")
+            return False
+        try:
+            with open(_script_path) as _f:
+                _content = _f.read()
+        except Exception as _re:
+            _log(f"  tasklog-purge: failed-state heal — script read error (non-fatal): {_re}")
+            return False
+        if 'v0.9.26 multi-tier' not in _content:
+            _log("  tasklog-purge: failed-state present and on-disk script is NOT the v0.9.26 fixed version — leaving alone (script will be re-emitted on next deploy)")
+            return False
+        subprocess.run(
+            ['systemctl', 'reset-failed', 'takauthentiktasklogpurge.service'],
+            capture_output=True, timeout=5
+        )
+        r_verify = subprocess.run(
+            ['systemctl', 'is-failed', 'takauthentiktasklogpurge.service'],
+            capture_output=True, text=True, timeout=5
+        )
+        if (r_verify.stdout or '').strip() != 'failed':
+            _log("  ✓ tasklog-purge: stale failed-state cleared (script on disk is v0.9.26+ fix; next Sunday timer will re-validate)")
+            return True
+        _log(f"  ⚠ tasklog-purge: reset-failed didn't take, state={r_verify.stdout.strip()!r}")
+        return False
+    except Exception as _e:
+        _log(f"  tasklog-purge stale-failed heal error (non-fatal): {_e}")
+        return False
+
+
 def _ensure_authentik_webadmin(skip_bind_verify=False):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
@@ -46347,6 +46428,25 @@ def _startup_migrations():
             _auto_authentik_tasklog_purge(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _atl_e:
             print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
+
+        # v0.9.31: Clear stale `failed` state on takauthentiktasklogpurge.service
+        # when the on-disk script is already the v0.9.26+ fixed version.
+        # Field-found on test6 + test8 (2026-05-18 soak validation) — the May 17
+        # 03:00 UTC weekly timer fired the OLD script, hit VACUUM-in-transaction,
+        # exited 1. v0.9.26 then dropped the fixed script via the migration above,
+        # but `systemctl --failed` still shows the unit stale-failed until either
+        # the next Sunday timer fires successfully or someone manually
+        # reset-failed it. Data hygiene is unaffected (the inline purge above
+        # runs on every boot); this is purely about clearing cosmetic systemd
+        # accounting so audits / dashboards stop showing a spurious failure.
+        # Idempotent: only acts if state IS currently failed AND the on-disk
+        # script contains the `v0.9.26 multi-tier` marker.
+        try:
+            _heal_takauthentik_tasklog_purge_stale_failed_state(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _atl_h_err:
+            print(f"Startup migration: tasklog stale-failed heal error (non-fatal): {_atl_h_err}", flush=True)
 
         # v0.8.7: Apply Authentik official tunings (env var name fix + cache + log level).
         # The function is idempotent: returns False if no changes needed (every startup
