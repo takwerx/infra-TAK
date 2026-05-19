@@ -2180,6 +2180,8 @@ function makeEngineTab(feed) {
     "",
     "if (!arcgisOk) {",
     "  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') - skipping deletes');",
+    "} else if (Object.keys(arcgis).length === 0) {",
+    "  node.warn(topicCfg + ': 0 features from ArcGIS (status 200) — skipping deletes to protect mission contents');",
     "} else {",
     "  var forcePurge = global.get('_forcePurge') || {};",
     "  var strictMode = (cfg.strictMode !== false);",
