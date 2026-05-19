@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.31-alpha"
+VERSION = "0.9.32-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -44616,7 +44616,7 @@ function dismissKernelBanner(){
     // we just hide the UI. The job continues to run regardless.
 }
 async function startKernelPatch(){
-    if(!confirm('Start kernel patch?\n\nThis will run apt-get full-upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\'s a separate explicit click.\n\nContinue?'))return;
+    if(!confirm("Start kernel patch?\\n\\nThis will run apt-get full-upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\\u2019s a separate explicit click.\\n\\nContinue?"))return;
     var banner=document.getElementById('kernel-patch-banner');
     _kpatchShowState('running');
     document.getElementById('kpatch-pid').textContent='starting...';
@@ -44676,9 +44676,9 @@ async function _kpatchPollOnce(){
     }catch(e){}
 }
 async function rebootForKernelPatch(){
-    if(!confirm('Reboot now?\n\nThis will reboot the server immediately. The console will be unavailable until the box comes back (usually 1-3 min).\n\nContinue?'))return;
+    if(!confirm('Reboot now?\\n\\nThis will reboot the server immediately. The console will be unavailable until the box comes back (usually 1-3 min).\\n\\nContinue?'))return;
     var logEl=document.getElementById('kpatch-log-done');
-    if(logEl)logEl.textContent+='\n[browser] reboot requested...';
+    if(logEl)logEl.textContent+='\\n[browser] reboot requested...';
     try{
         await fetch('/api/system/kernel-patch/reboot',{method:'POST',credentials:'same-origin'});
     }catch(e){}

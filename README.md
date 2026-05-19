@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.31-alpha](docs/RELEASE-v0.9.31-alpha.md)**
+**Current release: [v0.9.32-alpha](docs/RELEASE-v0.9.32-alpha.md)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
 
@@ -88,6 +88,8 @@ Then open your browser to the URL shown and log in.
 **Guard Dog — automatic since v0.4.7-alpha:** Guard Dog scripts are automatically re-deployed when the console detects a version change. No manual button press needed after upgrading. The button still exists as a fallback if you change alert email or server nickname. Set **Notifications** → alert email and use **Send test email** to verify. Details: [docs/GUARDDOG.md](docs/GUARDDOG.md).
 
 **Testing Update Now before you ship a release:** Maintainers should follow [docs/TESTING-UPDATES.md](docs/TESTING-UPDATES.md) on a test VPS (fake low `VERSION`, click **Update Now**, then restore). Pushing a Git **tag** is what shows customers “Update Available”; test the button before pushing the tag.
+
+**Test & Evaluation procedure (T&E) before any merge to `main`:** Maintainers run the canonical soak/validation procedure in [docs/TEST-AND-EVALUATION-PROCEDURE.md](docs/TEST-AND-EVALUATION-PROCEDURE.md) on the dev fleet (currently `test6` / `test8` / `test12`, ≥60 min soak each) before proposing a release. **Two-actor protocol:** the operator does the `git pull` + `systemctl restart takwerx-console` manually on each test box (same path customers hit; catches pull-path failures under operator eyes); the agent does pre-flight, post-pull verification, the soak, the health-check matrix, and the PASS/FAIL gate. Operator says **“perform the test and evaluation procedure”** to trigger it.
 
 **Upgrading from v0.1.x to v0.2.0:** v0.2.0 switches from Flask dev server to gunicorn (production server). The upgrade is automatic — just `git pull` and restart. On first restart, the console installs gunicorn, rewrites the systemd service, and starts the production server transparently. No manual steps needed.
 
@@ -336,6 +338,15 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.32-alpha — 2026-05-19 — Hotfix: Console dashboard JS aborted at parse time in v0.9.31 (escape-sequence bug in new kernel-patch confirm strings → every dashboard onclick broken, "What's using CPU/RAM?" included)
+
+**Headline: v0.9.31's new "Patch now" kernel-upgrade JavaScript shipped with Python-vs-JS escape-sequence mismatches that aborted the entire Console-page `<script>` block at browser parse time.** The `\n` and `\'` escapes inside `CONSOLE_TEMPLATE = '''…'''` (a Python triple-single-quoted string) were parsed by Python before being sent to the browser — so the rendered JS contained raw newlines and a stray apostrophe inside a `'…'` string literal. Browser threw `Uncaught SyntaxError: Invalid or unexpected token` on the first offending line, which prevented every function in that script block from being defined, which caused **every onclick on the Console page** to throw `Uncaught ReferenceError: <fn> is not defined` — operator-reported case was "What's using CPU/RAM?" but the resource-breakdown button, the kernel-patch buttons themselves, the unattended-upgrades toggle, and every other dashboard handler were all broken the same way. Fix is three one-line edits inside `CONSOLE_TEMPLATE`: `\n` → `\\n` so Python emits literal `\n` (two chars) that JS parses as a newline escape; the `'` in `that's` → `\\u2019` (typographic apostrophe) so neither Python nor JS quoting conflicts apply; outer JS quote style on the kernel-patch confirm flipped to `"…"` as defense in depth. Verified by extracting the rendered `<script>` block and running `node --check` — clean parse. No other code changes. All five other v0.9.31 fixes (TAK Server purge, Caddyfile regen on uninstall, MediaMTX `takwerx` user, Authentik chain healer, tasklog stale-failed cleanup) ship unchanged.
+
+- **Why this wasn't caught by v0.9.31 T&E.** v0.9.31 fleet validation soak passed on test6, test8, test12 because the validation matrix focused on server-side migrations + Caddy + Authentik + container health. The Console dashboard `<script>` block was not exercised end-to-end (no operator clicked through the dashboard onclick handlers on each box). v0.9.32 release notes' Validation plan adds an explicit "open DevTools, look for zero `SyntaxError` / `ReferenceError`, click the four canonical dashboard buttons" step so this class of bug surfaces during T&E. Also recorded as Lesson #3 in `docs/RELEASE-v0.9.32-alpha.md`: a 5-line `node --check` on the extracted rendered script catches this in 600ms and is worth wiring into a pre-merge make target.
+- **Triple-quoted Python templates with inline JS — long-tail rendering hazard.** Any `\n` or `\'` inside `CONSOLE_TEMPLATE = '''…'''` (or any other `'''…'''` / `"""…"""` template in `app.py`) is parsed by Python before reaching the browser. Use `\\n` and `\\u2019` (or switch the outer JS quote style) for anything that needs to survive Python's pass. This was the same class of bug as v0.8.2 → v0.8.7's `AUTHENTIK_WEB_WORKERS` single-vs-double-underscore silent ignore — value got written but not in the form the consumer actually parses.
+
+Full notes: [docs/RELEASE-v0.9.32-alpha.md](docs/RELEASE-v0.9.32-alpha.md).
 
 ### v0.9.31-alpha — 2026-05-18 — Six-in-one bugfix release: TAK Server purge self-heal + Caddyfile regen on uninstall + MediaMTX `takwerx` user creation + fleet-uniform Authentik forward_auth chain healer + tasklog stale-failed cleanup + one-click "Patch now" kernel-upgrade button
 
