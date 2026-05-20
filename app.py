@@ -22759,18 +22759,31 @@ window.startCloudtakUpdate = function() {
   var logCard = document.getElementById("log-card");
   var dyn = document.getElementById("deploy-log-dyn");
   var stat = document.getElementById("deploy-log");
+  var origBtnHTML = btn ? btn.innerHTML : "";
+  function restoreBtn() {
+    if (btn) { btn.disabled = false; btn.innerHTML = origBtnHTML; btn.style.opacity = "1"; }
+  }
   function showErr(s) {
     if (dyn) dyn.textContent = s;
     if (stat) stat.textContent = s;
-    if (btn) btn.disabled = false;
+    restoreBtn();
     alert(s);
   }
-  if (btn) btn.disabled = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="ct-btn-spinner"></span>Updating\u2026';
+    btn.style.opacity = "0.75";
+  }
   if (logCard) { logCard.style.display = "block"; logCard.scrollIntoView({ behavior: "smooth", block: "nearest" }); }
   var initMsg = "Updating CloudTAK to latest stable release...";
   if (dyn) dyn.textContent = initMsg;
   if (stat) stat.textContent = initMsg;
   window.logIndex = 0;
+  // Proxy so pollLog re-enables the button AND restores its original label on completion.
+  var btnProxy = btn ? {
+    get disabled() { return btn.disabled; },
+    set disabled(v) { if (!v) restoreBtn(); else btn.disabled = true; }
+  } : null;
   fetch("/api/cloudtak/update", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -22784,7 +22797,7 @@ window.startCloudtakUpdate = function() {
     if (d && d.error) {
       showErr("Error: " + d.error);
     } else {
-      window.pollLog(btn);
+      window.pollLog(btnProxy);
     }
   }).catch(function(e) {
     showErr("Failed: " + (e && e.message ? e.message : String(e)));
@@ -23083,6 +23096,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .tab.active{background:var(--bg-card);color:var(--text-primary)}
 .tab-panel{display:none}.tab-panel.active{display:block}
 .uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+.ct-btn-spinner{display:inline-block;width:11px;height:11px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes uninstall-spin{to{transform:rotate(360deg)}}
 .uninstall-progress-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)}
 .svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:8px}
