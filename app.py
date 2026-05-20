@@ -687,6 +687,53 @@ LOGIN_LOGO_FILENAME = "takwerx-logo.png"
 update_cache = {'latest': None, 'checked': 0, 'notes': '', 'body': ''}
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+def _warm_update_cache_bg():
+    """Populate update_cache once at startup so the server-side update banner
+    shows on the very first console page load — even if the JS <script> block
+    is broken (e.g. the v0.9.31 SyntaxError that stranded users who couldn't
+    see the banner or click Update Now).  Runs in a daemon thread; any network
+    error is silently swallowed."""
+    import urllib.request as _ur
+    try:
+        import time as _t
+        _t.sleep(8)   # let gunicorn finish startup before hitting GitHub
+        _gh = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+        _req = _ur.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/tags',
+            headers=_gh
+        )
+        _data = json.loads(_ur.urlopen(_req, timeout=6).read().decode())
+        if not _data:
+            return
+        _main_req = _ur.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=main&per_page=100',
+            headers=_gh
+        )
+        try:
+            _main_commits = {c['sha'] for c in json.loads(_ur.urlopen(_main_req, timeout=6).read().decode())}
+        except Exception:
+            _main_commits = None
+        _versions = []
+        for _tag in _data:
+            if _main_commits is not None and _tag.get('commit', {}).get('sha') not in _main_commits:
+                continue
+            _n = _tag.get('name', '').lstrip('v').replace('-alpha', '').replace('-beta', '')
+            _parts = _n.split('.')
+            try:
+                _versions.append((tuple(int(p) for p in _parts), _tag))
+            except (ValueError, IndexError):
+                continue
+        if not _versions:
+            return
+        _versions.sort(key=lambda x: x[0], reverse=True)
+        _latest_tag = _versions[0][1]
+        _latest = _latest_tag.get('name', '').lstrip('v')
+        update_cache.update({'latest': _latest, 'checked': time.time(), 'notes': f"Version {_latest_tag.get('name', '')}", 'body': ''})
+    except Exception:
+        pass
+
+threading.Thread(target=_warm_update_cache_bg, daemon=True).start()
+
 def load_settings():
     p = os.path.join(CONFIG_DIR, 'settings.json')
     if os.path.exists(p):
@@ -1843,10 +1890,25 @@ def console_page():
         module_versions = {}
     metrics = get_system_metrics()
     uu_hosts = _build_uu_hosts(metrics, settings)
+    # Server-side update state — used to render a no-JS-required banner so broken
+    # JS (e.g. the v0.9.31 SyntaxError) can't strand users who can't see the banner.
+    _srv_update = False
+    _srv_latest = ''
+    try:
+        _cached = update_cache.get('latest')
+        if _cached and (time.time() - update_cache.get('checked', 0)) < 7200:
+            _cv = tuple(int(p) for p in VERSION.replace('-alpha','').replace('-beta','').split('.'))
+            _lv = tuple(int(p) for p in _cached.replace('-alpha','').replace('-beta','').split('.'))
+            _srv_update = _lv > _cv
+            if _srv_update:
+                _srv_latest = _cached
+    except Exception:
+        pass
     resp = render_template_string(CONSOLE_TEMPLATE,
         settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
-        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts)
+        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts,
+        srv_update_available=_srv_update, srv_latest=_srv_latest)
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -44382,6 +44444,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 {% endif %}
+{% if srv_update_available %}<div id="srv-update-banner" style="background:linear-gradient(135deg,rgba(30,64,175,0.15),rgba(14,116,144,0.15));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:16px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px"><div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#x26A1; Update Available</div><div style="font-size:12px;color:var(--text-secondary);margin-top:4px">v{{ version }} &#x2192; v{{ srv_latest }}</div></div><form action="/api/update/apply" method="POST" style="display:inline"><button type="submit" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Update Now</button></form></div></div>{% endif %}
 <div id="update-banner" style="display:none;background:linear-gradient(135deg,rgba(30,64,175,0.15),rgba(14,116,144,0.15));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:16px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div>
@@ -44928,6 +44991,8 @@ async function setUpdateChannel(ch){
     }catch(e){if(st)st.textContent='Error: '+e.message;}
 }
 checkUpdate();
+// Hide the server-side fallback banner once JS is running — JS banner takes over.
+(function(){var b=document.getElementById('srv-update-banner');if(b)b.style.display='none';})();
 async function doConsoleRollback(){
     if(!confirm('Roll back console to the previous version?\\n\\nThe console will restart. You may see 502 briefly.'))return;
     var bar=document.getElementById('console-rollback-bar');
