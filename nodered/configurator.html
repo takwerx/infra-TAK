@@ -4391,8 +4391,22 @@ async function loadBackupList() {
   var sel = document.getElementById('backupFileSelect');
   var st  = document.getElementById('backupStatus');
   st.textContent = 'Loading…';
+  st.style.color = '#94a3b8';
   try {
-    var r = await fetch('/config/backups');
+    var r = await _fetchT('/config/backups', { redirect: 'manual' });
+    // opaqueredirect (status 0) = Authentik session expired → Caddy returned a
+    // cross-origin 302 to the login page. fetch() can't follow it across origins.
+    if (r.type === 'opaqueredirect' || r.status === 0) {
+      sel.innerHTML = '<option value="">— session expired —</option>';
+      st.style.color = '#f59e0b';
+      st.textContent = 'Session expired — reload the page to re-authenticate, then click Refresh again.';
+      return;
+    }
+    if (!r.ok) {
+      st.style.color = '#f87171';
+      st.textContent = 'Error loading backups: HTTP ' + r.status;
+      return;
+    }
     var d = await r.json();
     sel.innerHTML = '';
     if (!d.backups || d.backups.length === 0) {
@@ -4415,9 +4429,15 @@ async function loadBackupList() {
       opt.textContent = _bparts.join('  ');
       sel.appendChild(opt);
     });
+    st.style.color = '#94a3b8';
     st.textContent = d.backups.length + ' backup(s) found. Select one and click Restore.';
   } catch(e) {
-    st.textContent = 'Error loading backups: ' + e.message;
+    st.style.color = '#f87171';
+    if (e.name === 'AbortError') {
+      st.textContent = 'Error loading backups: timed out — Node-RED may be busy.';
+    } else {
+      st.textContent = 'Error loading backups: ' + e.message;
+    }
   }
 }
 
@@ -4425,11 +4445,22 @@ async function restoreBackup() {
   var sel = document.getElementById('backupFileSelect');
   var st  = document.getElementById('backupStatus');
   var fn  = sel.value;
-  if (!fn) { st.textContent = 'Please select a backup first.'; return; }
+  if (!fn || fn === '— session expired —') { st.textContent = 'Please select a backup first.'; return; }
   if (!confirm('Restore config from "' + fn + '"? This will overwrite your current in-memory settings immediately.')) return;
   st.textContent = 'Restoring…';
+  st.style.color = '#94a3b8';
   try {
-    var r = await fetch('/config/restore', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ filename: fn }) });
+    var r = await _fetchT('/config/restore', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ filename: fn }), redirect: 'manual' });
+    if (r.type === 'opaqueredirect' || r.status === 0) {
+      st.style.color = '#f59e0b';
+      st.textContent = 'Session expired — reload the page to re-authenticate, then try again.';
+      return;
+    }
+    if (!r.ok) {
+      st.style.color = '#f87171';
+      st.textContent = 'Restore failed: HTTP ' + r.status;
+      return;
+    }
     var d = await r.json();
     if (d.ok) {
       st.style.color = '#4ade80';
@@ -4441,7 +4472,11 @@ async function restoreBackup() {
     }
   } catch(e) {
     st.style.color = '#f87171';
-    st.textContent = 'Error: ' + e.message;
+    if (e.name === 'AbortError') {
+      st.textContent = 'Restore timed out — Node-RED may be busy.';
+    } else {
+      st.textContent = 'Error: ' + e.message;
+    }
   }
 }
 
