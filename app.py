@@ -42387,6 +42387,18 @@ def run_takserver_deploy(config):
                     if not _after or 'not-installed' in _after:
                         break
                 log_step("  ✓ Purge complete — proceeding with fresh install")
+            # Validate the .deb before attempting install — fail fast on corrupted uploads
+            # rather than burning through three install attempts and leaving a broken dpkg state.
+            _deb_ok = subprocess.run(
+                f'dpkg-deb --info {pkg} > /dev/null 2>&1',
+                shell=True, capture_output=True, timeout=30
+            )
+            if _deb_ok.returncode != 0:
+                log_step("✗ FATAL: The uploaded package is corrupted or incomplete (dpkg-deb --info failed).")
+                log_step("  On this page: delete the current upload, download a fresh copy from tak.gov, re-upload, then click")
+                log_step("  'Clean up & retry' to purge the broken state before trying again.")
+                deploy_status.update({'error': True, 'running': False})
+                return
             r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y {pkg} 2>&1', check=False)
             if not r1:
                 log_step("  apt-get failed, trying dpkg + dependency fix...")
@@ -42930,6 +42942,38 @@ def deploy_log_stream():
     last = int(request.args.get('after', 0))
     return jsonify({'entries': deploy_log[last:], 'total': len(deploy_log),
         'running': deploy_status['running'], 'complete': deploy_status['complete'], 'error': deploy_status['error']})
+
+
+@app.route('/api/takserver/purge-failed-install', methods=['POST'])
+@login_required
+def takserver_purge_failed_install():
+    """Purge a broken takserver dpkg state after a FATAL install failure so the operator can re-upload and retry."""
+    if deploy_status.get('running'):
+        return jsonify({'error': 'Deployment is running — wait for it to complete first.'}), 400
+    log = []
+    for cmd in [
+        'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver 2>&1',
+        'rm -rf /opt/tak',
+        'apt-get autoremove -y 2>/dev/null; true',
+    ]:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        log.append(r.stdout.strip() or r.stderr.strip() or '(ok)')
+    # Delete any .deb uploads that fail dpkg-deb --info (corrupted files)
+    cleaned_debs = []
+    for fn in os.listdir(UPLOAD_DIR):
+        if 'takserver' in fn.lower() and fn.endswith('.deb'):
+            fp = os.path.join(UPLOAD_DIR, fn)
+            r = subprocess.run(f'dpkg-deb --info {fp} > /dev/null 2>&1', shell=True, capture_output=True, timeout=15)
+            if r.returncode != 0:
+                try:
+                    os.remove(fp)
+                    cleaned_debs.append(fn)
+                except OSError:
+                    pass
+    deploy_status.update({'running': False, 'complete': False, 'error': False, 'cancelled': False})
+    deploy_log.clear()
+    return jsonify({'success': True, 'cleaned_debs': cleaned_debs, 'log': log})
+
 
 # === Shared CSS ===
 BASE_CSS = """
@@ -45177,7 +45221,36 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title">Deployment Log</div>
 <div id="deploy-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:500px;overflow-y:auto;line-height:1.7;white-space:pre-wrap">Reconnecting to deployment log...</div>
 <div id="deploy-log-area" style="display:block"></div>
-{% if deploy_done %}
+{% if deploy_error %}
+<div style="margin-top:16px;padding:16px 20px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--red);font-weight:600;margin-bottom:8px">✗ Deployment failed</div>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The install left a broken package state on disk. Click <strong>Clean up &amp; retry</strong> to purge it — any corrupted uploads will be deleted automatically. Then re-upload a fresh copy from <a href="https://tak.gov/products/tak-server" target="_blank" style="color:var(--cyan)">tak.gov</a> and deploy again.</p>
+<button type="button" id="tak-purge-btn" onclick="takPurgeFailed()" style="padding:10px 22px;background:linear-gradient(135deg,#7f1d1d,#b91c1c);color:#fff;border:none;border-radius:8px;font-family:\'DM Sans\',sans-serif;font-size:14px;font-weight:600;cursor:pointer">🧹 Clean up &amp; retry</button>
+<span id="tak-purge-msg" style="margin-left:12px;font-size:13px;color:var(--text-dim)"></span>
+</div>
+<script>
+function takPurgeFailed(){
+  var btn=document.getElementById('tak-purge-btn');
+  var msg=document.getElementById('tak-purge-msg');
+  if(btn){btn.disabled=true;btn.textContent='Cleaning up\u2026';}
+  fetch('/api/takserver/purge-failed-install',{method:'POST',headers:{'Content-Type':'application/json'}})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.success){
+        if(msg) msg.textContent='Done — page reloading\u2026';
+        setTimeout(function(){window.location.reload();},1200);
+      } else {
+        if(btn){btn.disabled=false;btn.textContent='\uD83E\uDDF9 Clean up & retry';}
+        if(msg) msg.textContent=d.error||'Cleanup failed.';
+      }
+    })
+    .catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='\uD83E\uDDF9 Clean up & retry';}
+      if(msg) msg.textContent='Request failed.';
+    });
+}
+</script>
+{% elif deploy_done %}
 <div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
 {% endif %}
 {% elif tak.installed %}
