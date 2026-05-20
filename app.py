@@ -43904,6 +43904,18 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <p>Accept the self-signed cert and log in with your <strong>console password</strong>. <strong>Full lockout?</strong> If you can't log in at all, you have to get on the CLI: the <strong>README on the GitHub repo</strong> has the exact commands to run on the server to reset the password (e.g. <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code>).</p>
 </div></div>
 <div class="help-card">
+<div class="help-card-header" onclick="helpToggle(this)"><h2>Force update via CLI</h2><span class="help-card-toggle">&#9662;</span></div>
+<div class="help-card-body">
+<p>If the <strong>Update Available</strong> banner isn&#39;t showing, or the <strong>Update Now</strong> button isn&#39;t responding, you can force-update the console directly from the server CLI. SSH in and run:</p>
+<pre style="background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--cyan);overflow-x:auto;white-space:pre;margin-bottom:12px;position:relative" id="force-update-block">cd $(grep -oP \'WorkingDirectory=\K.*\' /etc/systemd/system/takwerx-console.service)
+git fetch https://github.com/takwerx/infra-TAK.git main
+git checkout --force -B main FETCH_HEAD
+grep \'^VERSION\' app.py
+sudo systemctl restart takwerx-console</pre>
+<button type="button" onclick="(function(){var el=document.getElementById(\'force-update-block\');navigator.clipboard.writeText(el.innerText).then(function(){var b=event.target;b.textContent=\'Copied!\';setTimeout(function(){b.textContent=\'Copy\'},1500)});})()" style="margin-bottom:12px;padding:5px 14px;background:rgba(6,182,212,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Copy</button>
+<p>The <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">grep \'&#94;VERSION\'</code> line confirms the new version is on disk before the restart. After <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">systemctl restart</code> the console will be back in 10&#8211;15 seconds.</p>
+</div></div>
+<div class="help-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Console password</h2><span class="help-card-toggle">&#9662;</span></div>
 <div class="help-card-body">
 <p>This is the password you set when you ran <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">start.sh</code>. The <strong>same password</strong> is used to log in at the backdoor (above) and for <strong>Uninstall all services</strong> on the Console page. We don't store the plaintext, so it can't be shown here. Forgot it? Use the form below if you're logged in; for a full lockout you need the CLI — see the README on the GitHub repo.</p>
