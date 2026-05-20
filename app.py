@@ -16563,6 +16563,7 @@ def run_cloudtak_update():
                 return
             checkout_cmd = (
                 f"cd ~/CloudTAK && "
+                f"git checkout -- . && "
                 f"git fetch --depth 1 origin tag {release_tag} && "
                 f"git checkout {release_tag}"
             )
@@ -16577,6 +16578,12 @@ def run_cloudtak_update():
                 plog("✗ ~/CloudTAK not found — use Deploy instead")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # Reset local modifications before tag checkout — patches (nginx, port
+            # bindings) live in docker-compose.override.yml which is untracked, so
+            # discarding tracked-file dirt is safe and mirrors the TAK Portal update path.
+            subprocess.run(
+                f'git -c safe.directory={cloudtak_dir} -C {cloudtak_dir} checkout -- .',
+                shell=True, capture_output=True, text=True, timeout=15)
             r = subprocess.run(
                 f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
                 shell=True, capture_output=True, text=True, timeout=120)
