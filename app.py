@@ -1062,55 +1062,8 @@ def render_custom_banner(settings):
 
 
 def render_default_cert_password_warning(settings):
-    """v0.9.29 (security audit MED): show a dismissable banner while the TAK
-    cert export password is still the upstream default `atakatak`.
-
-    Renders only when:
-      - TAK Server is installed (avoid noise on bare consoles),
-      - `tak_cert_password` is unset or equals 'atakatak',
-      - operator has not dismissed it (`cert_pw_warning_dismissed`).
-    """
-    try:
-        if not (settings and os.path.exists('/opt/tak/CoreConfig.xml')):
-            return ''
-        if settings.get('cert_pw_warning_dismissed'):
-            return ''
-        pw = (settings.get('tak_cert_password') or '').strip()
-        if pw and pw != 'atakatak':
-            return ''
-    except Exception:
-        return ''
-    return (
-        '<style>'
-        '.cert-pw-nag{position:fixed;top:0;left:0;right:0;z-index:9998;'
-        'background:linear-gradient(90deg,#7c2d12,#9a3412);color:#fef3c7;'
-        'font-family:"JetBrains Mono",monospace;font-size:13px;'
-        'padding:10px 16px;display:flex;align-items:center;justify-content:center;'
-        'gap:14px;border-bottom:1px solid #fbbf24;flex-wrap:wrap}'
-        '.cert-pw-nag a{color:#fde68a;text-decoration:underline;font-weight:600}'
-        '.cert-pw-nag button{background:transparent;border:1px solid #fde68a;'
-        'color:#fde68a;padding:4px 10px;border-radius:6px;cursor:pointer;'
-        'font-family:inherit;font-size:12px}'
-        '.cert-pw-nag button:hover{background:#fde68a;color:#7c2d12}'
-        'body.has-cert-pw-nag{padding-top:44px}'
-        '</style>'
-        '<div class="cert-pw-nag" role="alert">'
-        '<span>'
-        '<strong>Security:</strong> TAK certificate password is still the '
-        'upstream default <code>atakatak</code>. '
-        '<a href="/takserver#cert-section">Change it on the TAK Server page</a>.'
-        '</span>'
-        '<button type="button" onclick="(function(){'
-        "fetch('/api/security/dismiss-cert-pw-warning',{method:'POST',"
-        "headers:{'Content-Type':'application/json'},body:'{}'})"
-        ".then(function(){document.querySelector('.cert-pw-nag').remove();"
-        "document.body.classList.remove('has-cert-pw-nag');});"
-        '})()">Dismiss</button>'
-        '</div>'
-        '<script>document.body && document.body.classList.add("has-cert-pw-nag");'
-        'document.addEventListener("DOMContentLoaded",function(){'
-        'document.body.classList.add("has-cert-pw-nag");});</script>'
-    )
+    """Removed in v0.9.35 — the atakatak default-password nag was too alarmist for operators who know what they're doing."""
+    return ''
 
 
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
