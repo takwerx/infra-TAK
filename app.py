@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.35-alpha"
+VERSION = "0.9.36-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -28378,6 +28378,17 @@ _AUTHENTIK_POOL_AUTOTUNE_COLD_START_RESERVE = 150  # v0.9.28: enterprise tier (w
 _AUTHENTIK_POOL_AUTOTUNE_INPLACE_TRIGGER_TICKS = 3
 _AUTHENTIK_POOL_AUTOTUNE_INPLACE_COOLDOWN_S = 900  # 15 min between in-place resizes
 
+# v0.9.36: idle-in-transaction safety net. PgBouncer transaction-mode keeps this
+# near zero under normal load (transactions are short). If it spikes above this
+# threshold, requests are being cancelled mid-transaction (asgiref CancelledError
+# storm — Caddy upstream timeout fires before Django commits, abandoning the tx).
+# The watchdog's existing action (restart server) flushes the gunicorn thread pool,
+# clearing all abandoned transactions. 60 is well above the healthy post-COMMIT
+# transient peak (~46 observed in AnchorTAK forensic, May 2026) but far below the
+# 130+ that causes server health-check timeouts.
+# Configurable: channels_pool_watchdog_idle_in_tx_threshold in settings.json.
+_AUTHENTIK_IDLE_IN_TX_WATCHDOG_THRESHOLD = 60
+
 
 def _authentik_pgbouncer_cl_waiting():
     """v0.9.27-alpha hotfix #2: read PgBouncer `SHOW POOLS` cl_waiting.
@@ -31042,6 +31053,7 @@ def _authentik_channels_pool_watchdog_loop():
 
     _wt.sleep(90)  # Let Authentik finish starting up before first check
     _consecutive_failures = 0
+    _consecutive_unhealthy = 0  # v0.9.36: track sustained (unhealthy) server state
 
     while True:
         try:
@@ -31054,12 +31066,23 @@ def _authentik_channels_pool_watchdog_loop():
                 continue
 
             _threshold = int(_settings.get('channels_pool_watchdog_threshold') or 150)
+            # v0.9.36: separate threshold for idle-in-transaction connections.
+            _idle_in_tx_threshold = int(
+                _settings.get('channels_pool_watchdog_idle_in_tx_threshold')
+                or _AUTHENTIK_IDLE_IN_TX_WATCHDOG_THRESHOLD
+            )
 
+            # v0.9.36: single round-trip returns both idle and idle-in-transaction
+            # counts. Previously only 'idle' was monitored — the asgiref CancelledError
+            # mid-tx storm (Caddy timeout fires before Django commits → abandoned tx →
+            # 'idle in transaction' accumulation) was invisible to this watchdog.
             _r = subprocess.run(
                 ['docker', 'exec', 'authentik-postgresql-1', 'psql',
-                 '-U', 'authentik', '-d', 'authentik', '-tA', '-c',
-                 "SELECT COUNT(*) FROM pg_stat_activity "
-                 "WHERE datname='authentik' AND state='idle'"],
+                 '-U', 'authentik', '-d', 'authentik', '-tA', '-F', '|', '-c',
+                 "SELECT "
+                 "  COUNT(*) FILTER (WHERE state='idle'), "
+                 "  COUNT(*) FILTER (WHERE state='idle in transaction') "
+                 "FROM pg_stat_activity WHERE datname='authentik'"],
                 capture_output=True, text=True, timeout=10
             )
             if _r.returncode != 0:
@@ -31067,12 +31090,13 @@ def _authentik_channels_pool_watchdog_loop():
                 _wt.sleep(120)
                 continue
 
-            _count_str = (_r.stdout or '').strip()
-            if not _count_str.isdigit():
+            _parts = (_r.stdout or '').strip().split('|')
+            if len(_parts) != 2 or not all(p.strip().isdigit() for p in _parts):
                 _wt.sleep(120)
                 continue
 
-            _count = int(_count_str)
+            _count = int(_parts[0].strip())
+            _idle_in_tx_count = int(_parts[1].strip())
             _consecutive_failures = 0
 
             # v0.9.26-alpha hotfix #4 + v0.9.27-alpha autotune: classify idle
@@ -31121,6 +31145,46 @@ def _authentik_channels_pool_watchdog_loop():
             _authentik_pool_autotune_sample(
                 _count, _classes_for_sample, _cl_waiting_for_sample
             )
+
+            # v0.9.36: server-health probe. authentik-server-1 goes (unhealthy) when
+            # the gunicorn thread pool is saturated with abandoned asgiref threads and
+            # the /-/health/live/ probe times out (10s). Docker marks it unhealthy only
+            # after its own retry cycle (typically 3×30s ≈ 90s of failing probes), so
+            # by the time we see 'unhealthy' the server has already been degraded for
+            # >2 min. Two consecutive watchdog ticks (~4 min total observation) before
+            # we restart, to avoid restarting on transient single-probe failures.
+            try:
+                _r_health = subprocess.run(
+                    ['docker', 'inspect', 'authentik-server-1',
+                     '--format', '{{.State.Health.Status}}'],
+                    capture_output=True, text=True, timeout=5
+                )
+                _health_str = (_r_health.stdout or '').strip()
+                if _health_str == 'unhealthy':
+                    _consecutive_unhealthy += 1
+                else:
+                    _consecutive_unhealthy = 0
+                if _consecutive_unhealthy >= 2:
+                    print(
+                        f"[ak-pg-watchdog] ALERT: authentik-server-1 has been (unhealthy) "
+                        f"for {_consecutive_unhealthy} consecutive ticks — "
+                        f"idle={_count} idle_in_tx={_idle_in_tx_count} — "
+                        f"restarting to recover health. SAFETY NET firing.",
+                        flush=True,
+                    )
+                    _restart_h = subprocess.run(
+                        ['docker', 'restart', 'authentik-server-1'],
+                        capture_output=True, text=True, timeout=90
+                    )
+                    if _restart_h.returncode == 0:
+                        print("[ak-pg-watchdog] authentik-server-1 restarted (health recovery)", flush=True)
+                    else:
+                        print(f"[ak-pg-watchdog] health-restart failed: {(_restart_h.stderr or '')[:120]}", flush=True)
+                    _consecutive_unhealthy = 0
+                    _wt.sleep(180)
+                    continue
+            except Exception:
+                pass  # Never block the main safety net
 
             # v0.9.27-alpha hotfix #4: proactive ghost-Channels reap on
             # observed starvation. Two trigger conditions, EITHER suffices:
@@ -31345,7 +31409,8 @@ def _authentik_channels_pool_watchdog_loop():
                     )
                 print(
                     f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
-                    f"(threshold={_threshold}, {_mr_str}) — restarting authentik-server-1. "
+                    f"(threshold={_threshold}, idle_in_tx={_idle_in_tx_count}, {_mr_str}) — "
+                    f"restarting authentik-server-1. "
                     f"SAFETY NET firing.{_cls_str} {_pgb_note}",
                     flush=True
                 )
@@ -31370,6 +31435,43 @@ def _authentik_channels_pool_watchdog_loop():
                         pass
                 # Sleep longer after restart to let server recover before next check
                 _wt.sleep(180)
+            elif _idle_in_tx_count > _idle_in_tx_threshold:
+                # v0.9.36: idle-in-transaction storm. Requests are being cancelled
+                # mid-transaction (asgiref CancelledError — typically Caddy upstream
+                # timeout fires before Django can commit). PgBouncer holds the server
+                # connection until the transaction closes, so connections accumulate
+                # until idle_in_transaction_session_timeout (300s) kills them. The
+                # watchdog's action (restart server) flushes gunicorn's thread pool,
+                # clearing all abandoned transactions immediately.
+                _mr_cur, _ = _authentik_max_requests_get_current()
+                _mr_str_tx = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
+                print(
+                    f"[ak-pg-watchdog] ALERT: {_idle_in_tx_count} idle-in-transaction PG connections "
+                    f"(threshold={_idle_in_tx_threshold}, idle={_count}, {_mr_str_tx}) — "
+                    f"CancelledError/mid-tx abandonment storm detected. "
+                    f"Restarting authentik-server-1. SAFETY NET firing.",
+                    flush=True
+                )
+                _authentik_max_requests_autotune_record_fire(
+                    idle_count=_idle_in_tx_count, threshold=_idle_in_tx_threshold, current_max=_mr_cur
+                )
+                _restart_tx = subprocess.run(
+                    ['docker', 'restart', 'authentik-server-1'],
+                    capture_output=True, text=True, timeout=90
+                )
+                if _restart_tx.returncode == 0:
+                    print(f"[ak-pg-watchdog] authentik-server-1 restarted — idle-in-tx cleared", flush=True)
+                    try:
+                        _autotune_log(f"WATCHDOG_RESTART_OK | idle_in_tx={_idle_in_tx_count} cleared")
+                    except Exception:
+                        pass
+                else:
+                    print(f"[ak-pg-watchdog] restart failed: {(_restart_tx.stderr or '')[:120]}", flush=True)
+                    try:
+                        _autotune_log(f"WATCHDOG_RESTART_FAIL | idle_in_tx={_idle_in_tx_count} {(_restart_tx.stderr or '')[:120]}")
+                    except Exception:
+                        pass
+                _wt.sleep(180)
             elif _count > 80:
                 _mr_cur, _ = _authentik_max_requests_get_current()
                 # v0.9.27: reuse the classification we already ran for autotune.
@@ -31383,12 +31485,14 @@ def _authentik_channels_pool_watchdog_loop():
                     )
                 print(
                     f"[ak-pg-watchdog] {_count} idle PG connections "
-                    f"(threshold={_threshold}) — accumulation in progress, monitoring{_cls_str}",
+                    f"(threshold={_threshold}, idle_in_tx={_idle_in_tx_count}) — "
+                    f"accumulation in progress, monitoring{_cls_str}",
                     flush=True
                 )
                 try:
                     _autotune_log(
-                        f"ACCUMULATING | idle={_count} threshold={_threshold} "
+                        f"ACCUMULATING | idle={_count} idle_in_tx={_idle_in_tx_count} "
+                        f"threshold={_threshold} "
                         f"MAX_REQUESTS={_mr_cur if _mr_cur is not None else '?'}"
                         + (
                             f" classes:Channels={_ch}/dramatiq={_dr}/cache={_ca}/adv={_adv}/other={_other}"
