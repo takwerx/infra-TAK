@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.35-alpha](docs/RELEASE-v0.9.35-alpha.md)**
+**Current release: [v0.9.36-alpha](docs/RELEASE-v0.9.36-alpha.md)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
 
@@ -338,6 +338,14 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.36-alpha — 2026-05-21 — Authentik watchdog blind-spot fix: idle-in-transaction storm detection + server-health auto-recovery — RELEASED 2026-05-21 to `main`
+
+**Headline: two gaps in the Authentik PG watchdog closed.** (1) Watchdog SQL monitored `state='idle'` only — the `state='idle in transaction'` class (asgiref `CancelledError` mid-transaction storm, where Caddy upstream timeout fires before Django can commit, leaving abandoned open transactions) was completely invisible. 130 abandoned transactions accumulated on tak-10 during a live incident while the watchdog saw 49 idle connections against a threshold of 150 and never fired. Fixed: single round-trip dual-count query returns both `idle` and `idle in transaction`; new `_AUTHENTIK_IDLE_IN_TX_WATCHDOG_THRESHOLD=60` (configurable) restarts the server when exceeded. (2) No health-check watchdog — when `authentik-server-1` went `(unhealthy)` (gunicorn thread pool saturated, health probe timeout), nothing auto-recovered it and the LDAP outpost flooded with 502s. Fixed: `_consecutive_unhealthy` counter per watchdog tick; 2 consecutive `(unhealthy)` readings (~4 min) → `docker restart authentik-server-1`. `idle_in_transaction_session_timeout` deliberately kept at 300s (lowering risks Django migration crash-loop on slow-disk SSDNodes per v0.8.8 history). Watchdog restart is the correct response.
+
+- **Fleet validation:** test6 / test8 / test12 pulled `2cc833e`, ~26 min soak (operator-authorized early gate). Live watchdog proof on test12: first tick detected 80 idle-in-tx > threshold 60, ALERT fired, server restarted, connections cleared 80→0.
+
+Full notes: [docs/RELEASE-v0.9.36-alpha.md](docs/RELEASE-v0.9.36-alpha.md).
 
 ### v0.9.35-alpha — 2026-05-20 — Seven bugfixes: Node-RED backup restore CORS fix + CloudTAK update checkout + CloudTAK spinner + server-side update banner + atakatak nag removed + Help CLI recovery + TAK Server corrupted .deb self-healing — RELEASED 2026-05-20 to `main`
 
