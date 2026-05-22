@@ -366,8 +366,16 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.36-alpha"
+VERSION = "0.9.37-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
+# Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
+# the full T&E validation on the new Authentik version across ≥3 dev boxes.
+# Main-channel boxes will never be offered a version above AUTHENTIK_VETTED_RELEASE.
+# Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
+# the version currently under validation.  When vetting passes, promote DEV → VETTED and
+# bump VERSION to a new infra-TAK release.
+AUTHENTIK_VETTED_RELEASE = "2026.2.3"   # fleet-validated — safe for all customers
+AUTHENTIK_DEV_RELEASE    = "2026.5.0"   # under validation on dev channel (2026-05-22)
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -12096,6 +12104,22 @@ def _get_authentik_latest_release_tag(use_cache=True):
         return _authentik_release_cache.get('tag')
 
 
+def _get_authentik_target_release(settings=None):
+    """Return the operator-approved Authentik version for this box's channel.
+
+    Dev channel (update_channel='dev' in settings.json): AUTHENTIK_DEV_RELEASE — the
+    version currently under validation by the operator.
+
+    Main channel (default): AUTHENTIK_VETTED_RELEASE — the last fleet-validated release.
+    Customers on main are never offered an Authentik version that hasn't been explicitly
+    vetted and promoted by bumping AUTHENTIK_VETTED_RELEASE in a new infra-TAK release.
+    """
+    if settings is None:
+        settings = load_settings()
+    channel = (settings.get('update_channel') or 'main').strip().lower()
+    return AUTHENTIK_DEV_RELEASE if channel == 'dev' else AUTHENTIK_VETTED_RELEASE
+
+
 def _get_authentik_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for Authentik."""
     out = {'version': '', 'update_available': False, 'latest': None}
@@ -12140,15 +12164,28 @@ def _get_authentik_version_info():
                             out['version'] = m.group(1).strip()
         except Exception:
             pass
-    # Compare against latest release
-    latest = _get_authentik_latest_release_tag()
-    if latest:
-        out['latest'] = latest
-        if out['version']:
-            installed = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
-            if installed and installed != latest:
+    # Compare against channel-appropriate vetted target (not raw GitHub latest).
+    # Main channel → AUTHENTIK_VETTED_RELEASE; dev channel → AUTHENTIK_DEV_RELEASE.
+    # update_available is only True when target > installed (never show a downgrade badge).
+    _s = load_settings()
+    _channel = (_s.get('update_channel') or 'main').strip().lower()
+    target = _get_authentik_target_release(_s)
+    out['latest'] = target
+    out['vetted_release'] = AUTHENTIK_VETTED_RELEASE
+    out['dev_release'] = AUTHENTIK_DEV_RELEASE
+    out['channel'] = _channel
+    if out['version']:
+        installed = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
+        out['version'] = installed
+        if installed and installed != target:
+            # Only flag as update_available if target is strictly newer (no downgrade badge)
+            try:
+                _t = tuple(int(x) for x in re.findall(r'\d+', target))
+                _i = tuple(int(x) for x in re.findall(r'\d+', installed))
+                if _t > _i:
+                    out['update_available'] = True
+            except Exception:
                 out['update_available'] = True
-            out['version'] = installed
     return out
 
 
@@ -24572,9 +24609,8 @@ def authentik_control():
         elif action == 'restart':
             _ssh_probe(remote, f'cd {ak_dir} && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=180)
         elif action == 'update':
-            latest = _get_authentik_latest_release_tag(use_cache=False)
-            if latest:
-                _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
+            latest = _get_authentik_target_release(settings)
+            _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
             _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose up -d 2>&1', timeout=300)
         else:
             return jsonify({'error': 'Invalid action'}), 400
@@ -24592,16 +24628,15 @@ def authentik_control():
         subprocess.run(f'cd {ak_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
     elif action == 'update':
         import re as _re
-        latest = _get_authentik_latest_release_tag(use_cache=False)
+        latest = _get_authentik_target_release(settings)
         cp = os.path.join(ak_dir, 'docker-compose.yml')
-        if latest:
-            if os.path.isfile(cp):
-                with open(cp) as _f:
-                    _cc = _f.read()
-                _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
-                if _new != _cc:
-                    with open(cp, 'w') as _f:
-                        _f.write(_new)
+        if os.path.isfile(cp):
+            with open(cp) as _f:
+                _cc = _f.read()
+            _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
+            if _new != _cc:
+                with open(cp, 'w') as _f:
+                    _f.write(_new)
         _ensure_authentik_compose_patches(cp)
         subprocess.run(f'cd {ak_dir} && docker compose pull && docker compose up -d && docker image prune -f', shell=True, capture_output=True, text=True, timeout=300)
     else:
@@ -25463,8 +25498,8 @@ entries:
     # Step 5: Generate docker-compose.yml and copy
     plog("")
     plog("━━━ Step 5/8: Creating Docker Compose ━━━")
-    _ak_latest = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
-    plog(f"  Authentik version: {_ak_latest}")
+    _ak_latest = _get_authentik_target_release()
+    plog(f"  Authentik version: {_ak_latest} (channel: {(load_settings().get('update_channel') or 'main')})")
     compose_content = """services:
   postgresql:
     image: docker.io/library/postgres:16-alpine
@@ -33636,14 +33671,24 @@ entries:
             # The inline text-based pg_cmd injection has been removed to avoid duplicate-key emissions.
             # _ensure_authentik_compose_patches is called after the file is written (see below).
 
-        # Pin AUTHENTIK_TAG to latest stable release
-        ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
-        plog(f"  Authentik version: {ak_tag}")
+        # Pin AUTHENTIK_TAG to the channel-appropriate vetted release.
+        # Only upgrade (target > current); never silently downgrade an operator-upgraded install.
+        ak_tag = _get_authentik_target_release()
+        plog(f"  Authentik version target: {ak_tag}")
         for i, l in enumerate(lines):
             m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)
-            if m and m.group(1).strip() != ak_tag:
-                lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
-                needs_write = True
+            if m:
+                cur_tag = m.group(1).strip()
+                if cur_tag != ak_tag:
+                    try:
+                        _ct = tuple(int(x) for x in re.findall(r'\d+', cur_tag))
+                        _tt = tuple(int(x) for x in re.findall(r'\d+', ak_tag))
+                        if _tt > _ct:
+                            lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                            needs_write = True
+                    except Exception:
+                        lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                        needs_write = True
         # Inject healthchecks for server and worker if missing (upstream compose may not have them)
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
             _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
@@ -34788,9 +34833,9 @@ body{display:flex;min-height:100vh}
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
@@ -34800,7 +34845,7 @@ body{display:flex;min-height:100vh}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
 </div>
 <div id="ak-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
 </div>
