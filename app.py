@@ -24730,6 +24730,50 @@ def _authentik_installed_for_reconfigure():
     return False
 
 
+@app.route('/api/authentik/container-stats')
+@login_required
+def authentik_container_stats():
+    """Return per-container CPU (system-normalized %) + RAM for the Authentik service cards."""
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    _stats_cmd = 'docker stats --no-stream --format "{{.Name}}|||{{.CPUPerc}}|||{{.MemUsage}}" 2>/dev/null'
+    _stats_raw = ''
+    _is_remote = deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip()
+    try:
+        if _is_remote:
+            _ok, _stats_raw = _ssh_probe(deploy_cfg['remote'], _stats_cmd, timeout=20)
+            if not _ok:
+                _stats_raw = ''
+        else:
+            _r = subprocess.run(_stats_cmd, shell=True, capture_output=True, text=True, timeout=15)
+            _stats_raw = _r.stdout or ''
+    except Exception:
+        pass
+    _vcpu = None
+    try:
+        _vcpu = _get_vcpu_count_remote(deploy_cfg['remote']) if _is_remote else _get_vcpu_count_local()
+    except Exception:
+        pass
+    result = {}
+    for _sl in (_stats_raw or '').strip().split('\n'):
+        if not _sl.strip():
+            continue
+        _sp = _sl.split('|||')
+        if len(_sp) >= 3:
+            _cn = _sp[0].strip().lstrip('/')
+            _cpu_s = _sp[1].strip().rstrip('%')
+            _mem_s = _sp[2].strip().split('/')[0].strip()
+            if not _cn.startswith('authentik'):
+                continue
+            try:
+                _raw = round(float(_cpu_s), 1)
+                _sys = round(_raw / _vcpu, 1) if (_vcpu and _vcpu > 1) else _raw
+                result[_cn] = {'cpu_raw': _raw, 'cpu_sys': _sys, 'mem': _mem_s, 'vcpu_count': _vcpu}
+            except ValueError:
+                pass
+    return jsonify(result)
+
+
 @app.route('/api/authentik/reconfigure', methods=['POST'])
 @login_required
 def authentik_reconfigure():
@@ -34962,7 +35006,7 @@ body{display:flex;min-height:100vh}
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div class="svc-grid">
 {% for c in container_info.containers %}
-<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'healthy' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div>{% if 'cpu_sys' in c %}<div style="font-size:10px;margin-top:4px;line-height:1.5"><span style="color:{{ 'var(--red)' if c.cpu_sys >= 50 else 'var(--text-dim)' }}" title="{{ c.cpu_raw }}% per-core{{ ' · investigate if sustained' if c.cpu_sys >= 50 else '' }}">{{ c.cpu_sys }}% sys</span><span style="color:var(--text-dim);margin-left:6px">{{ c.mem }}</span></div>{% endif %}</div>
+<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'healthy' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div>{% if 'cpu_sys' in c %}<div id="svc-metrics-{{ c.name }}" style="font-size:10px;margin-top:4px;line-height:1.5"><span class="svc-cpu" style="color:{{ 'var(--red)' if c.cpu_sys >= 50 else 'var(--text-dim)' }}" title="{{ c.cpu_raw }}% per-core{{ ' · investigate if sustained' if c.cpu_sys >= 50 else '' }}">{{ c.cpu_sys }}% sys</span><span class="svc-mem" style="color:var(--text-dim);margin-left:6px">{{ c.mem }}</span></div>{% endif %}</div>
 {% endfor %}
 <div class="svc-card" onclick="filterLogs('')" style="cursor:pointer" id="svc-all"><div class="svc-name">all containers</div><div class="svc-status" style="color:var(--text-dim)">● combined</div></div>
 </div>
@@ -35434,6 +35478,29 @@ async function loadContainerLogs(){
     }catch(e){el.textContent='Failed to load logs';}
 }
 if(document.getElementById('container-log')){loadContainerLogs();setInterval(loadContainerLogs,10000)}
+
+async function refreshContainerStats(){
+    try{
+        var r=await fetch('/api/authentik/container-stats');
+        if(!r.ok)return;
+        var data=await r.json();
+        for(var name in data){
+            var el=document.getElementById('svc-metrics-'+name);
+            if(!el)continue;
+            var d=data[name];
+            var cpuSys=Number(d.cpu_sys||0);
+            var cpuEl=el.querySelector('.svc-cpu');
+            var memEl=el.querySelector('.svc-mem');
+            if(cpuEl){
+                cpuEl.textContent=cpuSys.toFixed(1)+'% sys';
+                cpuEl.style.color=cpuSys>=50?'var(--red)':'var(--text-dim)';
+                cpuEl.title=Number(d.cpu_raw||0).toFixed(1)+'% per-core'+(cpuSys>=50?' · investigate if sustained':'');
+            }
+            if(memEl)memEl.textContent=d.mem||'';
+        }
+    }catch(e){}
+}
+if(document.querySelector('[id^="svc-metrics-"]')){refreshContainerStats();setInterval(refreshContainerStats,15000);}
 
 async function loadRemoteMetrics(){
     var bar=document.getElementById('remote-metrics-bar');
