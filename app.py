@@ -24564,7 +24564,48 @@ def authentik_page():
             if line.strip():
                 parts = line.split('|||')
                 containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
+        # Fetch per-container CPU/RAM for the service cards (non-blocking; ignore errors)
+        _stats_cmd = 'docker stats --no-stream --format "{{.Name}}|||{{.CPUPerc}}|||{{.MemUsage}}" 2>/dev/null'
+        _stats_by_name = {}
+        try:
+            if ak_deploy.get('target_mode') == 'remote' and (ak_deploy.get('remote', {}).get('host') or '').strip():
+                _ok_s, _stats_raw = _ssh_probe(ak_deploy['remote'], _stats_cmd, timeout=20)
+                _stats_raw = (_stats_raw or '') if _ok_s else ''
+            else:
+                _sr = subprocess.run(_stats_cmd, shell=True, capture_output=True, text=True, timeout=15)
+                _stats_raw = _sr.stdout or ''
+            for _sl in _stats_raw.strip().split('\n'):
+                if not _sl.strip():
+                    continue
+                _sp = _sl.split('|||')
+                if len(_sp) >= 3:
+                    _cn = _sp[0].strip().lstrip('/')
+                    _cpu_s = _sp[1].strip().rstrip('%')
+                    _mem_s = _sp[2].strip().split('/')[0].strip()
+                    try:
+                        _stats_by_name[_cn] = {'cpu_raw': round(float(_cpu_s), 1), 'mem': _mem_s}
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+        _vcpu = None
+        try:
+            if ak_deploy.get('target_mode') == 'remote' and (ak_deploy.get('remote', {}).get('host') or '').strip():
+                _vcpu = _get_vcpu_count_remote(ak_deploy.get('remote', {}))
+            else:
+                _vcpu = _get_vcpu_count_local()
+        except Exception:
+            pass
+        for _c in containers:
+            _s = _stats_by_name.get(_c['name'], {})
+            if _s:
+                _raw = _s['cpu_raw']
+                _sys = round(_raw / _vcpu, 1) if (_vcpu and _vcpu > 1) else _raw
+                _c['cpu_raw'] = _raw
+                _c['cpu_sys'] = _sys
+                _c['mem'] = _s['mem']
         container_info['containers'] = containers
+        container_info['vcpu_count'] = _vcpu
     modules = detect_modules()
     portal_installed = modules.get('takportal', {}).get('installed', False)
     portal_running = modules.get('takportal', {}).get('running', False)
@@ -24588,7 +24629,8 @@ def authentik_page():
         portal_installed=portal_installed,
         portal_running=portal_running,
         authentik_deploy_cfg=authentik_deploy_cfg,
-        remote_host=remote_host)
+        remote_host=remote_host,
+        vcpu_count=container_info.get('vcpu_count'))
 
 @app.route('/api/authentik/control', methods=['POST'])
 @login_required
@@ -34920,7 +34962,7 @@ body{display:flex;min-height:100vh}
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div class="svc-grid">
 {% for c in container_info.containers %}
-<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'healthy' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div></div>
+<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'healthy' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div>{% if 'cpu_sys' in c %}<div style="font-size:10px;margin-top:4px;line-height:1.5"><span style="color:{{ 'var(--red)' if c.cpu_sys >= 50 else 'var(--text-dim)' }}" title="{{ c.cpu_raw }}% per-core{{ ' · investigate if sustained' if c.cpu_sys >= 50 else '' }}">{{ c.cpu_sys }}% sys</span><span style="color:var(--text-dim);margin-left:6px">{{ c.mem }}</span></div>{% endif %}</div>
 {% endfor %}
 <div class="svc-card" onclick="filterLogs('')" style="cursor:pointer" id="svc-all"><div class="svc-name">all containers</div><div class="svc-status" style="color:var(--text-dim)">● combined</div></div>
 </div>
