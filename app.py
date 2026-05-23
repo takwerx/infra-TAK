@@ -17722,6 +17722,12 @@ def _run_webodm_deploy(settings):
         s['webodm_enabled'] = True
         save_settings(s)
         generate_caddyfile(s)
+        import subprocess as _sp2
+        try:
+            _sp2.run(['systemctl', 'reload', 'caddy'], timeout=15, check=True)
+            plog('Caddy reloaded — TLS cert provisioning started.')
+        except Exception as ce:
+            plog(f'Caddy reload warning: {ce}')
         plog('WebODM deployed successfully.')
         _webodm_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as exc:
@@ -17783,6 +17789,7 @@ def webodm_disable():
     s['webodm_enabled'] = False
     save_settings(s)
     generate_caddyfile(s)
+    _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
     return jsonify({'success': True})
 
 
