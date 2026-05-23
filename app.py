@@ -1159,7 +1159,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         parts.append(link('/cesium-tiles', '<span class="nav-icon material-symbols-outlined">terrain</span>Cesium 3D Tiles'))
     wo = modules.get('webodm', {})
     if wo.get('installed'):
-        parts.append(link('/webodm', '<span class="nav-icon material-symbols-outlined">flight</span>WebODM'))
+        parts.append(link('/webodm', '<img src="https://opendronemap.org/wp-content/uploads/2018/07/odm-logo.svg" alt="WebODM" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>WebODM</span>', 'WebODM'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -46432,7 +46432,7 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
-<div class="section-title"><span class="material-symbols-outlined" style="font-size:24px;color:var(--accent)">flight</span>WebODM</div>
+<div class="section-title"><img src="https://opendronemap.org/wp-content/uploads/2018/07/odm-logo.svg" alt="" style="height:28px;width:auto;object-fit:contain">WebODM</div>
 
 {% if not wo.get('installed') %}
 <!-- Deploy state -->
