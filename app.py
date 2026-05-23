@@ -17785,6 +17785,19 @@ def webodm_deploy_status_api():
     return jsonify(_webodm_deploy_status)
 
 
+@app.route('/api/webodm/repair-authentik', methods=['POST'])
+@login_required
+def webodm_repair_authentik():
+    s = load_settings()
+    fqdn = s.get('fqdn', '').strip()
+    ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if not fqdn or not ak_token:
+        return jsonify({'success': False, 'error': 'FQDN or Authentik token not configured'})
+    steps = []
+    _ensure_authentik_webodm_app(fqdn, ak_token, plog=steps.append, settings=s)
+    return jsonify({'success': True, 'steps': steps})
+
+
 @app.route('/api/webodm/uninstall', methods=['POST'])
 @login_required
 def webodm_uninstall():
@@ -27060,6 +27073,9 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     if _is_module_deployed(settings, 'nodered'):
         plog("  Configuring Authentik for Node-RED...")
         _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+    if settings.get('webodm_enabled'):
+        plog("  Configuring Authentik for WebODM...")
+        _ensure_authentik_webodm_app(fqdn, ak_token, plog, settings=settings)
     fh_cfg = _get_fedhub_deployment_config(settings)
     if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
         plog("  Configuring Authentik for Federation Hub (forward auth)...")
@@ -34544,6 +34560,9 @@ def run_authentik_deploy(reconfigure=False):
                         if _is_module_deployed(settings, 'nodered'):
                             plog("  Configuring Authentik for Node-RED...")
                             _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+                        if settings.get('webodm_enabled'):
+                            plog("  Configuring Authentik for WebODM...")
+                            _ensure_authentik_webodm_app(fqdn, ak_token, plog, settings=settings)
                         fh_cfg = _get_fedhub_deployment_config(settings)
                         if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
                             plog("  Configuring Authentik for Federation Hub (forward auth)...")
@@ -35809,6 +35828,10 @@ entries:
                         plog("")
                         plog("  Configuring Authentik for Node-RED...")
                         _ensure_authentik_nodered_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk, settings=settings)
+                    if settings.get('webodm_enabled'):
+                        plog("")
+                        plog("  Configuring Authentik for WebODM...")
+                        _ensure_authentik_webodm_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk, settings=settings)
                     # infra-TAK console (infratak + MediaMTX if deployed) behind Authentik
                     plog("")
                     plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
@@ -46615,6 +46638,7 @@ var _interval = setInterval(function(){
 <span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM
 </a>
 {% endif %}
+<button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
 <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').style.display='flex'">Uninstall</button>
 </div>
 </div>
@@ -46672,6 +46696,13 @@ function startDeploy(){
         if(d.success){window.location.reload();}
         else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
     }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
+}
+function repairAuthentik(btn){
+    btn.disabled=true;btn.textContent='Repairing…';
+    fetch('/api/webodm/repair-authentik',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){showToast('✓ Authentik configured — try opening WebODM now.');btn.textContent='↻ Repair Authentik';btn.disabled=false;}
+        else{showToast('Error: '+(d.error||'unknown'));btn.textContent='↻ Repair Authentik';btn.disabled=false;}
+    }).catch(e=>{showToast('Network error');btn.textContent='↻ Repair Authentik';btn.disabled=false;});
 }
 function doUninstall(){
     var msg=document.getElementById('uninstall-msg');
