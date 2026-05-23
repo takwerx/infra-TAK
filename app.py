@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.37-alpha"
+VERSION = "0.9.38-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -7438,6 +7438,13 @@ def cloudtak_page():
             sec_legacy_install = not os.path.exists(os.path.join(_ct_dir, '.postgres-password'))
     except Exception:
         pass
+    # Only probe plugin dirs when CloudTAK is installed locally — skip for remote
+    ct_plugins = []
+    if cloudtak.get('installed') and cloudtak_cfg.get('target_mode') != 'remote':
+        try:
+            ct_plugins = _detect_cloudtak_plugins()
+        except Exception:
+            ct_plugins = []
     return render_template_string(CLOUDTAK_TEMPLATE,
         settings=settings, cloudtak=cloudtak,
         version=VERSION,
@@ -7453,6 +7460,7 @@ def cloudtak_page():
         container_info=container_info,
         sec_compromised=sec_compromised,
         sec_legacy_install=sec_legacy_install,
+        cloudtak_plugins=ct_plugins,
         deploying=cloudtak_deploy_status.get('running', False),
         deploy_done=cloudtak_deploy_status.get('complete', False),
         deploy_error=cloudtak_deploy_status.get('error', False))
@@ -14839,6 +14847,31 @@ cloudtak_deploy_status = {'running': False, 'complete': False, 'error': False}
 cloudtak_uninstall_status = {'running': False, 'done': False, 'error': None}
 _cloudtak_deploy_lock = threading.Lock()
 
+# Plugin catalog — each entry describes a community CloudTAK plugin.
+# install_dir: subdirectory under ~/CloudTAK/api/web/plugins/ that Vite
+#   auto-discovers via import.meta.glob at build time (no wiring needed).
+CLOUDTAK_PLUGINS = [
+    {
+        'key': 'ping',
+        'name': 'Cell Ping / RTT',
+        'description': (
+            'Plot cellphone tower coverage as CoT features. '
+            'Cell Ping produces a u-d-c-c uncertainty circle; '
+            'RTT produces a u-rb-a arc (±70° wedge). '
+            'Posts directly to an active DataSync mission.'
+        ),
+        'repo': 'https://github.com/clptak/cloudtak-plugin-cellphone',
+        'install_dir': 'ping',
+        'requires': 'CloudTAK 13.2+',
+        'author': 'clptak',
+        'license': 'MIT',
+    },
+]
+
+cloudtak_plugin_log = []
+cloudtak_plugin_status = {'running': False, 'complete': False, 'error': False, 'action': '', 'plugin': ''}
+_cloudtak_plugin_lock = threading.Lock()
+
 @app.route('/api/cloudtak/deployment-config', methods=['GET'])
 @login_required
 def cloudtak_get_deployment_config():
@@ -15567,6 +15600,168 @@ def cloudtak_reset_server_config():
             return jsonify({'success': False, 'error': 'docker compose restart timed out'}), 500
         fqdn = settings.get('fqdn', '')
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
+
+
+def _detect_cloudtak_plugins():
+    """Return the CLOUDTAK_PLUGINS catalog annotated with installed=True/False and commit info."""
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
+    result = []
+    for p in CLOUDTAK_PLUGINS:
+        install_path = os.path.join(plugins_base, p['install_dir'])
+        installed = os.path.isdir(install_path)
+        commit = None
+        if installed:
+            try:
+                r = subprocess.run(
+                    ['git', '-C', install_path, 'log', '--oneline', '-1'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    commit = (r.stdout.strip() or '')[:60]
+            except Exception:
+                pass
+        result.append({**p, 'installed': installed, 'commit': commit})
+    return result
+
+
+def _run_cloudtak_plugin_action(plugin_key, action):
+    """Background thread: install / update / remove a CloudTAK plugin then rebuild the API image."""
+    global cloudtak_plugin_log, cloudtak_plugin_status
+    cloudtak_plugin_log = []
+    cloudtak_plugin_status = {'running': True, 'complete': False, 'error': False, 'action': action, 'plugin': plugin_key}
+
+    plugin = next((p for p in CLOUDTAK_PLUGINS if p['key'] == plugin_key), None)
+    if not plugin:
+        cloudtak_plugin_log.append(f'Unknown plugin key: {plugin_key}')
+        cloudtak_plugin_status.update({'running': False, 'error': True})
+        return
+
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
+    install_path = os.path.join(plugins_base, plugin['install_dir'])
+
+    def plog(msg):
+        ts = datetime.now().strftime('%H:%M:%S')
+        entry = f'[{ts}] {msg}'
+        cloudtak_plugin_log.append(entry)
+        print(entry, flush=True)
+
+    def run_cmd(cmd, cwd=None, timeout=600, shell=False):
+        cmd_str = cmd if isinstance(cmd, str) else ' '.join(cmd)
+        plog(f'$ {cmd_str}')
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, shell=shell)
+            for line in (r.stdout or '').splitlines():
+                if line.strip():
+                    plog(line)
+            for line in (r.stderr or '').splitlines():
+                if line.strip():
+                    plog(line)
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            plog('Error: command timed out')
+            return False
+        except Exception as e:
+            plog(f'Error: {e}')
+            return False
+
+    try:
+        if action == 'install':
+            plog(f'Installing plugin: {plugin["name"]}')
+            if os.path.isdir(install_path):
+                plog(f'Plugin directory already exists at {install_path} — already installed?')
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+            os.makedirs(plugins_base, exist_ok=True)
+            plog('Cloning plugin repository...')
+            if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+
+        elif action == 'update':
+            plog(f'Updating plugin: {plugin["name"]}')
+            if not os.path.isdir(install_path):
+                plog(f'Plugin not installed at {install_path}')
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+            if not run_cmd(['git', '-C', install_path, 'pull']):
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+
+        elif action == 'remove':
+            plog(f'Removing plugin: {plugin["name"]}')
+            if not os.path.isdir(install_path):
+                plog('Plugin is not installed — nothing to remove')
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+            import shutil
+            shutil.rmtree(install_path)
+            plog(f'Removed {install_path}')
+
+        # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
+        # This is the same step the upstream plugin README requires.
+        plog('')
+        plog('Rebuilding CloudTAK API image — this takes 5–15 minutes...')
+        if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'cloudtak-api'], cwd=ct_dir, timeout=1200):
+            cloudtak_plugin_status.update({'running': False, 'error': True})
+            return
+
+        plog('Restarting CloudTAK API container...')
+        if not run_cmd(['docker', 'compose', 'up', '-d', '--force-recreate', 'cloudtak-api'], cwd=ct_dir, timeout=120):
+            cloudtak_plugin_status.update({'running': False, 'error': True})
+            return
+
+        action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
+        plog(f'✓ Plugin {action_label} successfully. Reload CloudTAK in your browser to see the change.')
+        cloudtak_plugin_status.update({'running': False, 'complete': True, 'error': False})
+
+    except Exception as e:
+        plog(f'Unexpected error: {e}')
+        cloudtak_plugin_status.update({'running': False, 'error': True})
+
+
+@app.route('/api/cloudtak/plugins/list')
+@login_required
+def cloudtak_plugins_list():
+    """Return plugin catalog with installed/commit state and current action status."""
+    plugins = _detect_cloudtak_plugins()
+    return jsonify({'plugins': plugins, 'status': cloudtak_plugin_status})
+
+
+@app.route('/api/cloudtak/plugins/action', methods=['POST'])
+@login_required
+def cloudtak_plugin_action():
+    """Trigger install / update / remove for a named plugin."""
+    with _cloudtak_plugin_lock:
+        if cloudtak_plugin_status.get('running'):
+            return jsonify({'error': 'Another plugin action is already running'}), 409
+    data = request.get_json() or {}
+    plugin_key = (data.get('plugin') or '').strip()
+    action = (data.get('action') or '').strip()
+    if not plugin_key or action not in ('install', 'update', 'remove'):
+        return jsonify({'error': 'Invalid request — provide plugin key and action (install/update/remove)'}), 400
+    if not any(p['key'] == plugin_key for p in CLOUDTAK_PLUGINS):
+        return jsonify({'error': f'Unknown plugin: {plugin_key}'}), 400
+    t = threading.Thread(target=_run_cloudtak_plugin_action, args=(plugin_key, action), daemon=True)
+    t.start()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/cloudtak/plugins/log')
+@login_required
+def cloudtak_plugin_log_api():
+    """Poll plugin action log (same ?index=N pattern as /api/cloudtak/deploy/log)."""
+    idx = max(0, int(request.args.get('index', 0)))
+    return jsonify({
+        'entries': cloudtak_plugin_log[idx:],
+        'total': len(cloudtak_plugin_log),
+        'running': cloudtak_plugin_status.get('running', False),
+        'complete': cloudtak_plugin_status.get('complete', False),
+        'error': cloudtak_plugin_status.get('error', False),
+        'action': cloudtak_plugin_status.get('action', ''),
+        'plugin': cloudtak_plugin_status.get('plugin', ''),
+    })
 
 
 def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass='docker', remote_host=''):
@@ -23059,6 +23254,106 @@ window.doUninstall = function() {
   });
 };
 
+/* ── CloudTAK Plugin Manager ─────────────────────────────────────── */
+
+window._ctPluginLogIndex = 0;
+window._ctPluginLogInterval = null;
+
+window.ctPluginAction = function(pluginKey, action) {
+  var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
+  if (action === 'remove') {
+    if (!confirm('Remove plugin "' + pluginKey + '"? This will rebuild the CloudTAK API image (~5–15 min).')) return;
+  } else if (action === 'update') {
+    if (!confirm('Update plugin "' + pluginKey + '"? This will pull the latest code and rebuild the API image.')) return;
+  }
+
+  var logCard = document.getElementById('ct-plugin-log-card');
+  var logEl   = document.getElementById('ct-plugin-log');
+  var labelEl = document.getElementById('ct-plugin-log-action');
+
+  if (logCard) logCard.style.display = 'block';
+  if (logEl)   logEl.textContent = 'Starting ' + label.toLowerCase() + '...';
+  if (labelEl) labelEl.textContent = '— ' + label + ' ' + pluginKey;
+  if (logCard) logCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  window._ctPluginLogIndex = 0;
+
+  fetch('/api/cloudtak/plugins/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plugin: pluginKey, action: action }),
+    credentials: 'same-origin'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d && d.error) {
+      if (logEl) logEl.textContent = 'Error: ' + d.error;
+      return;
+    }
+    window._ctPollPluginLog();
+  }).catch(function(e) {
+    if (logEl) logEl.textContent = 'Request failed: ' + (e && e.message ? e.message : String(e));
+  });
+};
+
+window._ctPollPluginLog = function() {
+  if (window._ctPluginLogInterval) clearInterval(window._ctPluginLogInterval);
+  window._ctPluginPollFails = 0;
+
+  function doPoll() {
+    fetch('/api/cloudtak/plugins/log?index=' + window._ctPluginLogIndex, { credentials: 'same-origin' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        window._ctPluginPollFails = 0;
+        if (!d) return;
+        var logEl = document.getElementById('ct-plugin-log');
+        if (d.entries && d.entries.length) {
+          var text = d.entries.join('\n') + '\n';
+          if (window._ctPluginLogIndex === 0) {
+            if (logEl) logEl.textContent = text;
+          } else {
+            if (logEl) logEl.textContent = (logEl.textContent || '') + text;
+          }
+          if (logEl) logEl.scrollTop = logEl.scrollHeight;
+          window._ctPluginLogIndex += d.entries.length;
+        }
+        if (!d.running) {
+          clearInterval(window._ctPluginLogInterval);
+          window._ctPluginLogInterval = null;
+          if (d.complete) {
+            setTimeout(function() { location.reload(); }, 1500);
+          } else if (d.error) {
+            var logEl2 = document.getElementById('ct-plugin-log');
+            if (logEl2) logEl2.textContent = (logEl2.textContent || '') + '\n\n✗ Action failed (see log above).';
+          }
+        }
+      })
+      .catch(function() {
+        window._ctPluginPollFails = (window._ctPluginPollFails || 0) + 1;
+        if (window._ctPluginPollFails === 1) {
+          var logEl = document.getElementById('ct-plugin-log');
+          if (logEl) logEl.textContent = (logEl.textContent || '') + '\n[Connection interrupted — reconnecting...]';
+        }
+      });
+  }
+
+  doPoll();
+  window._ctPluginLogInterval = setInterval(doPoll, 1000);
+};
+
+/* Resume log polling if a plugin action was already running when the page loaded */
+(function() {
+  fetch('/api/cloudtak/plugins/log?index=0', { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.running) return;
+      var logCard = document.getElementById('ct-plugin-log-card');
+      var labelEl = document.getElementById('ct-plugin-log-action');
+      if (logCard) logCard.style.display = 'block';
+      if (labelEl) labelEl.textContent = d.action ? '— ' + d.action + ' ' + d.plugin : '';
+      window._ctPluginLogIndex = 0;
+      window._ctPollPluginLog();
+    }).catch(function() {});
+})();
+
 window.doCloudtakResetConfig = function() {
   var msgEl = document.getElementById("ct-reset-msg");
   var btn = document.getElementById("ct-reset-confirm-btn");
@@ -23247,6 +23542,63 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card">
     <div class="card-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
     <div class="log-box" id="container-logs">Loading...</div>
+  </div>
+  {% endif %}
+
+  <!-- Plugins -->
+  {% if cloudtak_cfg.get('target_mode') == 'remote' %}
+  <div class="card" style="background:rgba(59,130,246,.04);border-color:rgba(59,130,246,.2)">
+    <div class="card-title">Plugins</div>
+    <p style="font-size:13px;color:var(--text-dim)">Plugin management is not available for remote CloudTAK installations. Manage plugins directly on the remote host via SSH using the <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="color:var(--cyan)">upstream plugin docs</a>.</p>
+  </div>
+  {% elif cloudtak_plugins is defined %}
+  <div class="card" id="ct-plugins-section">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Plugins</span>
+      <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">upstream docs ↗</a>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
+      Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>cloudtak-api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
+    </p>
+    <div id="ct-plugin-cards" style="display:grid;grid-template-columns:1fr;gap:12px">
+      {% for p in cloudtak_plugins %}
+      <div style="background:var(--bg-surface);border:1px solid {% if p.installed %}rgba(16,185,129,.35){% else %}var(--border){% endif %};border-radius:10px;padding:16px 20px" id="ct-plugin-card-{{ p.key }}">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px">{{ p.name }}</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;line-height:1.5">{{ p.description }}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">author: {{ p.author }}</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">{{ p.license }}</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">requires {{ p.requires }}</span>
+            </div>
+            <a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>
+            {% if p.installed and p.commit %}
+            <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.commit }}</div>
+            {% endif %}
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex-shrink:0">
+            {% if p.installed %}
+            <span style="font-size:11px;font-weight:600;color:var(--green);background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:5px;padding:3px 9px">INSTALLED</span>
+            <button class="btn btn-ghost" style="font-size:12px;padding:7px 14px" onclick="ctPluginAction('{{ p.key }}','update')">⬆ Update</button>
+            <button class="btn" style="font-size:12px;padding:7px 14px;background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)" onclick="ctPluginAction('{{ p.key }}','remove')">Remove</button>
+            {% else %}
+            <span style="font-size:11px;font-weight:600;color:var(--text-dim);background:var(--bg-card);border:1px solid var(--border);border-radius:5px;padding:3px 9px">NOT INSTALLED</span>
+            <button class="btn btn-primary" style="font-size:12px;padding:7px 14px" onclick="ctPluginAction('{{ p.key }}','install')">Install</button>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Plugin action log (hidden until an action starts) -->
+    <div id="ct-plugin-log-card" style="display:none;margin-top:20px">
+      <div class="section-title" style="margin-bottom:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+      <div class="log-box" id="ct-plugin-log">Waiting...</div>
+    </div>
   </div>
   {% endif %}
 
