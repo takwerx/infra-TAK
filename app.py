@@ -17776,15 +17776,15 @@ def webodm_deploy_status_api():
     return jsonify(_webodm_deploy_status)
 
 
-@app.route('/api/webodm/disable', methods=['POST'])
+@app.route('/api/webodm/uninstall', methods=['POST'])
 @login_required
-def webodm_disable():
+def webodm_uninstall():
     import subprocess as _sp
     wo_dir = os.path.expanduser('~/webodm')
     compose_path = os.path.join(wo_dir, 'docker-compose.yml')
     if os.path.exists(compose_path):
-        _sp.run(['docker', 'compose', '-f', compose_path, 'down'],
-                capture_output=True, timeout=60, cwd=wo_dir)
+        _sp.run(['docker', 'compose', '-f', compose_path, 'down', '--volumes'],
+                capture_output=True, timeout=90, cwd=wo_dir)
     s = load_settings()
     s['webodm_enabled'] = False
     save_settings(s)
@@ -46483,7 +46483,7 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 <span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM
 </a>
 {% endif %}
-<button class="btn btn-danger" onclick="disableModule()">Disable</button>
+<button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').style.display='flex'">Uninstall</button>
 </div>
 </div>
 </div>
@@ -46517,6 +46517,20 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 </div>
 {% endif %}
 </div>
+
+<!-- Uninstall modal -->
+<div class="modal-overlay" id="uninstall-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:440px;width:90%">
+<div style="font-size:16px;font-weight:700;color:var(--red);margin-bottom:12px">⚠ Uninstall WebODM?</div>
+<div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will stop and remove all WebODM containers and the plugin. Processed job data in <span class="step-code">~/webodm/media/</span> will be preserved on disk.</div>
+<div style="display:flex;gap:10px;justify-content:flex-end">
+<button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').style.display='none'">Cancel</button>
+<button class="btn btn-danger" onclick="doUninstall()">Uninstall</button>
+</div>
+<div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div>
+</div>
+
 <div id="toast" class="toast"></div>
 <script>
 function startDeploy(){
@@ -46527,10 +46541,16 @@ function startDeploy(){
         else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
     }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
 }
-function disableModule(){
-    if(!confirm('Disable WebODM? Containers will be stopped. Data and plugin are preserved.'))return;
-    fetch('/api/webodm/disable',{method:'POST'}).then(()=>window.location.reload());
+function doUninstall(){
+    var msg=document.getElementById('uninstall-msg');
+    msg.textContent='Uninstalling…';
+    fetch('/api/webodm/uninstall',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){msg.textContent='Done. Reloading…';setTimeout(function(){window.location.reload();},800);}
+        else{msg.textContent='Error: '+(d.error||'unknown');}
+    }).catch(e=>{msg.textContent='Network error: '+e.message;});
 }
+var _modal=document.getElementById('uninstall-modal');
+if(_modal){_modal.addEventListener('click',function(e){if(e.target===_modal)_modal.style.display='none';});}
 function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
 </script></body></html>'''
 
