@@ -15713,7 +15713,9 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             return
 
         action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
-        plog(f'✓ Plugin {action_label} successfully. Reload CloudTAK in your browser to see the change.')
+        plog(f'✓ Plugin {action_label} successfully.')
+        if action in ('install', 'update'):
+            plog('  → In CloudTAK: Settings → Refresh App, then look at the bottom of the right-side menu.')
         cloudtak_plugin_status.update({'running': False, 'complete': True, 'error': False})
 
     except Exception as e:
@@ -23558,7 +23560,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">upstream docs ↗</a>
     </div>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
-      Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>cloudtak-api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
+      Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
+      After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong>, then look for the new item at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
     </p>
     <div id="ct-plugin-cards" style="display:grid;grid-template-columns:1fr;gap:12px">
       {% for p in cloudtak_plugins %}
