@@ -984,6 +984,27 @@ def detect_modules():
         'route': '/cesium-tiles',
         'priority': 11,
     }
+    # WebODM — drone photogrammetry + TAK overlay plugin
+    wo_enabled = settings.get('webodm_enabled', False)
+    wo_dir = os.path.expanduser('~/webodm')
+    wo_running = False
+    if wo_enabled:
+        try:
+            import subprocess as _sp
+            result = _sp.run(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp'],
+                             capture_output=True, text=True, timeout=3)
+            wo_running = result.stdout.strip() == 'true'
+        except Exception:
+            pass
+    modules['webodm'] = {
+        'name': 'WebODM',
+        'installed': bool(wo_enabled),
+        'running': wo_running,
+        'description': 'Drone photo processing → 3D Tiles & TAK overlays',
+        'icon': '🚁',
+        'route': '/webodm',
+        'priority': 12,
+    }
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_custom_banner(settings):
@@ -1136,6 +1157,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     ct = modules.get('cesium_tiles', {})
     if ct.get('installed'):
         parts.append(link('/cesium-tiles', '<span class="nav-icon material-symbols-outlined">terrain</span>Cesium 3D Tiles'))
+    wo = modules.get('webodm', {})
+    if wo.get('installed'):
+        parts.append(link('/webodm', '<span class="nav-icon material-symbols-outlined">flight</span>WebODM'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -9357,6 +9381,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'mediamtx': 'stream',
     'fedhub': 'fedhub',
     'cesium_tiles': '3dtiles',
+    'webodm': 'webodm',
 }
 
 def _get_service_domain(settings, service_key):
@@ -11526,6 +11551,28 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cesium_tiles'), ct_host)
+
+    wo_mod = modules.get('webodm', {})
+    if wo_mod.get('installed'):
+        wo_host = sd.get('webodm') or _get_service_domain(settings, 'webodm')
+        wo_port = settings.get('webodm_port', 8765)
+        wo_up = f'127.0.0.1:{wo_port}'
+        lines.append(f"# WebODM — drone photogrammetry + TAK overlay")
+        lines.append(f"{wo_host} {{")
+        if ak.get('installed'):
+            lines.append(f"    route {{")
+            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+            lines.append(f"        forward_auth {ak_up} {{")
+            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+            lines.append(f"            trusted_proxies private_ranges")
+            lines.append(f"        }}")
+            lines.append(f"        reverse_proxy {wo_up}")
+            lines.append(f"    }}")
+        else:
+            lines.append(f"    reverse_proxy {wo_up}")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'webodm'), wo_host)
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
@@ -17502,6 +17549,241 @@ def cesium_tiles_delete(name):
     shutil.rmtree(target)
     settings = load_settings()
     return jsonify({'success': True, 'datasets': _cesium_list_datasets(settings)})
+
+
+# ── WebODM ───────────────────────────────────────────────────────────────────
+
+WEBODM_DOCKER_COMPOSE = '''version: '2.4'
+volumes:
+  wo_dbdata:
+  wo_appmedia:
+services:
+  wo_db:
+    image: webodm/webodm_db
+    container_name: wo_db
+    volumes:
+      - {wo_dir}/db:/var/lib/postgresql/data:Z
+    restart: unless-stopped
+    oom_score_adj: -100
+  wo_broker:
+    image: redis:7.0.10
+    container_name: wo_broker
+    restart: unless-stopped
+    oom_score_adj: -500
+  wo_webapp:
+    image: webodm/webodm_webapp
+    container_name: webapp
+    entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
+    volumes:
+      - {wo_dir}/media:/webodm/app/media:z
+      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/plugins/webodm-tak-overlay:z
+    ports:
+      - "{wo_port}:8000"
+    depends_on:
+      - wo_db
+      - wo_broker
+      - wo_worker
+    environment:
+      - WO_PORT={wo_port}
+      - WO_HOST=0.0.0.0
+      - WO_DEBUG=NO
+      - WO_BROKER=redis://wo_broker
+      - WO_SECRET_KEY={wo_secret}
+      - WEB_CONCURRENCY=2
+    restart: unless-stopped
+  wo_worker:
+    image: webodm/webodm_webapp
+    container_name: wo_worker
+    entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
+    volumes:
+      - {wo_dir}/media:/webodm/app/media:z
+    depends_on:
+      - wo_db
+      - wo_broker
+    environment:
+      - WO_BROKER=redis://wo_broker
+      - WO_DEBUG=NO
+      - WO_SECRET_KEY={wo_secret}
+      - WEB_CONCURRENCY=2
+    restart: unless-stopped
+  wo_nodeodm:
+    image: opendronemap/nodeodm
+    container_name: wo_nodeodm
+    ports:
+      - "127.0.0.1:3001:3000"
+    restart: unless-stopped
+    oom_score_adj: 250
+'''
+
+_webodm_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _webodm_deploy_log(msg, status=None):
+    _webodm_deploy_status['log'].append(msg)
+    if status:
+        _webodm_deploy_status.update(status)
+
+
+def _run_webodm_deploy(settings):
+    import subprocess as _sp
+    import secrets as _sec
+    import shutil as _sh
+    plog = _webodm_deploy_log
+    wo_dir = os.path.expanduser('~/webodm')
+    wo_port = settings.get('webodm_port', 8765)
+    plugin_dir = os.path.join(wo_dir, 'plugins', 'webodm-tak-overlay')
+    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    try:
+        plog('Creating directories…')
+        for sub in ['', 'plugins', 'media', 'db']:
+            os.makedirs(os.path.join(wo_dir, sub) if sub else wo_dir, exist_ok=True)
+
+        plog('Installing TAK overlay plugin…')
+        if os.path.isdir(plugin_dir):
+            _sh.rmtree(plugin_dir)
+        r = _sp.run(['git', 'clone', '--depth=1',
+                     'https://github.com/Humble-Helper-96/webodm-tak-overlay.git',
+                     plugin_dir], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f'Plugin clone failed: {r.stderr[:300]}')
+        plog(f'Plugin cloned: {plugin_dir}')
+
+        plog('Writing docker-compose.yml…')
+        wo_secret = _sec.token_hex(32)
+        compose_content = WEBODM_DOCKER_COMPOSE.format(
+            wo_dir=wo_dir,
+            wo_port=wo_port,
+            wo_secret=wo_secret,
+        )
+        with open(compose_path, 'w') as f:
+            f.write(compose_content)
+
+        plog('Pulling images (this may take several minutes)…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'pull'],
+                    capture_output=True, text=True, timeout=300,
+                    cwd=wo_dir)
+        if r.returncode != 0:
+            plog(f'Pull warning (non-fatal): {r.stderr[:200]}')
+
+        plog('Starting WebODM containers…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+                    capture_output=True, text=True, timeout=120, cwd=wo_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+
+        plog('Waiting for WebODM to become ready (up to 90 s)…')
+        import time as _time
+        import urllib.request as _ur
+        for _ in range(18):
+            _time.sleep(5)
+            try:
+                resp = _ur.urlopen(f'http://127.0.0.1:{wo_port}/', timeout=4)
+                if resp.status < 500:
+                    break
+            except Exception:
+                pass
+        else:
+            plog('WebODM did not respond in time — check logs with: docker logs webapp')
+
+        plog('Registering NodeODM processing node…')
+        import time as _t2
+        _t2.sleep(5)
+        try:
+            import json as _json
+            import urllib.request as _ur2
+            import urllib.parse as _up2
+            # Get CSRF token
+            login_url = f'http://127.0.0.1:{wo_port}/api/token-auth/'
+            data = _up2.urlencode({'username': 'admin', 'password': 'admin'}).encode()
+            req = _ur2.Request(login_url, data=data,
+                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
+            try:
+                resp = _ur2.urlopen(req, timeout=10)
+                token_data = _json.loads(resp.read())
+                token = token_data.get('token', '')
+            except Exception:
+                token = ''
+            if token:
+                node_data = _json.dumps({'hostname': 'wo_nodeodm', 'port': 3000, 'token': ''}).encode()
+                node_req = _ur2.Request(
+                    f'http://127.0.0.1:{wo_port}/api/processingnodes/',
+                    data=node_data,
+                    headers={'Content-Type': 'application/json',
+                             'Authorization': f'JWT {token}'})
+                try:
+                    _ur2.urlopen(node_req, timeout=10)
+                    plog('NodeODM processing node registered.')
+                except Exception as ne:
+                    plog(f'Node registration skipped (do it manually): {ne}')
+        except Exception as e:
+            plog(f'Auto node registration skipped: {e}')
+
+        s = load_settings()
+        s['webodm_enabled'] = True
+        save_settings(s)
+        generate_caddyfile(s)
+        plog('WebODM deployed successfully.')
+        _webodm_deploy_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog(f'ERROR: {exc}')
+        _webodm_deploy_status.update({'running': False, 'complete': False, 'error': str(exc)})
+
+
+@app.route('/webodm')
+@login_required
+def webodm_page():
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    wo = modules.get('webodm', {})
+    wo_host = _get_service_domain(settings, 'webodm')
+    wo_url = f'https://{wo_host}' if wo_host else ''
+    r = make_response(render_template_string(WEBODM_TEMPLATE,
+        settings=settings, modules=modules, wo=wo,
+        wo_url=wo_url,
+        wo_host=wo_host,
+        deploying=_webodm_deploy_status.get('running', False),
+        deploy_done=_webodm_deploy_status.get('complete', False),
+        deploy_error=_webodm_deploy_status.get('error', False),
+        deploy_log=_webodm_deploy_status.get('log', []),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+@app.route('/api/webodm/deploy', methods=['POST'])
+@login_required
+def webodm_deploy():
+    import threading
+    if _webodm_deploy_status.get('running'):
+        return jsonify({'success': False, 'error': 'Deploy already in progress'})
+    _webodm_deploy_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    settings = load_settings()
+    t = threading.Thread(target=_run_webodm_deploy, args=(settings,), daemon=True)
+    t.start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/webodm/deploy-status')
+@login_required
+def webodm_deploy_status_api():
+    return jsonify(_webodm_deploy_status)
+
+
+@app.route('/api/webodm/disable', methods=['POST'])
+@login_required
+def webodm_disable():
+    import subprocess as _sp
+    wo_dir = os.path.expanduser('~/webodm')
+    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    if os.path.exists(compose_path):
+        _sp.run(['docker', 'compose', '-f', compose_path, 'down'],
+                capture_output=True, timeout=60, cwd=wo_dir)
+    s = load_settings()
+    s['webodm_enabled'] = False
+    save_settings(s)
+    generate_caddyfile(s)
+    return jsonify({'success': True})
 
 
 def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
@@ -46098,6 +46380,144 @@ async function doConsoleRollback(){
 }
 </script></body></html>'''
 
+# === WebODM Template ===
+WEBODM_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>WebODM — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0;display:flex;flex-direction:column}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.section-title{font-size:20px;font-weight:700;color:var(--text-primary);margin-bottom:24px;display:flex;align-items:center;gap:10px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}.btn-ghost:hover{border-color:var(--accent)}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.status-dot.green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.status-dot.yellow{background:var(--yellow)}
+.status-dot.red{background:var(--red)}
+.log-box{background:#0a0d14;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);max-height:260px;overflow-y:auto;line-height:1.7}
+.log-line{color:var(--text-dim)}.log-line.err{color:var(--red)}.log-line.ok{color:var(--green)}
+.info-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 20px;font-size:13px}
+.info-label{color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}
+.info-value{color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:11px;word-break:break-all}
+.step-item{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(30,39,54,.5)}
+.step-item:last-child{border-bottom:none}
+.step-num{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
+.open-btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;transition:opacity .2s}.open-btn:hover{opacity:.85}
+.toast{position:fixed;bottom:24px;right:24px;background:#1e2736;border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;color:var(--text-primary);display:none;z-index:999}
+body.light-mode{--bg-deep:#f1f5f9;--bg-surface:#fff;--bg-card:#f8fafc;--border:#e2e8f0;--text-primary:#0f172a;--text-secondary:#334155;--text-dim:#64748b}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="section-title"><span class="material-symbols-outlined" style="font-size:24px;color:var(--accent)">flight</span>WebODM</div>
+
+{% if not wo.get('installed') %}
+<!-- Deploy state -->
+<div style="background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px">
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">🚁 Drone Photo Processing for TAK</div>
+<div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install Tom Endress's TAK Incident Overlay plugin. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
+<div style="margin-top:12px;font-size:12px;color:var(--text-dim)">Deploys: WebODM 3.2+ · NodeODM processing node · <a href="https://github.com/Humble-Helper-96/webodm-tak-overlay" target="_blank" style="color:var(--cyan);text-decoration:none">TAK Overlay plugin v0.7.7</a></div>
+</div>
+
+{% if deploying %}
+<div class="card">
+<div class="card-title">Deploying WebODM…</div>
+<div class="log-box" id="deploy-log">{% for line in deploy_log %}<div class="log-line{% if 'ERROR' in line %} err{% elif '✓' in line or 'success' in line.lower() %} ok{% endif %}">{{ line }}</div>{% endfor %}</div>
+<div style="margin-top:14px;font-size:12px;color:var(--text-dim)">Image pull may take several minutes. This page auto-refreshes.</div>
+</div>
+<script>setTimeout(function(){window.location.reload();},5000);</script>
+{% elif deploy_error %}
+<div class="card">
+<div class="card-title" style="color:var(--red)">Deploy Failed</div>
+<div class="log-box">{% for line in deploy_log %}<div class="log-line{% if 'ERROR' in line %} err{% endif %}">{{ line }}</div>{% endfor %}</div>
+<button class="btn btn-primary" onclick="startDeploy()" style="margin-top:14px" id="deploy-btn">Retry Deploy</button>
+</div>
+{% else %}
+<div class="card" style="max-width:560px">
+<div class="card-title">Deploy WebODM</div>
+<div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will pull WebODM images (~1.5 GB), start all containers, clone the TAK overlay plugin, and register the NodeODM processing node. Takes 3–8 minutes on first deploy.</div>
+<button class="btn btn-primary" onclick="startDeploy()" id="deploy-btn">
+<span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy WebODM
+</button>
+<div id="deploy-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+{% endif %}
+
+{% else %}
+<!-- Management state -->
+<div class="card" style="margin-bottom:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+<div style="display:flex;align-items:center;gap:10px">
+<span class="status-dot {% if wo.get('running') %}green{% else %}yellow{% endif %}"></span>
+<span style="font-size:14px;font-weight:600">{% if wo.get('running') %}Running{% else %}Stopped{% endif %}</span>
+{% if wo_url %}
+<span style="font-size:12px;color:var(--text-dim);margin-left:8px">{{ wo_url }}</span>
+{% endif %}
+</div>
+<div style="display:flex;gap:10px;align-items:center">
+{% if wo_url %}
+<a href="{{ wo_url }}" target="_blank" class="open-btn">
+<span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM
+</a>
+{% endif %}
+<button class="btn btn-danger" onclick="disableModule()">Disable</button>
+</div>
+</div>
+</div>
+
+<!-- Connection info -->
+<div class="card">
+<div class="card-title">Connection Info</div>
+<div class="info-grid">
+<span class="info-label">WebODM URL</span>
+<span class="info-value">{{ wo_url or 'Configure FQDN in Settings first' }}</span>
+<span class="info-label">Default login</span>
+<span class="info-value">admin / admin (change after first login)</span>
+<span class="info-label">Processing node</span>
+<span class="info-value">wo_nodeodm:3000 (auto-registered)</span>
+<span class="info-label">Plugin</span>
+<span class="info-value">TAK Incident Overlay v0.7.7 by Tom Endress</span>
+</div>
+</div>
+
+<!-- Workflow -->
+<div class="card">
+<div class="card-title">TAK Overlay Workflow</div>
+<div class="steps-list">
+<div class="step-item"><div class="step-num">1</div><div class="step-text">Open WebODM at <span class="step-code">{{ wo_url or 'your WebODM URL' }}</span> and log in</div></div>
+<div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>TAK Incident Overlay</strong> plugin in the sidebar</div></div>
+<div class="step-item"><div class="step-num">3</div><div class="step-text">Upload your GPS-tagged drone photos (up to 150 JPEGs, 300 in high-capacity mode)</div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Processing runs automatically — typical time 3–25 minutes depending on quality mode</div></div>
+<div class="step-item"><div class="step-num">5</div><div class="step-text">Download the <span class="step-code">.mbtiles</span> file from the completed job</div></div>
+<div class="step-item"><div class="step-num">6</div><div class="step-text">Import into ATAK via <strong>Overlay Manager</strong> → <strong>Add</strong> → select the MBTiles file — the georeferenced orthomap appears on the TAK map at the correct location</div></div>
+</div>
+</div>
+{% endif %}
+</div>
+<div id="toast" class="toast"></div>
+<script>
+function startDeploy(){
+    var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;
+    var st=document.getElementById('deploy-status');if(st)st.textContent='Starting deploy…';
+    fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.reload();}
+        else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
+    }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
+}
+function disableModule(){
+    if(!confirm('Disable WebODM? Containers will be stopped. Data and plugin are preserved.'))return;
+    fetch('/api/webodm/disable',{method:'POST'}).then(()=>window.location.reload());
+}
+function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
+</script></body></html>'''
+
 # === Cesium 3D Tiles Template ===
 CESIUM_TILES_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cesium 3D Tiles — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -48330,6 +48750,14 @@ def _startup_migrations():
             if not os.path.isdir(ct_dir):
                 os.makedirs(ct_dir, exist_ok=True)
                 print("Startup migration: created ~/cesium-tiles/")
+
+        # Ensure webodm working directories exist when the module is enabled
+        if s.get('webodm_enabled'):
+            for _wo_sub in ['', 'plugins', 'media', 'db']:
+                _wo_path = os.path.expanduser(f'~/webodm/{_wo_sub}') if _wo_sub else os.path.expanduser('~/webodm')
+                if not os.path.isdir(_wo_path):
+                    os.makedirs(_wo_path, exist_ok=True)
+                    print(f"Startup migration: created ~/webodm/{_wo_sub}")
 
         # Keep guarddog.conf in sync with settings.json DB host (prevents stale IP after migration)
         tak_cfg = _get_tak_deployment_config(s)
