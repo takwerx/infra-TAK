@@ -15700,15 +15700,15 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             plog(f'Removed {install_path}')
 
         # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
-        # This is the same step the upstream plugin README requires.
+        # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).
         plog('')
         plog('Rebuilding CloudTAK API image — this takes 5–15 minutes...')
-        if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'cloudtak-api'], cwd=ct_dir, timeout=1200):
+        if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=1200):
             cloudtak_plugin_status.update({'running': False, 'error': True})
             return
 
         plog('Restarting CloudTAK API container...')
-        if not run_cmd(['docker', 'compose', 'up', '-d', '--force-recreate', 'cloudtak-api'], cwd=ct_dir, timeout=120):
+        if not run_cmd(['docker', 'compose', 'up', '-d', '--force-recreate', 'api'], cwd=ct_dir, timeout=120):
             cloudtak_plugin_status.update({'running': False, 'error': True})
             return
 
