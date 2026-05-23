@@ -17580,7 +17580,7 @@ services:
       - {wo_dir}/media:/webodm/app/media:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/plugins/webodm-tak-overlay:z
     ports:
-      - "{wo_port}:8000"
+      - "127.0.0.1:{wo_port}:8000"
     depends_on:
       - wo_db
       - wo_broker
@@ -17611,8 +17611,6 @@ services:
   wo_nodeodm:
     image: webodm/nodeodx
     container_name: wo_nodeodm
-    ports:
-      - "127.0.0.1:3001:3000"
     restart: unless-stopped
     oom_score_adj: 250
 '''
@@ -17666,6 +17664,10 @@ def _run_webodm_deploy(settings):
                     cwd=wo_dir)
         if r.returncode != 0:
             plog(f'Pull warning (non-fatal): {r.stderr[:200]}')
+
+        plog('Hardening UFW — blocking direct access to WebODM ports…')
+        for _wo_ufw_port in [wo_port, 3001]:
+            _sp.run(['ufw', 'deny', f'{_wo_ufw_port}/tcp'], capture_output=True)
 
         plog('Starting WebODM containers…')
         r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
@@ -48957,6 +48959,43 @@ def _startup_migrations():
                 if not os.path.isdir(_wo_path):
                     os.makedirs(_wo_path, exist_ok=True)
                     print(f"Startup migration: created ~/webodm/{_wo_sub}")
+
+        # Harden existing WebODM installs: patch compose port bindings + UFW deny
+        # Fixes 0.0.0.0:{wo_port}:8000 → 127.0.0.1:{wo_port}:8000 per PORT-EXPOSURE-POLICY.md Tier 3
+        _wo_compose = os.path.expanduser('~/webodm/docker-compose.yml')
+        if os.path.exists(_wo_compose):
+            try:
+                import re as _re_wo
+                with open(_wo_compose) as _f:
+                    _wo_txt = _f.read()
+                # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
+                _wo_patched = _re_wo.sub(
+                    r'- "(\d+):8000"',
+                    r'- "127.0.0.1:\1:8000"',
+                    _wo_txt
+                )
+                # Remove any host-side nodeodm port mapping (Docker-internal only)
+                _wo_patched = _re_wo.sub(
+                    r'\s*- "127\.0\.0\.1:3001:3000"\n', '\n', _wo_patched
+                )
+                if _wo_patched != _wo_txt:
+                    with open(_wo_compose, 'w') as _f:
+                        _f.write(_wo_patched)
+                    print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings (Tier 3/4)")
+                    import subprocess as _sp_wo
+                    _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d', '--no-deps', 'wo_webapp'],
+                               capture_output=True, timeout=60, cwd=os.path.expanduser('~/webodm'))
+            except Exception as _wo_e:
+                print(f"Startup migration: webodm compose harden warning: {_wo_e}")
+        # UFW deny belt-and-braces for WebODM ports
+        if s.get('webodm_enabled'):
+            try:
+                _wo_port_val = s.get('webodm_port', 8765)
+                import subprocess as _sp_ufw
+                for _p in [_wo_port_val, 3001]:
+                    _sp_ufw.run(['ufw', 'deny', f'{_p}/tcp'], capture_output=True, timeout=5)
+            except Exception:
+                pass
 
         # Keep guarddog.conf in sync with settings.json DB host (prevents stale IP after migration)
         tak_cfg = _get_tak_deployment_config(s)
