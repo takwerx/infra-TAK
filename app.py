@@ -972,6 +972,18 @@ def detect_modules():
         email_running = r.stdout.strip() == 'active'
     modules['emailrelay'] = {'name': 'Email Relay', 'installed': email_installed, 'running': email_running,
         'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
+    # Cesium 3D Tiles — pure static file serving via Caddy; no container needed
+    ct_enabled = settings.get('cesium_tiles_enabled', False)
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    modules['cesium_tiles'] = {
+        'name': 'Cesium 3D Tiles',
+        'installed': bool(ct_enabled),
+        'running': bool(ct_enabled) and os.path.isdir(ct_dir),
+        'description': 'Stream 3D terrain, buildings & point clouds to TAK clients',
+        'icon': '🌍',
+        'route': '/cesium-tiles',
+        'priority': 11,
+    }
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_custom_banner(settings):
@@ -1121,6 +1133,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     email = modules.get('emailrelay', {})
     if email.get('installed'):
         parts.append(link('/emailrelay', '<span class="nav-icon material-symbols-outlined">outgoing_mail</span>Email Relay'))
+    ct = modules.get('cesium_tiles', {})
+    if ct.get('installed'):
+        parts.append(link('/cesium-tiles', '<span class="nav-icon material-symbols-outlined">terrain</span>Cesium 3D Tiles'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -9341,6 +9356,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'cloudtak_video': 'video',
     'mediamtx': 'stream',
     'fedhub': 'fedhub',
+    'cesium_tiles': '3dtiles',
 }
 
 def _get_service_domain(settings, service_key):
@@ -11495,6 +11511,21 @@ def generate_caddyfile(settings=None):
             lines.append(f"}}")
             lines.append("")
             _emit_alias_redirect(_get_service_alias(settings, 'fedhub'), fh_host)
+
+    ct_mod = modules.get('cesium_tiles', {})
+    if ct_mod.get('installed'):
+        ct_host = sd.get('cesium_tiles') or _get_service_domain(settings, 'cesium_tiles')
+        ct_dir_abs = os.path.expanduser('~/cesium-tiles')
+        lines.append(f"# Cesium 3D Tiles — static file server (CORS enabled for ATAK WebView)")
+        lines.append(f"{ct_host} {{")
+        lines.append(f"    root * {ct_dir_abs}")
+        lines.append(f"    file_server")
+        lines.append(f"    header Access-Control-Allow-Origin *")
+        lines.append(f"    header Access-Control-Allow-Methods \"GET, HEAD, OPTIONS\"")
+        lines.append(f"    header Cache-Control \"public, max-age=3600\"")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'cesium_tiles'), ct_host)
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
@@ -17230,6 +17261,204 @@ def emailrelay_uninstall():
     email_deploy_log.clear()
     email_deploy_status.update({'running': False, 'complete': False, 'error': False})
     return jsonify({'success': True, 'steps': ['Postfix stopped and removed', 'Configuration cleared']})
+
+
+# ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
+
+@app.route('/cesium-tiles')
+@login_required
+def cesium_tiles_page():
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    ct = modules.get('cesium_tiles', {})
+    datasets = _cesium_list_datasets(settings)
+    r = make_response(render_template_string(CESIUM_TILES_TEMPLATE,
+        settings=settings, modules=modules, ct=ct,
+        datasets=datasets, metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+def _cesium_list_datasets(settings):
+    """Scan ~/cesium-tiles/ and return a list of dataset dicts for each subdir with tileset.json."""
+    import glob as _glob
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    if not os.path.isdir(ct_dir):
+        return []
+    fqdn = (settings.get('fqdn') or '').strip()
+    base_url = f"https://{_get_service_domain(settings, 'cesium_tiles')}" if fqdn else ''
+    datasets = []
+    try:
+        for name in sorted(os.listdir(ct_dir)):
+            subdir = os.path.join(ct_dir, name)
+            if not os.path.isdir(subdir):
+                continue
+            tileset_path = os.path.join(subdir, 'tileset.json')
+            if not os.path.exists(tileset_path):
+                continue
+            # Count tile files (.b3dm, .pnts, .i3dm, .cmpt, .glb, .json)
+            tile_files = _glob.glob(os.path.join(subdir, '**', '*.b3dm'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.pnts'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.i3dm'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.cmpt'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.glb'), recursive=True)
+            tile_count = len(tile_files)
+            # Total size of directory
+            total_bytes = sum(
+                os.path.getsize(os.path.join(dp, fn))
+                for dp, _, files in os.walk(subdir)
+                for fn in files
+            )
+            if total_bytes < 1024 * 1024:
+                size_str = f"{total_bytes / 1024:.0f} KB"
+            elif total_bytes < 1024 * 1024 * 1024:
+                size_str = f"{total_bytes / (1024*1024):.1f} MB"
+            else:
+                size_str = f"{total_bytes / (1024*1024*1024):.2f} GB"
+            tileset_url = f"{base_url}/{name}/tileset.json" if base_url else ''
+            datasets.append({
+                'name': name,
+                'size': size_str,
+                'tile_count': tile_count,
+                'url': tileset_url,
+            })
+    except Exception:
+        pass
+    return datasets
+
+
+@app.route('/api/cesium-tiles/enable', methods=['POST'])
+@login_required
+def cesium_tiles_enable():
+    settings = load_settings()
+    settings['cesium_tiles_enabled'] = True
+    save_settings(settings)
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    os.makedirs(ct_dir, exist_ok=True)
+    if (settings.get('fqdn') or '').strip():
+        generate_caddyfile(settings)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/cesium-tiles/disable', methods=['POST'])
+@login_required
+def cesium_tiles_disable():
+    settings = load_settings()
+    settings['cesium_tiles_enabled'] = False
+    save_settings(settings)
+    if (settings.get('fqdn') or '').strip():
+        generate_caddyfile(settings)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/cesium-tiles/datasets')
+@login_required
+def cesium_tiles_datasets():
+    settings = load_settings()
+    return jsonify({'datasets': _cesium_list_datasets(settings)})
+
+
+@app.route('/api/cesium-tiles/upload', methods=['POST'])
+@login_required
+def cesium_tiles_upload():
+    import zipfile
+    import tempfile
+    import shutil
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    os.makedirs(ct_dir, exist_ok=True)
+    dataset_name = (request.form.get('name') or '').strip()
+    if not dataset_name:
+        return jsonify({'success': False, 'error': 'Dataset name is required'})
+    # Sanitize: letters, digits, hyphens, underscores only
+    import re as _re_ct
+    dataset_name = _re_ct.sub(r'[^A-Za-z0-9_\-]', '-', dataset_name).strip('-') or 'dataset'
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file provided'})
+    f = request.files['file']
+    if not f.filename.lower().endswith('.zip'):
+        return jsonify({'success': False, 'error': 'Upload must be a .zip file'})
+    dest_dir = os.path.join(ct_dir, dataset_name)
+    if os.path.exists(dest_dir):
+        return jsonify({'success': False, 'error': f'Dataset "{dataset_name}" already exists — delete it first or choose a different name'})
+    # Stream to a temp file to avoid loading GB into memory
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.zip', dir=ct_dir)
+    try:
+        with os.fdopen(tmp_fd, 'wb') as tmp_f:
+            chunk_size = 64 * 1024
+            while True:
+                chunk = f.stream.read(chunk_size)
+                if not chunk:
+                    break
+                tmp_f.write(chunk)
+        # Validate zip contains tileset.json (at root or one level deep)
+        with zipfile.ZipFile(tmp_path, 'r') as zf:
+            names = zf.namelist()
+            has_tileset = any(
+                n == 'tileset.json' or n.endswith('/tileset.json')
+                for n in names
+            )
+            if not has_tileset:
+                return jsonify({'success': False, 'error': 'Zip does not contain a tileset.json — make sure you zipped the dataset folder itself, not just its contents'})
+            # Detect if there is a single top-level directory wrapping everything
+            top_dirs = {n.split('/')[0] for n in names if n}
+            single_wrap = (len(top_dirs) == 1 and not any(
+                n == 'tileset.json' for n in names
+            ))
+            os.makedirs(dest_dir, exist_ok=True)
+            if single_wrap:
+                # Strip the wrapping directory when extracting
+                wrap = list(top_dirs)[0]
+                for member in zf.infolist():
+                    rel = member.filename[len(wrap):].lstrip('/')
+                    if not rel:
+                        continue
+                    target = os.path.join(dest_dir, rel)
+                    if member.filename.endswith('/'):
+                        os.makedirs(target, exist_ok=True)
+                    else:
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with zf.open(member) as src, open(target, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+            else:
+                zf.extractall(dest_dir)
+    except zipfile.BadZipFile:
+        return jsonify({'success': False, 'error': 'File is not a valid zip archive'})
+    except Exception as e:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return jsonify({'success': False, 'error': str(e)})
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+    # Verify tileset.json ended up in the right place
+    if not os.path.exists(os.path.join(dest_dir, 'tileset.json')):
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return jsonify({'success': False, 'error': 'Could not find tileset.json at the root of the extracted dataset — check your zip structure'})
+    settings = load_settings()
+    return jsonify({'success': True, 'dataset': dataset_name, 'datasets': _cesium_list_datasets(settings)})
+
+
+@app.route('/api/cesium-tiles/datasets/<name>', methods=['DELETE'])
+@login_required
+def cesium_tiles_delete(name):
+    import shutil
+    import re as _re_ctd
+    if not _re_ctd.match(r'^[A-Za-z0-9_\-]+$', name):
+        return jsonify({'success': False, 'error': 'Invalid dataset name'})
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    target = os.path.join(ct_dir, name)
+    # Prevent path traversal
+    if not os.path.abspath(target).startswith(os.path.abspath(ct_dir)):
+        return jsonify({'success': False, 'error': 'Invalid path'})
+    if not os.path.isdir(target):
+        return jsonify({'success': False, 'error': 'Dataset not found'})
+    shutil.rmtree(target)
+    settings = load_settings()
+    return jsonify({'success': True, 'datasets': _cesium_list_datasets(settings)})
 
 
 def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
@@ -45826,6 +46055,273 @@ async function doConsoleRollback(){
 }
 </script></body></html>'''
 
+# === Cesium 3D Tiles Template ===
+CESIUM_TILES_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cesium 3D Tiles — infra-TAK</title>
+<style>
+''' + BASE_CSS + '''
+body{display:flex;flex-direction:row;min-height:100vh}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.section-title-sm{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-row{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite;flex-shrink:0}
+.status-dot.off{background:var(--text-dim);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:32px;text-align:center;cursor:pointer;transition:all .3s;background:rgba(15,23,42,.3)}
+.upload-area:hover,.upload-area.drag{border-color:var(--accent);background:var(--accent-glow)}
+.progress-bar-outer{width:100%;height:6px;background:rgba(59,130,246,.1);border-radius:3px;margin-top:10px;overflow:hidden;display:none}
+.progress-bar-inner{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--cyan));width:0%;transition:width .3s}
+.dataset-table{width:100%;border-collapse:collapse}
+.dataset-table th{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
+.dataset-table td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(30,39,54,.6);vertical-align:middle}
+.dataset-table tr:last-child td{border-bottom:none}
+.btn{padding:8px 16px;border-radius:7px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
+.btn-primary:hover{opacity:.9}
+.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--accent);background:rgba(59,130,246,.15)}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}
+.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-sm{padding:5px 10px;font-size:11px}
+.url-chip{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.15);border-radius:5px;padding:3px 8px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle;cursor:pointer}
+.url-chip:hover{background:rgba(6,182,212,.12)}
+.sample-box{background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px}
+.sample-box a{color:var(--cyan);text-decoration:none}
+.sample-box a:hover{text-decoration:underline}
+.steps-list{counter-reset:steps}
+.step-item{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(30,39,54,.5)}
+.step-item:last-child{border-bottom:none}
+.step-num{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step-text{font-size:13px;color:var(--text-secondary);line-height:1.5}
+.step-text code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
+.details-toggle{width:100%;text-align:left;background:none;border:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:0;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.details-toggle:hover{color:var(--text-primary)}
+.chevron{transition:transform .2s;font-size:16px}
+.chevron.open{transform:rotate(180deg)}
+.collapsed{display:none}
+input[type=text]{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace}
+input[type=text]:focus{outline:none;border-color:var(--accent)}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;z-index:999;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
+.empty-state{text-align:center;padding:32px;color:var(--text-dim);font-size:13px}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="section-title">Cesium 3D Tiles</div>
+
+<!-- Sample dataset callout -->
+<div class="sample-box">
+<div style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;color:var(--cyan);margin-bottom:8px">TRY IT WITH A FREE SAMPLE DATASET</div>
+<div style="font-size:13px;color:var(--text-secondary);line-height:1.6">
+Download the official Cesium 3D Tiles sample datasets (CC0 license, ~5 MB zip):<br>
+<a href="https://github.com/CesiumGS/3d-tiles-samples/archive/refs/heads/main.zip" target="_blank">github.com/CesiumGS/3d-tiles-samples</a>
+&nbsp;—&nbsp;
+Unzip, then re-zip the <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">1.0/TilesetWithDiscreteLOD</code> folder and upload it here to get a working ATAK URL in minutes.
+<br>
+<br>
+For real-world city models, Japan's <a href="https://www.mlit.go.jp/plateau/" target="_blank">Project PLATEAU</a> publishes free pre-built 3D Tiles for hundreds of cities (official government open data).
+</div>
+</div>
+
+{% if not ct.get('installed') %}
+<!-- Deploy state -->
+<div class="section-card" style="max-width:600px">
+<div style="display:flex;align-items:flex-start;gap:20px">
+<span style="font-size:48px;line-height:1;flex-shrink:0">🌍</span>
+<div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:8px">Cesium 3D Tiles</div>
+<div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px">
+Serve 3D terrain, building models, and point clouds directly to ATAK, WinTAK, and iTAK clients.
+Any dataset in <a href="https://github.com/CesiumGS/3d-tiles" style="color:var(--cyan);text-decoration:none" target="_blank">Cesium 3D Tiles format</a> works — upload it as a zip and give field users a single <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">tileset.json</code> URL.
+No new container — served directly by Caddy over HTTPS.
+</div>
+{% if not settings.get('fqdn') %}
+<div style="background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.25);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--yellow)">
+A domain must be configured before enabling Cesium 3D Tiles (Caddy needs it for the <code style="font-size:11px">3dtiles.&lt;domain&gt;</code> vhost).
+<a href="/caddy" style="color:var(--cyan);text-decoration:none;margin-left:6px">Configure domain →</a>
+</div>
+{% endif %}
+<button class="btn btn-primary" onclick="enableModule()" {% if not settings.get('fqdn') %}disabled style="opacity:.5;cursor:not-allowed"{% endif %} id="enable-btn">
+Enable Cesium 3D Tiles
+</button>
+<div id="enable-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+</div>
+</div>
+
+{% else %}
+<!-- Management state -->
+{% set ct_domain = settings.get('cesium_tiles_domain') or ('3dtiles.' + settings.get('fqdn','')) %}
+<div class="section-card" style="margin-bottom:20px">
+<div class="status-row">
+<div class="status-dot {% if not ct.get('running') %}off{% endif %}"></div>
+<div>
+<span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--text-primary)">{% if ct.get('running') %}Active{% else %}Not running{% endif %}</span>
+{% if settings.get('fqdn') %}
+<span style="font-size:12px;color:var(--text-dim);margin-left:12px">Base URL: <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">https://{{ ct_domain }}</code></span>
+{% endif %}
+</div>
+<button class="btn btn-danger btn-sm" onclick="disableModule()" style="margin-left:auto">Disable</button>
+</div>
+</div>
+
+<!-- Upload section -->
+<div class="section-card">
+<div class="section-title-sm">Upload Dataset (.zip)</div>
+<div style="margin-bottom:12px">
+<label class="form-label">Dataset Name</label>
+<input type="text" id="dataset-name" placeholder="e.g. san-diego-buildings" maxlength="80">
+<div style="font-size:11px;color:var(--text-dim);margin-top:5px">Used in the URL path. Letters, numbers, hyphens only.</div>
+</div>
+<div class="upload-area" id="upload-area" onclick="document.getElementById('file-input').click()">
+<input type="file" id="file-input" accept=".zip" style="display:none" onchange="handleFile(this.files[0])">
+<span class="material-symbols-outlined" style="font-size:36px;color:var(--text-dim);display:block;margin-bottom:8px">upload_file</span>
+<div style="font-size:14px;color:var(--text-secondary);margin-bottom:4px">Drop .zip here or click to browse</div>
+<div id="file-label" style="font-size:12px;color:var(--text-dim)">Zip your dataset folder — must contain tileset.json at the root</div>
+</div>
+<div class="progress-bar-outer" id="progress-outer">
+<div class="progress-bar-inner" id="progress-bar"></div>
+</div>
+<div id="upload-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+<button class="btn btn-primary" onclick="doUpload()" id="upload-btn" style="margin-top:14px" disabled>Upload Dataset</button>
+</div>
+
+<!-- Dataset list -->
+<div class="section-card">
+<div class="section-title-sm">Installed Datasets ({{ datasets|length }})</div>
+{% if datasets %}
+<table class="dataset-table">
+<thead><tr>
+<th>Name</th><th>Size</th><th>Tiles</th><th>ATAK URL</th><th></th>
+</tr></thead>
+<tbody id="dataset-tbody">
+{% for ds in datasets %}
+<tr id="row-{{ ds.name }}">
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-primary)">{{ ds.name }}</td>
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">{{ ds.size }}</td>
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">{{ ds.tile_count }}</td>
+<td>
+{% if ds.url %}
+<span class="url-chip" onclick="copyUrl('{{ ds.url }}')" title="Click to copy">{{ ds.url }}</span>
+{% else %}
+<span style="font-size:11px;color:var(--text-dim)">Configure domain first</span>
+{% endif %}
+</td>
+<td><button class="btn btn-danger btn-sm" onclick="deleteDataset('{{ ds.name }}')">Delete</button></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<div class="empty-state">No datasets yet — upload a zip above or place datasets in <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">~/cesium-tiles/&lt;name&gt;/</code> via SFTP.</div>
+{% endif %}
+</div>
+
+<!-- ATAK Instructions -->
+<div class="section-card">
+<button class="details-toggle" onclick="toggleInstructions(this)">
+<span>How to Connect in ATAK / WinTAK / iTAK</span>
+<span class="material-symbols-outlined chevron" id="instr-chevron">expand_more</span>
+</button>
+<div id="instr-body" class="collapsed" style="margin-top:16px">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Source: TAK Developers Confluence — Cesium 3D Tiles</div>
+<div class="steps-list">
+<div class="step-item"><div class="step-num">1</div><div class="step-text">Open ATAK and launch the <strong>Map Manager</strong></div></div>
+<div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>MOBILE</strong> tab</div></div>
+<div class="step-item"><div class="step-num">3</div><div class="step-text">Select the <strong>Down Arrow</strong>, then the <strong>Add (+)</strong> button</div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Type in the URL to the dataset's <code>tileset.json</code> — e.g. <code>https://{{ ct_domain }}/my-dataset/tileset.json</code><br><span style="font-size:12px;color:var(--text-dim)">ATAK will send a request to the URL to check for available services and confirm it is Cesium 3D Tiles content.</span></div></div>
+<div class="step-item"><div class="step-num">5</div><div class="step-text">If the connection succeeds, a window shows available services. <strong>Click the checkbox</strong> next to the tileset to import it.</div></div>
+<div class="step-item"><div class="step-num">6</div><div class="step-text">The dataset is now available under the <strong>Overlay Manager</strong> as a 3D layer. ATAK caches tiles locally in <code>atak/3dtilescache/</code>.</div></div>
+</div>
+</div>
+</div>
+
+{% endif %}
+</div>
+<div id="toast" class="toast"></div>
+<script>
+var _pendingFile=null;
+function enableModule(){
+    document.getElementById('enable-btn').disabled=true;
+    document.getElementById('enable-status').textContent='Enabling…';
+    fetch('/api/cesium-tiles/enable',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success)window.location.reload();
+        else{document.getElementById('enable-status').textContent='Error: '+(d.error||'unknown');document.getElementById('enable-btn').disabled=false;}
+    }).catch(e=>{document.getElementById('enable-status').textContent='Network error: '+e.message;document.getElementById('enable-btn').disabled=false;});
+}
+function disableModule(){
+    if(!confirm('Disable Cesium 3D Tiles? The tile files will not be deleted.'))return;
+    fetch('/api/cesium-tiles/disable',{method:'POST'}).then(()=>window.location.reload());
+}
+function handleFile(file){
+    if(!file)return;
+    _pendingFile=file;
+    document.getElementById('file-label').textContent=file.name+' ('+formatBytes(file.size)+')';
+    document.getElementById('upload-btn').disabled=false;
+}
+function formatBytes(b){if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';}
+var _uploadArea=document.getElementById('upload-area');
+if(_uploadArea){
+    _uploadArea.addEventListener('dragover',function(e){e.preventDefault();_uploadArea.classList.add('drag');});
+    _uploadArea.addEventListener('dragleave',function(){_uploadArea.classList.remove('drag');});
+    _uploadArea.addEventListener('drop',function(e){e.preventDefault();_uploadArea.classList.remove('drag');var f=e.dataTransfer.files[0];if(f){document.getElementById('file-input').files=e.dataTransfer.files;handleFile(f);}});
+}
+function doUpload(){
+    var name=(document.getElementById('dataset-name').value||'').trim();
+    if(!name){showToast('Enter a dataset name first.');return;}
+    if(!_pendingFile){showToast('Select a zip file first.');return;}
+    var fd=new FormData();
+    fd.append('name',name);
+    fd.append('file',_pendingFile);
+    var btn=document.getElementById('upload-btn');
+    var outer=document.getElementById('progress-outer');
+    var bar=document.getElementById('progress-bar');
+    var st=document.getElementById('upload-status');
+    btn.disabled=true;
+    outer.style.display='block';
+    bar.style.width='0%';
+    st.textContent='Uploading…';
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST','/api/cesium-tiles/upload');
+    xhr.upload.onprogress=function(e){if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);bar.style.width=pct+'%';st.textContent='Uploading… '+pct+'%';}};
+    xhr.onload=function(){
+        var d;try{d=JSON.parse(xhr.responseText);}catch(e){d={success:false,error:'Invalid response'};}
+        if(d.success){
+            st.textContent='';bar.style.width='100%';
+            showToast('Dataset "'+d.dataset+'" uploaded successfully.');
+            setTimeout(function(){window.location.reload();},1200);
+        }else{
+            st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'Upload failed')+'</span>';
+            btn.disabled=false;outer.style.display='none';
+        }
+    };
+    xhr.onerror=function(){st.innerHTML='<span style="color:var(--red)">Network error</span>';btn.disabled=false;outer.style.display='none';};
+    xhr.send(fd);
+}
+function copyUrl(url){
+    navigator.clipboard.writeText(url).then(function(){showToast('URL copied to clipboard.');}).catch(function(){showToast(url);});
+}
+function deleteDataset(name){
+    if(!confirm('Delete dataset "'+name+'"? This cannot be undone.'))return;
+    fetch('/api/cesium-tiles/datasets/'+encodeURIComponent(name),{method:'DELETE'}).then(r=>r.json()).then(d=>{
+        if(d.success){var row=document.getElementById('row-'+name);if(row)row.remove();showToast('Deleted "'+name+'".');}
+        else showToast('Error: '+(d.error||'Delete failed'));
+    });
+}
+function toggleInstructions(btn){
+    var body=document.getElementById('instr-body');
+    var chev=document.getElementById('instr-chevron');
+    if(body.classList.contains('collapsed')){body.classList.remove('collapsed');chev.classList.add('open');}
+    else{body.classList.add('collapsed');chev.classList.remove('open');}
+}
+function showToast(msg){
+    var t=document.getElementById('toast');
+    t.textContent=msg;t.classList.add('show');
+    setTimeout(function(){t.classList.remove('show');},3000);
+}
+</script></body></html>'''
+
 # === Marketplace Template (all services, deploy from here) ===
 MARKETPLACE_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Marketplace — infra-TAK</title>
 <style>
@@ -47734,6 +48230,13 @@ def _startup_migrations():
             generate_caddyfile(s)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # Ensure cesium-tiles directory exists when the module is enabled
+        if s.get('cesium_tiles_enabled'):
+            ct_dir = os.path.expanduser('~/cesium-tiles')
+            if not os.path.isdir(ct_dir):
+                os.makedirs(ct_dir, exist_ok=True)
+                print("Startup migration: created ~/cesium-tiles/")
 
         # Keep guarddog.conf in sync with settings.json DB host (prevents stale IP after migration)
         tak_cfg = _get_tak_deployment_config(s)
