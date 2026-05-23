@@ -15715,8 +15715,10 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
         plog(f'✓ Plugin {action_label} successfully.')
         if action in ('install', 'update'):
-            plog('  → In CloudTAK: hard-reload your browser (Cmd+Shift+R / Ctrl+Shift+R) to bypass')
-            plog('    the service worker cache. Plugin appears at the bottom of the right-side menu.')
+            plog('  → In CloudTAK: Settings → Refresh App to activate the new service worker.')
+            plog('    (Cmd+Shift+R does NOT work — the SW intercepts all requests.)')
+            plog('    Alternatively: close all CloudTAK browser tabs and reopen.')
+            plog('    Plugin appears at the bottom of the right-side menu.')
         cloudtak_plugin_status.update({'running': False, 'complete': True, 'error': False})
 
     except Exception as e:
@@ -16869,6 +16871,11 @@ def run_cloudtak_update():
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
+        plog("")
+        plog("⚠ Service worker note: Cmd+Shift+R does NOT work — the CloudTAK SW")
+        plog("  intercepts all requests before they reach the network.")
+        plog("  To see the new version: in CloudTAK open Settings → Refresh App.")
+        plog("  Or: close all CloudTAK browser tabs and reopen.")
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -23562,7 +23569,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
       Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
-      After install, do a <strong style="color:var(--text-secondary)">hard reload</strong> in CloudTAK (<code>Cmd+Shift+R</code> / <code>Ctrl+Shift+R</code>) to bypass the service worker cache. The plugin appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
+      After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong> to activate the new service worker. The plugin then appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
+      <span style="color:var(--text-dim)">(Cmd+Shift+R does not work — CloudTAK's service worker intercepts all requests. Refresh App or close all CloudTAK tabs and reopen.)</span>
     </p>
     <div id="ct-plugin-cards" style="display:grid;grid-template-columns:1fr;gap:12px">
       {% for p in cloudtak_plugins %}
