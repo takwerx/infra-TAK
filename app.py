@@ -981,6 +981,7 @@ def detect_modules():
         'running': bool(ct_enabled) and os.path.isdir(ct_dir),
         'description': 'Stream 3D terrain, buildings & point clouds to TAK clients',
         'icon': '🌍',
+        'icon_url': 'https://cesium.com/assets/images/cesium-logo-only-color.png',
         'route': '/cesium-tiles',
         'priority': 11,
     }
@@ -1002,6 +1003,7 @@ def detect_modules():
         'running': wo_running,
         'description': 'Drone photo processing → 3D Tiles & TAK overlays',
         'icon': '🚁',
+        'icon_url': 'https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png',
         'route': '/webodm',
         'priority': 12,
     }
@@ -17728,6 +17730,13 @@ def _run_webodm_deploy(settings):
             plog('Caddy reloaded — TLS cert provisioning started.')
         except Exception as ce:
             plog(f'Caddy reload warning: {ce}')
+        fqdn = s.get('fqdn', '').strip()
+        ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+        if fqdn and ak_token:
+            plog('Configuring Authentik for WebODM…')
+            _ensure_authentik_webodm_app(fqdn, ak_token, plog=plog, settings=s)
+        else:
+            plog('Authentik not configured — skipping proxy provider setup.')
         plog('WebODM deployed successfully.')
         _webodm_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as exc:
@@ -18627,6 +18636,105 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
+
+def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """Create WebODM proxy provider + application in Authentik, add to embedded outpost.
+    Same pattern as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    import urllib.error
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+
+    try:
+        if not flow_pk or not inv_flow_pk:
+            for attempt in range(36):
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                    resp = _urlreq.urlopen(req, timeout=10)
+                    flows = json.loads(resp.read().decode())['results']
+                    flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+                    if flow_pk:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+                        resp = _urlreq.urlopen(req, timeout=10)
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+                        if inv_flow_pk:
+                            break
+                except Exception:
+                    pass
+                if attempt % 6 == 0:
+                    log(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                time.sleep(5)
+            if not flow_pk or not inv_flow_pk:
+                log("  ⚠ No authorization/invalidation flow — skipping WebODM proxy provider")
+                return False
+            log("  ✓ Got authorization and invalidation flows")
+
+        provider_pk = None
+        try:
+            _wo_host = f'https://{_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}"}'
+            _cookie = f'.{fqdn.split(":")[0]}'
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'WebODM Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': _wo_host, 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=10)
+            provider_pk = json.loads(resp.read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=WebODM', headers=_ak_headers)
+                resp = _urlreq.urlopen(req, timeout=10)
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    provider_pk = results[0]['pk']
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps({'external_host': _wo_host, 'cookie_domain': _cookie}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log("  ✓ Proxy provider already exists (external_host updated)")
+            else:
+                log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
+
+        if provider_pk:
+            try:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    data=json.dumps({'name': 'WebODM', 'slug': 'webodm',
+                        'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                    headers=_ak_headers, method='POST')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Application 'WebODM' created")
+            except Exception as e:
+                if hasattr(e, 'code') and e.code == 400:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/webodm/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log("  ✓ Application 'WebODM' updated")
+                else:
+                    log(f"  ⚠ Application error: {str(e)[:80]}")
+
+            _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'webodm', plog=log)
+        else:
+            log("  ⚠ Could not create or find WebODM proxy provider")
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+    return True
+
 
 def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
     """Create Federation Hub proxy provider + application in Authentik, add to embedded outpost.
@@ -45919,7 +46027,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'cesium_tiles') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
@@ -46446,9 +46554,33 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 <div class="card">
 <div class="card-title">Deploying WebODM…</div>
 <div class="log-box" id="deploy-log">{% for line in deploy_log %}<div class="log-line{% if 'ERROR' in line %} err{% elif '✓' in line or 'success' in line.lower() %} ok{% endif %}">{{ line }}</div>{% endfor %}</div>
-<div style="margin-top:14px;font-size:12px;color:var(--text-dim)">Image pull may take several minutes. This page auto-refreshes.</div>
+<div style="margin-top:14px;font-size:12px;color:var(--text-dim)">Image pull may take several minutes…</div>
 </div>
-<script>setTimeout(function(){window.location.reload();},5000);</script>
+<script>
+(function(){
+var _lastCount = document.getElementById('deploy-log').children.length;
+var _interval = setInterval(function(){
+    fetch('/api/webodm/deploy-status').then(function(r){return r.json();}).then(function(d){
+        var box = document.getElementById('deploy-log');
+        if(box && d.log && d.log.length > _lastCount){
+            for(var i=_lastCount;i<d.log.length;i++){
+                var div=document.createElement('div');
+                var line=d.log[i];
+                div.className='log-line'+(line.indexOf('ERROR')>=0?' err':(line.indexOf('✓')>=0||line.toLowerCase().indexOf('success')>=0?' ok':''));
+                div.textContent=line;
+                box.appendChild(div);
+            }
+            _lastCount=d.log.length;
+            box.scrollTop=box.scrollHeight;
+        }
+        if(!d.running){
+            clearInterval(_interval);
+            setTimeout(function(){window.location.reload();},800);
+        }
+    }).catch(function(){});
+},3000);
+})();
+</script>
 {% elif deploy_error %}
 <div class="card">
 <div class="card-title" style="color:var(--red)">Deploy Failed</div>
@@ -46945,7 +47077,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'cesium_tiles') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
