@@ -17442,6 +17442,49 @@ def cesium_tiles_upload():
     return jsonify({'success': True, 'dataset': dataset_name, 'datasets': _cesium_list_datasets(settings)})
 
 
+@app.route('/api/cesium-tiles/upload-folder', methods=['POST'])
+@login_required
+def cesium_tiles_upload_folder():
+    import re as _re_ctf
+    import shutil
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    os.makedirs(ct_dir, exist_ok=True)
+    raw_name = (request.form.get('name') or '').strip()
+    if not raw_name:
+        return jsonify({'success': False, 'error': 'Dataset name is required'})
+    dataset_name = _re_ctf.sub(r'[^A-Za-z0-9_\-]', '-', raw_name).strip('-') or 'dataset'
+    dest_dir = os.path.join(ct_dir, dataset_name)
+    if os.path.exists(dest_dir):
+        return jsonify({'success': False, 'error': f'Dataset "{dataset_name}" already exists — delete it first or choose a different name'})
+    files = request.files.getlist('files[]')
+    if not files:
+        return jsonify({'success': False, 'error': 'No files received'})
+    # Validate tileset.json is present (filename is the relative path, already top-folder-stripped by JS)
+    has_tileset = any(
+        (f.filename or '').lstrip('/') == 'tileset.json'
+        for f in files
+    )
+    if not has_tileset:
+        return jsonify({'success': False, 'error': 'No tileset.json found — make sure the folder contains tileset.json at its root'})
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        for f in files:
+            rel = (f.filename or '').lstrip('/')
+            if not rel or '..' in rel.split('/'):
+                continue
+            target = os.path.join(dest_dir, rel)
+            # Prevent path traversal
+            if not os.path.abspath(target).startswith(os.path.abspath(dest_dir) + os.sep):
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            f.save(target)
+    except Exception as exc:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return jsonify({'success': False, 'error': str(exc)})
+    settings = load_settings()
+    return jsonify({'success': True, 'dataset': dataset_name, 'datasets': _cesium_list_datasets(settings)})
+
+
 @app.route('/api/cesium-tiles/datasets/<name>', methods=['DELETE'])
 @login_required
 def cesium_tiles_delete(name):
@@ -46175,17 +46218,28 @@ Enable Cesium 3D Tiles
 
 <!-- Upload section -->
 <div class="card">
-<div class="card-title">Upload Dataset (.zip)</div>
-<div style="margin-bottom:12px">
+<div class="card-title">Upload Dataset</div>
+<div style="margin-bottom:16px">
 <label class="form-label">Dataset Name</label>
-<input type="text" id="dataset-name" class="form-input" placeholder="e.g. san-diego-buildings" maxlength="80">
-<div style="font-size:11px;color:var(--text-dim);margin-top:5px">Used in the URL path. Letters, numbers, hyphens only.</div>
+<input type="text" id="dataset-name" class="form-input" placeholder="e.g. san-diego-buildings" maxlength="80" oninput="updateUrlPreview(this.value)">
+<div style="margin-top:7px;min-height:18px">
+<span style="font-size:11px;color:var(--text-dim)">ATAK URL: </span>
+<span id="url-preview" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">type a name above to preview</span>
 </div>
-<div class="upload-area" id="upload-area" onclick="document.getElementById('file-input').click()">
-<input type="file" id="file-input" accept=".zip" style="display:none" onchange="handleFile(this.files[0])">
-<span class="material-symbols-outlined" style="font-size:36px;color:var(--text-dim);display:block;margin-bottom:8px">upload_file</span>
-<div style="font-size:14px;color:var(--text-secondary);margin-bottom:4px">Drop .zip here or click to browse</div>
-<div id="file-label" style="font-size:12px;color:var(--text-dim)">Zip your dataset folder — must contain tileset.json at the root</div>
+</div>
+<div class="upload-area" id="upload-area">
+<input type="file" id="folder-input" webkitdirectory multiple style="display:none" onchange="handleFolderSelect(this.files)">
+<input type="file" id="zip-input" accept=".zip" style="display:none" onchange="handleZipSelect(this.files[0])">
+<span class="material-symbols-outlined" style="font-size:36px;color:var(--text-dim);display:block;margin-bottom:10px">drive_folder_upload</span>
+<div style="font-size:14px;color:var(--text-secondary);margin-bottom:10px" id="file-label">Select your dataset folder or a .zip file</div>
+<div style="display:flex;gap:10px;justify-content:center">
+<button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation();document.getElementById('folder-input').click()">
+<span class="material-symbols-outlined" style="font-size:14px">folder_open</span> Select Folder
+</button>
+<button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation();document.getElementById('zip-input').click()">
+<span class="material-symbols-outlined" style="font-size:14px">folder_zip</span> Select .zip
+</button>
+</div>
 </div>
 <div class="progress-bar-outer" id="progress-outer">
 <div class="progress-bar-inner" id="progress-bar"></div>
@@ -46248,7 +46302,8 @@ Enable Cesium 3D Tiles
 </div>
 <div id="toast" class="toast"></div>
 <script>
-var _pendingFile=null;
+var _pendingFiles=null,_pendingZip=null,_uploadMode=null;
+var _ctBaseUrl='{% if settings.get("fqdn") %}https://{{ ct_domain }}{% else %}{% endif %}';
 function enableModule(){
     document.getElementById('enable-btn').disabled=true;
     document.getElementById('enable-status').textContent='Enabling…';
@@ -46261,10 +46316,27 @@ function disableModule(){
     if(!confirm('Disable Cesium 3D Tiles? The tile files will not be deleted.'))return;
     fetch('/api/cesium-tiles/disable',{method:'POST'}).then(()=>window.location.reload());
 }
-function handleFile(file){
+function cleanName(v){return v.replace(/[^A-Za-z0-9_\-]/g,'-').replace(/^-+|-+$/g,'');}
+function updateUrlPreview(v){
+    var n=cleanName(v||'');
+    var el=document.getElementById('url-preview');
+    if(!el)return;
+    if(n&&_ctBaseUrl){el.textContent=_ctBaseUrl+'/'+n+'/tileset.json';el.style.color='var(--cyan)';}
+    else if(n){el.textContent='/'+n+'/tileset.json';el.style.color='var(--text-secondary)';}
+    else{el.textContent='type a name above to preview';el.style.color='var(--text-dim)';}
+}
+function handleFolderSelect(files){
+    if(!files||!files.length)return;
+    _pendingFiles=Array.from(files);_pendingZip=null;_uploadMode='folder';
+    var hasJson=_pendingFiles.some(function(f){var p=f.webkitRelativePath||f.name;return p.split('/').slice(1).join('/')==='tileset.json';});
+    var lbl=document.getElementById('file-label');
+    if(hasJson){lbl.innerHTML='<span style="color:var(--green)">✓ '+_pendingFiles.length+' files — tileset.json found</span>';document.getElementById('upload-btn').disabled=false;}
+    else{lbl.innerHTML='<span style="color:var(--red)">✗ No tileset.json found in this folder</span>';document.getElementById('upload-btn').disabled=true;}
+}
+function handleZipSelect(file){
     if(!file)return;
-    _pendingFile=file;
-    document.getElementById('file-label').textContent=file.name+' ('+formatBytes(file.size)+')';
+    _pendingZip=file;_pendingFiles=null;_uploadMode='zip';
+    document.getElementById('file-label').innerHTML='<span style="color:var(--green)">✓ '+file.name+' ('+formatBytes(file.size)+')</span>';
     document.getElementById('upload-btn').disabled=false;
 }
 function formatBytes(b){if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';}
@@ -46272,39 +46344,53 @@ var _uploadArea=document.getElementById('upload-area');
 if(_uploadArea){
     _uploadArea.addEventListener('dragover',function(e){e.preventDefault();_uploadArea.classList.add('drag');});
     _uploadArea.addEventListener('dragleave',function(){_uploadArea.classList.remove('drag');});
-    _uploadArea.addEventListener('drop',function(e){e.preventDefault();_uploadArea.classList.remove('drag');var f=e.dataTransfer.files[0];if(f){document.getElementById('file-input').files=e.dataTransfer.files;handleFile(f);}});
+    _uploadArea.addEventListener('drop',function(e){
+        e.preventDefault();_uploadArea.classList.remove('drag');
+        var f=e.dataTransfer.files[0];
+        if(!f)return;
+        if(f.name.toLowerCase().endsWith('.zip')){document.getElementById('zip-input').files=e.dataTransfer.files;handleZipSelect(f);}
+        else{showToast('Drop a .zip file here. To upload a folder, use the Select Folder button.');}
+    });
 }
 function doUpload(){
-    var name=(document.getElementById('dataset-name').value||'').trim();
+    var raw=(document.getElementById('dataset-name').value||'').trim();
+    var name=cleanName(raw);
     if(!name){showToast('Enter a dataset name first.');return;}
-    if(!_pendingFile){showToast('Select a zip file first.');return;}
-    var fd=new FormData();
-    fd.append('name',name);
-    fd.append('file',_pendingFile);
+    if(_uploadMode==='folder'&&_pendingFiles){_doFolderUpload(name);}
+    else if(_uploadMode==='zip'&&_pendingZip){_doZipUpload(name);}
+    else{showToast('Select a folder or zip file first.');}
+}
+function _sendXhr(url,fd,onDone){
     var btn=document.getElementById('upload-btn');
     var outer=document.getElementById('progress-outer');
     var bar=document.getElementById('progress-bar');
     var st=document.getElementById('upload-status');
-    btn.disabled=true;
-    outer.style.display='block';
-    bar.style.width='0%';
-    st.textContent='Uploading…';
+    btn.disabled=true;outer.style.display='block';bar.style.width='0%';st.textContent='Uploading…';
     var xhr=new XMLHttpRequest();
-    xhr.open('POST','/api/cesium-tiles/upload');
+    xhr.open('POST',url);
     xhr.upload.onprogress=function(e){if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);bar.style.width=pct+'%';st.textContent='Uploading… '+pct+'%';}};
     xhr.onload=function(){
-        var d;try{d=JSON.parse(xhr.responseText);}catch(e){d={success:false,error:'Invalid response'};}
-        if(d.success){
-            st.textContent='';bar.style.width='100%';
-            showToast('Dataset "'+d.dataset+'" uploaded successfully.');
-            setTimeout(function(){window.location.reload();},1200);
-        }else{
-            st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'Upload failed')+'</span>';
-            btn.disabled=false;outer.style.display='none';
-        }
+        var d;try{d=JSON.parse(xhr.responseText);}catch(ex){d={success:false,error:'Invalid response'};}
+        if(d.success){bar.style.width='100%';st.textContent='';showToast('Dataset "'+d.dataset+'" uploaded.');setTimeout(function(){window.location.reload();},1200);}
+        else{st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'Upload failed')+'</span>';btn.disabled=false;outer.style.display='none';}
     };
     xhr.onerror=function(){st.innerHTML='<span style="color:var(--red)">Network error</span>';btn.disabled=false;outer.style.display='none';};
     xhr.send(fd);
+}
+function _doFolderUpload(name){
+    var fd=new FormData();
+    fd.append('name',name);
+    for(var i=0;i<_pendingFiles.length;i++){
+        var f=_pendingFiles[i];
+        var rel=(f.webkitRelativePath||f.name).split('/').slice(1).join('/');
+        if(!rel)continue;
+        fd.append('files[]',f,rel);
+    }
+    _sendXhr('/api/cesium-tiles/upload-folder',fd);
+}
+function _doZipUpload(name){
+    var fd=new FormData();fd.append('name',name);fd.append('file',_pendingZip);
+    _sendXhr('/api/cesium-tiles/upload',fd);
 }
 function copyUrl(url){
     navigator.clipboard.writeText(url).then(function(){showToast('URL copied to clipboard.');}).catch(function(){showToast(url);});
