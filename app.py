@@ -17607,7 +17607,7 @@ services:
       - WEB_CONCURRENCY=2
     restart: unless-stopped
   wo_nodeodm:
-    image: opendronemap/nodeodm
+    image: webodm/nodeodx
     container_name: wo_nodeodm
     ports:
       - "127.0.0.1:3001:3000"
