@@ -12241,25 +12241,47 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
 
 
 def _get_cloudtak_version_info():
-    """Return {version: str, update_available: bool, latest: str|None} for CloudTAK."""
+    """Return {version: str, update_available: bool, latest: str|None} for CloudTAK.
+
+    Version resolution order (handles upstream tagging-before-package-bump bug):
+    1. git describe --tags --exact-match: if HEAD is exactly at a release tag,
+       use the tag name (e.g. v13.3.0 → '13.3.0'). This is authoritative even
+       when package.json still says 13.2.0 (dfpc-coe sometimes tags before
+       bumping package.json — the tag is the real version).
+    2. package.json (api/ or web/): used when HEAD is not at an exact tag.
+    3. git describe --tags --always fallback for everything else.
+    """
     import re
     out = {'version': '', 'update_available': False, 'latest': None}
     ct_dir = os.path.expanduser('~/CloudTAK')
-    for pkg in ['package.json', 'api/package.json', 'web/package.json']:
-        pkg_path = os.path.join(ct_dir, pkg)
-        if os.path.isfile(pkg_path):
-            try:
-                with open(pkg_path) as f:
-                    data = json.load(f)
-                out['version'] = (data.get('version') or '').strip()
-                if out['version']:
-                    break
-            except Exception:
-                pass
+    # Step 1: prefer exact git tag — authoritative even when package.json lags
+    if os.path.isdir(os.path.join(ct_dir, '.git')):
+        try:
+            rv = subprocess.run(
+                f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=5)
+            if rv.returncode == 0 and rv.stdout.strip():
+                out['version'] = rv.stdout.strip().lstrip('vV')
+        except Exception:
+            pass
+    # Step 2: package.json when not at an exact tag
+    if not out['version']:
+        for pkg in ['package.json', 'api/package.json', 'web/package.json']:
+            pkg_path = os.path.join(ct_dir, pkg)
+            if os.path.isfile(pkg_path):
+                try:
+                    with open(pkg_path) as f:
+                        data = json.load(f)
+                    out['version'] = (data.get('version') or '').strip()
+                    if out['version']:
+                        break
+                except Exception:
+                    pass
+    # Step 3: git describe fallback
     if not out['version'] and os.path.isdir(os.path.join(ct_dir, '.git')):
         rv = subprocess.run(f'cd {ct_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
-            out['version'] = rv.stdout.strip()
+            out['version'] = rv.stdout.strip().lstrip('vV')
     r = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
     if r.returncode == 0 and (r.stdout or '').strip():
         log_r = subprocess.run('docker logs cloudtak-api --tail 150 2>&1', shell=True, capture_output=True, text=True, timeout=10)
@@ -15603,25 +15625,39 @@ def cloudtak_reset_server_config():
 
 
 def _detect_cloudtak_plugins():
-    """Return the CLOUDTAK_PLUGINS catalog annotated with installed=True/False and commit info."""
+    """Return the CLOUDTAK_PLUGINS catalog annotated with installed/commit/update_available."""
     ct_dir = os.path.expanduser('~/CloudTAK')
     plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
     result = []
     for p in CLOUDTAK_PLUGINS:
         install_path = os.path.join(plugins_base, p['install_dir'])
         installed = os.path.isdir(install_path)
-        commit = None
+        sha = None
+        update_available = False
         if installed:
+            # Local HEAD — short SHA only (no commit message)
             try:
                 r = subprocess.run(
-                    ['git', '-C', install_path, 'log', '--oneline', '-1'],
+                    ['git', '-C', install_path, 'rev-parse', '--short=7', 'HEAD'],
                     capture_output=True, text=True, timeout=5
                 )
                 if r.returncode == 0:
-                    commit = (r.stdout.strip() or '')[:60]
+                    sha = r.stdout.strip()
             except Exception:
                 pass
-        result.append({**p, 'installed': installed, 'commit': commit})
+            # Remote HEAD — compare to detect available updates (5 s timeout)
+            try:
+                r2 = subprocess.run(
+                    ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r2.returncode == 0 and r2.stdout.strip():
+                    remote_short = r2.stdout.split()[0][:7]
+                    if sha and remote_short and sha != remote_short:
+                        update_available = True
+            except Exception:
+                pass
+        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available})
     return result
 
 
@@ -23269,6 +23305,28 @@ window.doUninstall = function() {
 window._ctPluginLogIndex = 0;
 window._ctPluginLogInterval = null;
 
+window._ctPluginSetBusy = function(pluginKey, action, busy) {
+  var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
+  var installBtn = document.getElementById('ct-plugin-install-btn-' + pluginKey);
+  var updateBtn  = document.getElementById('ct-plugin-update-btn-' + pluginKey);
+  var removeBtn  = document.getElementById('ct-plugin-remove-btn-' + pluginKey);
+  [installBtn, updateBtn, removeBtn].forEach(function(btn) {
+    if (!btn) return;
+    btn.disabled = busy;
+    btn.style.opacity = busy ? '0.6' : '';
+  });
+  var activeBtn = { install: installBtn, update: updateBtn, remove: removeBtn }[action];
+  if (activeBtn) {
+    if (busy) {
+      activeBtn._origHTML = activeBtn.innerHTML;
+      activeBtn.innerHTML = '<span class="ct-btn-spinner"></span>' + label + 'ing\u2026';
+    } else if (activeBtn._origHTML) {
+      activeBtn.innerHTML = activeBtn._origHTML;
+      delete activeBtn._origHTML;
+    }
+  }
+};
+
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
   if (action === 'remove') {
@@ -23281,6 +23339,7 @@ window.ctPluginAction = function(pluginKey, action) {
   var logEl   = document.getElementById('ct-plugin-log');
   var labelEl = document.getElementById('ct-plugin-log-action');
 
+  window._ctPluginSetBusy(pluginKey, action, true);
   if (logCard) logCard.style.display = 'block';
   if (logEl)   logEl.textContent = 'Starting ' + label.toLowerCase() + '...';
   if (labelEl) labelEl.textContent = '— ' + label + ' ' + pluginKey;
@@ -23296,15 +23355,17 @@ window.ctPluginAction = function(pluginKey, action) {
   }).then(function(r) { return r.json(); }).then(function(d) {
     if (d && d.error) {
       if (logEl) logEl.textContent = 'Error: ' + d.error;
+      window._ctPluginSetBusy(pluginKey, action, false);
       return;
     }
-    window._ctPollPluginLog();
+    window._ctPollPluginLog(pluginKey, action);
   }).catch(function(e) {
     if (logEl) logEl.textContent = 'Request failed: ' + (e && e.message ? e.message : String(e));
+    window._ctPluginSetBusy(pluginKey, action, false);
   });
 };
 
-window._ctPollPluginLog = function() {
+window._ctPollPluginLog = function(pluginKey, action) {
   if (window._ctPluginLogInterval) clearInterval(window._ctPluginLogInterval);
   window._ctPluginPollFails = 0;
 
@@ -23332,7 +23393,8 @@ window._ctPollPluginLog = function() {
             setTimeout(function() { location.reload(); }, 1500);
           } else if (d.error) {
             var logEl2 = document.getElementById('ct-plugin-log');
-            if (logEl2) logEl2.textContent = (logEl2.textContent || '') + '\n\n✗ Action failed (see log above).';
+            if (logEl2) logEl2.textContent = (logEl2.textContent || '') + '\n\n\u2717 Action failed (see log above).';
+            if (pluginKey && action) window._ctPluginSetBusy(pluginKey, action, false);
           }
         }
       })
@@ -23587,18 +23649,18 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
               <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">requires {{ p.requires }}</span>
             </div>
             <a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>
-            {% if p.installed and p.commit %}
-            <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.commit }}</div>
+            {% if p.installed and p.sha %}
+            <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.sha }}{% if p.update_available %} <span style="color:var(--cyan);margin-left:6px">update available</span>{% endif %}</div>
             {% endif %}
           </div>
           <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex-shrink:0">
             {% if p.installed %}
             <span style="font-size:11px;font-weight:600;color:var(--green);background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:5px;padding:3px 9px">INSTALLED</span>
-            <button class="btn btn-ghost" style="font-size:12px;padding:7px 14px" onclick="ctPluginAction('{{ p.key }}','update')">⬆ Update</button>
-            <button class="btn" style="font-size:12px;padding:7px 14px;background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)" onclick="ctPluginAction('{{ p.key }}','remove')">Remove</button>
+            <button class="btn btn-ghost" id="ct-plugin-update-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px;{% if p.update_available %}border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan);{% endif %}" onclick="ctPluginAction('{{ p.key }}','update')">⬆ Update{% if p.update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button>
+            <button class="btn" id="ct-plugin-remove-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px;background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)" onclick="ctPluginAction('{{ p.key }}','remove')">Remove</button>
             {% else %}
             <span style="font-size:11px;font-weight:600;color:var(--text-dim);background:var(--bg-card);border:1px solid var(--border);border-radius:5px;padding:3px 9px">NOT INSTALLED</span>
-            <button class="btn btn-primary" style="font-size:12px;padding:7px 14px" onclick="ctPluginAction('{{ p.key }}','install')">Install</button>
+            <button class="btn btn-primary" id="ct-plugin-install-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px" onclick="ctPluginAction('{{ p.key }}','install')">Install</button>
             {% endif %}
           </div>
         </div>
@@ -32243,6 +32305,116 @@ def _takportal_admin_guardrail(plog_fn=None):
         _log(f"takportal admin guardrail error (non-fatal): {_e}")
 
 
+def _check_takserver_ldap49_and_heal(plog=None):
+    """v0.9.38: Detect TAK Server negative LDAP auth cache and auto-flush the
+    LDAP outpost to clear it.
+
+    When a user fails to authenticate, TAK Server's LdapAuthenticator caches
+    the failed result internally (DistributedPersistentGroupManager). After a
+    password change in TAK Portal, subsequent logins still hit that cache and
+    return LDAP 49 without the request ever reaching Authentik. The only fix is
+    --force-recreate ldap, which forces TAK Server to drop and re-establish its
+    LDAP connection, clearing the cached failure.
+
+    Detection: tail /opt/tak/logs/takserver-api.log and count lines matching
+    'LdapAuthenticator - exception during group assignment' within the last
+    360 seconds. Threshold >= 2: one failure = normal wrong-password typo, no
+    action; two or more in a 5-min window = pattern indicates a stuck negative
+    cache (password changed, user retrying, still blocked).
+
+    Rate limit: 4-minute cooldown via settings['ldap49_cache_flush'] — at most
+    one flush per watchdog tick regardless of how many failures accumulate.
+
+    Called from _authentik_ldap_sa_bind_watchdog_loop before the SA bind probe
+    so the outpost is already fresh when the probe runs.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        _api_log = '/opt/tak/logs/takserver-api.log'
+        if not os.path.exists(_api_log):
+            return
+
+        _settings = load_settings()
+
+        # 4-minute cooldown — prevents double-flushes within a single tick window
+        _cooldown_info = _settings.get('ldap49_cache_flush') or {}
+        _last_flush = float(_cooldown_info.get('last_flush_ts') or 0)
+        if time.time() - _last_flush < 240:
+            return
+
+        # Tail last 300 lines — covers several minutes on an active box.
+        # Use subprocess list form to avoid shell expansion on the path.
+        _r = subprocess.run(
+            ['tail', '-n', '300', _api_log],
+            capture_output=True, text=True, timeout=5
+        )
+        if _r.returncode != 0 or not _r.stdout:
+            return
+
+        _cutoff = datetime.utcnow() - timedelta(seconds=360)
+        _count = 0
+        _marker = 'LdapAuthenticator - exception during group assignment'
+        for _line in _r.stdout.splitlines():
+            if _marker not in _line:
+                continue
+            try:
+                # TAK Server log format: 2026-05-23-03:18:13.396 [...] WARN ...
+                _ts_str = _line.split(' ')[0]
+                _ts = datetime.strptime(_ts_str, '%Y-%m-%d-%H:%M:%S.%f')
+                if _ts >= _cutoff:
+                    _count += 1
+            except (ValueError, IndexError):
+                # Unparseable timestamp — count conservatively
+                _count += 1
+
+        if _count < 2:
+            return
+
+        _log(f"  LDAP 49 cache-hit watchdog: {_count} user auth failure(s) in "
+             f"last 6 min — flushing LDAP outpost bind cache")
+        _ak_cfg = _get_module_deployment_config(_settings, 'authentik_deployment')
+        _is_remote = (
+            _ak_cfg.get('target_mode') == 'remote' and
+            bool((_ak_cfg.get('remote', {}).get('host') or '').strip())
+        )
+        try:
+            if _is_remote:
+                _module_run(
+                    _ak_cfg,
+                    'cd ~/authentik && docker compose up -d --no-deps --force-recreate ldap 2>&1',
+                    timeout=90
+                )
+            else:
+                _flush_r = subprocess.run(
+                    'cd ~/authentik && docker compose up -d --no-deps --force-recreate ldap 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=90
+                )
+                if _flush_r.returncode != 0:
+                    _log(f"  ⚠ LDAP 49 cache flush failed "
+                         f"(rc={_flush_r.returncode}): {(_flush_r.stdout or '')[:200]}")
+                    return
+            _log("  ✓ LDAP outpost flushed — TAK Server LDAP connection will "
+                 "reset on next auth attempt, clearing the cached failure")
+            # Persist audit trail so operators can track frequency
+            try:
+                _s2 = load_settings()
+                _prior = _s2.get('ldap49_cache_flush') or {}
+                _s2['ldap49_cache_flush'] = {
+                    'last_flush_ts': time.time(),
+                    'flush_count': int(_prior.get('flush_count') or 0) + 1,
+                    'last_trigger_count': _count,
+                }
+                save_settings(_s2)
+            except Exception:
+                pass
+        except Exception as _fe:
+            _log(f"  ⚠ LDAP 49 cache flush error: {str(_fe)[:120]}")
+    except Exception as _e:
+        (_plog := plog or print)(
+            f"  _check_takserver_ldap49_and_heal error (non-fatal): {str(_e)[:120]}"
+        )
+
+
 def _authentik_ldap_sa_bind_watchdog_loop():
     """v0.9.23 (Item 1+2 of PLAN-v0.9.23-alpha.md). Background daemon — periodic
     LDAP SA bind verification + webadmin admin-role drift heal.
@@ -32287,6 +32459,12 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             if not _env_pass:
                 _wt.sleep(300)
                 continue
+
+            # v0.9.38: detect TAK Server negative auth cache and flush if needed,
+            # before the SA bind probe so the outpost is fresh when we test it.
+            _check_takserver_ldap49_and_heal(
+                plog=lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True)
+            )
 
             try:
                 _verdict = _test_ldap_bind_dn_verdict(
