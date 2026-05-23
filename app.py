@@ -46419,7 +46419,16 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
 .open-btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;transition:opacity .2s}.open-btn:hover{opacity:.85}
 .toast{position:fixed;bottom:24px;right:24px;background:#1e2736;border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;color:var(--text-primary);display:none;z-index:999}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.04);border-left-color:var(--border)}
+.nav-item.active{color:var(--accent);background:rgba(59,130,246,.08);border-left-color:var(--accent)}
+.nav-icon{font-size:18px;width:22px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.sidebar-logo{padding:0 20px 16px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.sidebar-logo span{display:block;font-size:15px;font-weight:700;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:11px;color:var(--text-dim);margin-top:2px}
 body.light-mode{--bg-deep:#f1f5f9;--bg-surface:#fff;--bg-card:#f8fafc;--border:#e2e8f0;--text-primary:#0f172a;--text-secondary:#334155;--text-dim:#64748b}
+body.light-mode .nav-item:hover{background:rgba(0,0,0,.04)}
+body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
@@ -46429,7 +46438,7 @@ body.light-mode{--bg-deep:#f1f5f9;--bg-surface:#fff;--bg-card:#f8fafc;--border:#
 <!-- Deploy state -->
 <div style="background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px">
 <div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">🚁 Drone Photo Processing for TAK</div>
-<div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install Tom Endress's TAK Incident Overlay plugin. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
+<div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install the TAK Incident Overlay plugin by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a>. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
 <div style="margin-top:12px;font-size:12px;color:var(--text-dim)">Deploys: WebODM 3.2+ · NodeODM processing node · <a href="https://github.com/Humble-Helper-96/webodm-tak-overlay" target="_blank" style="color:var(--cyan);text-decoration:none">TAK Overlay plugin v0.7.7</a></div>
 </div>
 
@@ -46490,7 +46499,7 @@ body.light-mode{--bg-deep:#f1f5f9;--bg-surface:#fff;--bg-card:#f8fafc;--border:#
 <span class="info-label">Processing node</span>
 <span class="info-value">wo_nodeodm:3000 (auto-registered)</span>
 <span class="info-label">Plugin</span>
-<span class="info-value">TAK Incident Overlay v0.7.7 by Tom Endress</span>
+<span class="info-value">TAK Incident Overlay v0.7.7 by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a></span>
 </div>
 </div>
 
