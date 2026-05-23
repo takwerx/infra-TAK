@@ -100,6 +100,20 @@ if [ -f "$HOME/CloudTAK/api/package.json" ]; then
   fi
 fi
 
+# CloudTAK plugins — compare local HEAD vs remote HEAD (no release tags; use git ls-remote)
+if [ -d "$HOME/CloudTAK/api/web/plugins" ]; then
+  for plugin_dir in "$HOME/CloudTAK/api/web/plugins"/*/; do
+    [ -d "$plugin_dir/.git" ] || continue
+    plugin_name=$(basename "$plugin_dir")
+    local_sha=$(git -C "$plugin_dir" rev-parse HEAD 2>/dev/null)
+    remote_sha=$(git -C "$plugin_dir" ls-remote origin HEAD 2>/dev/null | awk '{print $1}')
+    if [ -n "$local_sha" ] && [ -n "$remote_sha" ] && [ "$local_sha" != "$remote_sha" ]; then
+      UPDATES="${UPDATES}  - CloudTAK plugin ($plugin_name): update available (${local_sha:0:7} → ${remote_sha:0:7})\n"
+      SIG="${SIG}ctplugin_${plugin_name}:${remote_sha:0:8};"
+    fi
+  done
+fi
+
 # TAK Portal (current from package.json, latest from container logs [update-check] — same as console)
 if [ -f "$HOME/TAK-Portal/package.json" ]; then
   cur_portal=$(grep -o '"version":[[:space:]]*"[^"]*"' "$HOME/TAK-Portal/package.json" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
