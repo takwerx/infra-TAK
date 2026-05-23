@@ -46057,50 +46057,57 @@ async function doConsoleRollback(){
 
 # === Cesium 3D Tiles Template ===
 CESIUM_TILES_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cesium 3D Tiles — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
 <style>
-''' + BASE_CSS + '''
-body{display:flex;flex-direction:row;min-height:100vh}
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
 .main{flex:1;min-width:0;overflow-y:auto;padding:32px}
-.section-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
-.section-title-sm{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
-.status-row{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;font-weight:600}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px;font-family:'JetBrains Mono',monospace}
+.status-row{display:flex;align-items:center;gap:12px}
 .status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite;flex-shrink:0}
 .status-dot.off{background:var(--text-dim);animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .upload-area{border:2px dashed var(--border);border-radius:10px;padding:32px;text-align:center;cursor:pointer;transition:all .3s;background:rgba(15,23,42,.3)}
-.upload-area:hover,.upload-area.drag{border-color:var(--accent);background:var(--accent-glow)}
+.upload-area:hover,.upload-area.drag{border-color:var(--accent);background:rgba(59,130,246,.06)}
 .progress-bar-outer{width:100%;height:6px;background:rgba(59,130,246,.1);border-radius:3px;margin-top:10px;overflow:hidden;display:none}
 .progress-bar-inner{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--cyan));width:0%;transition:width .3s}
 .dataset-table{width:100%;border-collapse:collapse}
 .dataset-table th{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
 .dataset-table td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(30,39,54,.6);vertical-align:middle}
 .dataset-table tr:last-child td{border-bottom:none}
-.btn{padding:8px 16px;border-radius:7px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
-.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
-.btn-primary:hover{opacity:.9}
-.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}
-.btn-ghost:hover{border-color:var(--accent);background:rgba(59,130,246,.15)}
-.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}
-.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn{display:inline-flex;align-items:center;padding:8px 16px;border-radius:7px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}.btn-ghost:hover{border-color:var(--accent);background:rgba(59,130,246,.15)}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
 .btn-sm{padding:5px 10px;font-size:11px}
 .url-chip{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.15);border-radius:5px;padding:3px 8px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle;cursor:pointer}
 .url-chip:hover{background:rgba(6,182,212,.12)}
 .sample-box{background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px}
-.sample-box a{color:var(--cyan);text-decoration:none}
-.sample-box a:hover{text-decoration:underline}
-.steps-list{counter-reset:steps}
+.sample-box a{color:var(--cyan);text-decoration:none}.sample-box a:hover{text-decoration:underline}
 .step-item{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(30,39,54,.5)}
 .step-item:last-child{border-bottom:none}
 .step-num{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
 .step-text{font-size:13px;color:var(--text-secondary);line-height:1.5}
-.step-text code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
+.step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
 .details-toggle{width:100%;text-align:left;background:none;border:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:0;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
 .details-toggle:hover{color:var(--text-primary)}
-.chevron{transition:transform .2s;font-size:16px}
+.chevron{transition:transform .2s;font-size:16px;color:var(--text-dim)}
 .chevron.open{transform:rotate(180deg)}
 .collapsed{display:none}
-input[type=text]{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace}
-input[type=text]:focus{outline:none;border-color:var(--accent)}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace}
+.form-input:focus{outline:none;border-color:var(--accent)}
 .form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
 .toast{position:fixed;bottom:24px;right:24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;z-index:999;opacity:0;transition:opacity .3s;pointer-events:none}
 .toast.show{opacity:1}
@@ -46126,7 +46133,7 @@ For real-world city models, Japan's <a href="https://www.mlit.go.jp/plateau/" ta
 
 {% if not ct.get('installed') %}
 <!-- Deploy state -->
-<div class="section-card" style="max-width:600px">
+<div class="card" style="max-width:600px">
 <div style="display:flex;align-items:flex-start;gap:20px">
 <span style="font-size:48px;line-height:1;flex-shrink:0">🌍</span>
 <div>
@@ -46153,7 +46160,7 @@ Enable Cesium 3D Tiles
 {% else %}
 <!-- Management state -->
 {% set ct_domain = settings.get('cesium_tiles_domain') or ('3dtiles.' + settings.get('fqdn','')) %}
-<div class="section-card" style="margin-bottom:20px">
+<div class="card" style="margin-bottom:20px">
 <div class="status-row">
 <div class="status-dot {% if not ct.get('running') %}off{% endif %}"></div>
 <div>
@@ -46167,11 +46174,11 @@ Enable Cesium 3D Tiles
 </div>
 
 <!-- Upload section -->
-<div class="section-card">
-<div class="section-title-sm">Upload Dataset (.zip)</div>
+<div class="card">
+<div class="card-title">Upload Dataset (.zip)</div>
 <div style="margin-bottom:12px">
 <label class="form-label">Dataset Name</label>
-<input type="text" id="dataset-name" placeholder="e.g. san-diego-buildings" maxlength="80">
+<input type="text" id="dataset-name" class="form-input" placeholder="e.g. san-diego-buildings" maxlength="80">
 <div style="font-size:11px;color:var(--text-dim);margin-top:5px">Used in the URL path. Letters, numbers, hyphens only.</div>
 </div>
 <div class="upload-area" id="upload-area" onclick="document.getElementById('file-input').click()">
@@ -46188,8 +46195,8 @@ Enable Cesium 3D Tiles
 </div>
 
 <!-- Dataset list -->
-<div class="section-card">
-<div class="section-title-sm">Installed Datasets ({{ datasets|length }})</div>
+<div class="card">
+<div class="card-title">Installed Datasets ({{ datasets|length }})</div>
 {% if datasets %}
 <table class="dataset-table">
 <thead><tr>
@@ -46219,7 +46226,7 @@ Enable Cesium 3D Tiles
 </div>
 
 <!-- ATAK Instructions -->
-<div class="section-card">
+<div class="card">
 <button class="details-toggle" onclick="toggleInstructions(this)">
 <span>How to Connect in ATAK / WinTAK / iTAK</span>
 <span class="material-symbols-outlined chevron" id="instr-chevron">expand_more</span>
@@ -46230,9 +46237,9 @@ Enable Cesium 3D Tiles
 <div class="step-item"><div class="step-num">1</div><div class="step-text">Open ATAK and launch the <strong>Map Manager</strong></div></div>
 <div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>MOBILE</strong> tab</div></div>
 <div class="step-item"><div class="step-num">3</div><div class="step-text">Select the <strong>Down Arrow</strong>, then the <strong>Add (+)</strong> button</div></div>
-<div class="step-item"><div class="step-num">4</div><div class="step-text">Type in the URL to the dataset's <code>tileset.json</code> — e.g. <code>https://{{ ct_domain }}/my-dataset/tileset.json</code><br><span style="font-size:12px;color:var(--text-dim)">ATAK will send a request to the URL to check for available services and confirm it is Cesium 3D Tiles content.</span></div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Type in the URL to the dataset's <span class="step-code">tileset.json</span> — e.g. <span class="step-code">https://{{ ct_domain }}/my-dataset/tileset.json</span><br><span style="font-size:12px;color:var(--text-dim)">ATAK will send a request to the URL to check for available services and confirm it is Cesium 3D Tiles content.</span></div></div>
 <div class="step-item"><div class="step-num">5</div><div class="step-text">If the connection succeeds, a window shows available services. <strong>Click the checkbox</strong> next to the tileset to import it.</div></div>
-<div class="step-item"><div class="step-num">6</div><div class="step-text">The dataset is now available under the <strong>Overlay Manager</strong> as a 3D layer. ATAK caches tiles locally in <code>atak/3dtilescache/</code>.</div></div>
+<div class="step-item"><div class="step-num">6</div><div class="step-text">The dataset is now available under the <strong>Overlay Manager</strong> as a 3D layer. ATAK caches tiles locally in <span class="step-code">atak/3dtilescache/</span>.</div></div>
 </div>
 </div>
 </div>
