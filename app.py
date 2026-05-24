@@ -1004,7 +1004,7 @@ def detect_modules():
         'installed': bool(wo_enabled),
         'running': wo_running,
         'description': 'Drone photo processing → 3D Tiles & TAK overlays',
-        'icon': '🚁',
+        'icon': '📡',
         'icon_url': 'https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png',
         'route': '/webodm',
         'priority': 12,
@@ -46771,7 +46771,7 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 {% if not wo.get('installed') %}
 <!-- Deploy state -->
 <div style="background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px">
-<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">🚁 Drone Photo Processing for TAK</div>
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">Drone Photo Processing for TAK</div>
 <div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install the TAK Incident Overlay plugin by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a>. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
 <div style="margin-top:12px;font-size:12px;color:var(--text-dim)">Deploys: WebODM 3.2+ · NodeODM processing node · <a href="https://github.com/Humble-Helper-96/webodm-tak-overlay" target="_blank" style="color:var(--cyan);text-decoration:none">TAK Overlay plugin v0.7.7</a></div>
 </div>
