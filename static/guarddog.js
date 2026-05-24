@@ -176,3 +176,39 @@ function gdSaveDiskioSettings(){
   });
 }
 if(document.getElementById('gd-diskio-card')){gdDiskioUiRefresh();gdRefreshDiskIO();setInterval(gdRefreshDiskIO,300000);}
+
+function doConsoleRollback(){
+  var modal=document.getElementById('gd-rollback-modal');
+  var pw=document.getElementById('gd-rollback-password');
+  var msg=document.getElementById('gd-rollback-msg');
+  if(!modal)return;
+  if(pw)pw.value='';
+  if(msg)msg.textContent='';
+  modal.classList.add('open');
+  setTimeout(function(){if(pw)pw.focus();},100);
+}
+function doConsoleRollbackSubmit(){
+  var pw=document.getElementById('gd-rollback-password');
+  var msg=document.getElementById('gd-rollback-msg');
+  var btn=document.querySelector('#gd-rollback-modal .btn:not(.btn-ghost)');
+  if(!pw||!msg)return;
+  var password=pw.value;
+  if(!password){msg.textContent='Password required.';msg.style.color='var(--red)';return;}
+  msg.textContent='Rolling back…';msg.style.color='var(--text-dim)';
+  if(btn){btn.disabled=true;btn.textContent='Rolling back…';}
+  fetch('/api/console/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:password}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok){
+        msg.style.color='var(--green)';msg.textContent='✓ '+d.message;
+        setTimeout(function(){window.location.reload();},10000);
+      }else{
+        if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}
+        msg.style.color='var(--red)';msg.textContent=d.error||'Rollback failed';
+      }
+    })
+    .catch(function(e){
+      if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}
+      msg.style.color='var(--red)';msg.textContent=e.message||'Network error';
+    });
+}

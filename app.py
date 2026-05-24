@@ -2449,6 +2449,11 @@ def update_apply():
 @login_required
 def console_rollback_api():
     """Roll back the console to the version saved before the last Update Now."""
+    data = request.get_json(silent=True) or {}
+    password = data.get('password', '')
+    auth = load_settings().get('auth', {})
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'ok': False, 'error': 'Incorrect password'}), 403
     console_dir = os.path.dirname(os.path.abspath(__file__))
     s = load_settings()
     rb = s.get('console_rollback') or {}
@@ -20743,6 +20748,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-uninstall-password" placeholder="Confirm password"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="document.getElementById('gd-uninstall-modal').classList.remove('open')">Cancel</button><button class="btn" style="background:var(--red);color:#fff" onclick="gdUninstall()">Uninstall</button></div>
     <div id="gd-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+  </div></div>
+  <div class="modal-overlay" id="gd-rollback-modal"><div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw">
+    <h3 style="font-size:16px;margin-bottom:8px;color:var(--yellow)">↩ Roll Back Console?</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">This will revert the console to <strong>{{ settings.get('console_rollback', {}).get('tag', 'previous version') }}</strong>. The console will restart briefly. This cannot be undone.</p>
+    <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-rollback-password" placeholder="Confirm password" onkeydown="if(event.key==='Enter')doConsoleRollbackSubmit()"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="document.getElementById('gd-rollback-modal').classList.remove('open');document.getElementById('gd-rollback-password').value=''">Cancel</button><button class="btn" style="background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.4)" onclick="doConsoleRollbackSubmit()">↩ Roll Back</button></div>
+    <div id="gd-rollback-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
   </div></div>
   <div class="card">
     <div class="card-title">Console Rollback</div>
