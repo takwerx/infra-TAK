@@ -46811,6 +46811,36 @@ Enable Cesium 3D Tiles
 </div>
 </div>
 
+<!-- How to upload instructions -->
+<div class="card" style="margin-bottom:20px">
+<button class="details-toggle" onclick="toggleUploadHelp(this)">
+<span>How to prepare &amp; upload a dataset</span>
+<span class="material-symbols-outlined chevron" id="upload-help-chevron">expand_more</span>
+</button>
+<div id="upload-help-body" class="collapsed" style="margin-top:16px">
+<div class="step-item">
+<div class="step-num">1</div>
+<div class="step-text"><strong>Get a 3D Tiles dataset.</strong> Any directory that contains a <span class="step-code">tileset.json</span> file at its root is a valid Cesium 3D Tiles dataset. The folder also contains the tile files (<span class="step-code">.b3dm</span>, <span class="step-code">.pnts</span>, <span class="step-code">.i3dm</span>, etc.) referenced by that JSON.</div>
+</div>
+<div class="step-item">
+<div class="step-num">2</div>
+<div class="step-text"><strong>Option A — Upload via browser.</strong> Enter a dataset name, then either:<br>
+• <strong>Select Folder</strong> — pick the dataset folder directly from your computer.<br>
+• <strong>Select .zip</strong> — zip the dataset folder first so the <span class="step-code">tileset.json</span> is at the top level inside the zip (not nested inside a sub-folder), then upload the zip.</div>
+</div>
+<div class="step-item">
+<div class="step-num">3</div>
+<div class="step-text"><strong>Option B — Place via SFTP.</strong> Copy the dataset folder directly to the server at:<br>
+<span class="step-code">~/cesium-tiles/&lt;dataset-name&gt;/tileset.json</span><br>
+<span style="font-size:12px;color:var(--text-dim)">The dataset will appear in the list below automatically — no upload needed.</span></div>
+</div>
+<div class="step-item" style="border-bottom:none">
+<div class="step-num">4</div>
+<div class="step-text"><strong>Copy the ATAK URL.</strong> Once the dataset appears in the table below, click its URL chip to copy it. Paste that URL into ATAK's Map Manager (see <em>How to Connect in ATAK</em> below).</div>
+</div>
+</div>
+</div>
+
 <!-- Upload section -->
 <div class="card">
 <div class="card-title">Upload Dataset</div>
@@ -47000,6 +47030,12 @@ function deleteDataset(name){
 function toggleInstructions(btn){
     var body=document.getElementById('instr-body');
     var chev=document.getElementById('instr-chevron');
+    if(body.classList.contains('collapsed')){body.classList.remove('collapsed');chev.classList.add('open');}
+    else{body.classList.add('collapsed');chev.classList.remove('open');}
+}
+function toggleUploadHelp(btn){
+    var body=document.getElementById('upload-help-body');
+    var chev=document.getElementById('upload-help-chevron');
     if(body.classList.contains('collapsed')){body.classList.remove('collapsed');chev.classList.add('open');}
     else{body.classList.add('collapsed');chev.classList.remove('open');}
 }
