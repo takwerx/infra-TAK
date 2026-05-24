@@ -17989,6 +17989,11 @@ def webodm_ready():
 @login_required
 def webodm_uninstall():
     import subprocess as _sp
+    data = request.json or {}
+    password = data.get('password', '')
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'error': 'Invalid admin password'}), 403
     wo_dir = os.path.expanduser('~/webodm')
     compose_path = os.path.join(wo_dir, 'docker-compose.yml')
     if os.path.exists(compose_path):
@@ -46737,6 +46742,17 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
 .open-btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;transition:opacity .2s}.open-btn:hover{opacity:.85}
 .toast{position:fixed;bottom:24px;right:24px;background:#1e2736;border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;color:var(--text-primary);display:none;z-index:999}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:12px}.modal p{font-size:13px;color:var(--text-dim);line-height:1.6;margin-bottom:18px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
+.form-group{margin-bottom:12px}.form-label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none}.form-input:focus{border-color:var(--accent)}
+.btn-sm{padding:6px 14px;font-size:11px}
+.uninstall-spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+.uninstall-progress-row{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:12px;color:var(--text-secondary)}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+@keyframes spin{to{transform:rotate(360deg)}}
 .nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
 .nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.04);border-left-color:var(--border)}
 .nav-item.active{color:var(--accent);background:rgba(59,130,246,.08);border-left-color:var(--accent)}
@@ -46881,7 +46897,7 @@ function startWarmup(){
 {% endif %}
 <button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
 <button class="btn btn-ghost" onclick="openWoPwModal()" title="Show admin accounts and reset password">🔑 Account Recovery</button>
-<button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').style.display='flex'">Uninstall</button>
+<button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">Uninstall</button>
 </div>
 </div>
 </div>
@@ -46937,15 +46953,20 @@ function startWarmup(){
 </div>
 </div>
 
-<div class="modal-overlay" id="uninstall-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center">
-<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:440px;width:90%">
-<div style="font-size:16px;font-weight:700;color:var(--red);margin-bottom:12px">⚠ Uninstall WebODM?</div>
-<div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will stop and remove all WebODM containers and the plugin. Processed job data in <span class="step-code">~/webodm/media/</span> will be preserved on disk.</div>
-<div style="display:flex;gap:10px;justify-content:flex-end">
-<button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').style.display='none'">Cancel</button>
-<button class="btn btn-danger" onclick="doUninstall()">Uninstall</button>
+<div class="modal-overlay" id="uninstall-modal">
+<div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw">
+<h3 style="color:var(--red);margin-bottom:12px">⚠ Uninstall WebODM?</h3>
+<p style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will stop and remove all WebODM containers and the plugin. Processed job data in <span class="step-code">~/webodm/media/</span> will be preserved on disk.</p>
+<div class="form-group" style="margin-bottom:16px">
+  <label class="form-label">Admin Password</label>
+  <input class="form-input" id="uninstall-password" type="password" placeholder="Confirm your password">
+</div>
+<div class="modal-actions">
+  <button class="btn btn-ghost" id="uninstall-cancel-btn" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button>
+  <button class="btn btn-danger" id="uninstall-confirm-btn" onclick="doUninstall()">Uninstall</button>
 </div>
 <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+<div id="uninstall-progress" class="uninstall-progress-row" style="display:none" aria-live="polite"></div>
 </div>
 </div>
 
@@ -47027,15 +47048,34 @@ function resetWoPassword(){
     }).catch(function(){btn.disabled=false;btn.textContent='Set Password';msg.textContent='Network error';});
 }
 function doUninstall(){
+    var pw=document.getElementById('uninstall-password').value;
     var msg=document.getElementById('uninstall-msg');
-    msg.textContent='Uninstalling…';
-    fetch('/api/webodm/uninstall',{method:'POST'}).then(r=>r.json()).then(d=>{
-        if(d.success){msg.textContent='Done. Reloading…';setTimeout(function(){window.location.reload();},800);}
-        else{msg.textContent='Error: '+(d.error||'unknown');}
-    }).catch(e=>{msg.textContent='Network error: '+e.message;});
+    var progress=document.getElementById('uninstall-progress');
+    var cancelBtn=document.getElementById('uninstall-cancel-btn');
+    var confirmBtn=document.getElementById('uninstall-confirm-btn');
+    msg.textContent='';
+    progress.style.display='flex';
+    progress.innerHTML='<span class="uninstall-spinner"></span><span>Uninstalling…</span>';
+    confirmBtn.disabled=true;
+    cancelBtn.disabled=true;
+    fetch('/api/webodm/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+        if(d.error){
+            msg.textContent=d.error;
+            progress.style.display='none';
+            progress.innerHTML='';
+            confirmBtn.disabled=false;
+            cancelBtn.disabled=false;
+            return;
+        }
+        progress.innerHTML='<span class="uninstall-spinner"></span><span>Done. Reloading…</span>';
+        setTimeout(function(){window.location.reload();},800);
+    }).catch(e=>{
+        msg.textContent='Network error: '+e.message;
+        progress.style.display='none';
+        confirmBtn.disabled=false;
+        cancelBtn.disabled=false;
+    });
 }
-var _modal=document.getElementById('uninstall-modal');
-if(_modal){_modal.addEventListener('click',function(e){if(e.target===_modal)_modal.style.display='none';});}
 function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
 </script></body></html>'''
 
