@@ -12518,6 +12518,40 @@ def _get_fail2ban_version_info():
     return {'version': installed, 'update_available': update_available, 'latest': available}
 
 
+def _get_webodm_version_info():
+    """Return {version, update_available, latest} for the running WebODM instance."""
+    import subprocess as _sp
+    import json as _json
+    info = {'version': '', 'update_available': False, 'latest': None}
+    try:
+        r = _sp.run(
+            ['docker', 'exec', 'webapp', 'python3', '-c',
+             'import json; d=json.load(open("/webodm/package.json")); print(d["version"])'],
+            capture_output=True, text=True, timeout=10)
+        v = r.stdout.strip()
+        if v:
+            info['version'] = v
+    except Exception:
+        pass
+    try:
+        import urllib.request as _ur
+        req = _ur.Request('https://api.github.com/repos/WebODM/WebODM/releases/latest',
+                          headers={'User-Agent': 'infra-TAK'})
+        resp = _ur.urlopen(req, timeout=8)
+        data = _json.loads(resp.read())
+        latest = data.get('tag_name', '').lstrip('v')
+        if latest:
+            info['latest'] = latest
+            if info['version']:
+                def _tv(s):
+                    try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
+                    except: return (0,)
+                info['update_available'] = _tv(latest) > _tv(info['version'])
+    except Exception:
+        pass
+    return info
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards."""
     modules = detect_modules()
@@ -12548,6 +12582,8 @@ def get_all_module_versions():
         result['fedhub'] = _get_fedhub_version_info()
     if modules.get('fail2ban', {}).get('installed'):
         result['fail2ban'] = _get_fail2ban_version_info()
+    if modules.get('webodm', {}).get('installed'):
+        result['webodm'] = _get_webodm_version_info()
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -17762,6 +17798,7 @@ def webodm_page():
     wo = modules.get('webodm', {})
     wo_host = _get_service_domain(settings, 'webodm')
     wo_url = f'https://{wo_host}' if wo_host else ''
+    wo_vinfo = _get_webodm_version_info() if wo.get('installed') else {}
     r = make_response(render_template_string(WEBODM_TEMPLATE,
         settings=settings, modules=modules, wo=wo,
         wo_url=wo_url,
@@ -17770,6 +17807,9 @@ def webodm_page():
         deploy_done=_webodm_deploy_status.get('complete', False),
         deploy_error=_webodm_deploy_status.get('error', False),
         deploy_log=_webodm_deploy_status.get('log', []),
+        wo_version=wo_vinfo.get('version', ''),
+        wo_latest=wo_vinfo.get('latest', ''),
+        wo_update_available=wo_vinfo.get('update_available', False),
         metrics=get_system_metrics(), version=VERSION))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
@@ -17841,6 +17881,54 @@ def webodm_reset_password():
         return jsonify({'success': False, 'error': r.stderr[:200] or 'User not found'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+
+_webodm_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+def _run_webodm_update():
+    import subprocess as _sp
+    global _webodm_update_status
+    wo_dir = os.path.expanduser('~/webodm')
+    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    log = []
+    def plog(msg):
+        log.append(msg)
+        _webodm_update_status['log'] = list(log)
+    try:
+        plog('Pulling latest WebODM images…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'pull'],
+                    capture_output=True, text=True, timeout=300, cwd=wo_dir)
+        plog(r.stdout[-500:] if r.stdout else '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose pull failed: {r.stderr[:300]}')
+        plog('Restarting containers with new images…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+                    capture_output=True, text=True, timeout=120, cwd=wo_dir)
+        plog(r.stdout[-300:] if r.stdout else '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        plog('Update complete.')
+        _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        plog(f'ERROR: {e}')
+        _webodm_update_status.update({'running': False, 'complete': False, 'error': str(e)})
+
+
+@app.route('/api/webodm/update', methods=['POST'])
+@login_required
+def webodm_update():
+    global _webodm_update_status
+    if _webodm_update_status.get('running'):
+        return jsonify({'started': False, 'error': 'Update already in progress'})
+    _webodm_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
+    threading.Thread(target=_run_webodm_update, daemon=True).start()
+    return jsonify({'started': True})
+
+
+@app.route('/api/webodm/update-status')
+@login_required
+def webodm_update_status():
+    return jsonify(_webodm_update_status)
 
 
 @app.route('/api/webodm/uninstall', methods=['POST'])
@@ -46673,15 +46761,20 @@ var _interval = setInterval(function(){
 <div style="display:flex;align-items:center;gap:10px">
 <span class="status-dot {% if wo.get('running') %}green{% else %}yellow{% endif %}"></span>
 <span style="font-size:14px;font-weight:600">{% if wo.get('running') %}Running{% else %}Stopped{% endif %}</span>
+{% if wo_version %}<span style="font-size:12px;color:var(--text-dim);margin-left:10px">v{{ wo_version }}</span>{% endif %}
+{% if wo_update_available and wo_latest %}<span style="font-size:12px;color:var(--cyan);margin-left:8px;font-weight:600">v{{ wo_latest }} available</span>{% endif %}
 {% if wo_url %}
-<span style="font-size:12px;color:var(--text-dim);margin-left:8px">{{ wo_url }}</span>
+<span style="font-size:12px;color:var(--text-dim);margin-left:8px">· {{ wo_url }}</span>
 {% endif %}
 </div>
-<div style="display:flex;gap:10px;align-items:center">
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
 {% if wo_url %}
 <a href="{{ wo_url }}" target="_blank" class="open-btn">
 <span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM
 </a>
+{% endif %}
+{% if wo_update_available and wo_latest %}
+<button class="btn btn-primary btn-sm" id="wo-update-btn" onclick="updateWebODM(this)">↑ Update to v{{ wo_latest }}</button>
 {% endif %}
 <button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
 <button class="btn btn-ghost" onclick="openWoPwModal()" title="Show admin accounts and reset password">🔑 Account Recovery</button>
@@ -46762,6 +46855,29 @@ function startDeploy(){
         if(d.success){window.location.reload();}
         else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
     }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
+}
+function updateWebODM(btn){
+    btn.disabled=true;btn.textContent='Pulling update…';
+    var log=document.getElementById('wo-update-log');
+    if(!log){
+        log=document.createElement('div');
+        log.id='wo-update-log';
+        log.style='margin-top:10px;font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow-y:auto;background:rgba(0,0,0,.3);border-radius:6px;padding:10px';
+        btn.parentNode.parentNode.parentNode.appendChild(log);
+    }
+    log.textContent='Starting update…\n';
+    function poll(){
+        fetch('/api/webodm/update-status').then(r=>r.json()).then(d=>{
+            log.textContent=d.log||'';log.scrollTop=log.scrollHeight;
+            if(d.running){setTimeout(poll,1500);}
+            else if(d.complete){btn.textContent='↑ Update to latest';btn.disabled=false;showToast('✓ WebODM updated — reload page for new version');setTimeout(()=>window.location.reload(),2000);}
+            else if(d.error){btn.textContent='↑ Update to latest';btn.disabled=false;showToast('Update error — see log');}
+        });
+    }
+    fetch('/api/webodm/update',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.started){setTimeout(poll,1000);}
+        else{btn.disabled=false;btn.textContent='↑ Update to latest';showToast('Error: '+(d.error||'unknown'));}
+    });
 }
 function repairAuthentik(btn){
     btn.disabled=true;btn.textContent='Repairing…';
