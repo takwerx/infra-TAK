@@ -46979,7 +46979,7 @@ function updateWebODM(btn){
         log.style='margin-top:10px;font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow-y:auto;background:rgba(0,0,0,.3);border-radius:6px;padding:10px';
         btn.parentNode.parentNode.parentNode.appendChild(log);
     }
-    log.textContent='Starting update…\n';
+    log.textContent='Starting update...';
     function poll(){
         fetch('/api/webodm/update-status').then(r=>r.json()).then(d=>{
             log.textContent=d.log||'';log.scrollTop=log.scrollHeight;
