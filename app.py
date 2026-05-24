@@ -46777,7 +46777,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:8px">Cesium 3D Tiles</div>
 <div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px">
-Serve 3D terrain, building models, and point clouds directly to ATAK, WinTAK, and iTAK clients.
+Serve 3D terrain, building models, and point clouds directly to ATAK and WinTAK clients.
 Any dataset in <a href="https://github.com/CesiumGS/3d-tiles" style="color:var(--cyan);text-decoration:none" target="_blank">Cesium 3D Tiles format</a> works — upload it as a zip and give field users a single <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">tileset.json</code> URL.
 No new container — served directly by Caddy over HTTPS.
 </div>
@@ -46824,18 +46824,22 @@ Enable Cesium 3D Tiles
 </div>
 <div class="step-item">
 <div class="step-num">2</div>
+<div class="step-text"><strong>Name it to match the tileset.</strong> The dataset name becomes part of the ATAK URL and is how TAK clients identify the layer — use something descriptive that matches what the data represents, e.g. <span class="step-code">downtown-san-diego</span> or <span class="step-code">incident-alpha-buildings</span>. Use lowercase with hyphens, no spaces. TAK clients display this name in their overlay manager so field users can find it quickly.</div>
+</div>
+<div class="step-item">
+<div class="step-num">3</div>
 <div class="step-text"><strong>Option A — Upload via browser.</strong> Enter a dataset name, then either:<br>
 • <strong>Select Folder</strong> — pick the dataset folder directly from your computer.<br>
 • <strong>Select .zip</strong> — zip the dataset folder first so the <span class="step-code">tileset.json</span> is at the top level inside the zip (not nested inside a sub-folder), then upload the zip.</div>
 </div>
 <div class="step-item">
-<div class="step-num">3</div>
+<div class="step-num">4</div>
 <div class="step-text"><strong>Option B — Place via SFTP.</strong> Copy the dataset folder directly to the server at:<br>
 <span class="step-code">~/cesium-tiles/&lt;dataset-name&gt;/tileset.json</span><br>
 <span style="font-size:12px;color:var(--text-dim)">The dataset will appear in the list below automatically — no upload needed.</span></div>
 </div>
 <div class="step-item" style="border-bottom:none">
-<div class="step-num">4</div>
+<div class="step-num">5</div>
 <div class="step-text"><strong>Copy the ATAK URL.</strong> Once the dataset appears in the table below, click its URL chip to copy it. Paste that URL into ATAK's Map Manager (see <em>How to Connect in ATAK</em> below).</div>
 </div>
 </div>
@@ -46907,7 +46911,7 @@ Enable Cesium 3D Tiles
 <!-- ATAK Instructions -->
 <div class="card">
 <button class="details-toggle" onclick="toggleInstructions(this)">
-<span>How to Connect in ATAK / WinTAK / iTAK</span>
+<span>How to Connect in ATAK / WinTAK</span>
 <span class="material-symbols-outlined chevron" id="instr-chevron">expand_more</span>
 </button>
 <div id="instr-body" class="collapsed" style="margin-top:16px">
