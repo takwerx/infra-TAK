@@ -17697,32 +17697,16 @@ def _run_webodm_deploy(settings):
         import time as _t2
         _t2.sleep(5)
         try:
-            import json as _json
-            import urllib.request as _ur2
-            import urllib.parse as _up2
-            # Get CSRF token
-            login_url = f'http://127.0.0.1:{wo_port}/api/token-auth/'
-            data = _up2.urlencode({'username': 'admin', 'password': 'admin'}).encode()
-            req = _ur2.Request(login_url, data=data,
-                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
-            try:
-                resp = _ur2.urlopen(req, timeout=10)
-                token_data = _json.loads(resp.read())
-                token = token_data.get('token', '')
-            except Exception:
-                token = ''
-            if token:
-                node_data = _json.dumps({'hostname': 'wo_nodeodm', 'port': 3000, 'token': ''}).encode()
-                node_req = _ur2.Request(
-                    f'http://127.0.0.1:{wo_port}/api/processingnodes/',
-                    data=node_data,
-                    headers={'Content-Type': 'application/json',
-                             'Authorization': f'JWT {token}'})
-                try:
-                    _ur2.urlopen(node_req, timeout=10)
-                    plog('NodeODM processing node registered.')
-                except Exception as ne:
-                    plog(f'Node registration skipped (do it manually): {ne}')
+            # Use manage.py addnode — same approach as WebODM's own start.sh,
+            # no auth credentials required, idempotent on duplicate hostname
+            _r_node = _sp.run(
+                ['docker', 'exec', 'webapp', 'python', 'manage.py',
+                 'addnode', 'wo_nodeodm', '3000', '--label', 'NodeODX'],
+                capture_output=True, text=True, timeout=30, cwd=wo_dir)
+            if _r_node.returncode == 0:
+                plog('NodeODM processing node registered.')
+            else:
+                plog(f'Node registration skipped (add manually: wo_nodeodm:3000): {_r_node.stderr[:200]}')
         except Exception as e:
             plog(f'Auto node registration skipped: {e}')
 
