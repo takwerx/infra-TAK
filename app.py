@@ -17580,7 +17580,7 @@ services:
     entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
-      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/plugins/webodm-tak-overlay:z
+      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/media/plugins/webodm-tak-overlay:z
     ports:
       - "127.0.0.1:{wo_port}:8000"
     depends_on:
