@@ -46783,21 +46783,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
-<div class="section-title">Cesium 3D Tiles</div>
-
-<!-- Sample dataset callout -->
-<div class="sample-box">
-<div style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;color:var(--cyan);margin-bottom:8px">TRY IT WITH A FREE SAMPLE DATASET</div>
-<div style="font-size:13px;color:var(--text-secondary);line-height:1.6">
-Download the official Cesium 3D Tiles sample datasets (CC0 license, ~5 MB zip):<br>
-<a href="https://github.com/CesiumGS/3d-tiles-samples/archive/refs/heads/main.zip" target="_blank">github.com/CesiumGS/3d-tiles-samples</a>
-&nbsp;—&nbsp;
-Unzip, then re-zip the <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">1.0/TilesetWithDiscreteLOD</code> folder and upload it here to get a working ATAK URL in minutes.
-<br>
-<br>
-For real-world city models, Japan's <a href="https://www.mlit.go.jp/plateau/" target="_blank">Project PLATEAU</a> publishes free pre-built 3D Tiles for hundreds of cities (official government open data).
-</div>
-</div>
+<div style="margin-bottom:20px"><img src="/static/3DTiles_light_color.svg" alt="Cesium 3D Tiles" style="height:40px;width:auto;object-fit:contain"></div>
 
 {% if not ct.get('installed') %}
 <!-- Deploy state -->
