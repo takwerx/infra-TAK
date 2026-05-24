@@ -991,14 +991,19 @@ def detect_modules():
     wo_enabled = settings.get('webodm_enabled', False)
     wo_dir = os.path.expanduser('~/webodm')
     wo_running = False
-    if wo_enabled:
-        try:
-            import subprocess as _sp
-            result = _sp.run(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp'],
-                             capture_output=True, text=True, timeout=3)
-            wo_running = result.stdout.strip() == 'true'
-        except Exception:
-            pass
+    try:
+        import subprocess as _sp
+        result = _sp.run(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp'],
+                         capture_output=True, text=True, timeout=3)
+        wo_running = result.stdout.strip() == 'true'
+        # Self-heal: containers are up but flag got cleared (e.g. interrupted uninstall/deploy)
+        if wo_running and not wo_enabled:
+            _s = load_settings()
+            _s['webodm_enabled'] = True
+            save_settings(_s)
+            wo_enabled = True
+    except Exception:
+        pass
     modules['webodm'] = {
         'name': 'WebODM',
         'installed': bool(wo_enabled),
@@ -17994,11 +17999,20 @@ def webodm_uninstall():
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
+    import shutil as _sh
     wo_dir = os.path.expanduser('~/webodm')
     compose_path = os.path.join(wo_dir, 'docker-compose.yml')
     if os.path.exists(compose_path):
         _sp.run(['docker', 'compose', '-f', compose_path, 'down', '--volumes'],
                 capture_output=True, timeout=90, cwd=wo_dir)
+    # Wipe bind-mounted postgres data so next deploy starts fresh and
+    # prompts for new admin credentials. media/ (processed jobs) is kept.
+    db_dir = os.path.join(wo_dir, 'db')
+    if os.path.isdir(db_dir):
+        try:
+            _sh.rmtree(db_dir)
+        except Exception:
+            _sp.run(['rm', '-rf', db_dir], capture_output=True)
     s = load_settings()
     s['webodm_enabled'] = False
     save_settings(s)
