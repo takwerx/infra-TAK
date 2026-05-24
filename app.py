@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.38-alpha"
+VERSION = "0.9.39-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -25967,7 +25967,7 @@ def authentik_control():
         elif action == 'update':
             latest = _get_authentik_target_release(settings)
             _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
-            _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose up -d 2>&1', timeout=300)
+            _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=360)
         else:
             return jsonify({'error': 'Invalid action'}), 400
         time.sleep(3)
@@ -25994,7 +25994,7 @@ def authentik_control():
                 with open(cp, 'w') as _f:
                     _f.write(_new)
         _ensure_authentik_compose_patches(cp)
-        subprocess.run(f'cd {ak_dir} && docker compose pull && docker compose up -d && docker image prune -f', shell=True, capture_output=True, text=True, timeout=300)
+        subprocess.run(f'cd {ak_dir} && docker compose pull && docker compose down --timeout 30 && docker compose up -d && docker image prune -f', shell=True, capture_output=True, text=True, timeout=360)
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(5)
