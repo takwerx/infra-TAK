@@ -17405,6 +17405,25 @@ def cesium_tiles_disable():
     return jsonify({'success': True})
 
 
+@app.route('/api/cesium-tiles/uninstall', methods=['POST'])
+@login_required
+def cesium_tiles_uninstall():
+    import shutil
+    s = load_settings()
+    s['cesium_tiles_enabled'] = False
+    save_settings(s)
+    if (s.get('fqdn') or '').strip():
+        generate_caddyfile(s)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    try:
+        if os.path.isdir(ct_dir):
+            shutil.rmtree(ct_dir)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+    return jsonify({'success': True})
+
+
 @app.route('/api/cesium-tiles/datasets')
 @login_required
 def cesium_tiles_datasets():
@@ -46807,7 +46826,26 @@ Enable Cesium 3D Tiles
 <span style="font-size:12px;color:var(--text-dim);margin-left:12px">Base URL: <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">https://{{ ct_domain }}</code></span>
 {% endif %}
 </div>
-<button class="btn btn-danger btn-sm" onclick="disableModule()" style="margin-left:auto">Disable</button>
+<div style="display:flex;gap:8px;margin-left:auto">
+<button class="btn btn-danger btn-sm" onclick="disableModule()">Disable</button>
+<button class="btn btn-danger btn-sm" onclick="document.getElementById('ct-remove-modal').style.display='flex'" style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4)">Remove</button>
+</div>
+</div>
+</div>
+
+<!-- Remove modal -->
+<div id="ct-remove-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:900;align-items:center;justify-content:center">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:440px;width:90%">
+<div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:var(--red);margin-bottom:12px">Remove Cesium 3D Tiles?</div>
+<div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:20px">
+This will disable the module and <strong>permanently delete all tile datasets</strong> from <code style="font-size:11px;color:var(--cyan)">~/cesium-tiles/</code>.<br><br>
+This cannot be undone. Back up any datasets you want to keep before continuing.
+</div>
+<div style="display:flex;gap:10px;justify-content:flex-end">
+<button class="btn btn-ghost btn-sm" onclick="document.getElementById('ct-remove-modal').style.display='none'">Cancel</button>
+<button class="btn btn-danger btn-sm" id="ct-remove-btn" onclick="removeModule()">Delete everything &amp; remove</button>
+</div>
+<div id="ct-remove-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
 </div>
 </div>
 
@@ -46944,6 +46982,15 @@ function enableModule(){
 function disableModule(){
     if(!confirm('Disable Cesium 3D Tiles? The tile files will not be deleted.'))return;
     fetch('/api/cesium-tiles/disable',{method:'POST'}).then(()=>window.location.reload());
+}
+function removeModule(){
+    var btn=document.getElementById('ct-remove-btn');
+    var st=document.getElementById('ct-remove-status');
+    btn.disabled=true;btn.textContent='Removing…';st.textContent='';
+    fetch('/api/cesium-tiles/uninstall',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.href='/console';}
+        else{st.textContent='Error: '+(d.error||'unknown');btn.disabled=false;btn.textContent='Delete everything & remove';}
+    }).catch(e=>{st.textContent='Network error';btn.disabled=false;btn.textContent='Delete everything & remove';});
 }
 function cleanName(v){return v.replace(/[^A-Za-z0-9_\-]/g,'-').replace(/^-+|-+$/g,'');}
 function updateUrlPreview(v){
