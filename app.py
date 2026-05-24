@@ -48964,9 +48964,13 @@ def _startup_migrations():
                     r'- "127.0.0.1:\1:8000"',
                     _wo_txt
                 )
-                # Remove any host-side nodeodm port mapping (Docker-internal only)
+                # Remove any host-side nodeodm port mapping (Docker-internal only).
+                # Also strip the now-empty `ports:` key to avoid YAML validation errors.
                 _wo_patched = _re_wo.sub(
-                    r'\s*- "127\.0\.0\.1:3001:3000"\n', '\n', _wo_patched
+                    r'[ \t]*- "127\.0\.0\.1:3001:3000"\n', '', _wo_patched
+                )
+                _wo_patched = _re_wo.sub(
+                    r'[ \t]+ports:\n(?=[ \t]+(restart:|oom_score_adj:))', '', _wo_patched
                 )
                 # Inject WO_DB_HOST=wo_db if missing — fixes "could not translate host name db"
                 # when our compose uses wo_db as the container name instead of the WebODM default "db"
