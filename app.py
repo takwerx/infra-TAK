@@ -46953,22 +46953,12 @@ function startWarmup(){
 </div>
 </div>
 
-<div class="modal-overlay" id="uninstall-modal">
-<div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw">
-<h3 style="color:var(--red);margin-bottom:12px">⚠ Uninstall WebODM?</h3>
-<p style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will stop and remove all WebODM containers and the plugin. Processed job data in <span class="step-code">~/webodm/media/</span> will be preserved on disk.</p>
-<div class="form-group" style="margin-bottom:16px">
-  <label class="form-label">Admin Password</label>
-  <input class="form-input" id="uninstall-password" type="password" placeholder="Confirm your password">
-</div>
-<div class="modal-actions">
-  <button class="btn btn-ghost" id="uninstall-cancel-btn" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button>
-  <button class="btn btn-danger" id="uninstall-confirm-btn" onclick="doUninstall()">Uninstall</button>
-</div>
-<div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
-<div id="uninstall-progress" class="uninstall-progress-row" style="display:none" aria-live="polite"></div>
-</div>
-</div>
+<div class="modal-overlay" id="uninstall-modal"><div class="modal">
+  <h3>&#x26a0; Uninstall WebODM?</h3><p>This will stop and remove all WebODM containers and the plugin. Processed job data in ~/webodm/media/ will be preserved on disk.</p>
+  <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
+  <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
 
 <div id="toast" class="toast"></div>
 <script>
@@ -47047,35 +47037,7 @@ function resetWoPassword(){
         else{msg.textContent='Error: '+(d.error||'unknown');}
     }).catch(function(){btn.disabled=false;btn.textContent='Set Password';msg.textContent='Network error';});
 }
-function doUninstall(){
-    var pw=document.getElementById('uninstall-password').value;
-    var msg=document.getElementById('uninstall-msg');
-    var progress=document.getElementById('uninstall-progress');
-    var cancelBtn=document.getElementById('uninstall-cancel-btn');
-    var confirmBtn=document.getElementById('uninstall-confirm-btn');
-    msg.textContent='';
-    progress.style.display='flex';
-    progress.innerHTML='<span class="uninstall-spinner"></span><span>Uninstalling…</span>';
-    confirmBtn.disabled=true;
-    cancelBtn.disabled=true;
-    fetch('/api/webodm/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(r=>r.json()).then(d=>{
-        if(d.error){
-            msg.textContent=d.error;
-            progress.style.display='none';
-            progress.innerHTML='';
-            confirmBtn.disabled=false;
-            cancelBtn.disabled=false;
-            return;
-        }
-        progress.innerHTML='<span class="uninstall-spinner"></span><span>Done. Reloading…</span>';
-        setTimeout(function(){window.location.reload();},800);
-    }).catch(e=>{
-        msg.textContent='Network error: '+e.message;
-        progress.style.display='none';
-        confirmBtn.disabled=false;
-        cancelBtn.disabled=false;
-    });
-}
+function doUninstall(){var pw=document.getElementById('uninstall-password').value,msg=document.getElementById('uninstall-msg');msg.textContent='';fetch('/api/webodm/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
 function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
 </script></body></html>'''
 
