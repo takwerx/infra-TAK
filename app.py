@@ -17807,6 +17807,42 @@ def webodm_repair_authentik():
     return jsonify({'success': True, 'steps': steps})
 
 
+@app.route('/api/webodm/admin-accounts')
+@login_required
+def webodm_admin_accounts():
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
+             'from django.contrib.auth.models import User; print(",".join([u.username for u in User.objects.filter(is_superuser=True)]))'],
+            capture_output=True, text=True, timeout=15)
+        accounts = [u.strip() for u in r.stdout.strip().split(',') if u.strip()]
+        return jsonify({'accounts': accounts})
+    except Exception as e:
+        return jsonify({'accounts': [], 'error': str(e)})
+
+
+@app.route('/api/webodm/reset-password', methods=['POST'])
+@login_required
+def webodm_reset_password():
+    import subprocess as _sp
+    data = request.get_json() or {}
+    username = (data.get('username') or 'admin').strip()
+    password = data.get('password', '')
+    if not password or len(password) < 8:
+        return jsonify({'success': False, 'error': 'Password must be at least 8 characters'})
+    try:
+        r = _sp.run(
+            ['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
+             f'from django.contrib.auth.models import User; u=User.objects.get(username={repr(username)}); u.set_password({repr(password)}); u.save(); print("ok")'],
+            capture_output=True, text=True, timeout=15)
+        if 'ok' in r.stdout:
+            return jsonify({'success': True})
+        return jsonify({'success': False, 'error': r.stderr[:200] or 'User not found'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
 @app.route('/api/webodm/uninstall', methods=['POST'])
 @login_required
 def webodm_uninstall():
@@ -46648,6 +46684,7 @@ var _interval = setInterval(function(){
 </a>
 {% endif %}
 <button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
+<button class="btn btn-ghost" onclick="openWoPwModal()" title="Show admin accounts and reset password">🔑 Account Recovery</button>
 <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').style.display='flex'">Uninstall</button>
 </div>
 </div>
@@ -46684,6 +46721,26 @@ var _interval = setInterval(function(){
 </div>
 
 <!-- Uninstall modal -->
+<!-- Account recovery modal -->
+<div id="wo-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:420px;width:90%">
+<div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:4px">WebODM Account Recovery</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Shows all admin accounts and lets you set a new password for any of them.</div>
+<div id="wo-acct-list" style="background:rgba(6,182,212,.04);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:var(--text-dim)">Loading accounts…</div>
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">Username to reset</label>
+<input id="wo-pw-user" type="text" class="form-input" placeholder="e.g. admin" style="margin-bottom:12px">
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">New password</label>
+<input id="wo-pw-input" type="password" class="form-input" placeholder="Min. 8 characters" style="margin-bottom:10px">
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">Confirm password</label>
+<input id="wo-pw-confirm" type="password" class="form-input" placeholder="Confirm new password" style="margin-bottom:14px">
+<div id="wo-pw-msg" style="font-size:12px;color:var(--red);min-height:16px;margin-bottom:10px"></div>
+<div style="display:flex;gap:10px;justify-content:flex-end">
+<button class="btn btn-ghost btn-sm" onclick="closeWoPwModal()">Cancel</button>
+<button class="btn btn-primary btn-sm" id="wo-pw-btn" onclick="resetWoPassword()">Set Password</button>
+</div>
+</div>
+</div>
+
 <div class="modal-overlay" id="uninstall-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center">
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:440px;width:90%">
 <div style="font-size:16px;font-weight:700;color:var(--red);margin-bottom:12px">⚠ Uninstall WebODM?</div>
@@ -46712,6 +46769,43 @@ function repairAuthentik(btn){
         if(d.success){showToast('✓ Authentik configured — try opening WebODM now.');btn.textContent='↻ Repair Authentik';btn.disabled=false;}
         else{showToast('Error: '+(d.error||'unknown'));btn.textContent='↻ Repair Authentik';btn.disabled=false;}
     }).catch(e=>{showToast('Network error');btn.textContent='↻ Repair Authentik';btn.disabled=false;});
+}
+function openWoPwModal(){
+    document.getElementById('wo-pw-modal').style.display='flex';
+    document.getElementById('wo-acct-list').textContent='Loading accounts…';
+    document.getElementById('wo-pw-user').value='';
+    document.getElementById('wo-pw-input').value='';
+    document.getElementById('wo-pw-confirm').value='';
+    document.getElementById('wo-pw-msg').textContent='';
+    fetch('/api/webodm/admin-accounts').then(r=>r.json()).then(d=>{
+        var el=document.getElementById('wo-acct-list');
+        if(d.accounts&&d.accounts.length){
+            el.innerHTML='<span style="color:var(--text-secondary)">Admin accounts: </span>'+d.accounts.map(function(u){return '<code style="color:var(--cyan);margin-right:8px">'+u+'</code>';}).join('');
+            document.getElementById('wo-pw-user').value=d.accounts[0];
+        } else {el.textContent=d.error||'Could not load accounts — WebODM may still be starting.';}
+    }).catch(function(){document.getElementById('wo-acct-list').textContent='Could not reach WebODM container.';});
+}
+function closeWoPwModal(){
+    document.getElementById('wo-pw-modal').style.display='none';
+}
+function resetWoPassword(){
+    var user=document.getElementById('wo-pw-user').value.trim();
+    var pw=document.getElementById('wo-pw-input').value;
+    var pw2=document.getElementById('wo-pw-confirm').value;
+    var msg=document.getElementById('wo-pw-msg');
+    var btn=document.getElementById('wo-pw-btn');
+    msg.textContent='';
+    if(!user){msg.textContent='Enter a username.';return;}
+    if(!pw){msg.textContent='Enter a password.';return;}
+    if(pw.length<8){msg.textContent='Password must be at least 8 characters.';return;}
+    if(pw!==pw2){msg.textContent='Passwords do not match.';return;}
+    btn.disabled=true;btn.textContent='Setting…';
+    fetch('/api/webodm/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pw})})
+    .then(r=>r.json()).then(d=>{
+        btn.disabled=false;btn.textContent='Set Password';
+        if(d.success){closeWoPwModal();showToast('✓ Password updated for '+user);}
+        else{msg.textContent='Error: '+(d.error||'unknown');}
+    }).catch(function(){btn.disabled=false;btn.textContent='Set Password';msg.textContent='Network error';});
 }
 function doUninstall(){
     var msg=document.getElementById('uninstall-msg');
