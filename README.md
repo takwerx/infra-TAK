@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.37-alpha](docs/RELEASE-v0.9.37-alpha.md)**
+**Current release: [v0.9.38-alpha](docs/RELEASE-v0.9.38-alpha.md)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
 
@@ -338,6 +338,16 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.38-alpha — 2026-05-23 — CloudTAK plugin manager + LDAP 49 auto-heal + Cesium 3D Tiles + WebODM — RELEASED 2026-05-23 to `main`
+
+**Headline: two new marketplace modules + two reliability improvements.** (1) **CloudTAK plugin manager** — install, update, and remove community plugins (Vue 3 SFCs) from the CloudTAK page without touching the command line; Guard Dog now monitors installed plugins for upstream commits. Ships with `clptak/cloudtak-plugin-cellphone` (Cell Ping / RTT). (2) **LDAP 49 auto-heal** — TAK Server's bind-cache stale-entry pattern (user changes password, subsequent logins still hit the old negative cache) is detected by the ldap-sa watchdog and cleared with `--force-recreate ldap` within 5 minutes; zero operator action. (3) **Cesium 3D Tiles** — new marketplace module; streams 3D terrain, buildings, and point clouds to ATAK/WinTAK over HTTPS via Caddy `file_server` (no new container); browser zip upload, dataset table with copy-paste URLs, Remove button, SVG logo, collapsible operator instructions. (4) **WebODM** — new marketplace module; deploys WebODM + NodeODM + TAK Incident Overlay plugin with one click; post-deploy warmup health-check (Open button only appears when container passes readiness probe); version tracking with one-click update; account recovery modal; password-gated uninstall that wipes the database so a fresh redeploy always prompts for new credentials; self-healing installed-state detection.
+
+Full notes: [docs/RELEASE-v0.9.38-alpha.md](docs/RELEASE-v0.9.38-alpha.md).
+
+### v0.9.37-alpha — 2026-05-22 — Authentik vetted-release gating + console diagnostics improvements — RELEASED 2026-05-22 to `main`
+
+**Headline: fleet Authentik version is now gated.** Authentik 2026.5.0 ships a Rust-based worker orchestrator (PR #21324) that raises CPU baseline to ~150% per-core at idle — architectural, not a bug. Fleet is held on `AUTHENTIK_VETTED_RELEASE="2026.2.3"` until the new architecture is soaked. Dev-channel boxes see `AUTHENTIK_DEV_RELEASE="2026.5.0"`. Update button only lights up when installed version is below the channel ceiling (no downgrade badge). Status line shows `vetted ✓` (green) on main channel or `dev: v2026.5.0` (amber) on dev channel. Full notes: [docs/RELEASE-v0.9.37-alpha.md](docs/RELEASE-v0.9.37-alpha.md).
 
 ### v0.9.36-alpha — 2026-05-21 — Authentik watchdog blind-spot fix: idle-in-transaction storm detection + server-health auto-recovery — RELEASED 2026-05-21 to `main`
 
