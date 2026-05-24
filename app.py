@@ -17591,7 +17591,7 @@ services:
       - WO_PORT={wo_port}
       - WO_HOST=0.0.0.0
       - WO_DEBUG=NO
-      - WO_DB_HOST=wo_db
+      - WO_DATABASE_HOST=wo_db
       - WO_BROKER=redis://wo_broker
       - WO_SECRET_KEY={wo_secret}
       - WEB_CONCURRENCY=2
@@ -17606,7 +17606,7 @@ services:
       - wo_db
       - wo_broker
     environment:
-      - WO_DB_HOST=wo_db
+      - WO_DATABASE_HOST=wo_db
       - WO_BROKER=redis://wo_broker
       - WO_DEBUG=NO
       - WO_SECRET_KEY={wo_secret}
@@ -48972,12 +48972,13 @@ def _startup_migrations():
                 _wo_patched = _re_wo.sub(
                     r'[ \t]+ports:\n(?=[ \t]+(restart:|oom_score_adj:))', '', _wo_patched
                 )
-                # Inject WO_DB_HOST=wo_db if missing — fixes "could not translate host name db"
-                # when our compose uses wo_db as the container name instead of the WebODM default "db"
-                if 'WO_DB_HOST' not in _wo_patched:
+                # Inject WO_DATABASE_HOST=wo_db if missing — fixes "could not translate host name db"
+                # when our compose uses wo_db as the container name instead of WebODM's default "db"
+                # (upstream settings.py reads os.environ.get('WO_DATABASE_HOST', 'db'))
+                if 'WO_DATABASE_HOST' not in _wo_patched:
                     _wo_patched = _wo_patched.replace(
                         '- WO_BROKER=redis://wo_broker',
-                        '- WO_DB_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
+                        '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
                     )
                 if _wo_patched != _wo_txt:
                     with open(_wo_compose, 'w') as _f:
