@@ -17931,6 +17931,60 @@ def webodm_update_status():
     return jsonify(_webodm_update_status)
 
 
+@app.route('/api/webodm/ready')
+@login_required
+def webodm_ready():
+    """
+    Returns {ready, status, url}.
+    Checks that the webapp container is running and responding to HTTP requests,
+    then confirms the Authentik proxy can reach it (caddy forward_auth is live).
+    Used by the post-deploy warmup phase so the operator doesn't try to open
+    WebODM before it has finished starting up.
+    """
+    import subprocess as _sp
+    import urllib.request as _ur
+    settings = load_settings()
+    wo_host = _get_service_domain(settings, 'webodm')
+    wo_url = f'https://{wo_host}' if wo_host else ''
+
+    # 1. Container health — 'healthy' state means Django is answering its own healthcheck
+    try:
+        r = _sp.run(['docker', 'inspect', '--format={{.State.Health.Status}}', 'webapp'],
+                    capture_output=True, text=True, timeout=6)
+        health = r.stdout.strip()
+    except Exception:
+        health = ''
+
+    if health == 'healthy':
+        return jsonify({'ready': True, 'status': 'healthy', 'url': wo_url})
+
+    # 2. Fallback: probe WebODM's internal API endpoint directly from the container
+    try:
+        r2 = _sp.run(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '4',
+                      'http://localhost:8000/api/'],
+                     capture_output=True, text=True, timeout=8)
+        if r2.returncode == 0:
+            return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
+    except Exception:
+        pass
+
+    # 3. Not ready yet — figure out a useful status message
+    try:
+        r3 = _sp.run(['docker', 'inspect', '--format={{.State.Status}}', 'webapp'],
+                     capture_output=True, text=True, timeout=6)
+        state = r3.stdout.strip()
+    except Exception:
+        state = 'unknown'
+
+    status_msg = {
+        'starting': 'Container is starting up…',
+        'running': 'Container running — Django is still initialising…',
+        'exited': 'Container exited unexpectedly — check logs',
+    }.get(state, f'Container state: {state}')
+
+    return jsonify({'ready': False, 'status': status_msg, 'url': wo_url})
+
+
 @app.route('/api/webodm/uninstall', methods=['POST'])
 @login_required
 def webodm_uninstall():
@@ -46713,6 +46767,7 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 <div style="margin-top:14px;font-size:12px;color:var(--text-dim)">Image pull may take several minutes…</div>
 </div>
 <script>
+var WO_URL = {{ wo_url|tojson }};
 (function(){
 var _lastCount = document.getElementById('deploy-log').children.length;
 var _interval = setInterval(function(){
@@ -46731,10 +46786,58 @@ var _interval = setInterval(function(){
         }
         if(!d.running){
             clearInterval(_interval);
-            setTimeout(function(){window.location.reload();},800);
+            if(d.error){
+                setTimeout(function(){window.location.reload();},800);
+            } else {
+                startWarmup();
+            }
         }
     }).catch(function(){});
 },3000);
+
+function startWarmup(){
+    var logBox = document.getElementById('deploy-log');
+    var title = document.querySelector('.card-title');
+    if(title) title.textContent = 'WebODM deployed — warming up…';
+    var footer = document.querySelector('[style*="Image pull may take"]');
+    if(footer) footer.remove();
+
+    var warmupDiv = document.createElement('div');
+    warmupDiv.style = 'margin-top:16px;padding:14px 16px;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.2);border-radius:8px;font-size:12px;color:var(--text-dim)';
+    warmupDiv.innerHTML = '<div style="display:flex;align-items:center;gap:10px"><div id="wo-warmup-spinner" style="width:14px;height:14px;border:2px solid rgba(6,182,212,.3);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0"></div><span id="wo-warmup-msg">WebODM containers are starting — waiting for readiness check…</span></div><div id="wo-ready-btn-wrap" style="margin-top:14px;display:none"><a id="wo-open-btn" href="#" target="_blank" class="open-btn" style="opacity:.5;pointer-events:none;cursor:default"><span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM</a><span id="wo-ready-label" style="margin-left:12px;font-size:12px;color:var(--green);font-weight:600"></span></div>';
+    if(logBox) logBox.parentNode.insertBefore(warmupDiv, logBox.nextSibling);
+
+    var checks = 0;
+    var maxChecks = 36; // ~3 min max
+    var warmupInterval = setInterval(function(){
+        checks++;
+        fetch('/api/webodm/ready').then(function(r){return r.json();}).then(function(d){
+            var msg = document.getElementById('wo-warmup-msg');
+            if(d.ready){
+                clearInterval(warmupInterval);
+                var spinner = document.getElementById('wo-warmup-spinner');
+                if(spinner) spinner.style.borderTopColor='var(--green)';
+                if(msg) msg.innerHTML = '<span style="color:var(--green);font-weight:600">✓ WebODM is ready</span>';
+                var btnWrap = document.getElementById('wo-ready-btn-wrap');
+                if(btnWrap) btnWrap.style.display='block';
+                var openBtn = document.getElementById('wo-open-btn');
+                if(openBtn){ openBtn.style.opacity='1'; openBtn.style.pointerEvents='auto'; openBtn.style.cursor='pointer'; openBtn.href=d.url||WO_URL||'#'; }
+                var lbl = document.getElementById('wo-ready-label');
+                if(lbl) lbl.textContent = 'Authentik proxy is live — you can log in now';
+            } else {
+                if(msg) msg.textContent = d.status || ('Waiting for WebODM to finish startup… (' + checks * 5 + 's)');
+                if(checks >= maxChecks){
+                    clearInterval(warmupInterval);
+                    if(msg) msg.innerHTML = '<span style="color:var(--yellow)">Taking longer than expected — try opening manually.</span>';
+                    var btnWrap2 = document.getElementById('wo-ready-btn-wrap');
+                    if(btnWrap2) btnWrap2.style.display='block';
+                    var ob2 = document.getElementById('wo-open-btn');
+                    if(ob2){ ob2.style.opacity='1'; ob2.style.pointerEvents='auto'; ob2.style.cursor='pointer'; ob2.href=d.url||WO_URL||'#'; }
+                }
+            }
+        }).catch(function(){});
+    }, 5000);
+}
 })();
 </script>
 {% elif deploy_error %}
