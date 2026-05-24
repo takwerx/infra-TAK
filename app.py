@@ -46824,7 +46824,7 @@ Enable Cesium 3D Tiles
 </div>
 <div class="step-item">
 <div class="step-num">2</div>
-<div class="step-text"><strong>Name it to match the tileset.</strong> The dataset name becomes part of the ATAK URL and is how TAK clients identify the layer — use something descriptive that matches what the data represents, e.g. <span class="step-code">downtown-san-diego</span> or <span class="step-code">incident-alpha-buildings</span>. Use lowercase with hyphens, no spaces. TAK clients display this name in their overlay manager so field users can find it quickly.</div>
+<div class="step-text"><strong>Choose a descriptive name.</strong> In the <em>Dataset Name</em> field below, enter a name that matches what the data represents — e.g. <span class="step-code">downtown-san-diego</span> or <span class="step-code">incident-alpha-buildings</span>. Use lowercase with hyphens, no spaces. This name becomes part of the ATAK URL and appears in the TAK client overlay manager, so field users can identify it at a glance.</div>
 </div>
 <div class="step-item">
 <div class="step-num">3</div>
