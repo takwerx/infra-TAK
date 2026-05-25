@@ -9738,6 +9738,7 @@ _register_module_remote_routes('takportal', 'takportal_deployment')
 _register_module_remote_routes('authentik', 'authentik_deployment')
 _register_module_remote_routes('mediamtx', 'mediamtx_deployment')
 _register_module_remote_routes('nodered', 'nodered_deployment')
+_register_module_remote_routes('webodm', 'webodm_deployment')
 _register_module_remote_routes('fedhub', 'fedhub_deployment', get_config_fn=_get_fedhub_deployment_config)
 
 
@@ -11570,7 +11571,12 @@ def generate_caddyfile(settings=None):
     if wo_mod.get('installed'):
         wo_host = sd.get('webodm') or _get_service_domain(settings, 'webodm')
         wo_port = settings.get('webodm_port', 8765)
-        wo_up = f'127.0.0.1:{wo_port}'
+        _wo_deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+        if _wo_deploy_cfg.get('target_mode') == 'remote':
+            _wo_remote_host = (_wo_deploy_cfg.get('remote', {}).get('host') or '').strip()
+            wo_up = f'{_wo_remote_host}:{wo_port}' if _wo_remote_host else f'127.0.0.1:{wo_port}'
+        else:
+            wo_up = f'127.0.0.1:{wo_port}'
         lines.append(f"# WebODM — drone photogrammetry + TAK overlay")
         lines.append(f"{wo_host} {{")
         if ak.get('installed'):
@@ -17693,11 +17699,157 @@ def _webodm_deploy_log(msg, status=None):
         _webodm_deploy_status.update(status)
 
 
+def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
+    """Deploy WebODM on a remote host via SSH (mirrors Node-RED remote pattern)."""
+    import secrets as _sec
+    remote = deploy_cfg.get('remote', {})
+    host = (remote.get('host') or '').strip()
+    if not host:
+        plog('✗ Remote host not configured')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+    plog(f'━━━ WebODM remote deploy → {host} ━━━')
+
+    # Resolve home dir on remote — Docker doesn't expand ~ in volume paths
+    ok, home_out = _module_run(deploy_cfg, 'echo $HOME', timeout=10)
+    wo_dir_remote = (home_out or '').strip() + '/webodm' if ok and (home_out or '').strip() else '~/webodm'
+    wo_port = settings.get('webodm_port', 8765)
+    compose_path_remote = f'{wo_dir_remote}/docker-compose.yml'
+    plog(f'  WebODM dir on remote: {wo_dir_remote}')
+
+    # Ensure Docker on remote
+    plog('━━━ Checking Docker (remote) ━━━')
+    ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
+    if not ok or 'Docker version' not in (out or ''):
+        plog('  Docker not found — installing...')
+        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        if not ok:
+            plog(f'✗ Docker install failed: {(out or "")[-300:]}')
+            _webodm_deploy_status.update({'running': False, 'error': True})
+            return
+    ok, dv = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=10)
+    plog(f'  {(dv or "").strip()}')
+
+    # Create directory structure on remote
+    plog('━━━ Creating directories (remote) ━━━')
+    ok, out = _module_run(deploy_cfg, f'mkdir -p {wo_dir_remote}/plugins {wo_dir_remote}/media {wo_dir_remote}/db', timeout=15, log_fn=plog)
+    if not ok:
+        plog(f'✗ mkdir failed: {out}')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+    plog('✓ Directories created')
+
+    # Clone TAK overlay plugin on remote
+    plog('━━━ Installing TAK overlay plugin (remote) ━━━')
+    ok, out = _module_run(deploy_cfg,
+        f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
+        f'git clone --depth=1 https://github.com/Humble-Helper-96/webodm-tak-overlay.git '
+        f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1',
+        timeout=90, log_fn=plog)
+    if not ok:
+        plog(f'✗ Plugin clone failed: {(out or "")[-300:]}')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+    plog('✓ TAK overlay plugin cloned')
+
+    # Write compose file locally, scp to remote
+    plog('━━━ Writing docker-compose.yml ━━━')
+    wo_secret = _sec.token_hex(32)
+    compose_content = WEBODM_DOCKER_COMPOSE.format(
+        wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret)
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tf:
+        tf.write(compose_content)
+        tmp_compose = tf.name
+    ok1, _ = _module_copy(deploy_cfg, tmp_compose, compose_path_remote, log_fn=plog)
+    try:
+        os.unlink(tmp_compose)
+    except Exception:
+        pass
+    if not ok1:
+        plog('✗ Failed to copy docker-compose.yml to remote')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+    plog('✓ docker-compose.yml written')
+
+    # Pull images on remote
+    plog('━━━ Pulling WebODM images (remote — may take several minutes) ━━━')
+    ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} pull 2>&1', timeout=600, log_fn=plog)
+    if not ok:
+        plog(f'  Pull warning (non-fatal): {(out or "")[-200:]}')
+
+    # UFW hardening on remote
+    _module_run(deploy_cfg, f'ufw deny {wo_port}/tcp 2>/dev/null; ufw deny 3001/tcp 2>/dev/null; true', timeout=15)
+    plog('✓ UFW: direct port access blocked on remote')
+
+    # Start containers on remote
+    plog('━━━ Starting WebODM containers (remote) ━━━')
+    ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} up -d 2>&1', timeout=120, log_fn=plog)
+    if not ok:
+        plog(f'✗ docker compose up failed: {(out or "")[-300:]}')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+    plog('✓ WebODM containers started')
+
+    # Readiness check — probe via curl on the remote host
+    plog('━━━ Waiting for WebODM readiness (remote, up to 90s) ━━━')
+    import time as _time
+    for _ in range(18):
+        _time.sleep(5)
+        ok_curl, curl_out = _module_run(deploy_cfg,
+            f'curl -s -o /dev/null -w "%{{http_code}}" http://127.0.0.1:{wo_port}/ 2>/dev/null || echo 000',
+            timeout=10)
+        code = (curl_out or '').strip()
+        if code and code not in ('000', '502', '503'):
+            plog(f'  WebODM responded (HTTP {code})')
+            break
+    else:
+        plog('  WebODM did not respond in time — check: docker logs webapp (on remote)')
+
+    # Register NodeODM processing node on remote
+    plog('━━━ Registering NodeODM node (remote) ━━━')
+    _time.sleep(5)
+    ok, out = _module_run(deploy_cfg,
+        'docker exec webapp python manage.py addnode wo_nodeodm 3000 --label NodeODX 2>&1',
+        timeout=30, log_fn=plog)
+    if ok:
+        plog('✓ NodeODM processing node registered')
+    else:
+        plog(f'  Node registration skipped (add manually: wo_nodeodm:3000): {(out or "")[-200:]}')
+
+    # Save settings, reload Caddy (local), configure Authentik (local)
+    s = load_settings()
+    s['webodm_enabled'] = True
+    deploy_cfg['deployed'] = True
+    deploy_cfg['remote']['_resolved_wo_dir'] = wo_dir_remote
+    s['webodm_deployment'] = _normalize_module_deployment_config(deploy_cfg)
+    save_settings(s)
+    generate_caddyfile(s)
+    try:
+        subprocess.run(['systemctl', 'reload', 'caddy'], timeout=15, check=True)
+        plog('✓ Caddy reloaded — TLS cert provisioning started')
+    except Exception as ce:
+        plog(f'  Caddy reload warning: {ce}')
+    fqdn = s.get('fqdn', '').strip()
+    ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if fqdn and ak_token:
+        plog('━━━ Configuring Authentik for WebODM ━━━')
+        _ensure_authentik_webodm_app(fqdn, ak_token, plog=plog, settings=s)
+    else:
+        plog('  Authentik not configured — skipping proxy provider setup')
+    plog('✓ WebODM deployed on remote.')
+    _webodm_deploy_status.update({'running': False, 'complete': True, 'error': False})
+
+
 def _run_webodm_deploy(settings):
     import subprocess as _sp
     import secrets as _sec
     import shutil as _sh
     plog = _webodm_deploy_log
+    deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+    if deploy_cfg.get('target_mode') == 'remote':
+        _run_webodm_deploy_remote(settings, deploy_cfg, plog)
+        return
     wo_dir = os.path.expanduser('~/webodm')
     wo_port = settings.get('webodm_port', 8765)
     plugin_dir = os.path.join(wo_dir, 'plugins', 'webodm-tak-overlay')
@@ -17809,10 +17961,12 @@ def webodm_page():
     wo_host = _get_service_domain(settings, 'webodm')
     wo_url = f'https://{wo_host}' if wo_host else ''
     wo_vinfo = _get_webodm_version_info() if wo.get('installed') else {}
+    wo_deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
     r = make_response(render_template_string(WEBODM_TEMPLATE,
         settings=settings, modules=modules, wo=wo,
         wo_url=wo_url,
         wo_host=wo_host,
+        wo_deploy_cfg=wo_deploy_cfg,
         deploying=_webodm_deploy_status.get('running', False),
         deploy_done=_webodm_deploy_status.get('complete', False),
         deploy_error=_webodm_deploy_status.get('error', False),
@@ -18004,22 +18158,31 @@ def webodm_uninstall():
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
-    import shutil as _sh
-    wo_dir = os.path.expanduser('~/webodm')
-    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
-    if os.path.exists(compose_path):
-        _sp.run(['docker', 'compose', '-f', compose_path, 'down', '--volumes'],
-                capture_output=True, timeout=90, cwd=wo_dir)
-    # Wipe bind-mounted postgres data so next deploy starts fresh and
-    # prompts for new admin credentials. media/ (processed jobs) is kept.
-    db_dir = os.path.join(wo_dir, 'db')
-    if os.path.isdir(db_dir):
-        try:
-            _sh.rmtree(db_dir)
-        except Exception:
-            _sp.run(['rm', '-rf', db_dir], capture_output=True)
     s = load_settings()
+    deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
+    if deploy_cfg.get('target_mode') == 'remote':
+        wo_dir_remote = (deploy_cfg.get('remote', {}).get('_resolved_wo_dir') or '~/webodm').strip()
+        compose_path_remote = f'{wo_dir_remote}/docker-compose.yml'
+        _module_run(deploy_cfg,
+            f'docker compose -f {compose_path_remote} down --volumes 2>/dev/null; true',
+            timeout=90)
+        _module_run(deploy_cfg, f'rm -rf {wo_dir_remote}/db 2>/dev/null; true', timeout=15)
+    else:
+        import shutil as _sh
+        wo_dir = os.path.expanduser('~/webodm')
+        compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+        if os.path.exists(compose_path):
+            _sp.run(['docker', 'compose', '-f', compose_path, 'down', '--volumes'],
+                    capture_output=True, timeout=90, cwd=wo_dir)
+        db_dir = os.path.join(wo_dir, 'db')
+        if os.path.isdir(db_dir):
+            try:
+                _sh.rmtree(db_dir)
+            except Exception:
+                _sp.run(['rm', '-rf', db_dir], capture_output=True)
     s['webodm_enabled'] = False
+    deploy_cfg['deployed'] = False
+    s['webodm_deployment'] = _normalize_module_deployment_config(deploy_cfg)
     save_settings(s)
     generate_caddyfile(s)
     _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
@@ -46890,7 +47053,42 @@ function startWarmup(){
 </div>
 {% else %}
 <div class="card" style="max-width:560px">
-<div class="card-title">Deploy WebODM</div>
+<div class="card-title">Deployment Target</div>
+<div style="display:flex;gap:10px;margin-bottom:16px">
+  <button id="wo-target-local-btn" onclick="woSetTarget('local')" class="btn btn-sm" style="{% if wo_deploy_cfg.target_mode != 'remote' %}background:rgba(6,182,212,.15);color:var(--cyan);border:1px solid rgba(6,182,212,.4){% else %}background:rgba(30,39,54,.5);color:var(--text-dim);border:1px solid var(--border){% endif %}">This server</button>
+  <button id="wo-target-remote-btn" onclick="woSetTarget('remote')" class="btn btn-sm" style="{% if wo_deploy_cfg.target_mode == 'remote' %}background:rgba(6,182,212,.15);color:var(--cyan);border:1px solid rgba(6,182,212,.4){% else %}background:rgba(30,39,54,.5);color:var(--text-dim);border:1px solid var(--border){% endif %}">Remote host</button>
+</div>
+<div id="wo-remote-cfg" style="display:{% if wo_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+  <div class="form-group"><label class="form-label">Remote host (IP or hostname)</label><input class="form-input" id="wo-ssh-host" value="{{ wo_deploy_cfg.remote.host or '' }}" placeholder="192.168.1.50"></div>
+  <div style="display:flex;gap:10px">
+    <div class="form-group" style="flex:1"><label class="form-label">SSH user</label><input class="form-input" id="wo-ssh-user" value="{{ wo_deploy_cfg.remote.ssh_user or 'root' }}" placeholder="root"></div>
+    <div class="form-group" style="width:90px"><label class="form-label">Port</label><input class="form-input" id="wo-ssh-port" value="{{ wo_deploy_cfg.remote.ssh_port or 22 }}" placeholder="22" type="number"></div>
+  </div>
+  <div class="form-group"><label class="form-label">Auth method</label>
+    <select class="form-input" id="wo-auth-method" onchange="woAuthMethodChange()">
+      <option value="ssh_key" {% if wo_deploy_cfg.remote.auth_method != 'password' %}selected{% endif %}>SSH key</option>
+      <option value="password" {% if wo_deploy_cfg.remote.auth_method == 'password' %}selected{% endif %}>Password</option>
+    </select>
+  </div>
+  <div id="wo-key-row" class="form-group" style="display:{% if wo_deploy_cfg.remote.auth_method == 'password' %}none{% else %}block{% endif %}">
+    <label class="form-label">SSH key path (leave blank for default ~/.ssh/id_ed25519)</label>
+    <input class="form-input" id="wo-ssh-key-path" value="{{ wo_deploy_cfg.remote.ssh_key_path or '' }}" placeholder="~/.ssh/id_ed25519">
+  </div>
+  <div id="wo-pw-row" class="form-group" style="display:{% if wo_deploy_cfg.remote.auth_method == 'password' %}block{% else %}none{% endif %}">
+    <label class="form-label">SSH password</label>
+    <input class="form-input" type="password" id="wo-ssh-password" placeholder="SSH password">
+  </div>
+  <div style="display:flex;gap:8px;margin-top:4px;align-items:center;flex-wrap:wrap">
+    <button class="btn btn-sm btn-ghost" onclick="woSaveConfig()">Save</button>
+    <button class="btn btn-sm btn-ghost" onclick="woEnsureSshKey()">Generate SSH key</button>
+    <button class="btn btn-sm btn-ghost" onclick="woInstallSshKey()">Install SSH key</button>
+    <button class="btn btn-sm btn-ghost" onclick="woTestSsh()">Test connection</button>
+    <span id="wo-cfg-msg" style="font-size:12px;color:var(--text-dim)"></span>
+  </div>
+</div>
+</div>
+<div class="card" style="max-width:560px">
+<div class="card-title">Deploy WebODM{% if wo_deploy_cfg.target_mode == 'remote' and wo_deploy_cfg.remote.host %} <span style="font-size:10px;color:var(--cyan);font-weight:400;margin-left:6px">→ {{ wo_deploy_cfg.remote.host }}</span>{% endif %}</div>
 <div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will pull WebODM images (~1.5 GB), start all containers, clone the TAK overlay plugin, and register the NodeODM processing node. Takes 3–8 minutes on first deploy.</div>
 <button class="btn btn-primary" onclick="startDeploy()" id="deploy-btn">
 <span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy WebODM
@@ -46898,6 +47096,53 @@ function startWarmup(){
 <div id="deploy-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
 </div>
 {% endif %}
+<script>
+function woSetTarget(mode){
+  var localBtn=document.getElementById('wo-target-local-btn');
+  var remoteBtn=document.getElementById('wo-target-remote-btn');
+  var cfg=document.getElementById('wo-remote-cfg');
+  var active='background:rgba(6,182,212,.15);color:var(--cyan);border:1px solid rgba(6,182,212,.4)';
+  var inactive='background:rgba(30,39,54,.5);color:var(--text-dim);border:1px solid var(--border)';
+  if(mode==='remote'){remoteBtn.style.cssText=active;localBtn.style.cssText=inactive;cfg.style.display='block';}
+  else{localBtn.style.cssText=active;remoteBtn.style.cssText=inactive;cfg.style.display='none';}
+  woSaveConfig(mode);
+}
+function woAuthMethodChange(){
+  var m=document.getElementById('wo-auth-method').value;
+  document.getElementById('wo-key-row').style.display=m==='password'?'none':'block';
+  document.getElementById('wo-pw-row').style.display=m==='password'?'block':'none';
+}
+function woMsg(t,c){var el=document.getElementById('wo-cfg-msg');if(el){el.textContent=t;el.style.color=c||'var(--text-dim)';}}
+function _woCfg(extraMode){
+  return {target_mode:extraMode||(document.getElementById('wo-remote-cfg').style.display!=='none'?'remote':'local'),
+    remote:{host:(document.getElementById('wo-ssh-host')||{}).value||'',
+      ssh_user:(document.getElementById('wo-ssh-user')||{}).value||'root',
+      ssh_port:parseInt((document.getElementById('wo-ssh-port')||{}).value||22,10)||22,
+      auth_method:(document.getElementById('wo-auth-method')||{}).value||'ssh_key',
+      ssh_key_path:(document.getElementById('wo-ssh-key-path')||{}).value||'',
+      ssh_password:(document.getElementById('wo-ssh-password')||{}).value||''}};
+}
+function woSaveConfig(mode){
+  woMsg('Saving…');
+  fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg(mode)}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'Saved':'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+function woEnsureSshKey(){
+  woMsg('Generating key…');
+  fetch('/api/webodm/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+function woInstallSshKey(){
+  woMsg('Installing key…');
+  fetch('/api/webodm/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+function woTestSsh(){
+  woMsg('Testing…');
+  fetch('/api/webodm/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'✓ Connected':'✗ '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+</script>
 
 {% else %}
 <!-- Management state -->
