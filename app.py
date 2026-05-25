@@ -47226,8 +47226,9 @@ function woTestSsh(){
 
 <div class="modal-overlay" id="uninstall-modal"><div class="modal">
   <h3>&#x26a0; Uninstall WebODM?</h3><p>This will stop and remove all WebODM containers and the plugin. Processed job data in ~/webodm/media/ will be preserved on disk.</p>
-  <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
-  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
+  <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password" onkeydown="if(event.key==='Enter')doUninstall()"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" id="uninstall-cancel-btn" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" id="uninstall-confirm-btn" onclick="doUninstall()">Uninstall</button></div>
+  <div id="uninstall-progress" style="display:none;margin-top:12px;padding:10px 14px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);border-radius:8px;font-size:12px;color:var(--text-secondary)"><span class="uninstall-spinner"></span><span id="uninstall-progress-msg">Uninstalling…</span></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
 
@@ -47308,7 +47309,39 @@ function resetWoPassword(){
         else{msg.textContent='Error: '+(d.error||'unknown');}
     }).catch(function(){btn.disabled=false;btn.textContent='Set Password';msg.textContent='Network error';});
 }
-function doUninstall(){var pw=document.getElementById('uninstall-password').value,msg=document.getElementById('uninstall-msg');msg.textContent='';fetch('/api/webodm/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
+function doUninstall(){
+  var pw=document.getElementById('uninstall-password').value;
+  var msg=document.getElementById('uninstall-msg');
+  var progress=document.getElementById('uninstall-progress');
+  var progressMsg=document.getElementById('uninstall-progress-msg');
+  var confirmBtn=document.getElementById('uninstall-confirm-btn');
+  var cancelBtn=document.getElementById('uninstall-cancel-btn');
+  msg.textContent='';
+  if(!pw){msg.textContent='Password required.';return;}
+  progress.style.display='block';
+  progressMsg.textContent='Stopping and removing WebODM containers…';
+  if(confirmBtn){confirmBtn.disabled=true;}
+  if(cancelBtn){cancelBtn.disabled=true;}
+  fetch('/api/webodm/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){
+        progress.style.display='none';
+        if(confirmBtn)confirmBtn.disabled=false;
+        if(cancelBtn)cancelBtn.disabled=false;
+        msg.textContent=d.error;
+        return;
+      }
+      progressMsg.textContent='Done — reloading…';
+      setTimeout(function(){location.reload();},1200);
+    })
+    .catch(function(e){
+      progress.style.display='none';
+      if(confirmBtn)confirmBtn.disabled=false;
+      if(cancelBtn)cancelBtn.disabled=false;
+      msg.textContent=e.message||'Request failed';
+    });
+}
 function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
 </script></body></html>'''
 
