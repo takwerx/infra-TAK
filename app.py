@@ -47104,7 +47104,8 @@ function woSetTarget(mode){
   var active='background:rgba(6,182,212,.15);color:var(--cyan);border:1px solid rgba(6,182,212,.4)';
   var inactive='background:rgba(30,39,54,.5);color:var(--text-dim);border:1px solid var(--border)';
   if(mode==='remote'){remoteBtn.style.cssText=active;localBtn.style.cssText=inactive;cfg.style.display='block';}
-  else{localBtn.style.cssText=active;remoteBtn.style.cssText=inactive;cfg.style.display='none';woSaveConfig('local');}
+  else{localBtn.style.cssText=active;remoteBtn.style.cssText=inactive;cfg.style.display='none';}
+  woMsg('');
 }
 function woAuthMethodChange(){
   var m=document.getElementById('wo-auth-method').value;
