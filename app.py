@@ -24968,9 +24968,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 2 — Download the bootstrap user.p12 certificate</div>
           <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
             <li style="margin-bottom:5px">In infra-TAK, go to <strong style="color:var(--text-primary)">TAK Server</strong> → <strong style="color:var(--text-primary)">Certificates</strong></li>
-            <li style="margin-bottom:5px">Find <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user</code> in the certificate list (created automatically during deploy)</li>
+            <li style="margin-bottom:5px">Find <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> in the certificate list (created automatically during deploy)</li>
             <li style="margin-bottom:5px">Click <strong style="color:var(--text-primary)">Download</strong> → save <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> to your computer</li>
-            <li style="color:var(--text-dim);font-size:12px">This is the TAK-side client certificate used to bootstrap the CloudTAK connection. The <code style="color:var(--text-dim)">cloudtakadmin</code> account lives in Authentik/LDAP — no separate .p12 is generated for it.</li>
+            <li style="color:var(--text-dim);font-size:12px">The certificate password is shown on this same Certificates page — note it, you will need it in Step 3.</li>
           </ol>
         </div>
 
@@ -24979,9 +24979,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
             <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %}</li>
             <li style="margin-bottom:5px">When prompted for the TAK Server address, enter: {% if settings.fqdn %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.{{ settings.fqdn }}</code>{% else %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.yourdomain.com</code>{% endif %}</li>
-            <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin</code> and the password you set in Step 1</li>
-            <li style="margin-bottom:5px">Upload the <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> you downloaded in Step 2 when prompted for the client certificate</li>
-            <li>CloudTAK will connect, authenticate, and display the map view</li>
+            <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> (the full suffixed name from Step 1) and the password you set in Step 1</li>
+            <li style="margin-bottom:5px">Upload <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> and enter the certificate password you noted in Step 2</li>
+            <li>CloudTAK will save and reload to the login page — sign in with your <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> credentials</li>
           </ol>
         </div>
 
