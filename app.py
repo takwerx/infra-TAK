@@ -2896,7 +2896,8 @@ def takserver_external_db_test_connection():
     checks = []
 
     def add_check(name, ok, detail=''):
-        checks.append({'name': name, 'ok': bool(ok), 'detail': (detail or '')[:400]})
+        # ok=None means "skipped/informational" — preserve as null in JSON, not bool
+        checks.append({'name': name, 'ok': (None if ok is None else bool(ok)), 'detail': (detail or '')[:400]})
 
     # Check 1: TCP reachability — v0.9.12: socket.create_connection instead of
     # `bash -c "</dev/tcp/HOST/PORT"`. No shell, no injection vector.
