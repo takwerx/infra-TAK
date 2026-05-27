@@ -24972,7 +24972,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 3 — Configure CloudTAK on first launch</div>
           <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
             <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %}</li>
-            <li style="margin-bottom:5px">You will be prompted to enter your TAK Server connection details and upload a certificate</li>
+            <li style="margin-bottom:5px">When prompted for the TAK Server address, enter: {% if settings.fqdn %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.{{ settings.fqdn }}</code>{% else %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.yourdomain.com</code>{% endif %}</li>
             <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin</code> and the password you set in Step 1</li>
             <li style="margin-bottom:5px">Upload the <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">.p12</code> file you downloaded in Step 2 when prompted</li>
             <li>CloudTAK will connect, authenticate, and display the map view</li>
