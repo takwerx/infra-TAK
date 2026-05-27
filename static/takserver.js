@@ -1151,7 +1151,7 @@ function initTakDeployModeUI(rootEl){
       '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600">Provision Database — Admin Credentials</div>',
       '<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Used once to create the app user and grant permissions. Not stored.</div>',
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px">',
-      '<div class="form-field"><label>Admin Username</label><input type="text" id="edb_admin_user" value="postgres" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
+      '<div class="form-field"><label>Admin Username</label><input type="text" id="edb_admin_user" placeholder="e.g. postgres or pgadmin" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
       '<div class="form-field"><label>Admin Password</label><div style="position:relative"><input type="password" id="edb_admin_pass" placeholder="RDS master password" autocomplete="off" style="width:100%;padding:8px 48px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="edb-admin-pass-toggle" onclick="toggleSinglePassword(\'edb_admin_pass\',\'edb-admin-pass-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div></div>',
       '</div>',
       '<button type="button" onclick="provisionExternalDb()" id="edb_provision_btn" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);border-radius:8px;font-size:12px;cursor:pointer">3. Provision Database (create user &amp; grants)</button>',
@@ -1427,7 +1427,7 @@ async function provisionExternalDb(){
     var msg=document.getElementById('external-db-msg');
     var logEl=document.getElementById('external-db-provision-log');
     var btn=document.getElementById('edb_provision_btn');
-    var adminUser=(document.getElementById('edb_admin_user')||{}).value||'postgres';
+    var adminUser=(document.getElementById('edb_admin_user')||{}).value||'';
     var adminPass=(document.getElementById('edb_admin_pass')||{}).value||'';
     if(!adminPass){if(msg){msg.textContent='✗ Admin password is required to provision';msg.style.color='var(--red)';}return;}
     if(btn)btn.disabled=true;
