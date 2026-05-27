@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.40-alpha"
+VERSION = "0.9.41-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -38466,13 +38466,33 @@ def _ensure_ldap_flow_authentication_none():
                     break
             if not id_stage_pk:
                 id_stage_pk = _find_stage('stages/identification/', 'ldap-identification-stage')
+            _id_stage_needs_recreation = False
             if id_stage_pk:
                 try:
                     # Include user_fields so PATCH does not trigger "no user fields selected" validation
                     _patch(f'stages/identification/{id_stage_pk}/', {'password_stage': None, 'user_fields': ['username']})
                 except Exception:
                     pass
-            wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names
+                # Verify the PATCH actually cleared password_stage.  On Authentik 2026.x some
+                # endpoints return HTTP 405 on PATCH (confirmed for policies/bindings; may affect
+                # stages too).  A silent failure leaves password_stage set on the identification
+                # stage, causing the LDAP flow to recurse infinitely on every real user bind
+                # ("exceeded stage recursion depth" → LDAP error 49 / "Invalid credentials").
+                # Fix: read the stage back; if password_stage is still set, DELETE it and force
+                # binding recreation so _create_ldap_stage builds a fresh stage without it.
+                try:
+                    _refreshed = _get(f'stages/identification/{id_stage_pk}/')
+                    if _refreshed.get('password_stage') is not None:
+                        print(f'  LDAP flow fix: PATCH did not clear password_stage on identification stage {id_stage_pk} — DELETE + recreate to resolve spiral', flush=True)
+                        try:
+                            _delete(f'stages/identification/{id_stage_pk}/')
+                        except Exception:
+                            pass
+                        id_stage_pk = None
+                        _id_stage_needs_recreation = True
+                except Exception:
+                    pass
+            wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names or _id_stage_needs_recreation
             if wrong_bindings:
                 for b in ldap_bindings:
                     try:
