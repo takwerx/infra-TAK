@@ -15048,10 +15048,23 @@ WantedBy=multi-user.target
         else:
             plog("  Caddy not running — skipping SSL integration")
 
-        # Verify MediaMTX is up
-        time.sleep(3)
-        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
-        if r.stdout.strip() == 'active':
+        # Verify MediaMTX is up — poll up to 30s so the deploy log shows green
+        # only after the service is actually accepting connections. Without this,
+        # hitting stream.fqdn immediately after deploy gets Authentik "Not Found"
+        # because Caddy has the vhost but :5080 isn't listening yet.
+        plog("")
+        plog("━━━ Waiting for MediaMTX to become active ━━━")
+        mtx_active = False
+        for _i in range(15):
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
+            if r.stdout.strip() == 'active':
+                mtx_active = True
+                plog("✓ MediaMTX is active")
+                break
+            time.sleep(2)
+        if not mtx_active:
+            plog("⚠ MediaMTX did not become active within 30s — check: systemctl status mediamtx")
+        if mtx_active:
             # If Authentik is running, ensure stream visibility groups exist (video-public, video-private, video-admin)
             ak_dir = os.path.expanduser('~/authentik')
             env_path = os.path.join(ak_dir, '.env')
