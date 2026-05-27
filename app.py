@@ -24941,10 +24941,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   {% if cloudtak.running and not deploying %}
   <!-- Post-install first-time setup guide -->
-  <details style="margin-bottom:20px;border:1px solid rgba(16,185,129,0.25);border-radius:12px;overflow:hidden">
-    <summary style="padding:14px 20px;background:rgba(16,185,129,0.07);cursor:pointer;font-size:13px;font-weight:600;color:var(--green);list-style:none;display:flex;align-items:center;gap:10px">
+  <details style="margin-bottom:20px;border:1px solid rgba(16,185,129,0.25);border-radius:12px;overflow:hidden" id="cloudtak-setup-guide">
+    <summary style="padding:14px 20px;background:rgba(16,185,129,0.07);cursor:pointer;font-size:13px;font-weight:600;color:var(--green);list-style:none;display:flex;align-items:center;gap:10px" onclick="var a=this.parentElement.querySelector('.ct-guide-arrow');if(a)a.style.transform=this.parentElement.open?'rotate(0deg)':'rotate(180deg)'">
       <span style="font-size:16px">🚀</span> First-Time Setup — Connect CloudTAK to TAK Server
-      <span style="font-size:11px;font-weight:400;color:var(--text-dim);margin-left:auto">click to expand</span>
+      <span class="ct-guide-arrow" style="margin-left:auto;font-size:14px;color:var(--text-dim);transition:transform 0.2s;display:inline-block;transform:rotate(0deg)">▼</span>
     </summary>
     <div style="padding:20px 24px;font-size:13px;color:var(--text-secondary);line-height:1.75;background:var(--bg-card)">
 
