@@ -24934,6 +24934,60 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
   {% endif %}
 
+  {% if cloudtak.running and not deploying %}
+  <!-- Post-install first-time setup guide -->
+  <details style="margin-bottom:20px;border:1px solid rgba(16,185,129,0.25);border-radius:12px;overflow:hidden">
+    <summary style="padding:14px 20px;background:rgba(16,185,129,0.07);cursor:pointer;font-size:13px;font-weight:600;color:var(--green);list-style:none;display:flex;align-items:center;gap:10px">
+      <span style="font-size:16px">🚀</span> First-Time Setup — Connect CloudTAK to TAK Server
+      <span style="font-size:11px;font-weight:400;color:var(--text-dim);margin-left:auto">click to expand</span>
+    </summary>
+    <div style="padding:20px 24px;font-size:13px;color:var(--text-secondary);line-height:1.75;background:var(--bg-card)">
+
+      <p style="margin:0 0 14px;color:var(--text-primary);font-weight:600">CloudTAK needs its own TAK Server user + certificate to connect. Follow these steps once after install:</p>
+
+      <div style="display:flex;flex-direction:column;gap:14px">
+
+        <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 1 — Create a CloudTAK admin user in TAK Portal</div>
+          <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
+            <li style="margin-bottom:5px">Open <strong style="color:var(--text-primary)">TAK Portal</strong> → <strong style="color:var(--text-primary)">Users</strong> → <strong style="color:var(--text-primary)">Create User</strong></li>
+            <li style="margin-bottom:5px">Set the username to <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin</code> (or your preferred name)</li>
+            <li style="margin-bottom:5px">This must be a <strong>regular user — do NOT check the admin box</strong></li>
+            <li style="margin-bottom:5px">Assign to any agency and at least one group</li>
+            <li>Set a password for the account — you will need this in Step 3</li>
+          </ol>
+        </div>
+
+        <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 2 — Download the user certificate (.p12)</div>
+          <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
+            <li style="margin-bottom:5px">In infra-TAK, go to <strong style="color:var(--text-primary)">TAK Server</strong> → <strong style="color:var(--text-primary)">Certificates</strong></li>
+            <li style="margin-bottom:5px">Find <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtakadmin</code> in the certificate list</li>
+            <li style="margin-bottom:5px">Click <strong style="color:var(--text-primary)">Download</strong> → save the <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">.p12</code> file to your computer</li>
+            <li style="color:var(--text-dim);font-size:12px">The .p12 bundles the user\'s client certificate and private key — keep it secure.</li>
+          </ol>
+        </div>
+
+        <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 3 — Configure CloudTAK on first launch</div>
+          <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
+            <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %}</li>
+            <li style="margin-bottom:5px">You will be prompted to enter your TAK Server connection details and upload a certificate</li>
+            <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin</code> and the password you set in Step 1</li>
+            <li style="margin-bottom:5px">Upload the <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">.p12</code> file you downloaded in Step 2 when prompted</li>
+            <li>CloudTAK will connect, authenticate, and display the map view</li>
+          </ol>
+        </div>
+
+      </div>
+
+      <p style="margin:16px 0 0;font-size:12px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:12px">
+        Each person using CloudTAK needs their own TAK Portal user and .p12. The <code style="color:var(--cyan)">cloudtakadmin</code> account is for the initial admin setup. Additional users follow the same Steps 1–2 and log in with their own credentials.
+      </p>
+    </div>
+  </details>
+  {% endif %}
+
   {% if container_info.get('containers') %}
   <div class="card">
     <div class="card-title">Services</div>
