@@ -2810,12 +2810,24 @@ def takserver_external_db_provision():
     ok, out = run_sql(f'GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {app_user};', 'grant db', use_db='postgres')
     plog(f'  {"✓" if ok else "✗"} GRANT ALL ON DATABASE: {out if not ok else "OK"}')
 
-    # Step 3b: Grant rds_superuser on AWS RDS (required for CREATE EXTENSION postgis)
+    # Step 3b: Cloud-provider-specific role grants
     is_rds = '.rds.amazonaws.com' in db_host
+    is_azure = '.postgres.database.azure.com' in db_host
     if is_rds:
         plog(f'  AWS RDS detected — granting rds_superuser to {app_user} (required for PostGIS)...')
-        ok, out = run_sql(f'GRANT rds_superuser TO {app_user};', 'grant rds_superuser')
+        ok, out = run_sql(f'GRANT rds_superuser TO {app_user};', 'grant rds_superuser', use_db='postgres')
         plog(f'  {"✓" if ok else "✗"} rds_superuser grant: {out if not ok else "OK"}')
+    if is_azure:
+        plog(f'  Azure PostgreSQL detected — granting azure_pg_admin to {app_user}...')
+        ok, out = run_sql(f'GRANT azure_pg_admin TO {app_user};', 'grant azure_pg_admin', use_db='postgres')
+        plog(f'  {"✓" if ok else "✗"} azure_pg_admin grant: {out if not ok else "OK"}')
+        # Pre-create required extensions as admin — Azure blocks CREATE EXTENSION for non-superusers
+        # even with IF NOT EXISTS, so SchemaManager (running as app_user) would fail without this.
+        azure_exts = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
+        plog(f'  Azure: pre-creating required extensions as {admin_user}...')
+        for ext in azure_exts:
+            ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {ext};', f'create ext {ext}', use_db=db_name)
+            plog(f'  {"✓" if ok else "⚠"} {ext}: {out if not ok else "OK"}')
 
     # Step 4: Grant schema privileges (must connect to the target database)
     plog(f'  Granting schema privileges...')
@@ -2929,6 +2941,42 @@ def takserver_external_db_test_connection():
             add_check('psql auth', None, 'psql client not installed locally — skipped')
         except Exception as e:
             add_check('psql auth', False, str(e)[:200])
+
+    # Check 4: Azure extension whitelist probe
+    # Only runs when the endpoint is an Azure Flexible Server FQDN.
+    # Connects as the app user and queries pg_available_extensions to verify
+    # all five extensions TAK Server's SchemaManager requires are whitelisted.
+    # Fails with actionable portal instructions if any are missing.
+    if '.postgres.database.azure.com' in db_host and tcp_ok:
+        azure_required = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
+        try:
+            names_sql = "SELECT name FROM pg_available_extensions WHERE name IN ({});".format(
+                ','.join(f"'{e}'" for e in azure_required)
+            )
+            env = dict(os.environ, PGPASSWORD=db_pass) if db_pass else os.environ.copy()
+            r = subprocess.run(
+                ['psql', '-h', db_host, '-p', str(db_port), '-U', db_user, '-d', db_name,
+                 '-c', names_sql, '--no-password', '-t', '-A'],
+                capture_output=True, text=True, timeout=15, env=env
+            )
+            if r.returncode == 0:
+                available = set(line.strip() for line in r.stdout.splitlines() if line.strip())
+                missing = [e for e in azure_required if e not in available]
+                if missing:
+                    missing_upper = ','.join(e.upper() for e in missing)
+                    all_upper = 'FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO'
+                    detail = (
+                        f'Missing: {missing_upper}. '
+                        f'In Azure Portal → {db_host.split(".")[0]} → Settings → Server parameters → '
+                        f'azure.extensions → set value to: {all_upper} → Save.'
+                    )
+                    add_check('Azure extensions whitelisted', False, detail)
+                else:
+                    add_check('Azure extensions whitelisted', True, 'All 5 required extensions available')
+            else:
+                add_check('Azure extensions whitelisted', None, 'Could not query extensions (no app user password?) — verify manually')
+        except Exception as e:
+            add_check('Azure extensions whitelisted', None, f'Extension check skipped: {str(e)[:150]}')
 
     all_ok = all(c['ok'] for c in checks if c.get('ok') is not None)
     return jsonify({'success': all_ok, 'checks': checks, 'host': db_host, 'port': db_port})
