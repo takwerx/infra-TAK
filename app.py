@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.40-alpha"
+VERSION = "0.9.41-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2748,38 +2748,56 @@ def takserver_external_db_provision():
         except Exception as e:
             return False, str(e)[:300]
 
-    # Step 1: Verify admin connection
-    plog(f'  Connecting as {admin_user} to {db_host}:{db_port}/{db_name}...')
-    ok, out = run_sql('SELECT 1;', 'admin connect')
+    # Step 1: Verify admin connection — always use the 'postgres' system database first
+    # since the target database (e.g. 'cot') may not exist yet on fresh managed instances.
+    plog(f'  Connecting as {admin_user} to {db_host}:{db_port}/postgres...')
+    ok, out = run_sql('SELECT 1;', 'admin connect', use_db='postgres')
     if not ok:
         plog(f'  ✗ Admin connection failed: {out}')
         return jsonify({'success': False, 'log': log, 'error': f'Cannot connect as {admin_user}: {out}'}), 400
     plog(f'  ✓ Connected as {admin_user}')
 
+    # Step 1b: Create the target database if it doesn't exist
+    plog(f'  Checking if database {db_name} exists...')
+    ok, out = run_sql(f"SELECT 1 FROM pg_database WHERE datname='{db_name}';", 'check db', use_db='postgres')
+    db_exists = ok and '1' in out
+    if db_exists:
+        plog(f'  Database {db_name} already exists')
+    else:
+        plog(f'  Creating database {db_name}...')
+        ok, out = run_sql(
+            f"CREATE DATABASE {db_name} ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8' LC_CTYPE 'en_US.UTF-8' TEMPLATE template0;",
+            'create db', use_db='postgres'
+        )
+        if not ok:
+            plog(f'  ✗ Failed to create database: {out}')
+            return jsonify({'success': False, 'log': log, 'error': f'Could not create database {db_name}: {out}'}), 500
+        plog(f'  ✓ Created database {db_name}')
+
     # Step 2: Create app user if it doesn't exist.
     # Identifier (app_user) was regex-validated upfront — safe to inline.
     # Password goes through psql -v substitution and :'pw' quoting.
     plog(f'  Checking if user {app_user} exists...')
-    ok, out = run_sql(f"SELECT 1 FROM pg_roles WHERE rolname='{app_user}';", 'check user')
+    ok, out = run_sql(f"SELECT 1 FROM pg_roles WHERE rolname='{app_user}';", 'check user', use_db='postgres')
     user_exists = ok and '1' in out
     if user_exists:
         plog(f'  User {app_user} already exists — updating password...')
-        ok, out = run_sql(f"ALTER USER {app_user} WITH PASSWORD :'pw';", 'alter user', pw_var={'pw': app_pass})
+        ok, out = run_sql(f"ALTER USER {app_user} WITH PASSWORD :'pw';", 'alter user', use_db='postgres', pw_var={'pw': app_pass})
         if not ok:
             plog(f'  ✗ Failed to update password: {out}')
         else:
             plog(f'  ✓ Password updated for {app_user}')
     else:
         plog(f'  Creating user {app_user}...')
-        ok, out = run_sql(f"CREATE USER {app_user} WITH PASSWORD :'pw';", 'create user', pw_var={'pw': app_pass})
+        ok, out = run_sql(f"CREATE USER {app_user} WITH PASSWORD :'pw';", 'create user', use_db='postgres', pw_var={'pw': app_pass})
         if not ok:
             plog(f'  ✗ Failed to create user: {out}')
             return jsonify({'success': False, 'log': log, 'error': f'Could not create user {app_user}: {out}'}), 500
         plog(f'  ✓ Created user {app_user}')
 
-    # Step 3: Grant database privileges
+    # Step 3: Grant database privileges (connect to postgres to issue GRANT ON DATABASE)
     plog(f'  Granting privileges on database {db_name} to {app_user}...')
-    ok, out = run_sql(f'GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {app_user};', 'grant db')
+    ok, out = run_sql(f'GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {app_user};', 'grant db', use_db='postgres')
     plog(f'  {"✓" if ok else "✗"} GRANT ALL ON DATABASE: {out if not ok else "OK"}')
 
     # Step 3b: Grant rds_superuser on AWS RDS (required for CREATE EXTENSION postgis)
