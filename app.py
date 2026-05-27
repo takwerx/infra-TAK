@@ -24959,7 +24959,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
             <li style="margin-bottom:5px">Set the username to <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin</code> (or your preferred name)</li>
             <li style="margin-bottom:5px">This must be a <strong>regular user — do NOT check the admin box</strong></li>
             <li style="margin-bottom:5px">Assign to any agency and at least one group</li>
-            <li>Set a password for the account — you will need this in Step 3</li>
+            <li style="margin-bottom:5px">Set a password for the account — you will need this in Step 3</li>
+            <li style="color:var(--yellow);font-size:12px">⚠ TAK Portal appends an org suffix to every username (e.g. <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">cloudtakadmin-orgname</code>). Note the full suffixed username shown after creation — that is what you enter in CloudTAK, not just <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">cloudtakadmin</code>.</li>
           </ol>
         </div>
 
@@ -24987,7 +24988,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       </div>
 
       <p style="margin:16px 0 0;font-size:12px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:12px">
-        Each person using CloudTAK needs their own TAK Portal user and .p12. The <code style="color:var(--cyan)">cloudtakadmin</code> account is for the initial admin setup. Additional users follow the same Steps 1–2 and log in with their own credentials.
+        This is a one-time bootstrap to connect CloudTAK to TAK Server. After setup, additional users just create a TAK Portal account and log into CloudTAK with their username and password — no .p12 required.
       </p>
     </div>
   </details>
