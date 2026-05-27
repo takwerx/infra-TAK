@@ -2943,40 +2943,44 @@ def takserver_external_db_test_connection():
             add_check('psql auth', False, str(e)[:200])
 
     # Check 4: Azure extension whitelist probe
-    # Only runs when the endpoint is an Azure Flexible Server FQDN.
-    # Connects as the app user and queries pg_available_extensions to verify
-    # all five extensions TAK Server's SchemaManager requires are whitelisted.
-    # Fails with actionable portal instructions if any are missing.
+    # Only runs when the endpoint is an Azure Flexible Server FQDN AND an app
+    # user password is stored (i.e. Provision Database has been run at least once).
+    # Skipped gracefully before provisioning — no FAIL so Test Connection passes
+    # at the pre-provision stage and the operator can proceed to step 3.
     if '.postgres.database.azure.com' in db_host and tcp_ok:
-        azure_required = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
-        try:
-            names_sql = "SELECT name FROM pg_available_extensions WHERE name IN ({});".format(
-                ','.join(f"'{e}'" for e in azure_required)
-            )
-            env = dict(os.environ, PGPASSWORD=db_pass) if db_pass else os.environ.copy()
-            r = subprocess.run(
-                ['psql', '-h', db_host, '-p', str(db_port), '-U', db_user, '-d', db_name,
-                 '-c', names_sql, '--no-password', '-t', '-A'],
-                capture_output=True, text=True, timeout=15, env=env
-            )
-            if r.returncode == 0:
-                available = set(line.strip() for line in r.stdout.splitlines() if line.strip())
-                missing = [e for e in azure_required if e not in available]
-                if missing:
-                    missing_upper = ','.join(e.upper() for e in missing)
-                    all_upper = 'FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO'
-                    detail = (
-                        f'Missing: {missing_upper}. '
-                        f'In Azure Portal → {db_host.split(".")[0]} → Settings → Server parameters → '
-                        f'azure.extensions → set value to: {all_upper} → Save.'
-                    )
-                    add_check('Azure extensions whitelisted', False, detail)
+        if not db_pass:
+            add_check('Azure extensions whitelisted', None, 'Skipped — run Provision Database first, then re-test')
+        else:
+            azure_required = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
+            try:
+                names_sql = "SELECT name FROM pg_available_extensions WHERE name IN ({});".format(
+                    ','.join(f"'{e}'" for e in azure_required)
+                )
+                env = dict(os.environ, PGPASSWORD=db_pass)
+                # Use postgres system db — cot may not exist yet before first deploy
+                r = subprocess.run(
+                    ['psql', '-h', db_host, '-p', str(db_port), '-U', db_user, '-d', 'postgres',
+                     '-c', names_sql, '--no-password', '-t', '-A'],
+                    capture_output=True, text=True, timeout=15, env=env
+                )
+                if r.returncode == 0:
+                    available = set(line.strip() for line in r.stdout.splitlines() if line.strip())
+                    missing = [e for e in azure_required if e not in available]
+                    if missing:
+                        missing_upper = ','.join(e.upper() for e in missing)
+                        all_upper = 'FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO'
+                        detail = (
+                            f'Missing: {missing_upper}. '
+                            f'In Azure Portal → {db_host.split(".")[0]} → Settings → Server parameters → '
+                            f'azure.extensions → set value to: {all_upper} → Save.'
+                        )
+                        add_check('Azure extensions whitelisted', False, detail)
+                    else:
+                        add_check('Azure extensions whitelisted', True, 'All 5 required extensions available')
                 else:
-                    add_check('Azure extensions whitelisted', True, 'All 5 required extensions available')
-            else:
-                add_check('Azure extensions whitelisted', None, 'Could not query extensions (no app user password?) — verify manually')
-        except Exception as e:
-            add_check('Azure extensions whitelisted', None, f'Extension check skipped: {str(e)[:150]}')
+                    add_check('Azure extensions whitelisted', None, f'Could not query extensions — verify manually in Azure Portal')
+            except Exception as e:
+                add_check('Azure extensions whitelisted', None, f'Extension check skipped: {str(e)[:150]}')
 
     all_ok = all(c['ok'] for c in checks if c.get('ok') is not None)
     return jsonify({'success': all_ok, 'checks': checks, 'host': db_host, 'port': db_port})
@@ -42484,6 +42488,20 @@ def takserver_uninstall():
     # Reset deploy status
     deploy_log.clear()
     deploy_status.update({'running': False, 'complete': False, 'error': False})
+    # Clear saved deployment config so the form is blank on next visit
+    try:
+        _settings = load_settings()
+        td = _settings.get('tak_deployment', {})
+        td['mode'] = 'single_server'
+        edb = td.get('external_db', {})
+        edb['host'] = ''
+        edb['password'] = ''
+        td['external_db'] = edb
+        _settings['tak_deployment'] = td
+        save_settings(_settings)
+        steps.append('Cleared saved deployment config')
+    except Exception as _ce:
+        steps.append(f'Could not clear deployment config (non-fatal): {_ce}')
     # v0.9.31: regenerate Caddyfile so the webtak.<fqdn> vhost is removed.
     # Same gap as takportal/authentik uninstall — without this the vhost
     # remained and Caddy fell through to Authentik's "Not Found" page.
