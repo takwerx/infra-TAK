@@ -42439,10 +42439,41 @@ def takserver_uninstall():
     if os.path.exists('/opt/tak'):
         subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
         steps.append('Removed /opt/tak')
-    # Clean up PostgreSQL database and user (so redeploys start clean)
-    subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
-    subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
-    steps.append('Cleaned up PostgreSQL (cot database, martiuser)')
+    # Clean up PostgreSQL — local or external depending on deployment mode
+    settings = load_settings()
+    tak_cfg = _get_tak_deployment_config(settings)
+    if tak_cfg.get('mode') == 'external_db':
+        # External / managed DB: use stored martiuser credentials to drop the cot database.
+        # martiuser was granted azure_pg_admin (Azure) or rds_superuser (AWS) during provisioning
+        # so it has permission to drop databases it doesn't own.
+        edb = tak_cfg.get('external_db', {})
+        edb_host = (edb.get('host') or '').strip()
+        edb_port = int(edb.get('port') or 5432)
+        edb_name = (edb.get('name') or 'cot').strip()
+        edb_user = (edb.get('user') or 'martiuser').strip()
+        edb_pass = (edb.get('password') or '').strip()
+        if edb_host and edb_pass:
+            env = dict(os.environ, PGPASSWORD=edb_pass)
+            # Terminate active connections then drop the database
+            terminate_sql = f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{edb_name}' AND pid <> pg_backend_pid();"
+            drop_sql = f"DROP DATABASE IF EXISTS {edb_name};"
+            for sql, label in [(terminate_sql, 'terminate connections'), (drop_sql, f'drop database {edb_name}')]:
+                r = subprocess.run(
+                    ['psql', '-h', edb_host, '-p', str(edb_port), '-U', edb_user,
+                     '-d', 'postgres', '--no-password', '-c', sql],
+                    capture_output=True, text=True, timeout=30, env=env
+                )
+                if r.returncode == 0:
+                    steps.append(f'External DB: {label} — OK')
+                else:
+                    steps.append(f'External DB: {label} — {(r.stderr or r.stdout or "failed")[:120]}')
+        else:
+            steps.append('External DB cleanup skipped — no credentials stored (run Provision Database on next deploy)')
+    else:
+        # Local PostgreSQL (single-server or two-server mode)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        steps.append('Cleaned up local PostgreSQL (cot database, martiuser)')
     # Clean up GPG verification artifacts
     subprocess.run('rm -rf /usr/share/debsig/keyrings/* /etc/debsig/policies/* 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
     steps.append('Cleaned up GPG verification artifacts')
