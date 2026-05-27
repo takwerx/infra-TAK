@@ -2729,19 +2729,29 @@ def takserver_external_db_provision():
     def run_sql(sql, label, use_db=None, pw_var=None):
         """Run a SQL statement as the admin user. Returns (ok, output).
 
-        v0.9.12: optional pw_var={'name': value} passes a password to psql via
-        `-v name=value` so the SQL can reference it as `:'name'` (psql will
-        quote and escape correctly). NEVER f-string passwords into SQL.
+        pw_var={'name': value}: when provided the SQL is piped to psql via
+        stdin with a leading \\set directive so psql resolves :'name' before
+        sending to the server. Piping via stdin avoids shell-level and psql
+        -v parser issues with special characters (e.g. # in passwords).
         """
         try:
             target_db = use_db or db_name
             env = dict(os.environ, PGPASSWORD=admin_pass)
-            argv = ['psql', '-h', db_host, '-p', str(db_port), '-U', admin_user, '-d', target_db]
+            argv = ['psql', '-h', db_host, '-p', str(db_port), '-U', admin_user,
+                    '-d', target_db, '--no-password', '-t', '-A']
             if pw_var:
+                # Build \set directives piped via stdin — avoids -v parsing issues
+                # with special chars (# treated as comment by psql's -v parser).
+                set_lines = ''
                 for _k, _v in pw_var.items():
-                    argv.extend(['-v', f'{_k}={_v}'])
-            argv.extend(['-c', sql, '--no-password', '-t', '-A'])
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=20, env=env)
+                    escaped = _v.replace('\\', '\\\\').replace("'", "\\'")
+                    set_lines += f"\\set {_k} '{escaped}'\n"
+                stdin_sql = set_lines + sql
+                r = subprocess.run(argv, input=stdin_sql, capture_output=True,
+                                   text=True, timeout=20, env=env)
+            else:
+                argv.extend(['-c', sql])
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=20, env=env)
             ok = r.returncode == 0
             out = (r.stdout or r.stderr or '').strip()[:300]
             return ok, out
