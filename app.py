@@ -12374,6 +12374,7 @@ def _get_authentik_version_info():
     out['vetted_release'] = AUTHENTIK_VETTED_RELEASE
     out['dev_release'] = AUTHENTIK_DEV_RELEASE
     out['channel'] = _channel
+    out['ahead_of_vetted'] = False
     if out['version']:
         installed = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
         out['version'] = installed
@@ -12384,6 +12385,9 @@ def _get_authentik_version_info():
                 _i = tuple(int(x) for x in re.findall(r'\d+', installed))
                 if _t > _i:
                     out['update_available'] = True
+                elif _i > _t and _channel == 'main':
+                    # Installed is newer than fleet-vetted — flag so UI doesn't misleadingly show "vetted ✓"
+                    out['ahead_of_vetted'] = True
             except Exception:
                 out['update_available'] = True
     return out
@@ -35801,6 +35805,7 @@ entries:
             # Step 5: Download docker-compose.yml and patch for blueprints
             plog("")
             plog("\u2501\u2501\u2501 Step 5/10: Downloading Docker Compose File \u2501\u2501\u2501")
+            _compose_fresh_download = False
             if not os.path.exists(compose_path):
                 r = subprocess.run(f'wget -q -O {compose_path} https://goauthentik.io/docker-compose.yml 2>&1', shell=True, capture_output=True, text=True, timeout=30)
                 if r.returncode != 0 or not os.path.exists(compose_path):
@@ -35808,6 +35813,7 @@ entries:
                     authentik_deploy_status.update({'running': False, 'error': True})
                     return
                 plog("\u2713 docker-compose.yml downloaded")
+                _compose_fresh_download = True
             else:
                 plog("\u2713 docker-compose.yml already exists")
 
@@ -35833,7 +35839,8 @@ entries:
             # _ensure_authentik_compose_patches is called after the file is written (see below).
 
         # Pin AUTHENTIK_TAG to the channel-appropriate vetted release.
-        # Only upgrade (target > current); never silently downgrade an operator-upgraded install.
+        # Fresh download: always force to vetted — upstream may ship newer than our vetted release.
+        # Existing install: only upgrade (target > current); never silently downgrade an operator-upgraded install.
         ak_tag = _get_authentik_target_release()
         plog(f"  Authentik version target: {ak_tag}")
         for i, l in enumerate(lines):
@@ -35841,15 +35848,19 @@ entries:
             if m:
                 cur_tag = m.group(1).strip()
                 if cur_tag != ak_tag:
-                    try:
-                        _ct = tuple(int(x) for x in re.findall(r'\d+', cur_tag))
-                        _tt = tuple(int(x) for x in re.findall(r'\d+', ak_tag))
-                        if _tt > _ct:
-                            lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
-                            needs_write = True
-                    except Exception:
+                    if _compose_fresh_download:
                         lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
                         needs_write = True
+                    else:
+                        try:
+                            _ct = tuple(int(x) for x in re.findall(r'\d+', cur_tag))
+                            _tt = tuple(int(x) for x in re.findall(r'\d+', ak_tag))
+                            if _tt > _ct:
+                                lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                                needs_write = True
+                        except Exception:
+                            lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                            needs_write = True
         # Inject healthchecks for server and worker if missing (upstream compose may not have them)
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
             _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
@@ -36998,9 +37009,9 @@ body{display:flex;min-height:100vh}
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
@@ -46963,7 +46974,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
@@ -47096,6 +47107,8 @@ function refreshModuleVersions(){
                 s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
             }else if(key==='authentik'&&d.channel==='dev'&&d.vetted_release){
                 s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+            }else if(key==='authentik'&&d.ahead_of_vetted&&d.vetted_release){
+                s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+d.vetted_release+') — not yet validated on main channel">! unvetted</span>';
             }else if(key==='authentik'&&d.vetted_release){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted \u2713</span>';
             }

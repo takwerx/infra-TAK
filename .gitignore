@@ -6,3 +6,7 @@ ignite/
 __pycache__/
 *.pyc
 .DS_Store
+
+# CloudTAK plugins — each plugin gets its own repo when ready for GitHub.
+# Files live locally until tested; keeping them out of infra-TAK history.
+cloudtak-plugins/
