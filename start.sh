@@ -445,6 +445,7 @@ ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
+RuntimeMaxSec=24h
 Environment=PYTHONUNBUFFERED=1
 Environment=CONFIG_DIR=$USE_DIR/.config
 Environment=HOME=$SERVICE_HOME

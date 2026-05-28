@@ -1419,7 +1419,9 @@ async function saveExternalDbConfig(silent){
     return saveTakDeploymentConfig(silent);
 }
 
+window._edbTestAllOk=false;
 async function testExternalDbConnection(){
+    window._edbTestAllOk=false;
     var msg=document.getElementById('external-db-msg');
     var out=document.getElementById('external-db-checks');
     if(msg){msg.textContent='Testing connection…';msg.style.color='var(--cyan)';}
@@ -1434,8 +1436,11 @@ async function testExternalDbConnection(){
         lines.push(icon+c.name+(c.detail?' — '+c.detail:''));
       });
       if(out)out.textContent=lines.join('\n');
-      if(msg){msg.textContent=d.success?'✓ Connection OK':'⚠ Connection check failed — review results above';msg.style.color=d.success?'var(--green)':'var(--yellow)';}
+      var allChecksOk=d.success&&(d.checks||[]).every(function(c){return c.ok===true||c.ok===null;});
+      window._edbTestAllOk=allChecksOk;
+      if(msg){msg.textContent=allChecksOk?'✓ Connection OK — ready to Deploy TAK Server':(d.success?'⚠ Connection check failed — review results above':'⚠ Connection check failed — review results above');msg.style.color=allChecksOk?'var(--green)':'var(--yellow)';}
     }catch(e){
+      window._edbTestAllOk=false;
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
       if(out){out.style.display='block';out.textContent=e.message;}
     }
@@ -1616,6 +1621,9 @@ async function startDeploy(){
     var deploymentMode=getTakDeploymentMode();
     if(deploymentMode==='two_server'){
       if(!confirm('Two-server mode: This will generate certificates, configure auth, and finish the TAK Server setup on this host (Server Two). Make sure steps 1-6 are complete. Continue?'))return;
+    }
+    if(deploymentMode==='external_db'){
+      if(!window._edbTestAllOk){alert('External DB: complete steps 2 and 3 first.\n\n1. Save Config\n2. Provision Database (all 5 Azure extensions must succeed)\n3. Test Connection (all checks must show [OK])\n\nThen click Deploy TAK Server.');return;}
     }
     const rf=[{id:'cert_country',l:'Country'},{id:'cert_state',l:'State'},{id:'cert_city',l:'City'},{id:'cert_org',l:'Organization'},{id:'cert_ou',l:'Org Unit'},{id:'root_ca_name',l:'Root CA'},{id:'intermediate_ca_name',l:'Intermediate CA'}];
     const empty=rf.filter(f=>!document.getElementById(f.id).value.trim());

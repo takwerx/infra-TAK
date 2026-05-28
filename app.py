@@ -2825,9 +2825,22 @@ def takserver_external_db_provision():
         # even with IF NOT EXISTS, so SchemaManager (running as app_user) would fail without this.
         azure_exts = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
         plog(f'  Azure: pre-creating required extensions as {admin_user}...')
+        ext_failures = []
         for ext in azure_exts:
             ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {ext};', f'create ext {ext}', use_db=db_name)
-            plog(f'  {"✓" if ok else "⚠"} {ext}: {out if not ok else "OK"}')
+            plog(f'  {"✓" if ok else "△"} {ext}: {out if not ok else "OK"}')
+            if not ok:
+                ext_failures.append(ext)
+        if ext_failures:
+            missing = ', '.join(e.upper() for e in ext_failures)
+            msg = (
+                f'Azure extensions not whitelisted: {missing}. '
+                f'Go to Azure Portal → your PostgreSQL Flexible Server → Server parameters → '
+                f'search "azure.extensions" → add: FUZZYSTRMATCH, POSTGIS, POSTGIS_TOPOLOGY, '
+                f'ADDRESS_STANDARDIZER, PGCRYPTO → Save. Then re-run Provision Database.'
+            )
+            plog(f'  ✗ Extension pre-creation failed — {msg}')
+            return jsonify({'success': False, 'error': msg, 'log': log, 'extensions_not_whitelisted': True}), 400
 
     # Step 4: Grant schema privileges (must connect to the target database)
     plog(f'  Granting schema privileges...')
@@ -44632,6 +44645,12 @@ def deploy_takserver():
     requested_mode = (data.get('deployment_mode') or tak_deploy_cfg.get('mode') or 'single_server').strip().lower()
     is_two_server = requested_mode == 'two_server'
     is_external_db = requested_mode == 'external_db'
+    if is_external_db:
+        _edb_cfg = tak_deploy_cfg.get('external_db', {})
+        if not (_edb_cfg.get('host') or '').strip():
+            return jsonify({'error': 'External DB: no database host configured. Fill in the host, save config, and run Provision Database (step 2) + Test Connection (step 3) before deploying.'}), 400
+        if not (_edb_cfg.get('password') or '').strip():
+            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database with all 5 Azure extensions whitelisted, then Test Connection (step 3), before deploying.'}), 400
     try:
         for field, key in [('Country', 'cert_country'), ('State', 'cert_state'),
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
@@ -45043,16 +45062,27 @@ def run_takserver_deploy(config):
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
 
         # For external_db: run SchemaManager explicitly against RDS now that CoreConfig
-        # points at the correct host. This is the definitive schema migration for RDS —
-        # the startup-triggered one from Step 5 already ran against the correct host
-        # (due to the early JDBC patch), but we run it again here as a safety net in
-        # case the first run was interrupted or the operator skipped Provision Database.
+        # points at the correct host. Pass explicit JDBC args — do NOT rely on CoreConfig.xml
+        # parsing, which can silently fail (jdbcUrl='null') when run via sudo -u tak.
         if config.get('external_db') and os.path.exists('/opt/tak/db-utils/SchemaManager.jar'):
             log_step("External DB: running SchemaManager against RDS (ensuring schema is current)...")
-            sm_r = subprocess.run(
-                'sudo -u tak java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
-                shell=True, capture_output=True, text=True, timeout=300
-            )
+            _sm_edb = (config.get('tak_deploy_cfg') or {}).get('external_db', {})
+            _sm_host = (_sm_edb.get('host') or '').strip()
+            _sm_port = int(_sm_edb.get('port') or 5432)
+            _sm_user = (_sm_edb.get('user') or 'martiuser').strip()
+            _sm_pass = (_sm_edb.get('password') or '').strip()
+            if _sm_host and _sm_pass:
+                _sm_jdbc = f'jdbc:postgresql://{_sm_host}:{_sm_port}/cot?sslmode=require'
+                _sm_cmd = (
+                    f'java -jar /opt/tak/db-utils/SchemaManager.jar upgrade'
+                    f' --jdbcUrl "{_sm_jdbc}"'
+                    f' --username {_sm_user}'
+                    f' --password {_sm_pass} 2>&1'
+                )
+            else:
+                # Fallback: rely on CoreConfig.xml (pre-v0.9.41 behaviour)
+                _sm_cmd = 'sudo -u tak java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1'
+            sm_r = subprocess.run(_sm_cmd, shell=True, capture_output=True, text=True, timeout=300)
             sm_out = (sm_r.stdout or '') + (sm_r.stderr or '')
             for line in sm_out.strip().split('\n')[:30]:
                 if line.strip():
@@ -49398,6 +49428,42 @@ def _startup_pin_console_service_home():
         print(f'Startup migration: pin HOME in console unit warning (non-fatal): {_e}')
 
 _startup_pin_console_service_home()
+
+
+# v0.9.41: startup migration — add RuntimeMaxSec=72h to the console service unit.
+# Gunicorn binds on 0.0.0.0:5001 so internet scanners (Censys, Shodan, etc.) hit
+# it directly. They open TCP, probe SSL, then close their side — gunicorn never
+# closes its side → CLOSE-WAIT sockets accumulate over days until the worker
+# can't accept new SSL handshakes (experienced on test6 after ~40 h uptime).
+# RuntimeMaxSec=24h tells systemd to restart the unit daily before enough
+# CLOSE-WAIT sockets can build up to starve the worker. Direct IP:5001
+# access (backdoor) is preserved — bind address is unchanged.
+def _startup_ensure_console_runtime_max_sec():
+    try:
+        svc = '/etc/systemd/system/takwerx-console.service'
+        if not os.path.exists(svc):
+            return
+        with open(svc) as f:
+            content = f.read()
+        if re.search(r'^RuntimeMaxSec=', content, flags=re.MULTILINE):
+            return
+        new = re.sub(
+            r'(^Restart=always\n)',
+            r'\1RuntimeMaxSec=24h\n',
+            content, count=1, flags=re.MULTILINE
+        )
+        if new == content:
+            return
+        with open(svc, 'w') as f:
+            f.write(new)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        print('Startup migration: added RuntimeMaxSec=24h to takwerx-console.service (v0.9.41 — CLOSE-WAIT scanner fix)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print(f'Startup migration: RuntimeMaxSec patch warning (non-fatal): {_e}')
+
+_startup_ensure_console_runtime_max_sec()
 
 
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
