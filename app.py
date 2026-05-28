@@ -45062,27 +45062,15 @@ def run_takserver_deploy(config):
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
 
         # For external_db: run SchemaManager explicitly against RDS now that CoreConfig
-        # points at the correct host. Pass explicit JDBC args — do NOT rely on CoreConfig.xml
-        # parsing, which can silently fail (jdbcUrl='null') when run via sudo -u tak.
+        # points at the correct host. SchemaManager has no CLI JDBC flags — it reads
+        # CoreConfig.xml from the working directory. Run from /opt/tak so it finds the
+        # already-patched CoreConfig.xml there rather than falling back to example.xml.
         if config.get('external_db') and os.path.exists('/opt/tak/db-utils/SchemaManager.jar'):
             log_step("External DB: running SchemaManager against RDS (ensuring schema is current)...")
-            _sm_edb = (config.get('tak_deploy_cfg') or {}).get('external_db', {})
-            _sm_host = (_sm_edb.get('host') or '').strip()
-            _sm_port = int(_sm_edb.get('port') or 5432)
-            _sm_user = (_sm_edb.get('user') or 'martiuser').strip()
-            _sm_pass = (_sm_edb.get('password') or '').strip()
-            if _sm_host and _sm_pass:
-                _sm_jdbc = f'jdbc:postgresql://{_sm_host}:{_sm_port}/cot?sslmode=require'
-                _sm_cmd = (
-                    f'java -jar /opt/tak/db-utils/SchemaManager.jar upgrade'
-                    f' --jdbcUrl "{_sm_jdbc}"'
-                    f' --username {_sm_user}'
-                    f' --password {_sm_pass} 2>&1'
-                )
-            else:
-                # Fallback: rely on CoreConfig.xml (pre-v0.9.41 behaviour)
-                _sm_cmd = 'sudo -u tak java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1'
-            sm_r = subprocess.run(_sm_cmd, shell=True, capture_output=True, text=True, timeout=300)
+            sm_r = subprocess.run(
+                'cd /opt/tak && java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
+                shell=True, capture_output=True, text=True, timeout=300
+            )
             sm_out = (sm_r.stdout or '') + (sm_r.stderr or '')
             for line in sm_out.strip().split('\n')[:30]:
                 if line.strip():
