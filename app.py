@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.41-alpha"
+VERSION = "0.9.42-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -39822,8 +39822,17 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                 subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                     shell=True, capture_output=True, text=True, timeout=90)
             ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
-            verdict2 = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
-            if (not ready2) or verdict2 == 'fail':
+            if not ready2:
+                return False, f'webadmin LDAP outpost not ready after recreate. Outpost status: {ready_status2}'
+            last_verdict2 = 'inconclusive'
+            for _attempt2 in range(10):
+                time.sleep(6)
+                _v2 = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
+                if _v2 == 'ok':
+                    last_verdict2 = 'ok'
+                    break
+                last_verdict2 = _v2
+            if last_verdict2 == 'fail':
                 return False, f'webadmin exists but LDAP bind verification failed (DN/password). Outpost status: {ready_status2}'
         return True, None
     except urllib.error.HTTPError as e:
