@@ -42541,6 +42541,11 @@ def takserver_uninstall():
                     steps.append(f'External DB: {label} — {(r.stderr or r.stdout or "failed")[:120]}')
         else:
             steps.append('External DB cleanup skipped — no credentials stored (run Provision Database on next deploy)')
+        # The .deb installer always creates a local martiuser + cot DB regardless of deployment
+        # mode. Clean them up so re-deploys don't hit stale-password noise in the postinstall.
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        steps.append('Cleaned up local PostgreSQL side-effect (cot database, martiuser)')
     else:
         # Local PostgreSQL (single-server or two-server mode)
         subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
