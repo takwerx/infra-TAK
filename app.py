@@ -18477,162 +18477,6 @@ def webodm_uninstall():
 
 # ── TAK Video Restreamer routes ───────────────────────────────────────────────
 
-TVR_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>TAK Video Restreamer — infra-TAK</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
-<style>
-:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
-.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0;display:flex;flex-direction:column}
-.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
-.section-title{font-size:20px;font-weight:700;color:var(--text-primary);margin-bottom:24px;display:flex;align-items:center;gap:10px}
-.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
-.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
-.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
-.btn-danger{background:linear-gradient(135deg,#7f1d1d,#991b1b);color:#fff}.btn-danger:hover{opacity:.9}
-.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
-.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
-.dot-green{background:var(--green)}.dot-red{background:var(--red)}.dot-yellow{background:var(--yellow)}
-.mono{font-family:'JetBrains Mono',monospace;font-size:12px}
-.url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
-.url-row:last-child{border-bottom:none}
-.url-label{width:80px;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;flex-shrink:0}
-.url-val{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);word-break:break-all;flex:1}
-.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
-.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.04em}
-.badge-green{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)}
-.badge-red{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
-.badge-yellow{background:rgba(234,179,8,.12);color:var(--yellow);border:1px solid rgba(234,179,8,.25)}
-.badge-blue{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.25)}
-</style></head><body>
-{{ sidebar_html }}
-<div class="main">
-<div class="section-title">🎥 TAK Video Restreamer</div>
-
-{% if not tvr.get('installed') %}
-<div class="card">
-  <div class="card-title">Deploy TAK Video Restreamer</div>
-  {% if mediamtx_conflict %}
-  <div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:14px;margin-bottom:18px;font-size:13px;color:var(--red)">
-    ⚠ <strong>Port conflict:</strong> Standalone MediaMTX is installed and uses the same streaming ports (8554/8555/8888/8890).
-    Uninstall MediaMTX first before deploying TAK Video Restreamer.
-  </div>
-  {% endif %}
-  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:18px">
-    Flask + MediaMTX + FFmpeg streaming server. Supports RTSP, RTSPS, SRT, HLS, RTMP with adaptive bitrate, KLV metadata, and recording.<br>
-    <span style="color:var(--yellow);font-size:12px">⏳ First deploy clones the repository and builds the Docker image — allow 5–10 minutes.</span>
-  </p>
-  <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" {% if mediamtx_conflict %}disabled{% endif %}>
-    <span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy
-  </button>
-</div>
-{% if deploying or deploy_log %}
-<div class="card">
-  <div class="card-title">Deploy Log</div>
-  <div class="log-box" id="logBox">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
-  {% if deploy_error %}<div style="margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see log above.</div>{% endif %}
-</div>
-{% endif %}
-{% else %}
-
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:0">
-  <div class="card" style="margin-bottom:0">
-    <div class="card-title">Status</div>
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
-      <span class="status-dot {% if tvr.get('running') %}dot-green{% else %}dot-red{% endif %}"></span>
-      <span style="font-weight:600">{% if tvr.get('running') %}Running{% else %}Stopped{% endif %}</span>
-      {% if tvr_commit %}<span class="badge badge-blue" style="margin-left:auto">SHA {{ tvr_commit }}</span>{% endif %}
-    </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn btn-secondary" onclick="control('start')">Start</button>
-      <button class="btn btn-secondary" onclick="control('stop')">Stop</button>
-      <button class="btn btn-secondary" onclick="control('restart')">Restart</button>
-    </div>
-  </div>
-  <div class="card" style="margin-bottom:0">
-    <div class="card-title">Web UI Access</div>
-    {% if tvr_url %}
-    <div style="margin-bottom:10px"><a href="{{ tvr_url }}" target="_blank" style="color:var(--cyan);font-family:\'JetBrains Mono\',monospace;font-size:12px">{{ tvr_url }}</a></div>
-    {% endif %}
-    <div style="font-size:12px;color:var(--text-dim)">Username: <span style="font-family:\'JetBrains Mono\',monospace;color:var(--text-primary)">admin</span></div>
-    <div style="font-size:12px;color:var(--text-dim)">Password: <span class="mono" id="pwField" style="color:var(--text-primary)">••••••••</span>
-      <button onclick="togglePw()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button>
-    </div>
-    <input type="hidden" id="pwValue" value="{{ tvr_admin_pass|e }}">
-  </div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <div class="card-title">Stream Endpoints</div>
-  <div class="url-row"><span class="url-label">RTSP</span><span class="url-val">rtsp://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:8554/&lt;stream&gt;</span></div>
-  <div class="url-row"><span class="url-label">RTSPS</span><span class="url-val">rtsps://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:8555/&lt;stream&gt;</span></div>
-  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:8890?streamid=publish:&lt;stream&gt;</span></div>
-  <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:1935/&lt;stream&gt;</span></div>
-  {% if fqdn %}<div class="url-row"><span class="url-label">HLS ABR</span><span class="url-val">https://{{ tvr_host }}/hls/&lt;stream&gt;/master.m3u8</span></div>{% endif %}
-</div>
-
-<div class="card">
-  <div class="card-title">Container Logs</div>
-  <div style="margin-bottom:10px;display:flex;gap:8px">
-    <button class="btn btn-secondary" onclick="fetchLogs()" style="font-size:11px">Refresh</button>
-  </div>
-  <div class="log-box" id="logBox">Loading...</div>
-</div>
-
-<div class="card" style="border-color:rgba(239,68,68,.2)">
-  <div class="card-title" style="color:var(--red)">Uninstall</div>
-  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">Stops and removes the container. Data in <code style="font-size:11px">~/tak-video-restreamer/data/</code> is preserved.</p>
-  <button class="btn btn-danger" onclick="doUninstall()">Uninstall TAK Video Restreamer</button>
-</div>
-{% endif %}
-
-</div>
-<script>
-{% if not tvr.get('installed') %}
-let polling = {{ 'true' if deploying else 'false' }};
-function startDeploy(){
-  document.getElementById('deployBtn').disabled=true;
-  fetch('/api/tak-video-restreamer/deploy',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin'})
-    .then(r=>r.json()).then(d=>{if(d.success){polling=true;poll();}else{alert('Deploy failed: '+(d.error||'unknown'));}});
-}
-function poll(){
-  if(!polling)return;
-  fetch('/api/tak-video-restreamer/deploy-status',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
-    let box=document.getElementById('logBox');
-    if(box){box.innerHTML=(d.log||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('');box.scrollTop=box.scrollHeight;}
-    if(d.complete){polling=false;setTimeout(()=>location.reload(),1500);}
-    else if(d.error&&!d.running){polling=false;}
-    else{setTimeout(poll,2000);}
-  }).catch(()=>setTimeout(poll,3000));
-}
-if(polling)poll();
-{% else %}
-function control(action){
-  fetch('/api/tak-video-restreamer/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action}),credentials:'same-origin'})
-    .then(r=>r.json()).then(d=>{if(d.success){setTimeout(()=>location.reload(),1500);}else{alert(d.error||'Failed');}});
-}
-function fetchLogs(){
-  fetch('/api/tak-video-restreamer/logs',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
-    let box=document.getElementById('logBox');
-    if(box){box.innerHTML=(d.lines||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('');box.scrollTop=box.scrollHeight;}
-  });
-}
-function togglePw(){
-  let f=document.getElementById('pwField'),v=document.getElementById('pwValue');
-  f.textContent=f.textContent.startsWith('•')?v.value:'••••••••';
-}
-function doUninstall(){
-  let pw=prompt('Enter infra-TAK admin password to confirm uninstall:');
-  if(!pw)return;
-  fetch('/api/tak-video-restreamer/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
-    .then(r=>r.json()).then(d=>{if(d.success){location.href='/marketplace';}else{alert(d.error||'Uninstall failed');}});
-}
-fetchLogs();
-{% endif %}
-</script>
-</body></html>'''
 
 
 @app.route('/tak-video-restreamer')
@@ -48676,6 +48520,149 @@ function doUninstall(){
 }
 function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
 </script></body></html>'''
+
+# ── TAK Video Restreamer page template ─────────────────────────────────────
+TVR_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>TAK Video Restreamer — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+'''
++ BASE_CSS + '''
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
+.url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
+.url-row:last-child{border-bottom:none}
+.url-label{width:80px;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;flex-shrink:0}
+.url-val{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);word-break:break-all;flex:1}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="section-title"><img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)"> TAK Video Restreamer</div>
+
+{% if not tvr.get('installed') %}
+<div class="card">
+  <div class="card-title">Deploy TAK Video Restreamer</div>
+  {% if mediamtx_conflict %}
+  <div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:14px;margin-bottom:18px;font-size:13px;color:var(--red)">
+    ⚠ <strong>Port conflict:</strong> Standalone MediaMTX is installed and uses the same streaming ports. Uninstall MediaMTX first.
+  </div>
+  {% endif %}
+  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:18px">Flask + MediaMTX + FFmpeg streaming server. Supports RTSP, RTSPS, SRT, HLS, RTMP with adaptive bitrate, KLV metadata, and recording.<br>
+  <span style="color:var(--yellow);font-size:12px">⏳ First deploy clones the repository and builds the Docker image — allow 5–10 minutes.</span></p>
+  <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" {% if mediamtx_conflict %}disabled{% endif %}>
+    <span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy
+  </button>
+</div>
+<div class="card" id="logCard" style="display:none">
+  <div class="card-title">Deploy Log</div>
+  <div class="log-box" id="logBox"></div>
+  <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see log above.</div>
+</div>
+{% if deploy_log %}
+<div class="card">
+  <div class="card-title">Previous Deploy Log</div>
+  <div class="log-box">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+  {% if deploy_error %}<div style="margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see log above.</div>{% endif %}
+</div>
+{% endif %}
+
+{% else %}
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">Status</div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <span style="width:8px;height:8px;border-radius:50%;display:inline-block;background:{% if tvr.get('running') %}var(--green){% else %}var(--red){% endif %}"></span>
+      <span style="font-weight:600">{% if tvr.get('running') %}Running{% else %}Stopped{% endif %}</span>
+      {% if tvr_commit %}<span style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)">SHA {{ tvr_commit }}</span>{% endif %}
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" style="font-size:11px" onclick="control('start')">Start</button>
+      <button class="btn btn-danger" style="font-size:11px" onclick="control('stop')">Stop</button>
+      <button class="btn btn-secondary" style="font-size:11px" onclick="control('restart')">Restart</button>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">Web UI Access</div>
+    {% if tvr_url %}<div style="margin-bottom:10px"><a href="{{ tvr_url }}" target="_blank" style="color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:12px">{{ tvr_url }}</a></div>{% endif %}
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Username: <span style="font-family:'JetBrains Mono',monospace;color:var(--text-primary)">admin</span></div>
+    <div style="font-size:12px;color:var(--text-dim)">Password: <span id="pwField" style="font-family:'JetBrains Mono',monospace;color:var(--text-primary)">••••••••</span>
+      <button onclick="togglePw()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button>
+    </div>
+    <input type="hidden" id="pwValue" value="{{ tvr_admin_pass|e }}">
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Stream Endpoints</div>
+  <div class="url-row"><span class="url-label">RTSP</span><span class="url-val">rtsp://{{ server_ip or fqdn or '&lt;host&gt;' }}:8554/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTSPS</span><span class="url-val">rtsps://{{ server_ip or fqdn or '&lt;host&gt;' }}:8555/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ server_ip or fqdn or '&lt;host&gt;' }}:8890?streamid=publish:&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ server_ip or fqdn or '&lt;host&gt;' }}:1935/&lt;stream&gt;</span></div>
+  {% if fqdn %}<div class="url-row"><span class="url-label">HLS ABR</span><span class="url-val">https://{{ tvr_host }}/hls/&lt;stream&gt;/master.m3u8</span></div>{% endif %}
+</div>
+
+<div class="card">
+  <div class="card-title">Container Logs</div>
+  <div style="margin-bottom:10px"><button class="btn btn-secondary" style="font-size:11px" onclick="fetchLogs()">Refresh</button></div>
+  <div class="log-box" id="logBox">Loading...</div>
+</div>
+
+<div class="card" style="border-color:rgba(239,68,68,.2)">
+  <div class="card-title" style="color:var(--red)">Uninstall</div>
+  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">Stops and removes the container. Data in <code style="font-size:11px">~/tak-video-restreamer/data/</code> is preserved.</p>
+  <button class="btn btn-danger" onclick="doUninstall()">Uninstall TAK Video Restreamer</button>
+</div>
+{% endif %}
+
+</div>
+<script>
+{% if not tvr.get('installed') %}
+let polling = false;
+function startDeploy(){
+  document.getElementById('deployBtn').disabled = true;
+  document.getElementById('logCard').style.display = '';
+  fetch('/api/tak-video-restreamer/deploy',{method:'POST',credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{
+      if(d.success){ polling=true; poll(); }
+      else{ alert('Deploy failed: '+(d.error||'unknown')); }
+    });
+}
+function poll(){
+  if(!polling) return;
+  fetch('/api/tak-video-restreamer/deploy-status',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+    let box=document.getElementById('logBox');
+    if(box){ box.innerHTML=(d.log||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join(''); box.scrollTop=box.scrollHeight; }
+    if(d.complete){ polling=false; setTimeout(()=>location.reload(),1500); }
+    else if(d.error&&!d.running){ polling=false; let e=document.getElementById('deployError'); if(e) e.style.display=''; }
+    else{ setTimeout(poll,2000); }
+  }).catch(()=>setTimeout(poll,3000));
+}
+{% else %}
+function control(action){
+  fetch('/api/tak-video-restreamer/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{ if(d.success){ setTimeout(()=>location.reload(),1500); } else{ alert(d.error||'Failed'); } });
+}
+function fetchLogs(){
+  fetch('/api/tak-video-restreamer/logs',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+    let box=document.getElementById('logBox');
+    if(box){ box.innerHTML=(d.lines||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join(''); box.scrollTop=box.scrollHeight; }
+  });
+}
+function togglePw(){
+  let f=document.getElementById('pwField'), v=document.getElementById('pwValue');
+  f.textContent = f.textContent.startsWith('\u2022') ? v.value : '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022';
+}
+function doUninstall(){
+  let pw=prompt('Enter infra-TAK admin password to confirm uninstall:');
+  if(!pw) return;
+  fetch('/api/tak-video-restreamer/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{ if(d.success){ location.href='/marketplace'; } else{ alert(d.error||'Uninstall failed'); } });
+}
+fetchLogs();
+{% endif %}
+</script>
+</body></html>'''
+
 
 # === Cesium 3D Tiles Template ===
 CESIUM_TILES_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cesium 3D Tiles — infra-TAK</title>
