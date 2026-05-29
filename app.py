@@ -2702,7 +2702,7 @@ def takserver_external_db_provision():
     # Auto-generate app password if not provided
     generated_pass = False
     if not app_pass:
-        alphabet = string.ascii_letters + string.digits + '!@#%^&*'
+        alphabet = string.ascii_letters + string.digits + '!@#%^*'
         app_pass = ''.join(secrets.choice(alphabet) for _ in range(24))
         generated_pass = True
         plog(f'  Generated strong password for {app_user}')
@@ -44885,7 +44885,8 @@ def run_takserver_deploy(config):
                     _cc = _re_early.sub(r'jdbc:postgresql://[^"]*', _jdbc_early, _cc)
                     _cc = _re_early.sub(r'(<connection[^>]*username=")[^"]*(")', lambda m: m.group(1) + _edb_user_early + m.group(2), _cc)
                     if _edb_pass_early:
-                        _cc = _re_early.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + _edb_pass_early + m.group(2), _cc)
+                        _edb_pass_xml = html.escape(_edb_pass_early, quote=True)
+                        _cc = _re_early.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + _edb_pass_xml + m.group(2), _cc)
                     with open('/opt/tak/CoreConfig.xml', 'w') as _f:
                         _f.write(_cc)
                     log_step(f"✓ CoreConfig JDBC pre-patched to {_edb_host_early}:{_edb_port_early}")
@@ -45034,7 +45035,8 @@ def run_takserver_deploy(config):
                     if needs_patch:
                         cc = re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                         if db_pass:
-                            cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass + m.group(2), cc)
+                            db_pass_xml = html.escape(db_pass, quote=True)
+                            cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass_xml + m.group(2), cc)
                         subprocess.run(['tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=5)
                         log_step(f"✓ JDBC URL and password set for {db_host}:{db_port}")
                     else:
