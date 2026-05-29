@@ -11781,18 +11781,8 @@ def generate_caddyfile(settings=None):
         lines.append(f"            header_down Location ^ /hls-proxy")
         lines.append(f"        }}")
         lines.append(f"    }}")
-        if ak.get('installed'):
-            lines.append(f"    route {{")
-            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-            lines.append(f"        forward_auth {ak_up} {{")
-            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-            lines.append(f"            trusted_proxies private_ranges")
-            lines.append(f"        }}")
-            lines.append(f"        reverse_proxy 127.0.0.1:3100")
-            lines.append(f"    }}")
-        else:
-            lines.append(f"    reverse_proxy 127.0.0.1:3100")
+        # TVR has its own Flask login — no Authentik forward_auth wrapper needed
+        lines.append(f"    reverse_proxy 127.0.0.1:3100")
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
@@ -48619,10 +48609,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
 <div class="card">
   <div class="card-title">Stream Endpoints</div>
-  <div class="url-row"><span class="url-label">RTSP</span><span class="url-val">rtsp://{{ server_ip or fqdn or '&lt;host&gt;' }}:8554/&lt;stream&gt;</span></div>
-  <div class="url-row"><span class="url-label">RTSPS</span><span class="url-val">rtsps://{{ server_ip or fqdn or '&lt;host&gt;' }}:8555/&lt;stream&gt;</span></div>
-  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ server_ip or fqdn or '&lt;host&gt;' }}:8890?streamid=publish:&lt;stream&gt;</span></div>
-  <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ server_ip or fqdn or '&lt;host&gt;' }}:1935/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTSP</span><span class="url-val">rtsp://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8554/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTSPS</span><span class="url-val">rtsps://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8555/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8890?streamid=publish:&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:1935/&lt;stream&gt;</span></div>
   {% if fqdn %}<div class="url-row"><span class="url-label">HLS ABR</span><span class="url-val">https://{{ tvr_host }}/hls/&lt;stream&gt;/master.m3u8</span></div>{% endif %}
 </div>
 
