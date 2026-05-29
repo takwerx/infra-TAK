@@ -56,7 +56,8 @@ A unified web console for deploying and managing TAK ecosystem infrastructure:
 - **TAK Portal** — User and certificate management portal with auto-configured Authentik + TAK Server integration
 - **Caddy SSL** — Let's Encrypt certificates and reverse proxy management
 - **CloudTAK** — Browser-based TAK client
-- **MediaMTX** — Video streaming server for real-time feeds
+- **MediaMTX** — Video streaming server for real-time feeds *(mutually exclusive with TAK Video Restreamer — they share streaming ports)*
+- **TAK Video Restreamer** — Flask + MediaMTX + FFmpeg streaming server (RTSP, RTSPS, SRT, HLS ABR, RTMP, KLV) deployed as a Docker container *(mutually exclusive with standalone MediaMTX)*. Lives behind Caddy at `stream.<FQDN>`. Has its own admin login (not Authentik SSO — TVR has built-in auth); password is displayed on the module page and changeable without rebuilding the container.
 - **Node-RED** — Flow-based automation engine, protected behind Authentik forward auth
 - **Email Relay** — Outbound email for notifications and alerts
 - **Guard Dog** — TAK Server health monitoring and auto-recovery (port 8089, processes, OOM, PostgreSQL, CoT DB size, disk, disk I/O performance, certificates; optional monitors for Authentik, Node-RED, MediaMTX, CloudTAK, Federation Hub)
@@ -216,7 +217,7 @@ start.sh                    ← One CLI command to launch everything
 | TAK Server | 8089 | TLS | TAK client connections (ATAK, iTAK, WinTAK) |
 | TAK Server | 8443 | HTTPS | Admin WebGUI (client certificate auth) |
 | TAK Server | 8446 | HTTPS | Admin WebGUI (Let's Encrypt, password/LDAP auth) |
-| MediaMTX | 8554 | RTSP | Video streaming clients (publish + play) |
+| MediaMTX / TAK Video Restreamer | 8554 | RTSP | Video streaming clients (publish + play) |
 | MediaMTX | 8322 | RTSPS | TLS-wrapped RTSP |
 | MediaMTX | 8890 | SRT | SRT streaming clients |
 | MediaMTX | 8000/8001 | UDP | RTP/RTCP companion ports for RTSP |
