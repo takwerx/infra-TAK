@@ -18606,6 +18606,34 @@ def tvr_uninstall():
     return jsonify({'success': True})
 
 
+@app.route('/api/tak-video-restreamer/set-password', methods=['POST'])
+@login_required
+def tvr_set_password():
+    import subprocess as _sp
+    data = request.json or {}
+    new_password = (data.get('password') or '').strip()
+    if len(new_password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    s = load_settings()
+    s['tak_video_restreamer_admin_password'] = new_password
+    save_settings(s)
+    # Rewrite docker-compose.yml with the new password and restart (no rebuild)
+    compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
+    if os.path.exists(compose_path):
+        try:
+            with open(compose_path, 'r') as f:
+                content = f.read()
+            import re as _re
+            content = _re.sub(r'(- ADMIN_PASSWORD=).*', f'- ADMIN_PASSWORD={new_password}', content)
+            with open(compose_path, 'w') as f:
+                f.write(content)
+            _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+                    capture_output=True, timeout=60, cwd=TVR_INSTALL_DIR)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return jsonify({'success': True})
+
+
 _tvr_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
 
 
@@ -48704,10 +48732,20 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="card-title">Web UI Access</div>
     {% if tvr_url %}<div style="margin-bottom:10px"><a href="{{ tvr_url }}" target="_blank" style="color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:12px">{{ tvr_url }}</a></div>{% endif %}
     <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Username: <span style="font-family:'JetBrains Mono',monospace;color:var(--text-primary)">admin</span></div>
-    <div style="font-size:12px;color:var(--text-dim)">Password: <span id="pwField" style="font-family:'JetBrains Mono',monospace;color:var(--text-primary)">••••••••</span>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Password: <span id="pwField" style="font-family:'JetBrains Mono',monospace;color:var(--text-primary)">••••••••</span>
       <button onclick="togglePw()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button>
     </div>
     <input type="hidden" id="pwValue" value="{{ tvr_admin_pass|e }}">
+    <div id="changePwForm" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+      <input type="password" id="newPw1" placeholder="New password" style="width:100%;padding:8px 10px;background:rgba(15,23,42,.6);border:1px solid rgba(59,130,246,.2);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;margin-bottom:6px">
+      <input type="password" id="newPw2" placeholder="Confirm new password" style="width:100%;padding:8px 10px;background:rgba(15,23,42,.6);border:1px solid rgba(59,130,246,.2);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;margin-bottom:8px">
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-primary" style="font-size:11px" onclick="submitChangePw()">Save & Restart</button>
+        <button class="btn btn-secondary" style="font-size:11px" onclick="document.getElementById('changePwForm').style.display='none'">Cancel</button>
+      </div>
+      <div id="changePwMsg" style="margin-top:8px;font-size:12px"></div>
+    </div>
+    {% if not changePwForm_open %}<button onclick="document.getElementById('changePwForm').style.display='';this.style.display='none'" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;padding:0;margin-top:4px">Change password</button>{% endif %}
   </div>
 </div>
 
@@ -48773,6 +48811,18 @@ function fetchLogs(){
 function togglePw(){
   let f=document.getElementById('pwField'), v=document.getElementById('pwValue');
   f.textContent = f.textContent.startsWith('\u2022') ? v.value : '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022';
+}
+function submitChangePw(){
+  let p1=document.getElementById('newPw1').value, p2=document.getElementById('newPw2').value;
+  let msg=document.getElementById('changePwMsg');
+  if(!p1){ msg.style.color='var(--red)'; msg.textContent='Enter a new password.'; return; }
+  if(p1!==p2){ msg.style.color='var(--red)'; msg.textContent='Passwords do not match.'; return; }
+  msg.style.color='var(--text-dim)'; msg.textContent='Saving…';
+  fetch('/api/tak-video-restreamer/set-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p1}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{
+      if(d.success){ msg.style.color='var(--green)'; msg.textContent='✓ Password updated. Container restarting…'; document.getElementById('pwValue').value=p1; setTimeout(()=>location.reload(),3000); }
+      else{ msg.style.color='var(--red)'; msg.textContent=d.error||'Failed'; }
+    });
 }
 function doUninstall(){
   let pw=prompt('Enter infra-TAK admin password to confirm removal:');
