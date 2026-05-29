@@ -48555,7 +48555,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
-<div class="section-title"><img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)"> TAK Video Restreamer</div>
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)">
+  <img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="TAK Video Restreamer" style="height:56px;width:auto;object-fit:contain">
+  <div>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--text-primary);letter-spacing:.04em">TAK VIDEO RESTREAMER</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Flask + MediaMTX · RTSP · RTSPS · SRT · HLS · RTMP</div>
+  </div>
+</div>
 
 {% if not tvr.get('installed') %}
 <div class="card">
@@ -48651,7 +48657,15 @@ function poll(){
   fetch('/api/tak-video-restreamer/deploy-status',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
     let box=document.getElementById('logBox');
     if(box){ box.innerHTML=(d.log||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join(''); box.scrollTop=box.scrollHeight; }
-    if(d.complete){ polling=false; setTimeout(()=>location.reload(),1500); }
+    if(d.complete){
+      polling=false;
+      let box=document.getElementById('logBox');
+      let banner=document.createElement('div');
+      banner.style.cssText='margin-top:14px;padding:12px 16px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);border-radius:8px;color:#10b981;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px';
+      banner.innerHTML='<span style="font-size:18px">✓</span> TAK Video Restreamer deployed successfully! Reloading…';
+      document.getElementById('logCard').appendChild(banner);
+      setTimeout(()=>location.reload(),2500);
+    }
     else if(d.error&&!d.running){ polling=false; let e=document.getElementById('deployError'); if(e) e.style.display=''; }
     else{ setTimeout(poll,2000); }
   }).catch(()=>setTimeout(poll,3000));
