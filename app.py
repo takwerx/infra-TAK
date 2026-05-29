@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.41-alpha"
+VERSION = "0.9.42-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -385,6 +385,9 @@ CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZ
 MEDIAMTX_LOGO_URL = "/static/mediamtx-logo.png"
 # Cesium 3D Tiles logo (bundled SVG — includes wordmark, no separate label needed)
 CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
+# TAK Video Restreamer (mutually exclusive with local mediamtx — same stream ports)
+TVR_REPO = "https://github.com/raytheonbbn/tak-video-restreamer.git"
+TVR_INSTALL_DIR = os.path.expanduser("~/tak-video-restreamer")
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
@@ -881,7 +884,8 @@ def detect_modules():
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
             mtx_running = r.stdout.strip() == 'active'
     modules['mediamtx'] = {'name': 'MediaMTX', 'installed': mtx_installed, 'running': mtx_running,
-        'description': 'Video Streaming Server', 'icon': '📹', 'icon_url': MEDIAMTX_LOGO_URL, 'route': '/mediamtx', 'priority': 4}
+        'description': 'Video Streaming Server', 'icon': '📹', 'icon_url': MEDIAMTX_LOGO_URL,
+        'route': '/mediamtx', 'priority': 4, 'conflicts': ['tak_video_restreamer']}
     # Guard Dog
     gd_installed = os.path.exists('/opt/tak-guarddog')
     gd_running = False
@@ -1027,6 +1031,41 @@ def detect_modules():
         'route': '/webodm',
         'priority': 12,
     }
+    # TAK Video Restreamer — Docker, mutually exclusive with local mediamtx (same stream ports)
+    tvr_enabled = settings.get('tak_video_restreamer_enabled', False)
+    tvr_running = False
+    if tvr_enabled:
+        try:
+            _tvr_r = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
+                capture_output=True, text=True, timeout=3)
+            tvr_running = _tvr_r.stdout.strip() == 'true'
+        except Exception:
+            pass
+    else:
+        # Self-heal: container is running but flag got cleared
+        try:
+            _tvr_r = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
+                capture_output=True, text=True, timeout=3)
+            if _tvr_r.stdout.strip() == 'true':
+                _s = load_settings()
+                _s['tak_video_restreamer_enabled'] = True
+                save_settings(_s)
+                tvr_enabled = True
+                tvr_running = True
+        except Exception:
+            pass
+    modules['tak_video_restreamer'] = {
+        'name': 'TAK Video Restreamer',
+        'installed': bool(tvr_enabled),
+        'running': tvr_running,
+        'description': 'Flask + MediaMTX restreamer — RTSP, RTSPS, SRT, HLS, KLV',
+        'icon': '🎥',
+        'route': '/tak-video-restreamer',
+        'priority': 13,
+        'conflicts': ['mediamtx'],
+    }
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_custom_banner(settings):
@@ -1170,6 +1209,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
         parts.append(link('/mediamtx', f'<img src="{html.escape(MEDIAMTX_LOGO_URL)}" alt="MediaMTX" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'MediaMTX'))
+    tvr = modules.get('tak_video_restreamer', {})
+    if tvr.get('installed'):
+        parts.append(link('/tak-video-restreamer', '<span class="nav-icon" style="font-size:22px;line-height:1">🎥</span><span>TAK Video</span>', 'TAK Video Restreamer'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -1943,6 +1985,12 @@ def marketplace_page():
     settings = load_settings()
     all_modules = detect_modules()
     modules = {k: m for k, m in all_modules.items() if not m.get('installed')}
+    # Annotate any uninstalled module that conflicts with an already-installed module
+    for key, mod in modules.items():
+        for conflict_key in (mod.get('conflicts') or []):
+            if all_modules.get(conflict_key, {}).get('installed'):
+                mod['_conflict_with'] = all_modules[conflict_key].get('name', conflict_key)
+                break
     resp = render_template_string(MARKETPLACE_TEMPLATE,
         settings=settings, modules=modules, metrics=get_system_metrics(), version=VERSION)
     from flask import make_response
@@ -4312,6 +4360,7 @@ def guarddog_page():
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (/api/health on port 3000). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
@@ -5884,6 +5933,11 @@ def _guarddog_health_check(service_id):
                 return bool(ok and out and out.strip() == 'active')
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True, timeout=3)
             return r.returncode == 0
+        if service_id == 'tak_video_restreamer':
+            r = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
+                capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() == 'true'
         if service_id == 'nodered':
             settings = load_settings()
             nr_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
@@ -5950,6 +6004,7 @@ def _guarddog_service_monitor_ids(settings):
         'authentik': ['authentik_http'],
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
+        'tak_video_restreamer': ['tvr_http'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
         'updates': ['updates_check'],
@@ -5976,6 +6031,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('takportal')
     if modules.get('mediamtx', {}).get('installed'):
         ids.append('mediamtx')
+    if modules.get('tak_video_restreamer', {}).get('installed'):
+        ids.append('tak_video_restreamer')
     if modules.get('nodered', {}).get('installed'):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
@@ -6305,6 +6362,10 @@ def _monitor_health_check(monitor_id):
             req = urllib.request.Request('http://127.0.0.1:1880/', method='GET')
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status in (200, 302, 301)
+        if monitor_id == 'tvr_http':
+            req = urllib.request.Request('http://127.0.0.1:3000/api/health', method='GET')
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status in (200, 204)
         if monitor_id == 'takportal_ctr':
             r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
@@ -9500,6 +9561,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'cloudtak_tiles': 'tiles.map',
     'cloudtak_video': 'video',
     'mediamtx': 'stream',
+    'tak_video_restreamer': 'stream',
     'fedhub': 'fedhub',
     'cesium_tiles': '3dtiles',
     'webodm': 'webodm',
@@ -11700,6 +11762,39 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'webodm'), wo_host)
+
+    tvr_mod = modules.get('tak_video_restreamer', {})
+    if tvr_mod.get('installed'):
+        tvr_host = sd.get('tak_video_restreamer') or _get_service_domain(settings, 'tak_video_restreamer')
+        lines.append(f"# TAK Video Restreamer — Flask + MediaMTX streaming server")
+        lines.append(f"{tvr_host} {{")
+        # Public paths: bypass Authentik (auth handled by the app itself or not needed)
+        for pub_path in ['/hls/*', '/api/hls/proxy/*', '/login*', '/static/*',
+                         '/api/auth/*', '/api/health*']:
+            lines.append(f"    handle {pub_path} {{")
+            lines.append(f"        reverse_proxy 127.0.0.1:3000")
+            lines.append(f"    }}")
+        # Native MediaMTX HLS (loopback :8888) available via /hls-proxy/
+        lines.append(f"    handle_path /hls-proxy/* {{")
+        lines.append(f"        reverse_proxy 127.0.0.1:8888 {{")
+        lines.append(f"            header_down Location ^ /hls-proxy")
+        lines.append(f"        }}")
+        lines.append(f"    }}")
+        if ak.get('installed'):
+            lines.append(f"    route {{")
+            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+            lines.append(f"        forward_auth {ak_up} {{")
+            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+            lines.append(f"            trusted_proxies private_ranges")
+            lines.append(f"        }}")
+            lines.append(f"        reverse_proxy 127.0.0.1:3000")
+            lines.append(f"    }}")
+        else:
+            lines.append(f"    reverse_proxy 127.0.0.1:3000")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
@@ -18379,6 +18474,270 @@ def webodm_uninstall():
     return jsonify({'success': True})
 
 
+# ── TAK Video Restreamer routes ───────────────────────────────────────────────
+
+TVR_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>TAK Video Restreamer — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0;display:flex;flex-direction:column}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.section-title{font-size:20px;font-weight:700;color:var(--text-primary);margin-bottom:24px;display:flex;align-items:center;gap:10px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:linear-gradient(135deg,#7f1d1d,#991b1b);color:#fff}.btn-danger:hover{opacity:.9}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.dot-green{background:var(--green)}.dot-red{background:var(--red)}.dot-yellow{background:var(--yellow)}
+.mono{font-family:'JetBrains Mono',monospace;font-size:12px}
+.url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
+.url-row:last-child{border-bottom:none}
+.url-label{width:80px;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;flex-shrink:0}
+.url-val{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);word-break:break-all;flex:1}
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.04em}
+.badge-green{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.badge-red{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.badge-yellow{background:rgba(234,179,8,.12);color:var(--yellow);border:1px solid rgba(234,179,8,.25)}
+.badge-blue{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.25)}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="section-title">🎥 TAK Video Restreamer</div>
+
+{% if not tvr.get('installed') %}
+<div class="card">
+  <div class="card-title">Deploy TAK Video Restreamer</div>
+  {% if mediamtx_conflict %}
+  <div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:14px;margin-bottom:18px;font-size:13px;color:var(--red)">
+    ⚠ <strong>Port conflict:</strong> Standalone MediaMTX is installed and uses the same streaming ports (8554/8555/8888/8890).
+    Uninstall MediaMTX first before deploying TAK Video Restreamer.
+  </div>
+  {% endif %}
+  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:18px">
+    Flask + MediaMTX + FFmpeg streaming server. Supports RTSP, RTSPS, SRT, HLS, RTMP with adaptive bitrate, KLV metadata, and recording.<br>
+    <span style="color:var(--yellow);font-size:12px">⏳ First deploy clones the repository and builds the Docker image — allow 5–10 minutes.</span>
+  </p>
+  <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" {% if mediamtx_conflict %}disabled{% endif %}>
+    <span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy
+  </button>
+</div>
+{% if deploying or deploy_log %}
+<div class="card">
+  <div class="card-title">Deploy Log</div>
+  <div class="log-box" id="logBox">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+  {% if deploy_error %}<div style="margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see log above.</div>{% endif %}
+</div>
+{% endif %}
+{% else %}
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:0">
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">Status</div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <span class="status-dot {% if tvr.get('running') %}dot-green{% else %}dot-red{% endif %}"></span>
+      <span style="font-weight:600">{% if tvr.get('running') %}Running{% else %}Stopped{% endif %}</span>
+      {% if tvr_commit %}<span class="badge badge-blue" style="margin-left:auto">SHA {{ tvr_commit }}</span>{% endif %}
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-secondary" onclick="control('start')">Start</button>
+      <button class="btn btn-secondary" onclick="control('stop')">Stop</button>
+      <button class="btn btn-secondary" onclick="control('restart')">Restart</button>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">Web UI Access</div>
+    {% if tvr_url %}
+    <div style="margin-bottom:10px"><a href="{{ tvr_url }}" target="_blank" style="color:var(--cyan);font-family:\'JetBrains Mono\',monospace;font-size:12px">{{ tvr_url }}</a></div>
+    {% endif %}
+    <div style="font-size:12px;color:var(--text-dim)">Username: <span style="font-family:\'JetBrains Mono\',monospace;color:var(--text-primary)">admin</span></div>
+    <div style="font-size:12px;color:var(--text-dim)">Password: <span class="mono" id="pwField" style="color:var(--text-primary)">••••••••</span>
+      <button onclick="togglePw()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button>
+    </div>
+    <input type="hidden" id="pwValue" value="{{ tvr_admin_pass|e }}">
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <div class="card-title">Stream Endpoints</div>
+  <div class="url-row"><span class="url-label">RTSP</span><span class="url-val">rtsp://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:8554/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTSPS</span><span class="url-val">rtsps://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:8555/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:8890?streamid=publish:&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ server_ip or fqdn or \'&lt;host&gt;\' }}:1935/&lt;stream&gt;</span></div>
+  {% if fqdn %}<div class="url-row"><span class="url-label">HLS ABR</span><span class="url-val">https://{{ tvr_host }}/hls/&lt;stream&gt;/master.m3u8</span></div>{% endif %}
+</div>
+
+<div class="card">
+  <div class="card-title">Container Logs</div>
+  <div style="margin-bottom:10px;display:flex;gap:8px">
+    <button class="btn btn-secondary" onclick="fetchLogs()" style="font-size:11px">Refresh</button>
+  </div>
+  <div class="log-box" id="logBox">Loading...</div>
+</div>
+
+<div class="card" style="border-color:rgba(239,68,68,.2)">
+  <div class="card-title" style="color:var(--red)">Uninstall</div>
+  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">Stops and removes the container. Data in <code style="font-size:11px">~/tak-video-restreamer/data/</code> is preserved.</p>
+  <button class="btn btn-danger" onclick="doUninstall()">Uninstall TAK Video Restreamer</button>
+</div>
+{% endif %}
+
+</div>
+<script>
+{% if not tvr.get('installed') %}
+let polling = {{ 'true' if deploying else 'false' }};
+function startDeploy(){
+  document.getElementById('deployBtn').disabled=true;
+  fetch('/api/tak-video-restreamer/deploy',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{if(d.success){polling=true;poll();}else{alert('Deploy failed: '+(d.error||'unknown'));}});
+}
+function poll(){
+  if(!polling)return;
+  fetch('/api/tak-video-restreamer/deploy-status',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+    let box=document.getElementById('logBox');
+    if(box){box.innerHTML=(d.log||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('');box.scrollTop=box.scrollHeight;}
+    if(d.complete){polling=false;setTimeout(()=>location.reload(),1500);}
+    else if(d.error&&!d.running){polling=false;}
+    else{setTimeout(poll,2000);}
+  }).catch(()=>setTimeout(poll,3000));
+}
+if(polling)poll();
+{% else %}
+function control(action){
+  fetch('/api/tak-video-restreamer/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{if(d.success){setTimeout(()=>location.reload(),1500);}else{alert(d.error||'Failed');}});
+}
+function fetchLogs(){
+  fetch('/api/tak-video-restreamer/logs',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+    let box=document.getElementById('logBox');
+    if(box){box.innerHTML=(d.lines||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('');box.scrollTop=box.scrollHeight;}
+  });
+}
+function togglePw(){
+  let f=document.getElementById('pwField'),v=document.getElementById('pwValue');
+  f.textContent=f.textContent.startsWith('•')?v.value:'••••••••';
+}
+function doUninstall(){
+  let pw=prompt('Enter infra-TAK admin password to confirm uninstall:');
+  if(!pw)return;
+  fetch('/api/tak-video-restreamer/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{if(d.success){location.href='/marketplace';}else{alert(d.error||'Uninstall failed');}});
+}
+fetchLogs();
+{% endif %}
+</script>
+</body></html>'''
+
+
+@app.route('/tak-video-restreamer')
+@login_required
+def tvr_page():
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    tvr = modules.get('tak_video_restreamer', {})
+    mediamtx_conflict = modules.get('mediamtx', {}).get('installed', False)
+    tvr_host = _get_service_domain(settings, 'tak_video_restreamer')
+    tvr_url = f'https://{tvr_host}' if tvr_host else ''
+    tvr_admin_pass = settings.get('tak_video_restreamer_admin_password', '')
+    tvr_commit = settings.get('tak_video_restreamer_commit_sha', '')
+    fqdn = settings.get('fqdn', '')
+    server_ip = settings.get('server_ip', '')
+    r = make_response(render_template_string(TVR_TEMPLATE,
+        settings=settings, modules=modules, tvr=tvr,
+        tvr_host=tvr_host, tvr_url=tvr_url,
+        tvr_admin_pass=tvr_admin_pass,
+        tvr_commit=tvr_commit,
+        mediamtx_conflict=mediamtx_conflict,
+        fqdn=fqdn, server_ip=server_ip,
+        deploying=_tvr_deploy_status.get('running', False),
+        deploy_log=_tvr_deploy_status.get('log', []),
+        deploy_error=_tvr_deploy_status.get('error', False),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+@app.route('/api/tak-video-restreamer/deploy', methods=['POST'])
+@login_required
+def tvr_deploy():
+    import threading
+    if _tvr_deploy_status.get('running'):
+        return jsonify({'success': False, 'error': 'Deploy already in progress'})
+    _tvr_deploy_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    settings = load_settings()
+    t = threading.Thread(target=_run_tvr_deploy, args=(settings,), daemon=True)
+    t.start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/tak-video-restreamer/deploy-status')
+@login_required
+def tvr_deploy_status_api():
+    return jsonify(_tvr_deploy_status)
+
+
+@app.route('/api/tak-video-restreamer/control', methods=['POST'])
+@login_required
+def tvr_control():
+    import subprocess as _sp
+    data = request.get_json() or {}
+    action = data.get('action', '').strip().lower()
+    if action not in ('start', 'stop', 'restart'):
+        return jsonify({'success': False, 'error': 'Invalid action'}), 400
+    compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return jsonify({'success': False, 'error': 'Compose file not found — deploy first'}), 404
+    cmd_map = {
+        'start':   ['docker', 'compose', '-f', compose_path, 'up', '-d'],
+        'stop':    ['docker', 'compose', '-f', compose_path, 'stop'],
+        'restart': ['docker', 'compose', '-f', compose_path, 'restart'],
+    }
+    r = _sp.run(cmd_map[action], capture_output=True, text=True, timeout=60, cwd=TVR_INSTALL_DIR)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': (r.stderr or r.stdout)[:300]})
+    return jsonify({'success': True})
+
+
+@app.route('/api/tak-video-restreamer/logs')
+@login_required
+def tvr_logs():
+    import subprocess as _sp
+    try:
+        r = _sp.run(['docker', 'logs', '--tail', '200', 'tak-video-restreamer'],
+                    capture_output=True, text=True, timeout=15)
+        raw = (r.stdout + r.stderr).splitlines()
+        return jsonify({'lines': raw[-200:]})
+    except Exception as e:
+        return jsonify({'lines': [], 'error': str(e)})
+
+
+@app.route('/api/tak-video-restreamer/uninstall', methods=['POST'])
+@login_required
+def tvr_uninstall():
+    import subprocess as _sp
+    data = request.json or {}
+    password = data.get('password', '')
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'error': 'Invalid admin password'}), 403
+    compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
+    if os.path.exists(compose_path):
+        _sp.run(['docker', 'compose', '-f', compose_path, 'down'],
+                capture_output=True, timeout=60, cwd=TVR_INSTALL_DIR)
+    s = load_settings()
+    s['tak_video_restreamer_enabled'] = False
+    save_settings(s)
+    generate_caddyfile(s)
+    _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
+    return jsonify({'success': True})
+
+
 def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, settings, plog=None):
     """Remote-deploy variant: SSH to the Authentik host, patch .env with SMTP settings
     pointing to the console server's Postfix, restart containers, set up recovery flow.
@@ -18909,6 +19268,303 @@ def emailrelay_configure_authentik():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
+# ── TAK Video Restreamer ──────────────────────────────────────────────────────
+
+# infra-TAK overrides two addresses from the upstream mediaMTX.yml:
+#   apiAddress  0.0.0.0:8889 → 127.0.0.1:8889  (API must never be public)
+#   hlsAddress  :8888        → 127.0.0.1:8888   (HLS reached via Caddy /hls-proxy/)
+TVR_MEDIAMTX_YML = '''\
+# TAK Video Restreamer - MediaMTX configuration (generated by infra-TAK)
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+udpMaxPayloadSize: 1452
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+  - user: any
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: api
+      - action: metrics
+      - action: pprof
+
+# v0.9.42: API bound to loopback — must never be publicly exposed
+api: yes
+apiAddress: 127.0.0.1:8889
+
+rtsp: yes
+rtspAddress: 0.0.0.0:8554
+rtspTransports: [tcp]
+rtspEncryption: optional
+rtspsAddress: 0.0.0.0:8555
+rtspServerCert: /opt/app/certs/server.crt
+rtspServerKey: /opt/app/certs/server.key
+
+rtmp: yes
+rtmpAddress: 0.0.0.0:1935
+
+# v0.9.42: HLS bound to loopback — Caddy proxies /hls-proxy/* to this port
+hls: yes
+hlsAddress: 127.0.0.1:8888
+hlsEncryption: no
+hlsTrustedProxies: ['127.0.0.1']
+hlsVariant: fmp4
+hlsSegmentCount: 3
+hlsSegmentDuration: 500ms
+hlsPartDuration: 200ms
+hlsSegmentMaxSize: 50M
+hlsMuxerCloseAfter: 60s
+hlsAlwaysRemux: yes
+
+webrtc: no
+webrtcAddress: :9898
+
+srt: yes
+srtAddress: 0.0.0.0:8890
+
+pathDefaults:
+  source: publisher
+  record: no
+  recordPath: /opt/app/streams/%path/%Y-%m-%d_%H-%M-%S
+  overridePublisher: yes
+  srtPublishPassphrase: ""
+  srtReadPassphrase: ""
+
+paths:
+  ~^tak-.*$:
+    source: publisher
+    record: no
+
+  ~^drone.*$:
+    source: publisher
+    record: no
+
+  ~^uas.*$:
+    source: publisher
+    record: no
+
+  ~^(.+)_hls$:
+    runOnDemand: ffmpeg -rtsp_transport tcp -analyzeduration 2000000 -probesize 2000000 -i rtsp://localhost:8554/$G1 -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -level 3.1 -pix_fmt yuv420p -b:v 2M -maxrate 2.5M -bufsize 5M -g 30 -keyint_min 30 -sc_threshold 0 -c:a aac -b:a 128k -ar 48000 -ac 2 -err_detect ignore_err -fflags +genpts+discardcorrupt -f rtsp -rtsp_transport tcp rtsp://localhost:8554/$MTX_PATH
+    runOnDemandStartTimeout: 10s
+    runOnDemandCloseAfter: 10s
+    runOnDemandRestart: yes
+
+  ~^.*$:
+    source: publisher
+'''
+
+# infra-TAK docker-compose for TAK Video Restreamer.
+# Key bindings vs upstream:
+#   3000  → 127.0.0.1 only  (web UI, Caddy proxies)
+#   8888  → 127.0.0.1 only  (native HLS, Caddy /hls-proxy/)
+#   8554/8555/8890/1935 → 0.0.0.0 (streaming clients access directly)
+#   8889  NOT published     (MediaMTX API stays inside container)
+TVR_DOCKER_COMPOSE = '''\
+version: '3.8'
+services:
+  media:
+    build:
+      context: {tvr_dir}
+      dockerfile: Dockerfile
+    container_name: tak-video-restreamer
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "0.0.0.0:8554:8554"
+      - "0.0.0.0:8555:8555"
+      - "0.0.0.0:1935:1935"
+      - "0.0.0.0:8890:8890/udp"
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - {tvr_dir}/mediaMTX.yml:/opt/app/mediamtx.yml:ro
+      - {tvr_dir}/data/streams:/opt/app/streams
+      - {tvr_dir}/data/logs:/opt/app/logs
+      - {tvr_dir}/data/hls:/opt/app/hls
+      - {tvr_dir}/data:/opt/app/data
+      - {tvr_dir}/data/certs:/opt/app/certs
+    environment:
+      - PORT=3000
+      - MEDIAMTX_API_URL=http://localhost:8889
+      - MEDIAMTX_RTSP_URL=rtsp://127.0.0.1:8554
+      - MEDIAMTX_HLS_URL=http://127.0.0.1:8888
+      - PYTHONUNBUFFERED=1
+      - STREAMS_DIR=/opt/app/streams
+      - DATA_DIR=/opt/app/data
+      - ACTIVE_CERTS_DIR=/opt/app/certs
+      - LOGS_DIR=/opt/app/logs
+      - HLS_OUTPUT_DIR=/opt/app/hls
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD={admin_pass}
+      - SECRET_KEY={secret_key}
+      - CORS_ORIGINS={cors_origins}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+'''
+
+_tvr_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _tvr_deploy_log(msg, status=None):
+    _tvr_deploy_status['log'].append(msg)
+    if status:
+        _tvr_deploy_status.update(status)
+
+
+def _run_tvr_deploy(settings):
+    import subprocess as _sp
+    import secrets as _sec
+    import shutil as _sh
+    plog = _tvr_deploy_log
+    tvr_dir = TVR_INSTALL_DIR
+    compose_path = os.path.join(tvr_dir, 'docker-compose.yml')
+    mtx_yml_path = os.path.join(tvr_dir, 'mediaMTX.yml')
+    try:
+        # Guard: refuse if standalone mediamtx is installed (same stream ports)
+        modules = detect_modules()
+        if modules.get('mediamtx', {}).get('installed'):
+            plog('✗ Cannot deploy: standalone MediaMTX is installed and uses the same ports (8554/8555/8888/8890).')
+            plog('  Uninstall MediaMTX first, then deploy TAK Video Restreamer.')
+            _tvr_deploy_status.update({'running': False, 'error': True})
+            return
+
+        # Step 1: Ensure Docker is present
+        plog('━━━ Step 1/6: Checking Docker ━━━')
+        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
+        if r.returncode != 0:
+            plog('  Docker not found — installing...')
+            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+                         shell=True, capture_output=True, text=True, timeout=300)
+            if r2.returncode != 0:
+                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
+            plog('✓ Docker installed')
+        else:
+            plog(f'✓ Docker present: {r.stdout.strip()}')
+
+        # Step 2: Clone or update repo
+        plog('')
+        plog('━━━ Step 2/6: Cloning Repository ━━━')
+        if os.path.isdir(os.path.join(tvr_dir, '.git')):
+            plog(f'  Repo already cloned at {tvr_dir} — pulling latest...')
+            r = _sp.run(['git', '-C', tvr_dir, 'pull', '--ff-only'],
+                        capture_output=True, text=True, timeout=60)
+            plog(f'  git pull: {r.stdout.strip() or r.stderr.strip()}')
+        else:
+            os.makedirs(tvr_dir, exist_ok=True)
+            plog(f'  Cloning {TVR_REPO} → {tvr_dir}')
+            r = _sp.run(['git', 'clone', '--depth=1', TVR_REPO, tvr_dir],
+                        capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise RuntimeError(f'git clone failed: {r.stderr[:300]}')
+            plog(f'✓ Repository cloned')
+
+        # Record the commit SHA for audit
+        sha_r = _sp.run(['git', '-C', tvr_dir, 'rev-parse', '--short', 'HEAD'],
+                        capture_output=True, text=True)
+        commit_sha = sha_r.stdout.strip() or 'unknown'
+        plog(f'  Commit SHA: {commit_sha}')
+
+        # Step 3: Write infra-TAK compose + mediaMTX.yml
+        plog('')
+        plog('━━━ Step 3/6: Writing Configuration ━━━')
+        for sub in ['data', 'data/streams', 'data/logs', 'data/hls', 'data/certs']:
+            os.makedirs(os.path.join(tvr_dir, sub), exist_ok=True)
+
+        admin_pass = settings.get('tak_video_restreamer_admin_password') or _sec.token_hex(16)
+        secret_key = settings.get('tak_video_restreamer_secret_key') or _sec.token_hex(32)
+        fqdn = settings.get('fqdn', '').strip()
+        cors_origins = f'https://{fqdn}' if fqdn else 'http://localhost:3000'
+
+        compose_content = TVR_DOCKER_COMPOSE.format(
+            tvr_dir=tvr_dir,
+            admin_pass=admin_pass,
+            secret_key=secret_key,
+            cors_origins=cors_origins,
+        )
+        with open(compose_path, 'w') as f:
+            f.write(compose_content)
+        plog(f'✓ docker-compose.yml written')
+
+        with open(mtx_yml_path, 'w') as f:
+            f.write(TVR_MEDIAMTX_YML)
+        plog(f'✓ mediaMTX.yml written (HLS + API bound to loopback)')
+
+        # Step 4: Build and start container
+        # First-build can take 5–10 min on a cold host — warn operator
+        plog('')
+        plog('━━━ Step 4/6: Building & Starting Container ━━━')
+        plog('  ⏳ First build downloads + compiles dependencies — allow 5–10 min...')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build'],
+                    capture_output=True, text=True, timeout=900, cwd=tvr_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up --build failed:\n{r.stderr[-500:]}')
+        plog('✓ Container built and started')
+
+        # Step 5: UFW rules
+        plog('')
+        plog('━━━ Step 5/6: Configuring Firewall (UFW) ━━━')
+        for port_proto in ['8554/tcp', '8555/tcp', '1935/tcp', '8890/udp']:
+            _sp.run(['ufw', 'allow', port_proto], capture_output=True)
+            plog(f'  ✓ ufw allow {port_proto}')
+        # Block direct access to web UI and HLS — Caddy is the only entry point
+        for port_proto in ['3000/tcp', '8888/tcp']:
+            _sp.run(['ufw', 'deny', port_proto], capture_output=True)
+            plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
+
+        # Step 6: Save settings + regenerate Caddyfile
+        plog('')
+        plog('━━━ Step 6/6: Registering Module ━━━')
+        s = load_settings()
+        s['tak_video_restreamer_enabled'] = True
+        s['tak_video_restreamer_admin_password'] = admin_pass
+        s['tak_video_restreamer_secret_key'] = secret_key
+        s['tak_video_restreamer_commit_sha'] = commit_sha
+        save_settings(s)
+        generate_caddyfile(s)
+        try:
+            _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, check=True)
+            plog('✓ Caddy reloaded')
+        except Exception as ce:
+            plog(f'  Caddy reload warning: {ce}')
+
+        # Optional: register Authentik proxy provider
+        ak_token = (_get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or
+                    _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if fqdn and ak_token:
+            plog('  Configuring Authentik for TAK Video Restreamer...')
+            _ensure_authentik_tvr_app(fqdn, ak_token, plog=plog, settings=s)
+        else:
+            plog('  Authentik not configured — skipping proxy provider setup.')
+
+        plog('')
+        plog('✓ TAK Video Restreamer deployed successfully.')
+        plog(f'  Web UI: https://{fqdn}/  (admin / {admin_pass})' if fqdn else
+             f'  Web UI: http://localhost:3000/  (admin / {admin_pass})')
+        plog('  RTSP:   rtsp://<host>:8554/<stream>')
+        plog('  RTSPS:  rtsps://<host>:8555/<stream>')
+        plog('  SRT:    srt://<host>:8890?streamid=publish:<stream>')
+        plog('  RTMP:   rtmp://<host>:1935/<stream>')
+        _tvr_deploy_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog(f'ERROR: {exc}')
+        _tvr_deploy_status.update({'running': False, 'complete': False, 'error': str(exc)})
+
+
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
 def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
     """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
@@ -19404,6 +20060,105 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
             _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'webodm', plog=log)
         else:
             log("  ⚠ Could not create or find WebODM proxy provider")
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+    return True
+
+
+def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """Create TAK Video Restreamer proxy provider + application in Authentik, add to embedded outpost.
+    Same pattern as WebODM — Caddy forward_auth protects the route at stream.FQDN."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    import urllib.error
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+
+    try:
+        if not flow_pk or not inv_flow_pk:
+            for attempt in range(36):
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                    resp = _urlreq.urlopen(req, timeout=10)
+                    flows = json.loads(resp.read().decode())['results']
+                    flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+                    if flow_pk:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+                        resp = _urlreq.urlopen(req, timeout=10)
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+                        if inv_flow_pk:
+                            break
+                except Exception:
+                    pass
+                if attempt % 6 == 0:
+                    log(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                time.sleep(5)
+            if not flow_pk or not inv_flow_pk:
+                log("  ⚠ No authorization/invalidation flow — skipping TAK Video Restreamer proxy provider")
+                return False
+            log("  ✓ Got authorization and invalidation flows")
+
+        provider_pk = None
+        try:
+            _tvr_host = f'https://{_get_service_domain(settings, "tak_video_restreamer") if settings else f"stream.{fqdn}"}'
+            _cookie = f'.{fqdn.split(":")[0]}'
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'TAK Video Restreamer Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': _tvr_host, 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=10)
+            provider_pk = json.loads(resp.read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=TAK+Video+Restreamer', headers=_ak_headers)
+                resp = _urlreq.urlopen(req, timeout=10)
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    provider_pk = results[0]['pk']
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps({'external_host': _tvr_host, 'cookie_domain': _cookie}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log("  ✓ Proxy provider already exists (external_host updated)")
+            else:
+                log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
+
+        if provider_pk:
+            try:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    data=json.dumps({'name': 'TAK Video Restreamer', 'slug': 'tak-video-restreamer',
+                        'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                    headers=_ak_headers, method='POST')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Application 'TAK Video Restreamer' created")
+            except Exception as e:
+                if hasattr(e, 'code') and e.code == 400:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/tak-video-restreamer/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log("  ✓ Application 'TAK Video Restreamer' updated")
+                else:
+                    log(f"  ⚠ Application error: {str(e)[:80]}")
+
+            _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-video-restreamer', plog=log)
+        else:
+            log("  ⚠ Could not create or find TAK Video Restreamer proxy provider")
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
@@ -48310,6 +49065,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 @media(max-width:600px){.modules-grid{grid-template-columns:1fr}}
 .module-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px;cursor:pointer;transition:all 0.3s;text-decoration:none;display:block;color:inherit}
 .module-card:hover{border-color:var(--border-hover);background:var(--bg-card-hover);transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.3)}
+.module-card.blocked{opacity:.45;cursor:not-allowed;pointer-events:none;filter:grayscale(.35);border-style:dashed}
+.conflict-banner{margin-top:10px;padding:7px 10px;border-radius:6px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.22);font-size:11px;color:#fca5a5;line-height:1.45}
 .module-header{display:flex;align-items:flex-end;gap:10px;margin-bottom:8px}
 .module-header--logo .module-icon{max-height:36px;width:auto;object-fit:contain}
 .module-header .module-icon{flex-shrink:0}
@@ -48364,13 +49121,17 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% else %}
 {% for key, mod in modules.items() %}
-<a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
+<a class="module-card{% if mod.get('_conflict_with') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
+{% if mod.get('_conflict_with') %}
+<div class="conflict-banner">🚫 Cannot deploy — <strong>{{ mod._conflict_with }}</strong> is already installed and uses the same ports. Uninstall it first.</div>
+{% else %}
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
 <span class="module-action">Deploy →</span>
+{% endif %}
 </a>
 {% endfor %}
 {% endif %}
