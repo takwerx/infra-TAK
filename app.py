@@ -48670,7 +48670,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="TAK Video Restreamer" style="height:56px;width:auto;object-fit:contain">
   <div>
     <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--text-primary);letter-spacing:.04em">TAK VIDEO RESTREAMER</div>
-    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Flask + MediaMTX · RTSP · RTSPS · SRT · HLS · RTMP</div>
   </div>
 </div>
 
