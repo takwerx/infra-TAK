@@ -4361,7 +4361,7 @@ def guarddog_page():
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (/api/health on port 3000). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (/api/health on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
@@ -6364,7 +6364,7 @@ def _monitor_health_check(monitor_id):
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status in (200, 302, 301)
         if monitor_id == 'tvr_http':
-            req = urllib.request.Request('http://127.0.0.1:3000/api/health', method='GET')
+            req = urllib.request.Request('http://127.0.0.1:3100/api/health', method='GET')
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status in (200, 204)
         if monitor_id == 'takportal_ctr':
@@ -11773,7 +11773,7 @@ def generate_caddyfile(settings=None):
         for pub_path in ['/hls/*', '/api/hls/proxy/*', '/login*', '/static/*',
                          '/api/auth/*', '/api/health*']:
             lines.append(f"    handle {pub_path} {{")
-            lines.append(f"        reverse_proxy 127.0.0.1:3000")
+            lines.append(f"        reverse_proxy 127.0.0.1:3100")
             lines.append(f"    }}")
         # Native MediaMTX HLS (loopback :8888) available via /hls-proxy/
         lines.append(f"    handle_path /hls-proxy/* {{")
@@ -11789,10 +11789,10 @@ def generate_caddyfile(settings=None):
             lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
-            lines.append(f"        reverse_proxy 127.0.0.1:3000")
+            lines.append(f"        reverse_proxy 127.0.0.1:3100")
             lines.append(f"    }}")
         else:
-            lines.append(f"    reverse_proxy 127.0.0.1:3000")
+            lines.append(f"    reverse_proxy 127.0.0.1:3100")
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
@@ -19220,7 +19220,7 @@ services:
       dockerfile: Dockerfile
     container_name: tak-video-restreamer
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3100:3000"
       - "0.0.0.0:8554:8554"
       - "0.0.0.0:8555:8555"
       - "0.0.0.0:1935:1935"
@@ -19333,7 +19333,7 @@ def _run_tvr_deploy(settings):
         admin_pass = settings.get('tak_video_restreamer_admin_password') or _sec.token_hex(16)
         secret_key = settings.get('tak_video_restreamer_secret_key') or _sec.token_hex(32)
         fqdn = settings.get('fqdn', '').strip()
-        cors_origins = f'https://{fqdn}' if fqdn else 'http://localhost:3000'
+        cors_origins = f'https://{fqdn}' if fqdn else 'http://localhost:3100'
 
         compose_content = TVR_DOCKER_COMPOSE.format(
             tvr_dir=tvr_dir,
@@ -19367,7 +19367,8 @@ def _run_tvr_deploy(settings):
             _sp.run(['ufw', 'allow', port_proto], capture_output=True)
             plog(f'  ✓ ufw allow {port_proto}')
         # Block direct access to web UI and HLS — Caddy is the only entry point
-        for port_proto in ['3000/tcp', '8888/tcp']:
+        # TVR web UI is on host port 3100 (not 3000 — that's TAK Portal)
+        for port_proto in ['3100/tcp', '8888/tcp']:
             _sp.run(['ufw', 'deny', port_proto], capture_output=True)
             plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
 
@@ -19399,7 +19400,7 @@ def _run_tvr_deploy(settings):
         plog('')
         plog('✓ TAK Video Restreamer deployed successfully.')
         plog(f'  Web UI: https://{fqdn}/  (admin / {admin_pass})' if fqdn else
-             f'  Web UI: http://localhost:3000/  (admin / {admin_pass})')
+             f'  Web UI: http://localhost:3100/  (admin / {admin_pass})')
         plog('  RTSP:   rtsp://<host>:8554/<stream>')
         plog('  RTSPS:  rtsps://<host>:8555/<stream>')
         plog('  SRT:    srt://<host>:8890?streamid=publish:<stream>')
