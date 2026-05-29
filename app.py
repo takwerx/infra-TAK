@@ -48526,8 +48526,7 @@ TVR_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><me
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
 <style>
-'''
-+ BASE_CSS + '''
+''' + BASE_CSS + '''
 .log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
 .url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
 .url-row:last-child{border-bottom:none}
