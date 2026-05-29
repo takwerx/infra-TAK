@@ -1212,7 +1212,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         parts.append(link('/mediamtx', f'<img src="{html.escape(MEDIAMTX_LOGO_URL)}" alt="MediaMTX" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'MediaMTX'))
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
-        parts.append(link('/tak-video-restreamer', '<img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:36px;width:auto;max-width:100px;object-fit:contain;display:block">', 'TAK Video Restreamer'))
+        parts.append(link('/tak-video-restreamer', '<img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -12765,6 +12765,35 @@ def _get_webodm_version_info():
     return info
 
 
+def _get_tvr_version_info():
+    """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based)."""
+    import subprocess as _sp
+    info = {'version': '', 'update_available': False, 'latest': None}
+    tvr_dir = os.path.expanduser('~/tak-video-restreamer')
+    try:
+        r = _sp.run(['git', 'rev-parse', '--short', 'HEAD'],
+                    capture_output=True, text=True, timeout=5, cwd=tvr_dir)
+        if r.returncode == 0:
+            info['version'] = r.stdout.strip()
+    except Exception:
+        pass
+    try:
+        import urllib.request as _ur, json as _json
+        req = _ur.Request(
+            'https://api.github.com/repos/raytheonbbn/tak-video-restreamer/commits/main',
+            headers={'User-Agent': 'infra-TAK'})
+        resp = _ur.urlopen(req, timeout=8)
+        data = _json.loads(resp.read())
+        latest = (data.get('sha') or '')[:7]
+        if latest:
+            info['latest'] = latest
+            if info['version'] and info['version'] != latest:
+                info['update_available'] = True
+    except Exception:
+        pass
+    return info
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards."""
     modules = detect_modules()
@@ -12797,6 +12826,8 @@ def get_all_module_versions():
         result['fail2ban'] = _get_fail2ban_version_info()
     if modules.get('webodm', {}).get('installed'):
         result['webodm'] = _get_webodm_version_info()
+    if modules.get('tak_video_restreamer', {}).get('installed'):
+        result['tak_video_restreamer'] = _get_tvr_version_info()
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -18483,11 +18514,13 @@ def tvr_page():
     tvr_commit = settings.get('tak_video_restreamer_commit_sha', '')
     fqdn = settings.get('fqdn', '')
     server_ip = settings.get('server_ip', '')
+    tvr_vinfo = _get_tvr_version_info() if tvr.get('installed') else {}
     r = make_response(render_template_string(TVR_TEMPLATE,
         settings=settings, modules=modules, tvr=tvr,
         tvr_host=tvr_host, tvr_url=tvr_url,
         tvr_admin_pass=tvr_admin_pass,
         tvr_commit=tvr_commit,
+        tvr_vinfo=tvr_vinfo,
         mediamtx_conflict=mediamtx_conflict,
         fqdn=fqdn, server_ip=server_ip,
         deploying=_tvr_deploy_status.get('running', False),
@@ -18571,6 +18604,66 @@ def tvr_uninstall():
     generate_caddyfile(s)
     _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
     return jsonify({'success': True})
+
+
+_tvr_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _run_tvr_update():
+    import subprocess as _sp
+    global _tvr_update_status
+    log = []
+    def plog(msg):
+        log.append(msg)
+        _tvr_update_status['log'] = list(log)
+    try:
+        plog('━━━ Step 1/3: Pulling latest source ━━━')
+        r = _sp.run(['git', 'pull', '--ff-only'],
+                    capture_output=True, text=True, timeout=120, cwd=TVR_INSTALL_DIR)
+        plog((r.stdout + r.stderr).strip() or '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'git pull failed: {r.stderr[:300]}')
+        r2 = _sp.run(['git', 'rev-parse', '--short', 'HEAD'],
+                     capture_output=True, text=True, timeout=5, cwd=TVR_INSTALL_DIR)
+        new_sha = r2.stdout.strip()
+        plog(f'✓ Now at commit {new_sha}')
+
+        plog('')
+        plog('━━━ Step 2/3: Rebuilding Docker image ━━━')
+        compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build'],
+                    capture_output=True, text=True, timeout=600, cwd=TVR_INSTALL_DIR)
+        plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
+
+        plog('')
+        plog('━━━ Step 3/3: Saving new SHA ━━━')
+        s = load_settings()
+        s['tak_video_restreamer_commit_sha'] = new_sha
+        save_settings(s)
+        plog(f'✓ TAK Video Restreamer updated to {new_sha}')
+        _tvr_update_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog(f'ERROR: {exc}')
+        _tvr_update_status.update({'running': False, 'complete': False, 'error': str(exc)})
+
+
+@app.route('/api/tak-video-restreamer/update', methods=['POST'])
+@login_required
+def tvr_update():
+    global _tvr_update_status
+    if _tvr_update_status.get('running'):
+        return jsonify({'started': False, 'error': 'Update already in progress'})
+    _tvr_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
+    threading.Thread(target=_run_tvr_update, daemon=True).start()
+    return jsonify({'started': True})
+
+
+@app.route('/api/tak-video-restreamer/update-status')
+@login_required
+def tvr_update_status_api():
+    return jsonify(_tvr_update_status)
 
 
 def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, settings, plog=None):
@@ -48582,18 +48675,29 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
 {% else %}
 
+{% if tvr_vinfo.get('update_available') %}
+<div style="background:rgba(6,182,212,.08);border:1px solid rgba(6,182,212,.3);border-radius:10px;padding:12px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px">
+  <span style="color:var(--cyan);font-size:13px;font-weight:600">⬆ Update available — commit {{ tvr_vinfo.get('latest') }}</span>
+  <button class="btn btn-primary" style="font-size:11px;margin-left:auto" id="updateBtn" onclick="startUpdate()">Update Now</button>
+</div>
+<div id="updateCard" style="display:none" class="card">
+  <div class="card-title">Update Log</div>
+  <div class="log-box" id="updateLogBox"></div>
+</div>
+{% endif %}
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
   <div class="card" style="margin-bottom:0">
     <div class="card-title">Status</div>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
       <span style="width:8px;height:8px;border-radius:50%;display:inline-block;background:{% if tvr.get('running') %}var(--green){% else %}var(--red){% endif %}"></span>
       <span style="font-weight:600">{% if tvr.get('running') %}Running{% else %}Stopped{% endif %}</span>
-      {% if tvr_commit %}<span style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)">SHA {{ tvr_commit }}</span>{% endif %}
+      {% if tvr_vinfo.get('version') %}<span style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)">SHA {{ tvr_vinfo.get('version') }}</span>{% elif tvr_commit %}<span style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)">SHA {{ tvr_commit }}</span>{% endif %}
     </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <button class="btn btn-primary" style="font-size:11px" onclick="control('start')">Start</button>
       <button class="btn btn-danger" style="font-size:11px" onclick="control('stop')">Stop</button>
       <button class="btn btn-secondary" style="font-size:11px" onclick="control('restart')">Restart</button>
+      <button class="btn btn-danger" style="font-size:11px;margin-left:auto" onclick="doUninstall()">Remove</button>
     </div>
   </div>
   <div class="card" style="margin-bottom:0">
@@ -48622,11 +48726,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="log-box" id="logBox">Loading...</div>
 </div>
 
-<div class="card" style="border-color:rgba(239,68,68,.2)">
-  <div class="card-title" style="color:var(--red)">Uninstall</div>
-  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">Stops and removes the container. Data in <code style="font-size:11px">~/tak-video-restreamer/data/</code> is preserved.</p>
-  <button class="btn btn-danger" onclick="doUninstall()">Uninstall TAK Video Restreamer</button>
-</div>
 {% endif %}
 
 </div>
@@ -48676,10 +48775,32 @@ function togglePw(){
   f.textContent = f.textContent.startsWith('\u2022') ? v.value : '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022';
 }
 function doUninstall(){
-  let pw=prompt('Enter infra-TAK admin password to confirm uninstall:');
+  let pw=prompt('Enter infra-TAK admin password to confirm removal:');
   if(!pw) return;
   fetch('/api/tak-video-restreamer/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
     .then(r=>r.json()).then(d=>{ if(d.success){ location.href='/marketplace'; } else{ alert(d.error||'Uninstall failed'); } });
+}
+let updatePolling=false;
+function startUpdate(){
+  let btn=document.getElementById('updateBtn');
+  if(btn) btn.disabled=true;
+  let card=document.getElementById('updateCard');
+  if(card) card.style.display='';
+  fetch('/api/tak-video-restreamer/update',{method:'POST',credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{
+      if(d.started){ updatePolling=true; pollUpdate(); }
+      else{ alert('Update failed: '+(d.error||'unknown')); }
+    });
+}
+function pollUpdate(){
+  if(!updatePolling) return;
+  fetch('/api/tak-video-restreamer/update-status',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+    let box=document.getElementById('updateLogBox');
+    if(box){ box.innerHTML=(d.log||[]).map(l=>'<div>'+l.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join(''); box.scrollTop=box.scrollHeight; }
+    if(d.complete){ updatePolling=false; setTimeout(()=>location.reload(),2000); }
+    else if(d.error&&!d.running){ updatePolling=false; }
+    else{ setTimeout(pollUpdate,2000); }
+  }).catch(()=>setTimeout(pollUpdate,3000));
 }
 fetchLogs();
 {% endif %}
