@@ -25823,7 +25823,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
               <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
               <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">requires {{ p.requires }}</span>
             </div>
-            <a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>
+            {% if p.repo %}<a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>{% elif p.local %}<span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">local dev (dev branch only)</span>{% endif %}
             {% if p.installed and p.sha %}
             <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.sha }}{% if p.update_available %} <span style="color:var(--cyan);margin-left:6px">update available</span>{% endif %}</div>
             {% endif %}
