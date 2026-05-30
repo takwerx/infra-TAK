@@ -12581,8 +12581,9 @@ def _get_cloudtak_version_info():
         if rv.returncode == 0 and rv.stdout.strip():
             out['version'] = rv.stdout.strip().lstrip('vV')
     r = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-    if r.returncode == 0 and (r.stdout or '').strip():
-        log_r = subprocess.run('docker logs cloudtak-api --tail 150 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+    _ct_api_id = (r.stdout or '').strip().splitlines()[0].strip() if r.returncode == 0 else ''
+    if _ct_api_id:
+        log_r = subprocess.run(f'docker logs {_ct_api_id} --tail 150 2>&1', shell=True, capture_output=True, text=True, timeout=10)
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
