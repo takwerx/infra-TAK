@@ -17301,6 +17301,14 @@ def run_cloudtak_update():
                 plog("✗ ~/CloudTAK not found — use Deploy instead")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            plugins_base = os.path.join(cloudtak_dir, 'api', 'web', 'plugins')
+            # Note which catalog plugins are installed before checkout.
+            # git shallow-fetch checkouts can wipe untracked subdirectories.
+            pre_installed = {
+                p['install_dir']: p for p in CLOUDTAK_PLUGINS
+                if os.path.isdir(os.path.join(plugins_base, p['install_dir']))
+                   or os.path.islink(os.path.join(plugins_base, p['install_dir']))
+            }
             # Reset local modifications before checkout — patches (nginx, port
             # bindings) live in docker-compose.override.yml which is untracked, so
             # discarding tracked-file dirt is safe and mirrors the TAK Portal update path.
@@ -17319,6 +17327,22 @@ def run_cloudtak_update():
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # Restore any catalog plugins that the checkout wiped.
+            os.makedirs(plugins_base, exist_ok=True)
+            for install_dir, p in pre_installed.items():
+                dest = os.path.join(plugins_base, install_dir)
+                if not os.path.exists(dest) and not os.path.islink(dest):
+                    local_path = p.get('local_path')
+                    repo       = p.get('repo')
+                    if local_path and os.path.isdir(local_path):
+                        os.symlink(local_path, dest)
+                        plog(f"  Restored plugin (symlink): {p['name']}")
+                    elif repo:
+                        plog(f"  Restoring plugin (git clone): {p['name']}…")
+                        subprocess.run(['git', 'clone', repo, dest], capture_output=True, timeout=120)
+                        plog(f"  Restored plugin: {p['name']}")
+                    else:
+                        plog(f"  ⚠ Plugin '{p['name']}' was wiped — no repo or local_path to restore from")
         plog(f"✓ Checked out {release_tag or 'latest HEAD'}")
 
         plog("")
