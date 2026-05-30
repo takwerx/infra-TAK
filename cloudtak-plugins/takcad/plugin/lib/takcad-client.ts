@@ -9,6 +9,7 @@
  * DEL  /api/marti/plugins/takcad/submit?fn=<method>&uid=<uid>
  */
 
+import { std } from '../../../src/std.ts';
 import type {
     IncidentRef, IncidentMetadata, IncidentTypeRef,
     VehicleRef, VehicleType,
@@ -16,6 +17,8 @@ import type {
     ResponseMessage,
 } from './takcad-types.ts';
 
+// Routed through CloudTAK's std() helper so requests carry the user's Bearer
+// token (from Capacitor Preferences). Raw fetch() has no auth → "No Auth Present".
 const BASE     = '/api/marti/plugins/takcad/submit';
 const BASE_PUT = '/api/marti/plugins/takcad/submit/result';
 
@@ -28,34 +31,16 @@ export class TakCadError extends Error {
 
 async function cadGet<T>(fn: string, params: Record<string, string> = {}): Promise<T> {
     const qs = new URLSearchParams({ fn, ...params });
-    const resp = await fetch(`${BASE}?${qs}`);
-    if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        throw new TakCadError(`${fn} failed (${resp.status}): ${text}`);
-    }
-    return resp.json() as Promise<T>;
+    return await std(`${BASE}?${qs.toString()}`, { method: 'GET' }) as T;
 }
 
 async function cadPut<T>(fn: string, body: unknown): Promise<T> {
-    const resp = await fetch(`${BASE_PUT}?fn=${encodeURIComponent(fn)}`, {
-        method:  'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(body),
-    });
-    if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        throw new TakCadError(`${fn} failed (${resp.status}): ${text}`);
-    }
-    return resp.json() as Promise<T>;
+    return await std(`${BASE_PUT}?fn=${encodeURIComponent(fn)}`, { method: 'PUT', body }) as T;
 }
 
 async function cadDelete(fn: string, uid: string): Promise<void> {
     const qs = new URLSearchParams({ fn, uid });
-    const resp = await fetch(`${BASE}?${qs}`, { method: 'DELETE' });
-    if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        throw new TakCadError(`${fn} failed (${resp.status}): ${text}`);
-    }
+    await std(`${BASE}?${qs.toString()}`, { method: 'DELETE' });
 }
 
 // ── Incidents ────────────────────────────────────────────────────────────────
