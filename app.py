@@ -12533,10 +12533,9 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
                 _cloudtak_release_cache['ts'] = _time.time()
             return tag
     except Exception:
-        # During deploy (use_cache=False) do not use stale cache — return None so we clone default branch
-        if not use_cache:
-            return None
-        return _cloudtak_release_cache.get('tag')
+        # Stale cache is better than nothing — return it regardless of use_cache so that
+        # a GitHub rate-limit or cold-start doesn't hard-block the update flow.
+        return _cloudtak_release_cache.get('tag') or None
 
 
 def _get_cloudtak_version_info():
@@ -17273,10 +17272,9 @@ def run_cloudtak_update():
         plog("━━━ Step 1/3: Fetching latest stable release ━━━")
         release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
         if not release_tag:
-            plog("✗ Could not fetch latest release tag from GitHub")
-            cloudtak_deploy_status.update({'running': False, 'error': True})
-            return
-        plog(f"  Target: {release_tag}")
+            plog("  ⚠ Could not fetch release tag from GitHub (rate limit or network) — will pull latest HEAD instead")
+        else:
+            plog(f"  Target: {release_tag}")
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
@@ -17302,20 +17300,25 @@ def run_cloudtak_update():
                 plog("✗ ~/CloudTAK not found — use Deploy instead")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            # Reset local modifications before tag checkout — patches (nginx, port
+            # Reset local modifications before checkout — patches (nginx, port
             # bindings) live in docker-compose.override.yml which is untracked, so
             # discarding tracked-file dirt is safe and mirrors the TAK Portal update path.
             subprocess.run(
                 f'git -c safe.directory={cloudtak_dir} -C {cloudtak_dir} checkout -- .',
                 shell=True, capture_output=True, text=True, timeout=15)
-            r = subprocess.run(
-                f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
-                shell=True, capture_output=True, text=True, timeout=120)
+            if release_tag:
+                r = subprocess.run(
+                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
+                    shell=True, capture_output=True, text=True, timeout=120)
+            else:
+                r = subprocess.run(
+                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull',
+                    shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-        plog(f"✓ Checked out {release_tag}")
+        plog(f"✓ Checked out {release_tag or 'latest HEAD'}")
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
