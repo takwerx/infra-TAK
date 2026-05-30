@@ -1,6 +1,7 @@
 import type { App } from 'vue';
 import { markRaw } from 'vue';
-import type { PluginAPI, PluginInstance } from '@tak-ps/cloudtak';
+import type { PluginAPI, PluginInstance } from '../../plugin.ts';
+import type { MenuItemConfig } from '../../plugin.ts';
 import { IconBuildingEstate } from '@tabler/icons-vue';
 import CadMain from './components/CadMain.vue';
 
@@ -35,10 +36,14 @@ export default class TakCadPlugin implements PluginInstance {
     }
 
     async disable(): Promise<void> {
-        try { this.api.menu.remove(MENU_KEY); }          catch { /* ignore */ }
-        try { this.api.router.removeRoute(ROUTE_NAME); } catch { /* ignore */ }
+        // Only remove the menu item. Do NOT remove the route: CloudTAK calls
+        // disable() on every page load before enable() (the isLoaded watcher
+        // fires immediately with isLoaded=false), so removing the route here
+        // makes the subsequent enable() menu.add fail with "route not found".
+        // The route is registered once in install() and left in place — same
+        // pattern as the working ping plugin.
+        try { this.api.menu.remove(MENU_KEY); } catch { /* ignore */ }
     }
 }
 
 type MenuItemIconType = NonNullable<Parameters<PluginAPI['menu']['add']>[0]['icon']>;
-type MenuItemConfig   = Parameters<PluginAPI['menu']['add']>[0];
