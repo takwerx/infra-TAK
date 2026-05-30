@@ -16136,8 +16136,11 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 return
             os.makedirs(plugins_base, exist_ok=True)
             if local_path:
-                plog(f'Linking local plugin source: {local_path} → {install_path}')
-                os.symlink(local_path, install_path)
+                # Copy (not symlink) — Docker COPY follows the symlink as-is and
+                # the host path won't exist inside the container, breaking Vite's glob.
+                import shutil
+                plog(f'Copying local plugin source: {local_path} → {install_path}')
+                shutil.copytree(local_path, install_path)
             else:
                 plog('Cloning plugin repository...')
                 if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
@@ -16151,7 +16154,13 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
             if local_path:
-                plog('Local plugin — source is live via symlink, no pull needed. Rebuilding…')
+                # Re-copy from source so any code changes in the repo are picked up.
+                import shutil
+                plog(f'Re-copying local plugin source: {local_path} → {install_path}')
+                shutil.rmtree(install_path, ignore_errors=True)
+                if os.path.islink(install_path):
+                    os.unlink(install_path)
+                shutil.copytree(local_path, install_path)
             else:
                 if not run_cmd(['git', '-C', install_path, 'pull']):
                     cloudtak_plugin_status.update({'running': False, 'error': True})
@@ -16163,13 +16172,12 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 plog('Plugin is not installed — nothing to remove')
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
+            import shutil
             if os.path.islink(install_path):
                 os.unlink(install_path)
-                plog(f'Removed symlink {install_path}')
             else:
-                import shutil
                 shutil.rmtree(install_path)
-                plog(f'Removed {install_path}')
+            plog(f'Removed {install_path}')
 
         # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
         # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).
@@ -17335,8 +17343,9 @@ def run_cloudtak_update():
                     local_path = p.get('local_path')
                     repo       = p.get('repo')
                     if local_path and os.path.isdir(local_path):
-                        os.symlink(local_path, dest)
-                        plog(f"  Restored plugin (symlink): {p['name']}")
+                        import shutil as _shutil
+                        _shutil.copytree(local_path, dest)
+                        plog(f"  Restored plugin (copy): {p['name']}")
                     elif repo:
                         plog(f"  Restoring plugin (git clone): {p['name']}…")
                         subprocess.run(['git', 'clone', repo, dest], capture_output=True, timeout=120)
