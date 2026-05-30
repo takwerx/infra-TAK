@@ -1,41 +1,70 @@
 <template>
     <div class='d-flex flex-column h-100 overflow-hidden'>
-
         <!-- ── Incident List ──────────────────────────────────── -->
         <template v-if='view === "list"'>
             <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
                 <div class='d-flex rounded overflow-hidden border border-secondary flex-grow-1'>
                     <button
-                        v-for='t in LIST_TABS' :key='t.key'
+                        v-for='t in LIST_TABS'
+                        :key='t.key'
                         class='flex-fill btn btn-sm py-1 rounded-0 border-0 small'
                         :class='listTab === t.key ? "bg-secondary text-white" : "text-white-50"'
                         @click='listTab = t.key'
-                    >{{ t.label }} <span class='badge' :class='listTab === t.key ? "bg-warning text-dark" : "bg-dark text-white-50"'>{{ t.key === 'active' ? activeIncidents.length : cancelledIncidents.length }}</span></button>
+                    >
+                        {{ t.label }} <span
+                            class='badge'
+                            :class='listTab === t.key ? "bg-warning text-dark" : "bg-dark text-white-50"'
+                        >{{ t.key === 'active' ? activeIncidents.length : cancelledIncidents.length }}</span>
+                    </button>
                 </div>
-                <button class='btn btn-sm btn-warning' @click='openCreate'>+ New</button>
+                <button
+                    class='btn btn-sm btn-warning'
+                    @click='openCreate'
+                >
+                    + New
+                </button>
             </div>
 
             <!-- Sort bar -->
             <div class='d-flex px-3 py-1 border-bottom text-white-50 small flex-shrink-0'>
-                <button v-for='col in SORT_COLS' :key='col.key'
+                <button
+                    v-for='col in SORT_COLS'
+                    :key='col.key'
                     class='btn btn-sm btn-link p-0 text-white-50 small me-3 text-decoration-none'
                     @click='toggleSort(col.key)'
                 >
                     {{ col.label }}
                     <span v-if='sortCol === col.key'>{{ sortAsc ? '↑' : '↓' }}</span>
                 </button>
-                <span class='ms-auto text-white-25 font-monospace' style='font-size:10px'>{{ lastRefreshed }}</span>
+                <span
+                    class='ms-auto text-white-25 font-monospace'
+                    style='font-size:10px'
+                >{{ lastRefreshed }}</span>
             </div>
 
             <!-- List -->
             <div class='flex-grow-1 overflow-auto'>
-                <div v-if='loading && !displayedIncidents.length' class='text-center text-white-50 py-4 small'>
+                <div
+                    v-if='loading && !displayedIncidents.length'
+                    class='text-center text-white-50 py-4 small'
+                >
                     <span class='spinner-border spinner-border-sm me-2' />Loading…
                 </div>
-                <div v-else-if='loadError' class='alert alert-danger m-3 py-2 small'>{{ loadError }}</div>
-                <div v-else-if='!displayedIncidents.length' class='text-center text-white-50 py-4 small'>No incidents</div>
                 <div
-                    v-for='inc in displayedIncidents' :key='inc.uid'
+                    v-else-if='loadError'
+                    class='alert alert-danger m-3 py-2 small'
+                >
+                    {{ loadError }}
+                </div>
+                <div
+                    v-else-if='!displayedIncidents.length'
+                    class='text-center text-white-50 py-4 small'
+                >
+                    No incidents
+                </div>
+                <div
+                    v-for='inc in displayedIncidents'
+                    :key='inc.uid'
                     class='d-flex align-items-start px-3 py-2 border-bottom incident-row'
                     role='button'
                     @click='openDetail(inc.uid)'
@@ -43,201 +72,400 @@
                     <div class='flex-grow-1 overflow-hidden'>
                         <div class='d-flex align-items-center gap-2'>
                             <span class='fw-semibold small text-white text-truncate'>{{ inc.incidentName }}</span>
-                            <span class='badge small' :class='statusBadge(inc.status)'>{{ inc.status }}</span>
+                            <span
+                                class='badge small'
+                                :class='statusBadge(inc.status)'
+                            >{{ inc.status }}</span>
                         </div>
-                        <div class='small text-white-50 text-truncate'>{{ formatAddress(inc.location) }}</div>
+                        <div class='small text-white-50 text-truncate'>
+                            {{ formatAddress(inc.location) }}
+                        </div>
                         <div class='d-flex gap-3 small text-white-50 mt-1'>
                             <span>{{ inc.incidentType?.name ?? '—' }}</span>
                             <span v-if='inc.dispatcher'>{{ inc.dispatcher }}</span>
                         </div>
                     </div>
                     <div class='text-end ms-2 flex-shrink-0'>
-                        <div class='small text-white-50'>{{ shortTime(inc.incidentTime) }}</div>
-                        <div class='small text-warning'>{{ inc.vehiclesResponding?.length ?? 0 }}🚗 {{ inc.personnelResponding?.length ?? 0 }}👤</div>
+                        <div class='small text-white-50'>
+                            {{ shortTime(inc.incidentTime) }}
+                        </div>
                     </div>
                 </div>
             </div>
         </template>
 
         <!-- ── Incident Detail ────────────────────────────────── -->
-        <template v-else-if="view === 'detail' && detailIncident">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2">
-                <button class="btn btn-sm btn-outline-secondary" @click="view = 'list'">← Back</button>
-                <span class="fw-semibold text-truncate flex-grow-1">{{ detailIncident.incidentName }}</span>
-                <span class="badge" :class="statusBadge(detailIncident.status)">{{ detailIncident.status }}</span>
+        <template v-else-if='view === "detail" && detailIncident'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
+                <button
+                    class='btn btn-sm btn-outline-secondary'
+                    @click='view = "list"'
+                >
+                    ← Back
+                </button>
+                <span class='fw-semibold text-truncate flex-grow-1'>{{ detailIncident.incidentName }}</span>
+                <span
+                    class='badge'
+                    :class='statusBadge(detailIncident.status)'
+                >{{ detailIncident.status }}</span>
             </div>
 
-            <div class="flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3">
-
+            <div class='flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3'>
                 <!-- Core info -->
-                <div class="card bg-dark border-secondary">
-                    <div class="card-body py-2 px-3 d-flex flex-column gap-1 small">
-                        <div class="row g-1">
-                            <div class="col-4 text-white-50">Type</div>
-                            <div class="col-8 text-white">{{ detailIncident.incidentType?.name }}</div>
-                            <div class="col-4 text-white-50">Time</div>
-                            <div class="col-8 text-white">{{ formatTime(detailIncident.incidentTime) }}</div>
-                            <div class="col-4 text-white-50">Location</div>
-                            <div class="col-8 text-white">{{ formatAddress(detailIncident.location) }}</div>
-                            <template v-if="detailIncident.location?.coords">
-                                <div class="col-4 text-white-50">Coords</div>
-                                <div class="col-8 font-monospace text-white-50" style="font-size:11px">
+                <div class='card bg-dark border-secondary'>
+                    <div class='card-body py-2 px-3 d-flex flex-column gap-1 small'>
+                        <div class='row g-1'>
+                            <div class='col-4 text-white-50'>
+                                Type
+                            </div>
+                            <div class='col-8 text-white'>
+                                {{ detailIncident.incidentType?.name }}
+                            </div>
+                            <div class='col-4 text-white-50'>
+                                Time
+                            </div>
+                            <div class='col-8 text-white'>
+                                {{ formatTime(detailIncident.incidentTime) }}
+                            </div>
+                            <div class='col-4 text-white-50'>
+                                Location
+                            </div>
+                            <div class='col-8 text-white'>
+                                {{ formatAddress(detailIncident.location) }}
+                            </div>
+                            <template v-if='detailIncident.location?.coords'>
+                                <div class='col-4 text-white-50'>
+                                    Coords
+                                </div>
+                                <div
+                                    class='col-8 font-monospace text-white-50'
+                                    style='font-size:11px'
+                                >
                                     {{ detailIncident.location.coords.latitudeDeg.toFixed(6) }},
                                     {{ detailIncident.location.coords.longitudeDeg.toFixed(6) }}
                                 </div>
                             </template>
-                            <div class="col-4 text-white-50">Dispatcher</div>
-                            <div class="col-8 text-white">{{ detailIncident.dispatcher || '—' }}</div>
-                            <template v-if="detailIncident.details">
-                                <div class="col-4 text-white-50">Details</div>
-                                <div class="col-8 text-white" style="white-space:pre-wrap">{{ detailIncident.details }}</div>
+                            <div class='col-4 text-white-50'>
+                                Dispatcher
+                            </div>
+                            <div class='col-8 text-white'>
+                                {{ detailIncident.dispatcher || '—' }}
+                            </div>
+                            <template v-if='detailIncident.details'>
+                                <div class='col-4 text-white-50'>
+                                    Details
+                                </div>
+                                <div
+                                    class='col-8 text-white'
+                                    style='white-space:pre-wrap'
+                                >
+                                    {{ detailIncident.details }}
+                                </div>
                             </template>
-                            <template v-if="detailIncident.firstResponderArrivalTime">
-                                <div class="col-4 text-white-50">Arrival</div>
-                                <div class="col-8 text-white">{{ formatTime(detailIncident.firstResponderArrivalTime) }}</div>
+                            <template v-if='detailIncident.firstResponderArrivalTime'>
+                                <div class='col-4 text-white-50'>
+                                    Arrival
+                                </div>
+                                <div class='col-8 text-white'>
+                                    {{ formatTime(detailIncident.firstResponderArrivalTime) }}
+                                </div>
                             </template>
                         </div>
                     </div>
                 </div>
 
                 <!-- Caller info -->
-                <template v-if="detailIncident.callerInfo">
-                    <div class="small text-white-50 fw-semibold text-uppercase">Caller</div>
-                    <div class="card bg-dark border-secondary">
-                        <div class="card-body py-2 px-3 d-flex flex-column gap-1 small">
-                            <div class="row g-1">
-                                <div class="col-4 text-white-50">Name</div>
-                                <div class="col-8 text-white">{{ detailIncident.callerInfo.name || '—' }}</div>
-                                <div class="col-4 text-white-50">Phone</div>
-                                <div class="col-8 text-white">{{ detailIncident.callerInfo.phoneNumber || '—' }}</div>
-                                <div class="col-4 text-white-50">Type</div>
-                                <div class="col-8 text-white">{{ detailIncident.callerInfo.callerInfoType || '—' }}</div>
+                <template v-if='detailIncident.callerInfo'>
+                    <div class='small text-white-50 fw-semibold text-uppercase'>
+                        Caller
+                    </div>
+                    <div class='card bg-dark border-secondary'>
+                        <div class='card-body py-2 px-3 d-flex flex-column gap-1 small'>
+                            <div class='row g-1'>
+                                <div class='col-4 text-white-50'>
+                                    Name
+                                </div>
+                                <div class='col-8 text-white'>
+                                    {{ detailIncident.callerInfo.name || '—' }}
+                                </div>
+                                <div class='col-4 text-white-50'>
+                                    Phone
+                                </div>
+                                <div class='col-8 text-white'>
+                                    {{ detailIncident.callerInfo.phoneNumber || '—' }}
+                                </div>
+                                <div class='col-4 text-white-50'>
+                                    Type
+                                </div>
+                                <div class='col-8 text-white'>
+                                    {{ detailIncident.callerInfo.callerInfoType || '—' }}
+                                </div>
                             </div>
                         </div>
                     </div>
                 </template>
 
                 <!-- Responding vehicles -->
-                <div class="small text-white-50 fw-semibold text-uppercase d-flex align-items-center">
-                    <span class="me-auto">Responding Vehicles ({{ detailIncident.vehiclesResponding?.length ?? 0 }})</span>
-                    <button class="btn btn-sm btn-outline-warning py-0 px-2" @click="view = 'responders'">Manage</button>
+                <div class='small text-white-50 fw-semibold text-uppercase d-flex align-items-center'>
+                    <span class='me-auto'>Responding Vehicles ({{ detailIncident.vehiclesResponding?.length ?? 0 }})</span>
+                    <button
+                        class='btn btn-sm btn-outline-warning py-0 px-2'
+                        @click='view = "responders"'
+                    >
+                        Manage
+                    </button>
                 </div>
-                <div v-if="detailIncident.vehiclesResponding?.length" class="card bg-dark border-secondary">
-                    <div class="card-body py-1 px-3">
-                        <div v-for="vr in detailIncident.vehiclesResponding" :key="vr.vehicle.vehicleUid"
-                            class="d-flex align-items-center py-1 border-bottom border-secondary small gap-2">
-                            <span class="text-white">{{ vr.vehicle.vehicleUid }}</span>
-                            <span v-if="vr.responseStatus" class="badge bg-secondary">{{ vr.responseStatus }}</span>
-                            <span v-if="vr.eta" class="text-white-50 ms-auto">ETA {{ vr.eta }}</span>
+                <div
+                    v-if='detailIncident.vehiclesResponding?.length'
+                    class='card bg-dark border-secondary'
+                >
+                    <div class='card-body py-1 px-3'>
+                        <div
+                            v-for='vr in detailIncident.vehiclesResponding'
+                            :key='vr.vehicle.vehicleUid'
+                            class='d-flex align-items-center py-1 border-bottom border-secondary small gap-2'
+                        >
+                            <span class='text-white'>{{ vr.vehicle.vehicleUid }}</span>
+                            <span
+                                v-if='vr.responseStatus'
+                                class='badge bg-secondary'
+                            >{{ vr.responseStatus }}</span>
+                            <span
+                                v-if='vr.eta'
+                                class='text-white-50 ms-auto'
+                            >ETA {{ vr.eta }}</span>
                         </div>
                     </div>
                 </div>
-                <div v-else class="text-white-50 small">No vehicles assigned</div>
+                <div
+                    v-else
+                    class='text-white-50 small'
+                >
+                    No vehicles assigned
+                </div>
 
                 <!-- Responding personnel -->
-                <div class="small text-white-50 fw-semibold text-uppercase">Personnel ({{ detailIncident.personnelResponding?.length ?? 0 }})</div>
-                <div v-if="detailIncident.personnelResponding?.length" class="card bg-dark border-secondary">
-                    <div class="card-body py-1 px-3">
-                        <div v-for="pr in detailIncident.personnelResponding" :key="pr.personUid"
-                            class="d-flex align-items-center py-1 border-bottom border-secondary small gap-2">
-                            <span class="text-white">{{ pr.callsign }}</span>
+                <div class='small text-white-50 fw-semibold text-uppercase'>
+                    Personnel ({{ detailIncident.personnelResponding?.length ?? 0 }})
+                </div>
+                <div
+                    v-if='detailIncident.personnelResponding?.length'
+                    class='card bg-dark border-secondary'
+                >
+                    <div class='card-body py-1 px-3'>
+                        <div
+                            v-for='pr in detailIncident.personnelResponding'
+                            :key='pr.personUid'
+                            class='d-flex align-items-center py-1 border-bottom border-secondary small gap-2'
+                        >
+                            <span class='text-white'>{{ pr.callsign }}</span>
                         </div>
                     </div>
                 </div>
-                <div v-else class="text-white-50 small">No personnel assigned</div>
+                <div
+                    v-else
+                    class='text-white-50 small'
+                >
+                    No personnel assigned
+                </div>
 
                 <!-- Notes -->
-                <div class="small text-white-50 fw-semibold text-uppercase">Notes</div>
-                <div v-if="detailIncident.notes?.length" class="d-flex flex-column gap-1">
-                    <div v-for="note in detailIncident.notes" :key="note.uid"
-                        class="card bg-dark border-secondary">
-                        <div class="card-body py-1 px-3 small">
-                            <div class="d-flex align-items-center gap-2 text-white-50 mb-1">
-                                <span class="fw-semibold text-white">{{ note.creator }}</span>
+                <div class='small text-white-50 fw-semibold text-uppercase'>
+                    Notes
+                </div>
+                <div
+                    v-if='detailIncident.notes?.length'
+                    class='d-flex flex-column gap-1'
+                >
+                    <div
+                        v-for='note in detailIncident.notes'
+                        :key='note.uid'
+                        class='card bg-dark border-secondary'
+                    >
+                        <div class='card-body py-1 px-3 small'>
+                            <div class='d-flex align-items-center gap-2 text-white-50 mb-1'>
+                                <span class='fw-semibold text-white'>{{ note.creator }}</span>
                                 <span>{{ formatTime(note.timestamp) }}</span>
-                                <button class="btn btn-sm btn-link text-danger py-0 px-1 ms-auto text-decoration-none"
-                                    @click="deleteNote(note.uid)">✕</button>
+                                <button
+                                    class='btn btn-sm btn-link text-danger py-0 px-1 ms-auto text-decoration-none'
+                                    @click='deleteNote(note.uid)'
+                                >
+                                    ✕
+                                </button>
                             </div>
-                            <div class="text-white" style="white-space:pre-wrap">{{ note.info }}</div>
+                            <div
+                                class='text-white'
+                                style='white-space:pre-wrap'
+                            >
+                                {{ note.info }}
+                            </div>
                         </div>
                     </div>
                 </div>
-                <div class="input-group">
-                    <input v-model="newNote" type="text" class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="Add a note…" @keyup.enter="addNote" />
-                    <button class="btn btn-sm btn-secondary" :disabled="!newNote.trim()" @click="addNote">Add</button>
+                <div class='input-group'>
+                    <input
+                        v-model='newNote'
+                        type='text'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='Add a note…'
+                        @keyup.enter='addNote'
+                    >
+                    <button
+                        class='btn btn-sm btn-secondary'
+                        :disabled='!newNote.trim()'
+                        @click='addNote'
+                    >
+                        Add
+                    </button>
                 </div>
 
                 <!-- Actions -->
-                <div v-if="detailError" class="alert alert-danger py-2 small">{{ detailError }}</div>
-                <div class="d-flex gap-2 flex-wrap">
-                    <button class="btn btn-sm btn-outline-warning" @click="openEdit">Edit</button>
-                    <button v-if="isActive(detailIncident.status)"
-                        class="btn btn-sm btn-outline-secondary" :disabled="saving" @click="closeIncident">
-                        <span v-if="saving" class="spinner-border spinner-border-sm me-1" />Close Incident
-                    </button>
-                    <button class="btn btn-sm btn-outline-danger ms-auto" :disabled="saving" @click="confirmDelete">Delete</button>
+                <div
+                    v-if='detailError'
+                    class='alert alert-danger py-2 small'
+                >
+                    {{ detailError }}
                 </div>
-
+                <div class='d-flex gap-2 flex-wrap'>
+                    <button
+                        class='btn btn-sm btn-outline-warning'
+                        @click='openEdit'
+                    >
+                        Edit
+                    </button>
+                    <button
+                        v-if='isActive(detailIncident.status)'
+                        class='btn btn-sm btn-outline-secondary'
+                        :disabled='saving'
+                        @click='closeIncident'
+                    >
+                        <span
+                            v-if='saving'
+                            class='spinner-border spinner-border-sm me-1'
+                        />Close Incident
+                    </button>
+                    <button
+                        class='btn btn-sm btn-outline-danger ms-auto'
+                        :disabled='saving'
+                        @click='confirmDelete'
+                    >
+                        Delete
+                    </button>
+                </div>
             </div>
         </template>
 
         <!-- ── Responder Manager ───────────────────────────────── -->
-        <template v-else-if="view === 'responders' && detailIncident">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2">
-                <button class="btn btn-sm btn-outline-secondary" @click="view = 'detail'">← Back</button>
-                <span class="fw-semibold">Assign Responders</span>
+        <template v-else-if='view === "responders" && detailIncident'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
+                <button
+                    class='btn btn-sm btn-outline-secondary'
+                    @click='view = "detail"'
+                >
+                    ← Back
+                </button>
+                <span class='fw-semibold'>Assign Responders</span>
             </div>
-            <div class="flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3">
-
+            <div class='flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3'>
                 <!-- Vehicles -->
-                <div class="small text-white-50 fw-semibold text-uppercase">Vehicles</div>
-                <div v-for="veh in vehicles" :key="veh.uid" class="d-flex align-items-center gap-2 py-1 border-bottom border-secondary small">
-                    <input type="checkbox"
-                        :checked="isVehicleAssigned(veh.uid)"
-                        @change="toggleVehicle(veh.uid)"
-                        class="form-check-input mt-0" />
-                    <span class="text-white">{{ veh.callsign }}</span>
-                    <span v-if="veh.vehicleType" class="text-white-50">{{ veh.vehicleType.name }}</span>
-                    <span v-if="veh.incidentsRequestingThisVehicle?.length" class="ms-auto badge bg-warning text-dark small">{{ veh.incidentsRequestingThisVehicle.length }} inc</span>
+                <div class='small text-white-50 fw-semibold text-uppercase'>
+                    Vehicles
                 </div>
-                <div v-if="!vehicles.length" class="text-white-50 small">No vehicles registered</div>
+                <div
+                    v-for='veh in vehicles'
+                    :key='veh.uid'
+                    class='d-flex align-items-center gap-2 py-1 border-bottom border-secondary small'
+                >
+                    <input
+                        type='checkbox'
+                        :checked='isVehicleAssigned(veh.uid)'
+                        class='form-check-input mt-0'
+                        @change='toggleVehicle(veh.uid)'
+                    >
+                    <span class='text-white'>{{ veh.callsign }}</span>
+                    <span
+                        v-if='veh.vehicleType'
+                        class='text-white-50'
+                    >{{ veh.vehicleType.name }}</span>
+                    <span
+                        v-if='veh.incidentsRequestingThisVehicle?.length'
+                        class='ms-auto badge bg-warning text-dark small'
+                    >{{ veh.incidentsRequestingThisVehicle.length }} inc</span>
+                </div>
+                <div
+                    v-if='!vehicles.length'
+                    class='text-white-50 small'
+                >
+                    No vehicles registered
+                </div>
 
                 <!-- Personnel -->
-                <div class="small text-white-50 fw-semibold text-uppercase">Personnel</div>
-                <div v-for="person in personnel" :key="person.uid" class="d-flex align-items-center gap-2 py-1 border-bottom border-secondary small">
-                    <input type="checkbox"
-                        :checked="isPersonnelAssigned(person.uid)"
-                        @change="togglePersonnel(person.uid, person.callsign)"
-                        class="form-check-input mt-0" />
-                    <span class="text-white">{{ person.callsign }}</span>
-                    <span v-if="person.roles?.length" class="text-white-50">{{ person.roles.map(r => r.name).join(', ') }}</span>
+                <div class='small text-white-50 fw-semibold text-uppercase'>
+                    Personnel
                 </div>
-                <div v-if="!personnel.length" class="text-white-50 small">No personnel registered</div>
+                <div
+                    v-for='person in personnel'
+                    :key='person.uid'
+                    class='d-flex align-items-center gap-2 py-1 border-bottom border-secondary small'
+                >
+                    <input
+                        type='checkbox'
+                        :checked='isPersonnelAssigned(person.uid)'
+                        class='form-check-input mt-0'
+                        @change='togglePersonnel(person.uid, person.callsign)'
+                    >
+                    <span class='text-white'>{{ person.callsign }}</span>
+                    <span
+                        v-if='person.roles?.length'
+                        class='text-white-50'
+                    >{{ person.roles.map(r => r.name).join(', ') }}</span>
+                </div>
+                <div
+                    v-if='!personnel.length'
+                    class='text-white-50 small'
+                >
+                    No personnel registered
+                </div>
 
-                <div v-if="detailError" class="alert alert-danger py-2 small">{{ detailError }}</div>
-                <button class="btn btn-sm btn-warning" :disabled="saving" @click="saveResponders">
-                    <span v-if="saving" class="spinner-border spinner-border-sm me-1" />Save Assignments
+                <div
+                    v-if='detailError'
+                    class='alert alert-danger py-2 small'
+                >
+                    {{ detailError }}
+                </div>
+                <button
+                    class='btn btn-sm btn-warning'
+                    :disabled='saving'
+                    @click='saveResponders'
+                >
+                    <span
+                        v-if='saving'
+                        class='spinner-border spinner-border-sm me-1'
+                    />Save Assignments
                 </button>
             </div>
         </template>
 
         <!-- ── Incident Form ──────────────────────────────────── -->
-        <template v-else-if="view === 'form'">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2">
-                <button class="btn btn-sm btn-outline-secondary" @click="cancelForm">← Back</button>
-                <span class="fw-semibold">{{ editUid ? 'Edit Incident' : 'New Incident' }}</span>
+        <template v-else-if='view === "form"'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
+                <button
+                    class='btn btn-sm btn-outline-secondary'
+                    @click='cancelForm'
+                >
+                    ← Back
+                </button>
+                <span class='fw-semibold'>{{ editUid ? 'Edit Incident' : 'New Incident' }}</span>
             </div>
-            <div class="flex-grow-1 overflow-auto p-3">
+            <div class='flex-grow-1 overflow-auto p-3'>
                 <IncidentForm
-                    :uid="editUid"
-                    :incident-types="incidentTypes"
-                    @saved="onFormSaved"
-                    @cancel="cancelForm"
+                    :uid='editUid'
+                    :incident-types='incidentTypes'
+                    @saved='onFormSaved'
+                    @cancel='cancelForm'
                 />
             </div>
         </template>
-
     </div>
 </template>
 
@@ -251,7 +479,7 @@ import {
 import type { IncidentMetadata, IncidentRef, VehicleRef, PersonRef, IncidentTypeRef, PersonCallsign, VehicleResponseStatus } from '../lib/takcad-types.ts';
 import { isActive, formatAddress, formatTime, STATUS_CANCELLED } from '../lib/takcad-types.ts';
 
-const props = defineProps<{
+const { incidentTypes, vehicles, personnel } = defineProps<{
     incidentTypes: IncidentTypeRef[];
     vehicles:      VehicleRef[];
     personnel:     PersonRef[];

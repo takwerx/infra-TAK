@@ -1,31 +1,61 @@
 <template>
     <div class='d-flex flex-column h-100 overflow-hidden'>
-
         <!-- ── Vehicle List ──────────────────────────────────── -->
         <template v-if='view === "list"'>
             <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
                 <span class='text-white-50 small me-auto'>{{ vehicles.length }} vehicles</span>
-                <button class='btn btn-sm btn-warning' @click='openCreate'>+ Add Vehicle</button>
+                <button
+                    class='btn btn-sm btn-warning'
+                    @click='openCreate'
+                >
+                    + Add Vehicle
+                </button>
             </div>
             <div class='flex-grow-1 overflow-auto'>
-                <div v-if='loading' class='text-center text-white-50 py-4 small'>
+                <div
+                    v-if='loading'
+                    class='text-center text-white-50 py-4 small'
+                >
                     <span class='spinner-border spinner-border-sm me-2' />Loading…
                 </div>
-                <div v-else-if='loadError' class='alert alert-danger m-3 py-2 small'>{{ loadError }}</div>
-                <div v-else-if='!vehicles.length' class='text-center text-white-50 py-4 small'>No vehicles registered</div>
-                <div v-for='veh in vehicles' :key='veh.uid'
+                <div
+                    v-else-if='loadError'
+                    class='alert alert-danger m-3 py-2 small'
+                >
+                    {{ loadError }}
+                </div>
+                <div
+                    v-else-if='!vehicles.length'
+                    class='text-center text-white-50 py-4 small'
+                >
+                    No vehicles registered
+                </div>
+                <div
+                    v-for='veh in vehicles'
+                    :key='veh.uid'
                     class='d-flex align-items-center px-3 py-2 border-bottom vehicle-row'
                     role='button'
-                    @click='openDetail(veh)'>
+                    @click='openDetail(veh)'
+                >
                     <div class='flex-grow-1'>
-                        <div class='fw-semibold small text-white'>{{ veh.callsign }}</div>
-                        <div class='small text-white-50'>{{ veh.vehicleType?.name ?? 'Untyped' }}</div>
+                        <div class='fw-semibold small text-white'>
+                            {{ veh.callsign }}
+                        </div>
+                        <div class='small text-white-50'>
+                            {{ veh.vehicleType?.name ?? 'Untyped' }}
+                        </div>
                     </div>
                     <div class='text-end small'>
-                        <div v-if='veh.vehiclePersonnel?.length' class='text-white-50'>
+                        <div
+                            v-if='veh.vehiclePersonnel?.length'
+                            class='text-white-50'
+                        >
                             {{ veh.vehiclePersonnel.map(p => p.callsign).join(', ') }}
                         </div>
-                        <div v-if='veh.incidentsRequestingThisVehicle?.length' class='badge bg-warning text-dark'>
+                        <div
+                            v-if='veh.incidentsRequestingThisVehicle?.length'
+                            class='badge bg-warning text-dark'
+                        >
                             {{ veh.incidentsRequestingThisVehicle.length }} incident(s)
                         </div>
                     </div>
@@ -34,104 +64,214 @@
         </template>
 
         <!-- ── Vehicle Detail / Edit ─────────────────────────── -->
-        <template v-else-if="view === 'detail' && selected">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2">
-                <button class="btn btn-sm btn-outline-secondary" @click="view = 'list'">← Back</button>
-                <span class="fw-semibold flex-grow-1">{{ selected.callsign }}</span>
+        <template v-else-if='view === "detail" && selected'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
+                <button
+                    class='btn btn-sm btn-outline-secondary'
+                    @click='view = "list"'
+                >
+                    ← Back
+                </button>
+                <span class='fw-semibold flex-grow-1'>{{ selected.callsign }}</span>
             </div>
-            <div class="flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3">
-
-                <div v-if="!editing">
-                    <div class="card bg-dark border-secondary">
-                        <div class="card-body py-2 px-3 small d-flex flex-column gap-1">
-                            <div class="row g-1">
-                                <div class="col-4 text-white-50">Callsign</div>
-                                <div class="col-8 text-white">{{ selected.callsign }}</div>
-                                <div class="col-4 text-white-50">Type</div>
-                                <div class="col-8 text-white">{{ selected.vehicleType?.name ?? '—' }}</div>
+            <div class='flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3'>
+                <div v-if='!editing'>
+                    <div class='card bg-dark border-secondary'>
+                        <div class='card-body py-2 px-3 small d-flex flex-column gap-1'>
+                            <div class='row g-1'>
+                                <div class='col-4 text-white-50'>
+                                    Callsign
+                                </div>
+                                <div class='col-8 text-white'>
+                                    {{ selected.callsign }}
+                                </div>
+                                <div class='col-4 text-white-50'>
+                                    Type
+                                </div>
+                                <div class='col-8 text-white'>
+                                    {{ selected.vehicleType?.name ?? '—' }}
+                                </div>
                             </div>
                         </div>
                     </div>
 
-                    <div v-if="selected.vehiclePersonnel?.length" class="mt-3">
-                        <div class="small text-white-50 fw-semibold text-uppercase mb-1">Personnel</div>
-                        <div class="card bg-dark border-secondary">
-                            <div class="card-body py-1 px-3">
-                                <div v-for="p in selected.vehiclePersonnel" :key="p.personUid"
-                                    class="py-1 border-bottom border-secondary small text-white">
+                    <div
+                        v-if='selected.vehiclePersonnel?.length'
+                        class='mt-3'
+                    >
+                        <div class='small text-white-50 fw-semibold text-uppercase mb-1'>
+                            Personnel
+                        </div>
+                        <div class='card bg-dark border-secondary'>
+                            <div class='card-body py-1 px-3'>
+                                <div
+                                    v-for='p in selected.vehiclePersonnel'
+                                    :key='p.personUid'
+                                    class='py-1 border-bottom border-secondary small text-white'
+                                >
                                     {{ p.callsign }}
                                 </div>
                             </div>
                         </div>
                     </div>
 
-                    <div v-if="detailError" class="alert alert-danger py-2 small mt-3">{{ detailError }}</div>
-                    <div class="d-flex gap-2 mt-3">
-                        <button class="btn btn-sm btn-outline-warning" @click="editing = true">Edit</button>
-                        <button class="btn btn-sm btn-outline-danger ms-auto" :disabled="saving" @click="confirmDelete">Delete</button>
+                    <div
+                        v-if='detailError'
+                        class='alert alert-danger py-2 small mt-3'
+                    >
+                        {{ detailError }}
+                    </div>
+                    <div class='d-flex gap-2 mt-3'>
+                        <button
+                            class='btn btn-sm btn-outline-warning'
+                            @click='editing = true'
+                        >
+                            Edit
+                        </button>
+                        <button
+                            class='btn btn-sm btn-outline-danger ms-auto'
+                            :disabled='saving'
+                            @click='confirmDelete'
+                        >
+                            Delete
+                        </button>
                     </div>
                 </div>
 
                 <!-- Inline edit form -->
-                <form v-else @submit.prevent="saveEdit" class="d-flex flex-column gap-2">
+                <form
+                    v-else
+                    class='d-flex flex-column gap-2'
+                    @submit.prevent='saveEdit'
+                >
                     <div>
-                        <label class="form-label small text-white-50 mb-1">Callsign <span class="text-danger">*</span></label>
-                        <input v-model="editForm.callsign" required type="text"
-                            class="form-control form-control-sm bg-dark text-white border-secondary" />
+                        <label class='form-label small text-white-50 mb-1'>Callsign <span class='text-danger'>*</span></label>
+                        <input
+                            v-model='editForm.callsign'
+                            required
+                            type='text'
+                            class='form-control form-control-sm bg-dark text-white border-secondary'
+                        >
                     </div>
                     <div>
-                        <label class="form-label small text-white-50 mb-1">Vehicle Type</label>
-                        <select v-model="editForm.vehicleTypeUid"
-                            class="form-select form-select-sm bg-dark text-white border-secondary">
-                            <option value="">— None —</option>
-                            <option v-for="t in vehicleTypes" :key="t.uid" :value="t.uid">{{ t.name }}</option>
+                        <label class='form-label small text-white-50 mb-1'>Vehicle Type</label>
+                        <select
+                            v-model='editForm.vehicleTypeUid'
+                            class='form-select form-select-sm bg-dark text-white border-secondary'
+                        >
+                            <option value=''>
+                                — None —
+                            </option>
+                            <option
+                                v-for='t in vehicleTypes'
+                                :key='t.uid'
+                                :value='t.uid'
+                            >
+                                {{ t.name }}
+                            </option>
                         </select>
                     </div>
-                    <div v-if="detailError" class="alert alert-danger py-2 small">{{ detailError }}</div>
-                    <div class="d-flex gap-2">
-                        <button type="submit" class="btn btn-sm btn-warning" :disabled="saving">
-                            <span v-if="saving" class="spinner-border spinner-border-sm me-1" />Save
+                    <div
+                        v-if='detailError'
+                        class='alert alert-danger py-2 small'
+                    >
+                        {{ detailError }}
+                    </div>
+                    <div class='d-flex gap-2'>
+                        <button
+                            type='submit'
+                            class='btn btn-sm btn-warning'
+                            :disabled='saving'
+                        >
+                            <span
+                                v-if='saving'
+                                class='spinner-border spinner-border-sm me-1'
+                            />Save
                         </button>
-                        <button type="button" class="btn btn-sm btn-outline-secondary" @click="editing = false">Cancel</button>
+                        <button
+                            type='button'
+                            class='btn btn-sm btn-outline-secondary'
+                            @click='editing = false'
+                        >
+                            Cancel
+                        </button>
                     </div>
                 </form>
-
             </div>
         </template>
 
         <!-- ── Add Vehicle ────────────────────────────────────── -->
-        <template v-else-if="view === 'create'">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2">
-                <button class="btn btn-sm btn-outline-secondary" @click="view = 'list'">← Back</button>
-                <span class="fw-semibold">Add Vehicle</span>
+        <template v-else-if='view === "create"'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
+                <button
+                    class='btn btn-sm btn-outline-secondary'
+                    @click='view = "list"'
+                >
+                    ← Back
+                </button>
+                <span class='fw-semibold'>Add Vehicle</span>
             </div>
-            <div class="p-3">
-                <form @submit.prevent="saveCreate" class="d-flex flex-column gap-3">
+            <div class='p-3'>
+                <form
+                    class='d-flex flex-column gap-3'
+                    @submit.prevent='saveCreate'
+                >
                     <div>
-                        <label class="form-label small text-white-50 mb-1">Callsign <span class="text-danger">*</span></label>
-                        <input v-model="createForm.callsign" required type="text"
-                            class="form-control form-control-sm bg-dark text-white border-secondary"
-                            placeholder="e.g. ENG-1" />
+                        <label class='form-label small text-white-50 mb-1'>Callsign <span class='text-danger'>*</span></label>
+                        <input
+                            v-model='createForm.callsign'
+                            required
+                            type='text'
+                            class='form-control form-control-sm bg-dark text-white border-secondary'
+                            placeholder='e.g. ENG-1'
+                        >
                     </div>
                     <div>
-                        <label class="form-label small text-white-50 mb-1">Vehicle Type</label>
-                        <select v-model="createForm.vehicleTypeUid"
-                            class="form-select form-select-sm bg-dark text-white border-secondary">
-                            <option value="">— None —</option>
-                            <option v-for="t in vehicleTypes" :key="t.uid" :value="t.uid">{{ t.name }}</option>
+                        <label class='form-label small text-white-50 mb-1'>Vehicle Type</label>
+                        <select
+                            v-model='createForm.vehicleTypeUid'
+                            class='form-select form-select-sm bg-dark text-white border-secondary'
+                        >
+                            <option value=''>
+                                — None —
+                            </option>
+                            <option
+                                v-for='t in vehicleTypes'
+                                :key='t.uid'
+                                :value='t.uid'
+                            >
+                                {{ t.name }}
+                            </option>
                         </select>
                     </div>
-                    <div v-if="createError" class="alert alert-danger py-2 small">{{ createError }}</div>
-                    <div class="d-flex gap-2">
-                        <button type="submit" class="btn btn-sm btn-warning flex-grow-1" :disabled="saving">
-                            <span v-if="saving" class="spinner-border spinner-border-sm me-1" />Add Vehicle
+                    <div
+                        v-if='createError'
+                        class='alert alert-danger py-2 small'
+                    >
+                        {{ createError }}
+                    </div>
+                    <div class='d-flex gap-2'>
+                        <button
+                            type='submit'
+                            class='btn btn-sm btn-warning flex-grow-1'
+                            :disabled='saving'
+                        >
+                            <span
+                                v-if='saving'
+                                class='spinner-border spinner-border-sm me-1'
+                            />Add Vehicle
                         </button>
-                        <button type="button" class="btn btn-sm btn-outline-secondary" @click="view = 'list'">Cancel</button>
+                        <button
+                            type='button'
+                            class='btn btn-sm btn-outline-secondary'
+                            @click='view = "list"'
+                        >
+                            Cancel
+                        </button>
                     </div>
                 </form>
             </div>
         </template>
-
     </div>
 </template>
 

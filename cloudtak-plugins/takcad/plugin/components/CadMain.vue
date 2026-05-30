@@ -1,11 +1,16 @@
 <template>
     <div class='d-flex flex-column h-100 overflow-hidden'>
-
         <!-- Header -->
         <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
-            <IconBuildingEstate :size='18' class='me-2 text-warning' />
+            <IconBuildingEstate
+                :size='18'
+                class='me-2 text-warning'
+            />
             <span class='fw-semibold'>TAK CAD</span>
-            <span v-if='activeCount > 0' class='ms-2 badge bg-danger'>{{ activeCount }}</span>
+            <span
+                v-if='activeCount > 0'
+                class='ms-2 badge bg-danger'
+            >{{ activeCount }}</span>
             <span class='ms-auto text-white-50 small'>{{ connectionStatus }}</span>
         </div>
 
@@ -41,7 +46,6 @@
                 :roles='roles'
             />
         </div>
-
     </div>
 </template>
 
