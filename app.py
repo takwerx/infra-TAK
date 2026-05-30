@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.42-alpha"
+VERSION = "0.9.43-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -15272,6 +15272,14 @@ _cloudtak_deploy_lock = threading.Lock()
 # Plugin catalog — each entry describes a community CloudTAK plugin.
 # install_dir: subdirectory under ~/CloudTAK/api/web/plugins/ that Vite
 #   auto-discovers via import.meta.glob at build time (no wiring needed).
+#
+# local_path (optional): absolute path to the plugin source directory on this
+#   machine. When set, install creates a symlink instead of git-cloning so
+#   edits in the source tree are reflected immediately on next API rebuild.
+#   Vite follows symlinks, so the bundle picks it up without any extra config.
+#   Set repo instead (or in addition) once the plugin has its own public repo.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 CLOUDTAK_PLUGINS = [
     {
         'key': 'ping',
@@ -15287,6 +15295,19 @@ CLOUDTAK_PLUGINS = [
         'requires': 'CloudTAK 13.2+',
         'author': 'clptak',
         'license': 'MIT',
+    },
+    {
+        'key': 'takcad',
+        'name': 'TAK CAD Dispatcher',
+        'description': (
+            'Computer-Aided Dispatch for CloudTAK — create and manage incidents, '
+            'assign vehicles and personnel, track responders and notes.'
+        ),
+        'local_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'takcad', 'plugin'),
+        'install_dir': 'takcad',
+        'requires': 'CloudTAK 13.2+ / TAK Server with TAK-CAD plugin',
+        'author': 'takwerx',
+        'license': 'Proprietary',
     },
 ]
 
@@ -16031,7 +16052,8 @@ def _detect_cloudtak_plugins():
     result = []
     for p in CLOUDTAK_PLUGINS:
         install_path = os.path.join(plugins_base, p['install_dir'])
-        installed = os.path.isdir(install_path)
+        installed = os.path.isdir(install_path) or os.path.islink(install_path)
+        is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
         if installed:
@@ -16045,19 +16067,20 @@ def _detect_cloudtak_plugins():
                     sha = r.stdout.strip()
             except Exception:
                 pass
-            # Remote HEAD — compare to detect available updates (5 s timeout)
-            try:
-                r2 = subprocess.run(
-                    ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
-                    capture_output=True, text=True, timeout=5
-                )
-                if r2.returncode == 0 and r2.stdout.strip():
-                    remote_short = r2.stdout.split()[0][:7]
-                    if sha and remote_short and sha != remote_short:
-                        update_available = True
-            except Exception:
-                pass
-        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available})
+            # Remote HEAD — skip for local-path plugins (symlink is always current)
+            if not is_local:
+                try:
+                    r2 = subprocess.run(
+                        ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if r2.returncode == 0 and r2.stdout.strip():
+                        remote_short = r2.stdout.split()[0][:7]
+                        if sha and remote_short and sha != remote_short:
+                            update_available = True
+                except Exception:
+                    pass
+        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available, 'local': is_local})
     return result
 
 
@@ -16102,38 +16125,51 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             plog(f'Error: {e}')
             return False
 
+    local_path = plugin.get('local_path')
+
     try:
         if action == 'install':
             plog(f'Installing plugin: {plugin["name"]}')
-            if os.path.isdir(install_path):
-                plog(f'Plugin directory already exists at {install_path} — already installed?')
+            if os.path.isdir(install_path) or os.path.islink(install_path):
+                plog(f'Plugin already exists at {install_path} — already installed?')
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
             os.makedirs(plugins_base, exist_ok=True)
-            plog('Cloning plugin repository...')
-            if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
-                cloudtak_plugin_status.update({'running': False, 'error': True})
-                return
+            if local_path:
+                plog(f'Linking local plugin source: {local_path} → {install_path}')
+                os.symlink(local_path, install_path)
+            else:
+                plog('Cloning plugin repository...')
+                if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
 
         elif action == 'update':
             plog(f'Updating plugin: {plugin["name"]}')
-            if not os.path.isdir(install_path):
+            if not os.path.isdir(install_path) and not os.path.islink(install_path):
                 plog(f'Plugin not installed at {install_path}')
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
-            if not run_cmd(['git', '-C', install_path, 'pull']):
-                cloudtak_plugin_status.update({'running': False, 'error': True})
-                return
+            if local_path:
+                plog('Local plugin — source is live via symlink, no pull needed. Rebuilding…')
+            else:
+                if not run_cmd(['git', '-C', install_path, 'pull']):
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
 
         elif action == 'remove':
             plog(f'Removing plugin: {plugin["name"]}')
-            if not os.path.isdir(install_path):
+            if not os.path.isdir(install_path) and not os.path.islink(install_path):
                 plog('Plugin is not installed — nothing to remove')
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
-            import shutil
-            shutil.rmtree(install_path)
-            plog(f'Removed {install_path}')
+            if os.path.islink(install_path):
+                os.unlink(install_path)
+                plog(f'Removed symlink {install_path}')
+            else:
+                import shutil
+                shutil.rmtree(install_path)
+                plog(f'Removed {install_path}')
 
         # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
         # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).

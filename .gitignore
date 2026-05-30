@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# CloudTAK plugins — each plugin gets its own repo when ready for GitHub.
-# Files live locally until tested; keeping them out of infra-TAK history.
-cloudtak-plugins/
+# CloudTAK plugins — plugins get their own repos when ready for GitHub.
+# rapidsos: local-only, not yet tracked.
+# takcad: tracked on dev for internal testing (TAK-CAD server not public yet).
+cloudtak-plugins/rapidsos/
