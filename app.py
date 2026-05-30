@@ -15304,6 +15304,10 @@ CLOUDTAK_PLUGINS = [
             'assign vehicles and personnel, track responders and notes.'
         ),
         'local_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'takcad', 'plugin'),
+        # server_path: CloudTAK API route files copied into api/routes/ so the
+        # browser plugin can reach TAK Server's /Marti/api/plugins/takcad/* via
+        # CloudTAK's cert auth (CloudTAK has no generic Marti passthrough).
+        'server_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'takcad', 'server'),
         'install_dir': 'takcad',
         'requires': 'CloudTAK 13.2+ / TAK Server with TAK-CAD plugin',
         'author': 'takwerx',
@@ -16178,6 +16182,26 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             else:
                 shutil.rmtree(install_path)
             plog(f'Removed {install_path}')
+
+        # Server-side route files: copied into api/routes/ so the browser plugin
+        # can reach TAK Server plugin APIs via CloudTAK's cert auth. CloudTAK
+        # auto-loads every file in api/routes/ (schema.load('./routes/')).
+        server_path = plugin.get('server_path')
+        if server_path and os.path.isdir(server_path):
+            import shutil
+            routes_base = os.path.join(ct_dir, 'api', 'routes')
+            os.makedirs(routes_base, exist_ok=True)
+            for fname in sorted(os.listdir(server_path)):
+                if not fname.endswith('.ts'):
+                    continue
+                dest = os.path.join(routes_base, fname)
+                if action == 'remove':
+                    if os.path.exists(dest):
+                        os.remove(dest)
+                        plog(f'Removed server route: api/routes/{fname}')
+                else:
+                    shutil.copy2(os.path.join(server_path, fname), dest)
+                    plog(f'Installed server route: api/routes/{fname}')
 
         # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
         # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).
@@ -17337,6 +17361,7 @@ def run_cloudtak_update():
                 return
             # Restore any catalog plugins that the checkout wiped.
             os.makedirs(plugins_base, exist_ok=True)
+            routes_base = os.path.join(cloudtak_dir, 'api', 'routes')
             for install_dir, p in pre_installed.items():
                 dest = os.path.join(plugins_base, install_dir)
                 if not os.path.exists(dest) and not os.path.islink(dest):
@@ -17352,6 +17377,16 @@ def run_cloudtak_update():
                         plog(f"  Restored plugin: {p['name']}")
                     else:
                         plog(f"  ⚠ Plugin '{p['name']}' was wiped — no repo or local_path to restore from")
+                # Server-side route files live in api/routes/ which the checkout
+                # also wipes — re-copy them whenever the plugin is installed.
+                server_path = p.get('server_path')
+                if server_path and os.path.isdir(server_path):
+                    import shutil as _shutil
+                    os.makedirs(routes_base, exist_ok=True)
+                    for fname in sorted(os.listdir(server_path)):
+                        if fname.endswith('.ts'):
+                            _shutil.copy2(os.path.join(server_path, fname), os.path.join(routes_base, fname))
+                            plog(f"  Restored server route: api/routes/{fname}")
         plog(f"✓ Checked out {release_tag or 'latest HEAD'}")
 
         plog("")
