@@ -1,29 +1,29 @@
 <template>
-    <div class="d-flex flex-column h-100 overflow-hidden">
+    <div class='d-flex flex-column h-100 overflow-hidden'>
 
         <!-- ── Personnel List ────────────────────────────────── -->
-        <template v-if="view === 'list'">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0">
-                <span class="text-white-50 small me-auto">{{ personnel.length }} personnel</span>
-                <button class="btn btn-sm btn-warning" @click="openCreate">+ Add Person</button>
+        <template v-if='view === "list"'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
+                <span class='text-white-50 small me-auto'>{{ personnel.length }} personnel</span>
+                <button class='btn btn-sm btn-warning' @click='openCreate'>+ Add Person</button>
             </div>
-            <div class="flex-grow-1 overflow-auto">
-                <div v-if="loading" class="text-center text-white-50 py-4 small">
-                    <span class="spinner-border spinner-border-sm me-2" />Loading…
+            <div class='flex-grow-1 overflow-auto'>
+                <div v-if='loading' class='text-center text-white-50 py-4 small'>
+                    <span class='spinner-border spinner-border-sm me-2' />Loading…
                 </div>
-                <div v-else-if="loadError" class="alert alert-danger m-3 py-2 small">{{ loadError }}</div>
-                <div v-else-if="!personnel.length" class="text-center text-white-50 py-4 small">No personnel registered</div>
-                <div v-for="person in personnel" :key="person.uid"
-                    class="d-flex align-items-center px-3 py-2 border-bottom person-row"
-                    role="button"
-                    @click="openDetail(person)">
-                    <div class="flex-grow-1">
-                        <div class="fw-semibold small text-white">{{ person.callsign }}</div>
-                        <div class="small text-white-50">
+                <div v-else-if='loadError' class='alert alert-danger m-3 py-2 small'>{{ loadError }}</div>
+                <div v-else-if='!personnel.length' class='text-center text-white-50 py-4 small'>No personnel registered</div>
+                <div v-for='person in personnel' :key='person.uid'
+                    class='d-flex align-items-center px-3 py-2 border-bottom person-row'
+                    role='button'
+                    @click='openDetail(person)'>
+                    <div class='flex-grow-1'>
+                        <div class='fw-semibold small text-white'>{{ person.callsign }}</div>
+                        <div class='small text-white-50'>
                             {{ person.roles?.map(r => r.name).join(', ') || 'No roles' }}
                         </div>
                     </div>
-                    <div v-if="person.takCadGroup" class="small text-white-50">{{ person.takCadGroup }}</div>
+                    <div v-if='person.takCadGroup' class='small text-white-50'>{{ person.takCadGroup }}</div>
                 </div>
             </div>
         </template>

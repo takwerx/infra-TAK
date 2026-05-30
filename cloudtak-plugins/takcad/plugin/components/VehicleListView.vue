@@ -1,31 +1,31 @@
 <template>
-    <div class="d-flex flex-column h-100 overflow-hidden">
+    <div class='d-flex flex-column h-100 overflow-hidden'>
 
         <!-- ── Vehicle List ──────────────────────────────────── -->
-        <template v-if="view === 'list'">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0">
-                <span class="text-white-50 small me-auto">{{ vehicles.length }} vehicles</span>
-                <button class="btn btn-sm btn-warning" @click="openCreate">+ Add Vehicle</button>
+        <template v-if='view === "list"'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
+                <span class='text-white-50 small me-auto'>{{ vehicles.length }} vehicles</span>
+                <button class='btn btn-sm btn-warning' @click='openCreate'>+ Add Vehicle</button>
             </div>
-            <div class="flex-grow-1 overflow-auto">
-                <div v-if="loading" class="text-center text-white-50 py-4 small">
-                    <span class="spinner-border spinner-border-sm me-2" />Loading…
+            <div class='flex-grow-1 overflow-auto'>
+                <div v-if='loading' class='text-center text-white-50 py-4 small'>
+                    <span class='spinner-border spinner-border-sm me-2' />Loading…
                 </div>
-                <div v-else-if="loadError" class="alert alert-danger m-3 py-2 small">{{ loadError }}</div>
-                <div v-else-if="!vehicles.length" class="text-center text-white-50 py-4 small">No vehicles registered</div>
-                <div v-for="veh in vehicles" :key="veh.uid"
-                    class="d-flex align-items-center px-3 py-2 border-bottom vehicle-row"
-                    role="button"
-                    @click="openDetail(veh)">
-                    <div class="flex-grow-1">
-                        <div class="fw-semibold small text-white">{{ veh.callsign }}</div>
-                        <div class="small text-white-50">{{ veh.vehicleType?.name ?? 'Untyped' }}</div>
+                <div v-else-if='loadError' class='alert alert-danger m-3 py-2 small'>{{ loadError }}</div>
+                <div v-else-if='!vehicles.length' class='text-center text-white-50 py-4 small'>No vehicles registered</div>
+                <div v-for='veh in vehicles' :key='veh.uid'
+                    class='d-flex align-items-center px-3 py-2 border-bottom vehicle-row'
+                    role='button'
+                    @click='openDetail(veh)'>
+                    <div class='flex-grow-1'>
+                        <div class='fw-semibold small text-white'>{{ veh.callsign }}</div>
+                        <div class='small text-white-50'>{{ veh.vehicleType?.name ?? 'Untyped' }}</div>
                     </div>
-                    <div class="text-end small">
-                        <div v-if="veh.vehiclePersonnel?.length" class="text-white-50">
+                    <div class='text-end small'>
+                        <div v-if='veh.vehiclePersonnel?.length' class='text-white-50'>
                             {{ veh.vehiclePersonnel.map(p => p.callsign).join(', ') }}
                         </div>
-                        <div v-if="veh.incidentsRequestingThisVehicle?.length" class="badge bg-warning text-dark">
+                        <div v-if='veh.incidentsRequestingThisVehicle?.length' class='badge bg-warning text-dark'>
                             {{ veh.incidentsRequestingThisVehicle.length }} incident(s)
                         </div>
                     </div>

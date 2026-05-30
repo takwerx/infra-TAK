@@ -1,139 +1,139 @@
 <template>
-    <form @submit.prevent="submit" class="d-flex flex-column gap-3">
+    <form @submit.prevent='submit' class='d-flex flex-column gap-3'>
 
         <!-- Name -->
         <div>
-            <label class="form-label small text-white-50 mb-1">Incident Name <span class="text-danger">*</span></label>
-            <input v-model="form.incidentName" type="text" required
-                class="form-control form-control-sm bg-dark text-white border-secondary"
-                placeholder="e.g. Structure Fire - 123 Main St" />
+            <label class='form-label small text-white-50 mb-1'>Incident Name <span class='text-danger'>*</span></label>
+            <input v-model='form.incidentName' type='text' required
+                class='form-control form-control-sm bg-dark text-white border-secondary'
+                placeholder='e.g. Structure Fire - 123 Main St' />
         </div>
 
         <!-- Type -->
         <div>
-            <label class="form-label small text-white-50 mb-1">Incident Type <span class="text-danger">*</span></label>
-            <select v-model="form.incidentTypeUid" required
-                class="form-select form-select-sm bg-dark text-white border-secondary">
-                <option value="">— Select type —</option>
-                <option v-for="t in incidentTypes" :key="t.uid" :value="t.uid">{{ t.name }}</option>
+            <label class='form-label small text-white-50 mb-1'>Incident Type <span class='text-danger'>*</span></label>
+            <select v-model='form.incidentTypeUid' required
+                class='form-select form-select-sm bg-dark text-white border-secondary'>
+                <option value=''>— Select type —</option>
+                <option v-for='t in incidentTypes' :key='t.uid' :value='t.uid'>{{ t.name }}</option>
             </select>
         </div>
 
         <!-- Date/Time -->
         <div>
-            <label class="form-label small text-white-50 mb-1">Incident Time <span class="text-danger">*</span></label>
-            <input v-model="form.incidentTimeLocal" type="datetime-local" required
-                class="form-control form-control-sm bg-dark text-white border-secondary" />
+            <label class='form-label small text-white-50 mb-1'>Incident Time <span class='text-danger'>*</span></label>
+            <input v-model='form.incidentTimeLocal' type='datetime-local' required
+                class='form-control form-control-sm bg-dark text-white border-secondary' />
         </div>
 
         <!-- Location -->
         <div>
-            <label class="form-label small text-white-50 mb-1">Location <span class="text-danger">*</span></label>
-            <div class="input-group mb-1">
-                <input v-model="geoQuery" type="text"
-                    class="form-control form-control-sm bg-dark text-white border-secondary"
-                    placeholder="Search address…"
-                    @input="onGeoInput" />
-                <button type="button" class="btn btn-sm btn-secondary" :disabled="geocoding" @click="doGeocode">
-                    <span v-if="geocoding" class="spinner-border spinner-border-sm" />
+            <label class='form-label small text-white-50 mb-1'>Location <span class='text-danger'>*</span></label>
+            <div class='input-group mb-1'>
+                <input v-model='geoQuery' type='text'
+                    class='form-control form-control-sm bg-dark text-white border-secondary'
+                    placeholder='Search address…'
+                    @input='onGeoInput' />
+                <button type='button' class='btn btn-sm btn-secondary' :disabled='geocoding' @click='doGeocode'>
+                    <span v-if='geocoding' class='spinner-border spinner-border-sm' />
                     <span v-else>Search</span>
                 </button>
             </div>
-            <div v-if="geoSuggestions.length" class="list-group mb-1">
-                <button v-for="s in geoSuggestions" :key="s.label" type="button"
-                    class="list-group-item list-group-item-action list-group-item-dark py-1 small"
-                    @click="applySuggestion(s)">{{ s.label }}</button>
+            <div v-if='geoSuggestions.length' class='list-group mb-1'>
+                <button v-for='s in geoSuggestions' :key='s.label' type='button'
+                    class='list-group-item list-group-item-action list-group-item-dark py-1 small'
+                    @click='applySuggestion(s)'>{{ s.label }}</button>
             </div>
-            <div class="row g-1">
-                <div class="col-8">
-                    <input v-model="form.streetName" type="text"
-                        class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="Street address" />
+            <div class='row g-1'>
+                <div class='col-8'>
+                    <input v-model='form.streetName' type='text'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='Street address' />
                 </div>
-                <div class="col-4">
-                    <input v-model="form.city" type="text"
-                        class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="City" />
+                <div class='col-4'>
+                    <input v-model='form.city' type='text'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='City' />
                 </div>
-                <div class="col-4">
-                    <input v-model="form.state" type="text"
-                        class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="State" />
+                <div class='col-4'>
+                    <input v-model='form.state' type='text'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='State' />
                 </div>
-                <div class="col-4">
-                    <input v-model="form.zipCode" type="text"
-                        class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="ZIP" />
+                <div class='col-4'>
+                    <input v-model='form.zipCode' type='text'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='ZIP' />
                 </div>
-                <div class="col-4">
-                    <input v-model="form.country" type="text"
-                        class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="Country" />
+                <div class='col-4'>
+                    <input v-model='form.country' type='text'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='Country' />
                 </div>
             </div>
-            <div class="row g-1 mt-1">
-                <div class="col-6">
-                    <input v-model.number="form.lat" type="number" step="any"
-                        class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="Latitude" />
+            <div class='row g-1 mt-1'>
+                <div class='col-6'>
+                    <input v-model.number='form.lat' type='number' step='any'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='Latitude' />
                 </div>
-                <div class="col-6">
-                    <input v-model.number="form.lon" type="number" step="any"
-                        class="form-control form-control-sm bg-dark text-white border-secondary"
-                        placeholder="Longitude" />
+                <div class='col-6'>
+                    <input v-model.number='form.lon' type='number' step='any'
+                        class='form-control form-control-sm bg-dark text-white border-secondary'
+                        placeholder='Longitude' />
                 </div>
             </div>
         </div>
 
         <!-- Dispatcher -->
         <div>
-            <label class="form-label small text-white-50 mb-1">Dispatcher</label>
-            <input v-model="form.dispatcher" type="text"
-                class="form-control form-control-sm bg-dark text-white border-secondary"
-                placeholder="Callsign or name" />
+            <label class='form-label small text-white-50 mb-1'>Dispatcher</label>
+            <input v-model='form.dispatcher' type='text'
+                class='form-control form-control-sm bg-dark text-white border-secondary'
+                placeholder='Callsign or name' />
         </div>
 
         <!-- Details -->
         <div>
-            <label class="form-label small text-white-50 mb-1">Details</label>
-            <textarea v-model="form.details" rows="3"
-                class="form-control form-control-sm bg-dark text-white border-secondary"
-                placeholder="Incident notes…" />
+            <label class='form-label small text-white-50 mb-1'>Details</label>
+            <textarea v-model='form.details' rows='3'
+                class='form-control form-control-sm bg-dark text-white border-secondary'
+                placeholder='Incident notes…' />
         </div>
 
         <!-- Caller Info (collapsible) -->
         <div>
-            <button type="button" class="btn btn-sm btn-link text-white-50 p-0 text-decoration-none"
-                @click="showCaller = !showCaller">
+            <button type='button' class='btn btn-sm btn-link text-white-50 p-0 text-decoration-none'
+                @click='showCaller = !showCaller'>
                 {{ showCaller ? '▾' : '▸' }} Caller Info
             </button>
-            <div v-if="showCaller" class="mt-2 d-flex flex-column gap-2">
-                <input v-model="form.callerName" type="text"
-                    class="form-control form-control-sm bg-dark text-white border-secondary"
-                    placeholder="Caller name" />
-                <input v-model="form.callerPhone" type="tel"
-                    class="form-control form-control-sm bg-dark text-white border-secondary"
-                    placeholder="Phone number" />
-                <select v-model="form.callerType"
-                    class="form-select form-select-sm bg-dark text-white border-secondary">
-                    <option value="">— Caller type —</option>
-                    <option value="PHONE">Phone</option>
-                    <option value="RADIO">Radio</option>
-                    <option value="OTHER">Other</option>
+            <div v-if='showCaller' class='mt-2 d-flex flex-column gap-2'>
+                <input v-model='form.callerName' type='text'
+                    class='form-control form-control-sm bg-dark text-white border-secondary'
+                    placeholder='Caller name' />
+                <input v-model='form.callerPhone' type='tel'
+                    class='form-control form-control-sm bg-dark text-white border-secondary'
+                    placeholder='Phone number' />
+                <select v-model='form.callerType'
+                    class='form-select form-select-sm bg-dark text-white border-secondary'>
+                    <option value=''>— Caller type —</option>
+                    <option value='PHONE'>Phone</option>
+                    <option value='RADIO'>Radio</option>
+                    <option value='OTHER'>Other</option>
                 </select>
             </div>
         </div>
 
         <!-- Error -->
-        <div v-if="saveError" class="alert alert-danger py-2 small">{{ saveError }}</div>
+        <div v-if='saveError' class='alert alert-danger py-2 small'>{{ saveError }}</div>
 
         <!-- Submit -->
-        <div class="d-flex gap-2">
-            <button type="submit" class="btn btn-sm btn-warning flex-grow-1" :disabled="saving">
-                <span v-if="saving" class="spinner-border spinner-border-sm me-1" />
+        <div class='d-flex gap-2'>
+            <button type='submit' class='btn btn-sm btn-warning flex-grow-1' :disabled='saving'>
+                <span v-if='saving' class='spinner-border spinner-border-sm me-1' />
                 {{ uid ? 'Save Changes' : 'Create Incident' }}
             </button>
-            <button type="button" class="btn btn-sm btn-outline-secondary" @click="emit('cancel')">Cancel</button>
+            <button type='button' class='btn btn-sm btn-outline-secondary' @click='emit("cancel")'>Cancel</button>
         </div>
 
     </form>

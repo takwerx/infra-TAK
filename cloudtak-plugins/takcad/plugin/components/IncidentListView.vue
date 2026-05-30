@@ -1,59 +1,59 @@
 <template>
-    <div class="d-flex flex-column h-100 overflow-hidden">
+    <div class='d-flex flex-column h-100 overflow-hidden'>
 
         <!-- ── Incident List ──────────────────────────────────── -->
-        <template v-if="view === 'list'">
-            <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2">
-                <div class="d-flex rounded overflow-hidden border border-secondary flex-grow-1">
+        <template v-if='view === "list"'>
+            <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
+                <div class='d-flex rounded overflow-hidden border border-secondary flex-grow-1'>
                     <button
-                        v-for="t in LIST_TABS" :key="t.key"
-                        class="flex-fill btn btn-sm py-1 rounded-0 border-0 small"
-                        :class="listTab === t.key ? 'bg-secondary text-white' : 'text-white-50'"
-                        @click="listTab = t.key"
-                    >{{ t.label }} <span class="badge" :class="listTab === t.key ? 'bg-warning text-dark' : 'bg-dark text-white-50'">{{ t.key === 'active' ? activeIncidents.length : cancelledIncidents.length }}</span></button>
+                        v-for='t in LIST_TABS' :key='t.key'
+                        class='flex-fill btn btn-sm py-1 rounded-0 border-0 small'
+                        :class='listTab === t.key ? "bg-secondary text-white" : "text-white-50"'
+                        @click='listTab = t.key'
+                    >{{ t.label }} <span class='badge' :class='listTab === t.key ? "bg-warning text-dark" : "bg-dark text-white-50"'>{{ t.key === 'active' ? activeIncidents.length : cancelledIncidents.length }}</span></button>
                 </div>
-                <button class="btn btn-sm btn-warning" @click="openCreate">+ New</button>
+                <button class='btn btn-sm btn-warning' @click='openCreate'>+ New</button>
             </div>
 
             <!-- Sort bar -->
-            <div class="d-flex px-3 py-1 border-bottom text-white-50 small flex-shrink-0">
-                <button v-for="col in SORT_COLS" :key="col.key"
-                    class="btn btn-sm btn-link p-0 text-white-50 small me-3 text-decoration-none"
-                    @click="toggleSort(col.key)"
+            <div class='d-flex px-3 py-1 border-bottom text-white-50 small flex-shrink-0'>
+                <button v-for='col in SORT_COLS' :key='col.key'
+                    class='btn btn-sm btn-link p-0 text-white-50 small me-3 text-decoration-none'
+                    @click='toggleSort(col.key)'
                 >
                     {{ col.label }}
-                    <span v-if="sortCol === col.key">{{ sortAsc ? '↑' : '↓' }}</span>
+                    <span v-if='sortCol === col.key'>{{ sortAsc ? '↑' : '↓' }}</span>
                 </button>
-                <span class="ms-auto text-white-25 font-monospace" style="font-size:10px">{{ lastRefreshed }}</span>
+                <span class='ms-auto text-white-25 font-monospace' style='font-size:10px'>{{ lastRefreshed }}</span>
             </div>
 
             <!-- List -->
-            <div class="flex-grow-1 overflow-auto">
-                <div v-if="loading && !displayedIncidents.length" class="text-center text-white-50 py-4 small">
-                    <span class="spinner-border spinner-border-sm me-2" />Loading…
+            <div class='flex-grow-1 overflow-auto'>
+                <div v-if='loading && !displayedIncidents.length' class='text-center text-white-50 py-4 small'>
+                    <span class='spinner-border spinner-border-sm me-2' />Loading…
                 </div>
-                <div v-else-if="loadError" class="alert alert-danger m-3 py-2 small">{{ loadError }}</div>
-                <div v-else-if="!displayedIncidents.length" class="text-center text-white-50 py-4 small">No incidents</div>
+                <div v-else-if='loadError' class='alert alert-danger m-3 py-2 small'>{{ loadError }}</div>
+                <div v-else-if='!displayedIncidents.length' class='text-center text-white-50 py-4 small'>No incidents</div>
                 <div
-                    v-for="inc in displayedIncidents" :key="inc.uid"
-                    class="d-flex align-items-start px-3 py-2 border-bottom incident-row"
-                    role="button"
-                    @click="openDetail(inc.uid)"
+                    v-for='inc in displayedIncidents' :key='inc.uid'
+                    class='d-flex align-items-start px-3 py-2 border-bottom incident-row'
+                    role='button'
+                    @click='openDetail(inc.uid)'
                 >
-                    <div class="flex-grow-1 overflow-hidden">
-                        <div class="d-flex align-items-center gap-2">
-                            <span class="fw-semibold small text-white text-truncate">{{ inc.incidentName }}</span>
-                            <span class="badge small" :class="statusBadge(inc.status)">{{ inc.status }}</span>
+                    <div class='flex-grow-1 overflow-hidden'>
+                        <div class='d-flex align-items-center gap-2'>
+                            <span class='fw-semibold small text-white text-truncate'>{{ inc.incidentName }}</span>
+                            <span class='badge small' :class='statusBadge(inc.status)'>{{ inc.status }}</span>
                         </div>
-                        <div class="small text-white-50 text-truncate">{{ formatAddress(inc.location) }}</div>
-                        <div class="d-flex gap-3 small text-white-50 mt-1">
+                        <div class='small text-white-50 text-truncate'>{{ formatAddress(inc.location) }}</div>
+                        <div class='d-flex gap-3 small text-white-50 mt-1'>
                             <span>{{ inc.incidentType?.name ?? '—' }}</span>
-                            <span v-if="inc.dispatcher">{{ inc.dispatcher }}</span>
+                            <span v-if='inc.dispatcher'>{{ inc.dispatcher }}</span>
                         </div>
                     </div>
-                    <div class="text-end ms-2 flex-shrink-0">
-                        <div class="small text-white-50">{{ shortTime(inc.incidentTime) }}</div>
-                        <div class="small text-warning">{{ inc.vehiclesResponding?.length ?? 0 }}🚗 {{ inc.personnelResponding?.length ?? 0 }}👤</div>
+                    <div class='text-end ms-2 flex-shrink-0'>
+                        <div class='small text-white-50'>{{ shortTime(inc.incidentTime) }}</div>
+                        <div class='small text-warning'>{{ inc.vehiclesResponding?.length ?? 0 }}🚗 {{ inc.personnelResponding?.length ?? 0 }}👤</div>
                     </div>
                 </div>
             </div>

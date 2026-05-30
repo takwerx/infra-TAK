@@ -1,44 +1,44 @@
 <template>
-    <div class="d-flex flex-column h-100 overflow-hidden">
+    <div class='d-flex flex-column h-100 overflow-hidden'>
 
         <!-- Header -->
-        <div class="d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0">
-            <IconBuildingEstate :size="18" class="me-2 text-warning" />
-            <span class="fw-semibold">TAK CAD</span>
-            <span v-if="activeCount > 0" class="ms-2 badge bg-danger">{{ activeCount }}</span>
-            <span class="ms-auto text-white-50 small">{{ connectionStatus }}</span>
+        <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
+            <IconBuildingEstate :size='18' class='me-2 text-warning' />
+            <span class='fw-semibold'>TAK CAD</span>
+            <span v-if='activeCount > 0' class='ms-2 badge bg-danger'>{{ activeCount }}</span>
+            <span class='ms-auto text-white-50 small'>{{ connectionStatus }}</span>
         </div>
 
         <!-- Tab nav -->
-        <div class="d-flex border-bottom flex-shrink-0">
+        <div class='d-flex border-bottom flex-shrink-0'>
             <button
-                v-for="tab in TABS"
-                :key="tab.key"
-                class="flex-fill btn btn-sm rounded-0 py-2 border-0"
-                :class="activeTab === tab.key ? 'bg-warning text-dark fw-semibold' : 'text-white-50'"
-                @click="activeTab = tab.key"
+                v-for='tab in TABS'
+                :key='tab.key'
+                class='flex-fill btn btn-sm rounded-0 py-2 border-0'
+                :class='activeTab === tab.key ? "bg-warning text-dark fw-semibold" : "text-white-50"'
+                @click='activeTab = tab.key'
             >
                 {{ tab.label }}
             </button>
         </div>
 
         <!-- Views -->
-        <div class="flex-grow-1 overflow-hidden">
+        <div class='flex-grow-1 overflow-hidden'>
             <IncidentListView
-                v-if="activeTab === 'incidents'"
-                :incident-types="incidentTypes"
-                :vehicles="vehicles"
-                :personnel="personnel"
-                @active-count="activeCount = $event"
-                @status="connectionStatus = $event"
+                v-if='activeTab === "incidents"'
+                :incident-types='incidentTypes'
+                :vehicles='vehicles'
+                :personnel='personnel'
+                @active-count='activeCount = $event'
+                @status='connectionStatus = $event'
             />
             <VehicleListView
-                v-else-if="activeTab === 'vehicles'"
-                :vehicle-types="vehicleTypes"
+                v-else-if='activeTab === "vehicles"'
+                :vehicle-types='vehicleTypes'
             />
             <PersonnelListView
-                v-else-if="activeTab === 'personnel'"
-                :roles="roles"
+                v-else-if='activeTab === "personnel"'
+                :roles='roles'
             />
         </div>
 
