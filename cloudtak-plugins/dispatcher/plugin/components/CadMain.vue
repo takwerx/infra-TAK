@@ -161,7 +161,8 @@ import IncidentListView from './IncidentListView.vue';
 import VehicleListView  from './VehicleListView.vue';
 import PersonnelListView from './PersonnelListView.vue';
 import { getIncidentTypes, getVehicleTypes, getVehicles, getPersonnel, getRoles, getIncidentMetadata, getMissions } from '../lib/takcad-client.ts';
-import type { IncidentTypeRef, VehicleType, VehicleRef, PersonRef, Role, MissionRef } from '../lib/takcad-client.ts';
+import type { MissionRef } from '../lib/takcad-client.ts';
+import type { IncidentTypeRef, VehicleType, VehicleRef, PersonRef, Role } from '../lib/takcad-types.ts';
 import { dispatcherStore as store } from '../lib/dispatcher-store.ts';
 
 const TABS = [

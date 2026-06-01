@@ -500,7 +500,7 @@ async function submitTakCad(address: string) {
 
     // Map type name back to IncidentTypeRef for the TAK-CAD API
     const incidentTypeRef: IncidentTypeRef = props.incidentTypes.find(t => t.name === form.incidentType)
-        ?? { uid: crypto.randomUUID(), name: form.incidentType };
+        ?? { uid: crypto.randomUUID(), name: form.incidentType, description: null, requiredVehicleTypes: [], requiredRoles: [] };
 
     let existing: IncidentRef | null = null;
     if (props.uid) {
