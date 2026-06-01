@@ -11,15 +11,21 @@
                 v-if='activeCount > 0'
                 class='ms-2 badge bg-danger'
             >{{ activeCount }}</span>
-            <!-- Server-mode pill -->
-            <span
+            <!-- Server-mode pill (clickable toggle) -->
+            <button
                 v-if='store.serverMode === "takcad"'
-                class='ms-2 badge bg-success text-white small'
-            >TAK-CAD Connected</span>
-            <span
+                class='ms-2 badge bg-success text-white small border-0'
+                style='cursor:pointer'
+                title='Click to switch to Standalone mode'
+                @click='forceStandalone'
+            >TAK-CAD Connected ✕</button>
+            <button
                 v-else-if='store.serverMode === "standalone"'
-                class='ms-2 badge bg-secondary text-white small'
-            >Standalone</span>
+                class='ms-2 badge bg-secondary text-white small border-0'
+                :style='store.forcedMode ? "cursor:pointer" : "cursor:default"'
+                :title='store.forcedMode ? "Click to reconnect to TAK-CAD" : ""'
+                @click='store.forcedMode ? retryDetection() : undefined'
+            >Standalone{{ store.forcedMode ? ' ↺' : '' }}</button>
             <span
                 v-else
                 class='ms-2 badge bg-secondary text-white small opacity-50'
@@ -90,13 +96,11 @@ const vehicles         = ref<VehicleRef[]>([]);
 const personnel        = ref<PersonRef[]>([]);
 const roles            = ref<Role[]>([]);
 
-onMounted(async () => {
-    // Mode detection: attempt getIncidentMetadata — success = takcad, error = standalone
+async function detect() {
     store.serverMode = 'detecting';
     try {
         await getIncidentMetadata();
         store.serverMode = 'takcad';
-        // Load TAK-CAD metadata in parallel (takcad mode only)
         try {
             [incidentTypes.value, vehicleTypes.value, vehicles.value, personnel.value, roles.value] =
                 await Promise.all([getIncidentTypes(), getVehicleTypes(), getVehicles(), getPersonnel(), getRoles()]);
@@ -106,5 +110,23 @@ onMounted(async () => {
     } catch {
         store.serverMode = 'standalone';
     }
+}
+
+function forceStandalone() {
+    store.forcedMode = 'standalone';
+    store.serverMode = 'standalone';
+}
+
+async function retryDetection() {
+    store.forcedMode = null;
+    await detect();
+}
+
+onMounted(async () => {
+    if (store.forcedMode === 'standalone') {
+        store.serverMode = 'standalone';
+        return;
+    }
+    await detect();
 });
 </script>

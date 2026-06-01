@@ -16,10 +16,12 @@ export interface LocalIncident {
 
 interface DispatcherState {
     serverMode:     ServerMode;
+    forcedMode:     'standalone' | null;
     localIncidents: LocalIncident[];
 }
 
 export const dispatcherStore = reactive<DispatcherState>({
     serverMode:     'detecting',
+    forcedMode:     null,
     localIncidents: [],
 });
