@@ -86,7 +86,7 @@
                         <button
                             v-for='f in feeds'
                             :key='f.guid'
-                            class='btn btn-sm w-100 text-start px-3 py-2 border-0 border-bottom rounded-0 text-muted'
+                            class='btn btn-sm w-100 text-start px-3 py-2 border-0 border-bottom rounded-0'
                             style='font-size:12px'
                             @click='selectFeed(f)'
                         >
@@ -115,10 +115,10 @@
                 </div>
             </div>
 
-            <!-- Tab nav -->
+            <!-- Tab nav — Vehicles/Personnel only in TAK-CAD mode -->
             <div class='d-flex border-bottom flex-shrink-0'>
                 <button
-                    v-for='tab in TABS'
+                    v-for='tab in visibleTabs'
                     :key='tab.key'
                     class='flex-fill btn btn-sm rounded-0 py-2 border-0'
                     :class='activeTab === tab.key ? "bg-warning text-dark fw-semibold" : "text-muted"'
@@ -154,7 +154,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import { Preferences } from '@capacitor/preferences';
 import { IconHeadset } from '@tabler/icons-vue';
 import IncidentListView from './IncidentListView.vue';
@@ -166,12 +166,16 @@ import type { IncidentTypeRef, VehicleType, VehicleRef, PersonRef, Role } from '
 import { dispatcherStore as store } from '../lib/dispatcher-store.ts';
 
 const TABS = [
-    { key: 'incidents',  label: 'Incidents'  },
-    { key: 'vehicles',   label: 'Vehicles'   },
-    { key: 'personnel',  label: 'Personnel'  },
+    { key: 'incidents',  label: 'Incidents',  takCadOnly: false },
+    { key: 'vehicles',   label: 'Vehicles',   takCadOnly: true  },
+    { key: 'personnel',  label: 'Personnel',  takCadOnly: true  },
 ] as const;
 
 type TabKey = typeof TABS[number]['key'];
+
+const visibleTabs = computed(() =>
+    TABS.filter(t => !t.takCadOnly || store.serverMode === 'takcad')
+);
 
 const activeTab        = ref<TabKey>('incidents');
 const activeCount      = ref(0);
@@ -227,10 +231,17 @@ async function detect() {
     }
 }
 
+// Reset badge and tab when disconnecting from TAK-CAD
+watch(() => store.serverMode, (mode) => {
+    if (mode === 'standalone') {
+        activeCount.value = 0;
+        if (activeTab.value !== 'incidents') activeTab.value = 'incidents';
+    }
+});
+
 function forceStandalone() {
     store.forcedMode = 'standalone';
     store.serverMode = 'standalone';
-    activeCount.value = 0;
 }
 
 async function retryDetection() {

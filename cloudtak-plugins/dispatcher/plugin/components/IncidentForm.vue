@@ -14,18 +14,6 @@
             >
         </div>
 
-        <!-- Name -->
-        <div>
-            <label class='form-label small text-muted mb-1'>Incident Name <span class='text-danger'>*</span></label>
-            <input
-                v-model='form.incidentName'
-                type='text'
-                required
-                class='form-control form-control-sm border'
-                placeholder='e.g. Structure Fire - 123 Main St'
-            >
-        </div>
-
         <!-- Type — shared dropdown in both modes -->
         <div>
             <label class='form-label small text-muted mb-1'>Incident Type <span class='text-danger'>*</span></label>
@@ -312,7 +300,6 @@ const typeOptions = computed<string[]>(() => {
 });
 
 const form = reactive({
-    incidentName:      '',
     incidentType:      '',
     incidentTimeLocal: toLocalInput(new Date().toISOString()),
     streetName: '', city: '', state: '', zipCode: '', country: '',
@@ -391,7 +378,6 @@ onMounted(async () => {
     if (props.uid && props.serverMode === 'takcad') {
         try {
             const inc = await getIncident(props.uid);
-            form.incidentName      = inc.incidentName;
             form.incidentType      = inc.incidentType?.name ?? '';
             form.incidentTimeLocal = toLocalInput(inc.incidentTime);
             form.streetName = inc.location?.address?.streetName ?? '';
@@ -441,12 +427,12 @@ async function submitStandalone(address: string) {
 
     saving.value = true;
     try {
-        // CoT marker (best-effort)
+        // CoT marker
         try {
             await dropIncidentMarker({
                 uid,
                 number,
-                name:       form.incidentName,
+                name:       form.incidentType,
                 type:       form.incidentType,
                 address,
                 lat:        form.lat!,
@@ -455,26 +441,30 @@ async function submitStandalone(address: string) {
                 dispatcher,
                 details:    form.details,
             });
-        } catch { /* marker is best-effort */ }
+        } catch (e) {
+            console.warn('[dispatcher] marker drop failed', e);
+        }
 
-        // DataSync mission log (best-effort)
+        // DataSync mission log
         const feed = props.activeFeed ?? dispatcherStore.activeFeed;
         if (feed) {
             try {
                 await postMissionCallLog(feed.guid, {
                     number,
-                    name:    form.incidentName,
+                    name:    form.incidentType,
                     type:    form.incidentType,
                     address,
                     time:    now,
                 });
-            } catch { /* log is best-effort */ }
+            } catch (e) {
+                console.warn('[dispatcher] mission log failed', e);
+            }
         }
 
         const local: LocalIncident = {
             uid,
             number,
-            name:       form.incidentName,
+            name:       form.incidentType,
             type:       form.incidentType,
             address,
             lat:        form.lat!,
@@ -516,7 +506,7 @@ async function submitTakCad(address: string) {
     const payload: IncidentRef = {
         ...(existing ?? {}),
         uid,
-        incidentName: form.incidentName,
+        incidentName: form.incidentType,
         incidentType: incidentTypeRef,
         incidentTime: new Date(form.incidentTimeLocal).toISOString(),
         status:       existing?.status ?? STATUS_ACTIVE,
@@ -562,7 +552,7 @@ async function submitTakCad(address: string) {
             await dropIncidentMarker({
                 uid,
                 number,
-                name:       form.incidentName,
+                name:       form.incidentType,
                 type:       form.incidentType,
                 address:    [form.streetName, form.city].filter(Boolean).join(', '),
                 lat:        form.lat!,
@@ -571,20 +561,20 @@ async function submitTakCad(address: string) {
                 dispatcher,
                 details:    form.details,
             });
-        } catch { /* marker is best-effort */ }
+        } catch (e) { console.warn('[dispatcher] marker drop failed', e); }
 
-        // DataSync log (both modes — best-effort)
+        // DataSync log (both modes)
         const feed = props.activeFeed ?? dispatcherStore.activeFeed;
         if (feed) {
             try {
                 await postMissionCallLog(feed.guid, {
                     number,
-                    name:    form.incidentName,
+                    name:    form.incidentType,
                     type:    form.incidentType,
                     address: [form.streetName, form.city].filter(Boolean).join(', '),
                     time:    now,
                 });
-            } catch { /* log is best-effort */ }
+            } catch (e) { console.warn('[dispatcher] mission log failed', e); }
         }
 
         emit('saved', uid);
