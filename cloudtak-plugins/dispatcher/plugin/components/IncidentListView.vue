@@ -469,47 +469,49 @@
 
         <!-- ── Standalone mode: CloudTAK-native UI ─────────────────────────── -->
         <template v-else-if='serverMode === "standalone"'>
-            <!-- Mission banner -->
+            <!-- DataSync Feed banner -->
             <div
                 v-if='!activeMission'
-                class='alert alert-secondary m-2 py-2 small d-flex align-items-center gap-2'
+                class='m-2'
             >
-                <span class='flex-grow-1'>No active mission — incidents will be local only.</span>
-                <div class='dropdown'>
+                <button
+                    class='btn btn-sm btn-outline-secondary w-100'
+                    :disabled='loadingMissions'
+                    @click='fetchMissions'
+                >
+                    <span
+                        v-if='loadingMissions'
+                        class='spinner-border spinner-border-sm me-1'
+                    />
+                    {{ loadingMissions ? 'Loading…' : '+ Select DataSync Feed' }}
+                </button>
+                <div
+                    v-if='missions.length'
+                    class='border rounded mt-1'
+                    style='max-height:180px;overflow-y:auto;background:var(--bs-body-bg, #1e2228)'
+                >
                     <button
-                        class='btn btn-sm btn-outline-secondary dropdown-toggle'
-                        :disabled='loadingMissions'
-                        @click='fetchMissions'
+                        v-for='m in missions'
+                        :key='m.guid'
+                        class='btn btn-sm w-100 text-start px-3 py-2 border-0 border-bottom rounded-0 text-muted'
+                        style='font-size:12px'
+                        @click='selectMission(m)'
                     >
-                        <span
-                            v-if='loadingMissions'
-                            class='spinner-border spinner-border-sm me-1'
-                        />
-                        Select Mission ▾
+                        {{ m.name }}
                     </button>
-                    <ul
-                        v-if='missions.length'
-                        class='dropdown-menu show'
-                    >
-                        <li
-                            v-for='m in missions'
-                            :key='m.guid'
-                        >
-                            <button
-                                class='dropdown-item small'
-                                @click='selectMission(m)'
-                            >
-                                {{ m.name }}
-                            </button>
-                        </li>
-                    </ul>
+                </div>
+                <div
+                    v-else-if='missions.length === 0 && !loadingMissions && missionsFetched'
+                    class='text-muted small text-center py-2'
+                >
+                    No DataSync feeds found
                 </div>
             </div>
             <div
                 v-else
                 class='px-3 py-1 border-bottom small text-muted d-flex align-items-center gap-2 flex-shrink-0'
             >
-                <span class='badge bg-primary text-white'>Mission</span>
+                <span class='badge bg-primary text-white'>DataSync</span>
                 <span class='text-truncate'>{{ activeMission.name }}</span>
                 <button
                     class='btn btn-link btn-sm p-0 text-muted ms-auto text-decoration-none'
@@ -928,9 +930,10 @@ type SlViewName = 'list' | 'detail' | 'form';
 
 const slView         = ref<SlViewName>('list');
 const slDetail       = ref<LocalIncident | null>(null);
-const activeMission  = ref<MissionRef | null>(null);
-const missions       = ref<MissionRef[]>([]);
+const activeMission   = ref<MissionRef | null>(null);
+const missions        = ref<MissionRef[]>([]);
 const loadingMissions = ref(false);
+const missionsFetched = ref(false);
 
 const slActiveIncidents = computed(() =>
     dispatcherStore.localIncidents.filter(i => i.status === 'ACTIVE')
@@ -942,9 +945,10 @@ watch(slActiveIncidents, n => {
 
 async function fetchMissions() {
     loadingMissions.value = true;
+    missionsFetched.value = false;
     try { missions.value = await getMissions(); }
     catch { missions.value = []; }
-    finally { loadingMissions.value = false; }
+    finally { loadingMissions.value = false; missionsFetched.value = true; }
 }
 
 function selectMission(m: MissionRef) {
