@@ -2,7 +2,7 @@ import type { App } from 'vue';
 import { markRaw } from 'vue';
 import type { PluginAPI, PluginInstance } from '../../plugin.ts';
 import type { MenuItemConfig } from '../../plugin.ts';
-import { IconBuildingEstate } from '@tabler/icons-vue';
+import { IconHeadset } from '@tabler/icons-vue';
 import CadMain from './components/CadMain.vue';
 
 const MENU_KEY   = 'plugin-tak-dispatcher';
@@ -31,7 +31,7 @@ export default class DispatcherPlugin implements PluginInstance {
             route:       ROUTE_NAME,
             tooltip:     'CloudTAK Dispatcher',
             description: 'Dispatch incidents on the map — works standalone or with TAK-CAD server plugin',
-            icon:        markRaw(IconBuildingEstate) as unknown as MenuItemIconType,
+            icon:        markRaw(IconHeadset) as unknown as MenuItemIconType,
         } as MenuItemConfig);
     }
 

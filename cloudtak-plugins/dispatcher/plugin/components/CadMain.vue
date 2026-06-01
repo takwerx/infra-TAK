@@ -2,7 +2,7 @@
     <div class='d-flex flex-column h-100 overflow-hidden'>
         <!-- Header -->
         <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
-            <IconBuildingEstate
+            <IconHeadset
                 :size='18'
                 class='me-2 text-warning'
             />
@@ -65,7 +65,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { IconBuildingEstate } from '@tabler/icons-vue';
+import { IconHeadset } from '@tabler/icons-vue';
 import IncidentListView from './IncidentListView.vue';
 import VehicleListView  from './VehicleListView.vue';
 import PersonnelListView from './PersonnelListView.vue';
