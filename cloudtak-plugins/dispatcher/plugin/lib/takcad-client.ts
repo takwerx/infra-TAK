@@ -104,8 +104,8 @@ export interface MissionRef {
 }
 
 export async function getMissions(): Promise<MissionRef[]> {
-    const resp = await std('/api/marti/missions?passwordProtected=false', { method: 'GET' }) as { data?: MissionRef[] } | null;
-    return resp?.data ?? [];
+    const resp = await std('/api/marti/mission', { method: 'GET' }) as { items?: MissionRef[] } | null;
+    return resp?.items ?? [];
 }
 
 // ── Geocoding ────────────────────────────────────────────────────────────────

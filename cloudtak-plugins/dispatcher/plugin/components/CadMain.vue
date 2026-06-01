@@ -115,6 +115,7 @@ async function detect() {
 function forceStandalone() {
     store.forcedMode = 'standalone';
     store.serverMode = 'standalone';
+    activeCount.value = 0;
 }
 
 async function retryDetection() {
