@@ -110,24 +110,24 @@ export default async function router(schema: Schema, config: Config) {
         group: 'TAKCAD',
         description: 'Post a CoT marker to TAK Server on behalf of the dispatcher plugin',
         body: Type.Object({
-            uid:     Type.String(),
-            name:    Type.String(),
-            type:    Type.String(),
+            uid: Type.String(),
+            name: Type.String(),
+            type: Type.String(),
             address: Type.String(),
-            lat:     Type.Number(),
-            lon:     Type.Number(),
+            lat: Type.Number(),
+            lon: Type.Number(),
         }),
         res: Type.Any(),
     }, async (req, res) => {
         try {
             await Auth.is_auth(config, req);
-            const user    = await Auth.as_user(config, req);
+            const user = await Auth.as_user(config, req);
             const profile = await config.models.Profile.from(user.email);
-            const api     = await TAKAPI.init(new URL(String(config.server.api)), new APIAuthCertificate(profile.auth.cert, profile.auth.key));
+            const api = await TAKAPI.init(new URL(String(config.server.api)), new APIAuthCertificate(profile.auth.cert, profile.auth.key));
 
-            const now   = new Date().toISOString();
+            const now = new Date().toISOString();
             const stale = new Date(Date.now() + 3600_000).toISOString();
-            const esc   = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const b = req.body as { uid: string; name: string; type: string; address: string; lat: number; lon: number };
             const remarks = esc(`${b.type}${b.address ? ' — ' + b.address : ''}`);
             const xml = [
