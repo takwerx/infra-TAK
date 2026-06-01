@@ -5,32 +5,32 @@ import type { MenuItemConfig } from '../../plugin.ts';
 import { IconBuildingEstate } from '@tabler/icons-vue';
 import CadMain from './components/CadMain.vue';
 
-const MENU_KEY   = 'plugin-takcad';
-const ROUTE_NAME = 'home-menu-takcad';
+const MENU_KEY   = 'plugin-dispatcher';
+const ROUTE_NAME = 'home-menu-dispatcher';
 
-export default class TakCadPlugin implements PluginInstance {
+export default class DispatcherPlugin implements PluginInstance {
     api: PluginAPI;
 
     constructor(api: PluginAPI) {
         this.api = api;
     }
 
-    static async install(app: App, api: PluginAPI): Promise<TakCadPlugin> {
+    static async install(app: App, api: PluginAPI): Promise<DispatcherPlugin> {
         void app;
         api.routes.add(
-            { path: 'takcad', name: ROUTE_NAME, component: CadMain },
+            { path: 'dispatcher', name: ROUTE_NAME, component: CadMain },
             'home-menu'
         );
-        return new TakCadPlugin(api);
+        return new DispatcherPlugin(api);
     }
 
     async enable(): Promise<void> {
         this.api.menu.add({
             key:         MENU_KEY,
-            label:       'TAK CAD',
+            label:       'Dispatcher',
             route:       ROUTE_NAME,
-            tooltip:     'TAK CAD Dispatcher',
-            description: 'Computer-Aided Dispatch — manage incidents, vehicles, and personnel',
+            tooltip:     'CloudTAK Dispatcher',
+            description: 'Dispatch incidents on the map — works standalone or with TAK-CAD server plugin',
             icon:        markRaw(IconBuildingEstate) as unknown as MenuItemIconType,
         } as MenuItemConfig);
     }

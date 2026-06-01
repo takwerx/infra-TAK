@@ -6,12 +6,24 @@
                 :size='18'
                 class='me-2 text-warning'
             />
-            <span class='fw-semibold'>TAK CAD</span>
+            <span class='fw-semibold'>Dispatcher</span>
             <span
                 v-if='activeCount > 0'
                 class='ms-2 badge bg-danger'
             >{{ activeCount }}</span>
-            <span class='ms-auto text-white-50 small'>{{ connectionStatus }}</span>
+            <!-- Server-mode pill -->
+            <span
+                v-if='store.serverMode === "takcad"'
+                class='ms-2 badge bg-success text-white small'
+            >TAK-CAD Connected</span>
+            <span
+                v-else-if='store.serverMode === "standalone"'
+                class='ms-2 badge bg-secondary text-white small'
+            >Standalone</span>
+            <span
+                v-else
+                class='ms-2 badge bg-secondary text-white small opacity-50'
+            >Detecting…</span>
         </div>
 
         <!-- Tab nav -->
@@ -20,7 +32,7 @@
                 v-for='tab in TABS'
                 :key='tab.key'
                 class='flex-fill btn btn-sm rounded-0 py-2 border-0'
-                :class='activeTab === tab.key ? "bg-warning text-dark fw-semibold" : "text-white-50"'
+                :class='activeTab === tab.key ? "bg-warning text-dark fw-semibold" : "text-muted"'
                 @click='activeTab = tab.key'
             >
                 {{ tab.label }}
@@ -31,6 +43,7 @@
         <div class='flex-grow-1 overflow-hidden'>
             <IncidentListView
                 v-if='activeTab === "incidents"'
+                :server-mode='store.serverMode'
                 :incident-types='incidentTypes'
                 :vehicles='vehicles'
                 :personnel='personnel'
@@ -39,6 +52,7 @@
             />
             <VehicleListView
                 v-else-if='activeTab === "vehicles"'
+                :server-mode='store.serverMode'
                 :vehicle-types='vehicleTypes'
             />
             <PersonnelListView
@@ -55,8 +69,9 @@ import { IconBuildingEstate } from '@tabler/icons-vue';
 import IncidentListView from './IncidentListView.vue';
 import VehicleListView  from './VehicleListView.vue';
 import PersonnelListView from './PersonnelListView.vue';
-import { getIncidentTypes, getVehicleTypes, getVehicles, getPersonnel, getRoles } from '../lib/takcad-client.ts';
+import { getIncidentTypes, getVehicleTypes, getVehicles, getPersonnel, getRoles, getIncidentMetadata } from '../lib/takcad-client.ts';
 import type { IncidentTypeRef, VehicleType, VehicleRef, PersonRef, Role } from '../lib/takcad-types.ts';
+import { dispatcherStore as store } from '../lib/dispatcher-store.ts';
 
 const TABS = [
     { key: 'incidents',  label: 'Incidents'  },
@@ -76,11 +91,20 @@ const personnel        = ref<PersonRef[]>([]);
 const roles            = ref<Role[]>([]);
 
 onMounted(async () => {
+    // Mode detection: attempt getIncidentMetadata — success = takcad, error = standalone
+    store.serverMode = 'detecting';
     try {
-        [incidentTypes.value, vehicleTypes.value, vehicles.value, personnel.value, roles.value] =
-            await Promise.all([getIncidentTypes(), getVehicleTypes(), getVehicles(), getPersonnel(), getRoles()]);
-    } catch (e) {
-        console.warn('[takcad] bootstrap load failed', e);
+        await getIncidentMetadata();
+        store.serverMode = 'takcad';
+        // Load TAK-CAD metadata in parallel (takcad mode only)
+        try {
+            [incidentTypes.value, vehicleTypes.value, vehicles.value, personnel.value, roles.value] =
+                await Promise.all([getIncidentTypes(), getVehicleTypes(), getVehicles(), getPersonnel(), getRoles()]);
+        } catch (e) {
+            console.warn('[dispatcher] takcad metadata load failed', e);
+        }
+    } catch {
+        store.serverMode = 'standalone';
     }
 });
 </script>

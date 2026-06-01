@@ -33,7 +33,13 @@ export interface CallerInfo {
 export interface SourceSystem {
     uid:      string;
     name:     string;
-    platform: string;
+    platform: string;  // PlatformEnum: WINTAK | OTHER | UNKNOWN (CLOUDTAK is NOT valid)
+}
+
+// server DTO: tak.server.plugins.dto.PersonMetadata { uid, name }
+export interface PersonMetadata {
+    uid?:  string;
+    name:  string;
 }
 
 export interface Role {
@@ -83,6 +89,7 @@ export interface VehicleCallsign {
 }
 
 export interface VehicleResponseStatus {
+    uid:            string;           // response record uid (needed to delete the assignment)
     vehicle:        VehicleCallsign;
     eta:            string | null;
     responseStatus: string | null;
@@ -91,13 +98,13 @@ export interface VehicleResponseStatus {
 export interface IncidentRef {
     uid:                       string;
     incidentName:              string;
-    callerInfo:                CallerInfo | null;
+    callerInfo:                CallerInfo[];   // server DTO: List<CallerInfo>
     incidentTime:              string;
     firstResponderArrivalTime: string | null;
     incidentCompletionTime:    string | null;
     sourceSystem:              SourceSystem | null;
     incidentType:              IncidentTypeRef;
-    dispatcher:                string | null;
+    dispatcher:                PersonMetadata | null;  // server DTO: PersonMetadata, not a string
     location:                  Location;
     details:                   string | null;
     requestedCallsigns:        string[];
@@ -108,19 +115,23 @@ export interface IncidentRef {
     vehicleUidsRequested:      string[];
 }
 
+// server DTO: tak.server.plugins.dto.IncidentMetadata
+// NOTE: incidentType is a plain String (the type name), and there is NO dispatcher field.
 export interface IncidentMetadata {
     uid:          string;
     incidentName: string;
     incidentTime: string;
-    incidentType: IncidentTypeRef;
+    incidentType: string;
     location:     Location;
     status:       string;
-    dispatcher:   string | null;
 }
 
 export interface PersonRef {
     uid:         string;
     callsign:    string;
+    name?:       string;
+    status?:     string;            // Person StatusEnum (server requires it on insert)
+    location?:   Location | null;   // server requires a location with coords on insert
     takCadGroup: string | null;
     roles:       Role[];
 }
@@ -128,6 +139,9 @@ export interface PersonRef {
 export interface VehicleRef {
     uid:                           string;
     callsign:                      string;
+    name?:                         string;
+    status?:                       string;          // Vehicle StatusEnum (server requires it on insert)
+    location?:                     Location | null; // server requires a location with coords on insert
     vehicleType:                   VehicleType | null;
     vehiclePersonnel:              PersonCallsign[];
     incidentsRequestingThisVehicle: string[];
@@ -180,7 +194,7 @@ export function emptyIncident(types: IncidentTypeRef[]): Partial<IncidentRef> {
         incidentTime:         new Date().toISOString(),
         location:             emptyLocation(),
         status:               STATUS_ACTIVE,
-        callerInfo:           null,
+        callerInfo:           [],
         dispatcher:           null,
         details:              null,
         notes:                [],

@@ -1,20 +1,20 @@
 <template>
     <div class='d-flex flex-column h-100 overflow-hidden'>
-        <!-- ── Vehicle List ──────────────────────────────────── -->
+        <!-- ── Personnel List ────────────────────────────────── -->
         <template v-if='view === "list"'>
             <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
-                <span class='text-white-50 small me-auto'>{{ vehicles.length }} vehicles</span>
+                <span class='text-muted small me-auto'>{{ personnel.length }} personnel</span>
                 <button
                     class='btn btn-sm btn-warning'
                     @click='openCreate'
                 >
-                    + Add Vehicle
+                    + Add Person
                 </button>
             </div>
             <div class='flex-grow-1 overflow-auto'>
                 <div
                     v-if='loading'
-                    class='text-center text-white-50 py-4 small'
+                    class='text-center text-muted py-4 small'
                 >
                     <span class='spinner-border spinner-border-sm me-2' />Loading…
                 </div>
@@ -25,45 +25,37 @@
                     {{ loadError }}
                 </div>
                 <div
-                    v-else-if='!vehicles.length'
-                    class='text-center text-white-50 py-4 small'
+                    v-else-if='!personnel.length'
+                    class='text-center text-muted py-4 small'
                 >
-                    No vehicles registered
+                    No personnel registered
                 </div>
                 <div
-                    v-for='veh in vehicles'
-                    :key='veh.uid'
-                    class='d-flex align-items-center px-3 py-2 border-bottom vehicle-row'
+                    v-for='person in personnel'
+                    :key='person.uid'
+                    class='d-flex align-items-center px-3 py-2 border-bottom person-row'
                     role='button'
-                    @click='openDetail(veh)'
+                    @click='openDetail(person)'
                 >
                     <div class='flex-grow-1'>
-                        <div class='fw-semibold small text-white'>
-                            {{ veh.callsign }}
+                        <div class='fw-semibold small'>
+                            {{ person.callsign }}
                         </div>
-                        <div class='small text-white-50'>
-                            {{ veh.vehicleType?.name ?? 'Untyped' }}
+                        <div class='small text-muted'>
+                            {{ person.roles?.map(r => r.name).join(', ') || 'No roles' }}
                         </div>
                     </div>
-                    <div class='text-end small'>
-                        <div
-                            v-if='veh.vehiclePersonnel?.length'
-                            class='text-white-50'
-                        >
-                            {{ veh.vehiclePersonnel.map(p => p.callsign).join(', ') }}
-                        </div>
-                        <div
-                            v-if='veh.incidentsRequestingThisVehicle?.length'
-                            class='badge bg-warning text-dark'
-                        >
-                            {{ veh.incidentsRequestingThisVehicle.length }} incident(s)
-                        </div>
+                    <div
+                        v-if='person.takCadGroup'
+                        class='small text-muted'
+                    >
+                        {{ person.takCadGroup }}
                     </div>
                 </div>
             </div>
         </template>
 
-        <!-- ── Vehicle Detail / Edit ─────────────────────────── -->
+        <!-- ── Person Detail / Edit ──────────────────────────── -->
         <template v-else-if='view === "detail" && selected'>
             <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
                 <button
@@ -76,45 +68,30 @@
             </div>
             <div class='flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3'>
                 <div v-if='!editing'>
-                    <div class='card bg-dark border-secondary'>
+                    <div class='card border'>
                         <div class='card-body py-2 px-3 small d-flex flex-column gap-1'>
                             <div class='row g-1'>
-                                <div class='col-4 text-white-50'>
+                                <div class='col-4 text-muted'>
                                     Callsign
                                 </div>
-                                <div class='col-8 text-white'>
+                                <div class='col-8'>
                                     {{ selected.callsign }}
                                 </div>
-                                <div class='col-4 text-white-50'>
-                                    Type
+                                <div class='col-4 text-muted'>
+                                    Group
                                 </div>
-                                <div class='col-8 text-white'>
-                                    {{ selected.vehicleType?.name ?? '—' }}
+                                <div class='col-8'>
+                                    {{ selected.takCadGroup || '—' }}
                                 </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div
-                        v-if='selected.vehiclePersonnel?.length'
-                        class='mt-3'
-                    >
-                        <div class='small text-white-50 fw-semibold text-uppercase mb-1'>
-                            Personnel
-                        </div>
-                        <div class='card bg-dark border-secondary'>
-                            <div class='card-body py-1 px-3'>
-                                <div
-                                    v-for='p in selected.vehiclePersonnel'
-                                    :key='p.personUid'
-                                    class='py-1 border-bottom border-secondary small text-white'
-                                >
-                                    {{ p.callsign }}
+                                <div class='col-4 text-muted'>
+                                    Roles
+                                </div>
+                                <div class='col-8'>
+                                    {{ selected.roles?.map(r => r.name).join(', ') || '—' }}
                                 </div>
                             </div>
                         </div>
                     </div>
-
                     <div
                         v-if='detailError'
                         class='alert alert-danger py-2 small mt-3'
@@ -124,7 +101,7 @@
                     <div class='d-flex gap-2 mt-3'>
                         <button
                             class='btn btn-sm btn-outline-warning'
-                            @click='editing = true'
+                            @click='startEdit'
                         >
                             Edit
                         </button>
@@ -145,31 +122,42 @@
                     @submit.prevent='saveEdit'
                 >
                     <div>
-                        <label class='form-label small text-white-50 mb-1'>Callsign <span class='text-danger'>*</span></label>
+                        <label class='form-label small text-muted mb-1'>Callsign <span class='text-danger'>*</span></label>
                         <input
                             v-model='editForm.callsign'
                             required
                             type='text'
-                            class='form-control form-control-sm bg-dark text-white border-secondary'
+                            class='form-control form-control-sm border'
                         >
                     </div>
                     <div>
-                        <label class='form-label small text-white-50 mb-1'>Vehicle Type</label>
-                        <select
-                            v-model='editForm.vehicleTypeUid'
-                            class='form-select form-select-sm bg-dark text-white border-secondary'
+                        <label class='form-label small text-muted mb-1'>TAK CAD Group</label>
+                        <input
+                            v-model='editForm.takCadGroup'
+                            type='text'
+                            class='form-control form-control-sm border'
+                            placeholder='e.g. ALPHA'
                         >
-                            <option value=''>
-                                — None —
-                            </option>
-                            <option
-                                v-for='t in vehicleTypes'
-                                :key='t.uid'
-                                :value='t.uid'
+                    </div>
+                    <div>
+                        <label class='form-label small text-muted mb-1'>Roles</label>
+                        <div
+                            v-for='role in roles'
+                            :key='role.uid'
+                            class='form-check'
+                        >
+                            <input
+                                :id='`edit-role-${role.uid}`'
+                                type='checkbox'
+                                class='form-check-input'
+                                :checked='editForm.roleUids.includes(role.uid)'
+                                @change='toggleRole(role.uid, editForm.roleUids)'
                             >
-                                {{ t.name }}
-                            </option>
-                        </select>
+                            <label
+                                class='form-check-label text-muted small'
+                                :for='`edit-role-${role.uid}`'
+                            >{{ role.name }}</label>
+                        </div>
                     </div>
                     <div
                         v-if='detailError'
@@ -200,7 +188,7 @@
             </div>
         </template>
 
-        <!-- ── Add Vehicle ────────────────────────────────────── -->
+        <!-- ── Add Person ─────────────────────────────────────── -->
         <template v-else-if='view === "create"'>
             <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
                 <button
@@ -209,7 +197,7 @@
                 >
                     ← Back
                 </button>
-                <span class='fw-semibold'>Add Vehicle</span>
+                <span class='fw-semibold'>Add Person</span>
             </div>
             <div class='p-3'>
                 <form
@@ -217,32 +205,43 @@
                     @submit.prevent='saveCreate'
                 >
                     <div>
-                        <label class='form-label small text-white-50 mb-1'>Callsign <span class='text-danger'>*</span></label>
+                        <label class='form-label small text-muted mb-1'>Callsign <span class='text-danger'>*</span></label>
                         <input
                             v-model='createForm.callsign'
                             required
                             type='text'
-                            class='form-control form-control-sm bg-dark text-white border-secondary'
-                            placeholder='e.g. ENG-1'
+                            class='form-control form-control-sm border'
+                            placeholder='e.g. DISPATCH-1'
                         >
                     </div>
                     <div>
-                        <label class='form-label small text-white-50 mb-1'>Vehicle Type</label>
-                        <select
-                            v-model='createForm.vehicleTypeUid'
-                            class='form-select form-select-sm bg-dark text-white border-secondary'
+                        <label class='form-label small text-muted mb-1'>TAK CAD Group</label>
+                        <input
+                            v-model='createForm.takCadGroup'
+                            type='text'
+                            class='form-control form-control-sm border'
+                            placeholder='e.g. ALPHA'
                         >
-                            <option value=''>
-                                — None —
-                            </option>
-                            <option
-                                v-for='t in vehicleTypes'
-                                :key='t.uid'
-                                :value='t.uid'
+                    </div>
+                    <div>
+                        <label class='form-label small text-muted mb-1'>Roles</label>
+                        <div
+                            v-for='role in roles'
+                            :key='role.uid'
+                            class='form-check'
+                        >
+                            <input
+                                :id='`create-role-${role.uid}`'
+                                type='checkbox'
+                                class='form-check-input'
+                                :checked='createForm.roleUids.includes(role.uid)'
+                                @change='toggleRole(role.uid, createForm.roleUids)'
                             >
-                                {{ t.name }}
-                            </option>
-                        </select>
+                            <label
+                                class='form-check-label text-muted small'
+                                :for='`create-role-${role.uid}`'
+                            >{{ role.name }}</label>
+                        </div>
                     </div>
                     <div
                         v-if='createError'
@@ -259,7 +258,7 @@
                             <span
                                 v-if='saving'
                                 class='spinner-border spinner-border-sm me-1'
-                            />Add Vehicle
+                            />Add Person
                         </button>
                         <button
                             type='button'
@@ -277,60 +276,78 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted } from 'vue';
-import { getVehicles, insertVehicle, updateVehicle, deleteVehicle } from '../lib/takcad-client.ts';
-import type { VehicleRef, VehicleType } from '../lib/takcad-types.ts';
+import { getPersonnel, insertPerson, updatePerson, deletePerson } from '../lib/takcad-client.ts';
+import type { PersonRef, Role } from '../lib/takcad-types.ts';
 
-const props = defineProps<{ vehicleTypes: VehicleType[] }>();
+const props = defineProps<{ roles: Role[] }>();
 
 type ViewName = 'list' | 'detail' | 'create';
 
-const view       = ref<ViewName>('list');
-const vehicles   = ref<VehicleRef[]>([]);
-const selected   = ref<VehicleRef | null>(null);
-const loading    = ref(false);
-const loadError  = ref('');
+const view        = ref<ViewName>('list');
+const personnel   = ref<PersonRef[]>([]);
+const selected    = ref<PersonRef | null>(null);
+const loading     = ref(false);
+const loadError   = ref('');
 const detailError = ref('');
 const createError = ref('');
-const saving     = ref(false);
-const editing    = ref(false);
+const saving      = ref(false);
+const editing     = ref(false);
 
-const editForm   = reactive({ callsign: '', vehicleTypeUid: '' });
-const createForm = reactive({ callsign: '', vehicleTypeUid: '' });
+const editForm   = reactive({ callsign: '', takCadGroup: '', roleUids: [] as string[] });
+const createForm = reactive({ callsign: '', takCadGroup: '', roleUids: [] as string[] });
+
+function toggleRole(uid: string, arr: string[]) {
+    const idx = arr.indexOf(uid);
+    if (idx >= 0) arr.splice(idx, 1);
+    else arr.push(uid);
+}
 
 async function loadList() {
     loading.value = true; loadError.value = '';
-    try { vehicles.value = await getVehicles(); }
+    try { personnel.value = await getPersonnel(); }
     catch (e) { loadError.value = e instanceof Error ? e.message : String(e); }
     finally { loading.value = false; }
 }
 
-function openDetail(veh: VehicleRef) {
-    selected.value = veh;
-    editing.value  = false;
+function openDetail(person: PersonRef) {
+    selected.value    = person;
+    editing.value     = false;
     detailError.value = '';
-    editForm.callsign      = veh.callsign;
-    editForm.vehicleTypeUid = veh.vehicleType?.uid ?? '';
     view.value = 'detail';
 }
 
+function startEdit() {
+    if (!selected.value) return;
+    editForm.callsign    = selected.value.callsign;
+    editForm.takCadGroup = selected.value.takCadGroup ?? '';
+    editForm.roleUids    = selected.value.roles?.map(r => r.uid) ?? [];
+    editing.value = true;
+}
+
 function openCreate() {
-    createForm.callsign      = '';
-    createForm.vehicleTypeUid = props.vehicleTypes[0]?.uid ?? '';
-    createError.value = '';
+    createForm.callsign    = '';
+    createForm.takCadGroup = '';
+    createForm.roleUids    = [];
+    createError.value      = '';
     view.value = 'create';
 }
 
 async function saveEdit() {
     if (!selected.value) return;
     saving.value = true; detailError.value = '';
-    const vt = props.vehicleTypes.find(t => t.uid === editForm.vehicleTypeUid) ?? null;
-    const updated: VehicleRef = { ...selected.value, callsign: editForm.callsign, vehicleType: vt };
+    const assignedRoles = props.roles.filter(r => editForm.roleUids.includes(r.uid));
+    const updated: PersonRef = {
+        ...selected.value,
+        callsign:    editForm.callsign,
+        takCadGroup: editForm.takCadGroup || null,
+        roles:       assignedRoles,
+    };
     try {
-        const r = await updateVehicle(updated);
+        const r = await updatePerson(updated);
         if (!r.success) throw new Error(r.errors?.join(', ') || 'Update failed');
-        selected.value = updated;
-        vehicles.value = vehicles.value.map(v => v.uid === updated.uid ? updated : v);
-        editing.value  = false;
+        selected.value  = updated;
+        personnel.value = personnel.value.map(p => p.uid === updated.uid ? updated : p);
+        editing.value   = false;
     } catch (e) {
         detailError.value = e instanceof Error ? e.message : String(e);
     } finally {
@@ -340,18 +357,22 @@ async function saveEdit() {
 
 async function saveCreate() {
     saving.value = true; createError.value = '';
-    const vt = props.vehicleTypes.find(t => t.uid === createForm.vehicleTypeUid) ?? null;
-    const payload: VehicleRef = {
-        uid:                            crypto.randomUUID(),
-        callsign:                       createForm.callsign,
-        vehicleType:                    vt,
-        vehiclePersonnel:               [],
-        incidentsRequestingThisVehicle: [],
+    const assignedRoles = props.roles.filter(r => createForm.roleUids.includes(r.uid));
+    // Server requires status + a non-null location. Location starts empty —
+    // populated by the ATAK user's GPS when they connect.
+    const payload: PersonRef = {
+        uid:         crypto.randomUUID(),
+        callsign:    createForm.callsign,
+        name:        createForm.callsign,
+        status:      'AVAILABLE',
+        location:    { address: { streetName: '', city: '', state: '', zipCode: '', country: '' }, coords: null },
+        takCadGroup: createForm.takCadGroup || null,
+        roles:       assignedRoles,
     };
     try {
-        const r = await insertVehicle(payload);
+        const r = await insertPerson(payload);
         if (!r.success) throw new Error(r.errors?.join(', ') || 'Insert failed');
-        vehicles.value = [...vehicles.value, payload];
+        personnel.value = [...personnel.value, payload];
         view.value = 'list';
     } catch (e) {
         createError.value = e instanceof Error ? e.message : String(e);
@@ -362,11 +383,11 @@ async function saveCreate() {
 
 async function confirmDelete() {
     if (!selected.value) return;
-    if (!confirm(`Delete vehicle "${selected.value.callsign}"?`)) return;
+    if (!confirm(`Delete "${selected.value.callsign}"?`)) return;
     saving.value = true; detailError.value = '';
     try {
-        await deleteVehicle(selected.value.uid);
-        vehicles.value = vehicles.value.filter(v => v.uid !== selected.value!.uid);
+        await deletePerson(selected.value.uid);
+        personnel.value = personnel.value.filter(p => p.uid !== selected.value!.uid);
         view.value = 'list';
         selected.value = null;
     } catch (e) {
@@ -377,10 +398,10 @@ async function confirmDelete() {
 }
 
 let pollTimer: ReturnType<typeof setInterval>;
-onMounted(() => { loadList(); pollTimer = setInterval(loadList, 60_000); });
+onMounted(() => { loadList(); pollTimer = setInterval(loadList, 15_000); });
 onUnmounted(() => clearInterval(pollTimer));
 </script>
 
 <style scoped>
-.vehicle-row:hover { background: rgba(255,255,255,.05); cursor: pointer; }
+.person-row:hover { background: rgba(255,255,255,.05); cursor: pointer; }
 </style>

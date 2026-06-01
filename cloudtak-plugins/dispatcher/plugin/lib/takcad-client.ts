@@ -34,8 +34,20 @@ async function cadGet<T>(fn: string, params: Record<string, string> = {}): Promi
     return await std(`${BASE}?${qs.toString()}`, { method: 'GET' }) as T;
 }
 
+// Inserts → PUT /submit/result (onSubmitDataWithResult), returns a ResponseMessage.
 async function cadPut<T>(fn: string, body: unknown): Promise<T> {
     return await std(`${BASE_PUT}?fn=${encodeURIComponent(fn)}`, { method: 'PUT', body }) as T;
+}
+
+// Updates → POST /submit?fn=&uid= (updateInPlugin → onUpdateData). NOTE: the server
+// routes update via a DIFFERENT endpoint than insert (PUT /submit/result gives
+// "method not implemented"), AND requires the uid as a query param ("missing uid"
+// otherwise). onUpdateData is fire-and-forget (void) → TAK Server returns a generic
+// 200 ack, not a ResponseMessage, so we synthesize success on a clean call.
+async function cadUpdate(fn: string, uid: string, body: unknown): Promise<ResponseMessage> {
+    const qs = new URLSearchParams({ fn, uid });
+    await std(`${BASE}?${qs.toString()}`, { method: 'POST', body });
+    return { success: true, result: null, warnings: [], errors: [] };
 }
 
 async function cadDelete(fn: string, uid: string): Promise<void> {
@@ -48,7 +60,7 @@ export const getIncidents        = ()                      => cadGet<IncidentRef
 export const getIncidentMetadata = ()                      => cadGet<IncidentMetadata[]>('getIncidentMetadata');
 export const getIncident         = (uid: string)           => cadGet<IncidentRef>('getIncident', { uid });
 export const insertIncident      = (i: IncidentRef)        => cadPut<ResponseMessage>('insertIncident', i);
-export const updateIncident      = (i: IncidentRef)        => cadPut<ResponseMessage>('updateIncident', i);
+export const updateIncident      = (i: IncidentRef)        => cadUpdate('updateIncident', i.uid, i);
 export const deleteIncident      = (uid: string)           => cadDelete('deleteIncident', uid);
 export const getIncidentTypes    = ()                      => cadGet<IncidentTypeRef[]>('getIncidentTypes');
 
@@ -56,37 +68,70 @@ export const getIncidentTypes    = ()                      => cadGet<IncidentTyp
 export const getVehicles      = ()                 => cadGet<VehicleRef[]>('getVehicles');
 export const getVehicle       = (uid: string)      => cadGet<VehicleRef>('getVehicle', { uid });
 export const insertVehicle    = (v: VehicleRef)    => cadPut<ResponseMessage>('insertVehicle', v);
-export const updateVehicle    = (v: VehicleRef)    => cadPut<ResponseMessage>('updateVehicle', v);
+export const updateVehicle    = (v: VehicleRef)    => cadUpdate('updateVehicle', v.uid, v);
 export const deleteVehicle    = (uid: string)      => cadDelete('deleteVehicle', uid);
 export const getVehicleTypes  = ()                 => cadGet<VehicleType[]>('getVehicleTypes');
+
+// Vehicle-to-incident assignment uses a separate VehicleResponseMetadata DTO —
+// NOT updateIncident.vehicleUidsRequested (the server ignores that field on update).
+// insertVehicleResponse → PUT /submit/result (onSubmitDataWithResult).
+// deleteVehicleResponse → POST /submit?uid= (onUpdateData — DELETE bridge is broken).
+export interface VehicleResponseMetadata {
+    uid:            string;
+    callsign:       string;
+    vehicleUid:     string;
+    incidentUid:    string;
+    responseStatus: string | null;
+    eta:            number | null;
+    arrivalTime:    string | null;
+}
+export const insertVehicleResponse = (r: VehicleResponseMetadata) => cadPut<ResponseMessage>('insertVehicleResponse', r);
+export const deleteVehicleResponse = (uid: string)                => cadUpdate('deleteVehicleResponse', uid, {});
 
 // ── Personnel ────────────────────────────────────────────────────────────────
 export const getPersonnel   = ()                => cadGet<PersonRef[]>('getPersonnel');
 export const getPerson      = (uid: string)     => cadGet<PersonRef>('getPerson', { uid });
 export const insertPerson   = (p: PersonRef)    => cadPut<ResponseMessage>('insertPerson', p);
-export const updatePerson   = (p: PersonRef)    => cadPut<ResponseMessage>('updatePerson', p);
+export const updatePerson   = (p: PersonRef)    => cadUpdate('updatePerson', p.uid, p);
 export const deletePerson   = (uid: string)     => cadDelete('deletePerson', uid);
 export const getRoles       = ()                => cadGet<Role[]>('getRoles');
 
-// ── Geocoding (OpenRouteService) ─────────────────────────────────────────────
-// Key configured in the TAK-CAD alpha release docs.  Safe to call from browser.
-const ORS_KEY  = '5b3ce3597851110001cf62488c4f8dccd2cc447aa974115095a2e6e4';
-const ORS_BASE = 'https://api.openrouteservice.org/geocode';
+// ── Missions ─────────────────────────────────────────────────────────────────
+export interface MissionRef {
+    guid:        string;
+    name:        string;
+    description?: string;
+}
 
+export async function getMissions(): Promise<MissionRef[]> {
+    const resp = await std('/api/marti/missions?passwordProtected=false', { method: 'GET' }) as { data?: MissionRef[] } | null;
+    return resp?.data ?? [];
+}
+
+// ── Geocoding ────────────────────────────────────────────────────────────────
+// Proxied through CloudTAK (server route plugin-takcad.ts → OpenRouteService).
+// A direct browser call to openrouteservice.org is blocked by CloudTAK's CSP
+// (connect-src is 'self' only), so it must go server-side. Auth via std().
 export interface GeocodeSuggestion {
-    label:   string;
-    lat:     number;
-    lon:     number;
+    label:      string;
+    lat:        number;
+    lon:        number;
+    streetName: string;
+    city:       string;
+    state:      string;
+    zipCode:    string;
+    country:    string;
 }
 
 export async function geocodeAddress(query: string): Promise<GeocodeSuggestion[]> {
-    const qs = new URLSearchParams({ api_key: ORS_KEY, text: query, size: '5' });
-    const resp = await fetch(`${ORS_BASE}/search?${qs}`);
-    if (!resp.ok) return [];
-    const json = await resp.json() as { features?: { geometry: { coordinates: number[] }; properties: { label: string } }[] };
-    return (json.features ?? []).map(f => ({
-        label: f.properties.label,
-        lon:   f.geometry.coordinates[0],
-        lat:   f.geometry.coordinates[1],
-    }));
+    const qs = new URLSearchParams({ q: query });
+    const resp = await std(`/api/takcad/geocode?${qs.toString()}`, { method: 'GET' }) as { suggestions?: GeocodeSuggestion[] };
+    return resp.suggestions ?? [];
+}
+
+// Reverse geocode a map-clicked point into an address (for "pick on map").
+export async function reverseGeocode(lat: number, lon: number): Promise<GeocodeSuggestion | null> {
+    const qs = new URLSearchParams({ lat: String(lat), lon: String(lon) });
+    const resp = await std(`/api/takcad/geocode/reverse?${qs.toString()}`, { method: 'GET' }) as { suggestion?: GeocodeSuggestion | null };
+    return resp.suggestion ?? null;
 }

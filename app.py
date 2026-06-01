@@ -15297,19 +15297,20 @@ CLOUDTAK_PLUGINS = [
         'license': 'MIT',
     },
     {
-        'key': 'takcad',
-        'name': 'TAK CAD Dispatcher',
+        'key': 'dispatcher',
+        'name': 'CloudTAK Dispatcher',
         'description': (
-            'Computer-Aided Dispatch for CloudTAK — create and manage incidents, '
-            'assign vehicles and personnel, track responders and notes.'
+            'Standalone dispatcher plugin for CloudTAK — create incidents on the map, '
+            'notify responders via mission thread and direct message. Works without the '
+            'TAK-CAD server plugin; auto-upgrades to full TAK-CAD mode when detected.'
         ),
-        'local_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'takcad', 'plugin'),
+        'local_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'dispatcher', 'plugin'),
         # server_path: CloudTAK API route files copied into api/routes/ so the
-        # browser plugin can reach TAK Server's /Marti/api/plugins/takcad/* via
+        # browser plugin can reach TAK Server's /Marti/api/plugins/<FQCN>/* via
         # CloudTAK's cert auth (CloudTAK has no generic Marti passthrough).
-        'server_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'takcad', 'server'),
-        'install_dir': 'takcad',
-        'requires': 'CloudTAK 13.2+ / TAK Server with TAK-CAD plugin',
+        'server_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'dispatcher', 'server'),
+        'install_dir': 'dispatcher',
+        'requires': 'CloudTAK 13.2+',
         'author': 'takwerx',
         'license': 'Proprietary',
     },
