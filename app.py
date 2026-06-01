@@ -25512,7 +25512,8 @@ window._ctPluginSetBusy = function(pluginKey, action, busy) {
   if (activeBtn) {
     if (busy) {
       activeBtn._origHTML = activeBtn.innerHTML;
-      activeBtn.innerHTML = '<span class="ct-btn-spinner"></span>' + label + 'ing\u2026';
+      var busyLabel = { install: 'Installing', update: 'Updating', remove: 'Removing' }[action] || (label + 'ing');
+      activeBtn.innerHTML = '<span class="ct-btn-spinner"></span>' + busyLabel + '\u2026';
     } else if (activeBtn._origHTML) {
       activeBtn.innerHTML = activeBtn._origHTML;
       delete activeBtn._origHTML;
