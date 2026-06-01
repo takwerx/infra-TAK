@@ -15297,7 +15297,7 @@ CLOUDTAK_PLUGINS = [
         'license': 'MIT',
     },
     {
-        'key': 'dispatcher',
+        'key': 'tak-dispatcher',
         'name': 'CloudTAK Dispatcher',
         'description': (
             'Standalone dispatcher plugin for CloudTAK — create incidents on the map, '
@@ -15309,7 +15309,7 @@ CLOUDTAK_PLUGINS = [
         # browser plugin can reach TAK Server's /Marti/api/plugins/<FQCN>/* via
         # CloudTAK's cert auth (CloudTAK has no generic Marti passthrough).
         'server_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'dispatcher', 'server'),
-        'install_dir': 'dispatcher',
+        'install_dir': 'tak-dispatcher',
         'requires': 'CloudTAK 13.2+',
         'author': 'takwerx',
         'license': 'Proprietary',

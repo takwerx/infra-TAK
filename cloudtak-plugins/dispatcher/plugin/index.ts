@@ -5,8 +5,8 @@ import type { MenuItemConfig } from '../../plugin.ts';
 import { IconBuildingEstate } from '@tabler/icons-vue';
 import CadMain from './components/CadMain.vue';
 
-const MENU_KEY   = 'plugin-dispatcher';
-const ROUTE_NAME = 'home-menu-dispatcher';
+const MENU_KEY   = 'plugin-tak-dispatcher';
+const ROUTE_NAME = 'home-menu-tak-dispatcher';
 
 export default class DispatcherPlugin implements PluginInstance {
     api: PluginAPI;
@@ -18,7 +18,7 @@ export default class DispatcherPlugin implements PluginInstance {
     static async install(app: App, api: PluginAPI): Promise<DispatcherPlugin> {
         void app;
         api.routes.add(
-            { path: 'dispatcher', name: ROUTE_NAME, component: CadMain },
+            { path: 'tak-dispatcher', name: ROUTE_NAME, component: CadMain },
             'home-menu'
         );
         return new DispatcherPlugin(api);
