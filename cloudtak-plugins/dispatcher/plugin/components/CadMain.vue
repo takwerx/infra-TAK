@@ -11,25 +11,25 @@
                 v-if='activeCount > 0'
                 class='ms-2 badge bg-danger'
             >{{ activeCount }}</span>
-            <!-- Server-mode pill (clickable toggle) -->
+            <!-- TAK-CAD connection toggle -->
             <button
                 v-if='store.serverMode === "takcad"'
                 class='ms-2 badge bg-success text-white small border-0'
                 style='cursor:pointer'
-                title='Click to switch to Standalone mode'
+                title='TAK-CAD connected — click to disconnect'
                 @click='forceStandalone'
-            >TAK-CAD Connected ✕</button>
+            >TAK-CAD ●</button>
             <button
                 v-else-if='store.serverMode === "standalone"'
                 class='ms-2 badge bg-secondary text-white small border-0'
-                :style='store.forcedMode ? "cursor:pointer" : "cursor:default"'
-                :title='store.forcedMode ? "Click to reconnect to TAK-CAD" : ""'
-                @click='store.forcedMode ? retryDetection() : undefined'
-            >Standalone{{ store.forcedMode ? ' ↺' : '' }}</button>
+                style='cursor:pointer'
+                title='Connect to TAK-CAD'
+                @click='retryDetection'
+            >TAK-CAD</button>
             <span
                 v-else
                 class='ms-2 badge bg-secondary text-white small opacity-50'
-            >Detecting…</span>
+            >TAK-CAD…</span>
         </div>
 
         <!-- Tab nav -->
@@ -121,6 +121,7 @@ async function retryDetection() {
     store.forcedMode = null;
     await detect();
 }
+
 
 onMounted(async () => {
     if (store.forcedMode === 'standalone') {
