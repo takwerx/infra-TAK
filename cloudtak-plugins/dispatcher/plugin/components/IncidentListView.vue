@@ -727,7 +727,9 @@ const displayedIncidents = computed(() => {
     });
 });
 
-watch(activeIncidents, n => emit('active-count', n.length), { immediate: true });
+watch(activeIncidents, n => {
+    if (props.serverMode === 'takcad') emit('active-count', n.length);
+}, { immediate: true });
 
 function toggleSort(col: SortCol) {
     if (sortCol.value === col) sortAsc.value = !sortAsc.value;
