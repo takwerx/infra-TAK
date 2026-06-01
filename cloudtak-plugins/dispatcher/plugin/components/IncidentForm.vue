@@ -495,6 +495,7 @@ async function submitStandalone(address: string) {
 }
 
 async function submitTakCad(address: string) {
+    void address;
     if (!form.incidentType) { saveError.value = 'Select an incident type'; return; }
 
     // Map type name back to IncidentTypeRef for the TAK-CAD API
