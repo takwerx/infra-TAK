@@ -460,6 +460,7 @@
                         :uid='editUid'
                         :server-mode='serverMode'
                         :incident-types='incidentTypes'
+                        :active-feed='dispatcherStore.activeFeed'
                         @saved='onFormSaved'
                         @cancel='cancelForm'
                     />
@@ -469,60 +470,16 @@
 
         <!-- ── Standalone mode: CloudTAK-native UI ─────────────────────────── -->
         <template v-else-if='serverMode === "standalone"'>
-            <!-- DataSync Feed banner -->
+            <!-- Feed gate: require DataSync feed before dispatching -->
             <div
-                v-if='!activeMission'
-                class='m-2'
+                v-if='!dispatcherStore.activeFeed'
+                class='text-center text-muted py-4 small px-3'
             >
-                <button
-                    class='btn btn-sm btn-outline-secondary w-100'
-                    :disabled='loadingMissions'
-                    @click='fetchMissions'
-                >
-                    <span
-                        v-if='loadingMissions'
-                        class='spinner-border spinner-border-sm me-1'
-                    />
-                    {{ loadingMissions ? 'Loading…' : '+ Select DataSync Feed' }}
-                </button>
-                <div
-                    v-if='missions.length'
-                    class='border rounded mt-1'
-                    style='max-height:180px;overflow-y:auto;background:var(--bs-body-bg, #1e2228)'
-                >
-                    <button
-                        v-for='m in missions'
-                        :key='m.guid'
-                        class='btn btn-sm w-100 text-start px-3 py-2 border-0 border-bottom rounded-0 text-muted'
-                        style='font-size:12px'
-                        @click='selectMission(m)'
-                    >
-                        {{ m.name }}
-                    </button>
-                </div>
-                <div
-                    v-else-if='missions.length === 0 && !loadingMissions && missionsFetched'
-                    class='text-muted small text-center py-2'
-                >
-                    No DataSync feeds found
-                </div>
-            </div>
-            <div
-                v-else
-                class='px-3 py-1 border-bottom small text-muted d-flex align-items-center gap-2 flex-shrink-0'
-            >
-                <span class='badge bg-primary text-white'>DataSync</span>
-                <span class='text-truncate'>{{ activeMission.name }}</span>
-                <button
-                    class='btn btn-link btn-sm p-0 text-muted ms-auto text-decoration-none'
-                    @click='activeMission = null'
-                >
-                    ✕
-                </button>
+                Select a DataSync Feed above to begin dispatching.
             </div>
 
-            <!-- Standalone incident list / form -->
-            <template v-if='slView === "list"'>
+            <!-- Standalone incident list / form (only when feed is selected) -->
+            <template v-else-if='slView === "list"'>
                 <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
                     <span class='text-muted small me-auto'>{{ slActiveIncidents.length }} active</span>
                     <button
@@ -608,7 +565,41 @@
                             </div>
                         </div>
                     </div>
-                    <div class='d-flex gap-2'>
+                    <!-- Notes log -->
+                    <div
+                        v-if='slDetail.notes.length'
+                        class='border-top pt-2 mt-2'
+                    >
+                        <div class='small text-muted mb-1'>Notes</div>
+                        <div
+                            v-for='(n, i) in slDetail.notes'
+                            :key='i'
+                            class='small mb-1'
+                        >
+                            <span class='text-muted'>{{ shortTime(n.time) }}</span>
+                            {{ n.text }}
+                        </div>
+                    </div>
+
+                    <!-- Add note -->
+                    <div class='d-flex gap-1 mt-2'>
+                        <input
+                            v-model='slNoteInput'
+                            type='text'
+                            class='form-control form-control-sm border flex-grow-1'
+                            placeholder='Add note…'
+                            @keydown.enter='slAddNote(slDetail)'
+                        >
+                        <button
+                            class='btn btn-sm btn-outline-secondary'
+                            :disabled='!slNoteInput.trim()'
+                            @click='slAddNote(slDetail)'
+                        >
+                            Add
+                        </button>
+                    </div>
+
+                    <div class='d-flex gap-2 mt-2'>
                         <button
                             class='btn btn-sm btn-outline-secondary'
                             @click='flyToIncident(slDetail)'
@@ -616,10 +607,10 @@
                             Show on Map
                         </button>
                         <button
-                            class='btn btn-sm btn-outline-danger ms-auto'
-                            @click='slCancelIncident(slDetail.uid)'
+                            class='btn btn-sm btn-warning ms-auto'
+                            @click='slCloseIncident(slDetail)'
                         >
-                            Cancel
+                            Close Incident
                         </button>
                     </div>
                 </div>
@@ -639,8 +630,8 @@
                 <div class='flex-grow-1 overflow-auto p-3'>
                     <IncidentForm
                         :server-mode='serverMode'
-                        :incident-types='[]'
-                        :active-mission-guid='activeMission?.guid'
+                        :incident-types='incidentTypes'
+                        :active-feed='dispatcherStore.activeFeed'
                         @saved-standalone='onStandaloneSaved'
                         @cancel='slView = "list"'
                     />
@@ -665,9 +656,10 @@ import {
     getIncidentMetadata, getIncident,
     updateIncident, deleteIncident,
     insertVehicleResponse, deleteVehicleResponse,
-    getMissions,
+    postMissionLog,
 } from '../lib/takcad-client.ts';
-import type { MissionRef, VehicleResponseMetadata } from '../lib/takcad-client.ts';
+import type { VehicleResponseMetadata } from '../lib/takcad-client.ts';
+import { removeIncidentMarker, updateIncidentMarker } from '../lib/map-marker.ts';
 import type { IncidentMetadata, IncidentRef, VehicleRef, PersonRef, IncidentTypeRef, PersonCallsign } from '../lib/takcad-types.ts';
 import { isActive, formatAddress, formatTime, STATUS_CANCELLED } from '../lib/takcad-types.ts';
 import { dispatcherStore } from '../lib/dispatcher-store.ts';
@@ -928,12 +920,9 @@ async function refreshDetail() {
 // ── Standalone mode state ─────────────────────────────────────────────────────
 type SlViewName = 'list' | 'detail' | 'form';
 
-const slView         = ref<SlViewName>('list');
-const slDetail       = ref<LocalIncident | null>(null);
-const activeMission   = ref<MissionRef | null>(null);
-const missions        = ref<MissionRef[]>([]);
-const loadingMissions = ref(false);
-const missionsFetched = ref(false);
+const slView      = ref<SlViewName>('list');
+const slDetail    = ref<LocalIncident | null>(null);
+const slNoteInput = ref('');
 
 const slActiveIncidents = computed(() =>
     dispatcherStore.localIncidents.filter(i => i.status === 'ACTIVE')
@@ -943,31 +932,50 @@ watch(slActiveIncidents, n => {
     if (props.serverMode === 'standalone') emit('active-count', n.length);
 }, { immediate: true });
 
-async function fetchMissions() {
-    loadingMissions.value = true;
-    missionsFetched.value = false;
-    try { missions.value = await getMissions(); }
-    catch { missions.value = []; }
-    finally { loadingMissions.value = false; missionsFetched.value = true; }
-}
-
-function selectMission(m: MissionRef) {
-    activeMission.value = m;
-    missions.value = [];
-    // Activate the mission in CloudTAK's map store if the API is available
-    if (typeof (mapStore as unknown as { makeActiveMission?: (m: unknown) => void }).makeActiveMission === 'function') {
-        (mapStore as unknown as { makeActiveMission: (m: unknown) => void }).makeActiveMission(m);
-    }
-}
 
 function slOpenDetail(uid: string) {
     slDetail.value = dispatcherStore.localIncidents.find(i => i.uid === uid) ?? null;
     slView.value = 'detail';
 }
 
-function slCancelIncident(uid: string) {
-    const idx = dispatcherStore.localIncidents.findIndex(i => i.uid === uid);
+async function slAddNote(inc: LocalIncident) {
+    const text = slNoteInput.value.trim();
+    if (!text) return;
+    const time = new Date().toISOString();
+    inc.notes.push({ text, time });
+    slNoteInput.value = '';
+
+    // Update CoT marker with latest notes appended to details
+    const updatedDetails = [inc.details, ...inc.notes.map(n => n.text)].filter(Boolean).join('\n');
+    try {
+        await updateIncidentMarker({ ...inc, details: updatedDetails });
+    } catch { /* best-effort */ }
+
+    // DataSync log entry
+    const feed = dispatcherStore.activeFeed;
+    if (feed) {
+        try { await postMissionLog(feed.guid, `UPDATE ${inc.number}: ${text}`); }
+        catch { /* best-effort */ }
+    }
+}
+
+async function slCloseIncident(inc: LocalIncident) {
+    const idx = dispatcherStore.localIncidents.findIndex(i => i.uid === inc.uid);
     if (idx !== -1) dispatcherStore.localIncidents[idx].status = 'CANCELLED';
+
+    // Remove CoT marker
+    try { await removeIncidentMarker(inc); } catch { /* best-effort */ }
+
+    // DataSync log entry
+    const feed = dispatcherStore.activeFeed;
+    if (feed) {
+        try {
+            const startMs = new Date(inc.time).getTime();
+            const durMin = Math.round((Date.now() - startMs) / 60000);
+            await postMissionLog(feed.guid, `INCIDENT CLOSED: ${inc.number} | ${inc.name} | ${durMin} min`);
+        } catch { /* best-effort */ }
+    }
+
     slView.value = 'list';
 }
 

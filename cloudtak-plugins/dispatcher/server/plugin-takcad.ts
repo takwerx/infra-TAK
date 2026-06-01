@@ -116,6 +116,8 @@ export default async function router(schema: Schema, config: Config) {
             address: Type.String(),
             lat: Type.Number(),
             lon: Type.Number(),
+            remarks: Type.Optional(Type.String()),
+            deleteMarker: Type.Optional(Type.Boolean()),
         }),
         res: Type.Any(),
     }, async (req, res) => {
@@ -126,10 +128,12 @@ export default async function router(schema: Schema, config: Config) {
             const api = await TAKAPI.init(new URL(String(config.server.api)), new APIAuthCertificate(profile.auth.cert, profile.auth.key));
 
             const now = new Date().toISOString();
-            const stale = new Date(Date.now() + 3600_000).toISOString();
             const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            const b = req.body as { uid: string; name: string; type: string; address: string; lat: number; lon: number };
-            const remarks = esc(`${b.type}${b.address ? ' — ' + b.address : ''}`);
+            const b = req.body as { uid: string; name: string; type: string; address: string; lat: number; lon: number; remarks?: string; deleteMarker?: boolean };
+            const stale = b.deleteMarker
+                ? new Date(Date.now() - 1000).toISOString()
+                : new Date(Date.now() + 3600_000).toISOString();
+            const remarks = esc(b.remarks ?? `${b.type}${b.address ? ' — ' + b.address : ''}`);
             const xml = [
                 `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`,
                 `<event version="2.0" uid="${esc(b.uid)}" type="a-u-G" how="h-g-i-g-o"`,

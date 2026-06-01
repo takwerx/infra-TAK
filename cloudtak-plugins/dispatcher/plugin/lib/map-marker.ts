@@ -1,34 +1,103 @@
 import { std } from '../../../src/std.ts';
 
-// Drop a CoT a-u-G (unknown ground — yellow diamond/clover) at the incident location.
-// Routed through the /takcad/cot server proxy (same auth pattern as geocode proxy).
+// Build the remarks string for a CoT incident marker.
+function buildRemarks(incident: {
+    type:       string;
+    time:       string;
+    dispatcher: string;
+    details:    string;
+}): string {
+    const t = new Date(incident.time);
+    const hhmm = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+    const parts = [
+        incident.type,
+        `Start: ${hhmm}`,
+        incident.dispatcher ? `Dispatcher: ${incident.dispatcher}` : '',
+        incident.details    ? incident.details                       : '',
+    ].filter(Boolean);
+    return parts.join(' | ');
+}
+
+// Drop or update a CoT a-u-G marker. Same UID = update on all subscribed clients.
+// callsign (map label) = "{number} {name}"
 export async function dropIncidentMarker(incident: {
-    uid:     string;
-    name:    string;
-    type:    string;
-    address: string;
-    lat:     number;
-    lon:     number;
+    uid:        string;
+    number:     string;
+    name:       string;
+    type:       string;
+    address:    string;
+    lat:        number;
+    lon:        number;
+    time:       string;
+    dispatcher: string;
+    details:    string;
 }): Promise<void> {
     await std('/api/takcad/cot', {
         method: 'POST',
         body: {
             uid:     incident.uid,
-            name:    incident.name,
+            name:    `${incident.number} ${incident.name}`,
             type:    incident.type,
             address: incident.address,
             lat:     incident.lat,
             lon:     incident.lon,
+            remarks: buildRemarks(incident),
         },
     });
 }
 
-// Post a plain-text message to the active mission's thread (DataSync log entry).
+// Resend same UID with updated remarks (e.g. after adding a note).
+export async function updateIncidentMarker(incident: {
+    uid:        string;
+    number:     string;
+    name:       string;
+    type:       string;
+    address:    string;
+    lat:        number;
+    lon:        number;
+    time:       string;
+    dispatcher: string;
+    details:    string;
+}): Promise<void> {
+    await dropIncidentMarker(incident);
+}
+
+// Remove the marker by sending a CoT with stale time in the past.
+export async function removeIncidentMarker(incident: {
+    uid:     string;
+    number:  string;
+    name:    string;
+    type:    string;
+    address: string;
+    lat:     number;
+    lon:     number;
+    time:    string;
+    dispatcher: string;
+    details:    string;
+}): Promise<void> {
+    await std('/api/takcad/cot', {
+        method: 'POST',
+        body: {
+            uid:          incident.uid,
+            name:         `${incident.number} ${incident.name}`,
+            type:         incident.type,
+            address:      incident.address,
+            lat:          incident.lat,
+            lon:          incident.lon,
+            remarks:      buildRemarks(incident),
+            deleteMarker: true,
+        },
+    });
+}
+
+// Post a plain-text message to the DataSync mission log.
 export async function postMissionCallLog(
     missionGuid: string,
-    incident: { name: string; type: string; address: string }
+    incident: { number: string; name: string; type: string; address: string; time: string }
 ): Promise<void> {
-    const msg = `CALL FOR SERVICE: ${incident.name} | ${incident.type}${incident.address ? ' | ' + incident.address : ''} | ${new Date().toLocaleTimeString()}`;
+    const t = new Date(incident.time);
+    const hhmm = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+    const msg = `CALL FOR SERVICE: ${incident.number} | ${incident.name} | ${incident.type}${incident.address ? ' | ' + incident.address : ''} | ${hhmm}`;
     await std(`/api/marti/missions/${encodeURIComponent(missionGuid)}/log`, {
         method: 'POST',
         body:   { message: msg },

@@ -3,6 +3,17 @@
         class='d-flex flex-column gap-3'
         @submit.prevent='submit'
     >
+        <!-- Incident Number (auto, read-only) -->
+        <div v-if='incidentNumber'>
+            <label class='form-label small text-muted mb-1'>Incident #</label>
+            <input
+                :value='incidentNumber'
+                type='text'
+                readonly
+                class='form-control form-control-sm border bg-transparent text-warning fw-semibold'
+            >
+        </div>
+
         <!-- Name -->
         <div>
             <label class='form-label small text-muted mb-1'>Incident Name <span class='text-danger'>*</span></label>
@@ -15,36 +26,25 @@
             >
         </div>
 
-        <!-- Type -->
+        <!-- Type — shared dropdown in both modes -->
         <div>
             <label class='form-label small text-muted mb-1'>Incident Type <span class='text-danger'>*</span></label>
-            <template v-if='serverMode === "takcad"'>
-                <select
-                    v-model='form.incidentTypeUid'
-                    required
-                    class='form-select form-select-sm border'
+            <select
+                v-model='form.incidentType'
+                required
+                class='form-select form-select-sm border'
+            >
+                <option value=''>
+                    — Select type —
+                </option>
+                <option
+                    v-for='t in typeOptions'
+                    :key='t'
+                    :value='t'
                 >
-                    <option value=''>
-                        — Select type —
-                    </option>
-                    <option
-                        v-for='t in incidentTypes'
-                        :key='t.uid'
-                        :value='t.uid'
-                    >
-                        {{ t.name }}
-                    </option>
-                </select>
-            </template>
-            <template v-else>
-                <input
-                    v-model='form.incidentTypeFree'
-                    type='text'
-                    required
-                    class='form-control form-control-sm border'
-                    placeholder='e.g. Fire, Medical, Rescue'
-                >
-            </template>
+                    {{ t }}
+                </option>
+            </select>
         </div>
 
         <!-- Date/Time -->
@@ -175,17 +175,6 @@
             </div>
         </div>
 
-        <!-- Dispatcher (takcad only) -->
-        <div v-if='serverMode === "takcad"'>
-            <label class='form-label small text-muted mb-1'>Dispatcher</label>
-            <input
-                v-model='form.dispatcher'
-                type='text'
-                class='form-control form-control-sm border'
-                placeholder='Callsign or name'
-            >
-        </div>
-
         <!-- Details -->
         <div>
             <label class='form-label small text-muted mb-1'>Details</label>
@@ -275,47 +264,60 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue';
+import { ref, reactive, computed, onMounted } from 'vue';
 import { useMapStore } from '../../../src/stores/map.ts';
-import { getIncident, insertIncident, updateIncident, geocodeAddress, reverseGeocode } from '../lib/takcad-client.ts';
-import type { GeocodeSuggestion } from '../lib/takcad-client.ts';
+import {
+    getIncident, insertIncident, updateIncident,
+    geocodeAddress, reverseGeocode,
+    getNextIncidentNumber,
+    DEFAULT_INCIDENT_TYPES,
+} from '../lib/takcad-client.ts';
+import type { GeocodeSuggestion, MissionRef } from '../lib/takcad-client.ts';
 import type { IncidentRef, IncidentTypeRef } from '../lib/takcad-types.ts';
 import { STATUS_ACTIVE } from '../lib/takcad-types.ts';
 import { dropIncidentMarker, postMissionCallLog } from '../lib/map-marker.ts';
 import type { LocalIncident } from '../lib/dispatcher-store.ts';
+import { dispatcherStore } from '../lib/dispatcher-store.ts';
 
 const props = defineProps<{
-    serverMode:        'detecting' | 'takcad' | 'standalone';
-    uid?:              string;
-    incidentTypes:     IncidentTypeRef[];
-    activeMissionGuid?: string;
+    serverMode:    'detecting' | 'takcad' | 'standalone';
+    uid?:          string;
+    incidentTypes: IncidentTypeRef[];
+    activeFeed?:   MissionRef | null;
 }>();
 
 const emit = defineEmits<{
-    (e: 'saved',           uid: string):      void;
+    (e: 'saved',            uid: string):       void;
     (e: 'saved-standalone', inc: LocalIncident): void;
-    (e: 'cancel'                          ):   void;
+    (e: 'cancel'                          ):    void;
 }>();
 
-const saving       = ref(false);
-const saveError    = ref('');
-const showCaller   = ref(false);
-const geocoding    = ref(false);
-const mapStore     = useMapStore();
-const picking      = ref(false);
-const geoQuery     = ref('');
+const saving         = ref(false);
+const saveError      = ref('');
+const showCaller     = ref(false);
+const geocoding      = ref(false);
+const mapStore       = useMapStore();
+const picking        = ref(false);
+const geoQuery       = ref('');
 const geoSuggestions = ref<GeocodeSuggestion[]>([]);
+const incidentNumber = ref('');
 let geoDebounce: ReturnType<typeof setTimeout>;
+
+// Shared type list: TAK-CAD server types (names only) or default list
+const typeOptions = computed<string[]>(() => {
+    if (props.serverMode === 'takcad' && props.incidentTypes.length) {
+        return props.incidentTypes.map(t => t.name);
+    }
+    return DEFAULT_INCIDENT_TYPES;
+});
 
 const form = reactive({
     incidentName:      '',
-    incidentTypeUid:   '',
-    incidentTypeFree:  '',
+    incidentType:      '',
     incidentTimeLocal: toLocalInput(new Date().toISOString()),
     streetName: '', city: '', state: '', zipCode: '', country: '',
     lat:        null as number | null,
     lon:        null as number | null,
-    dispatcher: '',
     details:    '',
     callerName:  '',
     callerPhone: '',
@@ -380,11 +382,17 @@ function pickOnMap() {
 }
 
 onMounted(async () => {
+    // Pre-generate incident number if feed is selected
+    if (props.activeFeed && !props.uid) {
+        try { incidentNumber.value = await getNextIncidentNumber(props.activeFeed); }
+        catch { incidentNumber.value = ''; }
+    }
+
     if (props.uid && props.serverMode === 'takcad') {
         try {
             const inc = await getIncident(props.uid);
-            form.incidentName    = inc.incidentName;
-            form.incidentTypeUid = inc.incidentType?.uid ?? '';
+            form.incidentName      = inc.incidentName;
+            form.incidentType      = inc.incidentType?.name ?? '';
             form.incidentTimeLocal = toLocalInput(inc.incidentTime);
             form.streetName = inc.location?.address?.streetName ?? '';
             form.city       = inc.location?.address?.city       ?? '';
@@ -393,8 +401,7 @@ onMounted(async () => {
             form.country    = inc.location?.address?.country    ?? '';
             form.lat        = inc.location?.coords?.latitudeDeg  ?? null;
             form.lon        = inc.location?.coords?.longitudeDeg ?? null;
-            form.dispatcher = inc.dispatcher?.name ?? '';
-            form.details    = inc.details    ?? '';
+            form.details    = inc.details ?? '';
             const caller = inc.callerInfo?.[0];
             if (caller) {
                 showCaller.value = true;
@@ -405,66 +412,79 @@ onMounted(async () => {
         } catch (e) {
             saveError.value = e instanceof Error ? e.message : String(e);
         }
-    } else if (props.serverMode === 'takcad' && props.incidentTypes.length) {
-        form.incidentTypeUid = props.incidentTypes[0].uid;
+    } else if (typeOptions.value.length) {
+        form.incidentType = typeOptions.value[0];
     }
 });
 
 async function submit() {
     saveError.value = '';
-
-    const hasCoords = form.lat != null && form.lon != null;
-    if (!hasCoords) {
-        saveError.value = 'Coordinates are required — use the address search or enter latitude/longitude.';
+    if (form.lat == null || form.lon == null) {
+        saveError.value = 'Coordinates are required — use address search or enter lat/lon.';
         return;
     }
-
     const address = [form.streetName, form.city, form.state].filter(Boolean).join(', ');
-
     if (props.serverMode === 'standalone') {
-        await submitStandalone(address, hasCoords);
+        await submitStandalone(address);
     } else {
-        await submitTakCad(address, hasCoords);
+        await submitTakCad(address);
     }
 }
 
-async function submitStandalone(address: string, hasCoords: boolean) {
-    void hasCoords;
-    const incidentType = form.incidentTypeFree.trim();
-    if (!incidentType) { saveError.value = 'Enter an incident type'; return; }
+async function submitStandalone(address: string) {
+    if (!form.incidentType) { saveError.value = 'Select an incident type'; return; }
 
     const uid = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const number = incidentNumber.value || 'INC';
+    const dispatcher = dispatcherStore.dispatcherName;
+
     saving.value = true;
     try {
-        await dropIncidentMarker({
-            uid,
-            name:    form.incidentName,
-            type:    incidentType,
-            address,
-            lat:     form.lat!,
-            lon:     form.lon!,
-        });
+        // CoT marker (best-effort)
+        try {
+            await dropIncidentMarker({
+                uid,
+                number,
+                name:       form.incidentName,
+                type:       form.incidentType,
+                address,
+                lat:        form.lat!,
+                lon:        form.lon!,
+                time:       now,
+                dispatcher,
+                details:    form.details,
+            });
+        } catch { /* marker is best-effort */ }
 
-        if (props.activeMissionGuid) {
+        // DataSync mission log (best-effort)
+        const feed = props.activeFeed ?? dispatcherStore.activeFeed;
+        if (feed) {
             try {
-                await postMissionCallLog(props.activeMissionGuid, {
+                await postMissionCallLog(feed.guid, {
+                    number,
                     name:    form.incidentName,
-                    type:    incidentType,
+                    type:    form.incidentType,
                     address,
+                    time:    now,
                 });
-            } catch { /* mission log is best-effort */ }
+            } catch { /* log is best-effort */ }
         }
 
         const local: LocalIncident = {
             uid,
-            name:                form.incidentName,
-            type:                incidentType,
+            number,
+            name:       form.incidentName,
+            type:       form.incidentType,
             address,
-            lat:                 form.lat!,
-            lon:                 form.lon!,
-            time:                new Date().toISOString(),
-            status:              'ACTIVE',
+            lat:        form.lat!,
+            lon:        form.lon!,
+            time:       now,
+            dispatcher,
+            details:    form.details,
+            status:     'ACTIVE',
             assignedContactUids: [],
+            notes:      [],
         };
         emit('saved-standalone', local);
     } catch (e) {
@@ -474,12 +494,12 @@ async function submitStandalone(address: string, hasCoords: boolean) {
     }
 }
 
-async function submitTakCad(address: string, hasCoords: boolean) {
-    void address;
-    const incidentType = props.incidentTypes.find(t => t.uid === form.incidentTypeUid);
-    if (!incidentType) { saveError.value = 'Select an incident type'; return; }
+async function submitTakCad(address: string) {
+    if (!form.incidentType) { saveError.value = 'Select an incident type'; return; }
 
-    const hasAddress = !!(form.streetName || form.city);
+    // Map type name back to IncidentTypeRef for the TAK-CAD API
+    const incidentTypeRef: IncidentTypeRef = props.incidentTypes.find(t => t.name === form.incidentType)
+        ?? { uid: crypto.randomUUID(), name: form.incidentType };
 
     let existing: IncidentRef | null = null;
     if (props.uid) {
@@ -488,31 +508,35 @@ async function submitTakCad(address: string, hasCoords: boolean) {
     }
 
     const uid = props.uid ?? crypto.randomUUID();
+    const now = new Date().toISOString();
+    const number = incidentNumber.value || '';
+    const dispatcher = dispatcherStore.dispatcherName;
+
     const payload: IncidentRef = {
         ...(existing ?? {}),
         uid,
         incidentName: form.incidentName,
-        incidentType,
+        incidentType: incidentTypeRef,
         incidentTime: new Date(form.incidentTimeLocal).toISOString(),
         status:       existing?.status ?? STATUS_ACTIVE,
-        dispatcher:   form.dispatcher ? { name: form.dispatcher } : null,
-        details:      form.details    || null,
+        dispatcher:   dispatcher ? { name: dispatcher } : null,
+        details:      form.details || null,
         location: {
-            address: hasAddress ? {
+            address: (form.streetName || form.city) ? {
                 streetName: form.streetName,
                 city:       form.city,
                 state:      form.state,
                 zipCode:    form.zipCode,
                 country:    form.country,
             } : null,
-            coords: hasCoords ? { latitudeDeg: form.lat!, longitudeDeg: form.lon! } : null,
+            coords: { latitudeDeg: form.lat!, longitudeDeg: form.lon! },
         },
         callerInfo: (form.callerName || form.callerPhone) ? [{
             uid:                 crypto.randomUUID(),
             name:                form.callerName  || null,
             phoneNumber:         form.callerPhone || null,
             callerInfoType:      form.callerType  || null,
-            timestamp:           new Date().toISOString(),
+            timestamp:           now,
             phoneContactMethod:  null,
             radioContactDetails: null,
             otherContactDetails: null,
@@ -532,17 +556,35 @@ async function submitTakCad(address: string, hasCoords: boolean) {
         const resp = props.uid ? await updateIncident(payload) : await insertIncident(payload);
         if (!resp.success) throw new Error(resp.errors?.join(', ') || 'Server returned failure');
 
-        // Also drop a map marker so iTAK subscribers see the incident pin
+        // CoT marker (both modes — best-effort)
         try {
             await dropIncidentMarker({
                 uid,
-                name:    form.incidentName,
-                type:    incidentType.name,
-                address: [form.streetName, form.city].filter(Boolean).join(', '),
-                lat:     form.lat!,
-                lon:     form.lon!,
+                number,
+                name:       form.incidentName,
+                type:       form.incidentType,
+                address:    [form.streetName, form.city].filter(Boolean).join(', '),
+                lat:        form.lat!,
+                lon:        form.lon!,
+                time:       now,
+                dispatcher,
+                details:    form.details,
             });
         } catch { /* marker is best-effort */ }
+
+        // DataSync log (both modes — best-effort)
+        const feed = props.activeFeed ?? dispatcherStore.activeFeed;
+        if (feed) {
+            try {
+                await postMissionCallLog(feed.guid, {
+                    number,
+                    name:    form.incidentName,
+                    type:    form.incidentType,
+                    address: [form.streetName, form.city].filter(Boolean).join(', '),
+                    time:    now,
+                });
+            } catch { /* log is best-effort */ }
+        }
 
         emit('saved', uid);
     } catch (e) {

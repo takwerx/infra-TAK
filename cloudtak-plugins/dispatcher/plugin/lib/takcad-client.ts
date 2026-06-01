@@ -96,7 +96,16 @@ export const updatePerson   = (p: PersonRef)    => cadUpdate('updatePerson', p.u
 export const deletePerson   = (uid: string)     => cadDelete('deletePerson', uid);
 export const getRoles       = ()                => cadGet<Role[]>('getRoles');
 
-// ── Missions ─────────────────────────────────────────────────────────────────
+// ── Shared incident type list ─────────────────────────────────────────────────
+// Used by both modes. TAK-CAD mode loads server types but falls back to this.
+export const DEFAULT_INCIDENT_TYPES = [
+    'Medical Emergency', 'Medical Assist', 'Fire', 'Traffic Accident',
+    'Hazardous Spill', 'Criminal Activity', 'Public Disturbance', 'Bomb Threat',
+    'Animal Control', 'Gas Leak', 'Water Main Break', 'Missing Person',
+    'Crowd Control', 'VIP Security', 'Welfare Check', 'Other',
+];
+
+// ── Missions / DataSync feeds ─────────────────────────────────────────────────
 export interface MissionRef {
     guid:        string;
     name:        string;
@@ -106,6 +115,41 @@ export interface MissionRef {
 export async function getMissions(): Promise<MissionRef[]> {
     const resp = await std('/api/marti/mission', { method: 'GET' }) as { items?: MissionRef[] } | null;
     return resp?.items ?? [];
+}
+
+// Read the mission log entries (for incident number counting).
+export async function getMissionLog(missionGuid: string): Promise<{ message: string }[]> {
+    const resp = await std(
+        `/api/marti/missions/${encodeURIComponent(missionGuid)}/log`,
+        { method: 'GET' }
+    ) as { items?: { message: string }[] } | null;
+    return resp?.items ?? [];
+}
+
+// Post a free-text message to the mission log.
+export async function postMissionLog(missionGuid: string, message: string): Promise<void> {
+    await std(`/api/marti/missions/${encodeURIComponent(missionGuid)}/log`, {
+        method: 'POST',
+        body:   { message },
+    });
+}
+
+// Generate next incident number from feed name + current CFS log count.
+// Format: FEEDNAME-001  (feed name sanitized, max 12 chars, uppercase)
+export async function getNextIncidentNumber(feed: MissionRef): Promise<string> {
+    const prefix = feed.name
+        .replace(/[^A-Z0-9]/gi, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '')
+        .toUpperCase()
+        .slice(0, 12);
+    try {
+        const log = await getMissionLog(feed.guid);
+        const count = log.filter(e => e.message?.startsWith('CALL FOR SERVICE:')).length;
+        return `${prefix}-${String(count + 1).padStart(3, '0')}`;
+    } catch {
+        return `${prefix}-001`;
+    }
 }
 
 // ── Geocoding ────────────────────────────────────────────────────────────────
