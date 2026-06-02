@@ -33,29 +33,31 @@ function buildRemarks(incident: MarkerIncident): string {
     return parts.join(' | ');
 }
 
-// Iconset path for the incident marker, in CloudTAK's colon web-render form
-// "<iconset-uuid>:<group>/<file>" (no extension). node-cot's from_geojson rewrites it
-// for the wire as <usericon iconsetpath="<uuid>/<group>/<file>.png"> — the exact path
-// an ATAK CoT inspector showed for this iconset's incident icon. The iconset UUID is
-// baked into the iconset zip, so it is stable on every box (ATAK, TAK Aware, CloudTAK)
-// that has the iconset loaded.
-const INCIDENT_ICON = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:Incident Management/incident';
+// Incident marker icon + color, copied from a CloudTAK-native point drawn with this
+// iconset's "incident" glyph. properties.icon is the colon form CloudTAK stores
+// ("<iconset-uuid>:<name>" — no group folder, no extension); marker-color tints the
+// monochrome glyph (the iconset's incident.png is white, we tint it orange). On the wire
+// node-cot's from_geojson turns these into <usericon iconsetpath="<uuid>/incident.png">
+// + <color argb>. The iconset UUID is baked into the iconset zip, so it is stable on
+// every box (ATAK, TAK Aware, CloudTAK) that has the iconset loaded.
+const INCIDENT_ICON  = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:incident';
+const INCIDENT_COLOR = '#FF7700';  // orange — ATAK argb -35072 = 0xFFFF7700
 
 // Drop or update an incident marker via CloudTAK's worker DB — the same supported,
 // fork-free mechanism the ping plugin and CloudTAK's own draw tools use.
 //
-// IMPORTANT: normalize_geojson is a generic drawn-SHAPE normalizer. For a Point it
-// HARDCODES properties.type='u-d-p' and rebuilds properties from a whitelist
-// (callsign / remarks / colors only) — it silently drops any custom type, how, or
-// icon. So we let it compute the base fields (center/time/stale/archived) and then
-// restore the atom type + how + usericon afterward. db.add passes feat.properties
+// IMPORTANT: normalize_geojson is a generic drawn-SHAPE normalizer. For a Point it sets
+// properties.type='u-d-p' (exactly what CloudTAK uses for an iconset point) and rebuilds
+// properties from a whitelist (callsign / remarks / colors only) — it silently drops how
+// + icon. So we let it compute the base fields (center/time/stale/archived) and keep
+// marker-color, then restore how + the usericon afterward. db.add passes feat.properties
 // straight through to the broadcast CoT (it does NOT re-normalize), so the usericon
-// reaches ATAK/iTAK. Without this restore the CoT goes out as a bare u-d-p point with
-// no <usericon> (renders as a white/green dot).
+// reaches ATAK/iTAK. Without this restore the CoT went out as a bare u-d-p point with no
+// <usericon> (rendered as a white/green dot).
 //
-// Setting feat.origin = { mode: 'Mission', mode_id: feedGuid } routes the CoT into
-// THAT specific DataSync feed (independent of the user's active mission). Requires the
-// feed to be SUBSCRIBED in CloudTAK first.
+// Setting feat.origin = { mode: 'Mission', mode_id: feedGuid } routes the CoT into THAT
+// specific DataSync feed (independent of the user's active mission). Requires the feed to
+// be SUBSCRIBED in CloudTAK first.
 export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerIncident): Promise<void> {
     const feat = {
         id:   incident.uid,
@@ -71,9 +73,10 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const norm: any = await normalize_geojson(feat as any);
-    norm.properties.type = 'a-n-G';
-    norm.properties.how  = 'h-g-i-g-o';
+    norm.properties.how = 'h-g-i-g-o';
     norm.properties.icon = INCIDENT_ICON;
+    norm.properties['marker-color'] = INCIDENT_COLOR;
+    norm.properties['marker-opacity'] = 1;
     const withOrigin = incident.feedGuid
         ? { ...norm, origin: { mode: 'Mission', mode_id: incident.feedGuid } }
         : norm;
