@@ -1,4 +1,5 @@
 import { reactive, watch } from 'vue';
+import { Preferences } from '@capacitor/preferences';
 import type { MissionRef } from './takcad-client.ts';
 
 export type ServerMode = 'detecting' | 'takcad' | 'standalone';
@@ -32,68 +33,68 @@ interface DispatcherState {
     localIncidents: LocalIncident[];
 }
 
-// Standalone incidents (and the chosen feed + dispatcher name) live only in the browser
-// tab. Persist the durable slice to localStorage so an open board survives a reload /
-// CloudTAK rebuild — markers themselves come back via feed sync; this restores the
-// dispatcher's structured list (status, assignments, notes). serverMode is intentionally
-// NOT persisted — it is re-detected on every mount. Per-browser only (not shared between
-// dispatcher machines — that is the larger "persist to the mission" item).
-const STORAGE_KEY = 'tak-dispatcher-state-v1';
+export const dispatcherStore = reactive<DispatcherState>({
+    serverMode:     'detecting',
+    forcedMode:     null,
+    dispatcherName: '',
+    activeFeed:     null,
+    localIncidents: [],
+});
 
-interface PersistedState {
+// Standalone incidents (+ chosen feed and forced mode) live only in the browser tab, so
+// a reload / CloudTAK rebuild would otherwise wipe the board. Persist the durable slice
+// via Capacitor Preferences — the SAME API CloudTAK uses for the dispatcher name, which
+// works in both web and native (plain localStorage is unreliable in CloudTAK's PWA
+// context, which is why nothing persisted before). dispatcherName keeps its own existing
+// 'dispatcher-name' key; serverMode is never persisted (re-detected each mount). Markers
+// themselves return via feed sync — this restores the structured board (status,
+// assignments, notes). Per-browser only; cross-machine sharing is the larger
+// persist-to-mission item.
+const STORAGE_KEY = 'tak-dispatcher-board-v1';
+
+interface PersistedBoard {
     forcedMode:     'standalone' | null;
-    dispatcherName: string;
     activeFeed:     MissionRef | null;
     localIncidents: LocalIncident[];
 }
 
-function loadPersisted(): PersistedState {
-    const empty: PersistedState = { forcedMode: null, dispatcherName: '', activeFeed: null, localIncidents: [] };
+let hydrated = false;
+
+// Load the persisted board into the store. Call once on plugin mount, BEFORE the
+// forcedMode check, so a restored standalone session comes back intact.
+export async function hydrateDispatcherStore(): Promise<void> {
+    if (hydrated) return;
     try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (!raw) return empty;
-        const data = JSON.parse(raw);
-        return {
-            forcedMode:     data.forcedMode === 'standalone' ? 'standalone' : null,
-            dispatcherName: typeof data.dispatcherName === 'string' ? data.dispatcherName : '',
-            activeFeed:     data.activeFeed ?? null,
-            localIncidents: Array.isArray(data.localIncidents) ? data.localIncidents : [],
-        };
+        const { value } = await Preferences.get({ key: STORAGE_KEY });
+        if (value) {
+            const data = JSON.parse(value);
+            if (data.forcedMode === 'standalone') dispatcherStore.forcedMode = 'standalone';
+            if (data.activeFeed) dispatcherStore.activeFeed = data.activeFeed;
+            if (Array.isArray(data.localIncidents)) dispatcherStore.localIncidents = data.localIncidents;
+        }
     } catch {
-        return empty;
+        /* best-effort */
     }
+    hydrated = true;
 }
 
-const persisted = loadPersisted();
-
-export const dispatcherStore = reactive<DispatcherState>({
-    serverMode:     'detecting',
-    forcedMode:     persisted.forcedMode,
-    dispatcherName: persisted.dispatcherName,
-    activeFeed:     persisted.activeFeed,
-    localIncidents: persisted.localIncidents,
-});
-
 // Auto-save the durable slice on any change (deep — fires on note/assignment edits too).
+// Guarded by `hydrated` so the empty initial state never clobbers a saved board before
+// hydrateDispatcherStore() has run.
 watch(
     () => [
         dispatcherStore.forcedMode,
-        dispatcherStore.dispatcherName,
         dispatcherStore.activeFeed,
         dispatcherStore.localIncidents,
     ],
     () => {
-        try {
-            const snapshot: PersistedState = {
-                forcedMode:     dispatcherStore.forcedMode,
-                dispatcherName: dispatcherStore.dispatcherName,
-                activeFeed:     dispatcherStore.activeFeed,
-                localIncidents: dispatcherStore.localIncidents,
-            };
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
-        } catch {
-            /* storage unavailable / full — best-effort */
-        }
+        if (!hydrated) return;
+        const snapshot: PersistedBoard = {
+            forcedMode:     dispatcherStore.forcedMode,
+            activeFeed:     dispatcherStore.activeFeed,
+            localIncidents: dispatcherStore.localIncidents,
+        };
+        Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(snapshot) }).catch(() => {});
     },
     { deep: true },
 );

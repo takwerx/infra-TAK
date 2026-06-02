@@ -163,7 +163,7 @@ import PersonnelListView from './PersonnelListView.vue';
 import { getIncidentTypes, getVehicleTypes, getVehicles, getPersonnel, getRoles, getIncidentMetadata, getMissions } from '../lib/takcad-client.ts';
 import type { MissionRef } from '../lib/takcad-client.ts';
 import type { IncidentTypeRef, VehicleType, VehicleRef, PersonRef, Role } from '../lib/takcad-types.ts';
-import { dispatcherStore as store } from '../lib/dispatcher-store.ts';
+import { dispatcherStore as store, hydrateDispatcherStore } from '../lib/dispatcher-store.ts';
 
 const TABS = [
     { key: 'incidents',  label: 'Incidents',  takCadOnly: false },
@@ -250,6 +250,9 @@ async function retryDetection() {
 }
 
 onMounted(async () => {
+    // Restore the persisted board (feed + incidents + forced mode) BEFORE the mode check
+    await hydrateDispatcherStore();
+
     // Restore persisted dispatcher name
     const { value } = await Preferences.get({ key: 'dispatcher-name' });
     if (value) store.dispatcherName = value;
