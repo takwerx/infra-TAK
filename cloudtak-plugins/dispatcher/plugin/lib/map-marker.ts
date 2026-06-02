@@ -69,9 +69,9 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
     norm.properties.type = 'a-n-G';
     norm.properties.how  = 'h-g-i-g-o';
     norm.properties.icon = INCIDENT_ICON;
-    // <color argb="-1"> (white = no tint) — matches the ATAK reference. NOT the orange that
-    // broke iTAK/TAK Aware; white renders the glyph in its own colors on every client.
-    norm.properties['marker-color'] = '#FFFFFF';
+    // NO marker-color: a CloudTAK-emitted white <color argb="-1"> is applied by ATAK and
+    // TAK Aware as a white TINT that washes the glyph out (iTAK ignores it). Without any
+    // <color>, the usericon renders in its own colors on every client.
     const withOrigin = incident.feedGuid
         ? { ...norm, origin: { mode: 'Mission', mode_id: incident.feedGuid } }
         : norm;
