@@ -33,15 +33,19 @@ function buildRemarks(incident: MarkerIncident): string {
     return parts.join(' | ');
 }
 
-// Incident marker icon, copied verbatim from a CloudTAK-native marker that renders in CloudTAK
-// AND round-trips correctly CloudTAK→ATAK. properties.icon is CloudTAK's FLAT key form
-// "<iconset-uuid>:<name>" — CloudTAK imported this iconset with the icon named just "incident"
-// (no "Incident Management/" folder), so the flat key is what resolves in CloudTAK's store and
-// what CloudTAK emits on the wire. (The ATAK CoT-inspector reference showed the folder path, but
-// that is ATAK's OUTBOUND form — the ATAK→CloudTAK direction CloudTAK can't resolve; we create
-// markers in CloudTAK, so we use CloudTAK's flat form.) marker-color #FFFFFF + opacity 1 match
-// the native marker and render the glyph in its own colors.
-const INCIDENT_ICON = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:incident';
+// Incident marker icon = the iconset's "incident" glyph in its FOLDERED path form. iTAK and
+// TAK Aware are strict and only render the foldered iconsetpath
+// (db450cbe-.../Incident Management/incident.png), which is also how all field clients render it
+// among themselves; ATAK accepts it too. properties.icon is CloudTAK's colon form
+// "<uuid>:<group>/<file>" (no ext) → node-cot rewrites it to that foldered iconsetpath on the
+// wire. We set NO marker-color: a white <color> is applied as a washing-out TINT by ATAK and
+// TAK Aware (the "super faint" look); without it the glyph renders in its own colors.
+//
+// CAVEAT: CloudTAK's OWN copy of this iconset is flattened (icon named just "incident", no
+// folder), so CloudTAK can't resolve the foldered key and shows a fallback locally — the field
+// responders see the correct icon, the CloudTAK dispatcher view shows a generic marker. Fix:
+// re-upload the foldered iconset into CloudTAK so its store matches the field devices.
+const INCIDENT_ICON = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:Incident Management/incident';
 
 // Drop or update an incident marker via CloudTAK's worker DB — the same supported,
 // fork-free mechanism the ping plugin and CloudTAK's own draw tools use.
@@ -71,8 +75,6 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
     norm.properties.type = 'a-n-G';
     norm.properties.how  = 'h-g-i-g-o';
     norm.properties.icon = INCIDENT_ICON;
-    norm.properties['marker-color'] = '#FFFFFF';
-    norm.properties['marker-opacity'] = 1;
     const withOrigin = incident.feedGuid
         ? { ...norm, origin: { mode: 'Mission', mode_id: incident.feedGuid } }
         : norm;
