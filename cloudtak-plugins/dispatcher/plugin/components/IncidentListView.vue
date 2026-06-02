@@ -640,7 +640,7 @@
                                 title='Pick from contacts'
                                 @click='toggleContactPicker'
                             >
-                                <IconUsers :size='16' :stroke='1.5'/>
+                                <IconUsers :size='16' />
                             </button>
                         </div>
                         <div
