@@ -1058,9 +1058,20 @@ const assignablePickerContacts = computed(() => {
     return allContacts.value.filter(c => !assigned.has(c.uid));
 });
 
-function toggleContactPicker() {
+// Refetch the live contacts list (keeps the previous list on failure). Called whenever
+// the dispatcher opens an incident or the picker, so users who connected after the panel
+// loaded show up without a reload.
+async function loadContacts() {
+    loadingContacts.value = true;
+    try { allContacts.value = await getContacts(); }
+    catch { /* keep previous list */ }
+    finally { loadingContacts.value = false; }
+}
+
+async function toggleContactPicker() {
     showContactPicker.value = !showContactPicker.value;
     pickerSelected.value = [];
+    if (showContactPicker.value) await loadContacts();
 }
 
 function togglePickerContact(uid: string) {
@@ -1093,12 +1104,7 @@ async function slOpenDetail(uid: string) {
     slContactSearch.value = '';
     showContactPicker.value = false;
     pickerSelected.value = [];
-    if (!allContacts.value.length) {
-        loadingContacts.value = true;
-        try { allContacts.value = await getContacts(); }
-        catch { allContacts.value = []; }
-        finally { loadingContacts.value = false; }
-    }
+    await loadContacts();
 }
 
 async function slAssignContact(inc: LocalIncident, contact: TakContact) {

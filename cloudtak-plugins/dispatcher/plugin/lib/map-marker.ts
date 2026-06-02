@@ -33,27 +33,15 @@ function buildRemarks(incident: MarkerIncident): string {
     return parts.join(' | ');
 }
 
-// Incident marker icon + color, copied from a CloudTAK-native point drawn with this
-// iconset's "incident" glyph. properties.icon is the colon form CloudTAK stores
-// ("<iconset-uuid>:<name>" — no group folder, no extension); marker-color tints the
-// monochrome glyph (the iconset's incident.png is white, we tint it orange). On the wire
-// node-cot's from_geojson turns these into <usericon iconsetpath="<uuid>/incident.png">
-// + <color argb>. The iconset UUID is baked into the iconset zip, so it is stable on
-// every box (ATAK, TAK Aware, CloudTAK) that has the iconset loaded.
-const INCIDENT_ICON  = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:incident';
-const INCIDENT_COLOR = '#FF7700';  // orange — ATAK argb -35072 = 0xFFFF7700
-
 // Drop or update an incident marker via CloudTAK's worker DB — the same supported,
 // fork-free mechanism the ping plugin and CloudTAK's own draw tools use.
 //
-// IMPORTANT: normalize_geojson is a generic drawn-SHAPE normalizer. For a Point it sets
-// properties.type='u-d-p' (exactly what CloudTAK uses for an iconset point) and rebuilds
-// properties from a whitelist (callsign / remarks / colors only) — it silently drops how
-// + icon. So we let it compute the base fields (center/time/stale/archived) and keep
-// marker-color, then restore how + the usericon afterward. db.add passes feat.properties
-// straight through to the broadcast CoT (it does NOT re-normalize), so the usericon
-// reaches ATAK/iTAK. Without this restore the CoT went out as a bare u-d-p point with no
-// <usericon> (rendered as a white/green dot).
+// We use a GENERIC atom marker (a-u-G — unknown ground, the universal yellow
+// diamond/clover) with NO custom usericon and NO <color>: iTAK and TAK Aware choke on a
+// colored custom-iconset marker, whereas a plain atom type renders identically on every
+// client (ATAK, WinTAK, iTAK, TAK Aware, CloudTAK). normalize_geojson rebuilds properties
+// from a whitelist and forces type='u-d-p', dropping how — so we restore type + how after
+// it. db.add passes feat.properties straight through to the broadcast CoT.
 //
 // Setting feat.origin = { mode: 'Mission', mode_id: feedGuid } routes the CoT into THAT
 // specific DataSync feed (independent of the user's active mission). Requires the feed to
@@ -73,10 +61,8 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const norm: any = await normalize_geojson(feat as any);
-    norm.properties.how = 'h-g-i-g-o';
-    norm.properties.icon = INCIDENT_ICON;
-    norm.properties['marker-color'] = INCIDENT_COLOR;
-    norm.properties['marker-opacity'] = 1;
+    norm.properties.type = 'a-u-G';
+    norm.properties.how  = 'h-g-i-g-o';
     const withOrigin = incident.feedGuid
         ? { ...norm, origin: { mode: 'Mission', mode_id: incident.feedGuid } }
         : norm;
