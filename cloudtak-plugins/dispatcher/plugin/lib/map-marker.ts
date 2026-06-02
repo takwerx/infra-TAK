@@ -33,13 +33,15 @@ function buildRemarks(incident: MarkerIncident): string {
     return parts.join(' | ');
 }
 
-// Incident marker icon: the fleet-standard iconset's "incident" glyph. properties.icon is
-// CloudTAK's colon web-render form "<iconset-uuid>:<group>/<file>" (no extension); node-cot's
-// from_geojson rewrites it on the wire as <usericon iconsetpath="<uuid>/<group>/<file>.png"> —
-// exactly the path an ATAK CoT inspector showed. We set NO <color> (no marker-color): the glyph
-// renders in its natural color on every client. The earlier breakage on iTAK/TAK Aware was the
-// orange <color> tint, not the usericon itself — so usericon-without-color is safe everywhere.
-const INCIDENT_ICON = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:Incident Management/incident';
+// Incident marker icon, copied verbatim from a CloudTAK-native marker that renders in CloudTAK
+// AND round-trips correctly CloudTAK→ATAK. properties.icon is CloudTAK's FLAT key form
+// "<iconset-uuid>:<name>" — CloudTAK imported this iconset with the icon named just "incident"
+// (no "Incident Management/" folder), so the flat key is what resolves in CloudTAK's store and
+// what CloudTAK emits on the wire. (The ATAK CoT-inspector reference showed the folder path, but
+// that is ATAK's OUTBOUND form — the ATAK→CloudTAK direction CloudTAK can't resolve; we create
+// markers in CloudTAK, so we use CloudTAK's flat form.) marker-color #FFFFFF + opacity 1 match
+// the native marker and render the glyph in its own colors.
+const INCIDENT_ICON = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:incident';
 
 // Drop or update an incident marker via CloudTAK's worker DB — the same supported,
 // fork-free mechanism the ping plugin and CloudTAK's own draw tools use.
@@ -69,9 +71,8 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
     norm.properties.type = 'a-n-G';
     norm.properties.how  = 'h-g-i-g-o';
     norm.properties.icon = INCIDENT_ICON;
-    // NO marker-color: a CloudTAK-emitted white <color argb="-1"> is applied by ATAK and
-    // TAK Aware as a white TINT that washes the glyph out (iTAK ignores it). Without any
-    // <color>, the usericon renders in its own colors on every client.
+    norm.properties['marker-color'] = '#FFFFFF';
+    norm.properties['marker-opacity'] = 1;
     const withOrigin = incident.feedGuid
         ? { ...norm, origin: { mode: 'Mission', mode_id: incident.feedGuid } }
         : norm;
