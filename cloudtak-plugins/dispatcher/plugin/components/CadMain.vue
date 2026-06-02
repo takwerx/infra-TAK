@@ -1,34 +1,7 @@
 <template>
     <div class='d-flex flex-column h-100 overflow-hidden'>
 
-        <!-- Dispatcher name prompt (blocks everything until set) -->
-        <div
-            v-if='!store.dispatcherName'
-            class='d-flex flex-column align-items-center justify-content-center h-100 gap-3 px-4'
-        >
-            <IconHeadset :size='32' class='text-warning' />
-            <div class='fw-semibold'>Who are you?</div>
-            <div class='text-muted small text-center'>Enter your callsign or name. This will appear on all incident markers.</div>
-            <div class='d-flex gap-2 w-100'>
-                <input
-                    v-model='nameInput'
-                    type='text'
-                    class='form-control form-control-sm border flex-grow-1'
-                    placeholder='Callsign or name…'
-                    @keydown.enter='saveName'
-                >
-                <button
-                    class='btn btn-sm btn-warning'
-                    :disabled='!nameInput.trim()'
-                    @click='saveName'
-                >
-                    Start
-                </button>
-            </div>
-        </div>
-
-        <!-- Main UI (only after name is set) -->
-        <template v-else>
+        <template>
             <!-- Header -->
             <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
                 <IconHeadset :size='18' class='text-warning' />
@@ -37,13 +10,10 @@
                     v-if='activeCount > 0'
                     class='badge bg-danger'
                 >{{ activeCount }}</span>
-                <button
-                    class='btn btn-link btn-sm p-0 text-muted ms-auto text-decoration-none small'
-                    :title='`Dispatcher: ${store.dispatcherName} — click to change`'
-                    @click='store.dispatcherName = ""; saveClearName()'
-                >
-                    {{ store.dispatcherName }}
-                </button>
+                <span
+                    class='text-muted ms-auto small'
+                    :title='`Dispatcher: ${store.dispatcherName}`'
+                >{{ store.dispatcherName }}</span>
                 <!-- TAK-CAD connection toggle -->
                 <button
                     v-if='store.serverMode === "takcad"'
@@ -155,7 +125,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue';
-import { Preferences } from '@capacitor/preferences';
+import ProfileConfig from '../../../src/base/profile.ts';
 import { IconHeadset } from '@tabler/icons-vue';
 import IncidentListView from './IncidentListView.vue';
 import VehicleListView  from './VehicleListView.vue';
@@ -185,21 +155,9 @@ const vehicleTypes     = ref<VehicleType[]>([]);
 const vehicles         = ref<VehicleRef[]>([]);
 const personnel        = ref<PersonRef[]>([]);
 const roles            = ref<Role[]>([]);
-const nameInput        = ref('');
 const feeds            = ref<MissionRef[]>([]);
 const loadingFeeds     = ref(false);
 const feedsFetched     = ref(false);
-
-async function saveName() {
-    const name = nameInput.value.trim();
-    if (!name) return;
-    store.dispatcherName = name;
-    await Preferences.set({ key: 'dispatcher-name', value: name });
-}
-
-async function saveClearName() {
-    await Preferences.remove({ key: 'dispatcher-name' });
-}
 
 async function fetchFeeds() {
     loadingFeeds.value = true;
@@ -253,9 +211,11 @@ onMounted(async () => {
     // Restore the persisted board (feed + incidents + forced mode) BEFORE the mode check
     await hydrateDispatcherStore();
 
-    // Restore persisted dispatcher name
-    const { value } = await Preferences.get({ key: 'dispatcher-name' });
-    if (value) store.dispatcherName = value;
+    // Dispatcher identity = the user's CloudTAK callsign (no separate prompt). Same callsign
+    // GeoChat messages are sent from; it also lands in incident-marker remarks.
+    const callsign = (await ProfileConfig.get('tak_callsign'))?.value;
+    const username = (await ProfileConfig.get('username'))?.value;
+    store.dispatcherName = String(callsign || username || 'Dispatcher');
 
     if (store.forcedMode === 'standalone') {
         store.serverMode = 'standalone';
