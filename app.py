@@ -25521,6 +25521,29 @@ window._ctPluginSetBusy = function(pluginKey, action, busy) {
   }
 };
 
+window.ctCopyPluginLog = function(btn) {
+  var logEl = document.getElementById('ct-plugin-log');
+  var text = logEl ? logEl.textContent : '';
+  var done = function() {
+    var orig = btn.textContent;
+    btn.textContent = '✓ Copied';
+    setTimeout(function() { btn.textContent = orig; }, 1500);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(function() {
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch (e) { /* noop */ }
+      document.body.removeChild(ta); done();
+    });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) { /* noop */ }
+    document.body.removeChild(ta); done();
+  }
+};
+
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
   if (action === 'remove') {
@@ -25919,7 +25942,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
     <!-- Plugin action log (hidden until an action starts) -->
     <div id="ct-plugin-log-card" style="display:none;margin-top:20px">
-      <div class="section-title" style="margin-bottom:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+      <div class="section-title" style="margin-bottom:10px;display:flex;align-items:center;gap:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span><button class="btn btn-ghost" style="margin-left:auto;font-size:11px;padding:4px 10px;text-transform:none;letter-spacing:0" onclick="ctCopyPluginLog(this)">⧉ Copy</button></div>
       <div class="log-box" id="ct-plugin-log">Waiting...</div>
     </div>
   </div>

@@ -36,11 +36,11 @@ function nominatimToSuggestion(f: NominatimFeature) {
     const street = [a.house_number, a.road || a.pedestrian || a.footway || a.path].filter(Boolean).join(' ');
     return {
         label: f.display_name || '',
-        lat:   parseFloat(f.lat),
-        lon:   parseFloat(f.lon),
+        lat: parseFloat(f.lat),
+        lon: parseFloat(f.lon),
         streetName: street || '',
-        city:    a.city || a.town || a.village || a.hamlet || a.county || '',
-        state:   a.state || '',
+        city: a.city || a.town || a.village || a.hamlet || a.county || '',
+        state: a.state || '',
         zipCode: a.postcode || '',
         country: a.country || '',
     };
@@ -63,7 +63,10 @@ export default async function router(schema: Schema, config: Config) {
 
             const qs = new URLSearchParams({ q: String(req.query.q), format: 'json', addressdetails: '1', limit: '5' });
             const r = await fetch(`${NOMINATIM_BASE}/search?${qs.toString()}`, { headers: NOMINATIM_HEADERS });
-            if (!r.ok) { res.json({ suggestions: [] }); return; }
+            if (!r.ok) {
+                res.json({ suggestions: [] });
+                return;
+            }
             const json = await r.json() as NominatimFeature[];
             res.json({ suggestions: (Array.isArray(json) ? json : []).map(nominatimToSuggestion) });
         } catch (err) {
@@ -87,7 +90,10 @@ export default async function router(schema: Schema, config: Config) {
 
             const qs = new URLSearchParams({ lat: String(req.query.lat), lon: String(req.query.lon), format: 'json', addressdetails: '1' });
             const r = await fetch(`${NOMINATIM_BASE}/reverse?${qs.toString()}`, { headers: NOMINATIM_HEADERS });
-            if (!r.ok) { res.json({ suggestion: null }); return; }
+            if (!r.ok) {
+                res.json({ suggestion: null });
+                return;
+            }
             const f = await r.json() as NominatimFeature;
             res.json({ suggestion: f && f.lat ? nominatimToSuggestion(f) : null });
         } catch (err) {
