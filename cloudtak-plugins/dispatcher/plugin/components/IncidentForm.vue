@@ -264,20 +264,22 @@ import type { GeocodeSuggestion, MissionRef } from '../lib/takcad-client.ts';
 import type { IncidentRef, IncidentTypeRef } from '../lib/takcad-types.ts';
 import { STATUS_ACTIVE } from '../lib/takcad-types.ts';
 import { dropIncidentMarker, postMissionCallLog, postFeedChat } from '../lib/map-marker.ts';
-import type { LocalIncident } from '../lib/dispatcher-store.ts';
+import { createIncident } from '../lib/events-client.ts';
+import type { DispatcherIncident } from '../lib/events-client.ts';
 import { dispatcherStore } from '../lib/dispatcher-store.ts';
 
 const props = defineProps<{
     serverMode:    'detecting' | 'takcad' | 'standalone';
     uid?:          string;
     incidentTypes: IncidentTypeRef[];
+    // TAK-CAD mode passes its locally-picked DataSync feed for marker/log routing.
     activeFeed?:   MissionRef | null;
 }>();
 
 const emit = defineEmits<{
-    (e: 'saved',            uid: string):       void;
-    (e: 'saved-standalone', inc: LocalIncident): void;
-    (e: 'cancel'                          ):    void;
+    (e: 'saved',            uid: string):              void;
+    (e: 'saved-standalone', inc: DispatcherIncident): void;
+    (e: 'cancel'                          ):           void;
 }>();
 
 const saving         = ref(false);
@@ -380,8 +382,9 @@ function pickOnMap() {
 }
 
 onMounted(async () => {
-    // Pre-generate incident number if feed is selected
-    if (props.activeFeed && !props.uid) {
+    // TAK-CAD mode pre-generates a number from the feed's mission log. Standalone numbers are
+    // assigned by the server on create (returned in the incident row), so we don't pre-gen them.
+    if (props.serverMode === 'takcad' && props.activeFeed && !props.uid) {
         try { incidentNumber.value = await getNextIncidentNumber(props.activeFeed); }
         catch { incidentNumber.value = ''; }
     }
@@ -431,65 +434,69 @@ async function submit() {
 async function submitStandalone(address: string) {
     if (!form.incidentType) { saveError.value = 'Select an incident type'; return; }
 
-    const uid = crypto.randomUUID();
-    const now = new Date().toISOString();
-    const number = incidentNumber.value || 'INC';
+    const event = dispatcherStore.activeEvent;
+    if (!event) { saveError.value = 'No event is open'; return; }
+
     const dispatcher = dispatcherStore.dispatcherName;
 
     saving.value = true;
     try {
-        // CoT marker + DataSync log
-        const feed = props.activeFeed ?? dispatcherStore.activeFeed;
+        // Persist server-side first; the server assigns the incident number (<prefix>-NNN)
+        // and returns the full row, shared with every dispatcher on this CloudTAK.
+        const incident = await createIncident(event.id, {
+            type:       form.incidentType,
+            address,
+            lat:        form.lat!,
+            lon:        form.lon!,
+            dispatcher,
+            details:    form.details,
+        });
+
+        // CoT marker + DataSync log/chat (best-effort; the record already exists server-side).
         const markerErrors: string[] = [];
         try {
             await dropIncidentMarker(mapStore, {
-                uid, number, name: form.incidentType, type: form.incidentType,
-                address, lat: form.lat!, lon: form.lon!,
-                time: now, dispatcher, details: form.details,
-                feedGuid: feed?.guid,
+                uid:        incident.id,
+                number:     incident.number,
+                name:       incident.type ?? form.incidentType,
+                type:       incident.type ?? form.incidentType,
+                address,
+                lat:        form.lat!,
+                lon:        form.lon!,
+                time:       incident.created_at,
+                dispatcher,
+                details:    form.details,
+                feedGuid:   event.feed_guid,
             });
         } catch (e) {
-            markerErrors.push(`Marker failed — subscribe to the "${feed?.name ?? 'feed'}" DataSync feed in CloudTAK first`);
+            markerErrors.push(`Marker failed — subscribe to the "${event.feed_name}" DataSync feed in CloudTAK first`);
             console.warn('[dispatcher] marker drop failed', e);
         }
-        if (feed) {
-            try {
-                await postMissionCallLog(feed.name, {
-                    uid, number, name: form.incidentType, type: form.incidentType,
-                    address, time: now,
-                });
-            } catch (e) {
-                markerErrors.push('DataSync log failed');
-                console.warn('[dispatcher] mission log failed', e);
-            }
-            try {
-                await postFeedChat(mapStore, feed,
-                    `NEW INCIDENT: ${number} ${form.incidentType}${address ? ' — ' + address : ''}`);
-            } catch (e) {
-                markerErrors.push('Feed chat failed');
-                console.warn('[dispatcher] feed chat failed', e);
-            }
+        try {
+            await postMissionCallLog(event.feed_name, {
+                uid:     incident.id,
+                number:  incident.number,
+                name:    form.incidentType,
+                type:    form.incidentType,
+                address,
+                time:    incident.created_at,
+            });
+        } catch (e) {
+            markerErrors.push('DataSync log failed');
+            console.warn('[dispatcher] mission log failed', e);
+        }
+        try {
+            await postFeedChat(mapStore, { guid: event.feed_guid, name: event.feed_name },
+                `NEW INCIDENT: ${incident.number} ${form.incidentType}${address ? ' — ' + address : ''}`);
+        } catch (e) {
+            markerErrors.push('Feed chat failed');
+            console.warn('[dispatcher] feed chat failed', e);
         }
         if (markerErrors.length) {
             saveError.value = markerErrors.join(' · ');
         }
 
-        const local: LocalIncident = {
-            uid,
-            number,
-            name:       form.incidentType,
-            type:       form.incidentType,
-            address,
-            lat:        form.lat!,
-            lon:        form.lon!,
-            time:       now,
-            dispatcher,
-            details:    form.details,
-            status:     'ACTIVE',
-            assignedContacts: [],
-            notes:      [],
-        };
-        emit('saved-standalone', local);
+        emit('saved-standalone', incident);
     } catch (e) {
         saveError.value = e instanceof Error ? e.message : String(e);
     } finally {
@@ -560,8 +567,8 @@ async function submitTakCad(address: string) {
         const resp = props.uid ? await updateIncident(payload) : await insertIncident(payload);
         if (!resp.success) throw new Error(resp.errors?.join(', ') || 'Server returned failure');
 
-        // CoT marker (both modes — best-effort)
-        const feedCad = props.activeFeed ?? dispatcherStore.activeFeed;
+        // CoT marker (best-effort)
+        const feedCad = props.activeFeed ?? null;
         try {
             await dropIncidentMarker(mapStore, {
                 uid,

@@ -35,11 +35,12 @@
                 >TAK-CAD…</span>
             </div>
 
-            <!-- DataSync feed picker (universal — both modes) -->
-            <div class='px-3 py-2 border-bottom flex-shrink-0'>
-                <div
-                    v-if='!store.activeFeed'
-                >
+            <!-- ── TAK-CAD mode: DataSync feed picker (markers/log routing) ─────── -->
+            <div
+                v-if='store.serverMode === "takcad"'
+                class='px-3 py-2 border-bottom flex-shrink-0'
+            >
+                <div v-if='!takcadFeed'>
                     <button
                         class='btn btn-sm btn-outline-secondary w-100'
                         :disabled='loadingFeeds'
@@ -75,50 +76,82 @@
                     class='d-flex align-items-center gap-2 small'
                 >
                     <span class='badge bg-primary'>DataSync</span>
-                    <span class='text-truncate flex-grow-1'>{{ store.activeFeed.name }}</span>
+                    <span class='text-truncate flex-grow-1'>{{ takcadFeed.name }}</span>
                     <button
                         class='btn btn-link btn-sm p-0 text-muted text-decoration-none'
-                        @click='store.activeFeed = null; feeds = []; feedsFetched = false'
+                        @click='takcadFeed = null; feeds = []; feedsFetched = false'
                     >
                         ✕
                     </button>
                 </div>
             </div>
 
-            <!-- Tab nav — Vehicles/Personnel only in TAK-CAD mode -->
-            <div class='d-flex border-bottom flex-shrink-0'>
+            <!-- ── Standalone mode: Event bar (when an Event is open) ───────────── -->
+            <div
+                v-else-if='store.serverMode === "standalone" && store.activeEvent'
+                class='px-3 py-2 border-bottom flex-shrink-0 d-flex align-items-center gap-2 small'
+            >
+                <span class='badge bg-primary'>Event</span>
+                <span class='text-truncate flex-grow-1 fw-semibold'>{{ store.activeEvent.name }}</span>
+                <span
+                    v-if='store.activeEvent.status === "archived"'
+                    class='badge bg-secondary'
+                >Archived</span>
                 <button
-                    v-for='tab in visibleTabs'
-                    :key='tab.key'
-                    class='flex-fill btn btn-sm rounded-0 py-2 border-0'
-                    :class='activeTab === tab.key ? "bg-warning text-dark fw-semibold" : "text-muted"'
-                    @click='activeTab = tab.key'
+                    class='btn btn-link btn-sm p-0 text-muted text-decoration-none'
+                    title='Back to events'
+                    @click='closeEvent'
                 >
-                    {{ tab.label }}
+                    ✕
                 </button>
             </div>
 
-            <!-- Views -->
-            <div class='flex-grow-1 overflow-hidden'>
-                <IncidentListView
-                    v-if='activeTab === "incidents"'
-                    :server-mode='store.serverMode'
-                    :incident-types='incidentTypes'
-                    :vehicles='vehicles'
-                    :personnel='personnel'
-                    @active-count='activeCount = $event'
-                    @status='connectionStatus = $event'
-                />
-                <VehicleListView
-                    v-else-if='activeTab === "vehicles"'
-                    :server-mode='store.serverMode'
-                    :vehicle-types='vehicleTypes'
-                />
-                <PersonnelListView
-                    v-else-if='activeTab === "personnel"'
-                    :roles='roles'
-                />
+            <!-- ── Standalone mode: Events screen (no Event open) ──────────────── -->
+            <div
+                v-if='store.serverMode === "standalone" && !store.activeEvent'
+                class='flex-grow-1 overflow-hidden'
+            >
+                <EventsView @opened='onEventOpened' />
             </div>
+
+            <!-- ── Otherwise: tabs + incident/vehicle/personnel views ──────────── -->
+            <template v-else>
+                <!-- Tab nav — Vehicles/Personnel only in TAK-CAD mode -->
+                <div class='d-flex border-bottom flex-shrink-0'>
+                    <button
+                        v-for='tab in visibleTabs'
+                        :key='tab.key'
+                        class='flex-fill btn btn-sm rounded-0 py-2 border-0'
+                        :class='activeTab === tab.key ? "bg-warning text-dark fw-semibold" : "text-muted"'
+                        @click='activeTab = tab.key'
+                    >
+                        {{ tab.label }}
+                    </button>
+                </div>
+
+                <!-- Views -->
+                <div class='flex-grow-1 overflow-hidden'>
+                    <IncidentListView
+                        v-if='activeTab === "incidents"'
+                        :server-mode='store.serverMode'
+                        :incident-types='incidentTypes'
+                        :vehicles='vehicles'
+                        :personnel='personnel'
+                        :takcad-feed='takcadFeed'
+                        @active-count='activeCount = $event'
+                        @status='connectionStatus = $event'
+                    />
+                    <VehicleListView
+                        v-else-if='activeTab === "vehicles"'
+                        :server-mode='store.serverMode'
+                        :vehicle-types='vehicleTypes'
+                    />
+                    <PersonnelListView
+                        v-else-if='activeTab === "personnel"'
+                        :roles='roles'
+                    />
+                </div>
+            </template>
         </template>
     </div>
 </template>
@@ -130,10 +163,13 @@ import { IconHeadset } from '@tabler/icons-vue';
 import IncidentListView from './IncidentListView.vue';
 import VehicleListView  from './VehicleListView.vue';
 import PersonnelListView from './PersonnelListView.vue';
+import EventsView from './EventsView.vue';
 import { getIncidentTypes, getVehicleTypes, getVehicles, getPersonnel, getRoles, getIncidentMetadata, getMissions } from '../lib/takcad-client.ts';
 import type { MissionRef } from '../lib/takcad-client.ts';
 import type { IncidentTypeRef, VehicleType, VehicleRef, PersonRef, Role } from '../lib/takcad-types.ts';
-import { dispatcherStore as store, hydrateDispatcherStore } from '../lib/dispatcher-store.ts';
+import { listIncidents } from '../lib/events-client.ts';
+import type { DispatcherEvent } from '../lib/events-client.ts';
+import { dispatcherStore as store, saveLastEventId } from '../lib/dispatcher-store.ts';
 
 const TABS = [
     { key: 'incidents',  label: 'Incidents',  takCadOnly: false },
@@ -159,6 +195,10 @@ const feeds            = ref<MissionRef[]>([]);
 const loadingFeeds     = ref(false);
 const feedsFetched     = ref(false);
 
+// TAK-CAD mode keeps its own local DataSync feed for marker/log routing (the standalone
+// path now routes via the open Event's feed_guid instead).
+const takcadFeed = ref<MissionRef | null>(null);
+
 async function fetchFeeds() {
     loadingFeeds.value = true;
     feedsFetched.value = false;
@@ -168,9 +208,24 @@ async function fetchFeeds() {
 }
 
 function selectFeed(f: MissionRef) {
-    store.activeFeed = f;
+    takcadFeed.value = f;
     feeds.value = [];
     feedsFetched.value = false;
+}
+
+// An Event was opened from the Events screen → load its incidents and remember it.
+async function onEventOpened(event: DispatcherEvent) {
+    saveLastEventId(event.id);
+    activeTab.value = 'incidents';
+    try { store.incidents = await listIncidents(event.id); }
+    catch { store.incidents = []; }
+}
+
+function closeEvent() {
+    store.activeEvent = null;
+    store.incidents = [];
+    saveLastEventId(null);
+    activeCount.value = 0;
 }
 
 async function detect() {
@@ -208,9 +263,6 @@ async function retryDetection() {
 }
 
 onMounted(async () => {
-    // Restore the persisted board (feed + incidents + forced mode) BEFORE the mode check
-    await hydrateDispatcherStore();
-
     // Dispatcher identity = the user's CloudTAK callsign (no separate prompt). Same callsign
     // GeoChat messages are sent from; it also lands in incident-marker remarks.
     const callsign = (await ProfileConfig.get('tak_callsign'))?.value;

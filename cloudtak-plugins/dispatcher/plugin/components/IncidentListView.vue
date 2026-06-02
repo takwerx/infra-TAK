@@ -460,7 +460,7 @@
                         :uid='editUid'
                         :server-mode='serverMode'
                         :incident-types='incidentTypes'
-                        :active-feed='dispatcherStore.activeFeed'
+                        :active-feed='takcadFeed'
                         @saved='onFormSaved'
                         @cancel='cancelForm'
                     />
@@ -468,20 +468,33 @@
             </template>
         </template>
 
-        <!-- ── Standalone mode: CloudTAK-native UI ─────────────────────────── -->
+        <!-- ── Standalone mode: server-backed Event board ──────────────────── -->
         <template v-else-if='serverMode === "standalone"'>
-            <!-- Feed gate: require DataSync feed before dispatching -->
+            <!-- Event gate (CadMain normally keeps the Events screen up until one is open) -->
             <div
-                v-if='!dispatcherStore.activeFeed'
+                v-if='!dispatcherStore.activeEvent'
                 class='text-center text-muted py-4 small px-3'
             >
-                Select a DataSync Feed above to begin dispatching.
+                Open an Event to begin dispatching.
             </div>
 
-            <!-- Standalone incident list / form (only when feed is selected) -->
+            <!-- Standalone incident list -->
             <template v-else-if='slView === "list"'>
-                <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0'>
-                    <span class='text-muted small me-auto'>{{ slActiveIncidents.length }} active</span>
+                <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
+                    <div class='d-flex rounded overflow-hidden border flex-grow-1'>
+                        <button
+                            v-for='t in SL_TABS'
+                            :key='t.key'
+                            class='flex-fill btn btn-sm py-1 rounded-0 border-0 small'
+                            :class='slTab === t.key ? "bg-primary text-white" : "text-muted"'
+                            @click='slTab = t.key'
+                        >
+                            {{ t.label }} <span
+                                class='badge'
+                                :class='slTab === t.key ? "bg-warning text-dark" : "text-muted"'
+                            >{{ t.key === 'active' ? slActiveIncidents.length : slClosedIncidents.length }}</span>
+                        </button>
+                    </div>
                     <button
                         class='btn btn-sm btn-warning'
                         @click='slView = "form"'
@@ -491,28 +504,31 @@
                 </div>
                 <div class='flex-grow-1 overflow-auto'>
                     <div
-                        v-if='!slActiveIncidents.length'
+                        v-if='!slDisplayedIncidents.length'
                         class='text-center text-muted py-4 small'
                     >
-                        No incidents this session
+                        No {{ slTab }} incidents
                     </div>
                     <div
-                        v-for='inc in slActiveIncidents'
-                        :key='inc.uid'
+                        v-for='inc in slDisplayedIncidents'
+                        :key='inc.id'
                         class='d-flex align-items-start px-3 py-2 border-bottom incident-row'
                         role='button'
-                        @click='slOpenDetail(inc.uid)'
+                        @click='slOpenDetail(inc.id)'
                     >
                         <div class='flex-grow-1 overflow-hidden'>
                             <div class='d-flex align-items-center gap-2'>
-                                <span class='fw-semibold small text-truncate'>{{ inc.name }}</span>
-                                <span class='badge bg-success text-white small'>{{ inc.status }}</span>
+                                <span class='fw-semibold small text-truncate'>{{ inc.number }} {{ inc.type }}</span>
+                                <span
+                                    class='badge small'
+                                    :class='inc.status === "active" ? "bg-success text-white" : "bg-secondary text-white"'
+                                >{{ inc.status }}</span>
                             </div>
                             <div class='small text-muted text-truncate'>
-                                {{ inc.address || `${inc.lat.toFixed(5)}, ${inc.lon.toFixed(5)}` }}
+                                {{ inc.address || `${(inc.lat ?? 0).toFixed(5)}, ${(inc.lon ?? 0).toFixed(5)}` }}
                             </div>
                             <div class='small text-muted'>
-                                {{ inc.type }} · {{ shortTime(inc.time) }}
+                                {{ inc.type }} · {{ shortTime(inc.created_at) }}
                             </div>
                         </div>
                     </div>
@@ -528,8 +544,11 @@
                     >
                         ← Back
                     </button>
-                    <span class='fw-semibold text-truncate flex-grow-1'>{{ slDetail.name }}</span>
-                    <span class='badge bg-success text-white'>{{ slDetail.status }}</span>
+                    <span class='fw-semibold text-truncate flex-grow-1'>{{ slDetail.number }} {{ slDetail.type }}</span>
+                    <span
+                        class='badge'
+                        :class='slDetail.status === "active" ? "bg-success text-white" : "bg-secondary text-white"'
+                    >{{ slDetail.status }}</span>
                 </div>
                 <div class='flex-grow-1 overflow-auto p-3 d-flex flex-column gap-3'>
                     <div class='card border'>
@@ -545,7 +564,7 @@
                                     Time
                                 </div>
                                 <div class='col-8'>
-                                    {{ formatTime(slDetail.time) }}
+                                    {{ formatTime(slDetail.created_at) }}
                                 </div>
                                 <div class='col-4 text-muted'>
                                     Address
@@ -560,7 +579,13 @@
                                     class='col-8 font-monospace text-muted'
                                     style='font-size:11px'
                                 >
-                                    {{ slDetail.lat.toFixed(6) }}, {{ slDetail.lon.toFixed(6) }}
+                                    {{ (slDetail.lat ?? 0).toFixed(6) }}, {{ (slDetail.lon ?? 0).toFixed(6) }}
+                                </div>
+                                <div class='col-4 text-muted'>
+                                    Dispatcher
+                                </div>
+                                <div class='col-8'>
+                                    {{ slDetail.dispatcher || '—' }}
                                 </div>
                             </div>
                         </div>
@@ -581,8 +606,11 @@
                         </div>
                     </div>
 
-                    <!-- Add note -->
-                    <div class='d-flex gap-1 mt-2'>
+                    <!-- Add note (active only) -->
+                    <div
+                        v-if='slDetail.status === "active"'
+                        class='d-flex gap-1 mt-2'
+                    >
                         <input
                             v-model='slNoteInput'
                             type='text'
@@ -605,12 +633,13 @@
                             Assigned Units
                         </div>
                         <div
-                            v-for='c in slDetail.assignedContacts'
+                            v-for='c in slDetail.assigned'
                             :key='c.uid'
                             class='d-flex align-items-center gap-2 small py-1 border-bottom'
                         >
                             <span class='flex-grow-1'>{{ c.callsign }}</span>
                             <button
+                                v-if='slDetail.status === "active"'
                                 class='btn btn-link btn-sm p-0 text-danger text-decoration-none'
                                 @click='slUnassignContact(slDetail, c.uid)'
                             >
@@ -618,96 +647,104 @@
                             </button>
                         </div>
                         <div
-                            v-if='!slDetail.assignedContacts.length'
+                            v-if='!slDetail.assigned.length'
                             class='text-muted small py-1'
                         >
                             No units assigned
                         </div>
 
-                        <!-- Assign: free-text search + contacts picker button -->
-                        <div class='d-flex gap-1 mt-2'>
-                            <input
-                                v-model='slContactSearch'
-                                type='text'
-                                class='form-control form-control-sm border'
-                                :placeholder='loadingContacts ? "Loading contacts…" : "Search contacts to assign…"'
-                                :disabled='loadingContacts'
-                            >
-                            <button
-                                class='btn btn-sm btn-outline-secondary d-flex align-items-center'
-                                :class='{ active: showContactPicker }'
-                                :disabled='loadingContacts'
-                                title='Pick from contacts'
-                                @click='toggleContactPicker'
-                            >
-                                <IconUsers :size='16' />
-                            </button>
-                        </div>
-                        <div
-                            v-if='filteredContacts.length && slContactSearch'
-                            class='border rounded mt-1'
-                            style='max-height:120px;overflow-y:auto'
-                        >
-                            <button
-                                v-for='c in filteredContacts'
-                                :key='c.uid'
-                                class='btn btn-sm w-100 text-start px-2 py-1 border-0 border-bottom rounded-0'
-                                style='font-size:12px'
-                                @click='slAssignContact(slDetail, c)'
-                            >
-                                + {{ c.callsign }}
-                            </button>
-                        </div>
-
-                        <!-- Multi-select contacts picker (mirrors CloudTAK's contacts tool) -->
-                        <div
-                            v-if='showContactPicker'
-                            class='border rounded mt-1'
-                        >
-                            <div class='small text-muted px-2 py-1 border-bottom d-flex align-items-center'>
-                                <span class='flex-grow-1'>Select units to assign</span>
-                                <span>{{ pickerSelected.length }} selected</span>
+                        <!-- Assign: free-text search + contacts picker button (active only) -->
+                        <template v-if='slDetail.status === "active"'>
+                            <div class='d-flex gap-1 mt-2'>
+                                <input
+                                    v-model='slContactSearch'
+                                    type='text'
+                                    class='form-control form-control-sm border'
+                                    :placeholder='loadingContacts ? "Loading contacts…" : "Search contacts to assign…"'
+                                    :disabled='loadingContacts'
+                                >
+                                <button
+                                    class='btn btn-sm btn-outline-secondary d-flex align-items-center'
+                                    :class='{ active: showContactPicker }'
+                                    :disabled='loadingContacts'
+                                    title='Pick from contacts'
+                                    @click='toggleContactPicker'
+                                >
+                                    <IconUsers :size='16' />
+                                </button>
                             </div>
-                            <div style='max-height:160px;overflow-y:auto'>
-                                <label
-                                    v-for='c in assignablePickerContacts'
+                            <div
+                                v-if='filteredContacts.length && slContactSearch'
+                                class='border rounded mt-1'
+                                style='max-height:120px;overflow-y:auto'
+                            >
+                                <button
+                                    v-for='c in filteredContacts'
                                     :key='c.uid'
-                                    class='d-flex align-items-center gap-2 px-2 py-1 border-bottom small mb-0'
-                                    style='cursor:pointer'
+                                    class='btn btn-sm w-100 text-start px-2 py-1 border-0 border-bottom rounded-0'
+                                    style='font-size:12px'
+                                    @click='slAssignContact(slDetail, c)'
                                 >
-                                    <input
-                                        type='checkbox'
-                                        class='form-check-input mt-0'
-                                        :checked='pickerSelected.includes(c.uid)'
-                                        @change='togglePickerContact(c.uid)'
+                                    + {{ c.callsign }}
+                                </button>
+                            </div>
+
+                            <!-- Multi-select contacts picker (mirrors CloudTAK's contacts tool) -->
+                            <div
+                                v-if='showContactPicker'
+                                class='border rounded mt-1'
+                            >
+                                <div class='small text-muted px-2 py-1 border-bottom d-flex align-items-center'>
+                                    <span class='flex-grow-1'>Select units to assign</span>
+                                    <span>{{ pickerSelected.length }} selected</span>
+                                </div>
+                                <div style='max-height:160px;overflow-y:auto'>
+                                    <label
+                                        v-for='c in assignablePickerContacts'
+                                        :key='c.uid'
+                                        class='d-flex align-items-center gap-2 px-2 py-1 border-bottom small mb-0'
+                                        style='cursor:pointer'
                                     >
-                                    <span class='flex-grow-1'>{{ c.callsign }}</span>
-                                </label>
-                                <div
-                                    v-if='!assignablePickerContacts.length'
-                                    class='text-muted small px-2 py-2'
-                                >
-                                    {{ loadingContacts ? 'Loading contacts…' : 'No contacts available' }}
+                                        <input
+                                            type='checkbox'
+                                            class='form-check-input mt-0'
+                                            :checked='pickerSelected.includes(c.uid)'
+                                            @change='togglePickerContact(c.uid)'
+                                        >
+                                        <span class='flex-grow-1'>{{ c.callsign }}</span>
+                                    </label>
+                                    <div
+                                        v-if='!assignablePickerContacts.length'
+                                        class='text-muted small px-2 py-2'
+                                    >
+                                        {{ loadingContacts ? 'Loading contacts…' : 'No contacts available' }}
+                                    </div>
+                                </div>
+                                <div class='d-flex align-items-center gap-2 p-2 border-top'>
+                                    <button
+                                        class='btn btn-sm btn-link text-muted p-0 text-decoration-none'
+                                        @click='showContactPicker = false'
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        class='btn btn-sm btn-primary ms-auto'
+                                        :disabled='!pickerSelected.length'
+                                        @click='slAssignSelected(slDetail)'
+                                    >
+                                        Assign {{ pickerSelected.length || '' }} selected
+                                    </button>
                                 </div>
                             </div>
-                            <div class='d-flex align-items-center gap-2 p-2 border-top'>
-                                <button
-                                    class='btn btn-sm btn-link text-muted p-0 text-decoration-none'
-                                    @click='showContactPicker = false'
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    class='btn btn-sm btn-primary ms-auto'
-                                    :disabled='!pickerSelected.length'
-                                    @click='slAssignSelected(slDetail)'
-                                >
-                                    Assign {{ pickerSelected.length || '' }} selected
-                                </button>
-                            </div>
-                        </div>
+                        </template>
                     </div>
 
+                    <div
+                        v-if='slDetailError'
+                        class='alert alert-danger py-2 small'
+                    >
+                        {{ slDetailError }}
+                    </div>
                     <div class='d-flex gap-2 mt-2'>
                         <button
                             class='btn btn-sm btn-outline-secondary'
@@ -716,10 +753,20 @@
                             Show on Map
                         </button>
                         <button
+                            v-if='slDetail.status === "active"'
                             class='btn btn-sm btn-warning ms-auto'
+                            :disabled='slSaving'
                             @click='slCloseIncident(slDetail)'
                         >
                             Close Incident
+                        </button>
+                        <button
+                            v-else
+                            class='btn btn-sm btn-outline-warning ms-auto'
+                            :disabled='slSaving'
+                            @click='slReopenIncident(slDetail)'
+                        >
+                            Reopen
                         </button>
                     </div>
                 </div>
@@ -740,7 +787,6 @@
                     <IncidentForm
                         :server-mode='serverMode'
                         :incident-types='incidentTypes'
-                        :active-feed='dispatcherStore.activeFeed'
                         @saved-standalone='onStandaloneSaved'
                         @cancel='slView = "list"'
                     />
@@ -769,19 +815,22 @@ import {
     postMissionLog,
 } from '../lib/takcad-client.ts';
 import type { VehicleResponseMetadata } from '../lib/takcad-client.ts';
-import { removeIncidentMarker, updateIncidentMarker } from '../lib/map-marker.ts';
+import { dropIncidentMarker, removeIncidentMarker, updateIncidentMarker } from '../lib/map-marker.ts';
 import { getContacts, sendAssignmentMessage, sendUpdateMessage } from '../lib/contacts-client.ts';
 import type { TakContact } from '../lib/contacts-client.ts';
 import type { IncidentMetadata, IncidentRef, VehicleRef, PersonRef, IncidentTypeRef, PersonCallsign } from '../lib/takcad-types.ts';
 import { isActive, formatAddress, formatTime, STATUS_CANCELLED } from '../lib/takcad-types.ts';
+import type { MissionRef } from '../lib/takcad-client.ts';
+import { listIncidents, patchIncident } from '../lib/events-client.ts';
+import type { DispatcherIncident, AssignedContact } from '../lib/events-client.ts';
 import { dispatcherStore } from '../lib/dispatcher-store.ts';
-import type { LocalIncident } from '../lib/dispatcher-store.ts';
 
 const props = defineProps<{
     serverMode:    'detecting' | 'takcad' | 'standalone';
     incidentTypes: IncidentTypeRef[];
     vehicles:      VehicleRef[];
     personnel:     PersonRef[];
+    takcadFeed?:   MissionRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -1031,21 +1080,30 @@ async function refreshDetail() {
     }
 }
 
-// ── Standalone mode state ─────────────────────────────────────────────────────
+// ── Standalone mode state (server-backed Event board) ─────────────────────────
 type SlViewName = 'list' | 'detail' | 'form';
+type SlTab      = 'active' | 'closed';
 
-const slView           = ref<SlViewName>('list');
-const slDetail         = ref<LocalIncident | null>(null);
-const slNoteInput      = ref('');
-const slContactSearch  = ref('');
-const allContacts      = ref<TakContact[]>([]);
-const loadingContacts  = ref(false);
+const SL_TABS = [
+    { key: 'active', label: 'Active' },
+    { key: 'closed', label: 'Closed' },
+] as const;
+
+const slView            = ref<SlViewName>('list');
+const slTab             = ref<SlTab>('active');
+const slDetail          = ref<DispatcherIncident | null>(null);
+const slNoteInput       = ref('');
+const slContactSearch   = ref('');
+const slSaving          = ref(false);
+const slDetailError     = ref('');
+const allContacts       = ref<TakContact[]>([]);
+const loadingContacts   = ref(false);
 const showContactPicker = ref(false);
 const pickerSelected    = ref<string[]>([]);
 
 const filteredContacts = computed(() => {
     const q = slContactSearch.value.toLowerCase();
-    const assigned = new Set((slDetail.value?.assignedContacts ?? []).map(c => c.uid));
+    const assigned = new Set((slDetail.value?.assigned ?? []).map(c => c.uid));
     return allContacts.value.filter(c =>
         !assigned.has(c.uid) &&
         (!q || c.callsign.toLowerCase().includes(q))
@@ -1054,7 +1112,7 @@ const filteredContacts = computed(() => {
 
 // Contacts not yet assigned — the multi-select picker's candidate list.
 const assignablePickerContacts = computed(() => {
-    const assigned = new Set((slDetail.value?.assignedContacts ?? []).map(c => c.uid));
+    const assigned = new Set((slDetail.value?.assigned ?? []).map(c => c.uid));
     return allContacts.value.filter(c => !assigned.has(c.uid));
 });
 
@@ -1080,7 +1138,7 @@ function togglePickerContact(uid: string) {
     else pickerSelected.value.splice(i, 1);
 }
 
-async function slAssignSelected(inc: LocalIncident) {
+async function slAssignSelected(inc: DispatcherIncident) {
     const chosen = allContacts.value.filter(c => pickerSelected.value.includes(c.uid));
     for (const c of chosen) {
         await slAssignContact(inc, c);
@@ -1090,141 +1148,260 @@ async function slAssignSelected(inc: LocalIncident) {
 }
 
 const slActiveIncidents = computed(() =>
-    dispatcherStore.localIncidents.filter(i => i.status === 'ACTIVE')
+    dispatcherStore.incidents.filter(i => i.status === 'active')
+);
+const slClosedIncidents = computed(() =>
+    dispatcherStore.incidents.filter(i => i.status === 'closed')
+);
+const slDisplayedIncidents = computed(() =>
+    slTab.value === 'active' ? slActiveIncidents.value : slClosedIncidents.value
 );
 
 watch(slActiveIncidents, n => {
     if (props.serverMode === 'standalone') emit('active-count', n.length);
 }, { immediate: true });
 
+// Build the marker payload for an incident, folding responders + notes into the remarks
+// details (same presentation as before, now sourced from server fields).
+function slMarkerFor(inc: DispatcherIncident, extraDetail = '') {
+    const responders = (inc.assigned ?? []).map(c => c.callsign).join(', ');
+    const details = [
+        inc.details ?? '',
+        responders ? `Responding: ${responders}` : '',
+        ...(inc.notes ?? []).map(n => n.text),
+        extraDetail,
+    ].filter(Boolean).join('\n');
+    return {
+        uid:        inc.id,
+        number:     inc.number,
+        name:       inc.type ?? '',
+        type:       inc.type ?? '',
+        address:    inc.address ?? '',
+        lat:        inc.lat ?? 0,
+        lon:        inc.lon ?? 0,
+        time:       inc.created_at,
+        dispatcher: inc.dispatcher ?? '',
+        details,
+        feedGuid:   dispatcherStore.activeEvent?.feed_guid,
+    };
+}
 
-async function slOpenDetail(uid: string) {
-    slDetail.value = dispatcherStore.localIncidents.find(i => i.uid === uid) ?? null;
+// Merge a server-returned incident back into the store + open detail.
+function slApplyIncident(updated: DispatcherIncident) {
+    const idx = dispatcherStore.incidents.findIndex(i => i.id === updated.id);
+    if (idx !== -1) dispatcherStore.incidents[idx] = updated;
+    else dispatcherStore.incidents.push(updated);
+    if (slDetail.value?.id === updated.id) slDetail.value = updated;
+}
+
+async function slLoadIncidents() {
+    const ev = dispatcherStore.activeEvent;
+    if (!ev) return;
+    try {
+        const list = await listIncidents(ev.id);
+        dispatcherStore.incidents = list;
+        if (slDetail.value) {
+            const fresh = list.find(i => i.id === slDetail.value!.id);
+            if (fresh) slDetail.value = fresh;
+        }
+    } catch { /* keep previous list */ }
+}
+
+async function slOpenDetail(id: string) {
+    slDetail.value = dispatcherStore.incidents.find(i => i.id === id) ?? null;
     slView.value = 'detail';
     slContactSearch.value = '';
+    slDetailError.value = '';
     showContactPicker.value = false;
     pickerSelected.value = [];
     await loadContacts();
 }
 
-async function slAssignContact(inc: LocalIncident, contact: TakContact) {
-    if (inc.assignedContacts.some(c => c.uid === contact.uid)) return;
-    inc.assignedContacts.push({ uid: contact.uid, callsign: contact.callsign });
-    inc.notes.push({ text: `${contact.callsign} was assigned`, time: new Date().toISOString() });
+async function slAssignContact(inc: DispatcherIncident, contact: TakContact) {
+    if ((inc.assigned ?? []).some(c => c.uid === contact.uid)) return;
+    const assigned: AssignedContact[] = [...(inc.assigned ?? []), { uid: contact.uid, callsign: contact.callsign }];
+    const notes = [...(inc.notes ?? []), { text: `${contact.callsign} was assigned`, time: new Date().toISOString() }];
     slContactSearch.value = '';
+    slDetailError.value = '';
 
-    // GeoChat assignment message
     try {
-        await sendAssignmentMessage(mapStore, contact, { name: `${inc.number} ${inc.type}`, address: inc.address });
-    } catch (e) { console.warn('[dispatcher] assignment message failed', e); }
+        const updated = await patchIncident(inc.id, { assigned, notes });
+        slApplyIncident(updated);
 
-    // Update CoT marker remarks with responders
-    const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
-    const updatedDetails = [inc.details, `Responding: ${responders}`].filter(Boolean).join('\n');
-    try { await updateIncidentMarker(mapStore, { ...inc, details: updatedDetails, feedGuid: dispatcherStore.activeFeed?.guid }); }
-    catch { /* best-effort */ }
+        // GeoChat assignment message
+        try {
+            await sendAssignmentMessage(mapStore, contact, { name: `${updated.number} ${updated.type ?? ''}`, address: updated.address ?? '' });
+        } catch (e) { console.warn('[dispatcher] assignment message failed', e); }
 
-    // DataSync log
-    const feed = dispatcherStore.activeFeed;
-    if (feed) {
-        try { await postMissionLog(feed.name, `ASSIGNED: ${inc.number} → ${contact.callsign}`); }
+        // Update CoT marker remarks with responders
+        try { await updateIncidentMarker(mapStore, slMarkerFor(updated)); }
         catch { /* best-effort */ }
+
+        // DataSync log
+        const feed = dispatcherStore.activeEvent;
+        if (feed) {
+            try { await postMissionLog(feed.feed_name, `ASSIGNED: ${updated.number} → ${contact.callsign}`); }
+            catch { /* best-effort */ }
+        }
+    } catch (e) {
+        slDetailError.value = e instanceof Error ? e.message : String(e);
     }
 }
 
-async function slUnassignContact(inc: LocalIncident, uid: string) {
-    const contact = inc.assignedContacts.find(c => c.uid === uid);
-    inc.assignedContacts = inc.assignedContacts.filter(c => c.uid !== uid);
+async function slUnassignContact(inc: DispatcherIncident, uid: string) {
+    const contact = (inc.assigned ?? []).find(c => c.uid === uid);
+    const assigned = (inc.assigned ?? []).filter(c => c.uid !== uid);
+    slDetailError.value = '';
 
-    const feed = dispatcherStore.activeFeed;
-    if (feed && contact) {
-        try { await postMissionLog(feed.name, `UNASSIGNED: ${inc.number} → ${contact.callsign}`); }
+    try {
+        const updated = await patchIncident(inc.id, { assigned });
+        slApplyIncident(updated);
+
+        const feed = dispatcherStore.activeEvent;
+        if (feed && contact) {
+            try { await postMissionLog(feed.feed_name, `UNASSIGNED: ${updated.number} → ${contact.callsign}`); }
+            catch { /* best-effort */ }
+        }
+
+        try { await updateIncidentMarker(mapStore, slMarkerFor(updated)); }
         catch { /* best-effort */ }
+    } catch (e) {
+        slDetailError.value = e instanceof Error ? e.message : String(e);
     }
-
-    // Update marker remarks
-    const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
-    const updatedDetails = [inc.details, responders ? `Responding: ${responders}` : ''].filter(Boolean).join('\n');
-    try { await updateIncidentMarker(mapStore, { ...inc, details: updatedDetails, feedGuid: dispatcherStore.activeFeed?.guid }); }
-    catch { /* best-effort */ }
 }
 
-async function slAddNote(inc: LocalIncident) {
+async function slAddNote(inc: DispatcherIncident) {
     const text = slNoteInput.value.trim();
     if (!text) return;
-    const time = new Date().toISOString();
-    inc.notes.push({ text, time });
+    const notes = [...(inc.notes ?? []), { text, time: new Date().toISOString() }];
     slNoteInput.value = '';
+    slDetailError.value = '';
 
-    // Update CoT marker with latest notes appended to details
-    const updatedDetails = [inc.details, ...inc.notes.map(n => n.text)].filter(Boolean).join('\n');
     try {
-        await updateIncidentMarker(mapStore, { ...inc, details: updatedDetails, feedGuid: dispatcherStore.activeFeed?.guid });
-    } catch { /* best-effort */ }
+        const updated = await patchIncident(inc.id, { notes });
+        slApplyIncident(updated);
 
-    // DataSync log entry
-    const feed = dispatcherStore.activeFeed;
-    if (feed) {
-        try { await postMissionLog(feed.name, `UPDATE ${inc.number}: ${text}`); }
+        // Update CoT marker with latest notes appended to details
+        try { await updateIncidentMarker(mapStore, slMarkerFor(updated)); }
         catch { /* best-effort */ }
-    }
 
-    // Push the update to every assigned responder as a direct GeoChat
-    for (const c of inc.assignedContacts) {
-        try { await sendUpdateMessage(mapStore, c, { name: `${inc.number} ${inc.type}` }, text); }
-        catch (e) { console.warn('[dispatcher] update message failed', e); }
+        // DataSync log entry
+        const feed = dispatcherStore.activeEvent;
+        if (feed) {
+            try { await postMissionLog(feed.feed_name, `UPDATE ${updated.number}: ${text}`); }
+            catch { /* best-effort */ }
+        }
+
+        // Push the update to every assigned responder as a direct GeoChat
+        for (const c of (updated.assigned ?? [])) {
+            try { await sendUpdateMessage(mapStore, c, { name: `${updated.number} ${updated.type ?? ''}` }, text); }
+            catch (e) { console.warn('[dispatcher] update message failed', e); }
+        }
+    } catch (e) {
+        slDetailError.value = e instanceof Error ? e.message : String(e);
     }
 }
 
-async function slCloseIncident(inc: LocalIncident) {
-    const idx = dispatcherStore.localIncidents.findIndex(i => i.uid === inc.uid);
-    if (idx !== -1) dispatcherStore.localIncidents[idx].status = 'CANCELLED';
+async function slCloseIncident(inc: DispatcherIncident) {
+    slSaving.value = true; slDetailError.value = '';
+    try {
+        const updated = await patchIncident(inc.id, { status: 'closed' });
+        slApplyIncident(updated);
 
-    // Remove CoT marker
-    try { await removeIncidentMarker(mapStore, { ...inc, feedGuid: dispatcherStore.activeFeed?.guid }); } catch { /* best-effort */ }
+        // Remove CoT marker (record stays server-side)
+        try { await removeIncidentMarker(mapStore, slMarkerFor(updated)); }
+        catch { /* best-effort */ }
 
-    // DataSync log entry
-    const feed = dispatcherStore.activeFeed;
-    if (feed) {
-        try {
-            const closedAt = new Date();
-            const startMs = new Date(inc.time).getTime();
-            const durMin = Math.round((closedAt.getTime() - startMs) / 60000);
-            const hhmm = `${String(closedAt.getHours()).padStart(2, '0')}:${String(closedAt.getMinutes()).padStart(2, '0')}`;
-            await postMissionLog(feed.name, `INCIDENT CLOSED: ${inc.number} | ${inc.name} | Closed ${hhmm} | ${durMin} min`);
-        } catch { /* best-effort */ }
+        // DataSync log entry
+        const feed = dispatcherStore.activeEvent;
+        if (feed) {
+            try {
+                const closedAt = new Date();
+                const startMs = new Date(updated.created_at).getTime();
+                const durMin = Math.round((closedAt.getTime() - startMs) / 60000);
+                const hhmm = `${String(closedAt.getHours()).padStart(2, '0')}:${String(closedAt.getMinutes()).padStart(2, '0')}`;
+                await postMissionLog(feed.feed_name, `INCIDENT CLOSED: ${updated.number} | ${updated.type ?? ''} | Closed ${hhmm} | ${durMin} min`);
+            } catch { /* best-effort */ }
+        }
+        slView.value = 'list';
+        slTab.value = 'closed';
+    } catch (e) {
+        slDetailError.value = e instanceof Error ? e.message : String(e);
+    } finally {
+        slSaving.value = false;
     }
+}
 
+async function slReopenIncident(inc: DispatcherIncident) {
+    slSaving.value = true; slDetailError.value = '';
+    try {
+        const updated = await patchIncident(inc.id, { status: 'active' });
+        slApplyIncident(updated);
+
+        // Re-drop the CoT marker to the feed
+        try { await dropIncidentMarker(mapStore, slMarkerFor(updated)); }
+        catch { /* best-effort */ }
+
+        const feed = dispatcherStore.activeEvent;
+        if (feed) {
+            try { await postMissionLog(feed.feed_name, `INCIDENT REOPENED: ${updated.number} | ${updated.type ?? ''}`); }
+            catch { /* best-effort */ }
+        }
+        slTab.value = 'active';
+    } catch (e) {
+        slDetailError.value = e instanceof Error ? e.message : String(e);
+    } finally {
+        slSaving.value = false;
+    }
+}
+
+function flyToIncident(inc: DispatcherIncident) {
+    mapStore.map?.flyTo({ center: [inc.lon ?? 0, inc.lat ?? 0], zoom: 15 });
+}
+
+function onStandaloneSaved(inc: DispatcherIncident) {
+    const idx = dispatcherStore.incidents.findIndex(i => i.id === inc.id);
+    if (idx === -1) dispatcherStore.incidents.push(inc);
     slView.value = 'list';
-}
-
-function flyToIncident(inc: LocalIncident) {
-    mapStore.map?.flyTo({ center: [inc.lon, inc.lat], zoom: 15 });
-}
-
-function onStandaloneSaved(inc: LocalIncident) {
-    dispatcherStore.localIncidents.push(inc);
-    slView.value = 'list';
+    slTab.value = 'active';
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
 let pollTimer: ReturnType<typeof setInterval>;
 
+function startTakcadPoll() {
+    loadList();
+    pollTimer = setInterval(() => { loadList(); refreshDetail(); }, 15_000);
+}
+
+// Standalone: 15s poll of the open Event's incidents so multiple dispatchers converge.
+function startStandalonePoll() {
+    slLoadIncidents();
+    pollTimer = setInterval(() => { slLoadIncidents(); }, 15_000);
+}
+
 onMounted(() => {
-    if (props.serverMode === 'takcad') {
-        loadList();
-        pollTimer = setInterval(() => { loadList(); refreshDetail(); }, 15_000);
-    }
+    if (props.serverMode === 'takcad') startTakcadPoll();
+    else if (props.serverMode === 'standalone' && dispatcherStore.activeEvent) startStandalonePoll();
 });
 
 onUnmounted(() => clearInterval(pollTimer));
 
-// Start polling when mode resolves to takcad
+// Start polling when mode resolves
 watch(() => props.serverMode, (mode) => {
-    if (mode === 'takcad' && !pollTimer) {
-        loadList();
-        pollTimer = setInterval(() => { loadList(); refreshDetail(); }, 15_000);
-    }
+    if (pollTimer) return;
+    if (mode === 'takcad') startTakcadPoll();
+    else if (mode === 'standalone' && dispatcherStore.activeEvent) startStandalonePoll();
+});
+
+// Restart the standalone poll when an Event is opened/changed.
+watch(() => dispatcherStore.activeEvent?.id, (id) => {
+    if (props.serverMode !== 'standalone') return;
+    clearInterval(pollTimer);
+    pollTimer = undefined as unknown as ReturnType<typeof setInterval>;
+    slView.value = 'list';
+    slDetail.value = null;
+    if (id) startStandalonePoll();
 });
 </script>
 

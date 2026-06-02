@@ -1,100 +1,46 @@
-import { reactive, watch } from 'vue';
+import { reactive } from 'vue';
 import { Preferences } from '@capacitor/preferences';
-import type { MissionRef } from './takcad-client.ts';
+import type { DispatcherEvent, DispatcherIncident } from './events-client.ts';
 
 export type ServerMode = 'detecting' | 'takcad' | 'standalone';
-
-export interface IncidentNote {
-    text: string;
-    time: string;
-}
-
-export interface LocalIncident {
-    uid:                 string;
-    number:              string;
-    name:                string;
-    type:                string;
-    address:             string;
-    lat:                 number;
-    lon:                 number;
-    time:                string;
-    dispatcher:          string;
-    details:             string;
-    status:              'ACTIVE' | 'CANCELLED';
-    assignedContacts: { uid: string; callsign: string }[];
-    notes:               IncidentNote[];
-}
 
 interface DispatcherState {
     serverMode:     ServerMode;
     forcedMode:     'standalone' | null;
     dispatcherName: string;
-    activeFeed:     MissionRef | null;
-    localIncidents: LocalIncident[];
+    // Standalone Event→Incident model (server-backed; shared across dispatchers on this CloudTAK).
+    events:         DispatcherEvent[];
+    activeEvent:    DispatcherEvent | null;
+    incidents:      DispatcherIncident[];
 }
 
 export const dispatcherStore = reactive<DispatcherState>({
     serverMode:     'detecting',
     forcedMode:     null,
     dispatcherName: '',
-    activeFeed:     null,
-    localIncidents: [],
+    events:         [],
+    activeEvent:    null,
+    incidents:      [],
 });
 
-// Standalone incidents (+ chosen feed and forced mode) live only in the browser tab, so
-// a reload / CloudTAK rebuild would otherwise wipe the board. Persist the durable slice
-// via Capacitor Preferences — the SAME API CloudTAK uses for the dispatcher name, which
-// works in both web and native (plain localStorage is unreliable in CloudTAK's PWA
-// context, which is why nothing persisted before). dispatcherName keeps its own existing
-// 'dispatcher-name' key; serverMode is never persisted (re-detected each mount). Markers
-// themselves return via feed sync — this restores the structured board (status,
-// assignments, notes). Per-browser only; cross-machine sharing is the larger
-// persist-to-mission item.
-const STORAGE_KEY = 'tak-dispatcher-board-v1';
+// The board itself is now server-backed (CloudTAK Postgres via the dispatcher route), so it
+// no longer persists in the browser. We keep ONE tiny Preferences key — the last opened
+// Event id — purely as a convenience so a reload reselects it. Everything else (the event
+// list and incidents) is re-fetched from the server on mount. Uses Capacitor Preferences
+// (the same API CloudTAK uses for the dispatcher name) because plain localStorage is
+// unreliable in CloudTAK's PWA context.
+const LAST_EVENT_KEY = 'tak-dispatcher-last-event-v1';
 
-interface PersistedBoard {
-    forcedMode:     'standalone' | null;
-    activeFeed:     MissionRef | null;
-    localIncidents: LocalIncident[];
-}
-
-let hydrated = false;
-
-// Load the persisted board into the store. Call once on plugin mount, BEFORE the
-// forcedMode check, so a restored standalone session comes back intact.
-export async function hydrateDispatcherStore(): Promise<void> {
-    if (hydrated) return;
+export async function loadLastEventId(): Promise<string | null> {
     try {
-        const { value } = await Preferences.get({ key: STORAGE_KEY });
-        if (value) {
-            const data = JSON.parse(value);
-            if (data.forcedMode === 'standalone') dispatcherStore.forcedMode = 'standalone';
-            if (data.activeFeed) dispatcherStore.activeFeed = data.activeFeed;
-            if (Array.isArray(data.localIncidents)) dispatcherStore.localIncidents = data.localIncidents;
-        }
+        const { value } = await Preferences.get({ key: LAST_EVENT_KEY });
+        return value || null;
     } catch {
-        /* best-effort */
+        return null;
     }
-    hydrated = true;
 }
 
-// Auto-save the durable slice on any change (deep — fires on note/assignment edits too).
-// Guarded by `hydrated` so the empty initial state never clobbers a saved board before
-// hydrateDispatcherStore() has run.
-watch(
-    () => [
-        dispatcherStore.forcedMode,
-        dispatcherStore.activeFeed,
-        dispatcherStore.localIncidents,
-    ],
-    () => {
-        if (!hydrated) return;
-        const snapshot: PersistedBoard = {
-            forcedMode:     dispatcherStore.forcedMode,
-            activeFeed:     dispatcherStore.activeFeed,
-            localIncidents: dispatcherStore.localIncidents,
-        };
-        Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(snapshot) }).catch(() => {});
-    },
-    { deep: true },
-);
+export function saveLastEventId(id: string | null): void {
+    if (id) Preferences.set({ key: LAST_EVENT_KEY, value: id }).catch(() => {});
+    else Preferences.remove({ key: LAST_EVENT_KEY }).catch(() => {});
+}
