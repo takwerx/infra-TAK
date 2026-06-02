@@ -50,6 +50,26 @@ async function query<T>(config: Config, statement: ReturnType<typeof sql>): Prom
     return result as unknown as T[];
 }
 
+// jsonb columns can come back from the driver as a (possibly double-encoded) JSON string.
+// Unwrap to a real array so the UI can map/spread it, and so a read-modify-write never
+// re-JSON.stringifies an already-stringified value (which double-encodes the column).
+function asArray(v: unknown): unknown[] {
+    let x: unknown = v;
+    for (let i = 0; i < 4 && typeof x === 'string'; i++) {
+        try {
+            x = JSON.parse(x);
+        } catch {
+            return [];
+        }
+    }
+    return Array.isArray(x) ? x : [];
+}
+
+// Normalize an incident row's jsonb fields to arrays before sending it to the client.
+function mapIncident(row: IncidentRow): IncidentRow {
+    return { ...row, assigned: asArray(row.assigned), notes: asArray(row.notes) };
+}
+
 export default async function router(schema: Schema, config: Config) {
     // Idempotent schema bootstrap. Best-effort so a transient DB hiccup can't block CloudTAK
     // startup; CREATE TABLE IF NOT EXISTS is safe to re-run on every load.
@@ -190,7 +210,7 @@ export default async function router(schema: Schema, config: Config) {
                 FROM dispatcher_incidents WHERE event_id = ${req.params.eventid}
                 ORDER BY created_at ASC
             `);
-            res.json({ incidents });
+            res.json({ incidents: incidents.map(mapIncident) });
         } catch (err) {
             Err.respond(err, res);
         }
@@ -233,7 +253,7 @@ export default async function router(schema: Schema, config: Config) {
                 RETURNING id, event_id, number, type, address, lat, lon, dispatcher, details,
                           status, assigned, notes, created_at, closed_at
             `);
-            res.json({ incident: incidents[0] });
+            res.json({ incident: mapIncident(incidents[0]) });
         } catch (err) {
             Err.respond(err, res);
         }
@@ -278,8 +298,8 @@ export default async function router(schema: Schema, config: Config) {
                 dispatcher: b.dispatcher ?? cur.dispatcher,
                 details: b.details ?? cur.details,
                 status: b.status ?? cur.status,
-                assigned: b.assigned ?? cur.assigned,
-                notes: b.notes ?? cur.notes,
+                assigned: b.assigned ?? asArray(cur.assigned),
+                notes: b.notes ?? asArray(cur.notes),
             };
             // Closing stamps closed_at; reopening clears it.
             const closedAt = next.status === 'closed'
@@ -302,7 +322,7 @@ export default async function router(schema: Schema, config: Config) {
                 RETURNING id, event_id, number, type, address, lat, lon, dispatcher, details,
                           status, assigned, notes, created_at, closed_at
             `);
-            res.json({ incident: incidents[0] });
+            res.json({ incident: mapIncident(incidents[0]) });
         } catch (err) {
             Err.respond(err, res);
         }

@@ -71,7 +71,7 @@
                         v-if='selectedFeed'
                         class='d-flex align-items-center gap-2 small mt-1'
                     >
-                        <span class='badge bg-primary'>DataSync</span>
+                        <span class='badge bg-primary text-white'>DataSync</span>
                         <span class='text-truncate flex-grow-1'>{{ selectedFeed.name }}</span>
                         <button
                             class='btn btn-link btn-sm p-0 text-muted text-decoration-none'
