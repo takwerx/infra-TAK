@@ -99,7 +99,13 @@
                 class='px-3 py-2 border-bottom flex-shrink-0 d-flex align-items-center gap-2 small'
             >
                 <span class='badge bg-primary text-white'>Event</span>
-                <span class='text-truncate flex-grow-1 fw-semibold'>{{ store.activeEvent.name }}</span>
+                <div class='flex-grow-1 text-truncate'>
+                    <span class='fw-semibold'>{{ store.activeEvent.name }}</span>
+                    <span class='text-muted ms-2'>
+                        <span class='badge bg-primary text-white'>DataSync</span>
+                        {{ store.activeEvent.feed_name }}
+                    </span>
+                </div>
                 <span
                     v-if='store.activeEvent.status === "archived"'
                     class='badge bg-secondary'
