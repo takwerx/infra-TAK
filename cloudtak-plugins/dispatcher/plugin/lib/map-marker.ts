@@ -33,15 +33,20 @@ function buildRemarks(incident: MarkerIncident): string {
     return parts.join(' | ');
 }
 
+// Incident marker icon: the fleet-standard iconset's "incident" glyph. properties.icon is
+// CloudTAK's colon web-render form "<iconset-uuid>:<group>/<file>" (no extension); node-cot's
+// from_geojson rewrites it on the wire as <usericon iconsetpath="<uuid>/<group>/<file>.png"> —
+// exactly the path an ATAK CoT inspector showed. We set NO <color> (no marker-color): the glyph
+// renders in its natural color on every client. The earlier breakage on iTAK/TAK Aware was the
+// orange <color> tint, not the usericon itself — so usericon-without-color is safe everywhere.
+const INCIDENT_ICON = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:Incident Management/incident';
+
 // Drop or update an incident marker via CloudTAK's worker DB — the same supported,
 // fork-free mechanism the ping plugin and CloudTAK's own draw tools use.
 //
-// We use a GENERIC atom marker (a-u-G — unknown ground, the universal yellow
-// diamond/clover) with NO custom usericon and NO <color>: iTAK and TAK Aware choke on a
-// colored custom-iconset marker, whereas a plain atom type renders identically on every
-// client (ATAK, WinTAK, iTAK, TAK Aware, CloudTAK). normalize_geojson rebuilds properties
-// from a whitelist and forces type='u-d-p', dropping how — so we restore type + how after
-// it. db.add passes feat.properties straight through to the broadcast CoT.
+// normalize_geojson rebuilds properties from a whitelist and forces type='u-d-p', dropping
+// how + icon — so we restore the atom type (a-n-G) + how + usericon after it. db.add passes
+// feat.properties straight through to the broadcast CoT.
 //
 // Setting feat.origin = { mode: 'Mission', mode_id: feedGuid } routes the CoT into THAT
 // specific DataSync feed (independent of the user's active mission). Requires the feed to
@@ -61,8 +66,12 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const norm: any = await normalize_geojson(feat as any);
-    norm.properties.type = 'a-u-G';
+    norm.properties.type = 'a-n-G';
     norm.properties.how  = 'h-g-i-g-o';
+    norm.properties.icon = INCIDENT_ICON;
+    // <color argb="-1"> (white = no tint) — matches the ATAK reference. NOT the orange that
+    // broke iTAK/TAK Aware; white renders the glyph in its own colors on every client.
+    norm.properties['marker-color'] = '#FFFFFF';
     const withOrigin = incident.feedGuid
         ? { ...norm, origin: { mode: 'Mission', mode_id: incident.feedGuid } }
         : norm;
