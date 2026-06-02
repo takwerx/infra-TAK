@@ -1140,11 +1140,45 @@ function togglePickerContact(uid: string) {
 
 async function slAssignSelected(inc: DispatcherIncident) {
     const chosen = allContacts.value.filter(c => pickerSelected.value.includes(c.uid));
-    for (const c of chosen) {
-        await slAssignContact(inc, c);
-    }
     pickerSelected.value = [];
     showContactPicker.value = false;
+    if (!chosen.length) return;
+
+    // Use the freshest incident state (the passed `inc` can be a stale snapshot), and assign
+    // ALL selected in ONE patch — the server replaces assigned wholesale, so looping per
+    // contact off a stale base would keep only the last one.
+    const cur = dispatcherStore.incidents.find(i => i.id === inc.id) ?? inc;
+    const existing = cur.assigned ?? [];
+    const toAdd = chosen.filter(c => !existing.some(a => a.uid === c.uid));
+    if (!toAdd.length) return;
+
+    const now = new Date().toISOString();
+    const assigned: AssignedContact[] = [...existing, ...toAdd.map(c => ({ uid: c.uid, callsign: c.callsign }))];
+    const notes = [...(cur.notes ?? []), ...toAdd.map(c => ({ text: `${c.callsign} was assigned`, time: now }))];
+
+    slDetailError.value = '';
+    try {
+        const updated = await patchIncident(inc.id, { assigned, notes });
+        slApplyIncident(updated);
+
+        // One GeoChat per newly-assigned responder
+        for (const c of toAdd) {
+            try { await sendAssignmentMessage(mapStore, c, { name: `${updated.number} ${updated.type ?? ''}`, address: updated.address ?? '' }); }
+            catch (e) { console.warn('[dispatcher] assignment message failed', e); }
+        }
+        // Update the marker remarks once with the full responder list
+        try { await updateIncidentMarker(mapStore, slMarkerFor(updated)); }
+        catch { /* best-effort */ }
+        const feed = dispatcherStore.activeEvent;
+        if (feed) {
+            for (const c of toAdd) {
+                try { await postMissionLog(feed.feed_name, `ASSIGNED: ${updated.number} → ${c.callsign}`); }
+                catch { /* best-effort */ }
+            }
+        }
+    } catch (e) {
+        slDetailError.value = e instanceof Error ? e.message : String(e);
+    }
 }
 
 const slActiveIncidents = computed(() =>
