@@ -599,6 +599,56 @@
                         </button>
                     </div>
 
+                    <!-- Assigned Units -->
+                    <div class='border-top pt-2 mt-3'>
+                        <div class='small text-muted mb-1 fw-semibold'>
+                            Assigned Units
+                        </div>
+                        <div
+                            v-for='c in slDetail.assignedContacts'
+                            :key='c.uid'
+                            class='d-flex align-items-center gap-2 small py-1 border-bottom'
+                        >
+                            <span class='flex-grow-1'>{{ c.callsign }}</span>
+                            <button
+                                class='btn btn-link btn-sm p-0 text-danger text-decoration-none'
+                                @click='slUnassignContact(slDetail, c.uid)'
+                            >
+                                ✕
+                            </button>
+                        </div>
+                        <div
+                            v-if='!slDetail.assignedContacts.length'
+                            class='text-muted small py-1'
+                        >
+                            No units assigned
+                        </div>
+
+                        <!-- Contact search -->
+                        <input
+                            v-model='slContactSearch'
+                            type='text'
+                            class='form-control form-control-sm border mt-2'
+                            :placeholder='loadingContacts ? "Loading contacts…" : "Search contacts to assign…"'
+                            :disabled='loadingContacts'
+                        >
+                        <div
+                            v-if='filteredContacts.length && slContactSearch'
+                            class='border rounded mt-1'
+                            style='max-height:120px;overflow-y:auto'
+                        >
+                            <button
+                                v-for='c in filteredContacts'
+                                :key='c.uid'
+                                class='btn btn-sm w-100 text-start px-2 py-1 border-0 border-bottom rounded-0'
+                                style='font-size:12px'
+                                @click='slAssignContact(slDetail, c)'
+                            >
+                                + {{ c.callsign }}
+                            </button>
+                        </div>
+                    </div>
+
                     <div class='d-flex gap-2 mt-2'>
                         <button
                             class='btn btn-sm btn-outline-secondary'
@@ -660,6 +710,8 @@ import {
 } from '../lib/takcad-client.ts';
 import type { VehicleResponseMetadata } from '../lib/takcad-client.ts';
 import { removeIncidentMarker, updateIncidentMarker } from '../lib/map-marker.ts';
+import { getContacts, sendAssignmentMessage } from '../lib/contacts-client.ts';
+import type { TakContact } from '../lib/contacts-client.ts';
 import type { IncidentMetadata, IncidentRef, VehicleRef, PersonRef, IncidentTypeRef, PersonCallsign } from '../lib/takcad-types.ts';
 import { isActive, formatAddress, formatTime, STATUS_CANCELLED } from '../lib/takcad-types.ts';
 import { dispatcherStore } from '../lib/dispatcher-store.ts';
@@ -922,9 +974,21 @@ async function refreshDetail() {
 // ── Standalone mode state ─────────────────────────────────────────────────────
 type SlViewName = 'list' | 'detail' | 'form';
 
-const slView      = ref<SlViewName>('list');
-const slDetail    = ref<LocalIncident | null>(null);
-const slNoteInput = ref('');
+const slView           = ref<SlViewName>('list');
+const slDetail         = ref<LocalIncident | null>(null);
+const slNoteInput      = ref('');
+const slContactSearch  = ref('');
+const allContacts      = ref<TakContact[]>([]);
+const loadingContacts  = ref(false);
+
+const filteredContacts = computed(() => {
+    const q = slContactSearch.value.toLowerCase();
+    const assigned = new Set((slDetail.value?.assignedContacts ?? []).map(c => c.uid));
+    return allContacts.value.filter(c =>
+        !assigned.has(c.uid) &&
+        (!q || c.callsign.toLowerCase().includes(q))
+    );
+});
 
 const slActiveIncidents = computed(() =>
     dispatcherStore.localIncidents.filter(i => i.status === 'ACTIVE')
@@ -935,9 +999,57 @@ watch(slActiveIncidents, n => {
 }, { immediate: true });
 
 
-function slOpenDetail(uid: string) {
+async function slOpenDetail(uid: string) {
     slDetail.value = dispatcherStore.localIncidents.find(i => i.uid === uid) ?? null;
     slView.value = 'detail';
+    slContactSearch.value = '';
+    if (!allContacts.value.length) {
+        loadingContacts.value = true;
+        try { allContacts.value = await getContacts(); }
+        catch { allContacts.value = []; }
+        finally { loadingContacts.value = false; }
+    }
+}
+
+async function slAssignContact(inc: LocalIncident, contact: TakContact) {
+    if (inc.assignedContacts.some(c => c.uid === contact.uid)) return;
+    inc.assignedContacts.push({ uid: contact.uid, callsign: contact.callsign });
+    slContactSearch.value = '';
+
+    // GeoChat assignment message
+    try {
+        await sendAssignmentMessage(contact.uid, { name: `${inc.number} ${inc.type}`, address: inc.address });
+    } catch (e) { console.warn('[dispatcher] assignment message failed', e); }
+
+    // Update CoT marker remarks with responders
+    const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
+    const updatedDetails = [inc.details, `Responding: ${responders}`].filter(Boolean).join('\n');
+    try { await updateIncidentMarker({ ...inc, details: updatedDetails }); }
+    catch { /* best-effort */ }
+
+    // DataSync log
+    const feed = dispatcherStore.activeFeed;
+    if (feed) {
+        try { await postMissionLog(feed.guid, `ASSIGNED: ${inc.number} → ${contact.callsign}`); }
+        catch { /* best-effort */ }
+    }
+}
+
+async function slUnassignContact(inc: LocalIncident, uid: string) {
+    const contact = inc.assignedContacts.find(c => c.uid === uid);
+    inc.assignedContacts = inc.assignedContacts.filter(c => c.uid !== uid);
+
+    const feed = dispatcherStore.activeFeed;
+    if (feed && contact) {
+        try { await postMissionLog(feed.guid, `UNASSIGNED: ${inc.number} → ${contact.callsign}`); }
+        catch { /* best-effort */ }
+    }
+
+    // Update marker remarks
+    const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
+    const updatedDetails = [inc.details, responders ? `Responding: ${responders}` : ''].filter(Boolean).join('\n');
+    try { await updateIncidentMarker({ ...inc, details: updatedDetails }); }
+    catch { /* best-effort */ }
 }
 
 async function slAddNote(inc: LocalIncident) {

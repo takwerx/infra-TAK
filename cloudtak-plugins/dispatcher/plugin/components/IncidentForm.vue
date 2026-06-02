@@ -363,6 +363,17 @@ function pickOnMap() {
                 form.zipCode    = s.zipCode;
                 form.country    = s.country;
                 geoQuery.value  = s.label;
+                // Fallback: parse label if fields are missing (ORS data gaps)
+                if ((!form.city || !form.state) && s.label) {
+                    const parts = s.label.split(',').map((p: string) => p.trim());
+                    if (!form.streetName && parts[0]) form.streetName = parts[0];
+                    if (!form.city && parts[1])        form.city       = parts[1];
+                    if (parts[2]) {
+                        const sv = parts[2].split(' ').filter(Boolean);
+                        if (!form.state   && sv[0]) form.state   = sv[0];
+                        if (!form.zipCode && sv[1]) form.zipCode = sv[1];
+                    }
+                }
             }
         } catch { /* coords set regardless */ }
     });
@@ -473,7 +484,7 @@ async function submitStandalone(address: string) {
             dispatcher,
             details:    form.details,
             status:     'ACTIVE',
-            assignedContactUids: [],
+            assignedContacts: [],
             notes:      [],
         };
         emit('saved-standalone', local);

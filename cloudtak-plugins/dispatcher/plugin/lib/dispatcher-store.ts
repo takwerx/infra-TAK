@@ -20,7 +20,7 @@ export interface LocalIncident {
     dispatcher:          string;
     details:             string;
     status:              'ACTIVE' | 'CANCELLED';
-    assignedContactUids: string[];
+    assignedContacts: { uid: string; callsign: string }[];
     notes:               IncidentNote[];
 }
 
