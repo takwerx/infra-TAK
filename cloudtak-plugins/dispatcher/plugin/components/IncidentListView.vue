@@ -624,14 +624,25 @@
                             No units assigned
                         </div>
 
-                        <!-- Contact search -->
-                        <input
-                            v-model='slContactSearch'
-                            type='text'
-                            class='form-control form-control-sm border mt-2'
-                            :placeholder='loadingContacts ? "Loading contacts…" : "Search contacts to assign…"'
-                            :disabled='loadingContacts'
-                        >
+                        <!-- Assign: free-text search + contacts picker button -->
+                        <div class='d-flex gap-1 mt-2'>
+                            <input
+                                v-model='slContactSearch'
+                                type='text'
+                                class='form-control form-control-sm border'
+                                :placeholder='loadingContacts ? "Loading contacts…" : "Search contacts to assign…"'
+                                :disabled='loadingContacts'
+                            >
+                            <button
+                                class='btn btn-sm btn-outline-secondary d-flex align-items-center'
+                                :class='{ active: showContactPicker }'
+                                :disabled='loadingContacts'
+                                title='Pick from contacts'
+                                @click='toggleContactPicker'
+                            >
+                                <IconUsers :size='16' :stroke='1.5'/>
+                            </button>
+                        </div>
                         <div
                             v-if='filteredContacts.length && slContactSearch'
                             class='border rounded mt-1'
@@ -646,6 +657,54 @@
                             >
                                 + {{ c.callsign }}
                             </button>
+                        </div>
+
+                        <!-- Multi-select contacts picker (mirrors CloudTAK's contacts tool) -->
+                        <div
+                            v-if='showContactPicker'
+                            class='border rounded mt-1'
+                        >
+                            <div class='small text-muted px-2 py-1 border-bottom d-flex align-items-center'>
+                                <span class='flex-grow-1'>Select units to assign</span>
+                                <span>{{ pickerSelected.length }} selected</span>
+                            </div>
+                            <div style='max-height:160px;overflow-y:auto'>
+                                <label
+                                    v-for='c in assignablePickerContacts'
+                                    :key='c.uid'
+                                    class='d-flex align-items-center gap-2 px-2 py-1 border-bottom small mb-0'
+                                    style='cursor:pointer'
+                                >
+                                    <input
+                                        type='checkbox'
+                                        class='form-check-input mt-0'
+                                        :checked='pickerSelected.includes(c.uid)'
+                                        @change='togglePickerContact(c.uid)'
+                                    >
+                                    <span class='flex-grow-1'>{{ c.callsign }}</span>
+                                </label>
+                                <div
+                                    v-if='!assignablePickerContacts.length'
+                                    class='text-muted small px-2 py-2'
+                                >
+                                    {{ loadingContacts ? 'Loading contacts…' : 'No contacts available' }}
+                                </div>
+                            </div>
+                            <div class='d-flex align-items-center gap-2 p-2 border-top'>
+                                <button
+                                    class='btn btn-sm btn-link text-muted p-0 text-decoration-none'
+                                    @click='showContactPicker = false'
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    class='btn btn-sm btn-primary ms-auto'
+                                    :disabled='!pickerSelected.length'
+                                    @click='slAssignSelected(slDetail)'
+                                >
+                                    Assign {{ pickerSelected.length || '' }} selected
+                                </button>
+                            </div>
                         </div>
                     </div>
 
@@ -700,6 +759,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
+import { IconUsers } from '@tabler/icons-vue';
 import { useMapStore } from '../../../src/stores/map.ts';
 import IncidentForm from './IncidentForm.vue';
 import {
@@ -980,6 +1040,8 @@ const slNoteInput      = ref('');
 const slContactSearch  = ref('');
 const allContacts      = ref<TakContact[]>([]);
 const loadingContacts  = ref(false);
+const showContactPicker = ref(false);
+const pickerSelected    = ref<string[]>([]);
 
 const filteredContacts = computed(() => {
     const q = slContactSearch.value.toLowerCase();
@@ -989,6 +1051,32 @@ const filteredContacts = computed(() => {
         (!q || c.callsign.toLowerCase().includes(q))
     );
 });
+
+// Contacts not yet assigned — the multi-select picker's candidate list.
+const assignablePickerContacts = computed(() => {
+    const assigned = new Set((slDetail.value?.assignedContacts ?? []).map(c => c.uid));
+    return allContacts.value.filter(c => !assigned.has(c.uid));
+});
+
+function toggleContactPicker() {
+    showContactPicker.value = !showContactPicker.value;
+    pickerSelected.value = [];
+}
+
+function togglePickerContact(uid: string) {
+    const i = pickerSelected.value.indexOf(uid);
+    if (i === -1) pickerSelected.value.push(uid);
+    else pickerSelected.value.splice(i, 1);
+}
+
+async function slAssignSelected(inc: LocalIncident) {
+    const chosen = allContacts.value.filter(c => pickerSelected.value.includes(c.uid));
+    for (const c of chosen) {
+        await slAssignContact(inc, c);
+    }
+    pickerSelected.value = [];
+    showContactPicker.value = false;
+}
 
 const slActiveIncidents = computed(() =>
     dispatcherStore.localIncidents.filter(i => i.status === 'ACTIVE')
@@ -1003,6 +1091,8 @@ async function slOpenDetail(uid: string) {
     slDetail.value = dispatcherStore.localIncidents.find(i => i.uid === uid) ?? null;
     slView.value = 'detail';
     slContactSearch.value = '';
+    showContactPicker.value = false;
+    pickerSelected.value = [];
     if (!allContacts.value.length) {
         loadingContacts.value = true;
         try { allContacts.value = await getContacts(); }
@@ -1014,6 +1104,7 @@ async function slOpenDetail(uid: string) {
 async function slAssignContact(inc: LocalIncident, contact: TakContact) {
     if (inc.assignedContacts.some(c => c.uid === contact.uid)) return;
     inc.assignedContacts.push({ uid: contact.uid, callsign: contact.callsign });
+    inc.notes.push({ text: `${contact.callsign} was assigned`, time: new Date().toISOString() });
     slContactSearch.value = '';
 
     // GeoChat assignment message
