@@ -1,7 +1,14 @@
 <template>
     <div class='d-flex flex-column h-100 overflow-hidden'>
 
-        <template>
+        <div
+            v-if='setupError'
+            class='alert alert-danger m-2 small'
+            style='white-space:pre-wrap;font-family:monospace;font-size:10px;overflow:auto'
+        >
+            <div class='fw-bold mb-1'>Dispatcher error:</div>{{ setupError }}
+        </div>
+        <template v-else>
             <!-- Header -->
             <div class='d-flex align-items-center px-3 py-2 border-bottom flex-shrink-0 gap-2'>
                 <IconHeadset :size='18' class='text-warning' />
@@ -157,7 +164,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue';
+import { ref, computed, onMounted, onErrorCaptured, watch } from 'vue';
 import ProfileConfig from '../../../src/base/profile.ts';
 import { IconHeadset } from '@tabler/icons-vue';
 import IncidentListView from './IncidentListView.vue';
@@ -182,6 +189,15 @@ type TabKey = typeof TABS[number]['key'];
 const visibleTabs = computed(() =>
     TABS.filter(t => !t.takCadOnly || store.serverMode === 'takcad')
 );
+
+// Diagnostic: surface any child setup/render throw as text instead of a blank panel.
+const setupError = ref('');
+onErrorCaptured((err) => {
+    setupError.value = err instanceof Error ? (err.stack || err.message) : String(err);
+    // eslint-disable-next-line no-console
+    console.error('[dispatcher] captured render error', err);
+    return false;
+});
 
 const activeTab        = ref<TabKey>('incidents');
 const activeCount      = ref(0);
