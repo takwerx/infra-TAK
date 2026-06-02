@@ -118,19 +118,20 @@ export async function getMissions(): Promise<MissionRef[]> {
 }
 
 // Read the mission log entries (for incident number counting).
-export async function getMissionLog(missionGuid: string): Promise<{ message: string }[]> {
+// CloudTAK's log route keys by mission NAME; entries carry a `content` field.
+export async function getMissionLog(missionName: string): Promise<{ content: string }[]> {
     const resp = await std(
-        `/api/marti/missions/${encodeURIComponent(missionGuid)}/log`,
+        `/api/marti/missions/${encodeURIComponent(missionName)}/log`,
         { method: 'GET' }
-    ) as { items?: { message: string }[] } | null;
+    ) as { items?: { content: string }[] } | null;
     return resp?.items ?? [];
 }
 
-// Post a free-text message to the mission log.
-export async function postMissionLog(missionGuid: string, message: string): Promise<void> {
-    await std(`/api/marti/missions/${encodeURIComponent(missionGuid)}/log`, {
+// Post a free-text entry to the mission log.
+export async function postMissionLog(missionName: string, content: string): Promise<void> {
+    await std(`/api/marti/missions/${encodeURIComponent(missionName)}/log`, {
         method: 'POST',
-        body:   { message },
+        body:   { content },
     });
 }
 
@@ -144,8 +145,8 @@ export async function getNextIncidentNumber(feed: MissionRef): Promise<string> {
         .toUpperCase()
         .slice(0, 12);
     try {
-        const log = await getMissionLog(feed.guid);
-        const count = log.filter(e => e.message?.startsWith('CALL FOR SERVICE:')).length;
+        const log = await getMissionLog(feed.name);
+        const count = log.filter(e => e.content?.startsWith('CALL FOR SERVICE:')).length;
         return `${prefix}-${String(count + 1).padStart(3, '0')}`;
     } catch {
         return `${prefix}-001`;

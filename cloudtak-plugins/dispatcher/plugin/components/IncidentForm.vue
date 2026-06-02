@@ -442,20 +442,20 @@ async function submitStandalone(address: string) {
         const feed = props.activeFeed ?? dispatcherStore.activeFeed;
         const markerErrors: string[] = [];
         try {
-            await dropIncidentMarker({
+            await dropIncidentMarker(mapStore, {
                 uid, number, name: form.incidentType, type: form.incidentType,
                 address, lat: form.lat!, lon: form.lon!,
                 time: now, dispatcher, details: form.details,
-                missionName: feed?.name,
+                feedGuid: feed?.guid,
             });
         } catch (e) {
-            markerErrors.push('Map marker failed — re-login to CloudTAK may be required');
+            markerErrors.push(`Marker failed — subscribe to the "${feed?.name ?? 'feed'}" DataSync feed in CloudTAK first`);
             console.warn('[dispatcher] marker drop failed', e);
         }
         if (feed) {
             try {
-                await postMissionCallLog(feed.guid, {
-                    number, name: form.incidentType, type: form.incidentType,
+                await postMissionCallLog(feed.name, {
+                    uid, number, name: form.incidentType, type: form.incidentType,
                     address, time: now,
                 });
             } catch (e) {
@@ -556,7 +556,7 @@ async function submitTakCad(address: string) {
         // CoT marker (both modes — best-effort)
         const feedCad = props.activeFeed ?? dispatcherStore.activeFeed;
         try {
-            await dropIncidentMarker({
+            await dropIncidentMarker(mapStore, {
                 uid,
                 number,
                 name:       form.incidentType,
@@ -567,15 +567,15 @@ async function submitTakCad(address: string) {
                 time:       now,
                 dispatcher,
                 details:    form.details,
-                missionName: feedCad?.name,
+                feedGuid:   feedCad?.guid,
             });
         } catch (e) { console.warn('[dispatcher] marker drop failed', e); }
 
         // DataSync log
         if (feedCad) {
             try {
-                await postMissionCallLog(feedCad.guid, {
-                    number, name: form.incidentType, type: form.incidentType,
+                await postMissionCallLog(feedCad.name, {
+                    uid, number, name: form.incidentType, type: form.incidentType,
                     address: [form.streetName, form.city].filter(Boolean).join(', '),
                     time: now,
                 });

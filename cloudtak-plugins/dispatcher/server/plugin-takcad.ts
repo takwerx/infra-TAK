@@ -101,67 +101,11 @@ export default async function router(schema: Schema, config: Config) {
         }
     });
 
-    // POST a CoT event to TAK Server using client-cert auth.
-    // The browser plugin can't post XML via raw fetch (no auth) or std() (JSON only),
-    // so this proxy accepts JSON, builds CoT XML, and forwards via TAKAPI.fetch().
-    await schema.post('/takcad/cot', {
-        name: 'Dispatcher CoT',
-        group: 'TAKCAD',
-        description: 'Post a CoT marker to TAK Server on behalf of the dispatcher plugin',
-        body: Type.Object({
-            uid: Type.String(),
-            name: Type.String(),
-            type: Type.String(),
-            address: Type.String(),
-            lat: Type.Number(),
-            lon: Type.Number(),
-            remarks: Type.Optional(Type.String()),
-            deleteMarker: Type.Optional(Type.Boolean()),
-            missionName: Type.Optional(Type.String()),
-        }),
-        res: Type.Any(),
-    }, async (req, res) => {
-        try {
-            await Auth.is_auth(config, req);
-            const user = await Auth.as_user(config, req);
-            const profile = await config.models.Profile.from(user.email);
-            const api = await TAKAPI.init(new URL(String(config.server.api)), new APIAuthCertificate(profile.auth.cert, profile.auth.key));
-
-            const now = new Date().toISOString();
-            const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            const b = req.body as { uid: string; name: string; type: string; address: string; lat: number; lon: number; remarks?: string; deleteMarker?: boolean; missionName?: string };
-            const stale = b.deleteMarker
-                ? new Date(Date.now() - 1000).toISOString()
-                : new Date(Date.now() + 3600_000).toISOString();
-            const remarks = esc(b.remarks ?? `${b.type}${b.address ? ' — ' + b.address : ''}`);
-            // Route into a DataSync mission feed via <marti><dest mission="NAME"/></marti>
-            // (same mechanism ATAK/WinTAK/Node-RED use to publish to a mission).
-            const martiDest = b.missionName
-                ? `<marti><dest mission="${esc(b.missionName)}"/></marti>`
-                : '';
-            const xml = [
-                `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`,
-                `<event version="2.0" uid="${esc(b.uid)}" type="a-u-G" how="h-g-i-g-o"`,
-                ` time="${now}" start="${now}" stale="${stale}">`,
-                `<point lat="${b.lat}" lon="${b.lon}" hae="0" ce="9999999" le="9999999"/>`,
-                `<detail>`,
-                `<contact callsign="${esc(b.name)}"/>`,
-                `<remarks>${remarks}</remarks>`,
-                martiDest,
-                `</detail>`,
-                `</event>`,
-            ].join('');
-
-            await api.fetch(new URL('/Marti/api/cot/xml', String(config.server.api)), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/xml' },
-                body: xml,
-            });
-            res.json({ status: 200 });
-        } catch (err) {
-            Err.respond(err, res);
-        }
-    });
+    // NOTE: Incident map markers are NOT posted via this server route. TAK Server has
+    // no REST CoT-injection endpoint (POST /Marti/api/cot/xml → 404), and a raw CoT
+    // does not persist into a DataSync mission. Instead the plugin draws markers
+    // browser-side via mapStore.worker.db.add() with a Mission origin (see
+    // plugin/lib/map-marker.ts) — the same supported mechanism the ping plugin uses.
 
     // GET — getIncidents, getIncidentMetadata, getIncident, getVehicles, etc.
     await schema.get('/marti/plugins/takcad/submit', {

@@ -1024,13 +1024,13 @@ async function slAssignContact(inc: LocalIncident, contact: TakContact) {
     // Update CoT marker remarks with responders
     const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
     const updatedDetails = [inc.details, `Responding: ${responders}`].filter(Boolean).join('\n');
-    try { await updateIncidentMarker({ ...inc, details: updatedDetails, missionName: dispatcherStore.activeFeed?.name }); }
+    try { await updateIncidentMarker(mapStore, { ...inc, details: updatedDetails, feedGuid: dispatcherStore.activeFeed?.guid }); }
     catch { /* best-effort */ }
 
     // DataSync log
     const feed = dispatcherStore.activeFeed;
     if (feed) {
-        try { await postMissionLog(feed.guid, `ASSIGNED: ${inc.number} → ${contact.callsign}`); }
+        try { await postMissionLog(feed.name, `ASSIGNED: ${inc.number} → ${contact.callsign}`); }
         catch { /* best-effort */ }
     }
 }
@@ -1041,14 +1041,14 @@ async function slUnassignContact(inc: LocalIncident, uid: string) {
 
     const feed = dispatcherStore.activeFeed;
     if (feed && contact) {
-        try { await postMissionLog(feed.guid, `UNASSIGNED: ${inc.number} → ${contact.callsign}`); }
+        try { await postMissionLog(feed.name, `UNASSIGNED: ${inc.number} → ${contact.callsign}`); }
         catch { /* best-effort */ }
     }
 
     // Update marker remarks
     const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
     const updatedDetails = [inc.details, responders ? `Responding: ${responders}` : ''].filter(Boolean).join('\n');
-    try { await updateIncidentMarker({ ...inc, details: updatedDetails, missionName: dispatcherStore.activeFeed?.name }); }
+    try { await updateIncidentMarker(mapStore, { ...inc, details: updatedDetails, feedGuid: dispatcherStore.activeFeed?.guid }); }
     catch { /* best-effort */ }
 }
 
@@ -1062,13 +1062,13 @@ async function slAddNote(inc: LocalIncident) {
     // Update CoT marker with latest notes appended to details
     const updatedDetails = [inc.details, ...inc.notes.map(n => n.text)].filter(Boolean).join('\n');
     try {
-        await updateIncidentMarker({ ...inc, details: updatedDetails, missionName: dispatcherStore.activeFeed?.name });
+        await updateIncidentMarker(mapStore, { ...inc, details: updatedDetails, feedGuid: dispatcherStore.activeFeed?.guid });
     } catch { /* best-effort */ }
 
     // DataSync log entry
     const feed = dispatcherStore.activeFeed;
     if (feed) {
-        try { await postMissionLog(feed.guid, `UPDATE ${inc.number}: ${text}`); }
+        try { await postMissionLog(feed.name, `UPDATE ${inc.number}: ${text}`); }
         catch { /* best-effort */ }
     }
 }
@@ -1078,7 +1078,7 @@ async function slCloseIncident(inc: LocalIncident) {
     if (idx !== -1) dispatcherStore.localIncidents[idx].status = 'CANCELLED';
 
     // Remove CoT marker
-    try { await removeIncidentMarker({ ...inc, missionName: dispatcherStore.activeFeed?.name }); } catch { /* best-effort */ }
+    try { await removeIncidentMarker(mapStore, { ...inc, feedGuid: dispatcherStore.activeFeed?.guid }); } catch { /* best-effort */ }
 
     // DataSync log entry
     const feed = dispatcherStore.activeFeed;
@@ -1086,7 +1086,7 @@ async function slCloseIncident(inc: LocalIncident) {
         try {
             const startMs = new Date(inc.time).getTime();
             const durMin = Math.round((Date.now() - startMs) / 60000);
-            await postMissionLog(feed.guid, `INCIDENT CLOSED: ${inc.number} | ${inc.name} | ${durMin} min`);
+            await postMissionLog(feed.name, `INCIDENT CLOSED: ${inc.number} | ${inc.name} | ${durMin} min`);
         } catch { /* best-effort */ }
     }
 
