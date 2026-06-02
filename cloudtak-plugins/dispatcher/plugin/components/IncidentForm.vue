@@ -446,6 +446,7 @@ async function submitStandalone(address: string) {
                 uid, number, name: form.incidentType, type: form.incidentType,
                 address, lat: form.lat!, lon: form.lon!,
                 time: now, dispatcher, details: form.details,
+                missionName: feed?.name,
             });
         } catch (e) {
             markerErrors.push('Map marker failed — re-login to CloudTAK may be required');
@@ -553,6 +554,7 @@ async function submitTakCad(address: string) {
         if (!resp.success) throw new Error(resp.errors?.join(', ') || 'Server returned failure');
 
         // CoT marker (both modes — best-effort)
+        const feedCad = props.activeFeed ?? dispatcherStore.activeFeed;
         try {
             await dropIncidentMarker({
                 uid,
@@ -565,11 +567,11 @@ async function submitTakCad(address: string) {
                 time:       now,
                 dispatcher,
                 details:    form.details,
+                missionName: feedCad?.name,
             });
         } catch (e) { console.warn('[dispatcher] marker drop failed', e); }
 
         // DataSync log
-        const feedCad = props.activeFeed ?? dispatcherStore.activeFeed;
         if (feedCad) {
             try {
                 await postMissionCallLog(feedCad.guid, {

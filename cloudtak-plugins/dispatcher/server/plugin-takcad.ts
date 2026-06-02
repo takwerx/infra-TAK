@@ -117,6 +117,7 @@ export default async function router(schema: Schema, config: Config) {
             lon: Type.Number(),
             remarks: Type.Optional(Type.String()),
             deleteMarker: Type.Optional(Type.Boolean()),
+            missionName: Type.Optional(Type.String()),
         }),
         res: Type.Any(),
     }, async (req, res) => {
@@ -128,11 +129,16 @@ export default async function router(schema: Schema, config: Config) {
 
             const now = new Date().toISOString();
             const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            const b = req.body as { uid: string; name: string; type: string; address: string; lat: number; lon: number; remarks?: string; deleteMarker?: boolean };
+            const b = req.body as { uid: string; name: string; type: string; address: string; lat: number; lon: number; remarks?: string; deleteMarker?: boolean; missionName?: string };
             const stale = b.deleteMarker
                 ? new Date(Date.now() - 1000).toISOString()
                 : new Date(Date.now() + 3600_000).toISOString();
             const remarks = esc(b.remarks ?? `${b.type}${b.address ? ' — ' + b.address : ''}`);
+            // Route into a DataSync mission feed via <marti><dest mission="NAME"/></marti>
+            // (same mechanism ATAK/WinTAK/Node-RED use to publish to a mission).
+            const martiDest = b.missionName
+                ? `<marti><dest mission="${esc(b.missionName)}"/></marti>`
+                : '';
             const xml = [
                 `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`,
                 `<event version="2.0" uid="${esc(b.uid)}" type="a-u-G" how="h-g-i-g-o"`,
@@ -141,6 +147,7 @@ export default async function router(schema: Schema, config: Config) {
                 `<detail>`,
                 `<contact callsign="${esc(b.name)}"/>`,
                 `<remarks>${remarks}</remarks>`,
+                martiDest,
                 `</detail>`,
                 `</event>`,
             ].join('');

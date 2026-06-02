@@ -1024,7 +1024,7 @@ async function slAssignContact(inc: LocalIncident, contact: TakContact) {
     // Update CoT marker remarks with responders
     const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
     const updatedDetails = [inc.details, `Responding: ${responders}`].filter(Boolean).join('\n');
-    try { await updateIncidentMarker({ ...inc, details: updatedDetails }); }
+    try { await updateIncidentMarker({ ...inc, details: updatedDetails, missionName: dispatcherStore.activeFeed?.name }); }
     catch { /* best-effort */ }
 
     // DataSync log
@@ -1048,7 +1048,7 @@ async function slUnassignContact(inc: LocalIncident, uid: string) {
     // Update marker remarks
     const responders = inc.assignedContacts.map(c => c.callsign).join(', ');
     const updatedDetails = [inc.details, responders ? `Responding: ${responders}` : ''].filter(Boolean).join('\n');
-    try { await updateIncidentMarker({ ...inc, details: updatedDetails }); }
+    try { await updateIncidentMarker({ ...inc, details: updatedDetails, missionName: dispatcherStore.activeFeed?.name }); }
     catch { /* best-effort */ }
 }
 
@@ -1062,7 +1062,7 @@ async function slAddNote(inc: LocalIncident) {
     // Update CoT marker with latest notes appended to details
     const updatedDetails = [inc.details, ...inc.notes.map(n => n.text)].filter(Boolean).join('\n');
     try {
-        await updateIncidentMarker({ ...inc, details: updatedDetails });
+        await updateIncidentMarker({ ...inc, details: updatedDetails, missionName: dispatcherStore.activeFeed?.name });
     } catch { /* best-effort */ }
 
     // DataSync log entry
@@ -1078,7 +1078,7 @@ async function slCloseIncident(inc: LocalIncident) {
     if (idx !== -1) dispatcherStore.localIncidents[idx].status = 'CANCELLED';
 
     // Remove CoT marker
-    try { await removeIncidentMarker(inc); } catch { /* best-effort */ }
+    try { await removeIncidentMarker({ ...inc, missionName: dispatcherStore.activeFeed?.name }); } catch { /* best-effort */ }
 
     // DataSync log entry
     const feed = dispatcherStore.activeFeed;
