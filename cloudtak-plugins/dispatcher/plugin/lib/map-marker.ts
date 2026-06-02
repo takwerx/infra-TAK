@@ -33,30 +33,36 @@ function buildRemarks(incident: MarkerIncident): string {
     return parts.join(' | ');
 }
 
+// Iconset path for the incident marker, in CloudTAK's colon web-render form
+// "<iconset-uuid>:<group>/<file>" (no extension). node-cot's from_geojson rewrites it
+// for the wire as <usericon iconsetpath="<uuid>/<group>/<file>.png"> — the exact path
+// an ATAK CoT inspector showed for this iconset's incident icon. The iconset UUID is
+// baked into the iconset zip, so it is stable on every box (ATAK, TAK Aware, CloudTAK)
+// that has the iconset loaded.
+const INCIDENT_ICON = 'db450cbe-2fec-47fb-bd2b-ba2db89b035e:Incident Management/incident';
+
 // Drop or update an incident marker via CloudTAK's worker DB — the same supported,
 // fork-free mechanism the ping plugin and CloudTAK's own draw tools use.
 //
+// IMPORTANT: normalize_geojson is a generic drawn-SHAPE normalizer. For a Point it
+// HARDCODES properties.type='u-d-p' and rebuilds properties from a whitelist
+// (callsign / remarks / colors only) — it silently drops any custom type, how, or
+// icon. So we let it compute the base fields (center/time/stale/archived) and then
+// restore the atom type + how + usericon afterward. db.add passes feat.properties
+// straight through to the broadcast CoT (it does NOT re-normalize), so the usericon
+// reaches ATAK/iTAK. Without this restore the CoT goes out as a bare u-d-p point with
+// no <usericon> (renders as a white/green dot).
+//
 // Setting feat.origin = { mode: 'Mission', mode_id: feedGuid } routes the CoT into
-// THAT specific DataSync feed (independent of the user's active mission). The worker
-// broadcasts it to TAK Server over the user's existing connection and links it to the
-// feed for all subscribers. Requires the feed to be SUBSCRIBED in CloudTAK first.
+// THAT specific DataSync feed (independent of the user's active mission). Requires the
+// feed to be SUBSCRIBED in CloudTAK first.
 export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerIncident): Promise<void> {
     const feat = {
         id:   incident.uid,
         type: 'Feature',
         properties: {
             callsign: `${incident.number} ${incident.name}`,
-            type:     'a-n-G',
-            how:      'h-g-i-g-o',
             remarks:  buildRemarks(incident),
-            // Custom incident icon from the fleet-standard iconset (loaded on ATAK,
-            // TAK Aware, and CloudTAK alike — the UUID is baked into the iconset zip,
-            // so it is stable across every box that has the iconset installed).
-            // Colon form is CloudTAK's web-render key; node-cot's from_geojson does
-            // .split(':').join('/') + '.png' on the wire, yielding the exact ATAK
-            // iconsetpath "db450cbe-…/Incident Management/incident.png". Keep the
-            // group folder ("Incident Management/") and no extension here.
-            icon:     'db450cbe-2fec-47fb-bd2b-ba2db89b035e:Incident Management/incident',
         },
         geometry: {
             type:        'Point',
@@ -64,9 +70,11 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
         },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const norm = await normalize_geojson(feat as any);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const withOrigin: any = incident.feedGuid
+    const norm: any = await normalize_geojson(feat as any);
+    norm.properties.type = 'a-n-G';
+    norm.properties.how  = 'h-g-i-g-o';
+    norm.properties.icon = INCIDENT_ICON;
+    const withOrigin = incident.feedGuid
         ? { ...norm, origin: { mode: 'Mission', mode_id: incident.feedGuid } }
         : norm;
     await mapStore.worker.db.add(JSON.parse(JSON.stringify(withOrigin)), { authored: true });
