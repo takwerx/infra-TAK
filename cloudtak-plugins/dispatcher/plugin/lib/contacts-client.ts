@@ -13,9 +13,11 @@ export interface TakContact {
 
 // CloudTAK proxies TAK Server's /Marti/api/contacts/all at /api/marti/api/contacts/all
 // (route is /marti/api/contacts/all, mounted under /api). Returns a bare JSON array.
+// TAK Server interleaves an empty placeholder entry (callsign:"", uid:"", notes:" admin")
+// between every real contact, so filter to entries that actually have a uid + callsign.
 export async function getContacts(): Promise<TakContact[]> {
     const resp = await std('/api/marti/api/contacts/all', { method: 'GET' }) as TakContact[] | null;
-    return Array.isArray(resp) ? resp : [];
+    return Array.isArray(resp) ? resp.filter(c => c && c.uid && c.callsign) : [];
 }
 
 // Send a direct GeoChat assignment message to a contact via CloudTAK's Chatroom —
