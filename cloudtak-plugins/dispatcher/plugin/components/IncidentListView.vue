@@ -770,7 +770,7 @@ import {
 } from '../lib/takcad-client.ts';
 import type { VehicleResponseMetadata } from '../lib/takcad-client.ts';
 import { removeIncidentMarker, updateIncidentMarker } from '../lib/map-marker.ts';
-import { getContacts, sendAssignmentMessage } from '../lib/contacts-client.ts';
+import { getContacts, sendAssignmentMessage, sendUpdateMessage } from '../lib/contacts-client.ts';
 import type { TakContact } from '../lib/contacts-client.ts';
 import type { IncidentMetadata, IncidentRef, VehicleRef, PersonRef, IncidentTypeRef, PersonCallsign } from '../lib/takcad-types.ts';
 import { isActive, formatAddress, formatTime, STATUS_CANCELLED } from '../lib/takcad-types.ts';
@@ -1161,6 +1161,12 @@ async function slAddNote(inc: LocalIncident) {
     if (feed) {
         try { await postMissionLog(feed.name, `UPDATE ${inc.number}: ${text}`); }
         catch { /* best-effort */ }
+    }
+
+    // Push the update to every assigned responder as a direct GeoChat
+    for (const c of inc.assignedContacts) {
+        try { await sendUpdateMessage(mapStore, c, { name: `${inc.number} ${inc.type}` }, text); }
+        catch (e) { console.warn('[dispatcher] update message failed', e); }
     }
 }
 
