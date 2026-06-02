@@ -438,38 +438,32 @@ async function submitStandalone(address: string) {
 
     saving.value = true;
     try {
-        // CoT marker
+        // CoT marker + DataSync log
+        const feed = props.activeFeed ?? dispatcherStore.activeFeed;
+        const markerErrors: string[] = [];
         try {
             await dropIncidentMarker({
-                uid,
-                number,
-                name:       form.incidentType,
-                type:       form.incidentType,
-                address,
-                lat:        form.lat!,
-                lon:        form.lon!,
-                time:       now,
-                dispatcher,
-                details:    form.details,
+                uid, number, name: form.incidentType, type: form.incidentType,
+                address, lat: form.lat!, lon: form.lon!,
+                time: now, dispatcher, details: form.details,
             });
         } catch (e) {
+            markerErrors.push('Map marker failed — re-login to CloudTAK may be required');
             console.warn('[dispatcher] marker drop failed', e);
         }
-
-        // DataSync mission log
-        const feed = props.activeFeed ?? dispatcherStore.activeFeed;
         if (feed) {
             try {
                 await postMissionCallLog(feed.guid, {
-                    number,
-                    name:    form.incidentType,
-                    type:    form.incidentType,
-                    address,
-                    time:    now,
+                    number, name: form.incidentType, type: form.incidentType,
+                    address, time: now,
                 });
             } catch (e) {
+                markerErrors.push('DataSync log failed');
                 console.warn('[dispatcher] mission log failed', e);
             }
+        }
+        if (markerErrors.length) {
+            saveError.value = markerErrors.join(' · ');
         }
 
         const local: LocalIncident = {
@@ -574,16 +568,14 @@ async function submitTakCad(address: string) {
             });
         } catch (e) { console.warn('[dispatcher] marker drop failed', e); }
 
-        // DataSync log (both modes)
-        const feed = props.activeFeed ?? dispatcherStore.activeFeed;
-        if (feed) {
+        // DataSync log
+        const feedCad = props.activeFeed ?? dispatcherStore.activeFeed;
+        if (feedCad) {
             try {
-                await postMissionCallLog(feed.guid, {
-                    number,
-                    name:    form.incidentType,
-                    type:    form.incidentType,
+                await postMissionCallLog(feedCad.guid, {
+                    number, name: form.incidentType, type: form.incidentType,
                     address: [form.streetName, form.city].filter(Boolean).join(', '),
-                    time:    now,
+                    time: now,
                 });
             } catch (e) { console.warn('[dispatcher] mission log failed', e); }
         }

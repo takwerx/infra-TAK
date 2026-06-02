@@ -20,24 +20,29 @@ import { TAKAPI, APIAuthCertificate } from '@tak-ps/node-tak';
 // Path segment 'takcad' → "no plugin with class name takcad is currently installed".
 const TAKCAD_BASE = '/Marti/api/plugins/tak.server.plugins.TakCadServerPlugin/submit';
 
-// OpenRouteService geocoding key (from the TAK-CAD alpha release docs). Kept
-// server-side so it's not shipped in the browser bundle.
-const ORS_KEY = '5b3ce3597851110001cf62488c4f8dccd2cc447aa974115095a2e6e4';
+// Nominatim (OpenStreetMap) geocoding — no API key required, better US address coverage.
+const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org';
+const NOMINATIM_HEADERS = { 'User-Agent': 'infra-TAK-dispatcher/1.0 (contact@takwerx.com)' };
 
-// Map an ORS geocode feature to a TAK-CAD suggestion (label, coords + parsed address).
-type OrsFeature = { geometry: { coordinates: number[] }; properties: Record<string, string> };
-function orsToSuggestion(f: OrsFeature) {
-    const p = f.properties || {};
-    const street = [p.housenumber, p.street].filter(Boolean).join(' ');
+type NominatimFeature = {
+    display_name: string;
+    lat: string;
+    lon: string;
+    address: Record<string, string>;
+};
+
+function nominatimToSuggestion(f: NominatimFeature) {
+    const a = f.address || {};
+    const street = [a.house_number, a.road || a.pedestrian || a.footway || a.path].filter(Boolean).join(' ');
     return {
-        label: p.label || '',
-        lon: f.geometry.coordinates[0],
-        lat: f.geometry.coordinates[1],
-        streetName: street || p.name || '',
-        city: p.locality || p.localadmin || p.county || '',
-        state: p.region_a || p.region || '',
-        zipCode: p.postalcode || '',
-        country: p.country || '',
+        label: f.display_name || '',
+        lat:   parseFloat(f.lat),
+        lon:   parseFloat(f.lon),
+        streetName: street || '',
+        city:    a.city || a.town || a.village || a.hamlet || a.county || '',
+        state:   a.state || '',
+        zipCode: a.postcode || '',
+        country: a.country || '',
     };
 }
 
@@ -47,7 +52,7 @@ export default async function router(schema: Schema, config: Config) {
     await schema.get('/takcad/geocode', {
         name: 'TAK-CAD Geocode',
         group: 'TAKCAD',
-        description: 'Proxy an address geocode lookup to OpenRouteService',
+        description: 'Proxy an address geocode lookup to Nominatim (OpenStreetMap)',
         query: Type.Object({
             q: Type.String(),
         }),
@@ -56,14 +61,11 @@ export default async function router(schema: Schema, config: Config) {
         try {
             await Auth.is_auth(config, req);
 
-            const qs = new URLSearchParams({ api_key: ORS_KEY, text: String(req.query.q), size: '5' });
-            const r = await fetch(`https://api.openrouteservice.org/geocode/search?${qs.toString()}`);
-            if (!r.ok) {
-                res.json({ suggestions: [] });
-                return;
-            }
-            const json = await r.json() as { features?: OrsFeature[] };
-            res.json({ suggestions: (json.features ?? []).map(orsToSuggestion) });
+            const qs = new URLSearchParams({ q: String(req.query.q), format: 'json', addressdetails: '1', limit: '5' });
+            const r = await fetch(`${NOMINATIM_BASE}/search?${qs.toString()}`, { headers: NOMINATIM_HEADERS });
+            if (!r.ok) { res.json({ suggestions: [] }); return; }
+            const json = await r.json() as NominatimFeature[];
+            res.json({ suggestions: (Array.isArray(json) ? json : []).map(nominatimToSuggestion) });
         } catch (err) {
             Err.respond(err, res);
         }
@@ -73,7 +75,7 @@ export default async function router(schema: Schema, config: Config) {
     await schema.get('/takcad/geocode/reverse', {
         name: 'TAK-CAD Reverse Geocode',
         group: 'TAKCAD',
-        description: 'Proxy a reverse geocode (lat/lon → address) to OpenRouteService',
+        description: 'Proxy a reverse geocode (lat/lon → address) to Nominatim (OpenStreetMap)',
         query: Type.Object({
             lat: Type.Number(),
             lon: Type.Number(),
@@ -83,20 +85,11 @@ export default async function router(schema: Schema, config: Config) {
         try {
             await Auth.is_auth(config, req);
 
-            const qs = new URLSearchParams({
-                'api_key': ORS_KEY,
-                'point.lat': String(req.query.lat),
-                'point.lon': String(req.query.lon),
-                'size': '1',
-            });
-            const r = await fetch(`https://api.openrouteservice.org/geocode/reverse?${qs.toString()}`);
-            if (!r.ok) {
-                res.json({ suggestion: null });
-                return;
-            }
-            const json = await r.json() as { features?: OrsFeature[] };
-            const f = (json.features ?? [])[0];
-            res.json({ suggestion: f ? orsToSuggestion(f) : null });
+            const qs = new URLSearchParams({ lat: String(req.query.lat), lon: String(req.query.lon), format: 'json', addressdetails: '1' });
+            const r = await fetch(`${NOMINATIM_BASE}/reverse?${qs.toString()}`, { headers: NOMINATIM_HEADERS });
+            if (!r.ok) { res.json({ suggestion: null }); return; }
+            const f = await r.json() as NominatimFeature;
+            res.json({ suggestion: f && f.lat ? nominatimToSuggestion(f) : null });
         } catch (err) {
             Err.respond(err, res);
         }
