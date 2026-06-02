@@ -390,6 +390,9 @@ import { getVehicles, insertVehicle, updateVehicle, deleteVehicle } from '../lib
 import type { VehicleRef, VehicleType } from '../lib/takcad-types.ts';
 import { getContacts, sendAssignmentMessage } from '../lib/contacts-client.ts';
 import type { TakContact } from '../lib/contacts-client.ts';
+import { useMapStore } from '../../../src/stores/map.ts';
+
+const mapStore = useMapStore();
 
 const props = defineProps<{
     serverMode:   'detecting' | 'takcad' | 'standalone';
@@ -544,7 +547,7 @@ async function loadContacts() {
 async function assignContact(contact: TakContact) {
     sendingTo.value = contact.uid;
     try {
-        await sendAssignmentMessage(contact.uid, { name: 'Active Incident', address: '' });
+        await sendAssignmentMessage(mapStore, contact, { name: 'Active Incident', address: '' });
         sendStatus.value = { ...sendStatus.value, [contact.uid]: 'Sent' };
     } catch (e) {
         sendStatus.value = { ...sendStatus.value, [contact.uid]: 'Failed' };

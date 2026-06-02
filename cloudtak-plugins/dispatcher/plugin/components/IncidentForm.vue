@@ -263,7 +263,7 @@ import {
 import type { GeocodeSuggestion, MissionRef } from '../lib/takcad-client.ts';
 import type { IncidentRef, IncidentTypeRef } from '../lib/takcad-types.ts';
 import { STATUS_ACTIVE } from '../lib/takcad-types.ts';
-import { dropIncidentMarker, postMissionCallLog } from '../lib/map-marker.ts';
+import { dropIncidentMarker, postMissionCallLog, postFeedChat } from '../lib/map-marker.ts';
 import type { LocalIncident } from '../lib/dispatcher-store.ts';
 import { dispatcherStore } from '../lib/dispatcher-store.ts';
 
@@ -462,6 +462,13 @@ async function submitStandalone(address: string) {
                 markerErrors.push('DataSync log failed');
                 console.warn('[dispatcher] mission log failed', e);
             }
+            try {
+                await postFeedChat(mapStore, feed,
+                    `NEW INCIDENT: ${number} ${form.incidentType}${address ? ' — ' + address : ''}`);
+            } catch (e) {
+                markerErrors.push('Feed chat failed');
+                console.warn('[dispatcher] feed chat failed', e);
+            }
         }
         if (markerErrors.length) {
             saveError.value = markerErrors.join(' · ');
@@ -573,13 +580,18 @@ async function submitTakCad(address: string) {
 
         // DataSync log
         if (feedCad) {
+            const cadAddress = [form.streetName, form.city].filter(Boolean).join(', ');
             try {
                 await postMissionCallLog(feedCad.name, {
                     uid, number, name: form.incidentType, type: form.incidentType,
-                    address: [form.streetName, form.city].filter(Boolean).join(', '),
+                    address: cadAddress,
                     time: now,
                 });
             } catch (e) { console.warn('[dispatcher] mission log failed', e); }
+            try {
+                await postFeedChat(mapStore, feedCad,
+                    `NEW INCIDENT: ${number} ${form.incidentType}${cadAddress ? ' — ' + cadAddress : ''}`);
+            } catch (e) { console.warn('[dispatcher] feed chat failed', e); }
         }
 
         emit('saved', uid);

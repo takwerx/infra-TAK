@@ -1,6 +1,8 @@
 import { std } from '../../../src/std.ts';
 import { normalize_geojson } from '@tak-ps/node-cot/normalize_geojson';
 import type { useMapStore } from '../../../src/stores/map.ts';
+import SubscriptionChat from '../../../src/base/subscription-chat.ts';
+import ProfileConfig from '../../../src/base/profile.ts';
 
 type MapStore = ReturnType<typeof useMapStore>;
 
@@ -44,9 +46,13 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
         type: 'Feature',
         properties: {
             callsign: `${incident.number} ${incident.name}`,
-            type:     'a-u-G',
+            type:     'u-d-p',
             how:      'h-g-i-g-o',
             remarks:  buildRemarks(incident),
+            // Custom incident icon from the fleet-standard iconset (loaded on ATAK,
+            // TAK Aware, and CloudTAK alike — the UUID is baked into the iconset zip,
+            // so it is stable across every box that has the iconset installed).
+            icon:     'db450cbe-2fec-47fb-bd2b-ba2db89b035e:incident',
         },
         geometry: {
             type:        'Point',
@@ -86,4 +92,23 @@ export async function postMissionCallLog(
         method: 'POST',
         body:   { content, entryUid: incident.uid },
     });
+}
+
+// Post an announcement into the DataSync feed's mission-chat thread — the same chat
+// MissionChats.vue drives. Reuses CloudTAK's SubscriptionChat so the message both
+// writes to the local chat DB (keyed by feed.guid) and broadcasts to every feed
+// subscriber over the user's connection (chatroom/dest = feed.name).
+export async function postFeedChat(
+    mapStore: MapStore,
+    feed: { guid: string; name: string },
+    message: string
+): Promise<void> {
+    const username = (await ProfileConfig.get('username'))?.value;
+    const callsign = (await ProfileConfig.get('tak_callsign'))?.value;
+    const sender = {
+        uid:      username ? `ANDROID-CloudTAK-${username}` : 'ANDROID-CloudTAK-dispatcher',
+        callsign: String(callsign || 'Dispatcher'),
+    };
+    const chat = new SubscriptionChat(feed.guid, feed.name);
+    await chat.send(message, sender, mapStore.worker);
 }

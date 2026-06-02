@@ -1,4 +1,9 @@
 import { std } from '../../../src/std.ts';
+import Chatroom from '../../../src/base/chatroom.ts';
+import ProfileConfig from '../../../src/base/profile.ts';
+import type { useMapStore } from '../../../src/stores/map.ts';
+
+type MapStore = ReturnType<typeof useMapStore>;
 
 export interface TakContact {
     uid:      string;
@@ -6,22 +11,28 @@ export interface TakContact {
     lastSeen?: string;
 }
 
+// CloudTAK proxies TAK Server's /Marti/api/contacts/all at /api/marti/api/contacts/all
+// (route is /marti/api/contacts/all, mounted under /api). Returns a bare JSON array.
 export async function getContacts(): Promise<TakContact[]> {
-    const resp = await std('/api/marti/contacts/all', { method: 'GET' }) as TakContact[] | null;
+    const resp = await std('/api/marti/api/contacts/all', { method: 'GET' }) as TakContact[] | null;
     return Array.isArray(resp) ? resp : [];
 }
 
-// Send a direct GeoChat assignment message to a contact.
+// Send a direct GeoChat assignment message to a contact via CloudTAK's Chatroom —
+// the same path MenuChat.vue uses (worker.conn.sendCOT under the hood). The old
+// POST /api/marti/chats had no backing route and silently failed.
 export async function sendAssignmentMessage(
-    contactUid: string,
+    mapStore: MapStore,
+    contact: { uid: string; callsign: string },
     incident: { name: string; address: string }
 ): Promise<void> {
+    const username = (await ProfileConfig.get('username'))?.value;
+    const myCallsign = (await ProfileConfig.get('tak_callsign'))?.value;
+    const sender = {
+        uid:      username ? `ANDROID-CloudTAK-${username}` : 'ANDROID-CloudTAK-dispatcher',
+        callsign: String(myCallsign || 'Dispatcher'),
+    };
     const msg = `You have been assigned to: ${incident.name}${incident.address ? ' at ' + incident.address : ''}. Incident on your map.`;
-    await std('/api/marti/chats', {
-        method: 'POST',
-        body: {
-            chatroom: contactUid,
-            message:  msg,
-        },
-    });
+    const room = new Chatroom(contact.callsign);
+    await room.chats.send(msg, sender, mapStore.worker, { uid: contact.uid, callsign: contact.callsign });
 }

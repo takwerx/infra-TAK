@@ -1018,7 +1018,7 @@ async function slAssignContact(inc: LocalIncident, contact: TakContact) {
 
     // GeoChat assignment message
     try {
-        await sendAssignmentMessage(contact.uid, { name: `${inc.number} ${inc.type}`, address: inc.address });
+        await sendAssignmentMessage(mapStore, contact, { name: `${inc.number} ${inc.type}`, address: inc.address });
     } catch (e) { console.warn('[dispatcher] assignment message failed', e); }
 
     // Update CoT marker remarks with responders
@@ -1084,9 +1084,11 @@ async function slCloseIncident(inc: LocalIncident) {
     const feed = dispatcherStore.activeFeed;
     if (feed) {
         try {
+            const closedAt = new Date();
             const startMs = new Date(inc.time).getTime();
-            const durMin = Math.round((Date.now() - startMs) / 60000);
-            await postMissionLog(feed.name, `INCIDENT CLOSED: ${inc.number} | ${inc.name} | ${durMin} min`);
+            const durMin = Math.round((closedAt.getTime() - startMs) / 60000);
+            const hhmm = `${String(closedAt.getHours()).padStart(2, '0')}:${String(closedAt.getMinutes()).padStart(2, '0')}`;
+            await postMissionLog(feed.name, `INCIDENT CLOSED: ${inc.number} | ${inc.name} | Closed ${hhmm} | ${durMin} min`);
         } catch { /* best-effort */ }
     }
 
