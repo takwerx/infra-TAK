@@ -46,13 +46,17 @@ export async function dropIncidentMarker(mapStore: MapStore, incident: MarkerInc
         type: 'Feature',
         properties: {
             callsign: `${incident.number} ${incident.name}`,
-            type:     'u-d-p',
+            type:     'a-n-G',
             how:      'h-g-i-g-o',
             remarks:  buildRemarks(incident),
             // Custom incident icon from the fleet-standard iconset (loaded on ATAK,
             // TAK Aware, and CloudTAK alike — the UUID is baked into the iconset zip,
             // so it is stable across every box that has the iconset installed).
-            icon:     'db450cbe-2fec-47fb-bd2b-ba2db89b035e:incident',
+            // Colon form is CloudTAK's web-render key; node-cot's from_geojson does
+            // .split(':').join('/') + '.png' on the wire, yielding the exact ATAK
+            // iconsetpath "db450cbe-…/Incident Management/incident.png". Keep the
+            // group folder ("Incident Management/") and no extension here.
+            icon:     'db450cbe-2fec-47fb-bd2b-ba2db89b035e:Incident Management/incident',
         },
         geometry: {
             type:        'Point',
