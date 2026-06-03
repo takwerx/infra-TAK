@@ -101,9 +101,9 @@
                 <span class='badge bg-primary text-white'>Event</span>
                 <div class='flex-grow-1 text-truncate'>
                     <span class='fw-semibold'>{{ store.activeEvent.name }}</span>
-                    <span class='text-muted ms-2'>
+                    <span class='ms-2'>
                         <span class='badge bg-primary text-white'>DataSync</span>
-                        {{ store.activeEvent.feed_name }}
+                        <span class='fw-semibold'>{{ store.activeEvent.feed_name }}</span>
                     </span>
                 </div>
                 <span
