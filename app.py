@@ -39196,6 +39196,31 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
                 if lr.returncode == 0 and 'invalid credentials' not in out:
                     return 'ok'
                 if 'invalid credentials' in out:
+                    # A flow-execution spiral (slow flow planner on slow-disk boxes, or a
+                    # password_stage left on the identification stage, or internal-routing
+                    # exposure of the Authentik 2026.2.x recursion) surfaces to ldapsearch
+                    # as LDAP 49 "invalid credentials" — even when the password is correct.
+                    # Do NOT hard-fail on that signal alone: a 'fail' verdict triggers the
+                    # caller's destructive DELETE+recreate of the user, which WIPES the
+                    # cached session that would otherwise succeed and locks the box into a
+                    # cold-spiral loop. Peek at the outpost log; if the spiral signature is
+                    # present this is NOT a credential failure → inconclusive (caller will
+                    # not destroy the user; routing/flow repair handles it). A genuine bad
+                    # password produces LDAP 49 WITHOUT the spiral marker and still fails.
+                    try:
+                        if is_remote:
+                            _okp, _slog = _ssh_probe(ak_cfg.get('remote', {}),
+                                'docker logs authentik-ldap-1 --since 90s 2>&1', timeout=15)
+                            _slog = (_slog or '').lower()
+                        else:
+                            _sr = subprocess.run('docker logs authentik-ldap-1 --since 90s 2>&1',
+                                shell=True, capture_output=True, text=True, timeout=10)
+                            _slog = (_sr.stdout or '').lower()
+                        if any(m in _slog for m in spiral_markers):
+                            saw_spiral = True
+                            continue
+                    except Exception:
+                        pass
                     return 'fail'
             except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
                 pass
@@ -46094,13 +46119,19 @@ def run_takserver_deploy(config):
                         log_step(f"  ⚠ LDAP flow repair error (non-fatal): {str(_fe)[:120]}")
                     time.sleep(15)
             if not sync_ok:
-                log_step(f"  ✗ webadmin Authentik sync failed: {sync_err}")
-                log_step("     This is usually a recoverable flow spiral, not a TAK Server problem.")
-                log_step("     Fix: open the TAK Server page → 'Connect TAK Server to LDAP', then test https://<host>:8446 (user: webadmin).")
-                deploy_status.update({'error': True, 'running': False})
-                return
-            _remove_webadmin_from_userauth()
-            log_step("  ✓ Removed any flat-file webadmin shadow (8446 → LDAP only)")
+                # Do NOT abort the deploy. TAK Server is installed and running; a webadmin
+                # bind-verify miss is usually a recoverable flow spiral (common on slow-disk
+                # boxes and on installs with no public IP / no LE cert, where the outpost is
+                # stuck on internal routing). Aborting here would also skip Guard Dog, the
+                # LE cert step, and the completion banner over a problem that's fixable in
+                # one click post-deploy. Finish the deploy and tell the operator how to fix.
+                log_step(f"  ⚠ webadmin Authentik sync not verified: {sync_err}")
+                log_step("     TAK Server is installed — this is usually a recoverable LDAP flow spiral, not a TAK Server problem.")
+                log_step("     Fix: TAK Server page → 'Connect TAK Server to LDAP'. Then test https://<host>:8446 (user: webadmin).")
+                log_step("     (webadmin may already work — the cold first bind can false-negative; try the 8446 login first.)")
+            else:
+                _remove_webadmin_from_userauth()
+                log_step("  ✓ Removed any flat-file webadmin shadow (8446 → LDAP only)")
 
         # v0.8.5: Now that TAK Server is installed (heavy LDAP load profile activated),
         # proactively migrate the LDAP outpost to FQDN routing if it's still on internal direct.
