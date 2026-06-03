@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.43-alpha"
+VERSION = "0.9.44-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2506,6 +2506,44 @@ def update_apply():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]})
+
+@app.route('/api/console/restart-safe')
+def console_restart_safe():
+    """v0.9.44: localhost-only readiness probe for the daily console-restart
+    timer (tak-console-restart.sh). Returns {"safe": bool, "reason": str|null}.
+
+    safe=False when any deploy/update operation is in flight, so the timer
+    defers the restart instead of killing a mid-flight deploy. Not session/
+    browser driven (mirrors the localhost-only Guard Dog script endpoints), so
+    it carries no @login_required — but it is restricted to loopback callers.
+    """
+    if (request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost'):
+        return jsonify({'error': 'forbidden'}), 403
+
+    busy = None
+    # 1) Update Now lock — file-based, set at the top of the Update Now endpoint
+    #    (20-min TTL), so it survives even if the worker handling it is wedged.
+    try:
+        _lock = '/var/lib/takwerx-console/update-now.lock'
+        if os.path.exists(_lock):
+            _age = int(time.time() - os.path.getmtime(_lock))
+            if _age < 1200:
+                busy = f'Update Now in progress (~{_age}s ago)'
+    except Exception:
+        pass
+    # 2) Any in-memory *_status dict reporting a running operation. Scanned
+    #    dynamically so new deploy-status globals are covered automatically.
+    if busy is None:
+        try:
+            for _name, _val in list(globals().items()):
+                if _name.endswith('_status') and isinstance(_val, dict) and _val.get('running'):
+                    busy = f'{_name} running'
+                    break
+        except Exception:
+            pass
+
+    return jsonify({'safe': busy is None, 'reason': busy})
+
 
 @app.route('/api/console/rollback', methods=['POST'])
 @login_required
@@ -51409,10 +51447,141 @@ def _fail2ban_takserver_filter(plog):
 
 
 # === Startup migrations: fix known bad settings and regenerate Caddy if needed ===
+# v0.9.44: canonical guard script for the daily console-restart timer. Written
+# to /usr/local/sbin by _ensure_console_restart_timer(); also committed at
+# scripts/tak-console-restart.sh for operator visibility. Keep the two in sync.
+_CONSOLE_RESTART_SCRIPT = r'''#!/bin/bash
+# infra-TAK console daily restart with idle gate — v0.9.44-alpha.
+#
+# A wedged gunicorn worker keeps port 5001 in LISTEN while serving nothing, so
+# systemd reports takwerx-console "active (running)" and never recovers it
+# (test6 + test8, 2026-06-03: 5-7 day-old workers hung; front door + backdoor
+# both dead while Authentik stayed up). Nothing restarted the console on a
+# schedule. This oneshot, fired daily at 04:00 by takconsolerestart.timer,
+# bounces the console so a wedged worker can never sit dead for days and pulled
+# code actually goes live.
+#
+# Idle gate: ask the console whether a deploy/update is in flight before
+# bouncing it. If it answers "not safe" we defer to the next cycle. If it does
+# NOT answer within the timeout it is almost certainly wedged -- which is
+# EXACTLY when a restart is wanted -- so we proceed.
+set -u
+TAG=tak-console-restart
+log() { logger -t "$TAG" -- "$*" 2>/dev/null; echo "$(date -u +%FT%TZ) [$TAG] $*"; }
+
+PORT="$(grep -oP '"console_port"[[:space:]]*:[[:space:]]*"?\K[0-9]+' /root/infra-TAK/.config/settings.json 2>/dev/null | head -1)"
+[ -n "${PORT:-}" ] || PORT=5001
+
+SAFE="$(curl -ks -m 5 "https://127.0.0.1:${PORT}/api/console/restart-safe" 2>/dev/null || true)"
+
+if [ -z "$SAFE" ]; then
+    log "console did not respond within 5s on :${PORT} (likely wedged) -- restarting"
+elif printf '%s' "$SAFE" | grep -q '"safe"[: ]*true'; then
+    log "console idle -- restarting to recover workers / load pulled code"
+else
+    REASON="$(printf '%s' "$SAFE" | grep -oP '"reason"[[:space:]]*:[[:space:]]*"\K[^"]*' | head -1)"
+    log "deferred -- console busy (${REASON:-operation in progress}); next cycle will retry"
+    exit 0
+fi
+
+if systemctl restart takwerx-console.service; then
+    log "restart issued OK"
+else
+    log "restart FAILED rc=$?"
+fi
+exit 0
+'''
+
+
+def _ensure_console_restart_timer():
+    """v0.9.44: install/repair the daily console-restart timer + idle-gate script.
+
+    Recovers the wedged-worker failure mode (test6/test8, 2026-06-03): port 5001
+    stays in LISTEN while gunicorn serves nothing, systemd reports the unit
+    "active (running)", and nothing bounces it -- the only periodic restart in
+    the project is Authentik's, never the console. A daily oneshot at 04:00
+    (idle-gated via /api/console/restart-safe) fixes it and also loads pulled
+    code that a never-restarted console would otherwise miss.
+
+    Idempotent -- safe to call on every console boot from _startup_migrations.
+    Returns a short status string for the boot log, or '' when nothing changed.
+    """
+    try:
+        script_path = '/usr/local/sbin/tak-console-restart.sh'
+        svc_path = '/etc/systemd/system/takconsolerestart.service'
+        tmr_path = '/etc/systemd/system/takconsolerestart.timer'
+
+        svc_content = (
+            '[Unit]\n'
+            'Description=infra-TAK console daily restart (idle-gated)\n'
+            'After=takwerx-console.service\n\n'
+            '[Service]\n'
+            'Type=oneshot\n'
+            f'ExecStart={script_path}\n'
+        )
+        # RandomizedDelaySec spreads the fleet's 04:00 restarts so customers
+        # don't all bounce in lockstep; Persistent catches a missed window
+        # (box powered off at 04:00) on next boot.
+        tmr_content = (
+            '[Unit]\n'
+            'Description=Restart infra-TAK console daily at 04:00 (recover wedged worker, load pulled code)\n\n'
+            '[Timer]\n'
+            'OnCalendar=*-*-* 04:00:00\n'
+            'RandomizedDelaySec=1800\n'
+            'Persistent=true\n'
+            'Unit=takconsolerestart.service\n\n'
+            '[Install]\n'
+            'WantedBy=timers.target\n'
+        )
+
+        changed = False
+
+        def _write_if_changed(path, content, mode=None):
+            cur = ''
+            if os.path.exists(path):
+                try:
+                    with open(path) as _f:
+                        cur = _f.read()
+                except Exception:
+                    pass
+            if cur != content:
+                with open(path, 'w') as _f:
+                    _f.write(content)
+                if mode is not None:
+                    os.chmod(path, mode)
+                return True
+            return False
+
+        changed |= _write_if_changed(script_path, _CONSOLE_RESTART_SCRIPT, 0o755)
+        changed |= _write_if_changed(svc_path, svc_content)
+        changed |= _write_if_changed(tmr_path, tmr_content)
+
+        _enabled = subprocess.run(
+            _sudo_wrap(['systemctl', 'is-enabled', 'takconsolerestart.timer']),
+            capture_output=True, text=True, timeout=5)
+        if changed or 'enabled' not in (_enabled.stdout or ''):
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takconsolerestart.timer']),
+                           capture_output=True, text=True, timeout=10)
+            return 'console-restart timer installed/armed (daily 04:00, idle-gated)'
+        return ''
+    except Exception as _e:
+        return f'console-restart timer warning: {str(_e)[:120]}'
+
+
 def _startup_migrations():
     try:
         s = load_settings()
         settings_dirty = False
+
+        # v0.9.44: ensure the daily console-restart timer exists (recovers a
+        # wedged gunicorn worker; loads pulled code). Runs every boot, idempotent.
+        try:
+            _crt_msg = _ensure_console_restart_timer()
+            if _crt_msg:
+                print(f"Startup migration: {_crt_msg}", flush=True)
+        except Exception as _crt_e:
+            print(f"Startup migration: console-restart timer error: {_crt_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
         fh_raw = s.get('fedhub_deployment', {})

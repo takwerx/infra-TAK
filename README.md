@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.43-alpha](docs/RELEASE-v0.9.43-alpha.md)**
+**Current release: [v0.9.44-alpha](docs/RELEASE-v0.9.44-alpha.md)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.44-alpha — 2026-06-03 — Daily console-restart timer (wedged-worker recovery)
+
+**Headline:** the console (`takwerx-console`, gunicorn 1 worker / 4 threads) can wedge — the worker stops serving while port 5001 stays in `LISTEN`, so systemd still reports `active (running)` and nothing recovers it; front door and backdoor both hang while Authentik stays up (hit test6 and test8 the same day, after 5–7 days of uptime). The only periodic restart in the project was Authentik's — the console had none. This adds **`takconsolerestart.timer`**: a daily 04:00 oneshot that bounces the console (idle-gated via a new localhost-only `GET /api/console/restart-safe`, so it defers if a deploy/update is in flight and restarts immediately if the worker is unresponsive). Self-installs on every boot via `_startup_migrations`, so fresh installs and existing boxes both get it on their next restart. Bonus: a long-lived console now loads pulled code instead of running a stale process across `git pull`s.
+
+Full notes: [docs/RELEASE-v0.9.44-alpha.md](docs/RELEASE-v0.9.44-alpha.md).
 
 ### v0.9.43-alpha — 2026-06-03 — CloudTAK Dispatcher plugin + webadmin LDAP spiral deploy hardening
 
