@@ -11,3 +11,10 @@ __pycache__/
 # rapidsos: local-only, not yet tracked.
 # takcad: tracked on dev for internal testing (TAK-CAD server not public yet).
 cloudtak-plugins/rapidsos/
+# Screenshots shared with Claude during dev — ignore images, keep the folder.
+screenshots/*
+!screenshots/.gitkeep
+
+# TAK-CAD server-plugin reference docs — LOCAL ONLY, never pushed to GitHub.
+# (TAK-CAD server plugin is closed-source; specs live here for Claude to review.)
+tak-cad-docs/
