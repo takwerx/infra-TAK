@@ -1,4 +1,62 @@
-# infra-TAK — Claude Code guidance
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+> The sections below the `---` divider are **process rules** (git stops, plan-first, handoff, scoping, T&E). They are hard requirements — read them. The sections above the divider are the **codebase map** so you don't re-explore every session.
+
+## What this is
+
+infra-TAK is a single-clone, single-password web console (`https://<host>:5001`) that deploys and manages the whole TAK ecosystem on one Ubuntu VPS: TAK Server, Federation Hub, Authentik (SSO/LDAP), TAK Portal, Caddy (SSL), CloudTAK, MediaMTX / TAK Video Restreamer, Node-RED, Email Relay, and Guard Dog (health monitoring). "No more SSH" — everything is driven from the browser. Current release line: see the top of `README.md` (e.g. `v0.9.41-alpha`); `dev` is ahead of `main`.
+
+## Architecture (the big picture)
+
+**It is a Flask monolith.** `app.py` is **~54,000 lines / ~200k tokens** and holds essentially the entire backend: ~322 `@app.route` handlers plus their helpers. There is no blueprint/package split — `modules/` is an empty stub. **NEVER read `app.py` whole** (see token rules below); grep for the route or function and read only the 50–200 lines you need.
+
+- **Entry / process model:** `start.sh` (run as root) installs deps into `.venv`, hashes the admin password, generates a self-signed cert, and writes the `takwerx-console.service` systemd unit that runs `gunicorn ... app:app` on port 5001 (1 worker, 4 threads). It does NOT use `python app.py` directly in production.
+- **State lives in `.config/`** (gitignored, mode 600), not a database: `auth.json` (password hash), `settings.json` (`ssl_mode`, `fqdn`, `server_ip`, `os_type`, `console_port`, `install_dir`, …), `ssl/`. Read/write it via `load_settings()` / `save_settings()` / `load_auth()` (`app.py:750`+). `CONFIG_DIR` env var points at it.
+- **Managed services are Docker containers / system packages** the console shells out to (TAK Server `.deb`, Authentik via compose in `~/authentik`, CloudTAK, MediaMTX, etc.). The console orchestrates them over the host's docker/systemctl/openssl/ssh — there is no ORM and few in-process libraries.
+- **Routes are grouped by module via URL prefix.** To find a feature's backend, grep the prefix. Approx counts: `/api/takserver` (77), `/api/fail2ban` (26), `/api/authentik` (24), `/api/guarddog` (22), `/api/cloudtak` (19), `/api/fedhub` (15), `/api/caddy` (10), plus `webodm`, `tak-video-restreamer`, `nodered`, `emailrelay`, `cesium-tiles`, `takportal`, `mediamtx`, `firewall`, `console`, `update`, `customization`. Routes use a `@login_required` decorator.
+- **Frontend** is server-rendered templates + `static/`; there is no separate SPA build for the console itself.
+
+### CloudTAK plugins (current active work — TAK CAD)
+
+CloudTAK plugins live in `cloudtak-plugins/<name>/` and are **registered in the `CLOUDTAK_PLUGINS` catalog list in `app.py` (~line 15283)**. Each entry has a `key`, `install_dir`, and either:
+- `repo` (public git URL — cloned at install), or
+- `local_path` (absolute path to source in *this* repo — **copied** into `~/CloudTAK/api/web/plugins/<install_dir>/` at install; Vite auto-discovers it via `import.meta.glob` and bundles on the next API rebuild), and optionally
+- `server_path` — CloudTAK API route files copied into CloudTAK's `api/routes/` so the browser plugin can reach TAK Server's `/Marti/api/plugins/<key>/*` through CloudTAK's cert auth (CloudTAK has no generic Marti passthrough — this server-side proxy is required).
+
+Install/detect/rebuild logic: `_detect_cloudtak_plugins()` (`app.py:16052`), `_run_cloudtak_plugin_action()` (`app.py:16091`), routes `/api/cloudtak/plugins/{list,action,log}` (`app.py:16233`+). **TAK CAD** = `cloudtak-plugins/takcad/`: Vue plugin under `plugin/` (`index.ts`, `components/`, `lib/takcad-client.ts`), server proxy under `server/plugin-takcad.ts`. Plugin client auth goes through CloudTAK's `std()` helper (not raw fetch) — raw fetch gave `401 No Auth Present`. See memory `cloudtak-plugin-authoring.md` for the gotchas (`disable()` must not `removeRoute`; copy-not-symlink; ESLint single-quotes; the service-worker cache masks rebuilds). It ships **dev-only** until the TAK-CAD *server* plugin is public.
+
+TAK Server plugin management (the `.jar`/`.yaml` side, distinct from CloudTAK browser plugins) is `/api/takserver/plugins/*` at `app.py:43556`+.
+
+## Commands
+
+This is a Flask app run under gunicorn + systemd; there is **no test suite, no linter, no build step** for `app.py` (the framework's own checklists are manual — see T&E below). The CloudTAK plugins are TypeScript/Vue and are linted/built by CloudTAK's own toolchain when CloudTAK rebuilds.
+
+```bash
+# Run / manage the console (on a host)
+sudo ./start.sh                              # first install or re-run (idempotent)
+sudo systemctl restart takwerx-console       # restart after a code change (operator does this on test boxes)
+journalctl -u takwerx-console -f             # tail logs
+grep '^VERSION' app.py                        # confirm running version
+
+# Navigate app.py WITHOUT reading it whole
+grep -nE "@app\.route\('/api/<prefix>" app.py        # find a feature's routes
+grep -n "def <function_name>" app.py                  # jump to a handler/helper
+
+# Recovery on a VPS (wrong version / failed Update Now) — see README "Universal recovery"
+git fetch https://github.com/takwerx/infra-TAK.git main && git checkout --force -B main FETCH_HEAD
+
+# CloudTAK plugin local-dev cycle: edit cloudtak-plugins/takcad/, then re-run the
+# plugin install action from the console (copies source) and rebuild CloudTAK's API.
+# Hard-refresh the browser — CloudTAK's service worker caches the old bundle.
+```
+
+`scripts/` holds standalone operator fixes (e.g. `ldap-diagnose-and-fix.sh`, `nodered-egress-firewall.sh`); `nodered/` has the Node-RED flow build (`deploy.sh`, `build-flows.js` — never raw `docker cp flows.json`). Memory/context for the project lives in `memory-bank/` (`activeContext.md`, `progress.md`) and `docs/` (149 `RELEASE-*`, `PLAN-*`, `HANDOFF-*` files).
+
+---
+
+# infra-TAK — Claude Code guidance (process rules)
 
 ## Git & release rules (hard stops)
 
@@ -107,7 +165,7 @@ If the task touches >3 functions, split it into sub-tasks and write a brief plan
 
 ## Context discipline
 
-**`app.py` is large (~120k tokens). Never load it whole.**
+**`app.py` is large (~54,000 lines / ~200k tokens). Never load it whole.**
 - Grep or search first to find the exact function/route
 - Read only the 50–200 line range needed
 - Anchor the agent before it starts: "In `deploy_nodered()` around line ~4200, fix X"
