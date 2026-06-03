@@ -15304,11 +15304,15 @@ CLOUDTAK_PLUGINS = [
             'notify responders via mission thread and direct message. Works without the '
             'TAK-CAD server plugin; auto-upgrades to full TAK-CAD mode when detected.'
         ),
-        'local_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'dispatcher', 'plugin'),
-        # server_path: CloudTAK API route files copied into api/routes/ so the
-        # browser plugin can reach TAK Server's /Marti/api/plugins/<FQCN>/* via
-        # CloudTAK's cert auth (CloudTAK has no generic Marti passthrough).
-        'server_path': os.path.join(_REPO_ROOT, 'cloudtak-plugins', 'dispatcher', 'server'),
+        # Deployed from its own public repo (like ping). The web plugin and the CloudTAK
+        # API routes live in separate subdirs: the installer clones the repo to a cache dir,
+        # copies plugin/ into web/plugins/ and server/*.ts into api/routes/. The server files
+        # must NOT land under web/plugins or CloudTAK's web build (vue-tsc) would type-check
+        # them (they import server-only api libs). plugin-takcad.ts is the optional TAK-CAD
+        # proxy; plugin-dispatcher.ts is the standalone Events/Incidents store.
+        'repo': 'https://github.com/takwerx/cloudtak-dispatcher-plugin',
+        'plugin_subpath': 'plugin',
+        'server_subpath': 'server',
         'install_dir': 'tak-dispatcher',
         'requires': 'CloudTAK 13.2+',
         'author': 'takwerx',
@@ -16131,6 +16135,25 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             return False
 
     local_path = plugin.get('local_path')
+    repo = plugin.get('repo')
+    plugin_subpath = plugin.get('plugin_subpath')
+    server_subpath = plugin.get('server_subpath')
+    # Repo plugins that ship the web plugin and the server route in separate subdirs are
+    # cloned to a cache dir, then plugin_subpath is copied into web/plugins and server_subpath
+    # into api/routes (server *.ts must NOT live under web/plugins or the web build breaks).
+    use_subpaths = bool(repo and (plugin_subpath or server_subpath))
+    cache_path = os.path.join(ct_dir, '.plugin-src', plugin['install_dir'])
+
+    def _web_src():
+        return os.path.join(cache_path, plugin_subpath) if plugin_subpath else cache_path
+
+    def _clone_or_pull_cache():
+        import shutil
+        if os.path.isdir(os.path.join(cache_path, '.git')):
+            return run_cmd(['git', '-C', cache_path, 'pull'])
+        shutil.rmtree(cache_path, ignore_errors=True)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        return run_cmd(['git', 'clone', repo, cache_path])
 
     try:
         if action == 'install':
@@ -16146,6 +16169,14 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 import shutil
                 plog(f'Copying local plugin source: {local_path} → {install_path}')
                 shutil.copytree(local_path, install_path)
+            elif use_subpaths:
+                import shutil
+                plog(f'Cloning plugin repository: {repo}')
+                if not _clone_or_pull_cache():
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
+                plog(f'Copying web plugin: {plugin_subpath or "."} → {install_path}')
+                shutil.copytree(_web_src(), install_path)
             else:
                 plog('Cloning plugin repository...')
                 if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
@@ -16166,6 +16197,17 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 if os.path.islink(install_path):
                     os.unlink(install_path)
                 shutil.copytree(local_path, install_path)
+            elif use_subpaths:
+                import shutil
+                plog(f'Pulling plugin repository: {repo}')
+                if not _clone_or_pull_cache():
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
+                plog(f'Re-copying web plugin: {plugin_subpath or "."} → {install_path}')
+                shutil.rmtree(install_path, ignore_errors=True)
+                if os.path.islink(install_path):
+                    os.unlink(install_path)
+                shutil.copytree(_web_src(), install_path)
             else:
                 if not run_cmd(['git', '-C', install_path, 'pull']):
                     cloudtak_plugin_status.update({'running': False, 'error': True})
@@ -16186,8 +16228,11 @@ def _run_cloudtak_plugin_action(plugin_key, action):
 
         # Server-side route files: copied into api/routes/ so the browser plugin
         # can reach TAK Server plugin APIs via CloudTAK's cert auth. CloudTAK
-        # auto-loads every file in api/routes/ (schema.load('./routes/')).
+        # auto-loads every file in api/routes/ (schema.load('./routes/')). For repo
+        # plugins the routes come from the cloned cache's server_subpath.
         server_path = plugin.get('server_path')
+        if use_subpaths and server_subpath:
+            server_path = os.path.join(cache_path, server_subpath)
         if server_path and os.path.isdir(server_path):
             import shutil
             routes_base = os.path.join(ct_dir, 'api', 'routes')
@@ -16203,6 +16248,12 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 else:
                     shutil.copy2(os.path.join(server_path, fname), dest)
                     plog(f'Installed server route: api/routes/{fname}')
+
+        # On remove, drop the repo source cache too (kept until now so the server-route
+        # removal above could list which files to delete).
+        if use_subpaths and action == 'remove':
+            import shutil
+            shutil.rmtree(cache_path, ignore_errors=True)
 
         # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
         # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).
@@ -17365,11 +17416,31 @@ def run_cloudtak_update():
             routes_base = os.path.join(cloudtak_dir, 'api', 'routes')
             for install_dir, p in pre_installed.items():
                 dest = os.path.join(plugins_base, install_dir)
+                local_path = p.get('local_path')
+                repo       = p.get('repo')
+                plugin_subpath = p.get('plugin_subpath')
+                server_subpath = p.get('server_subpath')
+                use_subpaths = bool(repo and (plugin_subpath or server_subpath))
+                cache_path = os.path.join(cloudtak_dir, '.plugin-src', install_dir)
+                server_path = p.get('server_path')
+                # Repo plugins with subdirs: clone (or reuse) the cache, source web + routes from it.
+                if use_subpaths:
+                    import shutil as _shutil
+                    if not os.path.isdir(os.path.join(cache_path, '.git')):
+                        _shutil.rmtree(cache_path, ignore_errors=True)
+                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        subprocess.run(['git', 'clone', repo, cache_path], capture_output=True, timeout=120)
+                    server_path = os.path.join(cache_path, server_subpath) if server_subpath else None
                 if not os.path.exists(dest) and not os.path.islink(dest):
-                    local_path = p.get('local_path')
-                    repo       = p.get('repo')
-                    if local_path and os.path.isdir(local_path):
-                        import shutil as _shutil
+                    import shutil as _shutil
+                    if use_subpaths:
+                        web_src = os.path.join(cache_path, plugin_subpath) if plugin_subpath else cache_path
+                        if os.path.isdir(web_src):
+                            _shutil.copytree(web_src, dest)
+                            plog(f"  Restored plugin (repo): {p['name']}")
+                        else:
+                            plog(f"  ⚠ Plugin '{p['name']}' repo missing '{plugin_subpath}' dir")
+                    elif local_path and os.path.isdir(local_path):
                         _shutil.copytree(local_path, dest)
                         plog(f"  Restored plugin (copy): {p['name']}")
                     elif repo:
@@ -17380,7 +17451,6 @@ def run_cloudtak_update():
                         plog(f"  ⚠ Plugin '{p['name']}' was wiped — no repo or local_path to restore from")
                 # Server-side route files live in api/routes/ which the checkout
                 # also wipes — re-copy them whenever the plugin is installed.
-                server_path = p.get('server_path')
                 if server_path and os.path.isdir(server_path):
                     import shutil as _shutil
                     os.makedirs(routes_base, exist_ok=True)
