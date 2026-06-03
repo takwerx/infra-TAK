@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.41-alpha](docs/RELEASE-v0.9.41-alpha.md)**
+**Current release: [v0.9.43-alpha](docs/RELEASE-v0.9.43-alpha.md)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
 
@@ -339,6 +339,24 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.43-alpha — 2026-06-03 — CloudTAK Dispatcher plugin + webadmin LDAP spiral deploy hardening
+
+**Headline: two areas.** (1) **CloudTAK Dispatcher plugin** — a Computer-Aided Dispatch panel inside CloudTAK, installed from CloudTAK → Plugins and deployed from its own public repo (`takwerx/cloudtak-dispatcher-plugin`, like the ping plugin). Works **standalone** with no TAK-CAD server plugin: incidents are server-backed in CloudTAK's own Postgres (shared across dispatchers), drawn on the map as native CoT and optionally pushed into a DataSync feed so every client (ATAK/iTAK/TAK Aware/WinTAK) sees them; multi-select responder assignment with notification over mission thread + direct message; markers use a foldered color-less `iconsetpath` that renders on all field clients. Auto-upgrades to full TAK-CAD mode when the TAK-CAD server plugin is detected. (2) **webadmin LDAP spiral deploy hardening** — fresh TAK Server installs on boxes that can't reach FQDN/Caddy routing (no public IP / no LE cert / slow disk) were dead-ending at the final `webadmin` LDAP-bind verification with `exceeded stage recursion depth` (a flow spiral, not a bad password). The deploy now repairs the flow before retrying, the verifier no longer destroys the webadmin user on a spiral verdict (which had wiped the cached session and locked the box into a cold-spiral loop), and a verify miss no longer aborts the whole deploy. Plus CloudTAK plugin install/update robustness (copy-not-symlink, restore plugins after a CloudTAK update, container-ID version check, GitHub-tag-fetch tolerance).
+
+Full notes: [docs/RELEASE-v0.9.43-alpha.md](docs/RELEASE-v0.9.43-alpha.md).
+
+### v0.9.42-alpha — 2026-05-29 — TAK Video Restreamer module
+
+New Marketplace module: **TAK Video Restreamer** (`raytheonbbn/tak-video-restreamer`) — a Flask + MediaMTX + FFmpeg streaming server deployed as a Docker container, behind Caddy at `stream.<FQDN>`. Mutually exclusive with the standalone MediaMTX module (shared streaming ports; the console blocks deploying both). Built-in Flask admin login (separate from Authentik), changeable without a rebuild. RTSP/RTSPS/SRT/RTMP/HLS-ABR endpoints, Guard Dog HTTP monitor on `/login:3100`, Update Now via `git pull` + `docker compose up -d --build`.
+
+Full notes: [docs/RELEASE-v0.9.42-alpha.md](docs/RELEASE-v0.9.42-alpha.md).
+
+### v0.9.41-alpha — 2026-05-28 — LDAP spiral fix + Azure External DB hardening
+
+Two bug areas: (1) **LDAP identification-stage spiral** — a silent PATCH failure left every webadmin bind returning error 49, spiraling across resync attempts. (2) **Azure External DB** — five hardening fixes covering extension provisioning, deploy gating, SchemaManager execution, uninstall cleanup, and a malformed-XML crash from `&` in generated passwords.
+
+Full notes: [docs/RELEASE-v0.9.41-alpha.md](docs/RELEASE-v0.9.41-alpha.md).
 
 ### v0.9.40-alpha — 2026-05-27 — Azure PostgreSQL end-to-end support + CloudTAK first-time setup guide + MediaMTX readiness fix
 
