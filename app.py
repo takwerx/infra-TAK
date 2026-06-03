@@ -46073,10 +46073,30 @@ def run_takserver_deploy(config):
                     break
                 sync_err = (err or 'Unknown sync error')[:120]
                 if attempt == 0:
-                    log_step(f"  ℹ webadmin sync attempt 1 failed: {sync_err} — retrying once...")
+                    # The first webadmin bind on a fresh deploy frequently fails with
+                    # "exceeded stage recursion depth" — a flow-execution spiral, NOT a
+                    # bad password. Cause: webadmin is verified while the LDAP outpost is
+                    # still on internal direct routing, and the ldap-authentication-flow
+                    # may carry a password_stage on its identification stage (recursion).
+                    # adm_ldapservice masks this (cached session); webadmin is a fresh bind
+                    # so it hits the spiral cold. Repair the flow before retrying — this is
+                    # what "Connect TAK Server to LDAP" does (clears password_stage, fixes
+                    # the 3 ldap-* stage bindings, force-recreates the outpost). Without it
+                    # a clean install dead-ends here. Idempotent on already-healthy boxes.
+                    log_step(f"  ℹ webadmin sync attempt 1 failed: {sync_err} — repairing LDAP flow and retrying...")
+                    try:
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        if ok_flow:
+                            log_step("  ✓ LDAP flow repaired (cleared recursion spiral)")
+                        else:
+                            log_step(f"  ⚠ LDAP flow repair: {err_flow} — retrying webadmin sync anyway")
+                    except Exception as _fe:
+                        log_step(f"  ⚠ LDAP flow repair error (non-fatal): {str(_fe)[:120]}")
                     time.sleep(15)
             if not sync_ok:
                 log_step(f"  ✗ webadmin Authentik sync failed: {sync_err}")
+                log_step("     This is usually a recoverable flow spiral, not a TAK Server problem.")
+                log_step("     Fix: open the TAK Server page → 'Connect TAK Server to LDAP', then test https://<host>:8446 (user: webadmin).")
                 deploy_status.update({'error': True, 'running': False})
                 return
             _remove_webadmin_from_userauth()
