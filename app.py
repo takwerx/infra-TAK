@@ -16103,30 +16103,41 @@ def _detect_cloudtak_plugins():
         is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
-        if installed:
-            # Local HEAD — short SHA only (no commit message)
+        # Resolve which directory actually holds the plugin's git clone. For repo plugins that
+        # ship the web/server halves in subdirs, install_path (under api/web/plugins/) is a
+        # *copy* with no .git — the real clone lives in ~/CloudTAK/.plugin-src/<install_dir>.
+        # Running `git -C` in a dir that has no .git makes git walk UP the tree and report
+        # CloudTAK's own repo commit/update state instead of the plugin's (the bogus-SHA bug).
+        # Local-path plugins are copied from this repo and have no upstream of their own.
+        git_dir = None
+        if installed and not is_local:
+            uses_subpaths = bool(p.get('repo') and (p.get('plugin_subpath') or p.get('server_subpath')))
+            cand = os.path.join(ct_dir, '.plugin-src', p['install_dir']) if uses_subpaths else install_path
+            if os.path.isdir(os.path.join(cand, '.git')):
+                git_dir = cand
+        if git_dir:
+            # Installed (local) HEAD — short SHA only (no commit message)
             try:
                 r = subprocess.run(
-                    ['git', '-C', install_path, 'rev-parse', '--short=7', 'HEAD'],
+                    ['git', '-C', git_dir, 'rev-parse', '--short=7', 'HEAD'],
                     capture_output=True, text=True, timeout=5
                 )
                 if r.returncode == 0:
                     sha = r.stdout.strip()
             except Exception:
                 pass
-            # Remote HEAD — skip for local-path plugins (symlink is always current)
-            if not is_local:
-                try:
-                    r2 = subprocess.run(
-                        ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if r2.returncode == 0 and r2.stdout.strip():
-                        remote_short = r2.stdout.split()[0][:7]
-                        if sha and remote_short and sha != remote_short:
-                            update_available = True
-                except Exception:
-                    pass
+            # Remote HEAD — a newer SHA upstream means an update is available
+            try:
+                r2 = subprocess.run(
+                    ['git', '-C', git_dir, 'ls-remote', 'origin', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r2.returncode == 0 and r2.stdout.strip():
+                    remote_short = r2.stdout.split()[0][:7]
+                    if sha and remote_short and sha != remote_short:
+                        update_available = True
+            except Exception:
+                pass
         result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available, 'local': is_local})
     return result
 

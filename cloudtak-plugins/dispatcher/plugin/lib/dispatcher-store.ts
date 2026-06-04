@@ -1,5 +1,4 @@
 import { reactive } from 'vue';
-import { Preferences } from '@capacitor/preferences';
 import type { DispatcherEvent, DispatcherIncident } from './events-client.ts';
 
 export type ServerMode = 'detecting' | 'takcad' | 'standalone';
@@ -24,23 +23,26 @@ export const dispatcherStore = reactive<DispatcherState>({
 });
 
 // The board itself is now server-backed (CloudTAK Postgres via the dispatcher route), so it
-// no longer persists in the browser. We keep ONE tiny Preferences key — the last opened
-// Event id — purely as a convenience so a reload reselects it. Everything else (the event
-// list and incidents) is re-fetched from the server on mount. Uses Capacitor Preferences
-// (the same API CloudTAK uses for the dispatcher name) because plain localStorage is
-// unreliable in CloudTAK's PWA context.
+// no longer persists in the browser. We keep ONE tiny key — the last opened Event id —
+// purely as a convenience so a reload reselects it. Everything else (the event list and
+// incidents) is re-fetched from the server on mount. Stored in localStorage, the same store
+// CloudTAK uses for its own auth token; CloudTAK's web build has no Capacitor runtime, so
+// the Capacitor Preferences API is unavailable here.
 const LAST_EVENT_KEY = 'tak-dispatcher-last-event-v1';
 
 export async function loadLastEventId(): Promise<string | null> {
     try {
-        const { value } = await Preferences.get({ key: LAST_EVENT_KEY });
-        return value || null;
+        return localStorage.getItem(LAST_EVENT_KEY) || null;
     } catch {
         return null;
     }
 }
 
 export function saveLastEventId(id: string | null): void {
-    if (id) Preferences.set({ key: LAST_EVENT_KEY, value: id }).catch(() => {});
-    else Preferences.remove({ key: LAST_EVENT_KEY }).catch(() => {});
+    try {
+        if (id) localStorage.setItem(LAST_EVENT_KEY, id);
+        else localStorage.removeItem(LAST_EVENT_KEY);
+    } catch {
+        // ignore storage failures (private mode / quota)
+    }
 }
