@@ -22,7 +22,9 @@ set -u
 TAG=tak-console-restart
 log() { logger -t "$TAG" -- "$*" 2>/dev/null; echo "$(date -u +%FT%TZ) [$TAG] $*"; }
 
-PORT="$(grep -oP '"console_port"[[:space:]]*:[[:space:]]*"?\K[0-9]+' /root/infra-TAK/.config/settings.json 2>/dev/null | head -1)"
+# Port = whatever the console unit actually binds, so this works regardless of
+# install dir (/root/infra-TAK, the OG /home/takwerx/infra-TAK, ...). Fall back to 5001.
+PORT="$(grep -oE -- '--bind[ =][^ ]+' /etc/systemd/system/takwerx-console.service 2>/dev/null | grep -oE '[0-9]+$' | head -1)"
 [ -n "${PORT:-}" ] || PORT=5001
 
 SAFE="$(curl -ks -m 5 "https://127.0.0.1:${PORT}/api/console/restart-safe" 2>/dev/null || true)"
