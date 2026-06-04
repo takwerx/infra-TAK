@@ -46939,9 +46939,25 @@ def _kernel_patch_start_job():
         'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a\n'
         'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
         'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) ==="\n'
+        # v0.9.44: OS patching must NEVER sweep in a TAK Server MAJOR upgrade — that is
+        # operator-driven and backup-gated (the console TAK update flow). Field: a kernel
+        # patch pulled takserver 5.6->5.7, whose postinstall failed and wedged dpkg. Hold
+        # the installed TAK packages for the duration of this run, release on exit. Only
+        # holds WE add are released, so any pre-existing operator hold is preserved.
+        'TAK_PKGS="takserver takserver-fed-hub"\n'
+        'HELD=""\n'
+        'PREHELD="$(apt-mark showhold 2>/dev/null)"\n'
+        'for p in $TAK_PKGS; do\n'
+        '  if dpkg -s "$p" >/dev/null 2>&1; then\n'
+        '    case " $PREHELD " in *" $p "*) : ;; *) apt-mark hold "$p" >/dev/null 2>&1 && HELD="$HELD $p" ;; esac\n'
+        '  fi\n'
+        'done\n'
+        '[ -n "$HELD" ] && echo "[$(TS)] TAK packages held for this patch (operator-driven upgrade only):$HELD"\n'
+        'release_holds() { for p in $HELD; do apt-mark unhold "$p" >/dev/null 2>&1; done; [ -n "$HELD" ] && echo "[$(TS)] released TAK holds:$HELD"; }\n'
+        'trap release_holds EXIT\n'
         'echo "[$(TS)] apt-get update"\n'
         'apt-get update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
-        'echo "[$(TS)] apt-get full-upgrade -y"\n'
+        'echo "[$(TS)] apt-get full-upgrade -y (TAK Server packages held)"\n'
         'apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
         '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
