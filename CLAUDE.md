@@ -52,7 +52,9 @@ git fetch https://github.com/takwerx/infra-TAK.git main && git checkout --force 
 # Hard-refresh the browser — CloudTAK's service worker caches the old bundle.
 ```
 
-`scripts/` holds standalone operator fixes (e.g. `ldap-diagnose-and-fix.sh`, `nodered-egress-firewall.sh`); `nodered/` has the Node-RED flow build (`deploy.sh`, `build-flows.js` — never raw `docker cp flows.json`). Memory/context for the project lives in `memory-bank/` (`activeContext.md`, `progress.md`) and `docs/` (149 `RELEASE-*`, `PLAN-*`, `HANDOFF-*` files).
+`scripts/` holds standalone operator fixes (e.g. `ldap-diagnose-and-fix.sh`, `nodered-egress-firewall.sh`); `nodered/` has the Node-RED flow build (`deploy.sh`, `build-flows.js` — never raw `docker cp flows.json`). Memory/context for the project lives in `memory-bank/` (`activeContext.md`, `progress.md`) and `docs/` (`RELEASE-*`, `PLAN-*`, `HANDOFF-*` files).
+
+> **`docs/` and `memory-bank/` now live in the PRIVATE sibling repo `infra-TAK-notes`** (`takwerx/infra-TAK-notes`), not in this public repo. On the dev Mac they sit at `../infra-TAK-notes/docs/` and `../infra-TAK-notes/memory-bank/` — open `~/GitHub/infra-TAK.code-workspace` to get both repos in one window. **Every `docs/…` and `memory-bank/…` path in the process rules below resolves to that private repo** (read/write HANDOFFs, PLANs, and memory-bank there; commit/push them to `infra-TAK-notes`, never to public `infra-TAK`).
 
 ---
 
