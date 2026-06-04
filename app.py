@@ -16092,6 +16092,73 @@ def cloudtak_reset_server_config():
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
 
 
+def _plugin_built_marker_path(ct_dir, install_dir):
+    # v0.9.44: SHA of the source last *successfully built* into the CloudTAK image.
+    # Lives outside any git clone so `git pull` on the cache can't touch it.
+    return os.path.join(ct_dir, '.plugin-src', f'.built-{install_dir}')
+
+
+def _read_plugin_built_sha(ct_dir, install_dir):
+    try:
+        with open(_plugin_built_marker_path(ct_dir, install_dir)) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _write_plugin_built_sha(ct_dir, install_dir, sha):
+    try:
+        p = _plugin_built_marker_path(ct_dir, install_dir)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'w') as f:
+            f.write((sha or '').strip())
+    except Exception:
+        pass
+
+
+def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
+    """v0.9.44: back up the CloudTAK files a plugin action mutates (api/routes + the web
+    plugin dir) so a failed rebuild can be rolled back — a broken plugin must never leave
+    CloudTAK in an unbuildable state."""
+    import tempfile, shutil
+    snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
+    routes = os.path.join(ct_dir, 'api', 'routes')
+    if os.path.isdir(routes):
+        shutil.copytree(routes, os.path.join(snap, 'routes'), symlinks=True)
+    web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
+    if web_existed:
+        shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
+    return {'snap': snap, 'web_existed': web_existed}
+
+
+def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
+    import shutil
+    if not snap_info or not snap_info.get('snap'):
+        return
+    snap = snap_info['snap']
+    routes = os.path.join(ct_dir, 'api', 'routes')
+    snap_routes = os.path.join(snap, 'routes')
+    if os.path.isdir(snap_routes):
+        shutil.rmtree(routes, ignore_errors=True)
+        shutil.move(snap_routes, routes)
+    if os.path.islink(install_path):
+        os.unlink(install_path)
+    elif os.path.isdir(install_path):
+        shutil.rmtree(install_path, ignore_errors=True)
+    snap_web = os.path.join(snap, 'web')
+    if snap_info.get('web_existed') and os.path.isdir(snap_web):
+        shutil.move(snap_web, install_path)
+    shutil.rmtree(snap, ignore_errors=True)
+    if plog:
+        plog('  ↩ Restored CloudTAK api/routes + plugin dir to the pre-update state.')
+
+
+def _cleanup_snapshot(snap_info):
+    import shutil
+    if snap_info and snap_info.get('snap'):
+        shutil.rmtree(snap_info['snap'], ignore_errors=True)
+
+
 def _detect_cloudtak_plugins():
     """Return the CLOUDTAK_PLUGINS catalog annotated with installed/commit/update_available."""
     ct_dir = os.path.expanduser('~/CloudTAK')
@@ -16116,17 +16183,23 @@ def _detect_cloudtak_plugins():
             if os.path.isdir(os.path.join(cand, '.git')):
                 git_dir = cand
         if git_dir:
-            # Installed (local) HEAD — short SHA only (no commit message)
+            # v0.9.44 honest badge: show the SHA actually BUILT into the running image,
+            # not the source cache HEAD. A failed rebuild advances the cache but leaves the
+            # old image live, so comparing the cache would falsely clear the "update" badge.
+            built_sha = _read_plugin_built_sha(ct_dir, p['install_dir'])
+            head_sha = None
             try:
                 r = subprocess.run(
                     ['git', '-C', git_dir, 'rev-parse', '--short=7', 'HEAD'],
                     capture_output=True, text=True, timeout=5
                 )
                 if r.returncode == 0:
-                    sha = r.stdout.strip()
+                    head_sha = r.stdout.strip()
             except Exception:
                 pass
-            # Remote HEAD — a newer SHA upstream means an update is available
+            # Built marker wins; fall back to cache HEAD for pre-0.9.44 installs (no marker).
+            sha = built_sha or head_sha
+            # Remote HEAD — an update exists if nothing is built yet or built != upstream.
             try:
                 r2 = subprocess.run(
                     ['git', '-C', git_dir, 'ls-remote', 'origin', 'HEAD'],
@@ -16134,7 +16207,7 @@ def _detect_cloudtak_plugins():
                 )
                 if r2.returncode == 0 and r2.stdout.strip():
                     remote_short = r2.stdout.split()[0][:7]
-                    if sha and remote_short and sha != remote_short:
+                    if remote_short and (not sha or sha != remote_short):
                         update_available = True
             except Exception:
                 pass
@@ -16204,7 +16277,11 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         return run_cmd(['git', 'clone', repo, cache_path])
 
+    built_ok = False
+    snap = None
     try:
+        # v0.9.44: snapshot the files we're about to mutate so a failed rebuild rolls back.
+        snap = _snapshot_cloudtak_plugin_state(ct_dir, install_path)
         if action == 'install':
             plog(f'Installing plugin: {plugin["name"]}')
             if os.path.isdir(install_path) or os.path.islink(install_path):
@@ -16309,8 +16386,27 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         plog('')
         plog('Rebuilding CloudTAK API image — this takes 5–15 minutes...')
         if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=1200):
+            plog('✗ Rebuild failed — rolling back so CloudTAK stays buildable...')
+            _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
+            snap = None
             cloudtak_plugin_status.update({'running': False, 'error': True})
             return
+        built_ok = True
+        # v0.9.44: record the source SHA that actually built (honest update badge).
+        if action == 'remove':
+            try:
+                os.remove(_plugin_built_marker_path(ct_dir, plugin['install_dir']))
+            except Exception:
+                pass
+        elif not local_path:
+            src = cache_path if use_subpaths else install_path
+            try:
+                rr = subprocess.run(['git', '-C', src, 'rev-parse', '--short=7', 'HEAD'],
+                                    capture_output=True, text=True, timeout=5)
+                if rr.returncode == 0:
+                    _write_plugin_built_sha(ct_dir, plugin['install_dir'], rr.stdout.strip())
+            except Exception:
+                pass
 
         plog('Restarting CloudTAK API container...')
         if not run_cmd(['docker', 'compose', 'up', '-d', '--force-recreate', 'api'], cwd=ct_dir, timeout=120):
@@ -16328,7 +16424,13 @@ def _run_cloudtak_plugin_action(plugin_key, action):
 
     except Exception as e:
         plog(f'Unexpected error: {e}')
+        if not built_ok:
+            plog('Rolling back partial changes...')
+            _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
+            snap = None
         cloudtak_plugin_status.update({'running': False, 'error': True})
+    finally:
+        _cleanup_snapshot(snap)
 
 
 @app.route('/api/cloudtak/plugins/list')
