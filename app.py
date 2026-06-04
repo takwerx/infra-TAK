@@ -30784,6 +30784,130 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
         return False
 
 
+def _list_local_ipv4s():
+    """Return the set of IPv4 addresses currently assigned to this host
+    (loopback excluded). Used to decide whether a stored settings.server_ip
+    still belongs to the box or has gone stale after a subnet move.
+    Best-effort — returns an empty set if it can't enumerate (network down,
+    `hostname` missing). Mirrors start.sh's `hostname -I`."""
+    ips = set()
+    try:
+        import subprocess as _sp
+        out = _sp.run(['hostname', '-I'], capture_output=True, text=True, timeout=3)
+        for tok in (out.stdout or '').split():
+            tok = tok.strip()
+            # hostname -I emits both IPv4 and IPv6 — keep dotted-quads only.
+            if tok and tok.count('.') == 3 and not tok.startswith('127.'):
+                ips.add(tok)
+    except Exception:
+        pass
+    return ips
+
+
+def _primary_local_ipv4():
+    """Return the source IPv4 the kernel would use for default-route egress
+    (i.e. the address operators reach the box on), or '' if undetectable.
+    Uses a UDP-socket connect trick: no packets are sent, it just consults
+    the routing table, so it works even with no internet access."""
+    try:
+        import socket as _sock
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        try:
+            s.connect(('1.1.1.1', 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and ip.count('.') == 3 and not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    return ''
+
+
+def _refresh_stale_private_server_ip(plog=None):
+    """v0.9.44: refresh settings.server_ip when the stored *private* IP no
+    longer belongs to any of this host's interfaces — i.e. the VM was moved
+    to a different subnet after install (issue #36, takwerx/infra-TAK).
+
+    BACKGROUND: start.sh writes server_ip once at fresh-install time and
+    `Update Now` never re-runs start.sh, so a subnet move leaves a stale IP
+    "tattooed" into the Caddy / domain-install page. Field report #36: a box
+    was installed on a 172.24.x.y subnet then moved to a 10.x.y.z subnet; the
+    console kept advertising the old 172.24 address as the DNS A-record target
+    operators were told to point their domain at.
+
+    Gating (all must hold to rewrite):
+      - current settings.server_ip is RFC 1918 private. We NEVER touch a
+        public IP: on cloud VMs that's deliberately the metadata public IP
+        (see _patch_settings_server_ip_prefer_cloud_public) while
+        `hostname -I` there returns the private interface — refreshing would
+        undo that correction.
+      - we can enumerate at least one current local IPv4 (network is up) —
+        otherwise a transient boot-time outage must not blank a good IP.
+      - the stored IP is NOT among the host's current IPv4 addresses. Proof
+        it's stale, not merely a non-primary NIC the operator chose on
+        purpose (those still appear in `hostname -I`).
+      - we can determine a new *private* primary IP to replace it with.
+
+    Unlike the v0.9.29 cloud-public migration this is deliberately NOT
+    one-shot: a box can move subnets repeatedly, so it re-evaluates every
+    boot but only writes (and logs) when the IP actually changed. Pairs with
+    the v0.9.44 daily console-restart timer so a box that moves while running
+    self-heals within a day without an operator restart. Records an audit
+    trail in settings.json under `server_ip_stale_refresh`.
+
+    Safe to call on every console boot from `_startup_migrations`.
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        s = load_settings()
+        cur_ip = (s.get('server_ip') or '').strip()
+        # Only ever refresh a private IP — public IPs are cloud-managed.
+        if not cur_ip or not _ip_is_rfc1918_private(cur_ip):
+            return False
+        local_ips = _list_local_ipv4s()
+        if not local_ips:
+            return False  # network not up — don't blank a good IP on a fluke
+        if cur_ip in local_ips:
+            return False  # still a live address on this box — not stale
+        # Stale: stored IP is gone from every interface. Pick the new primary,
+        # falling back to the first private address `hostname -I` reports.
+        new_ip = _primary_local_ipv4()
+        if not (new_ip and _ip_is_rfc1918_private(new_ip)):
+            new_ip = next((ip for ip in sorted(local_ips)
+                           if _ip_is_rfc1918_private(ip)), '')
+        if not new_ip or new_ip == cur_ip:
+            return False
+        plog(
+            f"  server_ip stale-refresh: stored {cur_ip} is not on any local "
+            f"interface (have {sorted(local_ips)}) — VM appears to have moved "
+            f"subnets; updating to {new_ip}"
+        )
+        s['server_ip'] = new_ip
+        s['server_ip_stale_refresh'] = {
+            'applied_at': datetime.utcnow().isoformat() + 'Z',
+            'from': cur_ip,
+            'to': new_ip,
+            'local_ips': sorted(local_ips),
+            'version': VERSION,
+        }
+        save_settings(s)
+        plog(
+            f"  server_ip stale-refresh: applied. {cur_ip} → {new_ip}. "
+            f"DNS A-records / Caddy page now advertise the current address. "
+            f"If you set the old IP on purpose, paste it back in "
+            f"Settings → Server IP."
+        )
+        return True
+    except Exception as e:
+        try:
+            plog(f"  server_ip stale-refresh: error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
 def _ensure_takwerx_system_user(plog=None):
     """v0.9.31: ensure the `takwerx` Linux system user exists.
 
@@ -52108,6 +52232,23 @@ def _startup_migrations():
             )
         except Exception as ip_fix_err:
             print(f"Startup migration: server_ip auto-correct error (non-fatal): {ip_fix_err}")
+
+        # v0.9.44 — refresh settings.server_ip when the stored PRIVATE IP no
+        # longer belongs to any local interface (the VM was moved to a
+        # different subnet after install). start.sh writes server_ip once and
+        # Update Now never re-runs it, so a subnet move "tattoos" the old IP
+        # into the Caddy / domain-install page (issue #36: installed on
+        # 172.24.x.y, moved to 10.x.y.z, console kept advertising 172.24 as
+        # the DNS A-record target). NOT one-shot — a box can move repeatedly —
+        # but only writes when the IP actually changed. Only touches private
+        # IPs, so it never undoes the v0.9.29 cloud-public correction above.
+        # See `_refresh_stale_private_server_ip`.
+        try:
+            _refresh_stale_private_server_ip(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ip_stale_err:
+            print(f"Startup migration: server_ip stale-refresh error (non-fatal): {ip_stale_err}")
 
         # v0.9.31 — self-heal mediamtx fail-loop on boxes where the takwerx
         # system user is missing entirely. v0.9.29 hardening added
