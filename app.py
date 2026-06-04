@@ -47015,6 +47015,13 @@ def _kernel_patch_job_state():
         'unit_state': str (e.g. 'active/running', 'inactive/dead', 'failed/failed')
       }
 
+    v0.9.44: `done`/`error` are now derived from the job's log markers and the
+    `/var/run/reboot-required` flag rather than the systemd-default Result value,
+    because a *successful* transient unit is garbage-collected within seconds of
+    completing — even while the box is still up — which used to leave the UI stuck
+    on "in progress". `reboot_required` is also returned. The reboot flag auto-clears
+    after the reboot, so it subsumes the v0.9.32 post-reboot guard below.
+
     v0.9.32 fix: post-reboot the transient unit `infratak-kernel-patch.service`
     is gone from systemd's memory (transient units do not survive reboot).
     But `systemctl show -p Result` on a non-existent unit returns
@@ -47051,15 +47058,26 @@ def _kernel_patch_job_state():
         except Exception:
             log_tail = ''
 
-    # Layer 1: gate on LoadState=loaded.
-    # Transient unit gone (post-reboot, never-spawned, masked, etc.) →
-    # don't infer done/err from the default Result property value.
+    # v0.9.44: a pending reboot (new kernel staged) is the authoritative "you
+    # should reboot" signal — and the kernel auto-clears /var/run/reboot-required
+    # after the reboot, so it also ends the post-reboot banner loop the old
+    # LoadState gate was guarding against (more directly than the apt-list probe).
+    reboot_required = os.path.exists('/var/run/reboot-required')
+
+    # Transient unit gone. systemd garbage-collects a *successful* transient unit
+    # within seconds of completion — even while the box is still up — so the old
+    # "load != loaded => done=False" gate left the UI stuck on "in progress" with
+    # the DONE log showing. Read the job's own log markers + the reboot flag instead.
     if load != 'loaded':
+        last_done = log_tail.rfind('=== DONE')
+        last_fatal = log_tail.rfind('FATAL:')
+        completed_ok = last_done != -1 and last_done > last_fatal
         return {
             'running': False,
             'pid': None,
-            'done': False,
-            'error': False,
+            'done': bool(completed_ok and reboot_required),
+            'error': bool(last_fatal != -1 and last_fatal > last_done),
+            'reboot_required': reboot_required,
             'log_tail': log_tail,
             'log_present': log_present,
             'unit_state': f"not-loaded/{load or 'unknown'}",
@@ -47069,37 +47087,11 @@ def _kernel_patch_job_state():
     # signal — don't depend on log_tail content (log may be rotated, wiped,
     # or empty if the unit died before writing anything). The log-tail
     # banner string is just operator-visible confirmation.
-    done = (not running) and (result == 'success')
+    # Done only if it finished successfully AND a reboot is actually pending —
+    # the "done" banner's whole job is to say "reboot to boot the new kernel",
+    # so if reboot-required is gone (already rebooted) there's nothing to assert.
+    done = (not running) and (result == 'success') and reboot_required
     err = (not running) and (active == 'failed' or (result not in ('', 'success')))
-
-    # Layer 2: cross-check `done` against the apt-list status. If no kernel
-    # update is pending on the box, there is nothing for the "reboot required"
-    # banner to say — downgrade done→False so the JS falls through to the
-    # apt-list check and hides the banner. Cheap: reuses the cached
-    # /api/system/kernel-patch-status response when fresh.
-    if done:
-        try:
-            import time as _kpat
-            _now = _kpat.time()
-            _cache = _kernel_patch_cache.get('data') if _kernel_patch_cache.get('data') else None
-            if _cache and (_now - _kernel_patch_cache.get('ts', 0)) < 60:
-                _patched = bool(_cache.get('patched'))
-            else:
-                _r = subprocess.run(
-                    'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
-                    shell=True, capture_output=True, text=True, timeout=15
-                )
-                _up = (_r.stdout or '').strip()
-                _patched = (_up.isdigit() and int(_up) == 0)
-            if _patched:
-                # No kernel update pending → there is nothing to reboot for.
-                # Don't keep firing the "Reboot now" banner.
-                done = False
-        except Exception:
-            # Best-effort cross-check; if the apt probe blows up, fall back
-            # to the prior behavior (Layer 1 already protects against the
-            # post-reboot default-Result-success case).
-            pass
 
     # If the job clearly completed (success or failure), bust the kernel
     # patch status cache so the post-reboot banner check picks up reality.
@@ -47110,6 +47102,7 @@ def _kernel_patch_job_state():
         'pid': (pid or None) if running else None,
         'done': done,
         'error': err,
+        'reboot_required': reboot_required,
         'log_tail': log_tail,
         'log_present': log_present,
         'unit_state': f"{active or 'unknown'}/{sub or 'unknown'}" + (f" ({result})" if result else ''),
