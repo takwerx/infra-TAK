@@ -51824,6 +51824,101 @@ def _ensure_console_restart_timer():
         return f'console-restart timer warning: {str(_e)[:120]}'
 
 
+def _selfheal_takserver_half_configured(plog=None):
+    """v0.9.44: silently clear a `takserver` dpkg 'half-configured' state WITHOUT
+    running the .deb postinstall.
+
+    The official TAK Server .deb postinstall is non-idempotent: it consumes then
+    `rm -rf`s /opt/tak/{config,messaging,API} (shipped by the .deb), so once a run
+    fails after deleting them, every `dpkg --configure` retry dies at the first
+    `chmod /opt/tak/config/*.sh` and the package stays `half-configured` forever.
+    That flag blocks ALL apt operations (OS/security patches, the kernel-patch job)
+    even though TAK Server itself keeps running fine.
+
+    We must NOT complete the real postinstall to clear it: its tail runs
+    `setupDefaultPassword.sh` + `takserver-setup-db.sh`, which would reset the DB
+    password and re-run DB setup on a LIVE server. Instead, only when takserver is
+    half-configured AND its service is active, neutralize the postinst (no-op),
+    `dpkg --configure` (flips it to install-ok-installed), then ALWAYS restore the
+    real postinst. The running TAK Server is never touched; apt is unblocked.
+
+    Idempotent: a no-op unless takserver is half-configured with a live service.
+    Field-validated on test6 (2026-06-04)."""
+    import shutil
+
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    try:
+        r = subprocess.run(['dpkg-query', '-W', '-f=${Status}', 'takserver'],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return
+    if r.returncode != 0 or (r.stdout or '').strip() != 'install ok half-configured':
+        return  # not installed, or not wedged — nothing to do
+
+    # Only heal a box whose TAK Server is actually running fine; a stopped/broken
+    # install is a real problem we must not paper over.
+    active = False
+    for unit in ('takserver', 'takserver-noplugins'):
+        try:
+            a = subprocess.run(['systemctl', 'is-active', unit],
+                               capture_output=True, text=True, timeout=5)
+            if (a.stdout or '').strip() == 'active':
+                active = True
+                break
+        except Exception:
+            pass
+    if not active:
+        _log('takserver self-heal: half-configured but service not active — leaving for manual review.')
+        return
+
+    postinst = '/var/lib/dpkg/info/takserver.postinst'
+    if not os.path.isfile(postinst):
+        return
+    backup = postinst + '.infratak-selfheal-bak'
+    try:
+        shutil.copy2(postinst, backup)
+    except Exception as e:
+        _log(f'takserver self-heal: could not back up postinst ({e}) — skipping.')
+        return
+
+    try:
+        with open(postinst, 'w') as f:
+            f.write('#!/bin/sh\nexit 0\n')
+        os.chmod(postinst, 0o755)
+        subprocess.run(['dpkg', '--configure', 'takserver'],
+                       capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        _log(f'takserver self-heal: dpkg --configure error ({e}).')
+    finally:
+        # ALWAYS restore the real postinst, no matter what happened above.
+        try:
+            shutil.move(backup, postinst)
+        except Exception:
+            try:
+                if os.path.exists(backup):
+                    shutil.copy2(backup, postinst)
+                    os.remove(backup)
+            except Exception:
+                pass
+
+    try:
+        v = subprocess.run(['dpkg-query', '-W', '-f=${Status}', 'takserver'],
+                           capture_output=True, text=True, timeout=10)
+        st = (v.stdout or '').strip()
+        if st == 'install ok installed':
+            _log('takserver self-heal: cleared dpkg half-configured state '
+                 '(TAK Server untouched, apt unblocked).')
+        else:
+            _log(f'takserver self-heal: state still "{st}" after configure — manual review.')
+    except Exception:
+        pass
+
+
 def _startup_migrations():
     try:
         s = load_settings()
@@ -52265,6 +52360,18 @@ def _startup_migrations():
             )
         except Exception as ip_stale_err:
             print(f"Startup migration: server_ip stale-refresh error (non-fatal): {ip_stale_err}")
+
+        # v0.9.44 — silently clear a `takserver` dpkg half-configured state left by the
+        # non-idempotent 5.7 .deb postinstall. TAK Server keeps running fine, but the
+        # half-configured flag blocks ALL apt operations (OS/security patches, the kernel
+        # patch). We do NOT run the real postinstall to clear it — its tail re-runs DB
+        # setup + resets the DB password on a live server. See `_selfheal_takserver_half_configured`.
+        try:
+            _selfheal_takserver_half_configured(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as tak_heal_err:
+            print(f"Startup migration: takserver self-heal error (non-fatal): {tak_heal_err}")
 
         # v0.9.31 — self-heal mediamtx fail-loop on boxes where the takwerx
         # system user is missing entirely. v0.9.29 hardening added
