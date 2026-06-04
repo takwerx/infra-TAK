@@ -12087,16 +12087,18 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # Step D: Write renewal script
     renewal_script = f'''#!/bin/bash
-# TAK Server Let's Encrypt Certificate Renewal
-# Triggered monthly by systemd timer. Rebuilds TAK JKS from Caddy cert when
-# within 35 days of expiry, then restarts TAK Server.
+# TAK Server Let's Encrypt Certificate Renewal (v0.9.44)
+# Re-imports Caddy's CURRENT cert into TAK's JKS whenever the keystore cert no longer
+# matches Caddy's (Caddy auto-renews on its own schedule), then restarts TAK Server.
+# Fixed from the old logic that gated on Caddy's days-left — which meant TAK never
+# picked up Caddy's renewed cert and its keystore cert silently expired.
 set -euo pipefail
 
 TAK_DOMAIN="{takserver_host}"
 CERT_DIR="{cert_dir}"
 CERT_CRT="$CERT_DIR/$TAK_DOMAIN.crt"
 CERT_KEY="$CERT_DIR/$TAK_DOMAIN.key"
-RENEW_WINDOW_DAYS=35
+JKS="/opt/tak/certs/files/takserver-le.jks"
 LOG_FILE="/var/log/takserver-cert-renewal.log"
 
 log() {{ echo "[$(date -Is)] $*" | tee -a "$LOG_FILE"; }}
@@ -12106,23 +12108,22 @@ if [ ! -f "$CERT_CRT" ] || [ ! -f "$CERT_KEY" ]; then
   exit 1
 fi
 
-END_DATE_RAW=$(openssl x509 -enddate -noout -in "$CERT_CRT" | cut -d= -f2)
-END_EPOCH=$(date -d "$END_DATE_RAW" +%s)
-NOW_EPOCH=$(date +%s)
-DAYS_LEFT=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
-log "Certificate days remaining for $TAK_DOMAIN: ${{DAYS_LEFT}} day(s)"
+# v0.9.44: sync on cert CONTENT, not Caddy's days-left. Caddy auto-renews on its own,
+# so re-import whenever TAK's keystore cert differs from Caddy's current cert (or the
+# keystore is missing) — otherwise the keystore keeps the old cert and silently expires.
+CADDY_FP=$(openssl x509 -in "$CERT_CRT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+TAK_FP=""
+if [ -f "$JKS" ]; then
+  TAK_FP=$(keytool -list -rfc -keystore "$JKS" -storepass {shlex.quote(cert_pass)} 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+fi
 
-if [ "$DAYS_LEFT" -gt "$RENEW_WINDOW_DAYS" ]; then
-  log "Outside renewal window (${{RENEW_WINDOW_DAYS}}d). No action taken."
+if [ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ]; then
+  log "TAK keystore already matches Caddy's current cert. No action."
   exit 0
 fi
 
-log "Within renewal window. Triggering Caddy reload and refreshing TAK keystore..."
-if ! systemctl reload caddy; then
-  log "Caddy reload failed; restarting..."
-  systemctl restart caddy
-fi
-sleep 15
+log "TAK keystore differs from Caddy's current cert (Caddy renewed) — refreshing keystore..."
+rm -f /tmp/takserver-le.p12 /tmp/takserver-le.jks
 
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" \\
   -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
@@ -12157,7 +12158,7 @@ Description=TAK Server Certificate Renewal Timer
 Requires=takserver-cert-renewal.service
 
 [Timer]
-OnCalendar=monthly
+OnCalendar=daily
 Persistent=true
 
 [Install]
@@ -12168,7 +12169,7 @@ WantedBy=timers.target
     subprocess.run(
         'systemctl daemon-reload && systemctl enable --now takserver-cert-renewal.timer 2>/dev/null; true',
         shell=True, capture_output=True)
-    log_fn("  ✓ Auto-renewal timer enabled (monthly)")
+    log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
 
     # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
     log_fn("  Starting TAK Server with LE cert on port 8446...")
@@ -12176,6 +12177,61 @@ WantedBy=timers.target
     log_fn("  ✓ TAK Server started")
     log_fn("✓ Port 8446 now serving Let's Encrypt cert — ready for TAK clients")
     return True
+
+
+def _selfheal_takserver_le_cert(plog=None):
+    """v0.9.44: re-sync TAK Server's 8446 Let's Encrypt cert when it has drifted from
+    Caddy's current cert.
+
+    Caddy auto-renews the LE cert on its own ~60-day cycle. The old renewal logic only
+    re-imported into TAK's keystore when CADDY's cert was near expiry — so once Caddy
+    renewed (resetting to ~90 days), the script said "no action" and TAK's keystore kept
+    the OLD cert, which then silently expired. CloudTAK login hits TAK's 8446 enrollment
+    API, so an expired keystore cert breaks login with CERT_HAS_EXPIRED (field: test6,
+    2026-06-04 — every TAK CA/admin cert valid to 2028, but the 8446 LE cert lapsed).
+
+    Here we compare the cert in TAK's keystore against Caddy's current cert and, if they
+    differ or the keystore cert is expired/missing, re-run install_le_cert_on_8446() to
+    repair. Runs daily via the console-restart timer; a no-op (no TAK restart) when the
+    keystore already matches Caddy."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+    try:
+        if not os.path.exists('/opt/tak/renew-letsencrypt.sh'):
+            return  # box never had the LE-on-8446 setup
+        settings = load_settings()
+        host = _get_service_domain(settings, 'takserver')
+        if not host:
+            return
+        cert_crt = (f'/var/lib/caddy/.local/share/caddy/certificates/'
+                    f'acme-v02.api.letsencrypt.org-directory/{host}/{host}.crt')
+        if not os.path.exists(cert_crt):
+            return  # no Caddy LE cert for this host — nothing to sync from
+        jks = '/opt/tak/certs/files/takserver-le.jks'
+        cert_pass = _get_tak_cert_password(settings)
+        caddy_fp = subprocess.run(
+            f'openssl x509 -in {shlex.quote(cert_crt)} -noout -fingerprint -sha256 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=15).stdout.strip()
+        tak_fp = ''
+        tak_expired = True
+        if os.path.exists(jks):
+            kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
+            tak_fp = subprocess.run(
+                f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
+            tak_expired = subprocess.run(
+                f'{kt} | openssl x509 -checkend 0 -noout',
+                shell=True, capture_output=True, timeout=20).returncode != 0
+        if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
+            return  # keystore already matches Caddy and is valid — nothing to do
+        _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
+             '— re-syncing and restarting TAK Server...')
+        install_le_cert_on_8446(host, _log, wait_for_cert=False)
+    except Exception as e:
+        _log(f'takserver LE-cert self-heal error (non-fatal): {e}')
 
 
 def run_caddy_deploy(domain):
@@ -52365,6 +52421,17 @@ def _startup_migrations():
             )
         except Exception as tak_heal_err:
             print(f"Startup migration: takserver self-heal error (non-fatal): {tak_heal_err}")
+
+        # v0.9.44 — re-sync TAK Server's 8446 Let's Encrypt cert if it drifted from
+        # Caddy's current cert. Caddy auto-renews independently; the keystore used to
+        # keep the OLD cert and silently expire, breaking CloudTAK login with
+        # CERT_HAS_EXPIRED. No-op when already in sync. See `_selfheal_takserver_le_cert`.
+        try:
+            _selfheal_takserver_le_cert(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as le_heal_err:
+            print(f"Startup migration: takserver LE-cert self-heal error (non-fatal): {le_heal_err}")
 
         # v0.9.31 — self-heal mediamtx fail-loop on boxes where the takwerx
         # system user is missing entirely. v0.9.29 hardening added
