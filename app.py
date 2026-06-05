@@ -45374,6 +45374,35 @@ def takserver_rollback_log_api():
     })
 
 
+def _verify_takserver_dpkg_ok(ulog):
+    """v0.9.44: return True iff `takserver` is fully configured (`install ok installed`).
+
+    A .deb postinstall can fail and leave the package `half-configured` while the rest of
+    the upgrade looked fine — field: test6 sat half-configured for 3 weeks while the update
+    reported done. Callers must NOT report success when this returns False. The console
+    also auto-repairs a half-configured state on its next restart via
+    _selfheal_takserver_half_configured, but we surface the failure immediately so it
+    isn't silently missed."""
+    try:
+        r = subprocess.run(['dpkg-query', '-W', '-f=${Status}', 'takserver'],
+                           capture_output=True, text=True, timeout=10)
+        state = (r.stdout or '').strip()
+    except Exception as e:
+        ulog(f"  ⚠ Could not verify takserver dpkg state ({e}) — assuming OK")
+        return True
+    if r.returncode != 0 or not state:
+        ulog("  ⚠ takserver not found in dpkg — skipping state verification")
+        return True
+    if state == 'install ok installed':
+        ulog("✓ takserver dpkg state verified: install ok installed")
+        return True
+    ulog(f"✗ Upgrade left takserver dpkg state '{state}' — NOT fully configured.")
+    ulog("  Reporting failure so it isn't missed. The console auto-repairs a half-configured")
+    ulog("  state on its next restart; otherwise re-run the update once the postinstall")
+    ulog("  cause is resolved.")
+    return False
+
+
 def run_takserver_upgrade(pkg_path):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -45470,6 +45499,9 @@ def run_takserver_upgrade(pkg_path):
                 ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
         generate_caddyfile(settings)
         subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        if not _verify_takserver_dpkg_ok(ulog):
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
         ulog("TAK Server update complete.")
         upgrade_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -45661,6 +45693,9 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         generate_caddyfile(settings)
         subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
 
+        if not _verify_takserver_dpkg_ok(ulog):
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
         ulog("")
         ulog("=" * 50)
         ulog("\u2713 Two-server update complete")
