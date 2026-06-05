@@ -47093,6 +47093,21 @@ def _kernel_patch_start_job():
     return (True, f"started (unit {_KERNEL_PATCH_UNIT}, pid {new_pid or 'pending'})", new_pid or None)
 
 
+def _kernel_reboot_pending():
+    """v0.9.44: True when the running kernel isn't the newest installed one — a more
+    reliable "reboot needed" signal than /var/run/reboot-required, which can be cleared
+    (e.g. a reboot that didn't land the new kernel, or a notify hook that never fired)
+    while a reboot is still required to activate a freshly-installed kernel."""
+    try:
+        running = subprocess.run(['uname', '-r'], capture_output=True, text=True, timeout=5).stdout.strip()
+        newest = subprocess.run(
+            "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1",
+            shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        return bool(running and newest and running != newest)
+    except Exception:
+        return False
+
+
 def _kernel_patch_job_state():
     """Return current state of the background kernel-patch transient unit.
     Returns a dict suitable for jsonify:
@@ -47153,7 +47168,7 @@ def _kernel_patch_job_state():
     # should reboot" signal — and the kernel auto-clears /var/run/reboot-required
     # after the reboot, so it also ends the post-reboot banner loop the old
     # LoadState gate was guarding against (more directly than the apt-list probe).
-    reboot_required = os.path.exists('/var/run/reboot-required')
+    reboot_required = os.path.exists('/var/run/reboot-required') or _kernel_reboot_pending()
 
     # Transient unit gone. systemd garbage-collects a *successful* transient unit
     # within seconds of completion — even while the box is still up — so the old
