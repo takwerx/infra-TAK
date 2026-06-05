@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.44-alpha"
+VERSION = "0.9.45-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -29904,9 +29904,24 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
             shell=True, capture_output=True, text=True, timeout=15
         )
         if 'EXIT=0' not in (_probe.stdout or ''):
-            plog(f"  proactive routing: cannot reach https://{fqdn} from LDAP container — skipping (Caddy/DNS not ready; retry later)")
-            return
-        plog(f"  proactive routing: all preconditions met (TAK installed, FQDN configured, Caddy reachable) — migrating outpost to FQDN")
+            # The pre-rewrite container resolves <fqdn> to the box's PUBLIC IP, so this probe times
+            # out on every box behind hairpin-broken NAT (home / Hyper-V / Starlink) — even though
+            # the migration is about to add `extra_hosts: <fqdn>:host-gateway`, which makes the
+            # outpost reach Caddy on the host's docker-bridge gateway instead of the public IP.
+            # The OLD code aborted here, permanently stranding exactly those boxes on internal
+            # (spiral-prone) routing — the field cause of webadmin 8446 login failing on no-hairpin
+            # boxes that DO have a public IP + port forwarding. Don't abort on the hairpin path: if
+            # host Caddy is up, migrate anyway and let the post-recreate websocket validation +
+            # automatic rollback (below) be the real safety net for boxes where FQDN truly won't work.
+            _caddy_up = subprocess.run('systemctl is-active caddy 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=10)
+            if (_caddy_up.stdout or '').strip() != 'active':
+                plog(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
+                return
+            plog(f"  proactive routing: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — "
+                 f"migrating anyway; outpost will reach Caddy via host-gateway (post-recreate validation confirms or rolls back)")
+        else:
+            plog(f"  proactive routing: all preconditions met (TAK installed, FQDN configured, Caddy reachable) — migrating outpost to FQDN")
 
         import time as _t
         backup_path = f'{compose_path}.bak.proactive-routing.{int(_t.time())}'
@@ -39422,9 +39437,22 @@ def _ensure_ldapsearch():
         return True
     try:
         if os.path.exists('/etc/debian_version'):
-            subprocess.run(
-                'DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y ldap-utils 2>&1',
-                shell=True, capture_output=True, timeout=120)
+            # ldap-utils is tiny; try a direct install first (no slow update), then
+            # update+install. Retry to ride out a transient dpkg/apt lock held by
+            # unattended-upgrades during the deploy window — the field cause of the
+            # "ldapsearch unavailable" verdict on fresh boxes, which then forced the
+            # webadmin bind check to inconclusive→FAIL and a false-red "NOT READY".
+            for attempt in range(3):
+                subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get install -y ldap-utils 2>&1',
+                    shell=True, capture_output=True, timeout=120)
+                if shutil.which('ldapsearch'):
+                    return True
+                subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1',
+                    shell=True, capture_output=True, timeout=120)
+                if shutil.which('ldapsearch'):
+                    return True
+                if attempt < 2:
+                    time.sleep(10)  # let a held apt/dpkg lock clear, then retry
         else:
             subprocess.run('dnf install -y openldap-clients 2>/dev/null || yum install -y openldap-clients 2>/dev/null',
                 shell=True, capture_output=True, timeout=120)
@@ -42226,6 +42254,16 @@ def takserver_connect_ldap():
     diag.append('Removed flat-file webadmin shadow if present (8446 → LDAP)')
     ok, msg = _apply_ldap_to_coreconfig()
     diag.append(f'CoreConfig: {msg}')
+    # Run the proactive FQDN routing migration directly from the manual repair button, BEFORE the
+    # bind verification below. Previously this only fired from a full deploy or the webadmin-sync
+    # 'inconclusive' branch — so on a box stranded on internal routing (hard 'fail' verdict) the
+    # operator's "Resync LDAP" click never actually moved the outpost off the spiral-prone path.
+    # The migration is self-contained (recreates only the ldap container, validates the websocket
+    # connection, auto-rolls-back if FQDN isn't viable), so it's safe to invoke here. Visible output.
+    try:
+        _ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()))
+    except Exception as _e:
+        diag.append(f'Proactive routing: skipped ({str(_e)[:80]})')
     # Diagnostic: compare passwords and check outpost health
     try:
         settings = load_settings()
@@ -42245,18 +42283,36 @@ def takserver_connect_ldap():
             ok_ssh, out = _ssh_probe(ak_cfg['remote'], 'docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null', timeout=10)
             ldap_status = (out or '').strip()
             diag.append(f'LDAP outpost: {ldap_status or "not running"}')
-            ok_ssh2, out2 = _ssh_probe(ak_cfg['remote'], 'docker logs authentik-ldap-1 --since 30s 2>&1 | tail -5', timeout=15)
+            ok_ssh2, out2 = _ssh_probe(ak_cfg['remote'], 'docker logs authentik-ldap-1 --since 60s 2>&1 | tail -25', timeout=15)
             outpost_tail = (out2 or '').strip()
         else:
             r = subprocess.run('docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
                 shell=True, capture_output=True, text=True, timeout=10)
             ldap_status = (r.stdout or '').strip()
             diag.append(f'LDAP outpost: {ldap_status or "not running"}')
-            r = subprocess.run('docker logs authentik-ldap-1 --since 30s 2>&1 | tail -5',
+            r = subprocess.run('docker logs authentik-ldap-1 --since 60s 2>&1 | tail -25',
                 shell=True, capture_output=True, text=True, timeout=10)
             outpost_tail = (r.stdout or '').strip()
         if outpost_tail:
-            diag.append(f'Outpost log: {outpost_tail[:200]}')
+            # Classify the bind OUTCOME up front — the result line was previously cut off by the
+            # 200-char truncation, which hid whether the failure was a flow spiral (slow-disk /
+            # recursion), a real password mismatch, or actually a success that verification missed.
+            _low = outpost_tail.lower()
+            if 'exceeded stage recursion depth' in _low or 'nil pointer dereference' in _low:
+                diag.append('Outpost verdict: FLOW SPIRAL (stage recursion) — bind-flow recursion, NOT a bad password')
+            elif 'invalid credentials' in _low or 'access denied' in _low or 'insufficient access' in _low:
+                diag.append('Outpost verdict: INVALID CREDENTIALS — password mismatch (re-set webadmin pw + Sync webadmin)')
+            elif 'authenticated' in _low:
+                diag.append('Outpost verdict: AUTHENTICATED — bind succeeded (verification may be falsely red)')
+            elif 'failed to execute flow' in _low or 'ak-stage-flow-error' in _low or 'flow error' in _low:
+                diag.append('Outpost verdict: FLOW ERROR — bind flow could not complete (check ldap-* flow bindings)')
+            # Surface the outcome-bearing lines (not just the last 5), and raise the cap so the
+            # decisive line is never cut. Fall back to the raw tail if no marker matched.
+            _markers = ('authenticated', 'invalid credentials', 'access denied', 'recursion',
+                        'flow error', 'failed to execute flow', 'ak-stage-flow-error', 'bind request')
+            _hot = [ln for ln in outpost_tail.splitlines() if any(m in ln.lower() for m in _markers)]
+            _show = '\n'.join(_hot[-8:]) if _hot else outpost_tail
+            diag.append(f'Outpost log: {_show[:800]}')
     except Exception as e:
         diag.append(f'Diagnostic error: {str(e)[:100]}')
     # Post-fix verification signals (best-effort)
@@ -42269,30 +42325,44 @@ def takserver_connect_ldap():
         ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD') or ''
         verify['service_bind_seen'] = bool(_test_ldap_bind(ldap_pass)) if ldap_pass else False
         wap = (settings.get('webadmin_password') or '').strip()
-        verify['webadmin_bind_seen'] = bool(_test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', wap)) if wap else False
-        verify['ready'] = all([
+        # Tri-state verdict ('ok' | 'fail' | 'inconclusive'). The boolean wrapper used to
+        # conflate 'fail' and 'inconclusive' as False, so a box where ldapsearch couldn't be
+        # installed (apt lock / no network during deploy) ALWAYS reported webadmin-bind=FAIL and
+        # a scary "NOT READY (verification failed)" — even when the bind actually worked. We now
+        # distinguish a CONFIRMED failure (real problem) from "could not verify" (probably fine).
+        wa_verdict = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', wap) if wap else 'fail'
+        verify['webadmin_bind'] = wa_verdict
+        verify['webadmin_bind_seen'] = (wa_verdict == 'ok')
+        core_ok = all([
             verify['coreconfig_has_ldap'],
             verify['webadmin_exists_in_authentik'],
             verify['webadmin_superuser'],
-            verify['webadmin_bind_seen'],
         ])
+        verify['ready'] = bool(core_ok and wa_verdict == 'ok')
+        verify['unverified'] = bool(core_ok and wa_verdict == 'inconclusive')
         diag.append(
             "Verification: coreconfig={} webadmin={} superuser={} webadmin-bind={} ready={}".format(
                 'OK' if verify['coreconfig_has_ldap'] else 'FAIL',
                 'OK' if verify['webadmin_exists_in_authentik'] else 'FAIL',
                 'OK' if verify['webadmin_superuser'] else 'FAIL',
-                'OK' if verify['webadmin_bind_seen'] else 'FAIL',
-                'YES' if verify['ready'] else 'NO',
+                {'ok': 'OK', 'fail': 'FAIL', 'inconclusive': 'UNVERIFIED'}.get(wa_verdict, 'FAIL'),
+                'YES' if verify['ready'] else ('UNVERIFIED' if verify['unverified'] else 'NO'),
             )
         )
     except Exception as e:
         verify = {'ready': False, 'error': str(e)[:120]}
         diag.append(f'Verification: ERROR ({str(e)[:80]})')
-    overall_ok = bool(ok and verify.get('ready', True))
-    if not overall_ok:
-        diag.append('Final: NOT READY (verification failed)')
+    # An 'inconclusive' webadmin bind (core config all good but ldapsearch unavailable) is NOT a
+    # failure — report success with a clear UNVERIFIED caveat and the manual 8446 test as the next
+    # step, instead of a false-red dead end. Only a CONFIRMED 'fail' blocks success.
+    if verify.get('unverified'):
+        overall_ok = bool(ok)
+        diag.append('Final: READY (webadmin bind UNVERIFIED — ldapsearch unavailable; confirm by logging in at '
+                    ':8446. If 8446 rejects the password, run: docker logs authentik-ldap-1 --since 2m — a '
+                    '"stage recursion" line means the bind-flow spiral, "invalid credentials" means a password mismatch)')
     else:
-        diag.append('Final: READY')
+        overall_ok = bool(ok and verify.get('ready', True))
+        diag.append('Final: READY' if overall_ok else 'Final: NOT READY (verification failed)')
     return jsonify({'success': overall_ok, 'message': ' | '.join(diag), 'verification': verify})
 
 
@@ -50115,7 +50185,7 @@ function takPurgeFailed(){
 }
 </script>
 {% elif deploy_done %}
-<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
+<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span id="deploy-cert-password-inline" style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
 {% endif %}
 {% elif tak.installed %}
 {% if show_connect_ldap %}
