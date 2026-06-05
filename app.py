@@ -29768,14 +29768,30 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             return
         plog(f"  routing repair: spiral CONFIRMED on http://authentik-server-1:9000 — proceeding to migrate to FQDN")
 
-        _probe = subprocess.run(
-            f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
-            shell=True, capture_output=True, text=True, timeout=15
-        )
-        if 'EXIT=0' not in (_probe.stdout or ''):
-            plog(f"  routing repair: cannot reach https://{fqdn} from LDAP container — skipping (Caddy not ready or DNS issue; box would end up worse)")
-            return
-        plog(f"  routing repair: caddy probe https://{fqdn}/-/health/live/ OK — migrating routing")
+        try:
+            _probe = subprocess.run(
+                f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
+                shell=True, capture_output=True, text=True, timeout=15
+            )
+            _direct_ok = 'EXIT=0' in (_probe.stdout or '')
+        except subprocess.TimeoutExpired:
+            # See _ensure_authentik_ldap_outpost_on_fqdn: a hairpin box hangs `docker exec wget` on
+            # its own public IP until the 15s subprocess timeout fires. That's the hairpin signal,
+            # not a fatal error — treat as a failed direct probe and migrate via host-gateway.
+            _direct_ok = False
+        if not _direct_ok:
+            # Spiral is already CONFIRMED here, so we MUST act. The migration adds
+            # extra_hosts:<fqdn>:host-gateway so the outpost reaches Caddy without the public-IP
+            # hairpin; if host Caddy is up, proceed and let the post-recreate validation + rollback
+            # below decide. Only skip if Caddy itself is down (box would genuinely end up worse).
+            _caddy_up = subprocess.run('systemctl is-active caddy 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=10)
+            if (_caddy_up.stdout or '').strip() != 'active':
+                plog(f"  routing repair: FQDN unreachable from container AND host Caddy not active — skipping (box would end up worse)")
+                return
+            plog(f"  routing repair: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — migrating via host-gateway")
+        else:
+            plog(f"  routing repair: caddy probe https://{fqdn}/-/health/live/ OK — migrating routing")
 
         import time as _t
         backup_path = f'{compose_path}.bak.routing-repair.{int(_t.time())}'
@@ -29899,11 +29915,21 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
             plog("  proactive routing: outpost already on FQDN — skipping (already correct)")
             return
 
-        _probe = subprocess.run(
-            f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
-            shell=True, capture_output=True, text=True, timeout=15
-        )
-        if 'EXIT=0' not in (_probe.stdout or ''):
+        try:
+            _probe = subprocess.run(
+                f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
+                shell=True, capture_output=True, text=True, timeout=15
+            )
+            _direct_ok = 'EXIT=0' in (_probe.stdout or '')
+        except subprocess.TimeoutExpired:
+            # CRITICAL: on a hairpin-broken box `docker exec ... wget` hangs reaching the box's own
+            # PUBLIC IP until the 15s subprocess timeout fires (wget's own --timeout=5 never cleanly
+            # completes the connect). That used to raise straight out to the outer except as
+            # "proactive routing error (no changes applied)" and abort — the exact symptom in Noah's
+            # logs. A timeout here IS the hairpin signal, not a fatal error: swallow it, treat the
+            # direct probe as failed, and fall through to migrate via host-gateway.
+            _direct_ok = False
+        if not _direct_ok:
             # The pre-rewrite container resolves <fqdn> to the box's PUBLIC IP, so this probe times
             # out on every box behind hairpin-broken NAT (home / Hyper-V / Starlink) — even though
             # the migration is about to add `extra_hosts: <fqdn>:host-gateway`, which makes the
