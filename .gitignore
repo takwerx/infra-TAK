@@ -11,16 +11,22 @@ __pycache__/
 # rapidsos: local-only, not yet tracked.
 # takcad: tracked on dev for internal testing (TAK-CAD server not public yet).
 cloudtak-plugins/rapidsos/
-# Screenshots shared with Claude during dev — ignore images, keep the folder.
-screenshots/*
-!screenshots/.gitkeep
+# Screenshots — no longer tracked (attach images inline via the Claude extension).
+screenshots/
 
 # TAK-CAD server-plugin reference docs — LOCAL ONLY, never pushed to GitHub.
 # (TAK-CAD server plugin is closed-source; specs live here for Claude to review.)
 tak-cad-docs/
 
-# Internal working notes moved to the PRIVATE repo takwerx/infra-TAK-notes
-# (docs/ HANDOFF·PLAN·RELEASE, memory-bank/). This repo is public — keep these
-# out of it. Open ~/GitHub/infra-TAK.code-workspace to edit both repos together.
+# Internal working notes + dev tooling moved to the PRIVATE repo
+# takwerx/infra-TAK-notes. This repo is public — keep these out of it.
+# Open ~/GitHub/infra-TAK.code-workspace to edit both repos together.
 docs/
 memory-bank/
+.cursor/
+.cursorrules
+ops/
+STATUS.md
+TESTING.md
+ssdnodes-firewall-request.md
+pull-dev-and-restart.sh
