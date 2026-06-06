@@ -42531,7 +42531,10 @@ def _run_vacuum_background(use_full, tak_cfg):
     try:
         if tak_cfg.get('mode') == 'two_server':
             s1 = tak_cfg.get('server_one', {})
-            vacuum_cmd = f"sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
+            # cd / first: SSH lands in /root, and `sudo -u postgres` can't cd there, which
+            # prints a benign "could not change directory to /root: Permission denied" warning
+            # into the output and reads as a failure even though VACUUM ran. (Local path uses cwd='/'.)
+            vacuum_cmd = f"cd / && sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
             ok, out = _ssh_probe(s1, vacuum_cmd, timeout=timeout_sec)
             if not ok:
                 _vacuum_status.update({'running': False, 'error': (out or 'SSH command failed')[:500]})
@@ -42626,7 +42629,8 @@ def takserver_reindex():
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'success': False, 'error': 'Server One host not configured'}), 400
-        reindex_cmd = f"sudo -u postgres psql -d cot -c '{reindex_sql}' 2>&1"
+        # cd / first (see VACUUM note): avoids the benign "/root: Permission denied" warning leaking into output.
+        reindex_cmd = f"cd / && sudo -u postgres psql -d cot -c '{reindex_sql}' 2>&1"
         ok, out = _ssh_probe(s1, reindex_cmd, timeout=timeout_sec)
         if not ok:
             return jsonify({'success': False, 'error': (out or 'SSH command failed')[:500]}), 400
