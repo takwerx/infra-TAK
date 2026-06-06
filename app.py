@@ -3359,9 +3359,13 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     # carry one; UFW is first-match-wins so it shadows the deny below, leaving Postgres
     # open to the internet). Delete runs AFTER the scoped allow so the core never loses
     # its DB; `delete allow` only removes the Anywhere rule, scoped allows survive.
+    # ORDER: delete any pre-existing deny FIRST (UFW appends + first-match-wins, so a
+    # stale deny would shadow the scoped allow), add the scoped allow, drop the broad
+    # allow, then re-add the deny LAST so it sits below the allow.
     ufw_cmd = (
         f'sudo ufw allow 22/tcp && '
         f'sudo ufw allow from {core_ip} to any port 22 proto tcp && '
+        f'(sudo ufw delete deny {db_port}/tcp || true) && '
         f'sudo ufw allow from {core_ip} to any port {db_port} proto tcp && '
         f'(sudo ufw delete allow {db_port}/tcp || true) && '
         f'sudo ufw deny {db_port}/tcp && '
@@ -3539,8 +3543,10 @@ def takserver_two_server_runbook():
         # v0.9.12 hardening: source-scope only, deny everything else on db_port.
         # The pre-v0.9.12 unconditional `ufw allow {db_port}/tcp` defeated the
         # source-scope rule above and left Postgres reachable from the internet.
+        # v0.9.46: delete any stale deny first (UFW first-match-wins; appended allow would
+        # otherwise sit below it), add scoped allow, drop broad allow, re-add deny last.
+        f'sudo ufw delete deny {db_port}/tcp || true',
         f'sudo ufw allow from {core_host_for_db_acl} to any port {db_port} proto tcp',
-        # v0.9.46: drop any legacy broad allow (shadows the deny → Postgres open to internet)
         f'sudo ufw delete allow {db_port}/tcp || true',
         f'sudo ufw deny {db_port}/tcp',
         'sudo ufw --force enable',
@@ -4520,17 +4526,23 @@ def _deploy_health_agent_to_server_one(s1_cfg):
             f'sudo ufw allow from {_src_ip} to any port 8080 proto tcp >/dev/null 2>&1; '
             f'sudo ufw allow from {_src_ip} to any port {_db_port} proto tcp >/dev/null 2>&1; '
         )
+    # ORDER MATTERS: UFW is first-match-wins and APPENDS new rules. A pre-existing
+    # `deny <port>/tcp` from an earlier deploy sits ABOVE a freshly-added scoped allow,
+    # so the deny wins and the allow never matches. Delete the deny FIRST, add the
+    # scoped allow(s), then re-add the deny LAST so it lands below the allows.
     _ufw_step = (
         'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
+        'sudo ufw delete deny 8080/tcp >/dev/null 2>&1; '
+        f'sudo ufw delete deny {_db_port}/tcp >/dev/null 2>&1; '
+        # `delete allow {port}/tcp` removes ONLY the broad Anywhere allow; scoped allows
+        # (incl. the core's existing DB ACL) survive, so TAK never loses its DB.
+        f'sudo ufw delete allow {_db_port}/tcp >/dev/null 2>&1; '
         'if [ -n "$SRC" ]; then '
         'sudo ufw allow from "$SRC" to any port 8080 proto tcp >/dev/null 2>&1; '
         f'sudo ufw allow from "$SRC" to any port {_db_port} proto tcp >/dev/null 2>&1; '
         'fi; '
         + _srvip_allows +
         'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
-        # `delete allow {port}/tcp` removes ONLY the Anywhere allow; scoped allows
-        # (incl. the core's existing DB ACL) survive, so TAK never loses its DB.
-        f'sudo ufw delete allow {_db_port}/tcp >/dev/null 2>&1; '
         f'sudo ufw deny {_db_port}/tcp >/dev/null 2>&1; '
     )
     setup_cmd = (
@@ -8539,12 +8551,15 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             plog(f'Fed Hub web UI: scoping 8080/9100 to console source IP{f" ({caddy_src} + observed)" if caddy_src else " (observed $SSH_CLIENT)"}, removing any broad allow')
             for port in (8080, 9100):
                 _srv = (f'sudo ufw allow from {caddy_src} to any port {port} proto tcp >/dev/null 2>&1; ' if caddy_src else '')
+                # Delete the deny FIRST (UFW appends + first-match-wins, so a pre-existing
+                # deny would shadow a freshly-added allow), add scoped allow(s), deny LAST.
                 _module_run(
                     cfg,
                     'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
+                    f'sudo ufw delete deny {port}/tcp >/dev/null 2>&1 || true; '
+                    f'sudo ufw delete allow {port}/tcp >/dev/null 2>&1 || true; '
                     f'if [ -n "$SRC" ]; then sudo ufw allow from "$SRC" to any port {port} proto tcp >/dev/null 2>&1; fi; '
                     + _srv +
-                    f'sudo ufw delete allow {port}/tcp >/dev/null 2>&1 || true; '
                     f'sudo ufw deny {port}/tcp >/dev/null 2>&1; true',
                     timeout=20,
                 )
