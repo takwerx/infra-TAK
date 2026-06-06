@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.44-alpha](docs/RELEASE-v0.9.44-alpha.md)**
+**Current release: [v0.9.45-alpha](docs/RELEASE-v0.9.45-alpha.md)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.45-alpha — 2026-06-06 — webadmin LDAP login on no-hairpin / self-hosted boxes
+
+**Headline:** `webadmin` 8446 login now works on self-hosted boxes behind NAT that lack hairpin routing (home lab / Hyper-V / Starlink) — **even with a public IP and full port forwarding**. The Authentik LDAP outpost's internal→FQDN routing migration was silently aborting on those boxes: its pre-check needed NAT hairpin (a container reaching its own host's public IP), the `docker exec wget` probe hung until a 15s timeout, and the box stayed on spiral-prone internal routing — so `webadmin` cold binds died with `exceeded stage recursion depth` (a flow spiral, not a wrong password) and 8446 rejected the correct password. The migration now treats the hairpin timeout as the signal it is and routes the outpost to Caddy via the host gateway (`extra_hosts: host-gateway`) instead, with the existing post-recreate validation + auto-rollback as the safety net; the **Resync LDAP to TAK Server** button runs it directly and visibly. Plus three supporting fixes: the LDAP bind verifier no longer shows a false-red "NOT READY" when `ldapsearch` can't be installed (tri-state OK / FAIL / UNVERIFIED, with a hardened install that rides out apt locks); the outpost-log diagnostic is un-truncated and classifies the failure (flow spiral vs invalid credentials vs authenticated); and the Download Certificates password no longer shows the pre-deploy default until you refresh.
+
+Full notes: [docs/RELEASE-v0.9.45-alpha.md](docs/RELEASE-v0.9.45-alpha.md).
 
 ### v0.9.44-alpha — 2026-06-03 — Daily console-restart timer (wedged-worker recovery)
 
