@@ -87,6 +87,19 @@ Free actions (no permission needed): `git push origin dev`, migrations/soak on d
 
 **Why:** On 2026-05-17 the agent autonomously squash-merged dev→main after reading "im tired of fucking around" as authorization. That was wrong. Releases are operator decisions.
 
+### Release procedure — run ALL of this once the operator authorizes the ship
+
+When the operator gives an unambiguous ship instruction ("ship to main", "selective merge to main, tag it", "release vX.Y.Z"), execute this full sequence — don't stop after the tag. The version is already bumped on dev (`VERSION` in `app.py`); the code is the T&E-validated dev tip.
+
+1. **README on dev** — bump `**Current release:**` and add a `## Changelog` entry (product-focused headline, dated). Link both to the GitHub Release URL `https://github.com/takwerx/infra-TAK/releases/tag/vX.Y.Z-alpha` (NOT `docs/RELEASE-*.md` — those live in the private notes repo and are dead links in the public repo). Commit + `git push origin dev`. README/changelog is non-functional, so it doesn't invalidate the soak — note the validated code SHA in the commit.
+2. **Selective merge dev → main** — `git checkout -B main origin/main` then `git checkout dev -- <changed files>` so main's tree is byte-identical to dev. **Verify `git diff dev main` is empty before committing.** Do NOT `git merge` dev — dev/main histories are rewrite-diverged (see `[[pending-history-rewrite-v0944]]`); only the tree matters, and a real merge drags 300+ rewritten commits. Commit on main as the release commit.
+3. **Tag + push** — annotated `git tag -a vX.Y.Z-alpha`, then `git push origin main` and `git push origin vX.Y.Z-alpha`.
+4. **GitHub Release** — `gh release create vX.Y.Z-alpha --title "…" --latest --notes "…"`. **Mark it `--latest`.** Body is **product-focused** (root cause + fix + upgrade note) — NO internal box names, T&E metrics, soak data, or infra details (public repo is product-only).
+5. **Private full notes** — write/finish `docs/RELEASE-vX.Y.Z-alpha.md` in the **private** `infra-TAK-notes` repo (root cause, full T&E results, soak data, known limitations), commit + push that repo.
+6. **Return to dev** (`git checkout dev`) and confirm `main` tree == `dev` tree.
+
+Public vs private split is the rule: GitHub Release + public README = product-only; the private notes repo holds the full engineering record.
+
 ---
 
 ## Plan-first build workflow

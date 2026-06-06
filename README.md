@@ -4,9 +4,9 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.45-alpha](docs/RELEASE-v0.9.45-alpha.md)**
+**Current release: [v0.9.45-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.45-alpha)**
 
-Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
+Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -344,39 +344,39 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 **Headline:** `webadmin` 8446 login now works on self-hosted boxes behind NAT that lack hairpin routing (home lab / Hyper-V / Starlink) — **even with a public IP and full port forwarding**. The Authentik LDAP outpost's internal→FQDN routing migration was silently aborting on those boxes: its pre-check needed NAT hairpin (a container reaching its own host's public IP), the `docker exec wget` probe hung until a 15s timeout, and the box stayed on spiral-prone internal routing — so `webadmin` cold binds died with `exceeded stage recursion depth` (a flow spiral, not a wrong password) and 8446 rejected the correct password. The migration now treats the hairpin timeout as the signal it is and routes the outpost to Caddy via the host gateway (`extra_hosts: host-gateway`) instead, with the existing post-recreate validation + auto-rollback as the safety net; the **Resync LDAP to TAK Server** button runs it directly and visibly. Plus three supporting fixes: the LDAP bind verifier no longer shows a false-red "NOT READY" when `ldapsearch` can't be installed (tri-state OK / FAIL / UNVERIFIED, with a hardened install that rides out apt locks); the outpost-log diagnostic is un-truncated and classifies the failure (flow spiral vs invalid credentials vs authenticated); and the Download Certificates password no longer shows the pre-deploy default until you refresh.
 
-Full notes: [docs/RELEASE-v0.9.45-alpha.md](docs/RELEASE-v0.9.45-alpha.md).
+Full notes: [v0.9.45-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.45-alpha).
 
 ### v0.9.44-alpha — 2026-06-03 — Daily console-restart timer (wedged-worker recovery)
 
 **Headline:** the console (`takwerx-console`, gunicorn 1 worker / 4 threads) can wedge — the worker stops serving while port 5001 stays in `LISTEN`, so systemd still reports `active (running)` and nothing recovers it; front door and backdoor both hang while Authentik stays up (hit test6 and test8 the same day, after 5–7 days of uptime). The only periodic restart in the project was Authentik's — the console had none. This adds **`takconsolerestart.timer`**: a daily 04:00 oneshot that bounces the console (idle-gated via a new localhost-only `GET /api/console/restart-safe`, so it defers if a deploy/update is in flight and restarts immediately if the worker is unresponsive). Self-installs on every boot via `_startup_migrations`, so fresh installs and existing boxes both get it on their next restart. Bonus: a long-lived console now loads pulled code instead of running a stale process across `git pull`s.
 
-Full notes: [docs/RELEASE-v0.9.44-alpha.md](docs/RELEASE-v0.9.44-alpha.md).
+Full notes: [v0.9.44-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.44-alpha).
 
 ### v0.9.43-alpha — 2026-06-03 — CloudTAK Dispatcher plugin + webadmin LDAP spiral deploy hardening
 
 **Headline: two areas.** (1) **CloudTAK Dispatcher plugin** — a Computer-Aided Dispatch panel inside CloudTAK, installed from CloudTAK → Plugins and deployed from its own public repo (`takwerx/cloudtak-dispatcher-plugin`, like the ping plugin). Works **standalone** with no TAK-CAD server plugin: incidents are server-backed in CloudTAK's own Postgres (shared across dispatchers), drawn on the map as native CoT and optionally pushed into a DataSync feed so every client (ATAK/iTAK/TAK Aware/WinTAK) sees them; multi-select responder assignment with notification over mission thread + direct message; markers use a foldered color-less `iconsetpath` that renders on all field clients. Auto-upgrades to full TAK-CAD mode when the TAK-CAD server plugin is detected. (2) **webadmin LDAP spiral deploy hardening** — fresh TAK Server installs on boxes that can't reach FQDN/Caddy routing (no public IP / no LE cert / slow disk) were dead-ending at the final `webadmin` LDAP-bind verification with `exceeded stage recursion depth` (a flow spiral, not a bad password). The deploy now repairs the flow before retrying, the verifier no longer destroys the webadmin user on a spiral verdict (which had wiped the cached session and locked the box into a cold-spiral loop), and a verify miss no longer aborts the whole deploy. Plus CloudTAK plugin install/update robustness (copy-not-symlink, restore plugins after a CloudTAK update, container-ID version check, GitHub-tag-fetch tolerance).
 
-Full notes: [docs/RELEASE-v0.9.43-alpha.md](docs/RELEASE-v0.9.43-alpha.md).
+Full notes: [v0.9.43-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.43-alpha).
 
 ### v0.9.42-alpha — 2026-05-29 — TAK Video Restreamer module
 
 New Marketplace module: **TAK Video Restreamer** (`raytheonbbn/tak-video-restreamer`) — a Flask + MediaMTX + FFmpeg streaming server deployed as a Docker container, behind Caddy at `stream.<FQDN>`. Mutually exclusive with the standalone MediaMTX module (shared streaming ports; the console blocks deploying both). Built-in Flask admin login (separate from Authentik), changeable without a rebuild. RTSP/RTSPS/SRT/RTMP/HLS-ABR endpoints, Guard Dog HTTP monitor on `/login:3100`, Update Now via `git pull` + `docker compose up -d --build`.
 
-Full notes: [docs/RELEASE-v0.9.42-alpha.md](docs/RELEASE-v0.9.42-alpha.md).
+Full notes: [v0.9.42-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.42-alpha).
 
 ### v0.9.41-alpha — 2026-05-28 — LDAP spiral fix + Azure External DB hardening
 
 Two bug areas: (1) **LDAP identification-stage spiral** — a silent PATCH failure left every webadmin bind returning error 49, spiraling across resync attempts. (2) **Azure External DB** — five hardening fixes covering extension provisioning, deploy gating, SchemaManager execution, uninstall cleanup, and a malformed-XML crash from `&` in generated passwords.
 
-Full notes: [docs/RELEASE-v0.9.41-alpha.md](docs/RELEASE-v0.9.41-alpha.md).
+Full notes: [v0.9.41-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.41-alpha).
 
 ### v0.9.40-alpha — 2026-05-27 — Azure PostgreSQL end-to-end support + CloudTAK first-time setup guide + MediaMTX readiness fix
 
 **Headline: four areas.** (1) **Azure PostgreSQL Flexible Server** — full end-to-end External DB support: auto-create `cot` database, grant `azure_pg_admin` to `martiuser`, pre-create all 5 required extensions as admin so SchemaManager never hits the extension permission wall, Test Connection Azure extension probe with exact portal instructions if any are missing, collapsible Azure pre-flight guide in the UI, uninstall drops the remote `cot` database for clean re-deploy. (2) **External DB UX fixes** — button order corrected (Provision → Test), admin username field uses placeholder instead of hardcoded `postgres`, passwords with `#` no longer break psql `-v` parser, provision correctly targets `postgres` DB first, deploy mode preserved after Configure. (3) **CloudTAK first-time setup guide** — collapsible three-step card on the CloudTAK page: create `cloudtakadmin` in TAK Portal (with org-suffix warning), download `user.p12` + cert password from Certificates page, configure CloudTAK with `takserver.fqdn` + credentials + cert; bootstrap is one-time, subsequent users just log in with username and password. (4) **MediaMTX readiness poll** — deploy now waits up to 30s for `systemctl is-active mediamtx` before declaring success, eliminating the "Not Found" error when operators hit `stream.fqdn` immediately after deploy.
 
-Full notes: [docs/RELEASE-v0.9.40-alpha.md](docs/RELEASE-v0.9.40-alpha.md).
+Full notes: [v0.9.40-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.40-alpha).
 
-Older releases: [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) or browse [`docs/RELEASE-*.md`](docs/) for inline notes.
+Older releases: [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
 
 ## License
