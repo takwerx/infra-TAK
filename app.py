@@ -22396,6 +22396,49 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div id="gd-dio-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — first sample in ~15 min after Guard Dog deploy</div>
     </div>
   </div>
+
+  <div class="card" id="gd-netfanout-card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <span>Network &amp; Fanout</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <select id="gd-net-range-sel" class="form-input" style="width:auto;min-width:100px;padding:4px 8px;font-size:11px" onchange="gdRefreshNetMetrics()">
+          <option value="1" selected>Last 1 hour</option>
+          <option value="24">Last 24 hours</option>
+        </select>
+        <button id="gd-net-refresh-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshNetMetrics()">Refresh</button>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Live TAK Server CoT-fanout load. The <strong>:8089 send-queue</strong> is the leading indicator of fanout backpressure &mdash; if it climbs while CPU stays flat, the bottleneck is the NIC / TCP send path, not compute. Sampled every 30&ndash;60s by the Guard Dog metrics collector.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:16px">
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Connected clients</div><span id="gd-net-clients" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">:8089 send-queue</div><span id="gd-net-txq" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Host TX</div><span id="gd-net-tx" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">JVM heap (used)</div><span id="gd-net-heap" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <div style="font-size:11px;color:var(--text-secondary);margin:4px 0 4px">TAK fanout send-queue &mdash; :8089 (<span style="color:#06b6d4">sum</span> / <span style="color:#ef4444">max one client</span>, bytes queued to clients)</div>
+    <div style="position:relative;height:130px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-net-chart-txq" style="width:100%;height:100%"></canvas>
+      <div id="gd-net-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — collector produces its first sample within ~1 min</div>
+    </div>
+    <div style="font-size:11px;color:var(--text-secondary);margin:14px 0 4px">External network throughput &mdash; <span style="color:#06b6d4">TX</span> / <span style="color:#f59e0b">RX</span> (bytes/s)</div>
+    <div style="position:relative;height:100px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-net-chart-thru" style="width:100%;height:100%"></canvas>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px">
+      <div>
+        <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">Connected clients</div>
+        <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <canvas id="gd-net-chart-clients" style="width:100%;height:100%"></canvas>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">JVM heap &mdash; used (MB)</div>
+        <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <canvas id="gd-net-chart-heap" style="width:100%;height:100%"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
   {% endif %}
 
   <div class="card">
