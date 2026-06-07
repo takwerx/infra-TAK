@@ -224,6 +224,9 @@ def inject_cloudtak_icon():
         _cert_pw_nag = render_default_cert_password_warning(_settings)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
         d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _sidebar)
+        # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
+        # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
+        d['service_domain'] = lambda key: _get_service_domain(_settings, key)
     return d
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -366,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.46-alpha"
+VERSION = "0.9.47-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -6622,6 +6625,150 @@ def guarddog_diskio_history():
         import traceback
         return jsonify({'entries': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
 
+# ── v0.9.47: network / fanout metrics (Guard Dog metrics collector → metrics.db) ──
+_GD_METRICS_DB = '/var/lib/takguard/metrics.db'
+# Whitelist: series key → (table, column). Keys/values are fixed here (never user input),
+# so f-string interpolation into SQL is safe — the ?series= param is validated against this map.
+_GD_SERIES = {
+    'host_tx':          ('host_net',  'tx_bytes_s'),
+    'host_rx':          ('host_net',  'rx_bytes_s'),
+    'host_tx_pkts':     ('host_net',  'tx_pkts_s'),
+    'host_rx_pkts':     ('host_net',  'rx_pkts_s'),
+    'tcp_tx_queue':         ('tcp_queue', 'tx_queue_sum'),
+    'tcp_tx_queue_max':     ('tcp_queue', 'tx_queue_max'),
+    'tcp_tx_queue_active':     ('tcp_queue', 'tx_queue_active'),
+    'tcp_tx_queue_active_max': ('tcp_queue', 'tx_queue_active_max'),
+    'tcp_stalled_conns':    ('tcp_queue', 'stalled_conns'),
+    'tcp_rx_queue':     ('tcp_queue', 'rx_queue_sum'),
+    'tcp_conns':        ('tcp_queue', 'conn_count'),
+    'clients':          ('marti',     'clients_connected'),
+    'heap':             ('marti',     'heap_used_mb'),
+    'heap_committed':   ('marti',     'heap_committed_mb'),
+    'cpu':              ('host_sys',  'cpu_pct'),
+    'mem_used':         ('host_sys',  'mem_used_mb'),
+    'load1':            ('host_sys',  'load_1'),
+}
+
+def _gd_metrics_ro():
+    """Open metrics.db read-only, or None if the collector hasn't produced it yet."""
+    import sqlite3
+    if not os.path.exists(_GD_METRICS_DB):
+        return None
+    try:
+        return sqlite3.connect(f'file:{_GD_METRICS_DB}?mode=ro', uri=True, timeout=3)
+    except Exception:
+        return None
+
+def _gd_bucketed(con, table, col, hours, where='', params=(), points=240):
+    """Time-bucketed AVG of `col` over the last `hours`, ~`points` samples. Returns entry list."""
+    now = int(time.time())
+    cutoff = now - hours * 3600
+    bucket = max(30, (hours * 3600) // points)
+    q = (f"SELECT (ts/{bucket})*{bucket} AS b, AVG({col}) FROM {table} "
+         f"WHERE ts >= ? {where} GROUP BY b ORDER BY b")
+    rows = con.execute(q, (cutoff,) + tuple(params)).fetchall()
+    return [{'t': datetime.utcfromtimestamp(b).strftime('%Y-%m-%dT%H:%M:%SZ'),
+             'v': round(v, 2) if v is not None else 0} for b, v in rows]
+
+def _gd_envelope(entries):
+    """Mirror the diskio-history envelope: avg_1h / avg_24h / min / max / samples."""
+    now = datetime.utcnow()
+    vals = [e['v'] for e in entries]
+    v1h = [e['v'] for e in entries
+           if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+    return {
+        'entries': entries,
+        'avg_1h':  round(sum(v1h) / len(v1h), 2) if v1h else None,
+        'avg_24h': round(sum(vals) / len(vals), 2) if vals else None,
+        'min': round(min(vals), 2) if vals else None,
+        'max': round(max(vals), 2) if vals else None,
+        'samples': len(entries),
+    }
+
+@app.route('/api/guarddog/net-metrics')
+@login_required
+def guarddog_net_metrics():
+    """One fanout series over the last ?hours=. ?series= ∈ _GD_SERIES keys (default host_tx)."""
+    try:
+        series = request.args.get('series', 'host_tx')
+        hours = max(1, min(168, int(request.args.get('hours', 1))))
+        if series not in _GD_SERIES:
+            return jsonify({'entries': [], 'error': f'unknown series: {series}'}), 400
+        con = _gd_metrics_ro()
+        if con is None:
+            return jsonify({'entries': [], 'deployed': False})
+        try:
+            table, col = _GD_SERIES[series]
+            entries = _gd_bucketed(con, table, col, hours)
+        finally:
+            con.close()
+        env = _gd_envelope(entries)
+        env['series'] = series
+        return jsonify(env)
+    except Exception as e:
+        import traceback
+        return jsonify({'entries': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/guarddog/net-metrics/bridges')
+@login_required
+def guarddog_net_bridges():
+    """Per-Docker-bridge (+lo) TX/RX bytes/s over the last ?hours=."""
+    try:
+        hours = max(1, min(168, int(request.args.get('hours', 1))))
+        con = _gd_metrics_ro()
+        if con is None:
+            return jsonify({'series': [], 'deployed': False})
+        try:
+            cutoff = int(time.time()) - hours * 3600
+            ifaces = con.execute(
+                "SELECT iface, MAX(network_name) FROM bridge_net WHERE ts >= ? "
+                "GROUP BY iface ORDER BY iface", (cutoff,)).fetchall()
+            out = []
+            for iface, name in ifaces:
+                out.append({
+                    'iface': iface, 'network_name': name,
+                    'tx': _gd_bucketed(con, 'bridge_net', 'tx_bytes_s', hours,
+                                       where='AND iface = ?', params=(iface,)),
+                    'rx': _gd_bucketed(con, 'bridge_net', 'rx_bytes_s', hours,
+                                       where='AND iface = ?', params=(iface,)),
+                })
+        finally:
+            con.close()
+        return jsonify({'series': out})
+    except Exception as e:
+        import traceback
+        return jsonify({'series': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/guarddog/net-metrics/containers')
+@login_required
+def guarddog_net_containers():
+    """Per-container net TX/RX bytes/s over the last ?hours=."""
+    try:
+        hours = max(1, min(168, int(request.args.get('hours', 1))))
+        con = _gd_metrics_ro()
+        if con is None:
+            return jsonify({'series': [], 'deployed': False})
+        try:
+            cutoff = int(time.time()) - hours * 3600
+            names = con.execute(
+                "SELECT container FROM docker_stats WHERE ts >= ? "
+                "GROUP BY container ORDER BY container", (cutoff,)).fetchall()
+            out = []
+            for (name,) in names:
+                out.append({
+                    'container': name,
+                    'tx': _gd_bucketed(con, 'docker_stats', 'net_tx_bytes_s', hours,
+                                       where='AND container = ?', params=(name,)),
+                    'rx': _gd_bucketed(con, 'docker_stats', 'net_rx_bytes_s', hours,
+                                       where='AND container = ?', params=(name,)),
+                })
+        finally:
+            con.close()
+        return jsonify({'series': out})
+    except Exception as e:
+        import traceback
+        return jsonify({'series': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
+
 @app.route('/api/guarddog/diskio-report')
 @login_required
 def guarddog_diskio_report():
@@ -7279,6 +7426,14 @@ def guarddog_send_sms():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
+# v0.9.47: shared so the deploy path and the boot self-heal can't drift.
+_METRICS_COLLECTOR_UNIT = ('[Unit]\nDescription=Guard Dog Network/Fanout Metrics Collector\n'
+                           'After=network.target takserver.service docker.service\n\n'
+                           '[Service]\nType=simple\n'
+                           'ExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-metrics-collector.py\n'
+                           'Restart=always\nRestartSec=15\n\n'
+                           '[Install]\nWantedBy=multi-user.target\n')
+
 def run_guarddog_deploy(alert_email):
     """Deploy Guard Dog: monitors + health endpoint. Requires TAK Server at /opt/tak. Alert email optional (alerts only when set)."""
     def plog(msg):
@@ -7326,7 +7481,7 @@ def run_guarddog_deploy(alert_email):
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
-            'tak-updates-watch.sh'
+            'tak-metrics-collector.py', 'tak-updates-watch.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -7394,8 +7549,11 @@ def run_guarddog_deploy(alert_email):
         gd_conf = {}
         if is_two_server and s1_host:
             gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+        # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
+        gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
         with open('/opt/tak-guarddog/guarddog.conf', 'w') as f:
             json.dump(gd_conf, f)
+        os.chmod('/opt/tak-guarddog/guarddog.conf', 0o600)
         # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
         server_identifier = _guarddog_server_identifier(settings)
         with open('/opt/tak-guarddog/server_identifier', 'w') as f:
@@ -7419,6 +7577,7 @@ def run_guarddog_deploy(alert_email):
             ('takintcaguard.service', '[Unit]\nDescription=TAK Intermediate CA Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-intca-watch.sh\n'),
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
+            ('tak-metrics-collector.service', _METRICS_COLLECTOR_UNIT),
             ('tak-post-start.service', '[Unit]\nDescription=Guard Dog Post-Start Orchestrator (starts Authentik, TAK Portal, CloudTAK after TAK)\nAfter=takserver.service docker.service\nWants=takserver.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=1200\nExecStart=/opt/tak-guarddog/tak-post-start.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
         ]
         # Two-server: remote DB monitor instead of local PG monitors
@@ -7600,6 +7759,14 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+        # v0.9.47: network/fanout metrics collector (always-on, like tak-health). Best-effort
+        # start — a collector failure must never block the rest of the Guard Dog deploy.
+        rmc = subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, text=True, timeout=5)
+        if rmc.returncode != 0:
+            plog(f"⚠ enable tak-metrics-collector.service failed (continuing): {rmc.stderr or rmc.stdout or 'unknown'}")
+        else:
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'tak-metrics-collector.service']), capture_output=True, timeout=5)
+            plog("✓ Network/fanout metrics collector started")
         # v0.9.12 A6: source-scope UFW for Guard Dog health endpoint
         _auto_harden_guarddog_8080(settings, plog=plog)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-post-start.service']), capture_output=True, text=True, timeout=5)
@@ -13128,7 +13295,7 @@ def _takportal_build_settings_dict(settings):
         "PORTAL_AUTH_ENABLED": "true" if settings.get('fqdn') else "false",
         "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
         "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
-        "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
+        "TAK_PORTAL_PUBLIC_URL": f"https://{_get_service_domain(settings, 'takportal')}" if settings.get('fqdn') else f"http://{server_ip}:3000",
         "TAK_URL": f"https://{tak_url_host}:8443/Marti",
         "TAK_API_P12_PATH": "data/certs/tak-client.p12",
         "TAK_API_P12_PASSPHRASE": cert_pass,
@@ -13997,7 +14164,7 @@ def run_takportal_deploy():
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
             plog(f"  \u2713 Caddy config updated for TAK Portal")
-            plog(f"  Open: https://takportal.{settings.get('fqdn')}")
+            plog(f"  Open: https://{_get_service_domain(settings, 'takportal')}")
         plog("=" * 50)
         plog("")
         plog("  Waiting 2 minutes for Authentik to fully sync...")
@@ -18338,6 +18505,41 @@ def cesium_tiles_delete(name):
 
 # ── WebODM ───────────────────────────────────────────────────────────────────
 
+# WebODM ODM (NodeODX) resource ceiling — fleet-uniform safety cap. A co-located ODM
+# job must never starve/OOM the rest of the TAK stack. Enforced three ways on wo_nodeodm:
+#   cpus           — CPU-time ceiling (host protection)
+#   mem_limit      — OOM backstop: Docker kills the ODM container, never the host
+#   --max_concurrency — NodeODX self-limits its thread pool so a job COMPLETES within the
+#                       cap instead of spawning host-core-count threads and OOM-killing.
+#                       (NodeODX reads os.cpus()=host count and ignores the cpu cgroup, so
+#                        the cpus cap alone won't stop it — this is the lever that does.)
+# Field guidance: Tom Endress, 2026-06 — validated "set to 4 cores/threads" holding under
+# co-located MediaMTX load; he wanted it safe for the fleet ("hate to see it OOM a TAKStack").
+ODM_MAX_CORES      = 4   # fleet ceiling — the single knob to retune fleet-wide (Tom-validated)
+ODM_CORE_RESERVE   = 2   # cores always left for OS + co-located services
+ODM_MEM_PER_CORE_G = 1   # NodeODX peak ~1GB/thread @ 2MP (per NodeODX max-concurrency help)
+ODM_MEM_HEADROOM_G = 2   # GB above the per-core estimate
+
+
+def _webodm_odm_limits(detected_cores, cfg):
+    """(cpus, mem_g) for the wo_nodeodm container. Operator override (hard-clamped to the
+    fleet ceiling) or auto-tune from detected cores. Always recomputes the target —
+    never max(cur, target), so the fleet converges (CLAUDE.md fleet-uniform rule)."""
+    cfg = cfg or {}
+    auto = max(1, min(int(detected_cores or 1) - ODM_CORE_RESERVE, ODM_MAX_CORES))
+    try:
+        cpus = int(cfg.get('odm_cpus')) if str(cfg.get('odm_cpus') or '').strip() else auto
+    except (TypeError, ValueError):
+        cpus = auto
+    cpus = max(1, min(cpus, ODM_MAX_CORES))          # hard fleet clamp
+    try:
+        mem = int(cfg.get('odm_mem_g')) if str(cfg.get('odm_mem_g') or '').strip() else \
+              cpus * ODM_MEM_PER_CORE_G + ODM_MEM_HEADROOM_G
+    except (TypeError, ValueError):
+        mem = cpus * ODM_MEM_PER_CORE_G + ODM_MEM_HEADROOM_G
+    return cpus, max(2, mem)
+
+
 WEBODM_DOCKER_COMPOSE = '''version: '2.4'
 volumes:
   wo_dbdata:
@@ -18399,6 +18601,9 @@ services:
   wo_nodeodm:
     image: webodm/nodeodx
     container_name: wo_nodeodm
+    command: ["--max_concurrency", "{wo_odm_cpus}"]
+    cpus: {wo_odm_cpus}
+    mem_limit: {wo_odm_mem}g
     restart: unless-stopped
     oom_score_adj: 250
 '''
@@ -18468,8 +18673,17 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     # Write compose file locally, scp to remote
     plog('━━━ Writing docker-compose.yml ━━━')
     wo_secret = _sec.token_hex(32)
+    # ODM resource cap (GH #32) — detect remote core count, then apply the fleet ceiling.
+    _okc, _np = _module_run(deploy_cfg, 'nproc 2>/dev/null || echo 4', timeout=10)
+    try:
+        _cores = int((_np or '4').strip() or 4) if _okc else 4
+    except (TypeError, ValueError):
+        _cores = 4
+    _odm_cpus, _odm_mem = _webodm_odm_limits(_cores, deploy_cfg)
+    plog(f'  ODM cap: {_odm_cpus} cores / {_odm_mem}g / max_concurrency {_odm_cpus} (host {_cores} cores, ceiling {ODM_MAX_CORES})')
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
-        wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret)
+        wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
+        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem)
     # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
@@ -18622,10 +18836,16 @@ def _run_webodm_deploy(settings):
 
         plog('Writing docker-compose.yml…')
         wo_secret = _sec.token_hex(32)
+        # ODM resource cap (GH #32) — local core count, then the fleet ceiling.
+        _odm_cores = os.cpu_count() or 4
+        _odm_cpus, _odm_mem = _webodm_odm_limits(_odm_cores, deploy_cfg)
+        plog(f'ODM cap: {_odm_cpus} cores / {_odm_mem}g / max_concurrency {_odm_cpus} (host {_odm_cores} cores, ceiling {ODM_MAX_CORES})')
         compose_content = WEBODM_DOCKER_COMPOSE.format(
             wo_dir=wo_dir,
             wo_port=wo_port,
             wo_secret=wo_secret,
+            wo_odm_cpus=_odm_cpus,
+            wo_odm_mem=_odm_mem,
         )
         with open(compose_path, 'w') as f:
             f.write(compose_content)
@@ -18718,6 +18938,7 @@ def webodm_page():
         wo_url=wo_url,
         wo_host=wo_host,
         wo_deploy_cfg=wo_deploy_cfg,
+        odm_max_cores=ODM_MAX_CORES,
         deploying=_webodm_deploy_status.get('running', False),
         deploy_done=_webodm_deploy_status.get('complete', False),
         deploy_error=_webodm_deploy_status.get('error', False),
@@ -22230,6 +22451,53 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div style="position:relative;height:120px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
       <canvas id="gd-dio-chart" style="width:100%;height:100%"></canvas>
       <div id="gd-dio-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — first sample in ~15 min after Guard Dog deploy</div>
+    </div>
+  </div>
+
+  <div class="card" id="gd-netfanout-card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <span>Network &amp; Fanout</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <select id="gd-net-range-sel" class="form-input" style="width:auto;min-width:100px;padding:4px 8px;font-size:11px" onchange="gdRefreshNetMetrics()">
+          <option value="1" selected>Last 1 hour</option>
+          <option value="24">Last 24 hours</option>
+        </select>
+        <button id="gd-net-refresh-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshNetMetrics()">Refresh</button>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Live TAK Server CoT-fanout load. The <strong>:8089 send-queue</strong> is the leading indicator of fanout backpressure &mdash; if it climbs while CPU stays flat, the bottleneck is the NIC / TCP send path, not compute. Sampled every 30&ndash;60s by the Guard Dog metrics collector.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:16px">
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Connected clients</div><span id="gd-net-clients" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">:8089 send-queue (live)</div><span id="gd-net-txq" style="font-weight:600;font-size:14px">—</span><span id="gd-net-stalled" style="font-size:10px;color:var(--text-dim);margin-left:6px"></span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Host TX</div><span id="gd-net-tx" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">JVM heap (used)</div><span id="gd-net-heap" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <div style="font-size:11px;color:var(--text-secondary);margin:4px 0 4px">TAK fanout send-queue &mdash; :8089 (<span style="color:#06b6d4">sum</span> / <span style="color:#ef4444">max one client</span>, bytes queued to clients)</div>
+    <div style="position:relative;height:130px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-net-chart-txq" style="width:100%;height:100%"></canvas>
+      <div id="gd-net-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — collector produces its first sample within ~1 min</div>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45"><strong style="color:var(--text-secondary)">How to read:</strong> flat and near the bottom = the server is keeping up with fanout. A line that <strong>climbs and stays up</strong> = TAK is producing position updates faster than the network can send them (clients start lagging or dropping) — your fanout ceiling, even if CPU/RAM look fine. If the <span style="color:#ef4444">red dashed</span> line is high but <span style="color:#06b6d4">cyan</span> is low, it's <em>one</em> slow client, not the whole server. <strong>Stalled</strong> connections (a queue that hasn't moved across samples — e.g. an idle Node-RED feed or a dropped client still holding a buffer) are <em>excluded</em> from this line and counted in the tile above, so leftover sockets don't masquerade as live backpressure.</div>
+    <div style="font-size:11px;color:var(--text-secondary);margin:14px 0 4px">External network throughput &mdash; <span style="color:#06b6d4">TX</span> / <span style="color:#f59e0b">RX</span> (bytes/s)</div>
+    <div style="position:relative;height:100px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-net-chart-thru" style="width:100%;height:100%"></canvas>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45"><strong style="color:var(--text-secondary)">How to read:</strong> on a fanout server <span style="color:#06b6d4">TX</span> (out) should be much larger than <span style="color:#f59e0b">RX</span> (in) — one position comes in, a copy goes out to every other client. Watch whether TX grows <em>in step</em> with the client count (normal) or <em>faster</em> than it (you're approaching the network ceiling).</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px">
+      <div>
+        <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">Connected clients</div>
+        <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <canvas id="gd-net-chart-clients" style="width:100%;height:100%"></canvas>
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45">Live streaming clients right now. The baseline you compare everything else against — TX and the send-queue should scale with this.</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">JVM heap &mdash; used (MB)</div>
+        <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <canvas id="gd-net-chart-heap" style="width:100%;height:100%"></canvas>
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45">TAK Server's Java memory. A <strong>sawtooth</strong> (climbs, then drops on garbage collection) is healthy. A line that climbs toward the top and never drops back = memory pressure.</div>
+      </div>
     </div>
   </div>
   {% endif %}
@@ -27244,7 +27512,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title">Access</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
-<a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':' + str(portal_port) }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :{{ portal_port }}{% endif %}</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':' + str(portal_port) }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :{{ portal_port }}{% endif %}</a>
 <a href="{{ authentik_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 Authentik{% if not settings.get('fqdn') %} :9090{% endif %}</a>
 <a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
@@ -27257,7 +27525,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div><span style="color:var(--text-dim)">TAK Server:</span> <span style="color:var(--cyan)">{{ takserver_base_url }}:8443</span></div>
 <div><span style="color:var(--text-dim)">Authentik URL:</span> <span style="color:var(--cyan)">{{ authentik_base_url }}</span></div>
 <div><span style="color:var(--text-dim)">Forward Auth:</span> <span style="color:var(--green)">{{ 'Enabled via Caddy' if settings.get('fqdn') else 'Disabled (no FQDN)' }}</span></div>
-<div><span style="color:var(--text-dim)">Self-Service Enrollment:</span> <span style="color:var(--cyan)">{{ 'https://takportal.' + settings.get('fqdn') + '/request-access' if settings.get('fqdn') else 'http://' + settings.get('server_ip','') + ':3000/request-access' }}</span></div>
+<div><span style="color:var(--text-dim)">Self-Service Enrollment:</span> <span style="color:var(--cyan)">{{ 'https://' + service_domain('takportal') + '/request-access' if settings.get('fqdn') else 'http://' + settings.get('server_ip','') + ':3000/request-access' }}</span></div>
 <div style="margin-top:8px;font-size:11px;color:var(--text-dim)">Users created in TAK Portal flow through Authentik → LDAP → TAK Server automatically</div>
 </div>
 </div>
@@ -27474,7 +27742,7 @@ function pollDeployLog(){
             if(btn){btn.textContent='\u2713 Deployment Complete';btn.style.background='var(--green)';btn.style.opacity='1';btn.style.cursor='default';}
             var el=document.getElementById('deploy-log');
             var fqdn=window.location.hostname.replace(/^[^.]+\./,'');
-            var portalUrl='https://takportal.'+fqdn;
+            var portalUrl={% if settings.get('fqdn') %}'https://{{ service_domain('takportal') }}'{% else %}'https://takportal.'+fqdn{% endif %};
             var refreshBtn=document.createElement('button');
             refreshBtn.textContent='\u21bb Refresh Page';
             refreshBtn.style.cssText='display:block;width:100%;padding:12px;margin-top:16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;';
@@ -33853,12 +34121,16 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
             plog("  proxy external_hosts: no FQDN configured — skip")
             return
         base = fqdn.split(':')[0]
+        # Build from _get_service_domain so a custom Caddy domain override (e.g.
+        # portal.<fqdn> instead of takportal.<fqdn>) is honored. Hardcoding the
+        # default prefix here used to revert the operator's external_host on every
+        # startup, breaking forward auth on the custom host (GH #41).
         canonical = {
-            'TAK Portal Proxy': f'https://takportal.{base}',
-            'Node-RED Proxy':   f'https://nodered.{base}',
-            'MediaMTX':         f'https://stream.{base}',
-            'infra-TAK':        f'https://infratak.{base}',
-            'Federation Hub Proxy': f'https://fedhub.{base}',
+            'TAK Portal Proxy': f"https://{_get_service_domain(_settings, 'takportal')}",
+            'Node-RED Proxy':   f"https://{_get_service_domain(_settings, 'nodered')}",
+            'MediaMTX':         f"https://{_get_service_domain(_settings, 'mediamtx')}",
+            'infra-TAK':        f"https://{_get_service_domain(_settings, 'infratak')}",
+            'Federation Hub Proxy': f"https://{_get_service_domain(_settings, 'fedhub')}",
         }
 
         _token = (
@@ -37948,7 +38220,7 @@ entries:
                                 'name': 'TAK Portal Proxy',
                                 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk or flow_pk,
-                                'external_host': f'https://takportal.{fqdn}',
+                                'external_host': f"https://{_get_service_domain(settings, 'takportal')}",
                                 'mode': 'forward_single',
                                 'token_validity': 'hours=24',
                                 'cookie_domain': f'.{base_domain}'
@@ -38045,7 +38317,7 @@ entries:
                             plog(f"  ⚠ Outpost config: {str(e)[:100]}")
 
                     if _is_module_deployed(settings, 'takportal'):
-                        plog(f"  ✓ Forward auth ready for takportal.{fqdn}")
+                        plog(f"  ✓ Forward auth ready for {_get_service_domain(settings, 'takportal')}")
 
                     # Create Node-RED app in Authentik only when Node-RED is deployed (so launcher shows only deployed modules)
                     if _is_module_deployed(settings, 'nodered'):
@@ -38421,7 +38693,7 @@ body{display:flex;min-height:100vh}
 {% endif %}
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
 <a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px;display:inline-flex;align-items:center;gap:6px" title="Open Authentik admin interface"><img src="{{ authentik_logo_url }}" alt="" style="width:18px;height:18px;object-fit:contain">Authentik{% if not settings.get('fqdn') %} :{{ ak_port }}{% endif %}</a>
-<a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
 <a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
 </div>
@@ -49190,6 +49462,14 @@ function startWarmup(){
 <div class="card" style="max-width:560px">
 <div class="card-title">Deploy WebODM{% if wo_deploy_cfg.target_mode == 'remote' and wo_deploy_cfg.remote.host %} <span style="font-size:10px;color:var(--cyan);font-weight:400;margin-left:6px">→ {{ wo_deploy_cfg.remote.host }}</span>{% endif %}</div>
 <div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will pull WebODM images (~1.5 GB), start all containers, clone the TAK overlay plugin, and register the NodeODM processing node. Takes 3–8 minutes on first deploy.</div>
+<div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:20px;background:rgba(30,39,54,.35)">
+  <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:4px">ODM resource limit</div>
+  <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">Caps the ODM processing container so a job can't starve the TAK stack. Leave blank for auto. ODM is hard-capped at {{ odm_max_cores }} cores fleet-wide.</div>
+  <div style="display:flex;gap:10px">
+    <div class="form-group" style="flex:1;margin-bottom:0"><label class="form-label">CPU cores</label><input class="form-input" id="wo-odm-cpus" type="number" min="1" max="{{ odm_max_cores }}" value="{{ wo_deploy_cfg.odm_cpus or '' }}" placeholder="auto (cores − 2, max {{ odm_max_cores }})"></div>
+    <div class="form-group" style="flex:1;margin-bottom:0"><label class="form-label">Memory (GB)</label><input class="form-input" id="wo-odm-mem" type="number" min="2" value="{{ wo_deploy_cfg.odm_mem_g or '' }}" placeholder="auto (cores + 2)"></div>
+  </div>
+</div>
 <button class="btn btn-primary" onclick="startDeploy()" id="deploy-btn">
 <span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy WebODM
 </button>
@@ -49220,27 +49500,29 @@ function _woCfg(extraMode){
       ssh_port:parseInt((document.getElementById('wo-ssh-port')||{}).value||22,10)||22,
       auth_method:(document.getElementById('wo-auth-method')||{}).value||'ssh_key',
       ssh_key_path:(document.getElementById('wo-ssh-key-path')||{}).value||'',
-      ssh_password:(document.getElementById('wo-ssh-password')||{}).value||''}};
+      ssh_password:(document.getElementById('wo-ssh-password')||{}).value||''},
+    odm_cpus:(document.getElementById('wo-odm-cpus')||{}).value||'',
+    odm_mem_g:(document.getElementById('wo-odm-mem')||{}).value||''};
 }
 function woSaveConfig(mode){
   woMsg('Saving…');
   fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg(mode)}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'Saved':'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){var ok=d&&!d.error;woMsg(ok?'Saved':'Error: '+((d&&d.error)||'failed'),ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woEnsureSshKey(){
   woMsg('Generating key…');
   fetch('/api/webodm/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woInstallSshKey(){
   woMsg('Installing key…');
   fetch('/api/webodm/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woTestSsh(){
   woMsg('Testing…');
   fetch('/api/webodm/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'✓ Connected':'✗ '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?'✓ Connected':'✗ '+(d.error||d.output||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 </script>
 
@@ -49336,8 +49618,12 @@ function woTestSsh(){
 <script>
 function startDeploy(){
     var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;
-    var st=document.getElementById('deploy-status');if(st)st.textContent='Starting deploy…';
-    fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
+    var st=document.getElementById('deploy-status');if(st)st.textContent='Saving config…';
+    // Persist deployment config (incl. ODM resource caps) before kicking off the deploy,
+    // which reads the saved webodm_deployment cfg and takes no request body.
+    fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+      .then(function(){if(st)st.textContent='Starting deploy…';return fetch('/api/webodm/deploy',{method:'POST'});})
+      .then(r=>r.json()).then(d=>{
         if(d.success){window.location.reload();}
         else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
     }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
@@ -50322,7 +50608,7 @@ function takPurgeFailed(){
 <div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
 <a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
-<a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
 <a href="{{ authentik_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 Authentik{% if not settings.get('fqdn') %} :9090{% endif %}</a>
 </div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">8446 login: <span style="color:var(--cyan)">webadmin</span> · <button type="button" onclick="showWebadminPassword()" id="webadmin-pw-btn" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">🔑 Show Password</button> <span id="webadmin-pw-display" style="color:var(--green);user-select:all;display:none"></span></div>
@@ -51357,6 +51643,75 @@ def _startup_harden_fedhub_ports():
 threading.Thread(target=_startup_harden_fedhub_ports, daemon=True).start()
 
 
+def _startup_ensure_metrics_collector():
+    """v0.9.47: ensure the Guard Dog network/fanout metrics collector is installed + running
+    whenever Guard Dog is already deployed — on EVERY console boot, so a plain pull+restart
+    (not just 'Update Now') self-installs it. Daemon thread so it never blocks boot.
+
+    Race-proof: the applied-version marker is written ONLY after the restart is confirmed live.
+    A rapid double console-restart can kill this daemon thread after it copies the new script but
+    before it recycles the process (leaving the running collector on stale code); the unwritten
+    marker makes the NEXT boot retry the restart instead of treating disk==disk as 'done'."""
+    try:
+        import hashlib
+        if not (os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak')):
+            return
+        src = os.path.join(BASE_DIR, 'scripts', 'guarddog', 'tak-metrics-collector.py')
+        if not os.path.isfile(src):
+            return
+        new_src = open(src).read()
+        # Version = hash of script + unit, so a change to either re-applies. Marker tracks what
+        # the RUNNING service was last confirmed on — NOT what's merely on disk.
+        want = hashlib.sha1((new_src + _METRICS_COLLECTOR_UNIT).encode()).hexdigest()
+        marker = '/opt/tak-guarddog/.metrics_collector_applied'
+        try:
+            have = open(marker).read().strip()
+        except Exception:
+            have = ''
+        active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'tak-metrics-collector.service']),
+                                capture_output=True, text=True, timeout=5).stdout.strip() == 'active'
+        if want == have and active:
+            return  # current version already applied AND running — no churn on every boot
+        # (re)install: script
+        with open('/opt/tak-guarddog/tak-metrics-collector.py', 'w') as f:
+            f.write(new_src)
+        # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Merge — never
+        # clobber two_server keys.
+        conf_path = '/opt/tak-guarddog/guarddog.conf'
+        try:
+            conf = json.load(open(conf_path)) if os.path.exists(conf_path) else {}
+        except Exception:
+            conf = {}
+        cp = _get_tak_cert_password(load_settings())
+        if cp and conf.get('tak_cert_pass') != cp:
+            conf['tak_cert_pass'] = cp
+            with open(conf_path, 'w') as f:
+                json.dump(conf, f)
+            os.chmod(conf_path, 0o600)
+        # systemd unit
+        unit_path = '/etc/systemd/system/tak-metrics-collector.service'
+        if (open(unit_path).read() if os.path.exists(unit_path) else None) != _METRICS_COLLECTOR_UNIT:
+            with open(unit_path, 'w') as f:
+                f.write(_METRICS_COLLECTOR_UNIT)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'tak-metrics-collector.service']), capture_output=True, timeout=15)
+        # Confirm the restart actually took BEFORE recording the applied version — else retry next boot.
+        time.sleep(2)
+        now_active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'tak-metrics-collector.service']),
+                                    capture_output=True, text=True, timeout=5).stdout.strip() == 'active'
+        if now_active:
+            with open(marker, 'w') as f:
+                f.write(want)
+            print("Startup migration: Guard Dog metrics collector applied %s + restarted" % want[:7])
+        else:
+            print("Startup migration: metrics collector restart not confirmed active — will retry next boot")
+    except Exception as _e:
+        print(f"Startup migration: metrics collector ensure error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_ensure_metrics_collector, daemon=True).start()
+
+
 # v0.9.12: self-heal the v0.9.2 reputation-policy misconfiguration that blocks
 # ALL LDAP authentication. The original v0.9.2 shipped:
 #   ReputationPolicy(check_ip=True, check_username=True)
@@ -52304,10 +52659,41 @@ def _startup_migrations():
                         '- WO_BROKER=redis://wo_broker',
                         '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
                     )
+                # GH #32 self-heal: normalize the wo_nodeodm block to the fleet ODM cap —
+                # cpus + mem_limit (host protection) + --max_concurrency (NodeODX thread cap
+                # so a job COMPLETES within the cap instead of spawning host-core-count
+                # threads and OOM-killing). Boxes deployed before the cap landed get it here
+                # on the next console restart — no redeploy. Idempotent: the regex rewrites
+                # the wo_nodeodm block to target, so an already-capped box produces no diff
+                # (the write+recreate below only fires when the file actually changed).
+                _wo_cap_changed = False
+                _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
+                if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
+                    _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
+                    _wo_nodeodm_block = (
+                        '  wo_nodeodm:\n'
+                        '    image: webodm/nodeodx\n'
+                        '    container_name: wo_nodeodm\n'
+                        f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
+                        f'    cpus: {_wo_cpus}\n'
+                        f'    mem_limit: {_wo_mem}g\n'
+                        '    restart: unless-stopped\n'
+                        '    oom_score_adj: 250\n'
+                    )
+                    _wo_before_cap = _wo_patched
+                    _wo_patched = _re_wo.sub(
+                        r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
+                        lambda _m: _wo_nodeodm_block,
+                        _wo_patched,
+                        count=1,
+                    )
+                    _wo_cap_changed = (_wo_patched != _wo_before_cap)
                 if _wo_patched != _wo_txt:
                     with open(_wo_compose, 'w') as _f:
                         _f.write(_wo_patched)
                     print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
+                    if _wo_cap_changed:
+                        print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
                     import subprocess as _sp_wo
                     _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
                                capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
