@@ -7423,6 +7423,14 @@ def guarddog_send_sms():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
+# v0.9.47: shared so the deploy path and the boot self-heal can't drift.
+_METRICS_COLLECTOR_UNIT = ('[Unit]\nDescription=Guard Dog Network/Fanout Metrics Collector\n'
+                           'After=network.target takserver.service docker.service\n\n'
+                           '[Service]\nType=simple\n'
+                           'ExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-metrics-collector.py\n'
+                           'Restart=always\nRestartSec=15\n\n'
+                           '[Install]\nWantedBy=multi-user.target\n')
+
 def run_guarddog_deploy(alert_email):
     """Deploy Guard Dog: monitors + health endpoint. Requires TAK Server at /opt/tak. Alert email optional (alerts only when set)."""
     def plog(msg):
@@ -7566,7 +7574,7 @@ def run_guarddog_deploy(alert_email):
             ('takintcaguard.service', '[Unit]\nDescription=TAK Intermediate CA Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-intca-watch.sh\n'),
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
-            ('tak-metrics-collector.service', '[Unit]\nDescription=Guard Dog Network/Fanout Metrics Collector\nAfter=network.target takserver.service docker.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-metrics-collector.py\nRestart=always\nRestartSec=15\n\n[Install]\nWantedBy=multi-user.target\n'),
+            ('tak-metrics-collector.service', _METRICS_COLLECTOR_UNIT),
             ('tak-post-start.service', '[Unit]\nDescription=Guard Dog Post-Start Orchestrator (starts Authentik, TAK Portal, CloudTAK after TAK)\nAfter=takserver.service docker.service\nWants=takserver.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=1200\nExecStart=/opt/tak-guarddog/tak-post-start.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
         ]
         # Two-server: remote DB monitor instead of local PG monitors
@@ -51515,6 +51523,58 @@ def _startup_harden_fedhub_ports():
         print(f"Startup migration: Fed Hub port harden error (non-fatal): {_e}")
 
 threading.Thread(target=_startup_harden_fedhub_ports, daemon=True).start()
+
+
+def _startup_ensure_metrics_collector():
+    """v0.9.47: ensure the Guard Dog network/fanout metrics collector is installed + running
+    whenever Guard Dog is already deployed — on EVERY console boot, so a plain pull+restart
+    (not just 'Update Now') self-installs it. Idempotent; daemon thread so it never blocks boot.
+    Only refreshes/(re)starts when the script, unit, or cert-pass actually changed."""
+    try:
+        if not (os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak')):
+            return
+        src = os.path.join(BASE_DIR, 'scripts', 'guarddog', 'tak-metrics-collector.py')
+        if not os.path.isfile(src):
+            return
+        changed = False
+        # 1. script
+        dest = '/opt/tak-guarddog/tak-metrics-collector.py'
+        new_src = open(src).read()
+        if (open(dest).read() if os.path.exists(dest) else None) != new_src:
+            with open(dest, 'w') as f:
+                f.write(new_src)
+            changed = True
+        # 2. cert pass in guarddog.conf (older deploys lack it → Marti scrape would no-op).
+        #    Merge — never clobber two_server keys.
+        conf_path = '/opt/tak-guarddog/guarddog.conf'
+        try:
+            conf = json.load(open(conf_path)) if os.path.exists(conf_path) else {}
+        except Exception:
+            conf = {}
+        cp = _get_tak_cert_password(load_settings())
+        if cp and conf.get('tak_cert_pass') != cp:
+            conf['tak_cert_pass'] = cp
+            with open(conf_path, 'w') as f:
+                json.dump(conf, f)
+            os.chmod(conf_path, 0o600)
+            changed = True
+        # 3. systemd unit
+        unit_path = '/etc/systemd/system/tak-metrics-collector.service'
+        if (open(unit_path).read() if os.path.exists(unit_path) else None) != _METRICS_COLLECTOR_UNIT:
+            with open(unit_path, 'w') as f:
+                f.write(_METRICS_COLLECTOR_UNIT)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+            changed = True
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, timeout=10)
+        active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'tak-metrics-collector.service']),
+                                capture_output=True, text=True, timeout=5)
+        if changed or active.stdout.strip() != 'active':
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'tak-metrics-collector.service']), capture_output=True, timeout=10)
+            print("Startup migration: Guard Dog metrics collector installed/refreshed + (re)started")
+    except Exception as _e:
+        print(f"Startup migration: metrics collector ensure error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_ensure_metrics_collector, daemon=True).start()
 
 
 # v0.9.12: self-heal the v0.9.2 reputation-policy misconfiguration that blocks
