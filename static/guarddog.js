@@ -220,13 +220,14 @@ function gdRefreshNetMetrics(){
   var card=document.getElementById('gd-netfanout-card');if(!card)return;
   var sel=document.getElementById('gd-net-range-sel');var hours=sel?sel.value:'1';
   var rbtn=document.getElementById('gd-net-refresh-btn');if(rbtn){rbtn.disabled=true;rbtn.textContent='Refreshing…';}
-  Promise.all([gdNetGet('tcp_tx_queue',hours),gdNetGet('tcp_tx_queue_max',hours),gdNetGet('host_tx',hours),gdNetGet('host_rx',hours),gdNetGet('clients',hours),gdNetGet('heap',hours)]).then(function(res){
-    var txq=res[0],txqmax=res[1],htx=res[2],hrx=res[3],cli=res[4],heap=res[5];
+  Promise.all([gdNetGet('tcp_tx_queue_active',hours),gdNetGet('tcp_tx_queue_active_max',hours),gdNetGet('host_tx',hours),gdNetGet('host_rx',hours),gdNetGet('clients',hours),gdNetGet('heap',hours),gdNetGet('tcp_stalled_conns',hours)]).then(function(res){
+    var txq=res[0],txqmax=res[1],htx=res[2],hrx=res[3],cli=res[4],heap=res[5],stall=res[6];
     var empty=document.getElementById('gd-net-empty');
     var has=txq&&txq.entries&&txq.entries.length;
     if(empty){empty.style.display=has?'none':'flex';if(txq&&txq.deployed===false)empty.textContent='Metrics collector not deployed yet — redeploy Guard Dog (or restart the console).';}
     var elC=document.getElementById('gd-net-clients');if(elC){var c=gdLastV(cli);elC.textContent=c!=null?Math.round(c):'—';}
     var elQ=document.getElementById('gd-net-txq');if(elQ){var q=gdLastV(txq);elQ.textContent=gdFmtBytes(q);if(q!=null)elQ.style.color=q>1048576?'var(--red)':q>262144?'var(--yellow)':'var(--green)';}
+    var elS=document.getElementById('gd-net-stalled');if(elS){var sc=gdLastV(stall);elS.textContent=(sc!=null&&sc>0)?('('+Math.round(sc)+' stalled excl.)'):'';}
     var elT=document.getElementById('gd-net-tx');if(elT){var t=gdLastV(htx);elT.textContent=t!=null?gdFmtBytes(t)+'/s':'—';}
     var elH=document.getElementById('gd-net-heap');if(elH){var hp=gdLastV(heap);elH.textContent=hp!=null?Math.round(hp)+' MB':'—';}
     gdDrawSeriesChart('gd-net-chart-txq',[{entries:(txq&&txq.entries)||[],color:'#06b6d4',fill:true},{entries:(txqmax&&txqmax.entries)||[],color:'#ef4444',dash:true}],{fmt:gdFmtBytes});

@@ -28,6 +28,8 @@ RETENTION_DAYS = 7         # raw-only; prune hourly
 PRUNE_EVERY    = 3600
 TAK_PORT       = 8089
 TAK_PORT_HEX   = '%04X' % TAK_PORT            # 8089 -> '1F99'  (NOT 0x1999)
+STALL_FLOOR    = 4096   # bytes; below this a constant queue is noise, not a stuck client
+STALL_SAMPLES  = 2      # consecutive unchanged reads before a connection counts as "stalled"
 MARTI_SUBS_URL = 'https://127.0.0.1:8443/Marti/api/subscriptions/all'  # data[] = live streaming clients
 ADMIN_P12      = '/opt/tak/certs/files/admin.p12'
 ADMIN_PEM      = '/opt/tak-guarddog/_marti_admin.pem'
@@ -39,7 +41,8 @@ CREATE TABLE IF NOT EXISTS host_net(ts INT, rx_bytes_s REAL, tx_bytes_s REAL,
 CREATE TABLE IF NOT EXISTS bridge_net(ts INT, iface TEXT, network_name TEXT,
   rx_bytes_s REAL, tx_bytes_s REAL);
 CREATE TABLE IF NOT EXISTS tcp_queue(ts INT, port INT, conn_count INT,
-  tx_queue_sum INT, tx_queue_max INT, rx_queue_sum INT, rx_queue_max INT);
+  tx_queue_sum INT, tx_queue_max INT, rx_queue_sum INT, rx_queue_max INT,
+  tx_queue_active INT, tx_queue_active_max INT, stalled_conns INT);
 CREATE TABLE IF NOT EXISTS docker_stats(ts INT, container TEXT, cpu_pct REAL, mem_mb REAL,
   net_rx_bytes_s REAL, net_tx_bytes_s REAL, blk_read_mb_s REAL, blk_write_mb_s REAL);
 CREATE TABLE IF NOT EXISTS host_sys(ts INT, cpu_pct REAL, mem_used_mb INT, mem_avail_mb INT,
@@ -101,28 +104,25 @@ def read_net_dev():
         pass
     return out
 
-def read_tcp_queue():
-    """Aggregate tx_queue/rx_queue over ESTABLISHED conns on :8089 (v4+v6)."""
-    conn = tx_sum = tx_max = rx_sum = rx_max = 0
+def read_tcp_conns():
+    """Per-connection send/recv queue for ESTABLISHED conns on :8089 (v4+v6).
+    Returns {remote_hex: (tx_queue, rx_queue)} keyed on the remote ADDR:PORT (unique per conn)."""
+    out = {}
     for path in ('/proc/net/tcp', '/proc/net/tcp6'):
         try:
             with open(path) as f:
                 next(f)
                 for line in f:
                     p = line.split()
-                    local = p[1]                       # ADDR:PORT (hex)
-                    if local.rsplit(':', 1)[1].upper() != TAK_PORT_HEX:
+                    if p[1].rsplit(':', 1)[1].upper() != TAK_PORT_HEX:   # local port == 8089
                         continue
-                    if p[3] != '01':                   # 01 = ESTABLISHED
+                    if p[3] != '01':                                     # 01 = ESTABLISHED
                         continue
                     txq, rxq = p[4].split(':')
-                    txq, rxq = int(txq, 16), int(rxq, 16)
-                    conn += 1
-                    tx_sum += txq; rx_sum += rxq
-                    tx_max = max(tx_max, txq); rx_max = max(rx_max, rxq)
+                    out[p[2]] = (int(txq, 16), int(rxq, 16))             # key = remote ADDR:PORT
         except Exception:
             pass
-    return conn, tx_sum, tx_max, rx_sum, rx_max
+    return out
 
 def docker_bridge_map():
     """Map bridge iface -> docker network name. Best-effort; falls back to iface name."""
@@ -291,6 +291,12 @@ def main():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     db = sqlite3.connect(DB_PATH)
     db.executescript(SCHEMA)
+    # Migrate older DBs: add the stalled-vs-active columns if the table predates them.
+    for _col in ('tx_queue_active', 'tx_queue_active_max', 'stalled_conns'):
+        try:
+            db.execute("ALTER TABLE tcp_queue ADD COLUMN %s INT DEFAULT 0" % _col)
+        except Exception:
+            pass
     db.commit()
 
     conf = _conf()
@@ -301,6 +307,7 @@ def main():
     prev_dev = read_net_dev()
     prev_docker = read_docker_stats()
     prev_cpu = (None, None)
+    prev_tcp = {}              # remote_hex -> (tx_queue, unchanged_streak) for stall detection
     last_slow = 0
     last_prune = 0
     last_bridge_refresh = _now()
@@ -320,9 +327,26 @@ def main():
                  (c['rx_pkts']-p['rx_pkts'])/dt, (c['tx_pkts']-p['tx_pkts'])/dt,
                  c['rx_drops'], c['tx_drops'], c['rx_errors'], c['tx_errors']))
 
-        conn, txs, txm, rxs, rxm = read_tcp_queue()
-        db.execute("INSERT INTO tcp_queue VALUES (?,?,?,?,?,?,?)",
-                   (ts, TAK_PORT, conn, txs, txm, rxs, rxm))
+        # Classify each :8089 connection. A queue that's been constant for STALL_SAMPLES reads
+        # is a stuck/idle client (dead socket, or a passive client like Node-RED holding a buffer);
+        # exclude it from the "active" backpressure figure so the headline reflects LIVE fanout.
+        cur_tcp = read_tcp_conns()
+        txs = txm = rxs = rxm = 0
+        act_sum = act_max = stalled_n = 0
+        new_prev = {}
+        for rem, (txq, rxq) in cur_tcp.items():
+            txs += txq; rxs += rxq
+            txm = max(txm, txq); rxm = max(rxm, rxq)
+            pv = prev_tcp.get(rem)
+            streak = (pv[1] + 1) if (pv and pv[0] == txq) else 0
+            new_prev[rem] = (txq, streak)
+            if txq >= STALL_FLOOR and streak >= STALL_SAMPLES:
+                stalled_n += 1
+            else:
+                act_sum += txq; act_max = max(act_max, txq)
+        prev_tcp = new_prev
+        db.execute("INSERT INTO tcp_queue VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (ts, TAK_PORT, len(cur_tcp), txs, txm, rxs, rxm, act_sum, act_max, stalled_n))
 
         # ---- SLOW: bridge_net, docker_stats, host_sys, marti ----
         if ts - last_slow >= SLOW_INTERVAL:
