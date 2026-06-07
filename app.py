@@ -18505,6 +18505,35 @@ def cesium_tiles_delete(name):
 
 # ── WebODM ───────────────────────────────────────────────────────────────────
 
+# WebODM ODM (NodeODX) resource ceiling — fleet-uniform safety cap. A co-located ODM
+# job must never starve/OOM the rest of the TAK stack. mem_limit is the OOM backstop:
+# Docker kills the ODM container, never the host. Field guidance: Tom Endress, 2026-06
+# ("hard-cap webODM's docker container … max ~6 cores … I'd hate to see it OOM a TAKStack").
+ODM_MAX_CORES      = 6   # fleet ceiling — the single knob to retune fleet-wide
+ODM_CORE_RESERVE   = 2   # cores always left for OS + co-located services
+ODM_MEM_PER_CORE_G = 1   # NodeODX peak ~1GB/thread @ 2MP (per NodeODX max-concurrency help)
+ODM_MEM_HEADROOM_G = 2   # GB above the per-core estimate
+
+
+def _webodm_odm_limits(detected_cores, cfg):
+    """(cpus, mem_g) for the wo_nodeodm container. Operator override (hard-clamped to the
+    fleet ceiling) or auto-tune from detected cores. Always recomputes the target —
+    never max(cur, target), so the fleet converges (CLAUDE.md fleet-uniform rule)."""
+    cfg = cfg or {}
+    auto = max(1, min(int(detected_cores or 1) - ODM_CORE_RESERVE, ODM_MAX_CORES))
+    try:
+        cpus = int(cfg.get('odm_cpus')) if str(cfg.get('odm_cpus') or '').strip() else auto
+    except (TypeError, ValueError):
+        cpus = auto
+    cpus = max(1, min(cpus, ODM_MAX_CORES))          # hard fleet clamp
+    try:
+        mem = int(cfg.get('odm_mem_g')) if str(cfg.get('odm_mem_g') or '').strip() else \
+              cpus * ODM_MEM_PER_CORE_G + ODM_MEM_HEADROOM_G
+    except (TypeError, ValueError):
+        mem = cpus * ODM_MEM_PER_CORE_G + ODM_MEM_HEADROOM_G
+    return cpus, max(2, mem)
+
+
 WEBODM_DOCKER_COMPOSE = '''version: '2.4'
 volumes:
   wo_dbdata:
@@ -18566,6 +18595,8 @@ services:
   wo_nodeodm:
     image: webodm/nodeodx
     container_name: wo_nodeodm
+    cpus: {wo_odm_cpus}
+    mem_limit: {wo_odm_mem}g
     restart: unless-stopped
     oom_score_adj: 250
 '''
@@ -18635,8 +18666,17 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     # Write compose file locally, scp to remote
     plog('━━━ Writing docker-compose.yml ━━━')
     wo_secret = _sec.token_hex(32)
+    # ODM resource cap (GH #32) — detect remote core count, then apply the fleet ceiling.
+    _okc, _np = _module_run(deploy_cfg, 'nproc 2>/dev/null || echo 4', timeout=10)
+    try:
+        _cores = int((_np or '4').strip() or 4) if _okc else 4
+    except (TypeError, ValueError):
+        _cores = 4
+    _odm_cpus, _odm_mem = _webodm_odm_limits(_cores, deploy_cfg)
+    plog(f'  ODM cap: {_odm_cpus} cores / {_odm_mem}g (host {_cores} cores, ceiling {ODM_MAX_CORES})')
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
-        wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret)
+        wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
+        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem)
     # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
@@ -18789,10 +18829,16 @@ def _run_webodm_deploy(settings):
 
         plog('Writing docker-compose.yml…')
         wo_secret = _sec.token_hex(32)
+        # ODM resource cap (GH #32) — local core count, then the fleet ceiling.
+        _odm_cores = os.cpu_count() or 4
+        _odm_cpus, _odm_mem = _webodm_odm_limits(_odm_cores, deploy_cfg)
+        plog(f'ODM cap: {_odm_cpus} cores / {_odm_mem}g (host {_odm_cores} cores, ceiling {ODM_MAX_CORES})')
         compose_content = WEBODM_DOCKER_COMPOSE.format(
             wo_dir=wo_dir,
             wo_port=wo_port,
             wo_secret=wo_secret,
+            wo_odm_cpus=_odm_cpus,
+            wo_odm_mem=_odm_mem,
         )
         with open(compose_path, 'w') as f:
             f.write(compose_content)
@@ -18885,6 +18931,7 @@ def webodm_page():
         wo_url=wo_url,
         wo_host=wo_host,
         wo_deploy_cfg=wo_deploy_cfg,
+        odm_max_cores=ODM_MAX_CORES,
         deploying=_webodm_deploy_status.get('running', False),
         deploy_done=_webodm_deploy_status.get('complete', False),
         deploy_error=_webodm_deploy_status.get('error', False),
@@ -49408,6 +49455,14 @@ function startWarmup(){
 <div class="card" style="max-width:560px">
 <div class="card-title">Deploy WebODM{% if wo_deploy_cfg.target_mode == 'remote' and wo_deploy_cfg.remote.host %} <span style="font-size:10px;color:var(--cyan);font-weight:400;margin-left:6px">→ {{ wo_deploy_cfg.remote.host }}</span>{% endif %}</div>
 <div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will pull WebODM images (~1.5 GB), start all containers, clone the TAK overlay plugin, and register the NodeODM processing node. Takes 3–8 minutes on first deploy.</div>
+<div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:20px;background:rgba(30,39,54,.35)">
+  <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:4px">ODM resource limit</div>
+  <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">Caps the ODM processing container so a job can't starve the TAK stack. Leave blank for auto. ODM is hard-capped at {{ odm_max_cores }} cores fleet-wide.</div>
+  <div style="display:flex;gap:10px">
+    <div class="form-group" style="flex:1;margin-bottom:0"><label class="form-label">CPU cores</label><input class="form-input" id="wo-odm-cpus" type="number" min="1" max="{{ odm_max_cores }}" value="{{ wo_deploy_cfg.odm_cpus or '' }}" placeholder="auto (cores − 2, max {{ odm_max_cores }})"></div>
+    <div class="form-group" style="flex:1;margin-bottom:0"><label class="form-label">Memory (GB)</label><input class="form-input" id="wo-odm-mem" type="number" min="2" value="{{ wo_deploy_cfg.odm_mem_g or '' }}" placeholder="auto (cores + 2)"></div>
+  </div>
+</div>
 <button class="btn btn-primary" onclick="startDeploy()" id="deploy-btn">
 <span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy WebODM
 </button>
@@ -49438,27 +49493,29 @@ function _woCfg(extraMode){
       ssh_port:parseInt((document.getElementById('wo-ssh-port')||{}).value||22,10)||22,
       auth_method:(document.getElementById('wo-auth-method')||{}).value||'ssh_key',
       ssh_key_path:(document.getElementById('wo-ssh-key-path')||{}).value||'',
-      ssh_password:(document.getElementById('wo-ssh-password')||{}).value||''}};
+      ssh_password:(document.getElementById('wo-ssh-password')||{}).value||''},
+    odm_cpus:(document.getElementById('wo-odm-cpus')||{}).value||'',
+    odm_mem_g:(document.getElementById('wo-odm-mem')||{}).value||''};
 }
 function woSaveConfig(mode){
   woMsg('Saving…');
   fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg(mode)}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'Saved':'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){var ok=d&&!d.error;woMsg(ok?'Saved':'Error: '+((d&&d.error)||'failed'),ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woEnsureSshKey(){
   woMsg('Generating key…');
   fetch('/api/webodm/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woInstallSshKey(){
   woMsg('Installing key…');
   fetch('/api/webodm/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woTestSsh(){
   woMsg('Testing…');
   fetch('/api/webodm/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'✓ Connected':'✗ '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?'✓ Connected':'✗ '+(d.error||d.output||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 </script>
 
@@ -49554,8 +49611,12 @@ function woTestSsh(){
 <script>
 function startDeploy(){
     var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;
-    var st=document.getElementById('deploy-status');if(st)st.textContent='Starting deploy…';
-    fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
+    var st=document.getElementById('deploy-status');if(st)st.textContent='Saving config…';
+    // Persist deployment config (incl. ODM resource caps) before kicking off the deploy,
+    // which reads the saved webodm_deployment cfg and takes no request body.
+    fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+      .then(function(){if(st)st.textContent='Starting deploy…';return fetch('/api/webodm/deploy',{method:'POST'});})
+      .then(r=>r.json()).then(d=>{
         if(d.success){window.location.reload();}
         else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
     }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
