@@ -28,7 +28,7 @@ RETENTION_DAYS = 7         # raw-only; prune hourly
 PRUNE_EVERY    = 3600
 TAK_PORT       = 8089
 TAK_PORT_HEX   = '%04X' % TAK_PORT            # 8089 -> '1F99'  (NOT 0x1999)
-MARTI_URL      = 'https://127.0.0.1:8443/Marti/api/metrics'
+MARTI_SUBS_URL = 'https://127.0.0.1:8443/Marti/api/subscriptions/all'  # data[] = live streaming clients
 ADMIN_P12      = '/opt/tak/certs/files/admin.p12'
 ADMIN_PEM      = '/opt/tak-guarddog/_marti_admin.pem'
 ADMIN_KEY      = '/opt/tak-guarddog/_marti_admin.key'
@@ -243,33 +243,48 @@ def ensure_admin_cert(cert_pass):
         os.chmod(ADMIN_PEM, 0o600); os.chmod(ADMIN_KEY, 0o600)
     return good
 
-def scrape_marti(cert_pass):
-    if not ensure_admin_cert(cert_pass):
-        return dict(heap_used_mb=0, heap_committed_mb=0, clients_connected=0, scrape_ok=0)
-    r = _run(['curl', '-sk', '--max-time', '8', '--cert', ADMIN_PEM, '--key', ADMIN_KEY, MARTI_URL])
-    if not r or r.returncode != 0 or not (r.stdout or '').strip():
-        # cert may have rotated — drop extracted copies so next loop re-extracts
-        for p in (ADMIN_PEM, ADMIN_KEY):
-            try: os.remove(p)
-            except OSError: pass
-        return dict(heap_used_mb=0, heap_committed_mb=0, clients_connected=0, scrape_ok=0)
+def read_jvm_heap():
+    """TAK messaging JVM heap via jcmd (no cert). Returns (used_mb, committed_mb) or (0,0).
+    TAK has no /Marti heap endpoint — jcmd GC.heap_info is the reliable source."""
     try:
-        d = json.loads(r.stdout)
+        pg = _run(['pgrep', '-f', 'spring.profiles.active=messaging'])
+        if not pg or not (pg.stdout or '').strip():
+            return 0, 0
+        pid = pg.stdout.split()[0]
+        r = _run(['jcmd', pid, 'GC.heap_info'], timeout=10)
+        out = (r.stdout if r else '') or ''
+        if 'heap' not in out:                       # attach may need the JVM's own uid
+            own = _run(['stat', '-c', '%U', '/proc/%s' % pid])
+            owner = (own.stdout.strip() if own else '')
+            if owner and owner != 'root':
+                r = _run(['sudo', '-u', owner, 'jcmd', pid, 'GC.heap_info'], timeout=10)
+                out = (r.stdout if r else '') or ''
+        m = re.search(r'total\s+(\d+)K,\s+used\s+(\d+)K', out)   # G1: "total 724992K, used 363455K"
+        if m:
+            return int(m.group(2)) // 1024, int(m.group(1)) // 1024   # used_mb, committed(total)_mb
     except Exception:
-        return dict(heap_used_mb=0, heap_committed_mb=0, clients_connected=0, scrape_ok=0)
-    # Marti metrics shape varies by TAK version — pull defensively by best-known keys.
-    def dig(obj, *keys):
-        for k in keys:
-            if isinstance(obj, dict) and k in obj:
-                return obj[k]
-        return None
-    heap_used = dig(d, 'heapUsed', 'jvmHeapUsed') or 0
-    heap_comm = dig(d, 'heapCommitted', 'jvmHeapCommitted') or 0
-    clients   = dig(d, 'numClients', 'clients', 'connectedClients') or 0
-    # heap values may be bytes — normalize to MB if large
-    hu = int(heap_used / 1e6) if heap_used and heap_used > 1e6 else int(heap_used or 0)
-    hc = int(heap_comm / 1e6) if heap_comm and heap_comm > 1e6 else int(heap_comm or 0)
-    return dict(heap_used_mb=hu, heap_committed_mb=hc, clients_connected=int(clients or 0), scrape_ok=1)
+        pass
+    return 0, 0
+
+def scrape_marti(cert_pass):
+    """Live connected-client count from Marti subscriptions/all + JVM heap from jcmd."""
+    clients, ok = 0, 0
+    if ensure_admin_cert(cert_pass):
+        r = _run(['curl', '-sk', '--max-time', '8', '--cert', ADMIN_PEM, '--key', ADMIN_KEY, MARTI_SUBS_URL])
+        if r and r.returncode == 0 and (r.stdout or '').strip():
+            try:
+                clients = len(json.loads(r.stdout).get('data', []))
+                ok = 1
+            except Exception:
+                ok = 0
+        if not ok:
+            # cert may have rotated / TAK down — drop extracted copies so next loop re-extracts
+            for p in (ADMIN_PEM, ADMIN_KEY):
+                try: os.remove(p)
+                except OSError: pass
+    heap_used, heap_comm = read_jvm_heap()
+    return dict(heap_used_mb=heap_used, heap_committed_mb=heap_comm,
+                clients_connected=clients, scrape_ok=ok)
 
 # ---- main loop -------------------------------------------------------------
 def main():
