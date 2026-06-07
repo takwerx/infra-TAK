@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.45-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.45-alpha)**
+**Current release: [v0.9.46-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.46-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.46-alpha — 2026-06-07 — Fed Hub co-location guard + split remote-server hardening
+
+**Headline: two areas, both surfaced by a field-reported split (two-server) deployment.** (1) **Federation Hub can no longer be deployed on the same OS as TAK Server.** The hub's JVM + MongoDB would contend with TAK Server's JVM + Postgres for RAM (MongoDB alone defaults to ~50% of system memory) and a single outage would take down both. The Deployment Target page now disables the "this machine" option and forces a separate SSH target when TAK Server is present — a dedicated console host with no TAK Server still deploys the hub locally; an already-deployed local hub is grandfathered with a migrate-recommended notice. (2) **Split-deployment security + reliability hardening.** The Guard Dog **Health Agent** on the remote DB server now turns green on private-LAN splits: its `:8080` UFW rule is scoped to the source IP the DB box *actually sees* from the console (`$SSH_CLIENT`), not a possibly-private configured `server_ip` — and a UFW rule-ordering bug (a `deny` appended *above* the `allow`, so first-match-wins kept blocking) is fixed. The remote **Postgres `5432`** and the **Federation Hub UI `8080`/`9100`** ports that earlier builds left `ALLOW Anywhere` (Postgres and the hub admin UI, incl. plaintext 8080, reachable from the internet) are now scoped to the console and denied to the world — the legacy broad allow that shadowed the deny is deleted, the core never loses its DB, and the Fed Hub firewall **re-converges on every console restart with no `.deb` update**. The Guard Dog **DB-auth** check no longer false-fails when the database password contains an XML-special character (`&`/`<`/`>`/`"`/`'`) — it decodes CoreConfig's XML entities like TAK's JDBC does, and surfaces the real PostgreSQL error (password vs `pg_hba` vs missing-db) instead of a blanket "rejected". And remote `VACUUM`/`REINDEX` no longer leak a harmless-but-alarming `could not change directory to "/root"` warning. Validated on three dev boxes (~95-min soak) plus the original field reporter's split deployment.
+
+Full notes: [v0.9.46-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.46-alpha).
 
 ### v0.9.45-alpha — 2026-06-06 — webadmin LDAP login on no-hairpin / self-hosted boxes
 

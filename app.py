@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.45-alpha"
+VERSION = "0.9.46-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -3355,10 +3355,19 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     # Also add an explicit `deny {db_port}/tcp` belt-and-braces so a future
     # `ufw allow` of that port (e.g. by an operator script) doesn't reopen the
     # surface unless the source-scope rule is matched first.
+    # v0.9.46: delete any legacy broad `allow {db_port}/tcp` (pre-v0.9.12 boxes still
+    # carry one; UFW is first-match-wins so it shadows the deny below, leaving Postgres
+    # open to the internet). Delete runs AFTER the scoped allow so the core never loses
+    # its DB; `delete allow` only removes the Anywhere rule, scoped allows survive.
+    # ORDER: delete any pre-existing deny FIRST (UFW appends + first-match-wins, so a
+    # stale deny would shadow the scoped allow), add the scoped allow, drop the broad
+    # allow, then re-add the deny LAST so it sits below the allow.
     ufw_cmd = (
         f'sudo ufw allow 22/tcp && '
         f'sudo ufw allow from {core_ip} to any port 22 proto tcp && '
+        f'(sudo ufw delete deny {db_port}/tcp || true) && '
         f'sudo ufw allow from {core_ip} to any port {db_port} proto tcp && '
+        f'(sudo ufw delete allow {db_port}/tcp || true) && '
         f'sudo ufw deny {db_port}/tcp && '
         'sudo ufw --force enable && sudo ufw reload'
     )
@@ -3436,15 +3445,13 @@ def _verify_server_one_db_password(s1_cfg, db_password, db_port=5432, db_user='m
     pw_q = shlex.quote((db_password or '').strip())
     user_q = shlex.quote((db_user or 'martiuser').strip() or 'martiuser')
     db_q = shlex.quote((db_name or 'cot').strip() or 'cot')
+    # v0.9.46: capture psql's real error (was 2>/dev/null) so a failure reports WHY —
+    # password-auth-failed vs no-pg_hba-entry vs missing-db — instead of a blanket "rejected".
     cmd = (
-        "if ! command -v psql >/dev/null 2>&1; then "
-        "echo NO_PSQL; "
-        f"elif PGPASSWORD={pw_q} psql -h 127.0.0.1 -p {port} -U {user_q} -d {db_q} -tAc \"select 1\" 2>/dev/null | "
-        "tr -d '[:space:]' | grep -qx 1; then "
-        "echo AUTH_OK; "
-        "else "
-        "echo AUTH_FAIL; "
-        "fi"
+        "if ! command -v psql >/dev/null 2>&1; then echo NO_PSQL; exit 0; fi; "
+        f"ERR=$(PGPASSWORD={pw_q} psql -h 127.0.0.1 -p {port} -U {user_q} -d {db_q} -tAc \"select 1\" 2>&1); "
+        "if echo \"$ERR\" | tr -d '[:space:]' | grep -qx 1; then echo AUTH_OK; "
+        "else echo \"AUTH_FAIL: $(echo \"$ERR\" | head -1)\"; fi"
     )
     ok, out = _ssh_probe(s1_cfg, cmd, timeout=15)
     out_s = (out or '').strip()
@@ -3454,7 +3461,14 @@ def _verify_server_one_db_password(s1_cfg, db_password, db_port=5432, db_user='m
         return True, 'DB auth verified on Server One'
     if 'NO_PSQL' in out_s:
         return False, 'psql not available on Server One for credential validation'
-    return False, 'DB password rejected by PostgreSQL on Server One'
+    low = out_s.lower()
+    if 'password authentication failed' in low:
+        return False, 'DB password rejected by PostgreSQL on Server One (password authentication failed)'
+    if 'pg_hba' in low:
+        return False, 'pg_hba.conf on Server One has no entry for the 127.0.0.1/martiuser loopback path — ' + out_s[:160]
+    if 'does not exist' in low:
+        return False, 'DB or role missing on Server One — ' + out_s[:160]
+    return False, ('DB auth failed on Server One — ' + out_s[:180]) if out_s else 'DB password rejected by PostgreSQL on Server One'
 
 
 @app.route('/api/takserver/two-server/open-db-firewall', methods=['POST'])
@@ -3529,7 +3543,11 @@ def takserver_two_server_runbook():
         # v0.9.12 hardening: source-scope only, deny everything else on db_port.
         # The pre-v0.9.12 unconditional `ufw allow {db_port}/tcp` defeated the
         # source-scope rule above and left Postgres reachable from the internet.
+        # v0.9.46: delete any stale deny first (UFW first-match-wins; appended allow would
+        # otherwise sit below it), add scoped allow, drop broad allow, re-add deny last.
+        f'sudo ufw delete deny {db_port}/tcp || true',
         f'sudo ufw allow from {core_host_for_db_acl} to any port {db_port} proto tcp',
+        f'sudo ufw delete allow {db_port}/tcp || true',
         f'sudo ufw deny {db_port}/tcp',
         'sudo ufw --force enable',
     ]
@@ -4489,14 +4507,44 @@ def _deploy_health_agent_to_server_one(s1_cfg):
     scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/opt/', timeout=30)
     if not scp_ok:
         return False, f'SCP failed: {(scp_out or "")[:150]}'
-    _src_ip = _fedhub_caddy_source_ip(load_settings())
+    # v0.9.46: scope 8080 to the source IP Server One ACTUALLY sees from the console
+    # ($SSH_CLIENT — free, we're already SSH'd in) unioned with server_ip. The old
+    # code pinned only server_ip, which is wrong on private-LAN splits where the
+    # console egresses a different IP → health poll silently denied → permanent yellow.
+    # Also converge the legacy 5432 ALLOW Anywhere (Postgres-to-internet) closed here,
+    # since this deploy is the button operators click when the remote DB is unhealthy.
+    _settings = load_settings()
+    _src_ip = _fedhub_caddy_source_ip(_settings) or ''
+    try:
+        _dbh, _dbp = _remotedb_host_port_from_tak_settings()
+        _db_port = int(_dbp or 5432)
+    except Exception:
+        _db_port = 5432
+    _srvip_allows = ''
     if _src_ip:
-        _ufw_step = (
+        _srvip_allows = (
             f'sudo ufw allow from {_src_ip} to any port 8080 proto tcp >/dev/null 2>&1; '
-            'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
+            f'sudo ufw allow from {_src_ip} to any port {_db_port} proto tcp >/dev/null 2>&1; '
         )
-    else:
-        _ufw_step = 'sudo ufw allow 8080/tcp >/dev/null 2>&1; '
+    # ORDER MATTERS: UFW is first-match-wins and APPENDS new rules. A pre-existing
+    # `deny <port>/tcp` from an earlier deploy sits ABOVE a freshly-added scoped allow,
+    # so the deny wins and the allow never matches. Delete the deny FIRST, add the
+    # scoped allow(s), then re-add the deny LAST so it lands below the allows.
+    _ufw_step = (
+        'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
+        'sudo ufw delete deny 8080/tcp >/dev/null 2>&1; '
+        f'sudo ufw delete deny {_db_port}/tcp >/dev/null 2>&1; '
+        # `delete allow {port}/tcp` removes ONLY the broad Anywhere allow; scoped allows
+        # (incl. the core's existing DB ACL) survive, so TAK never loses its DB.
+        f'sudo ufw delete allow {_db_port}/tcp >/dev/null 2>&1; '
+        'if [ -n "$SRC" ]; then '
+        'sudo ufw allow from "$SRC" to any port 8080 proto tcp >/dev/null 2>&1; '
+        f'sudo ufw allow from "$SRC" to any port {_db_port} proto tcp >/dev/null 2>&1; '
+        'fi; '
+        + _srvip_allows +
+        'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
+        f'sudo ufw deny {_db_port}/tcp >/dev/null 2>&1; '
+    )
     setup_cmd = (
         'sudo mkdir -p /opt/tak-guarddog && '
         'sudo mv /opt/tak-db-health-agent.py /opt/tak-guarddog/tak-db-health-agent.py && '
@@ -6369,7 +6417,10 @@ def _monitor_health_check(monitor_id):
                 ):
                     m = re.search(pat, cc)
                     if m and (m.group(1) or '').strip():
-                        local_pw = m.group(1).strip()
+                        # v0.9.46: CoreConfig stores the password XML-escaped (e.g. & -> &amp;).
+                        # TAK's JDBC decodes it; we must too, or a regenerated password with an
+                        # XML-special char (&,<,>,",') auths in TAK but false-fails this check.
+                        local_pw = html.unescape(m.group(1).strip())
                         break
             except Exception:
                 pass
@@ -7764,6 +7815,7 @@ def federation_hub_page():
     _fh_int_disp = (settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
     resp = make_response(render_template_string(FEDHUB_TEMPLATE,
         settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
+        fedhub_colocation_blocked=_takserver_installed_local(),
         fedhub_version=_fedhub_ver,
         fedhub_public_url=_fedhub_public_url,
         fedhub_sso_prime_url=_fedhub_sso_prime_url,
@@ -8103,6 +8155,12 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         settings = load_settings()
         cfg = _get_fedhub_deployment_config(settings)
         is_remote = cfg.get('target_mode') == 'remote'
+        # v0.9.46: refuse a NEW local install when TAK Server is on this box (no co-location).
+        # Grandfathered local hubs (already deployed) are left alone.
+        if not is_remote and not cfg.get('deployed') and _takserver_installed_local():
+            plog('✗ TAK Server is installed on this host. Federation Hub cannot co-locate with TAK Server — deploy it to a SEPARATE host (configure the SSH target below).')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
         if is_remote and not (cfg.get('remote', {}).get('host') or '').strip():
             plog('✗ Remote host not configured — save the SSH target on this page first.')
             status_dict.update({'running': False, 'complete': True, 'error': True})
@@ -8485,28 +8543,14 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         if is_remote:
             _module_run(cfg, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
             caddy_src = _fedhub_caddy_source_ip(settings)
-            if caddy_src:
-                plog(f'Fed Hub web UI: allowing 8080, 9100 only from Caddy host {caddy_src} (Settings → Server IP)')
-                for port in (8080, 9100):
-                    _module_run(
-                        cfg,
-                        f'sudo ufw allow from {caddy_src} to any port {port} proto tcp > /dev/null 2>&1; true',
-                        timeout=15,
-                    )
-            else:
-                plog(
-                    '⚠ Server IP unset or not IPv4 — opening 8080/9100 to everyone (insecure). '
-                    'Set Settings → Server IP to this console\'s public IP and re-run Update Federation Hub to restrict.'
-                )
-                for p in ('8080/tcp', '9100/tcp'):
-                    _module_run(cfg, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+            plog(f'Fed Hub web UI: scoping 8080/9100 to console source IP{f" ({caddy_src} + observed)" if caddy_src else " (observed $SSH_CLIENT)"}, removing any broad allow')
+            # Shared with _startup_harden_fedhub_ports() so the same hardening converges on
+            # every config-cycle restart without needing a .deb update (see that fn).
+            _fedhub_harden_ui_ports(cfg, settings)
             for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
                 _module_run(cfg, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
             _module_run(cfg, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
-            if caddy_src:
-                plog('✓ Firewall: SSH; 8080/9100 from Caddy host only; 9101-9103 public (federation peers)')
-            else:
-                plog('✓ Firewall configured (22, 8080, 9100-9103) — set Server IP + re-run deploy to harden UI ports')
+            plog('✓ Firewall: SSH; 8080/9100 scoped to console (broad allow removed); 9101-9103 public (federation peers)')
         else:
             # Local: open federation protocol ports; Caddy handles 8080/9100 via localhost
             for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
@@ -9729,9 +9773,19 @@ def _get_module_deployment_config(settings, key):
     return _normalize_module_deployment_config(settings.get(key, {}))
 
 
+def _takserver_installed_local():
+    """True if TAK Server core is installed on THIS host (co-location gate for Federation Hub)."""
+    return os.path.exists('/opt/tak') and os.path.exists('/opt/tak/CoreConfig.xml')
+
+
 def _get_fedhub_deployment_config(settings):
     """fedhub_deployment plus web_ui_port (remote hub web port for Caddy reverse_proxy)."""
     c = _normalize_module_deployment_config(settings.get('fedhub_deployment', {}))
+    # v0.9.46: Federation Hub must not co-locate with TAK Server. If TAK Server is on
+    # THIS box, a new local deploy is forced to remote. A box with no TAK Server may
+    # deploy locally (dedicated FedHub host). Already-deployed hubs are grandfathered.
+    if not c.get('deployed') and c.get('target_mode') != 'remote' and _takserver_installed_local():
+        c['target_mode'] = 'remote'
     try:
         p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 8080)
     except (TypeError, ValueError):
@@ -24080,14 +24134,15 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <details class="fh-section">
     <summary><span>Deployment target</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Deploy Federation Hub on <strong>this machine</strong> (same server as the console) or on a <strong>separate remote host</strong> via SSH — same pattern as TAK Server split-mode.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Deploy Federation Hub on <strong>this machine</strong> or a <strong>separate host</strong> via SSH. One rule: the hub <strong>cannot share an OS with TAK Server</strong> — the hub's JVM + MongoDB would contend with TAK Server's JVM + Postgres for RAM (MongoDB alone defaults to ~50% of system memory) and a single outage would take down both. A console host with no TAK Server can run the hub locally; a host already running TAK Server must point at a <strong>separate target</strong> (a different machine, or a separate VM on the same physical host — just not the same OS as TAK Server).</p>
     <input type="hidden" id="fedhub-deployed-flag" value="{% if fedhub_deploy_cfg.deployed %}1{% else %}0{% endif %}">
     <div style="display:flex;gap:24px;margin-bottom:16px;align-items:center">
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:{% if fedhub_colocation_blocked %}not-allowed;opacity:.5{% else %}pointer{% endif %}">
         <input type="radio" name="fedhub-target-mode" id="fedhub-mode-local" value="local"
           {% if (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}checked{% endif %}
+          {% if fedhub_colocation_blocked %}disabled{% endif %}
           onchange="fedhubToggleTargetMode()">
-        <span>This machine (local)</span>
+        <span>This machine (local){% if fedhub_colocation_blocked %} — unavailable (TAK Server on this host){% endif %}</span>
       </label>
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
         <input type="radio" name="fedhub-target-mode" id="fedhub-mode-remote" value="remote"
@@ -24096,7 +24151,16 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <span>Remote host (SSH)</span>
       </label>
     </div>
-    <div id="fedhub-local-note" style="{% if fedhub_deploy_cfg.target_mode == 'remote' %}display:none;{% endif %}font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.15);border-radius:6px;margin-bottom:14px;line-height:1.5">
+    {% if fedhub_colocation_blocked and fedhub_deploy_cfg.deployed and (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}
+    <div style="font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:6px;margin-bottom:14px;line-height:1.5">
+      This hub is running locally on a host that also has TAK Server (legacy). Migrating it to a separate host is strongly recommended.
+    </div>
+    {% elif fedhub_colocation_blocked %}
+    <div style="font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:6px;margin-bottom:14px;line-height:1.5">
+      ⚠ <strong>TAK Server is installed on this machine.</strong> Federation Hub can't be deployed here — it needs its own host so it doesn't contend with TAK Server for RAM. Configure an <strong>SSH target</strong> below (a separate machine, or a separate VM on this physical host).
+    </div>
+    {% endif %}
+    <div id="fedhub-local-note" style="{% if fedhub_colocation_blocked or fedhub_deploy_cfg.target_mode == 'remote' %}display:none;{% endif %}font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.15);border-radius:6px;margin-bottom:14px;line-height:1.5">
       Federation Hub will be installed directly on this machine. Upload the .deb below and click <strong>Deploy</strong>.
     </div>
     <div id="fedhub-ssh-fields" style="{% if (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}display:none;{% endif %}">
@@ -42451,7 +42515,10 @@ def _run_vacuum_background(use_full, tak_cfg):
     try:
         if tak_cfg.get('mode') == 'two_server':
             s1 = tak_cfg.get('server_one', {})
-            vacuum_cmd = f"sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
+            # cd / first: SSH lands in /root, and `sudo -u postgres` can't cd there, which
+            # prints a benign "could not change directory to /root: Permission denied" warning
+            # into the output and reads as a failure even though VACUUM ran. (Local path uses cwd='/'.)
+            vacuum_cmd = f"cd / && sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
             ok, out = _ssh_probe(s1, vacuum_cmd, timeout=timeout_sec)
             if not ok:
                 _vacuum_status.update({'running': False, 'error': (out or 'SSH command failed')[:500]})
@@ -42546,7 +42613,8 @@ def takserver_reindex():
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'success': False, 'error': 'Server One host not configured'}), 400
-        reindex_cmd = f"sudo -u postgres psql -d cot -c '{reindex_sql}' 2>&1"
+        # cd / first (see VACUUM note): avoids the benign "/root: Permission denied" warning leaking into output.
+        reindex_cmd = f"cd / && sudo -u postgres psql -d cot -c '{reindex_sql}' 2>&1"
         ok, out = _ssh_probe(s1, reindex_cmd, timeout=timeout_sec)
         if not ok:
             return jsonify({'success': False, 'error': (out or 'SSH command failed')[:500]}), 400
@@ -51247,6 +51315,46 @@ def _startup_harden_cloudtak_ports():
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
 _startup_harden_cloudtak_ports()
+
+
+def _fedhub_harden_ui_ports(cfg, settings):
+    """Scope Fed Hub web UI ports 8080/9100 to the console source IP. Delete any stale deny
+    + broad allow FIRST (UFW first-match-wins / appends), add the scoped allow ($SSH_CLIENT
+    observed ∪ server_ip), then deny LAST. Pure ufw over SSH — no .deb, no hub restart, no
+    federation drop. Idempotent. Shared by the Fed Hub deploy and the startup convergence."""
+    caddy_src = _fedhub_caddy_source_ip(settings)
+    for port in (8080, 9100):
+        _srv = (f'sudo ufw allow from {caddy_src} to any port {port} proto tcp >/dev/null 2>&1; ' if caddy_src else '')
+        _module_run(
+            cfg,
+            'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
+            f'sudo ufw delete deny {port}/tcp >/dev/null 2>&1 || true; '
+            f'sudo ufw delete allow {port}/tcp >/dev/null 2>&1 || true; '
+            f'if [ -n "$SRC" ]; then sudo ufw allow from "$SRC" to any port {port} proto tcp >/dev/null 2>&1; fi; '
+            + _srv +
+            f'sudo ufw deny {port}/tcp >/dev/null 2>&1; true',
+            timeout=20,
+        )
+    _module_run(cfg, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
+
+
+def _startup_harden_fedhub_ports():
+    """v0.9.46 config-cycle convergence: if a Fed Hub is deployed on a REMOTE host, re-scope
+    its 8080/9100 UI ports to the console (closing any legacy `ALLOW Anywhere` that left the
+    hub UI — incl. plaintext 8080 — internet-exposed) WITHOUT a .deb update. Runs in a daemon
+    thread so an unreachable hub host never blocks console boot. Idempotent / non-disruptive."""
+    try:
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                and (cfg.get('remote', {}).get('host') or '').strip()):
+            return
+        _fedhub_harden_ui_ports(cfg, settings)
+        print("Startup migration: Fed Hub web UI ports (8080/9100) scoped to console (broad allow removed)")
+    except Exception as _e:
+        print(f"Startup migration: Fed Hub port harden error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_harden_fedhub_ports, daemon=True).start()
 
 
 # v0.9.12: self-heal the v0.9.2 reputation-policy misconfiguration that blocks
