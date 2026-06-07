@@ -18506,10 +18506,16 @@ def cesium_tiles_delete(name):
 # ── WebODM ───────────────────────────────────────────────────────────────────
 
 # WebODM ODM (NodeODX) resource ceiling — fleet-uniform safety cap. A co-located ODM
-# job must never starve/OOM the rest of the TAK stack. mem_limit is the OOM backstop:
-# Docker kills the ODM container, never the host. Field guidance: Tom Endress, 2026-06
-# ("hard-cap webODM's docker container … max ~6 cores … I'd hate to see it OOM a TAKStack").
-ODM_MAX_CORES      = 6   # fleet ceiling — the single knob to retune fleet-wide
+# job must never starve/OOM the rest of the TAK stack. Enforced three ways on wo_nodeodm:
+#   cpus           — CPU-time ceiling (host protection)
+#   mem_limit      — OOM backstop: Docker kills the ODM container, never the host
+#   --max_concurrency — NodeODX self-limits its thread pool so a job COMPLETES within the
+#                       cap instead of spawning host-core-count threads and OOM-killing.
+#                       (NodeODX reads os.cpus()=host count and ignores the cpu cgroup, so
+#                        the cpus cap alone won't stop it — this is the lever that does.)
+# Field guidance: Tom Endress, 2026-06 — validated "set to 4 cores/threads" holding under
+# co-located MediaMTX load; he wanted it safe for the fleet ("hate to see it OOM a TAKStack").
+ODM_MAX_CORES      = 4   # fleet ceiling — the single knob to retune fleet-wide (Tom-validated)
 ODM_CORE_RESERVE   = 2   # cores always left for OS + co-located services
 ODM_MEM_PER_CORE_G = 1   # NodeODX peak ~1GB/thread @ 2MP (per NodeODX max-concurrency help)
 ODM_MEM_HEADROOM_G = 2   # GB above the per-core estimate
@@ -18595,6 +18601,7 @@ services:
   wo_nodeodm:
     image: webodm/nodeodx
     container_name: wo_nodeodm
+    command: ["--max_concurrency", "{wo_odm_cpus}"]
     cpus: {wo_odm_cpus}
     mem_limit: {wo_odm_mem}g
     restart: unless-stopped
@@ -18673,7 +18680,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     except (TypeError, ValueError):
         _cores = 4
     _odm_cpus, _odm_mem = _webodm_odm_limits(_cores, deploy_cfg)
-    plog(f'  ODM cap: {_odm_cpus} cores / {_odm_mem}g (host {_cores} cores, ceiling {ODM_MAX_CORES})')
+    plog(f'  ODM cap: {_odm_cpus} cores / {_odm_mem}g / max_concurrency {_odm_cpus} (host {_cores} cores, ceiling {ODM_MAX_CORES})')
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
         wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
         wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem)
@@ -18832,7 +18839,7 @@ def _run_webodm_deploy(settings):
         # ODM resource cap (GH #32) — local core count, then the fleet ceiling.
         _odm_cores = os.cpu_count() or 4
         _odm_cpus, _odm_mem = _webodm_odm_limits(_odm_cores, deploy_cfg)
-        plog(f'ODM cap: {_odm_cpus} cores / {_odm_mem}g (host {_odm_cores} cores, ceiling {ODM_MAX_CORES})')
+        plog(f'ODM cap: {_odm_cpus} cores / {_odm_mem}g / max_concurrency {_odm_cpus} (host {_odm_cores} cores, ceiling {ODM_MAX_CORES})')
         compose_content = WEBODM_DOCKER_COMPOSE.format(
             wo_dir=wo_dir,
             wo_port=wo_port,
@@ -52652,10 +52659,41 @@ def _startup_migrations():
                         '- WO_BROKER=redis://wo_broker',
                         '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
                     )
+                # GH #32 self-heal: normalize the wo_nodeodm block to the fleet ODM cap —
+                # cpus + mem_limit (host protection) + --max_concurrency (NodeODX thread cap
+                # so a job COMPLETES within the cap instead of spawning host-core-count
+                # threads and OOM-killing). Boxes deployed before the cap landed get it here
+                # on the next console restart — no redeploy. Idempotent: the regex rewrites
+                # the wo_nodeodm block to target, so an already-capped box produces no diff
+                # (the write+recreate below only fires when the file actually changed).
+                _wo_cap_changed = False
+                _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
+                if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
+                    _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
+                    _wo_nodeodm_block = (
+                        '  wo_nodeodm:\n'
+                        '    image: webodm/nodeodx\n'
+                        '    container_name: wo_nodeodm\n'
+                        f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
+                        f'    cpus: {_wo_cpus}\n'
+                        f'    mem_limit: {_wo_mem}g\n'
+                        '    restart: unless-stopped\n'
+                        '    oom_score_adj: 250\n'
+                    )
+                    _wo_before_cap = _wo_patched
+                    _wo_patched = _re_wo.sub(
+                        r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
+                        lambda _m: _wo_nodeodm_block,
+                        _wo_patched,
+                        count=1,
+                    )
+                    _wo_cap_changed = (_wo_patched != _wo_before_cap)
                 if _wo_patched != _wo_txt:
                     with open(_wo_compose, 'w') as _f:
                         _f.write(_wo_patched)
                     print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
+                    if _wo_cap_changed:
+                        print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
                     import subprocess as _sp_wo
                     _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
                                capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
