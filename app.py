@@ -224,6 +224,9 @@ def inject_cloudtak_icon():
         _cert_pw_nag = render_default_cert_password_warning(_settings)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
         d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _sidebar)
+        # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
+        # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
+        d['service_domain'] = lambda key: _get_service_domain(_settings, key)
     return d
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -366,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.46-alpha"
+VERSION = "0.9.47-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -6622,6 +6625,147 @@ def guarddog_diskio_history():
         import traceback
         return jsonify({'entries': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
 
+# ── v0.9.47: network / fanout metrics (Guard Dog metrics collector → metrics.db) ──
+_GD_METRICS_DB = '/var/lib/takguard/metrics.db'
+# Whitelist: series key → (table, column). Keys/values are fixed here (never user input),
+# so f-string interpolation into SQL is safe — the ?series= param is validated against this map.
+_GD_SERIES = {
+    'host_tx':          ('host_net',  'tx_bytes_s'),
+    'host_rx':          ('host_net',  'rx_bytes_s'),
+    'host_tx_pkts':     ('host_net',  'tx_pkts_s'),
+    'host_rx_pkts':     ('host_net',  'rx_pkts_s'),
+    'tcp_tx_queue':     ('tcp_queue', 'tx_queue_sum'),
+    'tcp_tx_queue_max': ('tcp_queue', 'tx_queue_max'),
+    'tcp_rx_queue':     ('tcp_queue', 'rx_queue_sum'),
+    'tcp_conns':        ('tcp_queue', 'conn_count'),
+    'clients':          ('marti',     'clients_connected'),
+    'heap':             ('marti',     'heap_used_mb'),
+    'heap_committed':   ('marti',     'heap_committed_mb'),
+    'cpu':              ('host_sys',  'cpu_pct'),
+    'mem_used':         ('host_sys',  'mem_used_mb'),
+    'load1':            ('host_sys',  'load_1'),
+}
+
+def _gd_metrics_ro():
+    """Open metrics.db read-only, or None if the collector hasn't produced it yet."""
+    import sqlite3
+    if not os.path.exists(_GD_METRICS_DB):
+        return None
+    try:
+        return sqlite3.connect(f'file:{_GD_METRICS_DB}?mode=ro', uri=True, timeout=3)
+    except Exception:
+        return None
+
+def _gd_bucketed(con, table, col, hours, where='', params=(), points=240):
+    """Time-bucketed AVG of `col` over the last `hours`, ~`points` samples. Returns entry list."""
+    now = int(time.time())
+    cutoff = now - hours * 3600
+    bucket = max(30, (hours * 3600) // points)
+    q = (f"SELECT (ts/{bucket})*{bucket} AS b, AVG({col}) FROM {table} "
+         f"WHERE ts >= ? {where} GROUP BY b ORDER BY b")
+    rows = con.execute(q, (cutoff,) + tuple(params)).fetchall()
+    return [{'t': datetime.utcfromtimestamp(b).strftime('%Y-%m-%dT%H:%M:%SZ'),
+             'v': round(v, 2) if v is not None else 0} for b, v in rows]
+
+def _gd_envelope(entries):
+    """Mirror the diskio-history envelope: avg_1h / avg_24h / min / max / samples."""
+    now = datetime.utcnow()
+    vals = [e['v'] for e in entries]
+    v1h = [e['v'] for e in entries
+           if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+    return {
+        'entries': entries,
+        'avg_1h':  round(sum(v1h) / len(v1h), 2) if v1h else None,
+        'avg_24h': round(sum(vals) / len(vals), 2) if vals else None,
+        'min': round(min(vals), 2) if vals else None,
+        'max': round(max(vals), 2) if vals else None,
+        'samples': len(entries),
+    }
+
+@app.route('/api/guarddog/net-metrics')
+@login_required
+def guarddog_net_metrics():
+    """One fanout series over the last ?hours=. ?series= ∈ _GD_SERIES keys (default host_tx)."""
+    try:
+        series = request.args.get('series', 'host_tx')
+        hours = max(1, min(168, int(request.args.get('hours', 1))))
+        if series not in _GD_SERIES:
+            return jsonify({'entries': [], 'error': f'unknown series: {series}'}), 400
+        con = _gd_metrics_ro()
+        if con is None:
+            return jsonify({'entries': [], 'deployed': False})
+        try:
+            table, col = _GD_SERIES[series]
+            entries = _gd_bucketed(con, table, col, hours)
+        finally:
+            con.close()
+        env = _gd_envelope(entries)
+        env['series'] = series
+        return jsonify(env)
+    except Exception as e:
+        import traceback
+        return jsonify({'entries': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/guarddog/net-metrics/bridges')
+@login_required
+def guarddog_net_bridges():
+    """Per-Docker-bridge (+lo) TX/RX bytes/s over the last ?hours=."""
+    try:
+        hours = max(1, min(168, int(request.args.get('hours', 1))))
+        con = _gd_metrics_ro()
+        if con is None:
+            return jsonify({'series': [], 'deployed': False})
+        try:
+            cutoff = int(time.time()) - hours * 3600
+            ifaces = con.execute(
+                "SELECT iface, MAX(network_name) FROM bridge_net WHERE ts >= ? "
+                "GROUP BY iface ORDER BY iface", (cutoff,)).fetchall()
+            out = []
+            for iface, name in ifaces:
+                out.append({
+                    'iface': iface, 'network_name': name,
+                    'tx': _gd_bucketed(con, 'bridge_net', 'tx_bytes_s', hours,
+                                       where='AND iface = ?', params=(iface,)),
+                    'rx': _gd_bucketed(con, 'bridge_net', 'rx_bytes_s', hours,
+                                       where='AND iface = ?', params=(iface,)),
+                })
+        finally:
+            con.close()
+        return jsonify({'series': out})
+    except Exception as e:
+        import traceback
+        return jsonify({'series': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/guarddog/net-metrics/containers')
+@login_required
+def guarddog_net_containers():
+    """Per-container net TX/RX bytes/s over the last ?hours=."""
+    try:
+        hours = max(1, min(168, int(request.args.get('hours', 1))))
+        con = _gd_metrics_ro()
+        if con is None:
+            return jsonify({'series': [], 'deployed': False})
+        try:
+            cutoff = int(time.time()) - hours * 3600
+            names = con.execute(
+                "SELECT container FROM docker_stats WHERE ts >= ? "
+                "GROUP BY container ORDER BY container", (cutoff,)).fetchall()
+            out = []
+            for (name,) in names:
+                out.append({
+                    'container': name,
+                    'tx': _gd_bucketed(con, 'docker_stats', 'net_tx_bytes_s', hours,
+                                       where='AND container = ?', params=(name,)),
+                    'rx': _gd_bucketed(con, 'docker_stats', 'net_rx_bytes_s', hours,
+                                       where='AND container = ?', params=(name,)),
+                })
+        finally:
+            con.close()
+        return jsonify({'series': out})
+    except Exception as e:
+        import traceback
+        return jsonify({'series': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
+
 @app.route('/api/guarddog/diskio-report')
 @login_required
 def guarddog_diskio_report():
@@ -7326,7 +7470,7 @@ def run_guarddog_deploy(alert_email):
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
-            'tak-updates-watch.sh'
+            'tak-metrics-collector.py', 'tak-updates-watch.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -7394,8 +7538,11 @@ def run_guarddog_deploy(alert_email):
         gd_conf = {}
         if is_two_server and s1_host:
             gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+        # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
+        gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
         with open('/opt/tak-guarddog/guarddog.conf', 'w') as f:
             json.dump(gd_conf, f)
+        os.chmod('/opt/tak-guarddog/guarddog.conf', 0o600)
         # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
         server_identifier = _guarddog_server_identifier(settings)
         with open('/opt/tak-guarddog/server_identifier', 'w') as f:
@@ -7419,6 +7566,7 @@ def run_guarddog_deploy(alert_email):
             ('takintcaguard.service', '[Unit]\nDescription=TAK Intermediate CA Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-intca-watch.sh\n'),
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
+            ('tak-metrics-collector.service', '[Unit]\nDescription=Guard Dog Network/Fanout Metrics Collector\nAfter=network.target takserver.service docker.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-metrics-collector.py\nRestart=always\nRestartSec=15\n\n[Install]\nWantedBy=multi-user.target\n'),
             ('tak-post-start.service', '[Unit]\nDescription=Guard Dog Post-Start Orchestrator (starts Authentik, TAK Portal, CloudTAK after TAK)\nAfter=takserver.service docker.service\nWants=takserver.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=1200\nExecStart=/opt/tak-guarddog/tak-post-start.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
         ]
         # Two-server: remote DB monitor instead of local PG monitors
@@ -7600,6 +7748,14 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+        # v0.9.47: network/fanout metrics collector (always-on, like tak-health). Best-effort
+        # start — a collector failure must never block the rest of the Guard Dog deploy.
+        rmc = subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, text=True, timeout=5)
+        if rmc.returncode != 0:
+            plog(f"⚠ enable tak-metrics-collector.service failed (continuing): {rmc.stderr or rmc.stdout or 'unknown'}")
+        else:
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'tak-metrics-collector.service']), capture_output=True, timeout=5)
+            plog("✓ Network/fanout metrics collector started")
         # v0.9.12 A6: source-scope UFW for Guard Dog health endpoint
         _auto_harden_guarddog_8080(settings, plog=plog)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-post-start.service']), capture_output=True, text=True, timeout=5)
@@ -13128,7 +13284,7 @@ def _takportal_build_settings_dict(settings):
         "PORTAL_AUTH_ENABLED": "true" if settings.get('fqdn') else "false",
         "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
         "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
-        "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
+        "TAK_PORTAL_PUBLIC_URL": f"https://{_get_service_domain(settings, 'takportal')}" if settings.get('fqdn') else f"http://{server_ip}:3000",
         "TAK_URL": f"https://{tak_url_host}:8443/Marti",
         "TAK_API_P12_PATH": "data/certs/tak-client.p12",
         "TAK_API_P12_PASSPHRASE": cert_pass,
@@ -13997,7 +14153,7 @@ def run_takportal_deploy():
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
             plog(f"  \u2713 Caddy config updated for TAK Portal")
-            plog(f"  Open: https://takportal.{settings.get('fqdn')}")
+            plog(f"  Open: https://{_get_service_domain(settings, 'takportal')}")
         plog("=" * 50)
         plog("")
         plog("  Waiting 2 minutes for Authentik to fully sync...")
@@ -27244,7 +27400,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title">Access</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
-<a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':' + str(portal_port) }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :{{ portal_port }}{% endif %}</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':' + str(portal_port) }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :{{ portal_port }}{% endif %}</a>
 <a href="{{ authentik_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 Authentik{% if not settings.get('fqdn') %} :9090{% endif %}</a>
 <a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
@@ -27257,7 +27413,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div><span style="color:var(--text-dim)">TAK Server:</span> <span style="color:var(--cyan)">{{ takserver_base_url }}:8443</span></div>
 <div><span style="color:var(--text-dim)">Authentik URL:</span> <span style="color:var(--cyan)">{{ authentik_base_url }}</span></div>
 <div><span style="color:var(--text-dim)">Forward Auth:</span> <span style="color:var(--green)">{{ 'Enabled via Caddy' if settings.get('fqdn') else 'Disabled (no FQDN)' }}</span></div>
-<div><span style="color:var(--text-dim)">Self-Service Enrollment:</span> <span style="color:var(--cyan)">{{ 'https://takportal.' + settings.get('fqdn') + '/request-access' if settings.get('fqdn') else 'http://' + settings.get('server_ip','') + ':3000/request-access' }}</span></div>
+<div><span style="color:var(--text-dim)">Self-Service Enrollment:</span> <span style="color:var(--cyan)">{{ 'https://' + service_domain('takportal') + '/request-access' if settings.get('fqdn') else 'http://' + settings.get('server_ip','') + ':3000/request-access' }}</span></div>
 <div style="margin-top:8px;font-size:11px;color:var(--text-dim)">Users created in TAK Portal flow through Authentik → LDAP → TAK Server automatically</div>
 </div>
 </div>
@@ -27474,7 +27630,7 @@ function pollDeployLog(){
             if(btn){btn.textContent='\u2713 Deployment Complete';btn.style.background='var(--green)';btn.style.opacity='1';btn.style.cursor='default';}
             var el=document.getElementById('deploy-log');
             var fqdn=window.location.hostname.replace(/^[^.]+\./,'');
-            var portalUrl='https://takportal.'+fqdn;
+            var portalUrl={% if settings.get('fqdn') %}'https://{{ service_domain('takportal') }}'{% else %}'https://takportal.'+fqdn{% endif %};
             var refreshBtn=document.createElement('button');
             refreshBtn.textContent='\u21bb Refresh Page';
             refreshBtn.style.cssText='display:block;width:100%;padding:12px;margin-top:16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;';
@@ -33853,12 +34009,16 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
             plog("  proxy external_hosts: no FQDN configured — skip")
             return
         base = fqdn.split(':')[0]
+        # Build from _get_service_domain so a custom Caddy domain override (e.g.
+        # portal.<fqdn> instead of takportal.<fqdn>) is honored. Hardcoding the
+        # default prefix here used to revert the operator's external_host on every
+        # startup, breaking forward auth on the custom host (GH #41).
         canonical = {
-            'TAK Portal Proxy': f'https://takportal.{base}',
-            'Node-RED Proxy':   f'https://nodered.{base}',
-            'MediaMTX':         f'https://stream.{base}',
-            'infra-TAK':        f'https://infratak.{base}',
-            'Federation Hub Proxy': f'https://fedhub.{base}',
+            'TAK Portal Proxy': f"https://{_get_service_domain(_settings, 'takportal')}",
+            'Node-RED Proxy':   f"https://{_get_service_domain(_settings, 'nodered')}",
+            'MediaMTX':         f"https://{_get_service_domain(_settings, 'mediamtx')}",
+            'infra-TAK':        f"https://{_get_service_domain(_settings, 'infratak')}",
+            'Federation Hub Proxy': f"https://{_get_service_domain(_settings, 'fedhub')}",
         }
 
         _token = (
@@ -37948,7 +38108,7 @@ entries:
                                 'name': 'TAK Portal Proxy',
                                 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk or flow_pk,
-                                'external_host': f'https://takportal.{fqdn}',
+                                'external_host': f"https://{_get_service_domain(settings, 'takportal')}",
                                 'mode': 'forward_single',
                                 'token_validity': 'hours=24',
                                 'cookie_domain': f'.{base_domain}'
@@ -38045,7 +38205,7 @@ entries:
                             plog(f"  ⚠ Outpost config: {str(e)[:100]}")
 
                     if _is_module_deployed(settings, 'takportal'):
-                        plog(f"  ✓ Forward auth ready for takportal.{fqdn}")
+                        plog(f"  ✓ Forward auth ready for {_get_service_domain(settings, 'takportal')}")
 
                     # Create Node-RED app in Authentik only when Node-RED is deployed (so launcher shows only deployed modules)
                     if _is_module_deployed(settings, 'nodered'):
@@ -38421,7 +38581,7 @@ body{display:flex;min-height:100vh}
 {% endif %}
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
 <a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px;display:inline-flex;align-items:center;gap:6px" title="Open Authentik admin interface"><img src="{{ authentik_logo_url }}" alt="" style="width:18px;height:18px;object-fit:contain">Authentik{% if not settings.get('fqdn') %} :{{ ak_port }}{% endif %}</a>
-<a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
 <a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
 </div>
@@ -50322,7 +50482,7 @@ function takPurgeFailed(){
 <div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
 <a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
-<a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
 <a href="{{ authentik_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 Authentik{% if not settings.get('fqdn') %} :9090{% endif %}</a>
 </div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">8446 login: <span style="color:var(--cyan)">webadmin</span> · <button type="button" onclick="showWebadminPassword()" id="webadmin-pw-btn" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">🔑 Show Password</button> <span id="webadmin-pw-display" style="color:var(--green);user-select:all;display:none"></span></div>
