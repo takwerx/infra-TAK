@@ -22420,22 +22420,26 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <canvas id="gd-net-chart-txq" style="width:100%;height:100%"></canvas>
       <div id="gd-net-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — collector produces its first sample within ~1 min</div>
     </div>
+    <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45"><strong style="color:var(--text-secondary)">How to read:</strong> flat and near the bottom = the server is keeping up with fanout. A line that <strong>climbs and stays up</strong> = TAK is producing position updates faster than the network can send them (clients start lagging or dropping) — your fanout ceiling, even if CPU/RAM look fine. If the <span style="color:#ef4444">red dashed</span> line is high but <span style="color:#06b6d4">cyan</span> is low, it's <em>one</em> slow client, not the whole server.</div>
     <div style="font-size:11px;color:var(--text-secondary);margin:14px 0 4px">External network throughput &mdash; <span style="color:#06b6d4">TX</span> / <span style="color:#f59e0b">RX</span> (bytes/s)</div>
     <div style="position:relative;height:100px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
       <canvas id="gd-net-chart-thru" style="width:100%;height:100%"></canvas>
     </div>
+    <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45"><strong style="color:var(--text-secondary)">How to read:</strong> on a fanout server <span style="color:#06b6d4">TX</span> (out) should be much larger than <span style="color:#f59e0b">RX</span> (in) — one position comes in, a copy goes out to every other client. Watch whether TX grows <em>in step</em> with the client count (normal) or <em>faster</em> than it (you're approaching the network ceiling).</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px">
       <div>
         <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">Connected clients</div>
         <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
           <canvas id="gd-net-chart-clients" style="width:100%;height:100%"></canvas>
         </div>
+        <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45">Live streaming clients right now. The baseline you compare everything else against — TX and the send-queue should scale with this.</div>
       </div>
       <div>
         <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">JVM heap &mdash; used (MB)</div>
         <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
           <canvas id="gd-net-chart-heap" style="width:100%;height:100%"></canvas>
         </div>
+        <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45">TAK Server's Java memory. A <strong>sawtooth</strong> (climbs, then drops on garbage collection) is healthy. A line that climbs toward the top and never drops back = memory pressure.</div>
       </div>
     </div>
   </div>
