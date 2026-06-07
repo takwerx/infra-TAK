@@ -51571,24 +51571,37 @@ threading.Thread(target=_startup_harden_fedhub_ports, daemon=True).start()
 def _startup_ensure_metrics_collector():
     """v0.9.47: ensure the Guard Dog network/fanout metrics collector is installed + running
     whenever Guard Dog is already deployed — on EVERY console boot, so a plain pull+restart
-    (not just 'Update Now') self-installs it. Idempotent; daemon thread so it never blocks boot.
-    Only refreshes/(re)starts when the script, unit, or cert-pass actually changed."""
+    (not just 'Update Now') self-installs it. Daemon thread so it never blocks boot.
+
+    Race-proof: the applied-version marker is written ONLY after the restart is confirmed live.
+    A rapid double console-restart can kill this daemon thread after it copies the new script but
+    before it recycles the process (leaving the running collector on stale code); the unwritten
+    marker makes the NEXT boot retry the restart instead of treating disk==disk as 'done'."""
     try:
+        import hashlib
         if not (os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak')):
             return
         src = os.path.join(BASE_DIR, 'scripts', 'guarddog', 'tak-metrics-collector.py')
         if not os.path.isfile(src):
             return
-        changed = False
-        # 1. script
-        dest = '/opt/tak-guarddog/tak-metrics-collector.py'
         new_src = open(src).read()
-        if (open(dest).read() if os.path.exists(dest) else None) != new_src:
-            with open(dest, 'w') as f:
-                f.write(new_src)
-            changed = True
-        # 2. cert pass in guarddog.conf (older deploys lack it → Marti scrape would no-op).
-        #    Merge — never clobber two_server keys.
+        # Version = hash of script + unit, so a change to either re-applies. Marker tracks what
+        # the RUNNING service was last confirmed on — NOT what's merely on disk.
+        want = hashlib.sha1((new_src + _METRICS_COLLECTOR_UNIT).encode()).hexdigest()
+        marker = '/opt/tak-guarddog/.metrics_collector_applied'
+        try:
+            have = open(marker).read().strip()
+        except Exception:
+            have = ''
+        active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'tak-metrics-collector.service']),
+                                capture_output=True, text=True, timeout=5).stdout.strip() == 'active'
+        if want == have and active:
+            return  # current version already applied AND running — no churn on every boot
+        # (re)install: script
+        with open('/opt/tak-guarddog/tak-metrics-collector.py', 'w') as f:
+            f.write(new_src)
+        # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Merge — never
+        # clobber two_server keys.
         conf_path = '/opt/tak-guarddog/guarddog.conf'
         try:
             conf = json.load(open(conf_path)) if os.path.exists(conf_path) else {}
@@ -51600,20 +51613,24 @@ def _startup_ensure_metrics_collector():
             with open(conf_path, 'w') as f:
                 json.dump(conf, f)
             os.chmod(conf_path, 0o600)
-            changed = True
-        # 3. systemd unit
+        # systemd unit
         unit_path = '/etc/systemd/system/tak-metrics-collector.service'
         if (open(unit_path).read() if os.path.exists(unit_path) else None) != _METRICS_COLLECTOR_UNIT:
             with open(unit_path, 'w') as f:
                 f.write(_METRICS_COLLECTOR_UNIT)
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
-            changed = True
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, timeout=10)
-        active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'tak-metrics-collector.service']),
-                                capture_output=True, text=True, timeout=5)
-        if changed or active.stdout.strip() != 'active':
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'tak-metrics-collector.service']), capture_output=True, timeout=10)
-            print("Startup migration: Guard Dog metrics collector installed/refreshed + (re)started")
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'tak-metrics-collector.service']), capture_output=True, timeout=15)
+        # Confirm the restart actually took BEFORE recording the applied version — else retry next boot.
+        time.sleep(2)
+        now_active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'tak-metrics-collector.service']),
+                                    capture_output=True, text=True, timeout=5).stdout.strip() == 'active'
+        if now_active:
+            with open(marker, 'w') as f:
+                f.write(want)
+            print("Startup migration: Guard Dog metrics collector applied %s + restarted" % want[:7])
+        else:
+            print("Startup migration: metrics collector restart not confirmed active — will retry next boot")
     except Exception as _e:
         print(f"Startup migration: metrics collector ensure error (non-fatal): {_e}")
 
