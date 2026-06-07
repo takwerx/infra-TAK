@@ -8543,26 +8543,10 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         if is_remote:
             _module_run(cfg, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
             caddy_src = _fedhub_caddy_source_ip(settings)
-            # v0.9.46: scope 8080/9100 to the console's REAL source IP ($SSH_CLIENT — what
-            # this host sees from the deploy) unioned with server_ip, then DELETE any legacy
-            # broad allow (UFW first-match-wins would otherwise keep it, leaving the UI open
-            # to the internet incl. plaintext 8080) and DENY the rest. Caddy reaches the hub
-            # from the same source IP it SSH'd in on, so the scoped allow lets Caddy through.
             plog(f'Fed Hub web UI: scoping 8080/9100 to console source IP{f" ({caddy_src} + observed)" if caddy_src else " (observed $SSH_CLIENT)"}, removing any broad allow')
-            for port in (8080, 9100):
-                _srv = (f'sudo ufw allow from {caddy_src} to any port {port} proto tcp >/dev/null 2>&1; ' if caddy_src else '')
-                # Delete the deny FIRST (UFW appends + first-match-wins, so a pre-existing
-                # deny would shadow a freshly-added allow), add scoped allow(s), deny LAST.
-                _module_run(
-                    cfg,
-                    'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
-                    f'sudo ufw delete deny {port}/tcp >/dev/null 2>&1 || true; '
-                    f'sudo ufw delete allow {port}/tcp >/dev/null 2>&1 || true; '
-                    f'if [ -n "$SRC" ]; then sudo ufw allow from "$SRC" to any port {port} proto tcp >/dev/null 2>&1; fi; '
-                    + _srv +
-                    f'sudo ufw deny {port}/tcp >/dev/null 2>&1; true',
-                    timeout=20,
-                )
+            # Shared with _startup_harden_fedhub_ports() so the same hardening converges on
+            # every config-cycle restart without needing a .deb update (see that fn).
+            _fedhub_harden_ui_ports(cfg, settings)
             for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
                 _module_run(cfg, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
             _module_run(cfg, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
@@ -51331,6 +51315,46 @@ def _startup_harden_cloudtak_ports():
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
 _startup_harden_cloudtak_ports()
+
+
+def _fedhub_harden_ui_ports(cfg, settings):
+    """Scope Fed Hub web UI ports 8080/9100 to the console source IP. Delete any stale deny
+    + broad allow FIRST (UFW first-match-wins / appends), add the scoped allow ($SSH_CLIENT
+    observed ∪ server_ip), then deny LAST. Pure ufw over SSH — no .deb, no hub restart, no
+    federation drop. Idempotent. Shared by the Fed Hub deploy and the startup convergence."""
+    caddy_src = _fedhub_caddy_source_ip(settings)
+    for port in (8080, 9100):
+        _srv = (f'sudo ufw allow from {caddy_src} to any port {port} proto tcp >/dev/null 2>&1; ' if caddy_src else '')
+        _module_run(
+            cfg,
+            'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
+            f'sudo ufw delete deny {port}/tcp >/dev/null 2>&1 || true; '
+            f'sudo ufw delete allow {port}/tcp >/dev/null 2>&1 || true; '
+            f'if [ -n "$SRC" ]; then sudo ufw allow from "$SRC" to any port {port} proto tcp >/dev/null 2>&1; fi; '
+            + _srv +
+            f'sudo ufw deny {port}/tcp >/dev/null 2>&1; true',
+            timeout=20,
+        )
+    _module_run(cfg, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
+
+
+def _startup_harden_fedhub_ports():
+    """v0.9.46 config-cycle convergence: if a Fed Hub is deployed on a REMOTE host, re-scope
+    its 8080/9100 UI ports to the console (closing any legacy `ALLOW Anywhere` that left the
+    hub UI — incl. plaintext 8080 — internet-exposed) WITHOUT a .deb update. Runs in a daemon
+    thread so an unreachable hub host never blocks console boot. Idempotent / non-disruptive."""
+    try:
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                and (cfg.get('remote', {}).get('host') or '').strip()):
+            return
+        _fedhub_harden_ui_ports(cfg, settings)
+        print("Startup migration: Fed Hub web UI ports (8080/9100) scoped to console (broad allow removed)")
+    except Exception as _e:
+        print(f"Startup migration: Fed Hub port harden error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_harden_fedhub_ports, daemon=True).start()
 
 
 # v0.9.12: self-heal the v0.9.2 reputation-policy misconfiguration that blocks
