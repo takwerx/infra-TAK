@@ -49225,22 +49225,22 @@ function _woCfg(extraMode){
 function woSaveConfig(mode){
   woMsg('Saving…');
   fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg(mode)}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'Saved':'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){var ok=d&&!d.error;woMsg(ok?'Saved':'Error: '+((d&&d.error)||'failed'),ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woEnsureSshKey(){
   woMsg('Generating key…');
   fetch('/api/webodm/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woInstallSshKey(){
   woMsg('Installing key…');
   fetch('/api/webodm/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 function woTestSsh(){
   woMsg('Testing…');
   fetch('/api/webodm/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
-    .then(function(r){return r.json();}).then(function(d){woMsg(d.ok?'✓ Connected':'✗ '+(d.error||'failed'),d.ok?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?'✓ Connected':'✗ '+(d.error||d.output||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
 }
 </script>
 
