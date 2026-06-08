@@ -4408,6 +4408,17 @@ def netbird_control_api():
     running = r_status.stdout.strip() == 'true'
     return jsonify({'success': True, 'running': running})
 
+@app.route('/api/netbird/stats')
+@login_required
+def netbird_stats_api():
+    settings = load_settings()
+    if not settings.get('netbird_enabled'):
+        return jsonify({'error': 'NetBird is not installed'}), 404
+    stats = _netbird_peer_stats(settings)
+    if stats is None:
+        return jsonify({'ok': False, 'connected': None, 'total': None})
+    return jsonify({'ok': True, **stats})
+
 @app.route('/api/netbird/logs')
 @login_required
 def netbird_logs_api():
@@ -21701,6 +21712,22 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
     return _req.urlopen(req, timeout=timeout, context=ctx)
 
 
+def _netbird_peer_stats(settings):
+    """Return connected/total peer counts from the management API."""
+    pat = (settings.get('netbird_pat') or '').strip()
+    if not pat:
+        return None
+    try:
+        resp = _netbird_mgmt_request('/api/peers', token=pat, timeout=10)
+        data = json.loads(resp.read().decode())
+        peers = data if isinstance(data, list) else (data.get('items') or data.get('data') or [])
+        total = len(peers)
+        connected = sum(1 for p in peers if p.get('connected'))
+        return {'total': total, 'connected': connected}
+    except Exception:
+        return None
+
+
 def _netbird_admin_credentials(settings):
     """Initial setup owner mirrors Authentik administrator (akadmin)."""
     fqdn = (settings.get('fqdn') or '').strip()
@@ -26117,24 +26144,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           </div>
         </div>
         <div class="info-item">
-          <div class="info-label">Management URL (gRPC)</div>
-          <div class="info-value" style="color:var(--text-secondary)">{{ netbird_url }}</div>
-        </div>
-        <div class="info-item">
-          <div class="info-label">OIDC Single Sign-On</div>
-          <div class="info-value" style="color:var(--green)">Authentik Provider (OIDC)</div>
-        </div>
-        <div class="info-item">
-          <div class="info-label">NAT Traversal Ports</div>
-          <div class="info-value" style="color:var(--text-secondary)">3478/udp (STUN)</div>
-        </div>
-        <div class="info-item">
-          <div class="info-label">Install Directory</div>
-          <div class="info-value" style="color:var(--text-dim)">~/netbird</div>
-        </div>
-        <div class="info-item">
-          <div class="info-label">Status Flag</div>
-          <div class="info-value" style="color:var(--green)">netbird_enabled = true</div>
+          <div class="info-label">Connected Peers</div>
+          <div class="info-value" id="netbird-peer-count" style="color:var(--text-secondary)">Loading…</div>
         </div>
       </div>
     </div>
@@ -26324,6 +26335,31 @@ function loadNetbirdLogs() {
   .catch(err => {
     logBox.textContent = 'Error loading logs: ' + err;
   });
+}
+
+function loadNetbirdStats() {
+  const el = document.getElementById('netbird-peer-count');
+  if (!el) return;
+  fetch('/api/netbird/stats', { credentials: 'same-origin' })
+  .then(res => res.json())
+  .then(data => {
+    if (data.ok && data.connected != null) {
+      el.textContent = data.connected + ' of ' + data.total;
+      el.style.color = data.connected > 0 ? 'var(--green)' : 'var(--text-secondary)';
+    } else {
+      el.textContent = 'Unavailable';
+      el.style.color = 'var(--text-dim)';
+    }
+  })
+  .catch(() => {
+    el.textContent = 'Unavailable';
+    el.style.color = 'var(--text-dim)';
+  });
+}
+
+if (document.getElementById('netbird-peer-count')) {
+  loadNetbirdStats();
+  setInterval(loadNetbirdStats, 30000);
 }
 
 function confirmUninstallNetbird() {
