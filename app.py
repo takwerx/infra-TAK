@@ -12899,7 +12899,8 @@ def _get_cloudtak_version_info():
     try:
         rcid = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null',
                               shell=True, capture_output=True, text=True, timeout=5)
-        _api_id = (rcid.stdout or '').strip().splitlines()[0].strip() if rcid.returncode == 0 else ''
+        _cid_lines = (rcid.stdout or '').strip().splitlines() if rcid.returncode == 0 else []
+        _api_id = _cid_lines[0].strip() if _cid_lines else ''
         if _api_id:
             rv = subprocess.run(
                 f"docker exec {_api_id} node -e \"process.stdout.write(require('/home/etl/api/package.json').version)\" 2>/dev/null",
@@ -12938,7 +12939,11 @@ def _get_cloudtak_version_info():
         if rv.returncode == 0 and rv.stdout.strip():
             out['version'] = rv.stdout.strip().lstrip('vV')
     r = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-    _ct_api_id = (r.stdout or '').strip().splitlines()[0].strip() if r.returncode == 0 else ''
+    # Guard: docker ps -q returns empty (rc 0) when no container is running — e.g.
+    # the post-update recreate window. `''.splitlines()[0]` was an IndexError → 500
+    # on /api/modules/version while CloudTAK was being recreated (caught in v0.9.48 T&E).
+    _ct_lines = (r.stdout or '').strip().splitlines() if r.returncode == 0 else []
+    _ct_api_id = _ct_lines[0].strip() if _ct_lines else ''
     if _ct_api_id:
         log_r = subprocess.run(f'docker logs {_ct_api_id} --tail 150 2>&1', shell=True, capture_output=True, text=True, timeout=10)
         if log_r.stdout:
