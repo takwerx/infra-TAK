@@ -13161,39 +13161,58 @@ def _get_tvr_version_info():
 
 
 def get_all_module_versions():
-    """Return dict of module_key -> {version, update_available, latest?} for console cards."""
+    """Return dict of module_key -> {version, update_available, latest?} for console cards.
+
+    Each per-module lookup is INDEPENDENTLY GUARDED: a version helper that raises
+    must not 500 the whole endpoint and blank every card. The helpers shell out to
+    docker/git and parse package.json, so they can throw subprocess.TimeoutExpired
+    (busy box), json.JSONDecodeError (malformed/partial package.json), or IndexError
+    (container mid-recreate). v0.9.48 T&E (test8, the busy box) hit all three over a
+    9h soak — each took down /api/modules/version once. Catch per module → that card
+    just lacks a version that poll; the rest still render.
+    """
     modules = detect_modules()
     result = {}
+
+    def _set(key, fn):
+        try:
+            result[key] = fn()
+        except Exception as e:
+            print(f"version-info: {key} lookup failed (non-fatal): {e}", flush=True)
+
     if modules.get('caddy', {}).get('installed'):
-        result['caddy'] = _get_caddy_version_info()
+        _set('caddy', _get_caddy_version_info)
     if modules.get('authentik', {}).get('installed'):
-        result['authentik'] = _get_authentik_version_info()
+        _set('authentik', _get_authentik_version_info)
     if modules.get('nodered', {}).get('installed'):
-        result['nodered'] = _get_nodered_version_info()
+        _set('nodered', _get_nodered_version_info)
     if modules.get('cloudtak', {}).get('installed'):
-        result['cloudtak'] = _get_cloudtak_version_info()
+        _set('cloudtak', _get_cloudtak_version_info)
     if modules.get('mediamtx', {}).get('installed'):
-        mtx = _get_mediamtx_version_info()
-        # Card expects single 'version' string and update_available; label so MediaMTX vs editor are clear
-        parts = []
-        if mtx.get('version'):
-            parts.append('MediaMTX v' + mtx['version'])
-        if mtx.get('editor_version'):
-            parts.append('editor v' + mtx['editor_version'])
-        mtx['version'] = ' · '.join(parts) if parts else (mtx.get('editor_version') or mtx.get('version') or '')
-        result['mediamtx'] = mtx
+        try:
+            mtx = _get_mediamtx_version_info()
+            # Card expects single 'version' string and update_available; label so MediaMTX vs editor are clear
+            parts = []
+            if mtx.get('version'):
+                parts.append('MediaMTX v' + mtx['version'])
+            if mtx.get('editor_version'):
+                parts.append('editor v' + mtx['editor_version'])
+            mtx['version'] = ' · '.join(parts) if parts else (mtx.get('editor_version') or mtx.get('version') or '')
+            result['mediamtx'] = mtx
+        except Exception as e:
+            print(f"version-info: mediamtx lookup failed (non-fatal): {e}", flush=True)
     if modules.get('takportal', {}).get('installed'):
-        result['takportal'] = _get_takportal_version_info()
+        _set('takportal', _get_takportal_version_info)
     if modules.get('takserver', {}).get('installed'):
-        result['takserver'] = _get_takserver_version_info()
+        _set('takserver', _get_takserver_version_info)
     if modules.get('fedhub', {}).get('installed'):
-        result['fedhub'] = _get_fedhub_version_info()
+        _set('fedhub', _get_fedhub_version_info)
     if modules.get('fail2ban', {}).get('installed'):
-        result['fail2ban'] = _get_fail2ban_version_info()
+        _set('fail2ban', _get_fail2ban_version_info)
     if modules.get('webodm', {}).get('installed'):
-        result['webodm'] = _get_webodm_version_info()
+        _set('webodm', _get_webodm_version_info)
     if modules.get('tak_video_restreamer', {}).get('installed'):
-        result['tak_video_restreamer'] = _get_tvr_version_info()
+        _set('tak_video_restreamer', _get_tvr_version_info)
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
