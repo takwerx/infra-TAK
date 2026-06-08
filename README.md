@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.47-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.47-alpha)**
+**Current release: [v0.9.48-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.48-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.48-alpha — 2026-06-08 — CloudTAK foreign-source video (RTSP/SRT) plays in the browser map
+
+**Headline: CloudTAK's built-in video proxy now works end-to-end.** When a CoT carries a video URL from a *separate* media server — an RTSP or SRT feed (e.g. a drone published to another MediaMTX) — CloudTAK's embedded media server now ingests it and serves browser-playable HLS, and it **keeps playing** instead of dropping after ~10 seconds. Four root causes fixed: (1) CloudTAK addresses its media server on port `:9997`, which the console's reverse proxy never exposed, so every video lease timed out — the console now fronts that port (still TLS + auth-gated, no new attack surface); (2) the embedded media server's HLS profile is tuned for low-latency playback (~3s behind the source); (3) a teardown bug that deleted the active viewer's stream every 10 seconds is fixed, so video holds while open and is still cleaned up on close (no leak); (4) SRT feeds whose stream id contains `#` (e.g. ATAK's UAS Tool) now connect automatically with no manual URL edits. All of it is applied as a self-heal that converges on every box and survives CloudTAK updates. Also in this release: the CloudTAK updater now surfaces the *real* error when an upstream rebuild fails (instead of a misleading "docker-compose: not found"), and the console reports the actually-running CloudTAK version. **Upgrade:** applied automatically on update — no action needed.
+
+Full notes: [v0.9.48-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.48-alpha).
 
 ### v0.9.47-alpha — 2026-06-07 — Custom TAK Portal domain · Network & Fanout metrics · WebODM resource cap
 
