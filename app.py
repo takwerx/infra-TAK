@@ -21683,7 +21683,7 @@ def _run_netbird_deploy(settings):
 
     try:
         # Step 1: Ensure Docker is present
-        plog('━━━ Step 1/7: Checking Docker ━━━')
+        plog('━━━ Step 1/5: Checking Docker ━━━')
         r = _sp.run(['docker', '--version'], capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
@@ -21697,7 +21697,7 @@ def _run_netbird_deploy(settings):
 
         # Step 2: Set up Authentik OIDC Application
         plog('')
-        plog('━━━ Step 2/7: Provisioning Authentik OIDC Application ━━━')
+        plog('━━━ Step 2/5: Provisioning Authentik OIDC Application ━━━')
         plog('  Contacting Authentik API...')
         client_id, client_secret = _ensure_authentik_netbird_app(settings, plog=plog)
         if not client_id or not client_secret:
@@ -21706,27 +21706,27 @@ def _run_netbird_deploy(settings):
 
         # Step 3: Write NetBird Configuration Files
         plog('')
-        plog('━━━ Step 3/7: Writing NetBird Configuration Files ━━━')
+        plog('━━━ Step 3/5: Writing NetBird Configuration Files ━━━')
         os.makedirs(nb_dir, exist_ok=True)
         os.makedirs(os.path.join(nb_dir, 'data'), exist_ok=True)
 
         netbird_domain = _get_service_domain(settings, 'netbird')
         authentik_domain = _get_service_domain(settings, 'authentik') or settings.get('fqdn', '').strip()
+        authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
 
-        # Generate a random auth secret for relay and a random admin password for NetBird setup
+        # Generate a random auth secret for relay
         auth_secret = _sec.token_hex(32)
-        nb_admin_password = _sec.token_urlsafe(24)
-        nb_admin_email = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_EMAIL') or f'admin@{settings.get("fqdn", "infratak.local")}'
 
-        config_content = f"""# NetBird Combined Server Configuration
+        # Standalone mode: Authentik IS the OIDC provider — no built-in OIDC setup page
+        config_content = f"""# NetBird Combined Server Configuration (Standalone Authentik OIDC)
 server:
   listenAddress: ":443"
   exposedAddress: "https://{netbird_domain}:443"
   metricsPort: 9090
   healthcheckAddress: ":9000"
   auth:
-    issuer: "https://{netbird_domain}/oauth2"
-    audience: "netbird-dashboard"
+    issuer: "{authentik_issuer}"
+    audience: "{client_id}"
     userIDClaim: "sub"
     dashboardRedirectURIs:
       - "https://{netbird_domain}"
@@ -21751,8 +21751,6 @@ server:
       - "33073:443"
       - "10000:10000"
       - "3478:3478/udp"
-    environment:
-      - NB_SETUP_PAT_ENABLED=true
     volumes:
       - ./config.yaml:/etc/netbird/config.yaml
       - ./data:/var/lib/netbird
@@ -21771,12 +21769,14 @@ server:
     environment:
       - NETBIRD_MGMT_API_ENDPOINT=https://{netbird_domain}
       - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://{netbird_domain}
-      - AUTH_AUDIENCE=netbird-dashboard
-      - AUTH_CLIENT_ID=netbird-dashboard
-      - AUTH_CLIENT_SECRET=
-      - AUTH_AUTHORITY=https://{netbird_domain}/oauth2
+      - AUTH_AUDIENCE={client_id}
+      - AUTH_CLIENT_ID={client_id}
+      - AUTH_CLIENT_SECRET={client_secret}
+      - AUTH_AUTHORITY={authentik_issuer}
       - USE_AUTH0=false
-      - AUTH_SUPPORTED_SCOPES=openid profile email offline_access
+      - AUTH_SUPPORTED_SCOPES=openid profile email offline_access api
+      - AUTH_REDIRECT_URI=https://{netbird_domain}/peers
+      - AUTH_SILENT_REDIRECT_URI=https://{netbird_domain}/silent-callback
     logging:
       driver: json-file
       options:
@@ -21787,6 +21787,8 @@ server:
         with open(config_path, 'w') as f:
             f.write(config_content)
         plog(f'  ✓ Wrote config.yaml to {config_path}')
+        plog(f'    auth.issuer → {authentik_issuer}')
+        plog(f'    audience    → {client_id}')
 
         with open(compose_path, 'w') as f:
             f.write(compose_content)
@@ -21795,7 +21797,7 @@ server:
 
         # Step 4: Launching Containers
         plog('')
-        plog('━━━ Step 4/7: Launching NetBird Services ━━━')
+        plog('━━━ Step 4/5: Launching NetBird Services ━━━')
         plog('  Pulling Docker images...')
         r = _sp.run(['docker', 'compose', 'pull'], capture_output=True, text=True, cwd=nb_dir)
         plog(f'  docker compose pull: {r.stdout.strip() or r.stderr.strip()}')
@@ -21807,113 +21809,9 @@ server:
         plog(f'  docker compose up -d: {r.stdout.strip()}')
         plog('✓ Containers started successfully')
 
-        # Step 5: Initial Setup & PAT
+        # Step 5: Network and Firewall Hardenings & Caddy Reload
         plog('')
-        plog('━━━ Step 5/7: Running Initial Setup ━━━')
-        plog('  Waiting for management server to become ready...')
-        nb_pat = None
-        _nb_api_base = f'https://{netbird_domain}'
-        # Wait for the management server to report setup_required=true
-        _setup_ready = False
-        for _attempt in range(45):
-            try:
-                _req = _urlreq.Request(f'{_nb_api_base}/api/instance')
-                _resp = json.loads(_urlreq.urlopen(_req, timeout=5).read().decode())
-                if _resp.get('setup_required') is True:
-                    _setup_ready = True
-                    break
-                elif _resp.get('setup_required') is False:
-                    plog('  ⚠ Instance already set up — skipping initial setup')
-                    break
-            except Exception:
-                pass
-            time.sleep(2)
-
-        if _setup_ready:
-            plog(f'  Server ready. Running initial setup as {nb_admin_email}...')
-            _setup_body = json.dumps({
-                'email': nb_admin_email,
-                'password': nb_admin_password,
-                'name': 'Admin',
-                'create_pat': True,
-                'pat_expire_in': 365,
-            }).encode()
-            _setup_req = _urlreq.Request(f'{_nb_api_base}/api/setup',
-                data=_setup_body, headers={'Content-Type': 'application/json'}, method='POST')
-            try:
-                _setup_resp = json.loads(_urlreq.urlopen(_setup_req, timeout=30).read().decode())
-                nb_pat = _setup_resp.get('personal_access_token', '')
-                if nb_pat:
-                    plog(f'  ✓ Setup complete — PAT obtained (length={len(nb_pat)})')
-                    # Store PAT and admin creds in settings for future API calls
-                    settings['netbird_pat'] = nb_pat
-                    settings['netbird_admin_email'] = nb_admin_email
-                    save_settings(settings)
-                else:
-                    plog(f'  ✓ Setup complete — no PAT returned (response keys: {list(_setup_resp.keys())})')
-            except Exception as _se:
-                _err_body = ''
-                try:
-                    _err_body = _se.read().decode()[:300]
-                except Exception:
-                    pass
-                plog(f'  ⚠ Setup call failed: {_err_body or str(_se)[:200]}')
-        else:
-            # Try to use a previously stored PAT
-            nb_pat = settings.get('netbird_pat', '')
-            if nb_pat:
-                plog(f'  Using previously stored PAT')
-
-        plog('✓ Initial setup phase complete')
-
-        # Step 6: Register Authentik as Identity Provider
-        plog('')
-        plog('━━━ Step 6/7: Registering Authentik Identity Provider ━━━')
-        if nb_pat and client_id and client_secret:
-            _ak_issuer = f'https://{authentik_domain}/application/o/netbird/'
-            _idp_headers = {'Authorization': f'Token {nb_pat}', 'Content-Type': 'application/json'}
-
-            # Check if Authentik IDP is already registered
-            _idp_exists = False
-            try:
-                _list_req = _urlreq.Request(f'{_nb_api_base}/api/identity-providers', headers=_idp_headers)
-                _idp_list = json.loads(_urlreq.urlopen(_list_req, timeout=15).read().decode())
-                if isinstance(_idp_list, list):
-                    _idp_exists = any(p.get('type') == 'authentik' for p in _idp_list)
-            except Exception:
-                pass
-
-            if _idp_exists:
-                plog('  ✓ Authentik identity provider already registered — skipping')
-            else:
-                _idp_body = json.dumps({
-                    'type': 'authentik',
-                    'name': 'Authentik',
-                    'issuer': _ak_issuer,
-                    'client_id': client_id,
-                    'client_secret': client_secret,
-                }).encode()
-                try:
-                    _idp_req = _urlreq.Request(f'{_nb_api_base}/api/identity-providers',
-                        data=_idp_body, headers=_idp_headers, method='POST')
-                    _idp_resp = json.loads(_urlreq.urlopen(_idp_req, timeout=15).read().decode())
-                    plog(f'  ✓ Authentik IDP registered (id={_idp_resp.get("id", "?")}, issuer={_ak_issuer})')
-                except Exception as _idp_err:
-                    _err_body = ''
-                    try:
-                        _err_body = _idp_err.read().decode()[:300]
-                    except Exception:
-                        pass
-                    plog(f'  ⚠ IDP registration failed: {_err_body or str(_idp_err)[:200]}')
-        elif not nb_pat:
-            plog('  ⚠ No PAT available — cannot register IDP via API. Add Authentik manually in Settings → Identity Providers.')
-        else:
-            plog('  ⚠ No Authentik credentials — skipping IDP registration')
-        plog('✓ Identity provider step complete')
-
-        # Step 7: Network and Firewall Hardenings & Caddy Reload
-        plog('')
-        plog('━━━ Step 7/7: Hardening Firewall & Reloading Proxy ━━━')
+        plog('━━━ Step 5/5: Hardening Firewall & Reloading Proxy ━━━')
         plog('  Configuring UFW for NetBird STUN (3478/udp)...')
         _sp.run(['sudo', 'ufw', 'allow', '3478/udp'], capture_output=True)
         plog('  ✓ UFW rule allowed: 3478/udp')
@@ -21931,7 +21829,8 @@ server:
         plog('')
         plog('🎉 NetBird VPN deployed successfully!')
         plog(f'Dashboard: https://{netbird_domain}')
-        plog(f'Users can log in via Authentik SSO at https://{authentik_domain}')
+        plog(f'Login via Authentik SSO at https://{authentik_domain}')
+        plog(f'Auth issuer: {authentik_issuer}')
         _netbird_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
     except Exception as e:
