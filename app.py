@@ -12879,19 +12879,38 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
 def _get_cloudtak_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for CloudTAK.
 
-    Version resolution order (handles upstream tagging-before-package-bump bug):
-    1. git describe --tags --exact-match: if HEAD is exactly at a release tag,
-       use the tag name (e.g. v13.3.0 → '13.3.0'). This is authoritative even
-       when package.json still says 13.2.0 (dfpc-coe sometimes tags before
-       bumping package.json — the tag is the real version).
-    2. package.json (api/ or web/): used when HEAD is not at an exact tag.
+    Version resolution order:
+    0. The RUNNING cloudtak-api container's package.json — authoritative for what is
+       actually serving. The git source tree is NOT a reliable version signal: a
+       FAILED "Update Now" checks out the new tag BEFORE the (failed) image rebuild,
+       so the source sits at e.g. v13.10.0 while the container still runs v13.4.0.
+       Reading git first made the console report the un-built version (caught on
+       test12 2026-06-07: source v13.10.0, container v13.4.0). Prefer the container.
+    1. git describe --tags --exact-match: if HEAD is exactly at a release tag, use the
+       tag name (authoritative even when package.json lags — dfpc-coe sometimes tags
+       before bumping package.json). Used only when no container is running.
+    2. package.json (api/ or web/) in the source tree.
     3. git describe --tags --always fallback for everything else.
     """
     import re
     out = {'version': '', 'update_available': False, 'latest': None}
     ct_dir = os.path.expanduser('~/CloudTAK')
+    # Step 0: prefer the RUNNING container's version (what's actually serving).
+    try:
+        rcid = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null',
+                              shell=True, capture_output=True, text=True, timeout=5)
+        _api_id = (rcid.stdout or '').strip().splitlines()[0].strip() if rcid.returncode == 0 else ''
+        if _api_id:
+            rv = subprocess.run(
+                f"docker exec {_api_id} node -e \"process.stdout.write(require('/home/etl/api/package.json').version)\" 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=8)
+            ver = (rv.stdout or '').strip()
+            if rv.returncode == 0 and re.match(r'^\d+\.\d+\.\d+', ver):
+                out['version'] = ver
+    except Exception:
+        pass
     # Step 1: prefer exact git tag — authoritative even when package.json lags
-    if os.path.isdir(os.path.join(ct_dir, '.git')):
+    if not out['version'] and os.path.isdir(os.path.join(ct_dir, '.git')):
         try:
             rv = subprocess.run(
                 f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
