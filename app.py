@@ -21712,20 +21712,40 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
     return _req.urlopen(req, timeout=timeout, context=ctx)
 
 
-def _netbird_peer_stats(settings):
-    """Return connected/total peer counts from the management API."""
-    pat = (settings.get('netbird_pat') or '').strip()
-    if not pat:
+def _netbird_peer_stats_from_db(nb_dir=None):
+    """Read peer counts from local management store (same-host, no PAT required)."""
+    import sqlite3
+    nb_dir = nb_dir or NETBIRD_INSTALL_DIR
+    db_path = os.path.join(nb_dir, 'data', 'store.db')
+    if not os.path.isfile(db_path):
         return None
     try:
-        resp = _netbird_mgmt_request('/api/peers', token=pat, timeout=10)
-        data = json.loads(resp.read().decode())
-        peers = data if isinstance(data, list) else (data.get('items') or data.get('data') or [])
-        total = len(peers)
-        connected = sum(1 for p in peers if p.get('connected'))
-        return {'total': total, 'connected': connected}
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=3)
+        row = conn.execute(
+            'SELECT COUNT(*), COALESCE(SUM(peer_status_connected), 0) FROM peers'
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {'total': int(row[0]), 'connected': int(row[1])}
     except Exception:
         return None
+
+
+def _netbird_peer_stats(settings):
+    """Return connected/total peer counts from management API or local store."""
+    pat = (settings.get('netbird_pat') or '').strip()
+    if pat:
+        try:
+            resp = _netbird_mgmt_request('/api/peers', token=pat, timeout=10)
+            data = json.loads(resp.read().decode())
+            peers = data if isinstance(data, list) else (data.get('items') or data.get('data') or [])
+            total = len(peers)
+            connected = sum(1 for p in peers if p.get('connected'))
+            return {'total': total, 'connected': connected}
+        except Exception:
+            pass
+    return _netbird_peer_stats_from_db()
 
 
 def _netbird_admin_credentials(settings):
@@ -22053,7 +22073,7 @@ def _run_netbird_deploy(settings):
         netbird_domain = _get_service_domain(settings, 'netbird')
         authentik_domain = _get_service_domain(settings, 'authentik') or settings.get('fqdn', '').strip()
         authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
-        auth_secret = _sec.token_hex(32)
+        auth_secret = _netbird_read_auth_secret(nb_dir) or _sec.token_hex(32)
 
         setup_pat = not settings.get('netbird_pat')
         _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat)
