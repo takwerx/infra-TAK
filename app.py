@@ -16948,14 +16948,20 @@ services:
 
 # --- CloudTAK embedded-MediaMTX (cloudtak-media) self-heal scripts (v0.9.48) ----
 # Run INSIDE the cloudtak-media container via `docker exec -i … sh` (stdin-piped, so
-# no host/remote quoting concerns). Two independent fixes, healed together with one
-# container restart:
+# no host/remote quoting concerns). THREE fixes, healed together with one restart:
 #
-#  (B) /mediamtx.yml  — hlsVariant: mpegts + hlsAlwaysRemux: true. Default lowLatency
-#      (LL-HLS) bails on drone variable framerate ("part duration changed" → hls.js
-#      404s a part and stops); mpegts removes that error class. alwaysRemux pre-warms
-#      the muxer (kills the ~10s cold-start buffer). Field-validated live (test12,
-#      real drone, 2026-06-07).
+#  (B) /mediamtx.yml — low-latency browser-HLS profile, identical to infra-TAK's own
+#      MediaMTX module (app.py ~14616, field-proven on the restreamer):
+#        hlsVariant: mpegts        (default lowLatency LL-HLS bails on drone variable
+#                                   framerate → hls.js 404s a part and stops)
+#        hlsAlwaysRemux: false     (we first shipped true to pre-warm, but with the
+#                                   segment tuning below true caused startup buffering
+#                                   AND extra lag on the on-demand pull; false matches
+#                                   the restreamer and is smoother — field A/B 2026-06-07)
+#        hlsSegmentCount: 3 / hlsSegmentDuration: 500ms / hlsPartDuration: 200ms
+#                                   (the DEFAULT 7×1s playlist was the 20s lag; 3×500ms
+#                                   dropped CloudTAK to ~3s behind a direct view —
+#                                   the residual is the proxy hop + hls.js, not config)
 #
 #  (C) /lib/persist.ts — THE teardown fix. media-infra's reaper cron (every 10s) lists
 #      CloudTAK leases with `ephemeral=false` and DELETES every MediaMTX path not in
@@ -16968,46 +16974,67 @@ services:
 #      ACTIVE viewer paths while still reaping genuinely-closed ones (FloatingVideo
 #      deletes its lease on close) — fleet-safe, no orphaned-RTSP leak. (The PLAN's
 #      earlier "just drop ephemeral=false" failed because the param is a REQUIRED enum;
-#      'all' is the right token.) Container executes the .ts directly, so editing the
-#      source + restart takes effect. The path may be absent on other media-infra
-#      builds → treated as not-applicable, never an error.
+#      'all' is the right token.) Field-validated 2026-06-07: viewer-open path held
+#      across 4+ reap cycles, viewer-close path reaped within ~10s.
 #
-# Drift only happens on a container RECREATE (both edits survive a plain
-# `docker restart`). The converger is check-before-apply so it is a no-op (no restart,
-# no video drop) on an already-correct box — safe on every startup / tick.
+#  (D) /lib/payload.ts — SRT streamid fix. ATAK UAS Tool emits a CoT video URL like
+#      `srt://host:8890?streamid=#!::m=request,r=uas1`. CloudTAK URL-DECODES it, so the
+#      lease/source carries a bare `#`. MediaMTX (Go net/url) treats `#` as a fragment
+#      and drops the streamid → caller dials with no streamid → REJECT. ffmpeg/libsrt
+#      handle `#` (that's why a direct view works), but MediaMTX's gosrt does not. Fix:
+#      in createPayload, percent-encode `#`→`%23` for srt:// sources only — MediaMTX
+#      decodes it back for the handshake. MUST live here (downstream of CloudTAK's
+#      decode, upstream of the gosrt parse); encoding it in the CoT gets undone.
+#      Field-validated 2026-06-07 (A/B: raw `#` REJECT, `%23` came online → HLS).
+#
+# All three live in cloudtak-media; the container runs the .ts files directly so an edit
+# + restart takes effect. persist.ts / payload.ts may be absent on other media-infra
+# builds → treated as not-applicable, never an error. Drift only happens on a container
+# RECREATE (every edit survives a plain `docker restart`). The converger is
+# check-before-apply → a no-op (no restart, no video drop) on an already-correct box.
 _CT_MEDIA_CHECK_SH = r'''
-V=$(yq -r '.hlsVariant' /mediamtx.yml 2>/dev/null || echo '?')
-A=$(yq -r '.hlsAlwaysRemux' /mediamtx.yml 2>/dev/null || echo '?')
+if [ "$(yq -r '.hlsVariant' /mediamtx.yml 2>/dev/null)" = mpegts ] \
+ && [ "$(yq -r '.hlsAlwaysRemux' /mediamtx.yml 2>/dev/null)" = false ] \
+ && [ "$(yq -r '.hlsSegmentCount' /mediamtx.yml 2>/dev/null)" = 3 ] \
+ && [ "$(yq -r '.hlsSegmentDuration' /mediamtx.yml 2>/dev/null)" = 500ms ] \
+ && [ "$(yq -r '.hlsPartDuration' /mediamtx.yml 2>/dev/null)" = 200ms ]; then H=ok; else H=drift; fi
 if [ ! -f /lib/persist.ts ]; then R=na
 elif grep -qF "'ephemeral', 'all'" /lib/persist.ts; then R=ok
 else R=drift; fi
-printf '%s %s %s\n' "$V" "$A" "$R"
+if [ ! -f /lib/payload.ts ]; then P=na
+elif grep -qF "replace(/#/g, '%23')" /lib/payload.ts; then P=ok
+else P=drift; fi
+printf '%s %s %s\n' "$H" "$R" "$P"
 '''
 _CT_MEDIA_APPLY_SH = r'''
-yq -i '.hlsVariant = "mpegts" | .hlsAlwaysRemux = true' /mediamtx.yml
+yq -i '.hlsVariant = "mpegts" | .hlsAlwaysRemux = false | .hlsSegmentCount = 3 | .hlsSegmentDuration = "500ms" | .hlsPartDuration = "200ms"' /mediamtx.yml
 if [ -f /lib/persist.ts ]; then
   sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" /lib/persist.ts
+fi
+if [ -f /lib/payload.ts ]; then
+  sed -i "s|source: path.proxy,|source: path.proxy.startsWith('srt://') ? path.proxy.replace(/#/g, '%23') : path.proxy,|" /lib/payload.ts
 fi
 '''
 
 
 def _ct_media_converged(check_out):
-    """True iff the container check output shows mediamtx HLS set AND the reaper is
-    ephemeral-aware (or persist.ts is absent)."""
+    """True iff the container check shows the HLS profile set, the reaper ephemeral-aware,
+    and the SRT streamid encode present (persist.ts / payload.ts absent = not-applicable)."""
     p = (check_out or '').split()
-    return len(p) >= 3 and p[0] == 'mpegts' and p[1] == 'true' and p[2] in ('ok', 'na')
+    return len(p) >= 3 and p[0] == 'ok' and p[1] in ('ok', 'na') and p[2] in ('ok', 'na')
 
 
 def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
-    """v0.9.48 (Parts B + C): self-heal the CloudTAK embedded MediaMTX (cloudtak-media)
-    — CONVERGENCE, not an event handler. Reads the live container state first and only
-    patches /mediamtx.yml (B) + /lib/persist.ts (C) and restarts the container when a
-    value has actually drifted, so a correctly-configured box is a no-op (no needless
-    restart, no video drop). Heals both files in one restart. See _CT_MEDIA_*_SH above
-    for the what/why.
+    """v0.9.48: self-heal the CloudTAK embedded MediaMTX (cloudtak-media) — CONVERGENCE,
+    not an event handler. Reads the live container state first and only patches
+    /mediamtx.yml (HLS profile), /lib/persist.ts (ephemeral-aware reaper), and
+    /lib/payload.ts (SRT streamid #→%23 encode), then restarts the container, when a
+    value has actually drifted — so a correctly-configured box is a no-op (no needless
+    restart, no video drop). Heals all three files in one restart. See _CT_MEDIA_*_SH
+    above for the what/why.
 
     Drift source: a container RECREATE (CloudTAK update, operator `docker compose up`,
-    daemon restart) reverts both files to the image default; they survive a plain
+    daemon restart) reverts the files to the image default; they survive a plain
     `docker restart`. This converger is the source of truth — it runs at console
     startup (Guard-Dog-independent) and right after every infra-TAK recreate for
     immediate convergence instead of waiting for the next boot.
