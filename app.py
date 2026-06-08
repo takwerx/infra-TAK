@@ -4352,6 +4352,7 @@ def netbird_page():
         
     netbird_domain = _get_service_domain(settings, 'netbird')
     netbird_url = f"https://{netbird_domain}" if netbird_domain else ""
+    nb_vinfo = _get_netbird_version_info() if netbird_status.get('installed') else {}
     
     return render_template_string(
         NETBIRD_TEMPLATE,
@@ -4359,9 +4360,18 @@ def netbird_page():
         netbird=netbird_status,
         version=VERSION,
         netbird_url=netbird_url,
+        netbird_version=nb_vinfo.get('version', ''),
+        netbird_update_available=nb_vinfo.get('update_available', False),
+        netbird_latest=nb_vinfo.get('latest') or '',
         deploy_log=_netbird_deploy_status.get('log', []),
         deploy_error=_netbird_deploy_status.get('error', False)
     )
+
+@app.route('/api/netbird/version')
+@login_required
+def netbird_version_api():
+    """Return NetBird image versions and update availability."""
+    return jsonify(_get_netbird_version_info())
 
 @app.route('/api/netbird/deploy', methods=['POST'])
 @login_required
@@ -4388,7 +4398,7 @@ def netbird_deploy_status_api():
 @login_required
 def netbird_control_api():
     action = (request.json or {}).get('action', '')
-    if action not in ('start', 'stop', 'restart'):
+    if action not in ('start', 'stop', 'restart', 'update'):
         return jsonify({'error': 'Invalid action'}), 400
     
     nb_dir = NETBIRD_INSTALL_DIR
@@ -4396,6 +4406,29 @@ def netbird_control_api():
         return jsonify({'error': 'NetBird is not installed'}), 404
     
     import subprocess as _sp
+    if action == 'update':
+        pull = _sp.run(['docker', 'compose', 'pull', 'netbird-server', 'dashboard'],
+                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
+        if pull.returncode != 0:
+            err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
+            return jsonify({'success': False, 'error': err}), 500
+        try:
+            _netbird_recreate_containers(nb_dir, lambda _m: None)
+            _netbird_finalize_account_store()
+        except Exception as ex:
+            return jsonify({'success': False, 'error': str(ex)[:300]}), 500
+        time.sleep(2)
+        r_status = _sp.run(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server'],
+                             capture_output=True, text=True)
+        running = r_status.stdout.strip() == 'true'
+        vinfo = _get_netbird_version_info()
+        return jsonify({
+            'success': True,
+            'running': running,
+            'action': action,
+            'pull': 'Pulled latest netbird-server and dashboard images',
+            'version': vinfo.get('version') or '',
+        })
     if action == 'start':
         _sp.run(['docker', 'compose', 'start'], capture_output=True, cwd=nb_dir)
     elif action == 'stop':
@@ -13339,6 +13372,95 @@ def _get_tvr_version_info():
     return info
 
 
+_netbird_release_cache = {}
+
+
+def _netbird_version_tuple(ver):
+    """Parse semver-ish NetBird version to comparable tuple."""
+    import re
+    v = (ver or '').strip().lstrip('vV')
+    parts = []
+    for p in v.split('.')[:3]:
+        try:
+            parts.append(int(re.sub(r'[^0-9].*', '', p) or '0'))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _get_netbird_github_latest(repo, use_cache=True):
+    """Latest release tag from netbirdio/netbird or netbirdio/dashboard."""
+    import time as _time
+    import urllib.request as _ur
+    cache_key = repo
+    if use_cache:
+        cached = _netbird_release_cache.get(cache_key)
+        if cached and (_time.time() - cached.get('ts', 0) < 14400):
+            return cached.get('tag')
+    try:
+        req = _ur.Request(
+            f'https://api.github.com/repos/netbirdio/{repo}/releases/latest',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        resp = _ur.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+        tag = (data.get('tag_name') or '').strip()
+        if tag:
+            _netbird_release_cache[cache_key] = {'tag': tag, 'ts': _time.time()}
+            return tag
+    except Exception:
+        pass
+    return _netbird_release_cache.get(cache_key, {}).get('tag')
+
+
+def _netbird_docker_image_version(container_name):
+    """Read org.opencontainers.image.version from a running/stopped container."""
+    try:
+        r = subprocess.run(
+            ['docker', 'inspect', container_name,
+             '--format', '{{index .Config.Labels "org.opencontainers.image.version"}}'],
+            capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            return r.stdout.strip().lstrip('vV')
+    except Exception:
+        pass
+    return ''
+
+
+def _get_netbird_version_info():
+    """Return {version, update_available, latest} for NetBird server + dashboard images."""
+    out = {'version': '', 'update_available': False, 'latest': None}
+    nb_dir = NETBIRD_INSTALL_DIR
+    if not os.path.isfile(os.path.join(nb_dir, 'docker-compose.yml')):
+        return out
+    mgmt_ver = _netbird_docker_image_version('netbird-server')
+    dash_ver = _netbird_docker_image_version('netbird-dashboard')
+    parts = []
+    if mgmt_ver:
+        parts.append(mgmt_ver)
+    if dash_ver:
+        parts.append('dash ' + dash_ver)
+    out['version'] = ' · '.join(parts)
+    mgmt_latest = _get_netbird_github_latest('netbird')
+    dash_latest = _get_netbird_github_latest('dashboard')
+    mgmt_latest_clean = (mgmt_latest or '').lstrip('vV')
+    dash_latest_clean = (dash_latest or '').lstrip('vV')
+    mgmt_behind = bool(mgmt_ver and mgmt_latest_clean
+                       and _netbird_version_tuple(mgmt_latest_clean) > _netbird_version_tuple(mgmt_ver))
+    dash_behind = bool(dash_ver and dash_latest_clean
+                       and _netbird_version_tuple(dash_latest_clean) > _netbird_version_tuple(dash_ver))
+    if mgmt_behind or dash_behind:
+        out['update_available'] = True
+        latest_parts = []
+        if mgmt_behind:
+            latest_parts.append(mgmt_latest_clean)
+        if dash_behind:
+            latest_parts.append('dash ' + dash_latest_clean)
+        out['latest'] = ' · '.join(latest_parts)
+    return out
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards."""
     modules = detect_modules()
@@ -13373,6 +13495,8 @@ def get_all_module_versions():
         result['webodm'] = _get_webodm_version_info()
     if modules.get('tak_video_restreamer', {}).get('installed'):
         result['tak_video_restreamer'] = _get_tvr_version_info()
+    if modules.get('netbird', {}).get('installed'):
+        result['netbird'] = _get_netbird_version_info()
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -21748,6 +21872,43 @@ def _netbird_peer_stats(settings):
     return _netbird_peer_stats_from_db()
 
 
+def _netbird_pat_is_valid(pat):
+    if not (pat or '').strip():
+        return False
+    try:
+        _netbird_mgmt_request('/api/users', token=pat.strip(), timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _netbird_finalize_account_store(plog=None):
+    """Clear onboarding/user-approval gates that hide admin menus (Setup Keys, etc.)."""
+    import sqlite3
+    _log = plog or (lambda m: None)
+    db_path = os.path.join(NETBIRD_INSTALL_DIR, 'data', 'store.db')
+    if not os.path.isfile(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute(
+            'UPDATE account_onboardings SET onboarding_flow_pending=0, signup_form_pending=0'
+        )
+        conn.execute(
+            'UPDATE accounts SET settings_extra_user_approval_required=0'
+        )
+        conn.execute(
+            "UPDATE users SET pending_approval=0 WHERE role IN ('owner', 'admin')"
+        )
+        conn.commit()
+        conn.close()
+        _log('  ✓ Account onboarding/approval gates cleared')
+        return True
+    except Exception as ex:
+        _log(f'  ⚠ Account store finalize: {str(ex)[:120]}')
+        return False
+
+
 def _netbird_admin_credentials(settings):
     """Initial setup owner mirrors Authentik administrator (akadmin)."""
     fqdn = (settings.get('fqdn') or '').strip()
@@ -21783,10 +21944,14 @@ def _netbird_complete_setup(settings, plog):
 
     if instance.get('setup_required') is False:
         pat = settings.get('netbird_pat') or ''
-        if pat:
+        if pat and _netbird_pat_is_valid(pat):
             plog('  ✓ Instance already set up — using stored PAT')
             return pat
-        plog('  ⚠ Instance set up but no stored PAT — IDP registration may fail')
+        if pat:
+            plog('  ⚠ Stored PAT invalid — cleared (Authentik IDP step may need manual PAT)')
+            settings.pop('netbird_pat', None)
+            save_settings(settings)
+        plog('  ⚠ Instance set up but no valid PAT — IDP registration may fail')
         return '__already_done__'
 
     email, name, password = _netbird_admin_credentials(settings)
@@ -22102,6 +22267,7 @@ def _run_netbird_deploy(settings):
             plog('  ⚠ No PAT — register Authentik manually in NetBird Settings → Identity Providers')
         plog('  Recreating containers to apply config...')
         _netbird_recreate_containers(nb_dir, plog)
+        _netbird_finalize_account_store(plog)
         plog('✓ Click Authentik on the NetBird login page to sign in')
 
         plog('')
@@ -26102,6 +26268,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
 .control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-update{border-color:rgba(6,182,212,0.3)}.control-btn.btn-update:hover{background:rgba(6,182,212,0.08);color:var(--cyan)}
 .section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
@@ -26123,15 +26290,15 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="page-header">
     <h1>
       <img src="https://netbird.io/favicon.ico" alt="" style="height:32px;width:auto;object-fit:contain">
-      <span>NetBird VPN</span>
+      <span>NetBird VPN</span>{% if netbird_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ netbird_version }}</span>{% endif %}{% if netbird_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:4px">{{ netbird_latest }} available</span>{% endif %}
     </h1>
     <p>Zero-trust overlay WireGuard VPN with Authentik Identity Management and automatic NAT traversal</p>
   </div>
 
   {% if netbird.running %}
-    <div class="status-banner running"><div class="dot"></div>NetBird is running</div>
+    <div class="status-banner running"><div class="dot"></div>NetBird is running{% if netbird_version %} · {{ netbird_version }}{% endif %}{% if netbird_update_available and netbird_latest %} · <span style="color:var(--cyan)">{{ netbird_latest }} available</span>{% endif %}</div>
   {% elif netbird.installed %}
-    <div class="status-banner stopped"><div class="dot"></div>NetBird is installed but stopped</div>
+    <div class="status-banner stopped"><div class="dot"></div>NetBird is installed but stopped{% if netbird_version %} · {{ netbird_version }}{% endif %}{% if netbird_update_available and netbird_latest %} · <span style="color:var(--cyan)">{{ netbird_latest }} available</span>{% endif %}</div>
   {% else %}
     <div class="status-banner not-installed"><div class="dot"></div>NetBird is not installed</div>
   {% endif %}
@@ -26143,14 +26310,17 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         {% if netbird.running %}
           <button class="control-btn" onclick="controlNetbird('restart')">↻ Restart</button>
           <button class="control-btn" onclick="loadNetbirdLogs()">📋 Container Logs</button>
+          <button class="control-btn btn-update" id="netbird-update-btn" onclick="netbirdUpdate()"{% if netbird_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)" title="Update available: {{ netbird_latest }}">●</span>{% endif %}</button>
           <button class="control-btn btn-stop" onclick="controlNetbird('stop')">■ Stop</button>
           <button class="control-btn btn-remove" onclick="document.getElementById('uninstall-netbird-modal').classList.add('open')">🗑 Remove</button>
         {% else %}
           <button class="control-btn btn-start" onclick="controlNetbird('start')">▶ Start</button>
           <button class="control-btn" onclick="loadNetbirdLogs()">📋 Container Logs</button>
+          <button class="control-btn btn-update" id="netbird-update-btn" onclick="netbirdUpdate()"{% if netbird_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)" title="Update available: {{ netbird_latest }}">●</span>{% endif %}</button>
           <button class="control-btn btn-remove" onclick="document.getElementById('uninstall-netbird-modal').classList.add('open')">🗑 Remove</button>
         {% endif %}
       </div>
+      <div id="netbird-update-status" style="display:none;margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
       <div id="netbird-control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
     </div>
 
@@ -26167,6 +26337,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           <div class="info-label">Connected Peers</div>
           <div class="info-value" id="netbird-peer-count" style="color:var(--text-secondary)">Loading…</div>
         </div>
+        <div class="info-item">
+          <div class="info-label">Setup Keys (headless peers)</div>
+          <div class="info-value">
+            <a href="{{ netbird_url }}/settings?tab=setup-keys" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Settings → Setup Keys &#8599;</a>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -26176,7 +26352,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         To add servers, operators, or mobile devices to your secure overlay network:
       </p>
 
-      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Linux Terminal Setup:</h4>
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Servers / headless Linux (setup key):</h4>
+      <p style="font-size:13px;color:var(--text-dim);line-height:1.5;margin-top:4px">
+        1. In the NetBird dashboard open <strong>Settings → Setup Keys</strong> (<a href="{{ netbird_url }}/settings?tab=setup-keys" target="_blank" rel="noopener" style="color:var(--cyan)">direct link</a>) and click <strong>Create Key</strong>.<br>
+        2. Copy the key, then on the server run:<br>
+        <code style="color:var(--cyan);font-family:'JetBrains Mono'">sudo netbird up --management-url {{ netbird_url }} --setup-key &lt;KEY&gt;</code>
+      </p>
+
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Linux Terminal Setup (interactive SSO):</h4>
       <div class="terminal-block">
         <button class="terminal-copy" onclick="copyText('linux-install-cmd')">Copy</button>
         <span id="linux-install-cmd">curl -fsSL https://pkgs.netbird.io/install.sh | sh
@@ -26337,6 +26520,46 @@ function controlNetbird(action) {
     statusDiv.textContent = 'Error: ' + err;
     statusDiv.style.color = 'var(--red)';
   });
+}
+
+async function netbirdUpdate() {
+  const btn = document.getElementById('netbird-update-btn');
+  const statusDiv = document.getElementById('netbird-update-status');
+  const controlDiv = document.getElementById('netbird-control-status');
+  if (!btn || !statusDiv) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px"></span>Updating...';
+  statusDiv.style.display = 'block';
+  statusDiv.style.color = 'var(--text-secondary)';
+  statusDiv.textContent = 'Pulling latest netbird-server and dashboard images...';
+  if (controlDiv) controlDiv.textContent = '';
+  document.querySelectorAll('.control-btn').forEach(function(b) {
+    if (b !== btn) { b.disabled = true; b.style.opacity = '0.5'; }
+  });
+  try {
+    const res = await fetch('/api/netbird/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'update' }),
+      credentials: 'same-origin'
+    });
+    let data = {};
+    try { data = res.ok ? await res.json() : await res.json(); } catch (_) {}
+    if (!res.ok || !data.success) {
+      statusDiv.style.color = 'var(--red)';
+      statusDiv.textContent = '✗ ' + ((data.error || 'Update failed').slice(0, 120));
+    } else {
+      statusDiv.style.color = 'var(--green)';
+      statusDiv.textContent = '✓ Updated' + (data.pull ? ' — ' + data.pull : '') + (data.version ? ' (' + data.version + ')' : '');
+      setTimeout(function() { window.location.reload(); }, 1500);
+    }
+  } catch (err) {
+    statusDiv.style.color = 'var(--red)';
+    statusDiv.textContent = '✗ Update failed — ' + err;
+  }
+  btn.disabled = false;
+  btn.innerHTML = '⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)">●</span>{% endif %}';
+  document.querySelectorAll('.control-btn').forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
 }
 
 function loadNetbirdLogs() {
