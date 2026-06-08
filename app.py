@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.48-alpha"
+VERSION = "0.9.49-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -18160,6 +18160,35 @@ def run_cloudtak_update():
                             _shutil.copy2(os.path.join(server_path, fname), os.path.join(routes_base, fname))
                             plog(f"  Restored server route: api/routes/{fname}")
         plog(f"✓ Checked out {release_tag or 'latest HEAD'}")
+
+        # v0.9.49: the checkout above reset the (tracked) compose file to upstream
+        # defaults, which republish every hardened port on 0.0.0.0 — including
+        # media :9997 ("${MEDIA_PORT_API:-9997}:9997"). Since v0.9.48 Caddy binds the
+        # CloudTAK video vhost on server_ip:9997, so a wildcard 0.0.0.0:9997 docker
+        # publish now COLLIDES → `up -d` dies with "address already in use". (Pre-.48
+        # it merely re-exposed the port silently until the next console restart ran
+        # the startup migration.) Re-apply the loopback hardening here — the same
+        # patch the startup migration / deploy path run — BEFORE the build/up.
+        if is_remote:
+            # _patch_cloudtak_compose_ports() edits local files; over SSH apply the
+            # critical media:9997 → loopback rewrite via perl (consistent regex across
+            # distros; sed's brace/backref handling diverges). The `unless /127.0.0.1/`
+            # guard makes it idempotent. Fuller hardening runs on the box's next restart.
+            _media_perl = (
+                "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml; do "
+                "[ -f \"$f\" ] && perl -i -pe "
+                "'s/(- \")(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}127.0.0.1:$2/ unless m{127\\.0\\.0\\.1}' "
+                "\"$f\"; done; true"
+            )
+            ok_sed, _ = _ssh_probe(remote_cfg, _media_perl, timeout=30)
+            plog("  Re-applied media:9997 loopback hardening after checkout"
+                 if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+        else:
+            try:
+                if _patch_cloudtak_compose_ports(cloudtak_dir):
+                    plog("  Re-applied port hardening after checkout (loopback/removed)")
+            except Exception as _pe:
+                plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
