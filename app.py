@@ -17058,6 +17058,28 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
         return False
 
 
+def _compose_cmd(remote_cfg=None):
+    """Return the working Docker Compose invocation ('docker compose' or
+    'docker-compose'), preferring v2, or None if neither is present.
+
+    Probe ONCE and run only the available binary. The old pattern — try
+    `docker compose`, then on ANY non-zero fall back to `docker-compose` — masks the
+    real failure of the v2 command with a bogus `docker-compose: not found` on
+    Compose-v2-only boxes (the exact symptom that hid a real CloudTAK build error on
+    test12). Detecting up front means the genuine error surfaces."""
+    if remote_cfg:
+        ok, _ = _ssh_probe(remote_cfg, 'docker compose version >/dev/null 2>&1 && echo OK', timeout=20)
+        if ok:
+            return 'docker compose'
+        ok, _ = _ssh_probe(remote_cfg, 'docker-compose version >/dev/null 2>&1 && echo OK', timeout=20)
+        return 'docker-compose' if ok else None
+    if subprocess.run('docker compose version', shell=True, capture_output=True, timeout=20).returncode == 0:
+        return 'docker compose'
+    if subprocess.run('docker-compose version', shell=True, capture_output=True, timeout=20).returncode == 0:
+        return 'docker-compose'
+    return None
+
+
 def _patch_cloudtak_compose_ports(cloudtak_dir=None):
     """Patch port bindings in CloudTAK compose.yaml / docker-compose.yml.
 
@@ -17875,18 +17897,18 @@ def run_cloudtak_redeploy(cfg=None):
             f.write(_cloudtak_build_override_yml(settings))
         plog("✓ .env and override written")
         plog("  Restarting containers...")
+        dcc = _compose_cmd()
+        if not dcc:
+            plog("✗ Neither `docker compose` nor `docker-compose` is available")
+            cloudtak_deploy_status.update({'running': False, 'error': True})
+            return
         r = subprocess.run(
-            'docker compose up -d --force-recreate 2>&1',
+            f'{dcc} up -d --force-recreate 2>&1',
             shell=True, capture_output=True, text=True, timeout=180, cwd=cloudtak_dir
         )
         if r.returncode != 0:
-            # Fallback for systems with docker-compose (hyphen) instead of docker compose
-            r = subprocess.run(
-                'docker-compose up -d --force-recreate 2>&1',
-                shell=True, capture_output=True, text=True, timeout=180, cwd=cloudtak_dir
-            )
-        if r.returncode != 0:
-            plog(f"✗ Restart failed: {r.stderr or r.stdout or 'unknown'}")
+            _tail = '\n'.join((r.stdout or r.stderr or 'unknown').strip().splitlines()[-20:])
+            plog(f"✗ Restart failed (via `{dcc}`):\n{_tail}")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Containers restarted")
@@ -18060,23 +18082,33 @@ def run_cloudtak_update():
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
         if is_remote:
-            build_cmd = "cd ~/CloudTAK && docker compose build --no-cache && docker compose up -d"
+            dcc = _compose_cmd(remote_cfg=remote_cfg)
+            if not dcc:
+                plog("✗ Neither `docker compose` nor `docker-compose` is available on the remote host")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache && {dcc} up -d"
             ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=2700)
             if not ok:
-                plog(f"✗ Build/restart failed on remote: {(out or '')[:220]}")
+                plog(f"✗ Build/restart failed on remote: {(out or '')[:600]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         else:
             cloudtak_dir = os.path.expanduser('~/CloudTAK')
+            dcc = _compose_cmd()
+            if not dcc:
+                plog("✗ Neither `docker compose` nor `docker-compose` is available")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            # Detected compose binary only — no fallback chain that would mask the real
+            # build error with a bogus 'docker-compose: not found'. Surface the tail of
+            # the combined output so an actual build failure is diagnosable.
             r = subprocess.run(
-                'docker compose build --no-cache && docker compose up -d 2>&1',
+                f'{dcc} build --no-cache && {dcc} up -d 2>&1',
                 shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
             if r.returncode != 0:
-                r = subprocess.run(
-                    'docker-compose build --no-cache && docker-compose up -d 2>&1',
-                    shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
-            if r.returncode != 0:
-                plog(f"✗ Build/restart failed: {(r.stderr or r.stdout or 'unknown')[:300]}")
+                _tail = '\n'.join((r.stdout or r.stderr or 'unknown').strip().splitlines()[-20:])
+                plog(f"✗ Build/restart failed (via `{dcc}`):\n{_tail}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
