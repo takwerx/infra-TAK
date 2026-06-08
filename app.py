@@ -816,28 +816,40 @@ def login_required(f):
     return decorated
 
 def detect_modules():
+    def _run(*a, **kw):
+        """v0.9.48: probe subprocess that NEVER raises. detect_modules() is polled by
+        /api/modules, /api/modules/version and the guarddog health endpoint; a slow or
+        wedged docker/systemctl probe on a busy box must degrade to 'not running', not
+        raise TimeoutExpired and 500 the caller (caught in T&E: `docker compose ps` for
+        node-red timed out at 5s under load). Default timeout, swallow all errors."""
+        kw.setdefault("timeout", 8)
+        kw.setdefault("capture_output", True)
+        try:
+            return subprocess.run(*a, **kw)
+        except Exception:
+            return subprocess.CompletedProcess(a[0] if a else "", 124, "", "")
     modules = {}
     settings = load_settings()
     has_fqdn = bool(settings.get('fqdn', ''))
     # Caddy SSL - First when no FQDN configured
-    caddy_installed = subprocess.run(['which', 'caddy'], capture_output=True).returncode == 0
+    caddy_installed = _run(['which', 'caddy'], capture_output=True).returncode == 0
     caddy_running = False
     if caddy_installed:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
+        r = _run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
         caddy_running = r.stdout.strip() == 'active'
         # Leftover from uninstall-all? (binary still there but service disabled and stopped)
         if not caddy_running:
-            re = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
+            re = _run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
             if (re.stdout or '').strip() == 'disabled':
                 for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
                     if os.path.exists(path):
                         try:
                             os.remove(path)
                         except Exception:
-                            subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
+                            _run(f'rm -f {path}', shell=True, capture_output=True)
                 if os.path.exists('/etc/caddy'):
-                    subprocess.run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
-                subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+                    _run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
+                _run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
                 caddy_installed = False
     modules['caddy'] = {'name': 'Caddy SSL', 'installed': caddy_installed, 'running': caddy_running,
         'description': "Domain setup, Let's Encrypt SSL & reverse proxy" if not has_fqdn else f"SSL & reverse proxy — {settings.get('fqdn', '')}",
@@ -846,7 +858,7 @@ def detect_modules():
     tak_installed = os.path.exists('/opt/tak') and os.path.exists('/opt/tak/CoreConfig.xml')
     tak_running = False
     if tak_installed:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
+        r = _run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
         tak_running = r.stdout.strip() == 'active'
     modules['takserver'] = {'name': 'TAK Server', 'installed': tak_installed, 'running': tak_running,
         'description': 'Team Awareness Kit Server', 'icon': '🗺️', 'icon_url': TAK_LOGO_URL, 'route': '/takserver', 'priority': 1}
@@ -861,7 +873,7 @@ def detect_modules():
     else:
         ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
         if ak_installed:
-            r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            r = _run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
             ak_running = 'Up' in r.stdout
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
@@ -869,7 +881,7 @@ def detect_modules():
     portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
     portal_running = False
     if portal_installed:
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        r = _run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         portal_running = 'Up' in r.stdout
     modules['takportal'] = {'name': 'TAK Portal', 'installed': portal_installed, 'running': portal_running,
         'description': 'User & certificate management with Authentik', 'icon': '👥', 'route': '/takportal', 'priority': 3}
@@ -884,7 +896,7 @@ def detect_modules():
     else:
         mtx_installed = os.path.exists('/usr/local/bin/mediamtx') and os.path.exists('/usr/local/etc/mediamtx.yml')
         if mtx_installed:
-            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
+            r = _run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
             mtx_running = r.stdout.strip() == 'active'
     modules['mediamtx'] = {'name': 'MediaMTX', 'installed': mtx_installed, 'running': mtx_running,
         'description': 'Video Streaming Server', 'icon': '📹', 'icon_url': MEDIAMTX_LOGO_URL,
@@ -893,20 +905,20 @@ def detect_modules():
     gd_installed = os.path.exists('/opt/tak-guarddog')
     gd_running = False
     if gd_installed:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'list-timers', '--no-pager']), capture_output=True, text=True)
+        r = _run(_sudo_wrap(['systemctl', 'list-timers', '--no-pager']), capture_output=True, text=True)
         gd_running = 'tak8089guard' in r.stdout
     modules['guarddog'] = {'name': 'Guard Dog', 'installed': gd_installed, 'running': gd_running,
         'description': 'Health monitoring and auto-recovery', 'icon': '🐕', 'route': '/guarddog', 'priority': 5}
     # Fail2ban
     f2b_installed = (os.path.exists('/etc/fail2ban') and
-                     subprocess.run(['which', 'fail2ban-client'], capture_output=True).returncode == 0)
+                     _run(['which', 'fail2ban-client'], capture_output=True).returncode == 0)
     f2b_running = False
     f2b_version = None
     if f2b_installed:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']), capture_output=True, text=True)
+        r = _run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']), capture_output=True, text=True)
         f2b_running = r.stdout.strip() == 'active'
         try:
-            v = subprocess.run(['fail2ban-client', '--version'], capture_output=True, text=True, timeout=5)
+            v = _run(['fail2ban-client', '--version'], capture_output=True, text=True, timeout=5)
             f2b_version = (v.stdout.strip().splitlines()[0] if v.stdout.strip() else None)
         except Exception:
             pass
@@ -929,13 +941,13 @@ def detect_modules():
         nr_compose = os.path.join(nr_dir, 'docker-compose.yml')
         if os.path.exists(nr_compose):
             nodered_installed = True
-            r = subprocess.run(f'docker compose -f "{nr_compose}" ps -q 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5, cwd=nr_dir)
+            r = _run(f'docker compose -f "{nr_compose}" ps -q 2>/dev/null', shell=True, capture_output=True, text=True, timeout=8, cwd=nr_dir)
             if r.returncode == 0 and (r.stdout or '').strip():
-                r2 = subprocess.run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+                r2 = _run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
                 nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
         if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
             nodered_installed = True
-            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'nodered']), capture_output=True, text=True)
+            r = _run(_sudo_wrap(['systemctl', 'is-active', 'nodered']), capture_output=True, text=True)
             if r.stdout.strip() == 'active':
                 nodered_running = True
     modules['nodered'] = {'name': 'Node-RED', 'installed': nodered_installed, 'running': nodered_running,
@@ -956,7 +968,7 @@ def detect_modules():
             os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')) or
             os.path.exists(os.path.join(cloudtak_dir, 'compose.yaml'))
         )
-        r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+        r = _run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
         if r.stdout and 'Up' in r.stdout:
             cloudtak_running = True
         if not cloudtak_installed and cloudtak_running:
@@ -974,10 +986,10 @@ def detect_modules():
     modules['fedhub'] = {'name': 'Federation Hub', 'installed': fh_installed, 'running': fh_running,
         'description': 'TAK Federation Hub on a dedicated Ubuntu host (SSH)', 'icon': '🌐', 'route': '/federation-hub', 'priority': 8}
     # Email Relay (Postfix)
-    email_installed = subprocess.run(['which', 'postfix'], capture_output=True).returncode == 0
+    email_installed = _run(['which', 'postfix'], capture_output=True).returncode == 0
     email_running = False
     if email_installed:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postfix']), capture_output=True, text=True)
+        r = _run(_sudo_wrap(['systemctl', 'is-active', 'postfix']), capture_output=True, text=True)
         email_running = r.stdout.strip() == 'active'
     modules['emailrelay'] = {'name': 'Email Relay', 'installed': email_installed, 'running': email_running,
         'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
@@ -1039,7 +1051,7 @@ def detect_modules():
     tvr_running = False
     if tvr_enabled:
         try:
-            _tvr_r = subprocess.run(
+            _tvr_r = _run(
                 ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
                 capture_output=True, text=True, timeout=3)
             tvr_running = _tvr_r.stdout.strip() == 'true'
@@ -1048,7 +1060,7 @@ def detect_modules():
     else:
         # Self-heal: container is running but flag got cleared
         try:
-            _tvr_r = subprocess.run(
+            _tvr_r = _run(
                 ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
                 capture_output=True, text=True, timeout=3)
             if _tvr_r.stdout.strip() == 'true':
