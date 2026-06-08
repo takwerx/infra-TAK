@@ -12974,6 +12974,27 @@ def _get_cloudtak_version_info():
             out['latest'] = latest_ver
             if out['version'] != latest_ver:
                 out['update_available'] = True
+    # v0.9.49: suppress a FALSE "update available" caused by the container's
+    # package.json lagging the git tag. dfpc-coe ships patch tags without bumping
+    # package.json (e.g. v13.11.1 carries package.json 13.11.0), so the Step-0
+    # container version can never equal the latest tag and the badge sticks on
+    # forever even when the box is current. If ~/CloudTAK HEAD is checked out
+    # EXACTLY at the latest tag AND the running container shares its major.minor,
+    # the box was genuinely rebuilt from that tag — only the strings differ.
+    # Gating on major.minor still flags a FAILED update (source moved to the new
+    # tag but the container is far behind, e.g. 13.4.0 vs 13.11.1) as available.
+    if out['update_available'] and out['version'] and out['latest']:
+        try:
+            _latest_norm = out['latest'].lstrip('vV')
+            _src = subprocess.run(
+                f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=5)
+            _src_tag = (_src.stdout or '').strip().lstrip('vV')
+            _mm = lambda v: '.'.join(v.split('.')[:2])
+            if _src_tag and _src_tag == _latest_norm and _mm(out['version']) == _mm(_latest_norm):
+                out['update_available'] = False
+        except Exception:
+            pass
     return out
 
 
