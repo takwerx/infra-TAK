@@ -4456,6 +4456,7 @@ def netbird_uninstall_api():
             settings['netbird_enabled'] = False
             if 'netbird_pat' in settings:
                 del settings['netbird_pat']
+            settings.pop('netbird_admin_email', None)
             save_settings(settings)
             # Regenerate caddyfile and reload
             generate_caddyfile(settings)
@@ -21538,14 +21539,24 @@ def _ensure_authentik_netbird_app(settings, plog=None):
         except Exception:
             log('  ⚠ Could not look up scope mappings')
 
-        # Determine redirect URIs (strict origins for CORS compliance + regex paths for authorization)
+        # Redirect URIs for Authentik OAuth2 provider (embedded IdP + external connector).
+        # Dashboard uses hash callbacks /#callback (netbird#5933); Authentik connector
+        # uses /oauth2/callback on the NetBird domain. All strict — no regex URIs.
         netbird_domain = _get_service_domain(settings, 'netbird')
-        netbird_domain_esc = netbird_domain.replace('.', '\\.')
+        nb_base = f'https://{netbird_domain}'
         redirect_uris_obj = [
-            {'matching_mode': 'strict', 'url': f'https://{netbird_domain}'},
-            {'matching_mode': 'strict', 'url': f'https://{netbird_domain}/'},
-            {'matching_mode': 'regex', 'url': f'^https://{netbird_domain_esc}(\\$|/.*)'},
-            {'matching_mode': 'regex', 'url': r'^http://localhost:5[34]000(\$|/.*)'},
+            {'matching_mode': 'strict', 'url': nb_base},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/#callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/#silent-callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/nb-auth'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/nb-silent-auth'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/peers'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/silent-callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/logout/callback'},
+            {'matching_mode': 'strict', 'url': 'http://localhost:53000/'},
+            {'matching_mode': 'strict', 'url': 'http://localhost:54000/'},
         ]
 
         _provider_extras = {}
@@ -21570,7 +21581,7 @@ def _ensure_authentik_netbird_app(settings, plog=None):
                         provider_pk = ex_pk
                         client_id = detail['client_id']
                         client_secret = detail['client_secret']
-                        patch_data = {'redirect_uris': redirect_uris_obj}
+                        patch_data = {'redirect_uris': redirect_uris_obj, 'client_type': 'confidential'}
                         patch_data.update(_provider_extras)
                         try:
                             req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
@@ -21671,60 +21682,218 @@ def _netbird_deploy_log(msg, status=None):
     if status:
         _netbird_deploy_status.update(status)
 
-def _run_netbird_deploy(settings):
-    import subprocess as _sp
-    import secrets as _sec
-    import shutil as _sh
-    import urllib.request as _urlreq
+def _netbird_mgmt_ssl_ctx():
     import ssl as _ssl
-    plog = _netbird_deploy_log
-    nb_dir = NETBIRD_INSTALL_DIR
-    compose_path = os.path.join(nb_dir, 'docker-compose.yml')
-    config_path = os.path.join(nb_dir, 'config.yaml')
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    return ctx
 
-    # SSL context that skips verification (for hitting localhost:33073 directly)
-    _nossl = _ssl.create_default_context()
-    _nossl.check_hostname = False
-    _nossl.verify_mode = _ssl.CERT_NONE
+
+def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http://localhost:33073', timeout=15):
+    """HTTP helper for NetBird management API (bootstrap uses loopback before Caddy)."""
+    import urllib.request as _req
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = f'Token {token}'
+    req = _req.Request(f'{base}{path}', method=method, data=data, headers=headers)
+    ctx = _netbird_mgmt_ssl_ctx() if base.startswith('https') else None
+    return _req.urlopen(req, timeout=timeout, context=ctx)
+
+
+def _netbird_admin_credentials(settings):
+    """Initial setup owner mirrors Authentik administrator (akadmin)."""
+    fqdn = (settings.get('fqdn') or '').strip()
+    email = f'akadmin@{fqdn}' if fqdn else 'akadmin@localhost'
+    name = 'akadmin'
+    import secrets as _sec
+    password = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_PASSWORD')
+                or _sec.token_urlsafe(24))
+    return email, name, password
+
+
+def _netbird_wait_instance(plog, timeout_sec=120):
+    """Poll /api/instance until the management server responds."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            resp = _netbird_mgmt_request('/api/instance', timeout=5)
+            return json.loads(resp.read().decode())
+        except Exception:
+            time.sleep(2)
+    return None
+
+
+def _netbird_complete_setup(settings, plog):
+    """Create the NetBird owner (akadmin) via /api/setup and return a PAT.
+    Reuses settings['netbird_pat'] when setup was already completed."""
+    import urllib.error
+
+    instance = _netbird_wait_instance(plog)
+    if not instance:
+        plog('  ✗ Management server did not become ready')
+        return None
+
+    if instance.get('setup_required') is False:
+        pat = settings.get('netbird_pat') or ''
+        if pat:
+            plog('  ✓ Instance already set up — using stored PAT')
+            return pat
+        plog('  ⚠ Instance set up but no stored PAT — IDP registration may fail')
+        return '__already_done__'
+
+    email, name, password = _netbird_admin_credentials(settings)
+    plog(f'  Running initial setup for {email} (name={name})...')
+    body = json.dumps({
+        'email': email,
+        'name': name,
+        'password': password,
+        'create_pat': True,
+        'pat_expire_in': 365,
+    }).encode()
 
     try:
-        # Step 1: Ensure Docker is present
-        plog('━━━ Step 1/6: Checking Docker ━━━')
-        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
-        if r.returncode != 0:
-            plog('  Docker not found — installing...')
-            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
-                         shell=True, capture_output=True, text=True, timeout=300)
-            if r2.returncode != 0:
-                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
-            plog('✓ Docker installed')
+        resp = _netbird_mgmt_request('/api/setup', method='POST', data=body, timeout=30)
+        result = json.loads(resp.read().decode())
+        pat = result.get('personal_access_token') or ''
+        if pat:
+            settings['netbird_pat'] = pat
+            settings['netbird_admin_email'] = email
+            save_settings(settings)
+            plog(f'  ✓ Setup complete — PAT saved (user={email})')
+            return pat
+        plog(f'  ⚠ Setup returned 200 without PAT (keys: {list(result.keys())})')
+        return None
+    except urllib.error.HTTPError as e:
+        if e.code == 412:
+            pat = settings.get('netbird_pat') or ''
+            plog('  ✓ Setup already completed (HTTP 412)')
+            return pat or '__already_done__'
+        err = ''
+        try:
+            err = e.read().decode()[:300]
+        except Exception:
+            pass
+        plog(f'  ✗ /api/setup failed HTTP {e.code}: {err}')
+        return None
+
+
+def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
+    """Register Authentik as external OIDC IDP (Management Setup — embedded dashboard)."""
+    import urllib.error
+    if not pat or pat == '__already_done__':
+        plog('  ⚠ No PAT available — skip IDP API registration')
+        return False
+
+    payload = json.dumps({
+        'name': 'Authentik',
+        'type': 'oidc',
+        'issuer': authentik_issuer,
+        'client_id': client_id,
+        'client_secret': client_secret or '',
+        'user_id_claim': 'sub',
+    }).encode()
+
+    idp_redirect = None
+    try:
+        resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
+        body = json.loads(resp.read().decode())
+        idp_redirect = body.get('redirect_uri') or body.get('redirectURL') or body.get('redirect_url')
+        plog('  ✓ Authentik registered as external OIDC IDP')
+    except urllib.error.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode()[:300]
+        except Exception:
+            pass
+        if e.code in (400, 409, 422):
+            plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
+            try:
+                resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
+                idps = json.loads(resp.read().decode())
+                items = idps if isinstance(idps, list) else idps.get('items') or idps.get('data') or []
+                for item in items:
+                    if 'authentik' in (item.get('name') or '').lower():
+                        idp_redirect = item.get('redirect_uri') or item.get('redirectURL')
+                        break
+            except Exception:
+                pass
         else:
-            plog(f'✓ Docker present: {r.stdout.strip()}')
+            plog(f'  ⚠ IDP registration failed HTTP {e.code}: {err_body[:200]}')
+            return False
 
-        # Step 2: Set up Authentik OIDC Application
-        plog('')
-        plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
-        plog('  Contacting Authentik API...')
-        client_id, client_secret = _ensure_authentik_netbird_app(settings, plog=plog)
-        if not client_id or not client_secret:
-            raise RuntimeError("Authentik OIDC provider provisioning returned empty credentials. Make sure Authentik is running and healthy.")
-        plog(f'✓ Authentik OIDC provider configured successfully (client_id={client_id})')
+    netbird_domain = _get_service_domain(settings, 'netbird')
+    if not idp_redirect:
+        idp_redirect = f'https://{netbird_domain}/oauth2/callback'
+    plog(f'  IDP callback URI: {idp_redirect}')
+    _netbird_patch_authentik_idp_redirect(settings, idp_redirect, plog=plog)
+    return True
 
-        # Step 3: Bootstrap — boot with built-in OIDC to complete initial setup
-        plog('')
-        plog('━━━ Step 3/6: Bootstrapping NetBird (built-in OIDC for initial setup) ━━━')
-        os.makedirs(nb_dir, exist_ok=True)
-        os.makedirs(os.path.join(nb_dir, 'data'), exist_ok=True)
 
-        netbird_domain = _get_service_domain(settings, 'netbird')
-        authentik_domain = _get_service_domain(settings, 'authentik') or settings.get('fqdn', '').strip()
-        authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
-        auth_secret = _sec.token_hex(32)
-        nb_admin_email = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_EMAIL') or f'admin@{settings.get("fqdn", "infratak.local")}'
-        nb_admin_password = _sec.token_urlsafe(24)
+def _netbird_patch_authentik_idp_redirect(settings, callback_url, plog=None):
+    """Ensure Authentik NetBird provider allows the embedded-IdP connector callback URL."""
+    import urllib.request as _urlreq
+    import urllib.error
+    _log = plog or (lambda m: None)
+    ak_url = _get_authentik_api_url(settings)
+    token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not token or not callback_url:
+        return
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    netbird_domain = _get_service_domain(settings, 'netbird')
+    nb_base = f'https://{netbird_domain}'
+    wanted = [
+        {'matching_mode': 'strict', 'url': callback_url},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/callback'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/logout/callback'},
+        {'matching_mode': 'strict', 'url': nb_base},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/#callback'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/#silent-callback'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/nb-auth'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/nb-silent-auth'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/peers'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/silent-callback'},
+    ]
+    seen = set()
+    redirect_uris_obj = []
+    for entry in wanted:
+        u = entry['url']
+        if u not in seen:
+            seen.add(u)
+            redirect_uris_obj.append(entry)
+    try:
+        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search=NetBird', headers=headers)
+        existing = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+        for ex in existing:
+            if ex.get('name') != 'NetBird':
+                continue
+            pk = ex.get('pk')
+            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{pk}/',
+                data=json.dumps({'redirect_uris': redirect_uris_obj}).encode(),
+                headers=headers, method='PATCH')
+            _urlreq.urlopen(req, timeout=10)
+            _log(f'  ✓ Authentik redirect URIs updated (incl. {callback_url})')
+            return
+    except Exception as ex:
+        _log(f'  ⚠ Authentik redirect URI patch: {str(ex)[:120]}')
 
-        # Phase 1 config: built-in OIDC so /api/setup works
-        _bootstrap_config = f"""# NetBird Bootstrap Config (built-in OIDC — temporary)
+
+def _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True):
+    """Write config.yaml and docker-compose.yml for embedded-IdP NetBird.
+
+    Dashboard auth stays on https://<netbird>/oauth2 (same-origin token exchange).
+    Authentik is added as an external login provider after bootstrap via the API.
+    Hash-based OAuth callbacks (/#callback) are required by current dashboard images.
+    """
+    config_path = os.path.join(nb_dir, 'config.yaml')
+    compose_path = os.path.join(nb_dir, 'docker-compose.yml')
+    pat_env = 'true' if setup_pat_enabled else 'false'
+    pat_block = f"""    environment:
+      - NB_SETUP_PAT_ENABLED={pat_env}
+""" if setup_pat_enabled else ''
+
+    config_content = f"""# NetBird self-hosted (embedded IdP + Authentik external login)
 server:
   listenAddress: ":443"
   exposedAddress: "https://{netbird_domain}:443"
@@ -21738,9 +21907,11 @@ server:
       - "https://{netbird_domain}"
       - "https://{netbird_domain}/"
       - "https://{netbird_domain}/#callback"
+      - "https://{netbird_domain}/#silent-callback"
+      - "https://{netbird_domain}/nb-auth"
+      - "https://{netbird_domain}/nb-silent-auth"
       - "https://{netbird_domain}/peers"
       - "https://{netbird_domain}/silent-callback"
-      - "https://{netbird_domain}/#silent-callback"
     dashboardPostLogoutRedirectURIs:
       - "https://{netbird_domain}"
       - "https://{netbird_domain}/"
@@ -21748,7 +21919,7 @@ server:
   authSecret: "{auth_secret}"
 """
 
-        _bootstrap_compose = f"""services:
+    compose_content = f"""services:
   netbird-server:
     image: netbirdio/netbird-server:latest
     container_name: netbird-server
@@ -21757,12 +21928,10 @@ server:
       - "33073:443"
       - "10000:10000"
       - "3478:3478/udp"
-    environment:
-      - NB_SETUP_PAT_ENABLED=true
     volumes:
       - ./config.yaml:/etc/netbird/config.yaml
       - ./data:/var/lib/netbird
-    logging:
+{pat_block}    logging:
       driver: json-file
       options:
         max-size: "10m"
@@ -21783,6 +21952,8 @@ server:
       - AUTH_AUTHORITY=https://{netbird_domain}/oauth2
       - USE_AUTH0=false
       - AUTH_SUPPORTED_SCOPES=openid profile email offline_access
+      - AUTH_REDIRECT_URI=/#callback
+      - AUTH_SILENT_REDIRECT_URI=/#silent-callback
     logging:
       driver: json-file
       options:
@@ -21790,208 +21961,117 @@ server:
         max-file: "5"
 """
 
-        with open(config_path, 'w') as f:
-            f.write(_bootstrap_config)
-        with open(compose_path, 'w') as f:
-            f.write(_bootstrap_compose)
-        plog('  ✓ Wrote bootstrap config (built-in OIDC + NB_SETUP_PAT_ENABLED)')
+    with open(config_path, 'w') as f:
+        f.write(config_content)
+    with open(compose_path, 'w') as f:
+        f.write(compose_content)
 
-        plog('  Pulling Docker images...')
-        r = _sp.run(['docker', 'compose', 'pull'], capture_output=True, text=True, cwd=nb_dir)
-        plog(f'  docker compose pull: {r.stdout.strip() or r.stderr.strip()}')
 
-        plog('  Starting containers (Phase 1 — bootstrap)...')
+def _netbird_read_auth_secret(nb_dir):
+    """Preserve authSecret when rewriting compose files on redeploy."""
+    config_path = os.path.join(nb_dir, 'config.yaml')
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path) as f:
+            for line in f:
+                if line.strip().startswith('authSecret:'):
+                    return line.split(':', 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return None
+
+
+def _netbird_recreate_containers(nb_dir, plog):
+    """Recreate containers so dashboard picks up env var changes."""
+    import subprocess as _sp
+    r = _sp.run(['docker', 'compose', 'up', '-d', '--force-recreate'],
+                capture_output=True, text=True, cwd=nb_dir, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f'docker compose up --force-recreate failed: {r.stderr[:300]}')
+    plog('  ✓ Containers recreated')
+
+
+def _run_netbird_deploy(settings):
+    import subprocess as _sp
+    import secrets as _sec
+    plog = _netbird_deploy_log
+    nb_dir = NETBIRD_INSTALL_DIR
+
+    try:
+        plog('━━━ Step 1/6: Checking Docker ━━━')
+        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
+        if r.returncode != 0:
+            plog('  Docker not found — installing...')
+            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+                         shell=True, capture_output=True, text=True, timeout=300)
+            if r2.returncode != 0:
+                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
+            plog('✓ Docker installed')
+        else:
+            plog(f'✓ Docker present: {r.stdout.strip()}')
+
+        plog('')
+        plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
+        client_id, client_secret = _ensure_authentik_netbird_app(settings, plog=plog)
+        if not client_id or not client_secret:
+            raise RuntimeError('Authentik OIDC provisioning failed — ensure Authentik is running.')
+        plog(f'✓ Authentik provider ready (client_id={client_id[:12]}...)')
+
+        plog('')
+        plog('━━━ Step 3/6: Deploying NetBird Containers (bootstrap) ━━━')
+        os.makedirs(nb_dir, exist_ok=True)
+        os.makedirs(os.path.join(nb_dir, 'data'), exist_ok=True)
+
+        netbird_domain = _get_service_domain(settings, 'netbird')
+        authentik_domain = _get_service_domain(settings, 'authentik') or settings.get('fqdn', '').strip()
+        authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
+        auth_secret = _sec.token_hex(32)
+
+        setup_pat = not settings.get('netbird_pat')
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat)
+        plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
+
+        plog('  Pulling images...')
+        _sp.run(['docker', 'compose', 'pull'], capture_output=True, text=True, cwd=nb_dir)
         r = _sp.run(['docker', 'compose', 'up', '-d'], capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
-        plog('  ✓ Containers started (bootstrap mode)')
+        plog('✓ Containers running')
 
-        # Wait for management server to become ready, then complete setup
-        plog('  Waiting for management server to become ready...')
-        _nb_local = 'http://localhost:33073'
-        _setup_ready = False
-        for _attempt in range(60):
-            try:
-                _req = _urlreq.Request(f'{_nb_local}/api/instance')
-                _resp = json.loads(_urlreq.urlopen(_req, timeout=5, context=_nossl).read().decode())
-                if _resp.get('setup_required') is True:
-                    _setup_ready = True
-                    break
-                elif _resp.get('setup_required') is False:
-                    plog('  ⚠ Instance already set up — skipping bootstrap setup')
-                    break
-            except Exception:
-                pass
-            time.sleep(2)
+        plog('')
+        plog('━━━ Step 4/6: Initial Setup (akadmin) ━━━')
+        pat = _netbird_complete_setup(settings, plog)
 
-        nb_pat = None
-        if _setup_ready:
-            plog(f'  Server ready. Running initial setup as {nb_admin_email}...')
-            _setup_body = json.dumps({
-                'email': nb_admin_email,
-                'password': nb_admin_password,
-                'name': 'Admin',
-                'create_pat': True,
-                'pat_expire_in': 365,
-            }).encode()
-            _setup_req = _urlreq.Request(f'{_nb_local}/api/setup',
-                data=_setup_body, headers={'Content-Type': 'application/json'}, method='POST')
-            try:
-                _setup_resp = json.loads(_urlreq.urlopen(_setup_req, timeout=30, context=_nossl).read().decode())
-                nb_pat = _setup_resp.get('personal_access_token', '')
-                if nb_pat:
-                    plog(f'  ✓ Setup complete — PAT obtained (length={len(nb_pat)})')
-                    settings['netbird_pat'] = nb_pat
-                    settings['netbird_admin_email'] = nb_admin_email
-                    save_settings(settings)
-                else:
-                    plog(f'  ✓ Setup complete — no PAT returned (keys: {list(_setup_resp.keys())})')
-            except Exception as _se:
-                _err_body = ''
-                try:
-                    _err_body = _se.read().decode()[:300]
-                except Exception:
-                    pass
-                plog(f'  ⚠ Setup call failed: {_err_body or str(_se)[:200]}')
+        plog('')
+        plog('━━━ Step 5/6: Authentik External IDP + Finalize Config ━━━')
+        auth_secret = _netbird_read_auth_secret(nb_dir) or auth_secret
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=False)
+        plog('  ✓ Embedded IdP config (AUTH_REDIRECT_URI=/#callback)')
+        pat = settings.get('netbird_pat') or (pat if pat not in (None, '__already_done__') else '')
+        if pat:
+            _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog)
         else:
-            nb_pat = settings.get('netbird_pat', '')
-            if nb_pat:
-                plog('  Using previously stored PAT')
-            elif not _setup_ready:
-                plog('  ⚠ Management server did not become ready in time')
+            plog('  ⚠ No PAT — register Authentik manually in NetBird Settings → Identity Providers')
+        plog('  Recreating containers to apply config...')
+        _netbird_recreate_containers(nb_dir, plog)
+        plog('✓ Click Authentik on the NetBird login page to sign in')
 
-        plog('✓ Bootstrap phase complete (setup_required cleared)')
-
-        # Step 4: Reconfigure for Authentik (standalone OIDC) and restart
         plog('')
-        plog('━━━ Step 4/6: Switching to Authentik OIDC ━━━')
-
-        _final_config = f"""# NetBird Combined Server Configuration (Standalone Authentik OIDC)
-server:
-  listenAddress: ":443"
-  exposedAddress: "https://{netbird_domain}:443"
-  metricsPort: 9090
-  healthcheckAddress: ":9000"
-  auth:
-    issuer: "{authentik_issuer}"
-    audience: "{client_id}"
-    userIDClaim: "sub"
-    dashboardRedirectURIs:
-      - "https://{netbird_domain}"
-      - "https://{netbird_domain}/"
-      - "https://{netbird_domain}/#callback"
-      - "https://{netbird_domain}/peers"
-      - "https://{netbird_domain}/silent-callback"
-      - "https://{netbird_domain}/#silent-callback"
-    dashboardPostLogoutRedirectURIs:
-      - "https://{netbird_domain}"
-      - "https://{netbird_domain}/"
-  dataDir: "/var/lib/netbird/"
-  authSecret: "{auth_secret}"
-"""
-
-        _final_compose = f"""services:
-  netbird-server:
-    image: netbirdio/netbird-server:latest
-    container_name: netbird-server
-    restart: unless-stopped
-    ports:
-      - "33073:443"
-      - "10000:10000"
-      - "3478:3478/udp"
-    volumes:
-      - ./config.yaml:/etc/netbird/config.yaml
-      - ./data:/var/lib/netbird
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-  dashboard:
-    image: netbirdio/dashboard:latest
-    container_name: netbird-dashboard
-    restart: unless-stopped
-    ports:
-      - "8642:80"
-    environment:
-      - NETBIRD_MGMT_API_ENDPOINT=https://{netbird_domain}
-      - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://{netbird_domain}
-      - AUTH_AUDIENCE={client_id}
-      - AUTH_CLIENT_ID={client_id}
-      - AUTH_CLIENT_SECRET={client_secret}
-      - AUTH_AUTHORITY={authentik_issuer}
-      - USE_AUTH0=false
-      - AUTH_SUPPORTED_SCOPES=openid profile email offline_access api
-      - AUTH_REDIRECT_URI=https://{netbird_domain}/peers
-      - AUTH_SILENT_REDIRECT_URI=https://{netbird_domain}/silent-callback
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-"""
-
-        with open(config_path, 'w') as f:
-            f.write(_final_config)
-        plog(f'  ✓ Wrote final config.yaml')
-        plog(f'    auth.issuer → {authentik_issuer}')
-        plog(f'    audience    → {client_id}')
-
-        with open(compose_path, 'w') as f:
-            f.write(_final_compose)
-        plog(f'  ✓ Wrote final docker-compose.yml')
-
-        plog('  Restarting containers with Authentik OIDC...')
-        _sp.run(['docker', 'compose', 'down'], capture_output=True, text=True, cwd=nb_dir, timeout=60)
-        r = _sp.run(['docker', 'compose', 'up', '-d'], capture_output=True, text=True, cwd=nb_dir)
-        if r.returncode != 0:
-            raise RuntimeError(f'docker compose up (phase 2) failed: {r.stderr[:300]}')
-        plog('✓ Containers restarted with Authentik as sole OIDC provider')
-
-        # Step 5: Firewall & Caddy
-        plog('')
-        plog('━━━ Step 5/6: Hardening Firewall & Reloading Proxy ━━━')
-        plog('  Configuring UFW for NetBird STUN (3478/udp)...')
+        plog('━━━ Step 6/6: Firewall & Reverse Proxy ━━━')
         _sp.run(['sudo', 'ufw', 'allow', '3478/udp'], capture_output=True)
-        plog('  ✓ UFW rule allowed: 3478/udp')
-
-        plog('  Updating Caddy reverse proxy routing...')
         settings['netbird_enabled'] = True
         save_settings(settings)
-
         generate_caddyfile(settings)
         _sp.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
-        plog('  ✓ Caddy routes reloaded')
-        plog('✓ Firewall & reverse proxy setup complete!')
+        plog('✓ Caddy routes active — STUN 3478/udp allowed')
 
-        # Step 6: Verify dashboard redirects to Authentik
+        fqdn = settings.get('fqdn', 'localhost')
         plog('')
-        plog('━━━ Step 6/6: Verifying Authentik Login ━━━')
-        # Wait for server to come back up after restart, then verify setup_required is false
-        _verified = False
-        for _attempt in range(30):
-            try:
-                _req = _urlreq.Request(f'{_nb_local}/api/instance')
-                _resp = json.loads(_urlreq.urlopen(_req, timeout=5, context=_nossl).read().decode())
-                if _resp.get('setup_required') is False:
-                    _verified = True
-                    break
-            except Exception:
-                pass
-            time.sleep(2)
-
-        if _verified:
-            plog('  ✓ Management server confirmed: setup_required=false')
-            plog('  ✓ Dashboard will redirect to Authentik for login')
-        else:
-            plog('  ⚠ Could not verify setup_required status — check manually')
-
-        plog('')
-        plog('🎉 NetBird VPN deployed successfully!')
+        plog('🎉 NetBird deployed successfully!')
         plog(f'Dashboard: https://{netbird_domain}')
-        plog(f'Login via Authentik SSO at https://{authentik_domain}')
-        plog(f'Auth issuer: {authentik_issuer}')
+        plog(f'Login: Authentik button on https://{netbird_domain} (embedded IdP + external SSO)')
+        plog(f'Bootstrap owner: akadmin@{fqdn}')
         _netbird_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
     except Exception as e:
