@@ -11872,7 +11872,7 @@ def generate_caddyfile(settings=None):
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_tiles'), ct_tiles)
         lines.append(f"# CloudTAK Media (video) — /stream/* → HLS, rest → MediaMTX API")
         lines.append(f"{ct_video} {{")
-        lines.append(f"    handle /stream/* {{")
+        lines.append(f"    handle_path /stream/* {{")
         lines.append(f"        reverse_proxy {ct_up['video_hls']}")
         lines.append(f"    }}")
         lines.append(f"    handle {{")
@@ -11881,6 +11881,29 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_video'), ct_video)
+        # v0.9.48: CloudTAK force-appends :9997 to EVERY media URL it builds
+        # (video-service.ts sets url.port='9997' for both the MediaMTX control API
+        # and the /stream HLS URL). The 443 vhost above is therefore never hit by
+        # CloudTAK itself → the whole Video Lease subsystem (proxy + normal leases)
+        # times out. Add a second listener on :9997 with the SAME routing so the
+        # upstream CloudTAK image works unmodified and survives its own rebuilds.
+        # MUST bind the public IP: 127.0.0.1:9997 is the cloudtak-media container's
+        # docker publish, so a 0.0.0.0:9997 listener collides and Caddy won't start.
+        # Caddy reuses the hostname's existing cert on :9997 (no ACME conflict).
+        ct_bind_ip = (settings.get('server_ip') or '').strip()
+        if ct_bind_ip:
+            ct_video_host = ct_video.split()[0].strip()  # hostname only (drop any TLS/options)
+            lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs")
+            lines.append(f"{ct_video_host}:9997 {{")
+            lines.append(f"    bind {ct_bind_ip}")
+            lines.append(f"    handle_path /stream/* {{")
+            lines.append(f"        reverse_proxy {ct_up['video_hls']}")
+            lines.append(f"    }}")
+            lines.append(f"    handle {{")
+            lines.append(f"        reverse_proxy {ct_up['video_api']}")
+            lines.append(f"    }}")
+            lines.append(f"}}")
+            lines.append("")
 
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
@@ -16904,6 +16927,137 @@ services:
 """
 
 
+# --- CloudTAK embedded-MediaMTX (cloudtak-media) self-heal scripts (v0.9.48) ----
+# Run INSIDE the cloudtak-media container via `docker exec -i … sh` (stdin-piped, so
+# no host/remote quoting concerns). Two independent fixes, healed together with one
+# container restart:
+#
+#  (B) /mediamtx.yml  — hlsVariant: mpegts + hlsAlwaysRemux: true. Default lowLatency
+#      (LL-HLS) bails on drone variable framerate ("part duration changed" → hls.js
+#      404s a part and stops); mpegts removes that error class. alwaysRemux pre-warms
+#      the muxer (kills the ~10s cold-start buffer). Field-validated live (test12,
+#      real drone, 2026-06-07).
+#
+#  (C) /lib/persist.ts — THE teardown fix. media-infra's reaper cron (every 10s) lists
+#      CloudTAK leases with `ephemeral=false` and DELETES every MediaMTX path not in
+#      that set. FloatingVideo's viewer lease is ephemeral=true → excluded → its path
+#      reaped within ≤10s → browser buffers then 404s. The CloudTAK API
+#      (api/routes/video-lease.ts) filters `(${ephemeral}::BOOLEAN IS NULL OR ephemeral
+#      = ${ephemeral})` and AllBoolean.ALL='all' casts to NULL → returns ALL leases;
+#      impersonate=true sets the username filter to NULL so it does NOT exclude them.
+#      So flipping the reaper's query `'ephemeral','false'` → `'ephemeral','all'` keeps
+#      ACTIVE viewer paths while still reaping genuinely-closed ones (FloatingVideo
+#      deletes its lease on close) — fleet-safe, no orphaned-RTSP leak. (The PLAN's
+#      earlier "just drop ephemeral=false" failed because the param is a REQUIRED enum;
+#      'all' is the right token.) Container executes the .ts directly, so editing the
+#      source + restart takes effect. The path may be absent on other media-infra
+#      builds → treated as not-applicable, never an error.
+#
+# Drift only happens on a container RECREATE (both edits survive a plain
+# `docker restart`). The converger is check-before-apply so it is a no-op (no restart,
+# no video drop) on an already-correct box — safe on every startup / tick.
+_CT_MEDIA_CHECK_SH = r'''
+V=$(yq -r '.hlsVariant' /mediamtx.yml 2>/dev/null || echo '?')
+A=$(yq -r '.hlsAlwaysRemux' /mediamtx.yml 2>/dev/null || echo '?')
+if [ ! -f /lib/persist.ts ]; then R=na
+elif grep -qF "'ephemeral', 'all'" /lib/persist.ts; then R=ok
+else R=drift; fi
+printf '%s %s %s\n' "$V" "$A" "$R"
+'''
+_CT_MEDIA_APPLY_SH = r'''
+yq -i '.hlsVariant = "mpegts" | .hlsAlwaysRemux = true' /mediamtx.yml
+if [ -f /lib/persist.ts ]; then
+  sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" /lib/persist.ts
+fi
+'''
+
+
+def _ct_media_converged(check_out):
+    """True iff the container check output shows mediamtx HLS set AND the reaper is
+    ephemeral-aware (or persist.ts is absent)."""
+    p = (check_out or '').split()
+    return len(p) >= 3 and p[0] == 'mpegts' and p[1] == 'true' and p[2] in ('ok', 'na')
+
+
+def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
+    """v0.9.48 (Parts B + C): self-heal the CloudTAK embedded MediaMTX (cloudtak-media)
+    — CONVERGENCE, not an event handler. Reads the live container state first and only
+    patches /mediamtx.yml (B) + /lib/persist.ts (C) and restarts the container when a
+    value has actually drifted, so a correctly-configured box is a no-op (no needless
+    restart, no video drop). Heals both files in one restart. See _CT_MEDIA_*_SH above
+    for the what/why.
+
+    Drift source: a container RECREATE (CloudTAK update, operator `docker compose up`,
+    daemon restart) reverts both files to the image default; they survive a plain
+    `docker restart`. This converger is the source of truth — it runs at console
+    startup (Guard-Dog-independent) and right after every infra-TAK recreate for
+    immediate convergence instead of waiting for the next boot.
+
+    `wait=True` retries container resolution for ~10s (use right after `up -d`).
+    Returns True if converged (already-correct or healed), False on error/no container.
+    """
+    def _log(m):
+        (plog or (lambda x: print(x, flush=True)))(m)
+    tries = 10 if wait else 1
+    try:
+        if remote_cfg:
+            import base64
+            chk_b64 = base64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
+            apply_b64 = base64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
+            # base64 strings are quoting-safe; decode on the remote host and pipe into
+            # the container's sh via stdin (`docker exec -i`).
+            cmd = (
+                "for i in $(seq 1 %d); do "
+                "m=$(docker ps --filter name=cloudtak-media --format '{{.Names}}' | head -n1); "
+                "[ -n \"$m\" ] && break; sleep 1; done; "
+                "if [ -z \"$m\" ]; then echo NOCONTAINER; exit 0; fi; "
+                "out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
+                "set -- $out; "
+                "if [ \"$1\" = mpegts ] && [ \"$2\" = true ] && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
+                "echo %s | base64 -d | docker exec -i \"$m\" sh && docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL"
+            ) % (tries, chk_b64, apply_b64)
+            ok, out = _ssh_probe(remote_cfg, cmd, timeout=120)
+            out = (out or '').strip()
+            if ok and 'HEALED' in out:
+                _log("  ✓ Remote cloudtak-media healed (HLS=mpegts/alwaysRemux + reaper ephemeral-aware)")
+                return True
+            if ok and 'OK' in out:
+                return True  # already converged — silent
+            _log(f"  ⚠ Remote cloudtak-media heal skipped: {(out or 'no cloudtak-media container')[:160]}")
+            return False
+        # Local: resolve the cloudtak-media container (compose suffixes it, e.g. -1).
+        media = None
+        for _ in range(tries):
+            r = subprocess.run(
+                "docker ps --filter name=cloudtak-media --format '{{.Names}}'",
+                shell=True, capture_output=True, text=True, timeout=15)
+            names = [n for n in (r.stdout or '').split() if n.strip()]
+            if names:
+                media = names[0]
+                break
+            time.sleep(1)
+        if not media:
+            return False  # CloudTAK media not up — nothing to heal (silent on the no-wait path)
+        cur = subprocess.run(
+            ['docker', 'exec', '-i', media, 'sh'],
+            input=_CT_MEDIA_CHECK_SH, capture_output=True, text=True, timeout=25)
+        if _ct_media_converged(cur.stdout):
+            return True  # already converged — no restart
+        ap = subprocess.run(
+            ['docker', 'exec', '-i', media, 'sh'],
+            input=_CT_MEDIA_APPLY_SH, capture_output=True, text=True, timeout=40)
+        if ap.returncode != 0:
+            _log(f"  ⚠ cloudtak-media heal apply failed: {(ap.stderr or ap.stdout or '').strip()[:200]}")
+            return False
+        subprocess.run(f"docker restart {shlex.quote(media)}",
+                       shell=True, capture_output=True, text=True, timeout=60)
+        _log("  ✓ cloudtak-media healed (HLS=mpegts/alwaysRemux + reaper ephemeral-aware)")
+        return True
+    except Exception as e:
+        _log(f"  ⚠ cloudtak-media heal error (non-fatal): {e}")
+        return False
+
+
 def _patch_cloudtak_compose_ports(cloudtak_dir=None):
     """Patch port bindings in CloudTAK compose.yaml / docker-compose.yml.
 
@@ -17233,6 +17387,8 @@ def run_cloudtak_deploy(cfg=None):
             cfg['deployed'] = True
             settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
             save_settings(settings)
+            # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
+            _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
             plog("Deploy finished — CloudTAK is running.")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -17430,15 +17586,19 @@ def run_cloudtak_deploy(cfg=None):
         plog("✓ Containers started")
         plog("✓ Restart complete.")
 
-        # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used
-        for port in ['5000/tcp', '5002/tcp']:
+        # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used.
+        # 9997 (v0.9.48): Caddy fronts the CloudTAK video vhost on :9997 (CloudTAK hardcodes
+        # that port for every media URL); allow it now so a fresh install works without
+        # waiting for the next console-update _auto_harden_cloudtak() pass. The media
+        # container still publishes 9997 on 127.0.0.1 only, so this exposes Caddy, not it.
+        for port in ['5000/tcp', '5002/tcp', '9997/tcp']:
             subprocess.run(f'ufw allow {port} 2>/dev/null; true', shell=True, capture_output=True)
         r = subprocess.run('which firewall-cmd', shell=True, capture_output=True)
         if r.returncode == 0:
-            for port in ['5000', '5002']:
+            for port in ['5000', '5002', '9997']:
                 subprocess.run(f'firewall-cmd --permanent --add-port={port}/tcp 2>/dev/null; true', shell=True, capture_output=True)
             subprocess.run('firewall-cmd --reload 2>/dev/null; true', shell=True, capture_output=True)
-        plog("✓ Firewall: ports 5000 (Web UI), 5002 (tiles) opened for direct access")
+        plog("✓ Firewall: ports 5000 (Web UI), 5002 (tiles), 9997 (Caddy video) opened")
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".
@@ -17561,6 +17721,10 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _caddy_e:
             plog(f"⚠ Caddy confirm skipped: {_caddy_e} (CloudTAK is still running)")
 
+        # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware
+        # reaper) — a fresh install creates the container from the image default.
+        _cloudtak_media_hls_heal(plog=plog, wait=True)
+
         plog("")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         if api_ready:
@@ -17664,6 +17828,8 @@ def run_cloudtak_redeploy(cfg=None):
                     plog("✓ Caddy reloaded")
                 except subprocess.TimeoutExpired:
                     plog("⚠ Caddy reload timed out — reload manually if needed")
+            # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
+            _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ Update config & restart done (remote)")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
             return
@@ -17760,6 +17926,9 @@ def run_cloudtak_redeploy(cfg=None):
                 plog("✓ Caddy reloaded")
             except subprocess.TimeoutExpired:
                 plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
+        # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
+        # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_media_hls_heal(plog=plog, wait=True)
         plog("✓ Update config & restart done")
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -17911,6 +18080,9 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
+        # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
+        # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
@@ -51595,12 +51767,36 @@ def _startup_harden_cloudtak_ports():
             )
             if r.returncode == 0:
                 print("Startup migration: CloudTAK recreated with hardened port bindings")
+                # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
+                # re-apply the self-heal (HLS config + ephemeral-aware reaper).
+                _cloudtak_media_hls_heal(wait=True)
             else:
                 print(f"Startup migration: CloudTAK recreate warning: {(r.stdout or '')[:200]}")
     except Exception as _e:
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
 _startup_harden_cloudtak_ports()
+
+
+def _startup_heal_cloudtak_media_hls():
+    """v0.9.48 (Part B+C/D): converge cloudtak-media (HLS config + ephemeral-aware reaper) on every console
+    start, independent of Guard Dog and of which path recreated the container.
+    `_cloudtak_media_hls_heal` is check-before-apply, so this is a no-op restart-free
+    pass when the config is already correct; it only heals a container that drifted
+    back to the image default (e.g. an out-of-band `docker compose up`). This is the
+    Guard-Dog-independent backbone of the self-heal — the recreate hooks just make
+    convergence immediate instead of waiting for the next boot."""
+    try:
+        _ct_dir = os.path.expanduser('~/CloudTAK')
+        if not (os.path.exists(os.path.join(_ct_dir, 'docker-compose.yml'))
+                or os.path.exists(os.path.join(_ct_dir, 'compose.yaml'))):
+            return  # CloudTAK not installed locally (or split/remote) — nothing to heal here
+        if _cloudtak_media_hls_heal():
+            return
+    except Exception as _e:
+        print(f"Startup self-heal: cloudtak-media error (non-fatal): {_e}")
+
+_startup_heal_cloudtak_media_hls()
 
 
 def _fedhub_harden_ui_ports(cfg, settings):
@@ -54917,18 +55113,34 @@ def _post_update_auto_deploy():
                     # v0.9.11 covered postgis 5433 + minio 9000/9002. v0.9.12 extends
                     # to every other CloudTAK service host port that should never be
                     # publicly reachable: api 5000, tiles 5002, events 5003 (just in
-                    # case), media admin 9997, media HLS 18888.
+                    # case), media HLS 18888.
                     # RTSP 18554 / RTMP 11935 / SRT 18890 are NOT denied — those are
                     # legitimate public streaming endpoints (Tier 1).
+                    # v0.9.48: 9997 is NO LONGER denied — Caddy now fronts the CloudTAK
+                    # video vhost on :9997 (CloudTAK hardcodes that port for every media
+                    # URL it builds; see generate_caddyfile). The cloudtak-media
+                    # container still publishes 9997 on 127.0.0.1 ONLY, so allowing the
+                    # port exposes Caddy (auth-gated, cert-fronted), not the container.
                     try:
                         for _port in ('5000/tcp', '5002/tcp', '5003/tcp',
                                       '5433/tcp', '9000/tcp', '9002/tcp',
-                                      '9997/tcp', '18888/tcp'):
+                                      '18888/tcp'):
                             subprocess.run(
                                 f'(sudo ufw deny {_port} || ufw deny {_port}) >/dev/null 2>&1 || true',
                                 shell=True, capture_output=True, timeout=10
                             )
-                        print("  CloudTAK UFW deny rules applied (5000,5002,5003,5433,9000,9002,9997,18888)")
+                        # Flip 9997 from deny→allow: delete any legacy deny rule first
+                        # (ufw is first-match, so an older `deny 9997` would shadow a
+                        # newly-appended allow), then allow inbound to Caddy's listener.
+                        subprocess.run(
+                            '(sudo ufw delete deny 9997/tcp || ufw delete deny 9997/tcp) >/dev/null 2>&1 || true',
+                            shell=True, capture_output=True, timeout=10
+                        )
+                        subprocess.run(
+                            '(sudo ufw allow 9997/tcp || ufw allow 9997/tcp) >/dev/null 2>&1 || true',
+                            shell=True, capture_output=True, timeout=10
+                        )
+                        print("  CloudTAK UFW rules applied (deny 5000,5002,5003,5433,9000,9002,18888; allow 9997 for Caddy video)")
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
 
@@ -54942,6 +55154,9 @@ def _post_update_auto_deploy():
                             )
                             if _rec.returncode == 0:
                                 print("  CloudTAK recreated with hardened port bindings")
+                                # v0.9.48 (Part B+C/D): force-recreate reverted cloudtak-media
+                                # to image default — re-apply self-heal (HLS + ephemeral reaper).
+                                _cloudtak_media_hls_heal(wait=True)
                             else:
                                 print(f"  WARNING: CloudTAK recreate returned {_rec.returncode}: {(_rec.stdout or '')[:200]}")
                         except Exception as _re:
