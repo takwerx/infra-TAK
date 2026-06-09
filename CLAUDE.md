@@ -102,6 +102,25 @@ Public vs private split is the rule: GitHub Release + public README = product-on
 
 ---
 
+## Node-RED config persistence is SACRED (hard stop)
+
+Configurator configs (`arcgis_configs`, `tc_configs`, `pp_configs`, `tak_settings`, `ipaws_config`) live **only** in Node-RED's volatile global context — **not** in `flows.json`, **not** in git, **not** reconstructable from engine tabs (a tab looks its config up *by name*: `if(!cfg) return null`). Lose context without a fresh backup and the configs are **gone forever**. This has wiped real users (Charles on v0.9.49; Joe's "Red Flag" on test12). It must never happen again.
+
+**Before ANY change to the persistence path** — `nodered/deploy.sh`, `CFG_BACKUP_SNIPPET`, `fn_save`/`fn_saveall`/`fn_*_delete`/`fn_cfg_restore`/`fn_deploy_restore`, the `contextStorage`/`settings.js` logic, or the configurator save/restore JS:
+1. Pull live configs off-box first (`docker exec nodered curl -s localhost:1880/context/global`) and confirm non-empty.
+2. Treat every restore/deploy as **DESTRUCTIVE until proven otherwise**.
+3. Validate on a real box: add a throwaway config → run the change (deploy **and** restart) → confirm it survived. Never ship a persistence change without this.
+
+**Code invariants — no exceptions:**
+- A restore/deploy MUST NEVER shrink the live config set by replacing it with a smaller/older snapshot. If a candidate has fewer configs than another available source, **union by `configName`** (keep both) — older/smaller never silently wins. Both live context and `latest.json` honor deletes, so unioning *them* never resurrects a deleted config; the stale `/opt/tak` persistent snapshot is last-resort fallback only, never part of the union.
+- Back up on **SAVE and DELETE**, not just on deploy (`CFG_BACKUP_SNIPPET` writes `latest.json` synchronously — every save/delete handler must run it).
+- Verify `contextStorage:localfilesystem` is present in the file the **container** reads (derive the path from the `docker inspect` bind-mount source, not `$HOME`), with a canary — never assume a patch landed.
+- A restore that yields **0 configs, or fewer than live, is a FAILURE to surface** in the UI/logs, not a success.
+
+See memory `nodered-config-persistence-sacred.md`. The v0.9.50 shields: save/delete→`latest.json`, settings.js real-path + canary, deploy.sh live∪`latest.json` union, `fn_deploy_restore` never-drop-live merge, hardened `fn_cfg_restore` (strip `default`, report counts).
+
+---
+
 ## Plan-first build workflow
 
 Name the scenario at the start of every chat.

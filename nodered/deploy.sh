@@ -256,6 +256,72 @@ print(', '.join(parts) if parts else '(no config keys)')
 PYEOF
 }
 
+# ── SHIELD: union live context with the save-time on-disk backup (latest.json) ──
+# latest.json is written synchronously on every Configurator SAVE and DELETE
+# (CFG_BACKUP_SNIPPET), so it is the authoritative current set AND honors deletes.
+# Union it with the live REST capture by configName: a momentarily-short live
+# capture (a redeploy race, a busy container) can then never shrink the restored
+# set, and because BOTH sources honor deletes the union never resurrects a deleted
+# config. This is the shield that stops "a stale snapshot overwrote my newer
+# configs" — the bug that wiped Joe's Red Flag. Persistent (/opt/tak) is NOT in the
+# union (it is the stale source); it stays a last-resort fallback in the gate below.
+# (v0.9.50 — see CLAUDE.md "Node-RED config persistence is SACRED")
+docker cp "$CONTAINER:/data/config-backups/latest.json" /tmp/_nr_latest.json 2>/dev/null || rm -f /tmp/_nr_latest.json
+if [ -f "$NR_CTX_GLOBAL" ] || [ -f /tmp/_nr_latest.json ]; then
+  if python3 - "$NR_CTX_GLOBAL" /tmp/_nr_latest.json > /tmp/_nr_union.log 2>&1 <<'PYEOF'
+import json, sys, os
+live_f, latest_f = sys.argv[1], sys.argv[2]
+def load(f):
+    if not os.path.exists(f): return {}
+    try: d = json.load(open(f))
+    except Exception: return {}
+    if isinstance(d, dict) and 'default' in d and isinstance(d['default'], dict): d = d['default']
+    return d if isinstance(d, dict) else {}
+def uw(v):
+    if isinstance(v, dict) and 'msg' in v:
+        m = v['msg']
+        if isinstance(m, str):
+            try: return json.loads(m)
+            except Exception: return m
+        return m
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except Exception: return v
+    return v
+live = load(live_f); latest = load(latest_f)
+if not live and not latest: sys.exit(0)
+# Start from live so non-config keys (_subscribed, _lastPoll_*, caches) are preserved.
+merged = dict(live) if live else dict(latest)
+for k in ('arcgis_configs','tc_configs','pp_configs'):
+    out = []; seen = set()
+    for src in (live, latest):              # live wins on name conflict; union of names
+        lst = uw(src.get(k))
+        if not isinstance(lst, list): continue
+        for c in lst:
+            if not isinstance(c, dict): out.append(c); continue
+            name = c.get('configName') or c.get('name')
+            key = name if name is not None else ('__noname__%d' % len(out))
+            if key in seen: continue
+            seen.add(key); out.append(c)
+    merged[k] = out
+for k in ('tak_settings','ipaws_config'):
+    chosen = None
+    for src in (live, latest):
+        v = uw(src.get(k))
+        if isinstance(v, dict) and v: chosen = v; break
+    merged[k] = chosen if chosen is not None else (uw(merged.get(k)) if isinstance(uw(merged.get(k)), dict) else {})
+json.dump(merged, open(live_f, 'w'))
+print('UNION restored set: ' + ', '.join('%s=%d' % (k, len(merged.get(k, []))) for k in ('arcgis_configs','tc_configs','pp_configs')))
+PYEOF
+  then
+    grep -E 'UNION' /tmp/_nr_union.log 2>/dev/null | sed 's/^/    /' || true
+  else
+    echo "    (latest.json union skipped: $(head -1 /tmp/_nr_union.log 2>/dev/null))"
+  fi
+  rm -f /tmp/_nr_union.log
+fi
+rm -f /tmp/_nr_latest.json
+
 echo "    Context keys (live):  $(_ctx_summary "$NR_CTX_GLOBAL")"
 if _ctx_is_valid "$NR_CTX_GLOBAL"; then
   # Good live backup — also update the persistent snapshot for next time
