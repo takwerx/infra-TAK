@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.49-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.49-alpha)**
+**Current release: [v0.9.50-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.50-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.50-alpha — 2026-06-09 — Node-RED Configurator configs survive updates
+
+**Headline: updating your box will no longer wipe the feeds you built in the Node-RED Configurator.** Configurator configs (ArcGIS/TAK feeds, TextChat, PulsePoint, IPAWS, TAK settings) live in Node-RED's in-memory state, and a chain of flaws in the backup/restore path could erase them on an update or restart — and the emergency restore sometimes loaded nothing. This release hardens that path end to end: configs are now backed up to disk the instant you save **or** delete one; the persistence setting is written to the file Node-RED actually reads (and verified); a restore can never replace your live feeds with an older, smaller backup (it keeps the larger set); and the restore screen now tells you the real config counts instead of silently "succeeding" with an empty backup. Field-validated on two boxes (≥99-min soak): a full update kept every config, and they also survived a Node-RED restart. Also: CloudTAK's `/sw.js` is now served no-cache so the browser picks up new builds sooner, and stale "hard-refresh" advice (which never worked) was replaced with the **Clear site data** steps that do. **Upgrade:** applied automatically. Configs already lost before this release can't be recovered, but anything you (re)create now will stick.
+
+Full notes: [v0.9.50-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.50-alpha).
 
 ### v0.9.49-alpha — 2026-06-08 — CloudTAK "Update Now" reaches the latest release cleanly
 
