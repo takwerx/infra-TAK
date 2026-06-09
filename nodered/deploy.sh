@@ -535,11 +535,27 @@ for _NR_CERT in "$CERT_HOST_DIR/nodered.pem" "$CERT_HOST_DIR/nodered.key"; do
 done
 
 # ── Patch settings.js on the HOST before the stop/start cycle ────────────────
-# settings.js lives at ~/node-red/settings.js on the host and is volume-mounted
-# into the container.  We patch it here (no docker exec needed) so Node-RED reads
-# contextStorage:localfilesystem on restart and picks up the global.json file copy.
+# settings.js is volume-mounted into the container at /data/settings.js.  We patch
+# the host file (no docker exec needed) so Node-RED reads contextStorage:localfilesystem
+# on restart and picks up the global.json file copy.
+#
+# CRITICAL: derive the REAL host path from the container's bind-mount, NOT "$HOME".
+# deploy.sh runs as root ($HOME=/root) but the container mounts the *install user's*
+# home (e.g. /home/takwerx/node-red/settings.js).  Patching $HOME/node-red/settings.js
+# silently edited the wrong file on every box whose install user wasn't root — so
+# contextStorage/fs never landed in the mounted file, Node-RED kept context in memory
+# only, and every restart/update wiped all Configurator configs.  (Fixed v0.9.50.)
 echo "==> Ensuring contextStorage:localfilesystem in settings.js"
-NR_SETTINGS_HOST="$HOME/node-red/settings.js"
+NR_SETTINGS_HOST="$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data/settings.js"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+if [ -z "$NR_SETTINGS_HOST" ] || [ ! -f "$NR_SETTINGS_HOST" ]; then
+  # Fallbacks: legacy $HOME assumption, then any single install-user home.
+  if [ -f "$HOME/node-red/settings.js" ]; then
+    NR_SETTINGS_HOST="$HOME/node-red/settings.js"
+  else
+    NR_SETTINGS_HOST="$(ls /home/*/node-red/settings.js 2>/dev/null | head -1 || true)"
+  fi
+fi
+echo "    settings.js (mounted host file): ${NR_SETTINGS_HOST:-<not found>}"
 if [ -f "$NR_SETTINGS_HOST" ]; then
   if ! grep -q 'contextStorage' "$NR_SETTINGS_HOST" 2>/dev/null; then
     echo "    $NR_SETTINGS_HOST: adding contextStorage (localfilesystem + flushInterval:0)"
@@ -588,6 +604,17 @@ PYEOF
 else
   echo "    WARNING: settings.js not found at $NR_SETTINGS_HOST"
   echo "    API-based restore (post-startup) will ensure configs survive regardless."
+fi
+
+# Verify the patch actually landed in the file the CONTAINER reads (/data/settings.js).
+# This is the canary for the wrong-path bug above: if contextStorage is absent here,
+# Node-RED runs memory-only and configs get wiped on the next restart.
+if docker exec "$CONTAINER" grep -q 'contextStorage' /data/settings.js 2>/dev/null; then
+  echo "    settings.js: contextStorage CONFIRMED in mounted /data/settings.js ✓"
+else
+  echo "    *** WARNING: contextStorage NOT present in the container's /data/settings.js ***"
+  echo "    *** Context will be memory-only and configs WILL be wiped on restart.        ***"
+  echo "    *** Mounted host file patched: ${NR_SETTINGS_HOST:-<unknown>}                ***"
 fi
 
 # Copy merged flows to host, then stop Node-RED before writing /data/flows.json.
