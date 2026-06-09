@@ -11873,6 +11873,13 @@ def generate_caddyfile(settings=None):
         lines.append(f"            write_timeout 120s")
         lines.append(f"        }}")
         lines.append(f"    }}")
+        lines.append(f"    # sw.js ships no Cache-Control from the CloudTAK image, so browsers may")
+        lines.append(f"    # heuristically cache the service-worker script and miss a new build for")
+        lines.append(f"    # hours. Force revalidation so an updated SW is detected on the next load.")
+        lines.append(f"    # (Hygiene only — it does NOT fix the SW 'waiting' stall; that needs")
+        lines.append(f"    # skipWaiting()/clients.claim() in CloudTAK's own service worker.)")
+        lines.append(f"    @ct_swjs path /sw.js")
+        lines.append(f"    header @ct_swjs Cache-Control \"no-cache, no-store, must-revalidate\"")
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
@@ -16793,8 +16800,8 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         plog(f'✓ Plugin {action_label} successfully.')
         if action in ('install', 'update'):
             plog('  → In CloudTAK: Settings → Refresh App to activate the new service worker.')
-            plog('    (Cmd+Shift+R does NOT work — the SW intercepts all requests.)')
-            plog('    Alternatively: close all CloudTAK browser tabs and reopen.')
+            plog('    If still on the old version: DevTools (F12) → Application → Clear site data, then reload.')
+            plog('    (A refresh — even Cmd/Ctrl+Shift+R — will NOT help; the service worker serves a cached copy.)')
             plog('    Plugin appears at the bottom of the right-side menu.')
         cloudtak_plugin_status.update({'running': False, 'complete': True, 'error': False})
 
@@ -17823,7 +17830,8 @@ def run_cloudtak_deploy(cfg=None):
             plog("  Caddy is already configured. The site will work as soon as Node finishes warming up.")
             plog("  Watch progress: docker logs -f cloudtak-api-1")
             if domain:
-                plog(f"  Try: https://map.{domain}/ in a few minutes (hard-refresh: Cmd/Ctrl+Shift+R)")
+                plog(f"  Try: https://map.{domain}/ in a few minutes. If it shows the old version,")
+                plog(f"  open DevTools (F12) → Application → Clear site data, then reload (a refresh won't help — SW cache).")
             # Fall through — do not return, do not mark error. Step 7 will reconfirm Caddy.
         else:
             plog("✓ CloudTAK API responded — proceeding to Caddy confirmation")
@@ -18251,10 +18259,10 @@ def run_cloudtak_update():
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
         plog("")
-        plog("⚠ Service worker note: Cmd+Shift+R does NOT work — the CloudTAK SW")
-        plog("  intercepts all requests before they reach the network.")
-        plog("  To see the new version: in CloudTAK open Settings → Refresh App.")
-        plog("  Or: close all CloudTAK browser tabs and reopen.")
+        plog("⚠ Service worker note: a refresh (even Cmd/Ctrl+Shift+R) will NOT show the new")
+        plog("  version — CloudTAK's service worker serves a cached copy. To force it:")
+        plog("  DevTools (F12) → Application → Clear site data, then reload.")
+        plog("  (In-app Settings → Refresh App sometimes works but is not reliable.)")
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -26801,7 +26809,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
           <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 3 — Configure CloudTAK on first launch</div>
           <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
-            <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %} — if the setup/config page does not appear, force-reload: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--text-secondary)">Cmd+Shift+R</code> on Mac or <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--text-secondary)">Ctrl+Shift+R</code> on Windows</li>
+            <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %} — if the setup/config page does not appear, wait a minute and reload (CloudTAK may still be starting); if it stays stale, clear it via <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--text-secondary)">DevTools → Application → Clear site data</code></li>
             <li style="margin-bottom:5px">When prompted for the TAK Server address, enter: {% if settings.fqdn %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.{{ settings.fqdn }}</code>{% else %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.yourdomain.com</code>{% endif %}</li>
             <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> (the full suffixed name from Step 1) and the password you set in Step 1</li>
             <li style="margin-bottom:5px">Upload <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> and enter the certificate password you noted in Step 2</li>
@@ -26849,7 +26857,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
       Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
       After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong> to activate the new service worker. The plugin then appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
-      <span style="color:var(--text-dim)">(Cmd+Shift+R does not work — CloudTAK's service worker intercepts all requests. Refresh App or close all CloudTAK tabs and reopen.)</span>
+      <span style="color:var(--text-dim)">(A refresh — even Cmd/Ctrl+Shift+R — does not help; CloudTAK's service worker serves a cached copy. If Settings → Refresh App doesn't update it, clear it: DevTools → Application → Clear site data, then reload.)</span>
     </p>
     <div id="ct-plugin-cards" style="display:grid;grid-template-columns:1fr;gap:12px">
       {% for p in cloudtak_plugins %}
