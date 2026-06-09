@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.48-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.48-alpha)**
+**Current release: [v0.9.49-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.49-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.49-alpha — 2026-06-08 — CloudTAK "Update Now" reaches the latest release cleanly
+
+**Headline: updating CloudTAK from the console works again, and the version readout tells the truth.** Two fixes. (1) **"Update Now" no longer fails at the final step.** Updating to the current CloudTAK release used to die with `address already in use` on port `:9997`: the update checks out the new version, which resets CloudTAK's container port bindings back to the public defaults, and that collided with the auth-gated video proxy added in v0.9.48. The updater now re-applies the loopback port hardening immediately after checkout, so the rebuild completes and the box lands on the latest CloudTAK — this also re-closes a set of CloudTAK admin ports that every past update briefly re-exposed until the next restart. (2) **No more phantom "update available."** When CloudTAK's published version number lags its release tag, a fully-updated box used to show a permanent "update available" badge; the console now recognizes it is current and clears the badge, while still flagging a genuinely failed update. **Upgrade:** applied automatically — after updating the console, run CloudTAK **Update Now** to move to the latest CloudTAK.
+
+Full notes: [v0.9.49-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.49-alpha).
 
 ### v0.9.48-alpha — 2026-06-08 — CloudTAK foreign-source video (RTSP/SRT) plays in the browser map
 
