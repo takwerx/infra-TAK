@@ -615,7 +615,7 @@
     <div class="field-grid" style="margin-bottom:1rem" id="missionEnsureFields">
       <div>
         <label for="missionGroup">TAK group <span style="color:#64748b;font-weight:400">(for auto-create only)</span></label>
-        <input type="text" id="missionGroup" placeholder="DATASYNC-FEEDS" value="DATASYNC-FEEDS">
+        <input type="text" id="missionGroup" placeholder="DATASYNC-FEED" value="DATASYNC-FEED">
         <div style="font-size:0.72rem;color:#64748b;margin-top:0.25rem;line-height:1.35">
           The group the cert (nodered or admin) uses to write — only consulted when this Configurator
           creates the mission. Existing missions are unchanged.
@@ -2969,7 +2969,7 @@ function getCurrentConfigData() {
 async function ensureMissionInTak() {
   var name = (document.getElementById('missionName') || {}).value || '';
   name = name.trim();
-  var group = ((document.getElementById('missionGroup') || {}).value || 'DATASYNC-FEEDS').trim();
+  var group = ((document.getElementById('missionGroup') || {}).value || 'DATASYNC-FEED').trim();
   var statusEl = document.getElementById('missionEnsureStatus');
   if (!statusEl) return;
   if (!name) {
@@ -3079,6 +3079,7 @@ async function generateConfig() {
     cotStreamPort: parseInt(document.getElementById('streamPort').value, 10) || undefined,
     streamPort: parseInt(document.getElementById('streamPort').value, 10) || 8089,
     missionName: document.getElementById('missionName').value || '',
+    takGroup: (document.getElementById('missionGroup').value || '').trim() || undefined,
     takDestinationLabel: (document.getElementById('arcgisTakDestinationLabel').value || '').trim() || undefined,
     creatorUid: (document.getElementById('configCreatorUid').value || '').trim(),
     pollInterval: parseInt(document.getElementById('pollInterval').value, 10) || 5,
@@ -4352,6 +4353,7 @@ function resetForm() {
   document.getElementById('streamCertUser').value = '';
   document.getElementById('streamPort').value = '8089';
   document.getElementById('missionName').value = '';
+  document.getElementById('missionGroup').value = 'DATASYNC-FEED';
   document.getElementById('arcgisTakDestinationLabel').value = '';
   document.getElementById('configCreatorUid').value = 'admin';
   document.getElementById('pollInterval').value = '5';
@@ -4874,6 +4876,7 @@ async function selectConfig(idx) {
   document.getElementById('streamCertUser').value = c.streamCertUser || '';
   document.getElementById('streamPort').value = (c.cotStreamPort > 0) ? c.cotStreamPort : (c.streamPort > 0 ? c.streamPort : 8089);
   if (c.missionName) document.getElementById('missionName').value = c.missionName;
+  if (c.takGroup) document.getElementById('missionGroup').value = c.takGroup;
   document.getElementById('arcgisTakDestinationLabel').value = c.takDestinationLabel || '';
   document.getElementById('configCreatorUid').value = (c.creatorUid != null && c.creatorUid !== '') ? c.creatorUid : 'admin';
   document.getElementById('pollInterval').value = (c.pollInterval != null && c.pollInterval > 0) ? c.pollInterval : 5;

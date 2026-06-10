@@ -1009,7 +1009,7 @@ const configFlows = [
     func: [
       "var p = msg.payload || {};",
       "var name = String(p.missionName || '').trim();",
-      "var group = String(p.group || 'DATASYNC-FEEDS').trim();",
+      "var group = String(p.group || 'DATASYNC-FEED').trim();",
       "var defaultRole = String(p.defaultRole || 'MISSION_READONLY_SUBSCRIBER').trim();",
       "var tak = global.get('tak_settings') || {};",
       "var creatorUid = String(p.creatorUid || tak.creatorUid || 'nodered').trim();",
