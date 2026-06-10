@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.50-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.50-alpha)**
+**Current release: [v0.9.51-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.51-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.51-alpha — 2026-06-10 — Bring-your-own TLS certificate + cleaner service removal
+
+**Headline: you can now use your own TLS certificate instead of Let's Encrypt.** When you set up your domain (or later on the Caddy page) you can choose **Custom certificate** and upload your own full-chain PEM + private key. It's applied to every subdomain and to TAK Server's enrollment endpoint, so infra-TAK works behind a corporate gateway/WAF or on networks where automatic (ACME) certificates can't be issued — the box never even attempts Let's Encrypt in this mode. Your upload is validated first (the key matches the certificate, it isn't expired, and it covers your hostnames), Caddy reloads with no downtime, and there's a one-click switch back to automatic. Renewal is a manual re-upload, with the existing certificate-expiry indicator and Guard Dog alert watching the date. **Also in this release:** uninstalling a service (MediaMTX, TAK Video Restreamer, Node-RED) now removes it cleanly from Authentik instead of leaving a dead entry behind — and any box that already had a leftover is tidied up automatically on the next restart; and the TAK Video Restreamer "update available" check is now reliable. **Upgrade:** applied automatically; no action required.
+
+Full notes: [v0.9.51-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.51-alpha).
 
 ### v0.9.50-alpha — 2026-06-09 — Node-RED Configurator configs survive updates
 
