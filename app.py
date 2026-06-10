@@ -9287,18 +9287,60 @@ caddy_deploy_log = []
 def caddy_deploy():
     if caddy_deploy_status['running']:
         return jsonify({'success': False, 'error': 'Deployment already in progress'})
-    data = request.get_json()
-    domain = data.get('domain', '').strip().lower()
+    # v0.9.51 — accept the SSL-mode choice at first deploy. Custom mode comes as a
+    # multipart upload (domain + ssl_mode=custom + cert_file/key_file); the default
+    # Let's Encrypt path is the legacy JSON {domain}. Deploying straight into custom
+    # mode means Caddy never attempts ACME (no failed-validation rate-limit burn on
+    # boxes behind a WAF / where ACME can't reach — the whole reason for custom mode).
+    cert_pem = key_pem = ''
+    if request.files or (request.form and request.form.get('domain')):
+        domain = (request.form.get('domain') or '').strip().lower()
+        ssl_mode = (request.form.get('ssl_mode') or 'fqdn').strip()
+        cf = request.files.get('cert_file')
+        kf = request.files.get('key_file')
+        if cf and cf.filename:
+            cert_pem = cf.read().decode('utf-8', 'replace')
+        if kf and kf.filename:
+            key_pem = kf.read().decode('utf-8', 'replace')
+    else:
+        data = request.get_json(silent=True) or {}
+        domain = (data.get('domain') or '').strip().lower()
+        ssl_mode = (data.get('ssl_mode') or 'fqdn').strip()
     if not domain:
         return jsonify({'success': False, 'error': 'Domain is required'})
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
         return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'})
-    # Save domain to settings
+
     settings = load_settings()
     settings['fqdn'] = domain
+    warnings = []
+    if ssl_mode == 'custom':
+        if not cert_pem or not key_pem:
+            return jsonify({'success': False, 'error': 'Custom certificate selected — upload both a certificate (full-chain PEM) and a private key (PEM).'}), 400
+        # Validate against the domain being deployed (fqdn is set above so coverage checks work).
+        v = _validate_custom_cert(cert_pem, key_pem, settings)
+        if not v['ok']:
+            return jsonify({'success': False, 'error': v['error']}), 400
+        cert_path, key_path = _custom_cert_paths()
+        try:
+            os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+            with open(cert_path, 'w') as fh:
+                fh.write(cert_pem.strip() + '\n')
+            os.chmod(cert_path, 0o600)
+            with open(key_path, 'w') as fh:
+                fh.write(key_pem.strip() + '\n')
+            os.chmod(key_path, 0o600)
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Failed to store certificate files: {e}'}), 500
+        settings['ssl_mode'] = 'custom'
+        warnings = v.get('warnings') or []
+    else:
+        settings['ssl_mode'] = 'fqdn'
     save_settings(settings)
     caddy_deploy_log.clear()
     caddy_deploy_status.update({'running': True, 'complete': False, 'error': False})
+    for w in warnings:
+        caddy_deploy_log.append(f"⚠ {w}")
     threading.Thread(target=run_caddy_deploy, args=(domain,), daemon=True).start()
     return jsonify({'success': True})
 
@@ -12979,16 +13021,22 @@ def run_caddy_deploy(domain):
             caddy_deploy_status.update({'running': False, 'error': True})
             return
 
-        # Update settings
-        settings['ssl_mode'] = 'fqdn'
+        # Update settings — preserve a custom SSL mode chosen at deploy time; only the
+        # Let's Encrypt path owns ssl_mode='fqdn' (v0.9.51).
+        custom_mode = (settings.get('ssl_mode') or '') == 'custom'
+        if not custom_mode:
+            settings['ssl_mode'] = 'fqdn'
         save_settings(settings)
 
         plog("")
         plog("=" * 50)
         plog(f"✓ Caddy deployed successfully!")
         plog(f"  Domain: https://{domain}")
-        plog(f"  SSL: Let's Encrypt (automatic)")
-        plog("  Note: DNS must point to this server's IP for SSL to activate")
+        if custom_mode:
+            plog(f"  SSL: Custom certificate (your uploaded cert — no ACME)")
+        else:
+            plog(f"  SSL: Let's Encrypt (automatic)")
+            plog("  Note: DNS must point to this server's IP for SSL to activate")
         plog("=" * 50)
         caddy_deploy_status.update({'running': False, 'complete': True})
 
@@ -27902,13 +27950,33 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="text-align:center;margin-bottom:24px">
 <div style="font-size:36px;margin-bottom:12px">🌐</div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;color:var(--text-secondary)">Configure a Domain Name</div>
-<div style="font-size:13px;color:var(--text-dim);margin-top:8px;max-width:500px;margin-left:auto;margin-right:auto;line-height:1.5">Caddy provides automatic HTTPS with Let's Encrypt certificates. Enter your domain name and point its DNS to this server's IP address.</div>
+<div style="font-size:13px;color:var(--text-dim);margin-top:8px;max-width:500px;margin-left:auto;margin-right:auto;line-height:1.5">Enter your domain, then choose how TLS certificates are issued. Automatic uses Let's Encrypt; Custom serves your own certificate (for domains behind a corporate WAF/gateway where ACME can't reach).</div>
 </div>
 <div style="max-width:500px;margin:0 auto">
 <label class="input-label">Base Domain</label>
 <input type="text" id="domain-input" class="input-field" placeholder="yourdomain.com" style="margin-bottom:8px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:20px">Subdomains auto-configured: infratak · console · tak · authentik · portal · nodered · map · tiles.map · video<br>Point a wildcard DNS (*.yourdomain.com) or individual A records to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span></div>
-<div style="text-align:center">
+<label class="input-label">SSL Certificate</label>
+<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 0">
+<input type="radio" name="setup-ssl-mode" value="fqdn" checked onchange="toggleSetupSslMode()" style="margin-top:3px">
+<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Automatic (Let's Encrypt)</div>
+<div style="font-size:12px;color:var(--text-dim)">Free trusted certs over ACME. Needs ports 80/443 reachable from the internet + DNS pointing here.</div></div>
+</label>
+<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 0;border-top:1px solid var(--border)">
+<input type="radio" name="setup-ssl-mode" value="custom" onchange="toggleSetupSslMode()" style="margin-top:3px">
+<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Custom certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (no ACME)</span></div>
+<div style="font-size:12px;color:var(--text-dim)">Upload a full-chain PEM + key, applied to all subdomains. Use a wildcard (e.g. *.yourdomain.com). Caddy never attempts Let's Encrypt.</div></div>
+</label>
+<div id="setup-custom-cert" style="display:none;margin:12px 0 4px;padding:16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+<div><label class="input-label">Certificate (full-chain PEM)</label>
+<input type="file" id="setup-cert-file" accept=".pem,.crt,.cer,.cert,.txt" class="input-field" style="padding:8px"></div>
+<div><label class="input-label">Private key (PEM)</label>
+<input type="file" id="setup-key-file" accept=".pem,.key,.txt" class="input-field" style="padding:8px"></div>
+</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:10px;line-height:1.5">Validated (key match, not expired, hostname coverage) before deploy. If TAK Server is later installed, its 8446 enrollment cert uses this too.</div>
+</div>
+<div style="text-align:center;margin-top:20px">
 <button onclick="deployCaddy()" id="deploy-btn" style="padding:14px 40px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:16px;font-weight:600;cursor:pointer">🚀 Deploy Caddy</button>
 </div>
 </div>
@@ -27926,14 +27994,31 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');</script>
 <script>
+function toggleSetupSslMode(){
+    var sel=document.querySelector('input[name="setup-ssl-mode"]:checked');
+    var panel=document.getElementById('setup-custom-cert');
+    if(panel)panel.style.display=(sel&&sel.value==='custom')?'block':'none';
+}
 async function deployCaddy(){
     var domain=document.getElementById('domain-input').value.trim();
     if(!domain){alert('Please enter a domain name');return}
-    if(!confirm('Deploy Caddy with domain: '+domain+'?\\n\\nMake sure DNS is pointing to this server.')){return}
+    var modeEl=document.querySelector('input[name="setup-ssl-mode"]:checked');
+    var mode=modeEl?modeEl.value:'fqdn';
+    var req;
+    if(mode==='custom'){
+        var cf=document.getElementById('setup-cert-file'),kf=document.getElementById('setup-key-file');
+        if(!cf.files.length||!kf.files.length){alert('Custom certificate selected — choose both a certificate and a private key file.');return}
+        if(!confirm('Deploy Caddy for '+domain+' with your custom certificate?\\n\\nCaddy will serve your cert on all subdomains and will not attempt Let\\'s Encrypt.')){return}
+        var fd=new FormData();fd.append('domain',domain);fd.append('ssl_mode','custom');fd.append('cert_file',cf.files[0]);fd.append('key_file',kf.files[0]);
+        req={method:'POST',body:fd};
+    }else{
+        if(!confirm('Deploy Caddy with domain: '+domain+'?\\n\\nMake sure DNS is pointing to this server.')){return}
+        req={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain,ssl_mode:'fqdn'})};
+    }
     var btn=document.getElementById('deploy-btn');
     btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';
     try{
-        var r=await fetch('/api/caddy/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain})});
+        var r=await fetch('/api/caddy/deploy',req);
         var d=await r.json();
         if(d.success){pollCaddyLog()}
         else{var el=document.getElementById('deploy-log');var card=el?(el.closest('.card')||el.parentElement):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,el||card.firstChild);}if(el)el.textContent='Error: '+d.error;btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f680 Deploy Caddy';btn.style.background='';deployCaddy();};}
