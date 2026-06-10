@@ -27952,7 +27952,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;color:var(--text-secondary)">Configure a Domain Name</div>
 <div style="font-size:13px;color:var(--text-dim);margin-top:8px;max-width:500px;margin-left:auto;margin-right:auto;line-height:1.5">Enter your domain, then choose how TLS certificates are issued. Automatic uses Let's Encrypt; Custom serves your own certificate (for domains behind a corporate WAF/gateway where ACME can't reach).</div>
 </div>
-<div style="max-width:500px;margin:0 auto">
+<div style="max-width:680px;margin:0 auto">
 <label class="input-label">Base Domain</label>
 <input type="text" id="domain-input" class="input-field" placeholder="yourdomain.com" style="margin-bottom:8px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:20px">Subdomains auto-configured: infratak · console · tak · authentik · portal · nodered · map · tiles.map · video<br>Point a wildcard DNS (*.yourdomain.com) or individual A records to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span></div>
@@ -27968,11 +27968,11 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="font-size:12px;color:var(--text-dim)">Upload a full-chain PEM + key, applied to all subdomains. Use a wildcard (e.g. *.yourdomain.com). Caddy never attempts Let's Encrypt.</div></div>
 </label>
 <div id="setup-custom-cert" style="display:none;margin:12px 0 4px;padding:16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px">
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+<div style="display:grid;grid-template-columns:1fr;gap:14px">
 <div><label class="input-label">Certificate (full-chain PEM)</label>
-<input type="file" id="setup-cert-file" accept=".pem,.crt,.cer,.cert,.txt" class="input-field" style="padding:8px"></div>
+<input type="file" id="setup-cert-file" accept=".pem,.crt,.cer,.cert,.txt" class="input-field" style="padding:8px;width:100%"></div>
 <div><label class="input-label">Private key (PEM)</label>
-<input type="file" id="setup-key-file" accept=".pem,.key,.txt" class="input-field" style="padding:8px"></div>
+<input type="file" id="setup-key-file" accept=".pem,.key,.txt" class="input-field" style="padding:8px;width:100%"></div>
 </div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:10px;line-height:1.5">Validated (key match, not expired, hostname coverage) before deploy. If TAK Server is later installed, its 8446 enrollment cert uses this too.</div>
 </div>
