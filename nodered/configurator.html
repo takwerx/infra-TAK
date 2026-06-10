@@ -2621,7 +2621,9 @@ async function fetchDistinct() {
       '<button class="btn-secondary" onclick="filterSelectNone()">Select None</button>' +
       '</div><div class="cb-grid">';
     state.distinctValues.forEach(function(v, i) {
-      var display = (v == null || v === '') ? '(empty)' : v;
+      // Value stays the raw code (it becomes the ArcGIS WHERE clause); only the label shown is decoded.
+      var dv = decodeVal(field, v);
+      var display = (v == null || v === '') ? '(empty)' : (dv != null ? dv : v);
       html += '<label class="cb-item">' +
         '<input type="checkbox" autocomplete="off" onchange="filterToggle(this,' + i + ')">' +
         '<span>' + display + '</span></label>';
@@ -2699,7 +2701,7 @@ function updateFilterPreview() {
     el.textContent = 'Filter: all values selected (no filter applied)';
     return;
   }
-  var vals = all.map(function(v) { return "'" + String(v).replace(/'/g, "''") + "'"; });
+  var vals = all.map(function(v) { var dv = decodeVal(field, v); return "'" + String(dv != null ? dv : v).replace(/'/g, "''") + "'"; });
   el.textContent = 'WHERE ' + field + ' IN (' + vals.join(', ') + ')';
 }
 
@@ -2743,7 +2745,8 @@ function removeCheckboxFilter(val) {
 function renderAllSelectedTags() {
   var html = '';
   state.selectedValues.forEach(function(v) {
-    html += '<span class="filter-tag">' + v +
+    var dv = decodeVal(state.filterField, v);
+    html += '<span class="filter-tag">' + (dv != null ? dv : v) +
       ' <span class="x" onclick="removeCheckboxFilter(\'' + v.replace(/'/g, "\\'") + '\')">&times;</span></span>';
   });
   state.manualSources.forEach(function(v) {
