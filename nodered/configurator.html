@@ -1968,7 +1968,7 @@ function buildColorPicker(ve, curColor, setter, clearer) {
 
   var html = '<div style="display:flex;flex-wrap:wrap;gap:2px;align-items:center;max-width:210px">'
     + swatches
-    + '<input type="color" value="' + (curColor || '#FF0000') + '" style="width:18px;height:18px;padding:0;border:' + (customMatch ? '2px solid #2ec4b6' : '1px solid #555') + ';border-radius:3px;cursor:pointer;flex-shrink:0" title="Custom color picker" oninput="' + setter + '(\'' + ve + '\', this.value)">'
+    + '<input type="color" value="' + (curColor || '#FF0000') + '" style="width:34px;height:24px;padding:0;margin-left:3px;border:' + (customMatch ? '2px solid #2ec4b6' : '1px solid #888') + ';border-radius:4px;cursor:pointer;flex-shrink:0" title="Custom color picker — click for the full picker" oninput="' + setter + '(\'' + ve + '\', this.value)">'
     + '<input type="text" value="' + (curColor || '') + '" placeholder="#hex" style="width:72px;font-size:0.72rem;margin-left:2px;flex-shrink:0" title="Type a custom hex color" onchange="' + setter + '(\'' + ve + '\', this.value)">'
     + '<div onclick="' + clearer + '(\'' + ve + '\')" title="No color" style="width:16px;height:16px;border:' + (!curColor ? '2px solid #2ec4b6' : '2px solid #555') + ';border-radius:3px;cursor:pointer;flex-shrink:0;background:repeating-conic-gradient(#555 0% 25%, transparent 0% 50%) 50%/8px 8px"></div>'
     + '</div>';
@@ -4832,10 +4832,23 @@ async function selectConfig(idx) {
     state.classField = '';
     document.getElementById('classField').value = '';
   }
-  state.domains = c.domains || {};
+  // fetchSelectedLayers() already populated state.domains from the live layer metadata — keep it.
+  // Only fall back to the saved map if nothing was fetched (e.g. service unreachable on edit).
+  if (!state.domains || !Object.keys(state.domains).length) state.domains = c.domains || {};
   if (c.classes) {
     state.classMappings = c.classes;
-    state.classValues = Object.keys(c.classes).filter(function(k) { return k !== '_default'; });
+    // Old configs saved class keys as raw codes; re-key to domain labels so they match the
+    // decoded runtime attributes (and show labels). Idempotent for already-label-keyed configs.
+    if (c.classField && state.domains[c.classField]) {
+      var _cdm = state.domains[c.classField];
+      var _remap = {};
+      Object.keys(state.classMappings).forEach(function(k) {
+        var nk = (_cdm[k] != null) ? _cdm[k] : k;
+        _remap[nk] = state.classMappings[k];
+      });
+      state.classMappings = _remap;
+    }
+    state.classValues = Object.keys(state.classMappings).filter(function(k) { return k !== '_default'; });
     renderClassMappings();
   } else {
     state.classMappings = {};
