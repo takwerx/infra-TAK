@@ -9327,6 +9327,42 @@ def _custom_cert_paths():
     return os.path.join(ssl_dir, 'custom-fullchain.pem'), os.path.join(ssl_dir, 'custom-key.pem')
 
 
+def _sync_custom_cert_for_caddy():
+    """Deploy a Caddy-readable copy of the custom cert/key and return its (cert, key) paths.
+
+    The canonical copies live under .config/ssl (mode 600, root-owned) — but Caddy runs as
+    the unprivileged 'caddy' user and cannot even traverse .config (700 root), so pointing
+    Caddy's `tls` directive at .config makes it fail to start with 'permission denied'.
+    We copy them into Caddy's own data dir (~caddy, owned by the caddy user) on every
+    Caddyfile regeneration so the deployed copy always tracks the canonical one.
+    Returns (None, None) if the source cert is missing or the copy fails."""
+    import shutil, pwd
+    src_cert, src_key = _custom_cert_paths()
+    if not (os.path.exists(src_cert) and os.path.exists(src_key)):
+        return None, None
+    try:
+        caddy_pw = pwd.getpwnam('caddy')
+        base = caddy_pw.pw_dir if os.path.isdir(caddy_pw.pw_dir) else '/var/lib/caddy'
+    except KeyError:
+        caddy_pw = None
+        base = '/var/lib/caddy'
+    dst_cert = os.path.join(base, 'infratak-custom-fullchain.pem')
+    dst_key = os.path.join(base, 'infratak-custom-key.pem')
+    try:
+        os.makedirs(base, exist_ok=True)
+        shutil.copyfile(src_cert, dst_cert)
+        shutil.copyfile(src_key, dst_key)
+        if caddy_pw:
+            os.chown(dst_cert, caddy_pw.pw_uid, caddy_pw.pw_gid)
+            os.chown(dst_key, caddy_pw.pw_uid, caddy_pw.pw_gid)
+        os.chmod(dst_cert, 0o644)
+        os.chmod(dst_key, 0o600)
+        return dst_cert, dst_key
+    except Exception as e:
+        print(f"[custom-cert] failed to deploy Caddy-readable cert copy: {e}", flush=True)
+        return None, None
+
+
 def _cert_name_matches(cert_name, target):
     """True if a cert SAN/CN (cert_name, possibly a *.x wildcard) covers hostname target.
     Wildcards match exactly one left-most label (RFC 6125): *.example.com matches
@@ -12179,10 +12215,18 @@ def generate_caddyfile(settings=None):
         # CloudTAK itself → the whole Video Lease subsystem (proxy + normal leases)
         # times out. Add a second listener on :9997 with the SAME routing so the
         # upstream CloudTAK image works unmodified and survives its own rebuilds.
-        # MUST bind the public IP: 127.0.0.1:9997 is the cloudtak-media container's
-        # docker publish, so a 0.0.0.0:9997 listener collides and Caddy won't start.
-        # Caddy reuses the hostname's existing cert on :9997 (no ACME conflict).
+        # MUST bind a specific non-loopback IP: 127.0.0.1:9997 is the cloudtak-media
+        # container's docker publish, so a 0.0.0.0:9997 listener collides and Caddy
+        # won't start. Caddy reuses the hostname's existing cert on :9997 (no ACME conflict).
+        # v0.9.51 — universal bind: settings.server_ip may be a PUBLIC/NAT address (Azure,
+        # GCP, any load-balanced box) that isn't assigned to a local interface; binding it
+        # fails with "cannot assign requested address" and kills Caddy on every regen. Bind
+        # a locally-assigned IP: keep server_ip when it's on the NIC, else fall back to the
+        # box's primary local IP (NAT forwards the public :9997 to it). If neither resolves,
+        # skip the listener rather than crash Caddy.
         ct_bind_ip = (settings.get('server_ip') or '').strip()
+        if ct_bind_ip and ct_bind_ip not in _list_local_ipv4s():
+            ct_bind_ip = _primary_local_ipv4()
         if ct_bind_ip:
             ct_video_host = ct_video.split()[0].strip()  # hostname only (drop any TLS/options)
             lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs")
@@ -12372,9 +12416,10 @@ def generate_caddyfile(settings=None):
     # tls disables ACME for that site without needing a global `auto_https off`, so the
     # automatic HTTP→HTTPS redirect on :80 is preserved.
     if (settings.get('ssl_mode') or '') == 'custom':
-        cert_path = os.path.join(CONFIG_DIR, 'ssl', 'custom-fullchain.pem')
-        key_path = os.path.join(CONFIG_DIR, 'ssl', 'custom-key.pem')
-        if os.path.exists(cert_path) and os.path.exists(key_path):
+        # Caddy runs unprivileged and can't read .config — deploy a caddy-readable copy
+        # and point `tls` at THAT (see _sync_custom_cert_for_caddy).
+        cert_path, key_path = _sync_custom_cert_for_caddy()
+        if cert_path and key_path:
             tls_directive = f"    tls {cert_path} {key_path}"
             injected = []
             for ln in lines:
