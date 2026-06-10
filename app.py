@@ -13579,32 +13579,56 @@ def _get_webodm_version_info():
     return info
 
 
+_tvr_release_cache = {'sha': None, 'ts': 0}
+
+
+def _get_tvr_latest_commit_sha(use_cache=True):
+    """Latest commit SHA (full) on main for raytheonbbn/tak-video-restreamer.
+    The repo ships off main with no releases, so the commit SHA is the only
+    version signal. Cached 4h — like CloudTAK/Authentik — because this lookup
+    runs on every dashboard poll AND every TVR page load; unauthenticated GitHub
+    is 60 req/hr/IP, and a 403 would otherwise silently blank the update badge.
+    Returns stale cache on failure rather than None so a rate-limit doesn't hide
+    a known-available update. Pass use_cache=False to force a fresh check."""
+    import time as _time
+    if use_cache and _tvr_release_cache['sha'] and (_time.time() - _tvr_release_cache['ts'] < 14400):
+        return _tvr_release_cache['sha']
+    try:
+        import urllib.request as _ur
+        req = _ur.Request('https://api.github.com/repos/raytheonbbn/tak-video-restreamer/commits/main',
+                          headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=10) as resp:
+            sha = (json.loads(resp.read().decode()).get('sha') or '').strip() or None
+            if sha:
+                _tvr_release_cache['sha'] = sha
+                _tvr_release_cache['ts'] = _time.time()
+            return sha
+    except Exception as e:
+        print(f"version-info: tvr latest-commit check failed (non-fatal): {e}", flush=True)
+        return _tvr_release_cache.get('sha') or None
+
+
 def _get_tvr_version_info():
-    """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based)."""
+    """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based).
+    Compares FULL local vs remote SHAs — git's --short length is adaptive (7+ as the repo
+    grows) so the old short-vs-[:7] compare could mismatch; display values stay 7 chars."""
     import subprocess as _sp
     info = {'version': '', 'update_available': False, 'latest': None}
     tvr_dir = os.path.expanduser('~/tak-video-restreamer')
+    local_full = ''
     try:
-        r = _sp.run(['git', 'rev-parse', '--short', 'HEAD'],
+        r = _sp.run(['git', 'rev-parse', 'HEAD'],
                     capture_output=True, text=True, timeout=5, cwd=tvr_dir)
         if r.returncode == 0:
-            info['version'] = r.stdout.strip()
-    except Exception:
-        pass
-    try:
-        import urllib.request as _ur, json as _json
-        req = _ur.Request(
-            'https://api.github.com/repos/raytheonbbn/tak-video-restreamer/commits/main',
-            headers={'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=8)
-        data = _json.loads(resp.read())
-        latest = (data.get('sha') or '')[:7]
-        if latest:
-            info['latest'] = latest
-            if info['version'] and info['version'] != latest:
-                info['update_available'] = True
-    except Exception:
-        pass
+            local_full = r.stdout.strip()
+            info['version'] = local_full[:7]
+    except Exception as e:
+        print(f"version-info: tvr local SHA lookup failed (non-fatal): {e}", flush=True)
+    latest_full = _get_tvr_latest_commit_sha()
+    if latest_full:
+        info['latest'] = latest_full[:7]
+        if local_full and local_full != latest_full:
+            info['update_available'] = True
     return info
 
 
@@ -14955,6 +14979,7 @@ def mediamtx_uninstall():
     generate_caddyfile(settings)
     subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
     steps.append('Updated Caddyfile')
+    _deregister_authentik_proxy_app(settings, 'stream', 'MediaMTX', plog=lambda m: steps.append(m.strip()))
     return jsonify({'success': True, 'steps': steps})
 
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
@@ -20020,6 +20045,7 @@ def tvr_uninstall():
     save_settings(s)
     generate_caddyfile(s)
     _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
+    _deregister_authentik_proxy_app(s, 'tak-video-restreamer', 'TAK Video Restreamer Proxy')
     return jsonify({'success': True})
 
 
@@ -21209,6 +21235,7 @@ def nodered_uninstall():
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             steps.append('Caddyfile updated')
+        _deregister_authentik_proxy_app(settings, 'node-red', 'Node-RED Proxy', plog=lambda m: steps.append(m.strip()))
         return jsonify({'success': True, 'steps': steps})
     except Exception as e:
         return jsonify({'error': f'Uninstall failed: {str(e)[:200]}'}), 500
@@ -22077,6 +22104,108 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
     except Exception as e:
         _log(f"  ⚠ Outpost error: {str(e)[:80]}")
         return False
+
+
+def _outpost_remove_providers_safe(ak_url, ak_headers, provider_pks_to_remove, plog=None):
+    """Remove given provider PKs from the embedded outpost — inverse of
+    _outpost_add_providers_safe. GET the outpost, drop the PKs, PATCH back.
+    No-op (no PATCH) if none of the PKs are currently present."""
+    if not provider_pks_to_remove:
+        return False
+    import urllib.request as _req
+    _log = plog or (lambda m: None)
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers)
+        outposts = json.loads(_req.urlopen(r, timeout=15).read().decode()).get('results', [])
+        embedded = next((o for o in outposts if 'embed' in (o.get('name') or '').lower() or o.get('type') == 'proxy'), None)
+        if not embedded:
+            return False
+        op_pk = embedded.get('pk')
+        full = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/', headers=ak_headers), timeout=15).read().decode())
+        raw = full.get('providers') or []
+
+        def _to_pk(p):
+            if p is None:
+                return None
+            if isinstance(p, int):
+                return p
+            return p.get('pk') or p.get('id')
+
+        current_pks = [_to_pk(p) for p in raw if _to_pk(p) is not None]
+        remove = set(pk for pk in provider_pks_to_remove if pk)
+        new_pks = [pk for pk in current_pks if pk not in remove]
+        if len(new_pks) == len(current_pks):
+            return False  # nothing to remove
+        _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
+            data=json.dumps({'providers': new_pks}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+        _log("  ✓ Provider removed from embedded outpost")
+        return True
+    except Exception as e:
+        _log(f"  ⚠ Outpost remove error: {str(e)[:80]}")
+        return False
+
+
+def _deregister_authentik_proxy_app(settings, app_slug, prov_name, plog=None):
+    """Remove a managed service's Authentik proxy application + provider and drop the
+    provider from the embedded outpost. Called when a service is uninstalled so it
+    stops appearing as a service in Authentik. Idempotent and NON-FATAL: an uninstall
+    must still succeed if Authentik is down or the entries are already gone (404 = ok).
+
+    Slug-scoped — e.g. removing MediaMTX's 'stream' app never touches TAK Video
+    Restreamer's 'tak-video-restreamer' app even though they share the stream.<fqdn>
+    subdomain (they have distinct Authentik slugs/providers)."""
+    _log = plog or (lambda m: None)
+    import urllib.request as _req
+    ak_token = (
+        _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+        _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    )
+    if not ak_token:
+        _log("  Authentik deregister: no API token — skip")
+        return False
+    ak_url = _get_authentik_api_url(settings)
+    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+    def _del(url):
+        try:
+            _req.urlopen(_req.Request(url, headers=ak_headers, method='DELETE'), timeout=10)
+            return True
+        except Exception as e:
+            if getattr(e, 'code', None) == 404:
+                return True  # already gone
+            _log(f"  ⚠ Authentik deregister DELETE failed ({getattr(e, 'code', None) or str(e)[:60]})")
+            return False
+
+    # Resolve the provider PK via the application first (so we delete the right provider).
+    provider_pk = None
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/core/applications/{app_slug}/', headers=ak_headers)
+        app = json.loads(_req.urlopen(r, timeout=10).read().decode())
+        provider_pk = app.get('provider')
+    except Exception as e:
+        if getattr(e, 'code', None) != 404:
+            _log(f"  ⚠ Authentik deregister: app lookup failed ({str(e)[:60]})")
+    # Fallback: resolve by provider name if the app carried no provider / was already gone.
+    if not provider_pk and prov_name:
+        try:
+            from urllib.parse import quote as _q
+            r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?search={_q(prov_name)}', headers=ak_headers)
+            results = json.loads(_req.urlopen(r, timeout=10).read().decode()).get('results', [])
+            match = next((p for p in results if (p.get('name') or '').strip() == prov_name), None)
+            if match:
+                provider_pk = match.get('pk')
+        except Exception:
+            pass
+
+    # (1) Delete the application — slug is the PK in Authentik's core/applications API.
+    if _del(f'{ak_url}/api/v3/core/applications/{app_slug}/'):
+        _log(f"  ✓ Authentik application '{app_slug}' removed")
+    # (2) Drop the provider from the embedded outpost, then delete the provider.
+    if provider_pk:
+        _outpost_remove_providers_safe(ak_url, ak_headers, [provider_pk], plog=_log)
+        if _del(f'{ak_url}/api/v3/providers/proxy/{provider_pk}/'):
+            _log(f"  ✓ Authentik proxy provider '{prov_name}' removed")
+    return True
 
 
 def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
@@ -34709,6 +34838,12 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
 
         outpost_provider_pks = []
 
+        # Install snapshot for orphan GC below (computed once, not per-service).
+        try:
+            _installed_now = detect_modules()
+        except Exception:
+            _installed_now = {}
+
         for module_key, prov_name, app_slug, app_name, dom_key, open_new_tab in _AUTHENTIK_PROXY_CHAIN_SERVICES:
             # Skip services that aren't deployed (Federation Hub deployed flag
             # lives in cloudtak_deployment? No — _is_module_deployed only knows
@@ -34727,6 +34862,15 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                 deployed = (module_key == 'infratak')
 
             if not deployed:
+                # Orphan GC: if a catalog proxy service is FULLY uninstalled (installed=False,
+                # not merely stopped/undeployed), remove its leftover Authentik app+provider so
+                # it stops showing as a service. Real-world case: MediaMTX after a manual swap to
+                # TAK Video Restreamer (test12) — distinct slugs, so removing MediaMTX's 'stream'
+                # never touches TVR's 'tak-video-restreamer'. Default True → never GC a module
+                # detect_modules() couldn't classify, and never GC infra-TAK itself.
+                if module_key != 'infratak' and not _installed_now.get(module_key, {}).get('installed', True):
+                    _log(f"  ⧗ {prov_name}: service uninstalled — removing orphaned Authentik app")
+                    _deregister_authentik_proxy_app(settings, app_slug, prov_name, plog=_log)
                 continue
 
             service_domain = _get_service_domain(settings, dom_key)
