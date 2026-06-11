@@ -615,7 +615,7 @@
     <div class="field-grid" style="margin-bottom:1rem" id="missionEnsureFields">
       <div>
         <label for="missionGroup">TAK group <span style="color:#64748b;font-weight:400">(for auto-create only)</span></label>
-        <input type="text" id="missionGroup" placeholder="DATASYNC-FEED" value="DATASYNC-FEED">
+        <input type="text" id="missionGroup" placeholder="Type this feed's TAK group here — e.g. DATASYNC-FEED">
         <div style="font-size:0.72rem;color:#64748b;margin-top:0.25rem;line-height:1.35">
           The group the cert (nodered or admin) uses to write — only consulted when this Configurator
           creates the mission. Existing missions are unchanged.
@@ -4353,7 +4353,7 @@ function resetForm() {
   document.getElementById('streamCertUser').value = '';
   document.getElementById('streamPort').value = '8089';
   document.getElementById('missionName').value = '';
-  document.getElementById('missionGroup').value = 'DATASYNC-FEED';
+  document.getElementById('missionGroup').value = '';
   document.getElementById('arcgisTakDestinationLabel').value = '';
   document.getElementById('configCreatorUid').value = 'admin';
   document.getElementById('pollInterval').value = '5';
