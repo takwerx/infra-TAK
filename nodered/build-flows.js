@@ -1896,7 +1896,7 @@ const FN_PARSE_COT = [
   "// initial render. Simplify each ring/path before it becomes CoT. Hash + centroid",
   "// stay on the ORIGINAL geometry, so change-detection is unaffected. Only dense",
   "// rings (> _SIMP_MIN verts) are touched, so small/simple feeds pass through.",
-  "var _SIMP_TOL = (cfg.simplifyTolerance != null && cfg.simplifyTolerance !== '') ? Number(cfg.simplifyTolerance) : 0.002;",
+  "var _SIMP_TOL = (cfg.simplifyTolerance != null && cfg.simplifyTolerance !== '') ? Number(cfg.simplifyTolerance) : 0.04;",
   "var _SIMP_MIN = 60;",
   "// Salt the per-feature change-hash with the resolved style + class mappings so a color/style/class",
   "// edit (which doesn't touch geometry or label fields) still changes the hash and forces a re-push.",
