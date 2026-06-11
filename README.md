@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.51-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.51-alpha)**
+**Current release: [v0.9.52-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.52-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.52-alpha — 2026-06-11 — ArcGIS configurator: per-class polygon styling + decoded zone labels
+
+**Headline: ArcGIS feeds can now be styled per feature class, and coded data fields show their real labels everywhere.** Polygon and polyline feeds get per-class styling — distinct stroke color, fill color, fill opacity, line thickness, and line style for each class, with anything you leave unset inheriting the feed's uniform style. Coded-value fields (a field that stores a number like `1`/`2` that actually means something like "Infested Zone"/"Adjacent Surveillance Zone") now display the human label everywhere — the configurator preview, the class and source-filter pickers, the on-map callsign, and the DataSync feed's item names — instead of the raw code. Large polygons render much smoother in TAK while staying light enough not to stall the web client: each feed automatically gets a per-shape point budget tuned to how many features it has, so a handful of big boundaries keep their detail while a feed of hundreds stays performant — no tuning required. **Also in this release:** style and label edits now reliably reach TAK on the next sync; the per-feed TAK group is no longer hardcoded; and the dev-channel update path is more reliable. **Upgrade:** applied automatically; existing feeds are unaffected and pick up the improvements on their next sync.
+
+Full notes: [v0.9.52-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.52-alpha).
 
 ### v0.9.51-alpha — 2026-06-10 — Bring-your-own TLS certificate + cleaner service removal
 
