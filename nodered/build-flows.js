@@ -1902,7 +1902,7 @@ const FN_PARSE_COT = [
   "// snapshot can't blow up — see HANDOFF-2026-06-08-wwa-32mb). A shape already under the cap is left",
   "// untouched (small/curvy fire perimeters never get chopped). Buckets (not a smooth formula) so a",
   "// time-filtered feed's per-poll count wobble doesn't change the cap and churn hashes.",
-  "var _PT_CAP = (features.length <= 150) ? 400 : (features.length <= 400 ? 150 : 50);",
+  "var _PT_CAP = (features.length <= 150) ? 400 : (features.length <= 500 ? 150 : (features.length <= 1500 ? 80 : 40));",
   "// Salt the per-feature change-hash with the resolved style + class mappings so a color/style/class",
   "// edit (which doesn't touch geometry or label fields) still changes the hash and forces a re-push.",
   "var _STYLE_SALT = djb2(JSON.stringify(cfg.style || {}) + '|' + JSON.stringify(cfg.classes || {}) + '|' + (cfg.classField || '') + '|' + JSON.stringify(cfg.domains || {}));",
