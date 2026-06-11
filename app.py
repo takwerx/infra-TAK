@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.52-alpha9"
+VERSION = "0.9.52-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -54509,7 +54509,20 @@ def _post_update_auto_deploy():
     try:
         s = load_settings()
         last_ver = s.get('last_console_version', '')
-        if last_ver == VERSION:
+        # Dev-channel iterations keep the SAME version string (e.g. 0.9.52-alpha) but advance the
+        # git SHA. Treat a changed SHA as a deploy trigger too, so module auto-deploy (Node-RED
+        # flows, Guard Dog, Authentik) runs on every dev update — not only on a version-string bump.
+        # Without this, a same-version dev pull lands in the no-op branch below and the Node-RED
+        # container is never re-deployed (config/flow changes silently never reach the box).
+        try:
+            cur_sha = subprocess.run(
+                ['git', f'--git-dir={os.path.join(BASE_DIR, ".git")}', 'rev-parse', 'HEAD'],
+                capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+        except Exception:
+            cur_sha = ''
+        last_sha = s.get('last_console_sha', '')
+        if last_ver == VERSION and (cur_sha == '' or last_sha == cur_sha):
             # v0.9.25 hotfix #2: same-version restart Authentik compose self-heal.
             # Field test on tak-10 (2026-05-16): operator pulled hotfix #1 onto
             # a box already at last_console_version=0.9.25-alpha. The early
@@ -56276,8 +56289,10 @@ def _post_update_auto_deploy():
                 try:
                     s_done = load_settings()
                     s_done['last_console_version'] = VERSION
+                    if cur_sha:
+                        s_done['last_console_sha'] = cur_sha
                     save_settings(s_done)
-                    print(f"Post-update: last_console_version saved as {VERSION}", flush=True)
+                    print(f"Post-update: last_console_version saved as {VERSION} (sha {cur_sha[:7] or 'n/a'})", flush=True)
                 except Exception as _e:
                     print(f"Post-update: failed to save last_console_version: {_e}", flush=True)
                 try:
