@@ -1900,7 +1900,7 @@ const FN_PARSE_COT = [
   "var _SIMP_MIN = 60;",
   "// Salt the per-feature change-hash with the resolved style + class mappings so a color/style/class",
   "// edit (which doesn't touch geometry or label fields) still changes the hash and forces a re-push.",
-  "var _STYLE_SALT = djb2(JSON.stringify(cfg.style || {}) + '|' + JSON.stringify(cfg.classes || {}) + '|' + (cfg.classField || '') + '|' + (cfg.simplifyTolerance || ''));",
+  "var _STYLE_SALT = djb2(JSON.stringify(cfg.style || {}) + '|' + JSON.stringify(cfg.classes || {}) + '|' + (cfg.classField || '') + '|' + (cfg.simplifyTolerance || '') + '|' + JSON.stringify(cfg.domains || {}));",
   "function _perpDist(p, a, b) {",
   "  var dx = b[0]-a[0], dy = b[1]-a[1];",
   "  var len2 = dx*dx + dy*dy;",
