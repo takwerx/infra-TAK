@@ -22315,6 +22315,12 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
                 'invalidation_flow': inv_flow_pk,
                 'client_type': 'confidential',
                 'redirect_uris': redirect_uris_obj,
+                # Authentik 2024.x+ added an explicit grant_types field that defaults to
+                # EMPTY on create. An empty list rejects every OIDC login with "Invalid
+                # grant_type for provider / request is malformed" — SSO is dead before the
+                # user ever sees a login form. Allow the authorization-code flow this SSO
+                # provider uses, plus refresh_token for offline_access / token refresh.
+                'grant_types': ['authorization_code', 'refresh_token'],
             }
             payload.update(_provider_extras)
             try:
@@ -22501,7 +22507,10 @@ def _ensure_authentik_netbird_app(settings, plog=None):
                         provider_pk = ex_pk
                         client_id = detail['client_id']
                         client_secret = detail['client_secret']
-                        patch_data = {'redirect_uris': redirect_uris_obj, 'client_type': 'confidential'}
+                        # grant_types: heal existing providers created before this field
+                        # was set (empty = "Invalid grant_type for provider", SSO dead).
+                        patch_data = {'redirect_uris': redirect_uris_obj, 'client_type': 'confidential',
+                                      'grant_types': ['authorization_code', 'refresh_token']}
                         patch_data.update(_provider_extras)
                         try:
                             req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
@@ -22530,6 +22539,12 @@ def _ensure_authentik_netbird_app(settings, plog=None):
                 'invalidation_flow': inv_flow_pk,
                 'client_type': 'confidential',
                 'redirect_uris': redirect_uris_obj,
+                # Authentik 2024.x+ added an explicit grant_types field that defaults to
+                # EMPTY on create. An empty list rejects every OIDC login with "Invalid
+                # grant_type for provider / request is malformed" — SSO is dead before the
+                # user ever sees a login form. Allow the authorization-code flow this SSO
+                # provider uses, plus refresh_token for offline_access / token refresh.
+                'grant_types': ['authorization_code', 'refresh_token'],
             }
             payload.update(_provider_extras)
             try:
