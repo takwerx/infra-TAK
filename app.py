@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.53-alpha"
+VERSION = "0.9.54-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -1627,6 +1627,39 @@ def _read_guarddog_latest_write_mbs():
                     except ValueError:
                         pass
         return last_val
+    except Exception:
+        return None
+
+
+# v0.9.54: fleet-constant 4 KB commit-latency ceiling — mirrors WARN_MS_PER_COMMIT
+# in scripts/guarddog/tak-diskio-watch.sh. Kept in sync by hand (two languages).
+_GUARDDOG_DISKIO_LATENCY_CSV = '/var/lib/takguard/diskio_latency.csv'
+_GUARDDOG_LAT_CEILING_MS = 10
+
+
+def _guarddog_diskio_latency_1h_avg():
+    """Return the 1h-average 4 KB commit latency (ms/commit) from Guard Dog's
+    diskio_latency.csv, or None if the series is absent/empty. Mirrors the 1h
+    window the bash latency gate uses (v0.9.54 §4c)."""
+    try:
+        if not os.path.exists(_GUARDDOG_DISKIO_LATENCY_CSV):
+            return None
+        cutoff = datetime.utcnow() - timedelta(hours=1)
+        vals = []
+        with open(_GUARDDOG_DISKIO_LATENCY_CSV) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('timestamp') or line.startswith('#'):
+                    continue
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    try:
+                        ts = datetime.strptime(parts[0], '%Y-%m-%dT%H:%M:%SZ')
+                        if ts >= cutoff:
+                            vals.append(float(parts[2]))
+                    except ValueError:
+                        pass
+        return (sum(vals) / len(vals)) if vals else None
     except Exception:
         return None
 
@@ -6859,8 +6892,30 @@ def guarddog_diskio_history():
         avg_all = round(sum(vals_all) / len(vals_all), 1) if vals_all else None
         min_val = round(min(vals_all), 1) if vals_all else None
         max_val = round(max(vals_all), 1) if vals_all else None
+        # v0.9.54: latency-series parity (4 KB ms/commit). Additive — existing throughput
+        # fields above are untouched. Charts ms/commit alongside MB/s; absent on boxes that
+        # have not yet run the new probe (lat_* come back null, entries[] is [] → no break).
+        lat_entries = []
+        lat_path = '/var/lib/takguard/diskio_latency.csv'
+        if os.path.exists(lat_path):
+            with open(lat_path, 'r') as f:
+                for row in csv_mod.DictReader(f):
+                    try:
+                        ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                        if ts >= cutoff:
+                            lat_entries.append({'t': row['timestamp'],
+                                                'ms': float(row['ms_per_commit']),
+                                                'kbps': float(row['kb_per_sec'])})
+                    except (ValueError, KeyError):
+                        continue
+        lat_1h = [e['ms'] for e in lat_entries if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+        lat_all = [e['ms'] for e in lat_entries]
+        lat_avg_1h = round(sum(lat_1h) / len(lat_1h), 2) if lat_1h else None
+        lat_avg_24h = round(sum(lat_all) / len(lat_all), 2) if lat_all else None
         return jsonify({'entries': entries, 'avg_1h': avg_1h, 'avg_24h': avg_all,
-                        'min': min_val, 'max': max_val, 'samples': len(entries)})
+                        'min': min_val, 'max': max_val, 'samples': len(entries),
+                        'latency': lat_entries, 'lat_avg_1h': lat_avg_1h, 'lat_avg_24h': lat_avg_24h,
+                        'lat_ceiling_ms': _GUARDDOG_LAT_CEILING_MS})
     except Exception as e:
         import traceback
         return jsonify({'entries': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
@@ -7062,6 +7117,26 @@ def _guarddog_diskio_report_inner():
     output.write(f'# 1h average: {avg_1h} MB/s\n')
     output.write(f'# {hours}h average: {avg_all} MB/s\n')
     output.write(f'# Min: {round(min(vals), 1)} MB/s | Max: {round(max(vals), 1)} MB/s\n')
+    # v0.9.54: small-block commit-latency summary — the regime that matches the provider's
+    # 4 KB numbers and Postgres commits (a throttled disk reads 80 MB/s sequentially while
+    # a 4 KB fsync takes 16 ms). Header-only; data rows below stay the throughput series.
+    lat_path = '/var/lib/takguard/diskio_latency.csv'
+    if os.path.exists(lat_path):
+        lat_vals = []
+        try:
+            with open(lat_path, 'r') as lf:
+                for row in csv_mod.DictReader(lf):
+                    try:
+                        ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                        if ts >= cutoff:
+                            lat_vals.append(float(row['ms_per_commit']))
+                    except (ValueError, KeyError):
+                        continue
+        except (OSError, PermissionError):
+            lat_vals = []
+        if lat_vals:
+            output.write(f'# Commit latency (4 KB sync): {hours}h average {round(sum(lat_vals)/len(lat_vals), 2)} ms/commit '
+                         f'| Min {round(min(lat_vals), 2)} | Max {round(max(lat_vals), 2)} ms (ceiling 10 ms)\n')
     output.write(f'#\n')
     output.write('timestamp,mb_per_sec\n')
     for ts, v in entries:
@@ -7404,6 +7479,85 @@ def _guarddog_send_alert_email_via_relay(to_addr, subject, body):
     msg['Subject'] = subject or 'Guard Dog Alert'
     with smtplib.SMTP('localhost', 25, timeout=15) as s:
         s.sendmail(from_addr, [to_addr], msg.as_string())
+
+
+_GUARDDOG_SPIRAL_CORR_SENTINEL = '/var/lib/takguard/spiral_correlation_alert_sent'
+
+
+def _guarddog_spiral_correlation_check(cl_waiting):
+    """v0.9.54 §4c: correlate a disk commit-latency stall with real DB demand.
+
+    When the 1h-avg 4 KB commit latency is over the fleet ceiling AND PgBouncer has
+    clients waiting (cl_waiting > 0) in the same window, the disk is throttling
+    Postgres commits while Authentik genuinely needs the DB — the unambiguous
+    fingerprint of provider-disk-contention (the 2026-06-10 test12 incident). Emit a
+    distinct, attributed alert BEFORE the outage. Detection/attribution ONLY —
+    remediation stays with the existing watchdog/autotune.
+
+    Best-effort and read-only: callers wrap in try/except so the safety net is never
+    blocked. journald line fires every time the correlation holds; the email/SMS
+    notification is debounced 6h via a sentinel and honors diskio_email_off (this is
+    fundamentally a disk-attribution alert)."""
+    if not cl_waiting or cl_waiting <= 0:
+        return
+    lat_1h = _guarddog_diskio_latency_1h_avg()
+    if lat_1h is None or lat_1h <= _GUARDDOG_LAT_CEILING_MS:
+        return
+    print(f"[ak-pg-watchdog] SPIRAL-INCOMING: disk commit latency {lat_1h:.1f} ms/commit "
+          f"(ceiling {_GUARDDOG_LAT_CEILING_MS} ms) with cl_waiting={cl_waiting} — provider "
+          f"disk contention starving Postgres; Authentik/feed spiral likely imminent.", flush=True)
+    # 6h debounce on the notification (the journald line above always fires).
+    try:
+        import time as _t
+        if (os.path.exists(_GUARDDOG_SPIRAL_CORR_SENTINEL)
+                and (_t.time() - os.path.getmtime(_GUARDDOG_SPIRAL_CORR_SENTINEL)) < 21600):
+            return
+    except Exception:
+        pass
+    if os.path.exists('/opt/tak-guarddog/diskio_email_off'):
+        print("[ak-pg-watchdog] spiral-incoming notification suppressed (diskio_email_off set)", flush=True)
+        return
+    settings = load_settings()
+    alert_email = (settings.get('guarddog_alert_email') or '').strip()
+    try:
+        with open('/opt/tak-guarddog/server_identifier') as f:
+            server_id = f.read().strip()
+    except Exception:
+        server_id = socket.gethostname()
+    subj = f"⚠ Spiral incoming on {server_id} — provider disk contention"
+    body = (f"Guard Dog detected the disk-latency / DB-demand correlation that precedes "
+            f"an Authentik spiral.\n\n"
+            f"Server: {server_id}\n"
+            f"Commit latency (1h avg): {lat_1h:.1f} ms/commit (ceiling {_GUARDDOG_LAT_CEILING_MS} ms)\n"
+            f"PgBouncer cl_waiting: {cl_waiting}\n\n"
+            f"A throttled disk is stalling small-block (4 KB) Postgres commits while "
+            f"Authentik genuinely needs the database. This is hosting-provider disk "
+            f"contention — NOT an infra-TAK fault. If it persists, request a node "
+            f"migration from your VPS provider.\n\n"
+            f"— Guard Dog")
+    # Touch the sentinel BEFORE sending (matches the disk script) so a send failure
+    # can't re-spam every tick inside the 6h window.
+    try:
+        os.makedirs('/var/lib/takguard', exist_ok=True)
+        with open(_GUARDDOG_SPIRAL_CORR_SENTINEL, 'w') as f:
+            f.write('')
+    except Exception:
+        pass
+    if alert_email:
+        try:
+            _guarddog_send_alert_email_via_relay(alert_email, subj, body)
+            print(f"[ak-pg-watchdog] spiral-incoming email sent to {alert_email}", flush=True)
+        except Exception as _e:
+            print(f"[ak-pg-watchdog] spiral-incoming email failed: {_e}", flush=True)
+    if os.path.exists('/opt/tak-guarddog/sms_send.sh'):
+        try:
+            _tmp = f'/tmp/gd-spiral-sms-{os.getpid()}.txt'
+            with open(_tmp, 'w') as f:
+                f.write(body)
+            subprocess.run(['/opt/tak-guarddog/sms_send.sh', subj, _tmp], capture_output=True, timeout=20)
+            os.remove(_tmp)
+        except Exception:
+            pass
 
 
 @app.route('/api/guarddog/send-alert-email', methods=['POST'])
@@ -13654,15 +13808,22 @@ def _get_cloudtak_version_info():
             out['latest'] = latest_ver
             if out['version'] != latest_ver:
                 out['update_available'] = True
-    # v0.9.49: suppress a FALSE "update available" caused by the container's
-    # package.json lagging the git tag. dfpc-coe ships patch tags without bumping
-    # package.json (e.g. v13.11.1 carries package.json 13.11.0), so the Step-0
-    # container version can never equal the latest tag and the badge sticks on
-    # forever even when the box is current. If ~/CloudTAK HEAD is checked out
-    # EXACTLY at the latest tag AND the running container shares its major.minor,
-    # the box was genuinely rebuilt from that tag — only the strings differ.
-    # Gating on major.minor still flags a FAILED update (source moved to the new
-    # tag but the container is far behind, e.g. 13.4.0 vs 13.11.1) as available.
+    # v0.9.54: suppress a FALSE "update available" caused by the container's
+    # api/package.json lagging the git release tag. dfpc-coe ships release tags
+    # whose api/package.json trails the tag — and the lag now crosses a MINOR
+    # boundary (the v13.14.0 tag carries api/package.json 13.13.0, root 13.14.0).
+    # The v0.9.49 gate compared the container's major.minor to the LATEST TAG's
+    # major.minor (13.13 vs 13.14) and so wrongly kept the badge lit on a fully
+    # up-to-date box, making every Update Now look like a no-op (caught on test12
+    # 2026-06-12: HEAD v13.14.0, container 13.13.0, badge stuck).
+    #
+    # Correct signal: the box is current iff ~/CloudTAK HEAD is checked out
+    # EXACTLY at the latest release tag AND the running container's version equals
+    # the version baked into THAT tag's api/package.json (what a correct rebuild
+    # produces — the container reads /home/etl/api/package.json, so compare against
+    # the source api/package.json, never the tag string or root package.json).
+    # If the container is behind the source api/package.json, the rebuild did not
+    # land (source moved, image didn't) — keep showing the update.
     if out['update_available'] and out['version'] and out['latest']:
         try:
             _latest_norm = out['latest'].lstrip('vV')
@@ -13670,9 +13831,17 @@ def _get_cloudtak_version_info():
                 f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
                 shell=True, capture_output=True, text=True, timeout=5)
             _src_tag = (_src.stdout or '').strip().lstrip('vV')
-            _mm = lambda v: '.'.join(v.split('.')[:2])
-            if _src_tag and _src_tag == _latest_norm and _mm(out['version']) == _mm(_latest_norm):
-                out['update_available'] = False
+            if _src_tag and _src_tag == _latest_norm:
+                _src_api_ver = ''
+                _api_pkg = os.path.join(ct_dir, 'api', 'package.json')
+                if os.path.isfile(_api_pkg):
+                    try:
+                        with open(_api_pkg) as _f:
+                            _src_api_ver = (json.load(_f).get('version') or '').strip()
+                    except Exception:
+                        _src_api_ver = ''
+                if _src_api_ver and out['version'] == _src_api_ver:
+                    out['update_available'] = False
         except Exception:
             pass
     return out
@@ -37441,6 +37610,15 @@ def _authentik_channels_pool_watchdog_loop():
             _authentik_pool_autotune_sample(
                 _count, _classes_for_sample, _cl_waiting_for_sample
             )
+
+            # v0.9.54 §4c: disk-latency ∧ DB-demand correlation observer. Read-only
+            # attribution — emits the spiral-incoming alert when a 4 KB commit-latency
+            # stall co-occurs with cl_waiting>0. Never blocks the safety net;
+            # remediation below is unchanged.
+            try:
+                _guarddog_spiral_correlation_check(_cl_waiting_for_sample)
+            except Exception as _corr_e:
+                print(f"[ak-pg-watchdog] spiral-correlation check error (non-fatal): {_corr_e}", flush=True)
 
             # v0.9.36: server-health probe. authentik-server-1 goes (unhealthy) when
             # the gunicorn thread pool is saturated with abandoned asgiref threads and
