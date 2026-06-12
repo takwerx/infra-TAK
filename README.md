@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.53-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.53-alpha)**
+**Current release: [v0.9.54-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.54-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.54-alpha — 2026-06-12 — Guard Dog catches slow-disk stalls + CloudTAK update reliability
+
+**Headline: Guard Dog now catches the slow-disk problem that silently takes TAK stacks down — and the CloudTAK "update available" banner stops crying wolf.** On shared/cloud hosting, a disk can pass a normal speed test while individual database writes stall for seconds — exactly the condition that quietly snowballs into an Authentik/login slowdown. Guard Dog now measures small-write commit latency directly (the metric that actually matters for the database), charts it alongside throughput, and warns you when it crosses a safe ceiling. Even better, when slow commits coincide with the database having clients waiting, Guard Dog sends a distinct "provider disk contention — act now" alert that points you at your host *before* an outage instead of after — and its disk report now matches the small-write numbers your provider quotes. **Also in this release:** CloudTAK's "Update Now" no longer shows a stuck "update available" badge after a successful update — CloudTAK's upstream sometimes ships a release whose internal version label lags the release tag, which made the console think an update never took; the console now reads the release correctly and shows the true version. **Upgrade:** applied automatically; the new disk-latency watch rides Guard Dog's existing schedule and the CloudTAK fix takes effect on the next console restart.
+
+Full notes: [v0.9.54-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.54-alpha).
 
 ### v0.9.53-alpha — 2026-06-11 — Self-hosted NetBird VPN module
 
