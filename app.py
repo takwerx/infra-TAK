@@ -13842,6 +13842,12 @@ def _get_cloudtak_version_info():
                         _src_api_ver = ''
                 if _src_api_ver and out['version'] == _src_api_ver:
                     out['update_available'] = False
+                    # Display the tag version (e.g. 13.14.0), NOT the lagging
+                    # container api/package.json string (13.13.0). The box runs
+                    # the latest tag's code — only dfpc's internal version field
+                    # lags (#1479) — so showing the stale number reads as "the
+                    # update didn't take" even though the box is fully current.
+                    out['version'] = _src_tag
         except Exception:
             pass
     return out
