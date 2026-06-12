@@ -391,6 +391,12 @@ CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
 # TAK Video Restreamer (mutually exclusive with local mediamtx — same stream ports)
 TVR_REPO = "https://github.com/raytheonbbn/tak-video-restreamer.git"
 TVR_INSTALL_DIR = os.path.expanduser("~/tak-video-restreamer")
+NETBIRD_INSTALL_DIR = os.path.expanduser("~/netbird")
+# Fleet-vetted NetBird image pins — NEVER ':latest' (boxes deployed days apart must
+# converge to one version; netbirdio pushes new minors every few days). Bump these in an
+# infra-TAK release after T&E. Current values = what ':latest' resolved to on 2026-06-10.
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.39.0"
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
@@ -1082,6 +1088,43 @@ def detect_modules():
         'priority': 13,
         'conflicts': ['mediamtx'],
     }
+
+    # NetBird VPN
+    netbird_enabled = settings.get('netbird_enabled', False)
+    netbird_running = False
+    if netbird_enabled:
+        try:
+            _nb_r = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server'],
+                capture_output=True, text=True, timeout=3)
+            netbird_running = _nb_r.stdout.strip() == 'true'
+        except Exception:
+            pass
+    else:
+        # Self-heal: container is running but flag got cleared
+        try:
+            _nb_r = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server'],
+                capture_output=True, text=True, timeout=3)
+            if _nb_r.stdout.strip() == 'true':
+                _s = load_settings()
+                _s['netbird_enabled'] = True
+                save_settings(_s)
+                netbird_enabled = True
+                netbird_running = True
+        except Exception:
+            pass
+    modules['netbird'] = {
+        'name': 'NetBird VPN',
+        'installed': bool(netbird_enabled),
+        'running': netbird_running,
+        'description': 'Zero-trust WireGuard VPN integrated with Authentik SSO',
+        'icon': '🌐',
+        'icon_url': 'https://netbird.io/favicon.ico',
+        'route': '/netbird',
+        'priority': 14,
+    }
+
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_custom_banner(settings):
@@ -1240,6 +1283,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     wo = modules.get('webodm', {})
     if wo.get('installed'):
         parts.append(link('/webodm', '<img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="WebODM" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block;filter:brightness(0) invert(1)"><span>WebODM</span>', 'WebODM'))
+    nb = modules.get('netbird', {})
+    if nb.get('installed'):
+        parts.append(link('/netbird', '<img src="https://netbird.io/favicon.ico" alt="NetBird" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>NetBird VPN</span>', 'NetBird VPN'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -4308,6 +4354,188 @@ def mediamtx_page():
         editor_version=mtx_vinfo.get('editor_version') or '',
         editor_update_available=mtx_vinfo.get('editor_update_available', False),
         editor_latest=mtx_vinfo.get('editor_latest') or '')
+
+
+# ── NetBird VPN ─────────────────────────────────────────────────────────────
+@app.route('/netbird')
+@login_required
+def netbird_page():
+    settings = load_settings()
+    modules = detect_modules()
+    netbird_status = modules.get('netbird', {})
+    
+    if netbird_status.get('installed') and not _netbird_deploy_status.get('running', False):
+        _netbird_deploy_status.update({'complete': False, 'error': False})
+        
+    netbird_domain = _get_service_domain(settings, 'netbird')
+    netbird_url = f"https://{netbird_domain}" if netbird_domain else ""
+    nb_vinfo = _get_netbird_version_info() if netbird_status.get('installed') else {}
+    
+    return render_template_string(
+        NETBIRD_TEMPLATE,
+        settings=settings,
+        netbird=netbird_status,
+        version=VERSION,
+        netbird_url=netbird_url,
+        netbird_version=nb_vinfo.get('version', ''),
+        netbird_update_available=nb_vinfo.get('update_available', False),
+        netbird_latest=nb_vinfo.get('latest') or '',
+        deploy_log=_netbird_deploy_status.get('log', []),
+        deploy_error=_netbird_deploy_status.get('error', False)
+    )
+
+@app.route('/api/netbird/version')
+@login_required
+def netbird_version_api():
+    """Return NetBird image versions and update availability."""
+    return jsonify(_get_netbird_version_info())
+
+@app.route('/api/netbird/deploy', methods=['POST'])
+@login_required
+def netbird_deploy_api():
+    if _netbird_deploy_status.get('running'):
+        return jsonify({'error': 'Deployment already in progress'}), 409
+    
+    _netbird_deploy_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    settings = load_settings()
+    threading.Thread(target=_run_netbird_deploy, args=(settings,), daemon=True).start()
+    return jsonify({'success': True})
+
+@app.route('/api/netbird/deploy-status')
+@login_required
+def netbird_deploy_status_api():
+    return jsonify({
+        'log': _netbird_deploy_status.get('log', []),
+        'running': _netbird_deploy_status.get('running', False),
+        'complete': _netbird_deploy_status.get('complete', False),
+        'error': _netbird_deploy_status.get('error', False)
+    })
+
+@app.route('/api/netbird/control', methods=['POST'])
+@login_required
+def netbird_control_api():
+    action = (request.json or {}).get('action', '')
+    if action not in ('start', 'stop', 'restart', 'update'):
+        return jsonify({'error': 'Invalid action'}), 400
+    
+    nb_dir = NETBIRD_INSTALL_DIR
+    if not os.path.exists(os.path.join(nb_dir, 'docker-compose.yml')):
+        return jsonify({'error': 'NetBird is not installed'}), 404
+    
+    import subprocess as _sp
+    if action == 'update':
+        pull = _sp.run(['docker', 'compose', 'pull', 'netbird-server', 'dashboard'],
+                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
+        if pull.returncode != 0:
+            err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
+            return jsonify({'success': False, 'error': err}), 500
+        try:
+            _netbird_recreate_containers(nb_dir, lambda _m: None)
+            _netbird_finalize_account_store()
+        except Exception as ex:
+            return jsonify({'success': False, 'error': str(ex)[:300]}), 500
+        time.sleep(2)
+        r_status = _sp.run(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server'],
+                             capture_output=True, text=True)
+        running = r_status.stdout.strip() == 'true'
+        vinfo = _get_netbird_version_info()
+        return jsonify({
+            'success': True,
+            'running': running,
+            'action': action,
+            'pull': 'Pulled latest netbird-server and dashboard images',
+            'version': vinfo.get('version') or '',
+        })
+    if action == 'start':
+        _sp.run(['docker', 'compose', 'start'], capture_output=True, cwd=nb_dir)
+    elif action == 'stop':
+        _sp.run(['docker', 'compose', 'stop'], capture_output=True, cwd=nb_dir)
+    elif action == 'restart':
+        _sp.run(['docker', 'compose', 'restart'], capture_output=True, cwd=nb_dir)
+        
+    time.sleep(2)
+    r_status = _sp.run(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server'], capture_output=True, text=True)
+    running = r_status.stdout.strip() == 'true'
+    return jsonify({'success': True, 'running': running})
+
+@app.route('/api/netbird/stats')
+@login_required
+def netbird_stats_api():
+    settings = load_settings()
+    if not settings.get('netbird_enabled'):
+        return jsonify({'error': 'NetBird is not installed'}), 404
+    stats = _netbird_peer_stats(settings)
+    if stats is None:
+        return jsonify({'ok': False, 'connected': None, 'total': None})
+    return jsonify({'ok': True, **stats})
+
+@app.route('/api/netbird/logs')
+@login_required
+def netbird_logs_api():
+    nb_dir = NETBIRD_INSTALL_DIR
+    if not os.path.exists(os.path.join(nb_dir, 'docker-compose.yml')):
+        return jsonify({'lines': ['NetBird is not deployed.']})
+    
+    import subprocess as _sp
+    r = _sp.run(['docker', 'compose', 'logs', '--tail=100'], capture_output=True, text=True, cwd=nb_dir)
+    lines = (r.stdout or r.stderr or '').split('\n')
+    return jsonify({'lines': lines})
+
+_netbird_uninstall_status = {'running': False, 'complete': False, 'error': False}
+
+@app.route('/api/netbird/uninstall', methods=['POST'])
+@login_required
+def netbird_uninstall_api():
+    data = request.json or {}
+    password = data.get('password', '')
+
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'error': 'Incorrect admin password'}), 403
+
+    if _netbird_uninstall_status.get('running'):
+        return jsonify({'success': True, 'message': 'Uninstall already in progress'})
+
+    # Kick off teardown in background thread so the HTTP response reaches the browser
+    # before Caddy restarts and kills the connection.
+    def _do_uninstall():
+        import subprocess as _sp
+        import shutil as _sh
+        _netbird_uninstall_status.update({'running': True, 'complete': False, 'error': False})
+        try:
+            nb_dir = NETBIRD_INSTALL_DIR
+            # Tear down docker containers
+            if os.path.exists(os.path.join(nb_dir, 'docker-compose.yml')):
+                _sp.run(['docker', 'compose', 'down', '-v'], capture_output=True, cwd=nb_dir)
+            # Remove NetBird directory
+            if os.path.exists(nb_dir):
+                _sh.rmtree(nb_dir)
+            # Remove UFW rule
+            _sp.run(['sudo', 'ufw', 'delete', 'allow', '3478/udp'], capture_output=True)
+            # Update settings
+            settings = load_settings()
+            settings['netbird_enabled'] = False
+            if 'netbird_pat' in settings:
+                del settings['netbird_pat']
+            settings.pop('netbird_admin_email', None)
+            save_settings(settings)
+            # Regenerate caddyfile and reload
+            generate_caddyfile(settings)
+            _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+                     shell=True, capture_output=True, text=True, timeout=90)
+            _netbird_uninstall_status.update({'running': False, 'complete': True, 'error': False})
+        except Exception:
+            _netbird_uninstall_status.update({'running': False, 'complete': True, 'error': True})
+
+    import threading as _th
+    _th.Thread(target=_do_uninstall, daemon=True).start()
+    return jsonify({'success': True, 'message': 'Uninstall started'})
+
+@app.route('/api/netbird/uninstall-status')
+@login_required
+def netbird_uninstall_status_api():
+    return jsonify(_netbird_uninstall_status)
+
 
 # ── Guard Dog (TAK Server hardening / 7 monitors) ─────────────────────────────
 guarddog_deploy_log = []
@@ -10126,6 +10354,7 @@ def caddy_get_domains():
         ('cloudtak_video', 'CloudTAK Video', 'cloudtak', modules.get('cloudtak', {}).get('installed', False)),
         ('mediamtx', 'MediaMTX', 'mediamtx', modules.get('mediamtx', {}).get('installed', False)),
         ('fedhub', 'Federation Hub', 'fedhub', modules.get('fedhub', {}).get('installed', False)),
+        ('netbird', 'NetBird', 'netbird', modules.get('netbird', {}).get('installed', False)),
     ]
     for key, label, mod_key, installed in svc_defs:
         setting_key = f'{key}_domain' if key != 'mediamtx' else 'mediamtx_domain'
@@ -10182,6 +10411,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'fedhub': 'fedhub',
     'cesium_tiles': '3dtiles',
     'webodm': 'webodm',
+    'netbird': 'netbird',
 }
 
 def _get_service_domain(settings, service_key):
@@ -12451,12 +12681,47 @@ def generate_caddyfile(settings=None):
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
 
+    nb_mod = modules.get('netbird', {})
+    if nb_mod.get('installed'):
+        nb_host = sd.get('netbird') or _get_service_domain(settings, 'netbird')
+        lines.append(f"# NetBird VPN")
+        lines.append(f"{nb_host} {{")
+        # Management API and gRPC
+        lines.append(f"    @netbird_mgmt {{")
+        lines.append(f"        path /api* /management.*")
+        lines.append(f"    }}")
+        lines.append(f"    handle @netbird_mgmt {{")
+        lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
+        lines.append(f"    }}")
+        # Signal exchange (gRPC)
+        lines.append(f"    @netbird_signal {{")
+        lines.append(f"        path /signalexchange.*")
+        lines.append(f"    }}")
+        lines.append(f"    handle @netbird_signal {{")
+        lines.append(f"        reverse_proxy h2c://127.0.0.1:10000")
+        lines.append(f"    }}")
+        # Embedded Dex IDP OIDC endpoints + relay WebSocket
+        lines.append(f"    @netbird_idp {{")
+        lines.append(f"        path /oauth2 /oauth2/* /.well-known/* /auth /auth/* /token /keys /callback /userinfo /device /device/* /approval /approval/* /relay")
+        lines.append(f"    }}")
+        lines.append(f"    handle @netbird_idp {{")
+        lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
+        lines.append(f"    }}")
+        # Dashboard UI (catch-all)
+        lines.append(f"    handle {{")
+        lines.append(f"        reverse_proxy 127.0.0.1:8642")
+        lines.append(f"    }}")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'netbird'), nb_host)
+
     # v0.9.51 — Custom certificate (bring-your-own-cert) mode. When ssl_mode == 'custom'
     # the operator has uploaded a full-chain PEM + key on the Caddy page; Caddy must serve
     # THAT cert (no ACME) on every site. We inject a `tls <cert> <key>` directive into each
     # site address block (covers the wildcard case — one cert for all subdomains). Per-site
     # tls disables ACME for that site without needing a global `auto_https off`, so the
     # automatic HTTP→HTTPS redirect on :80 is preserved.
+    # NOTE: this runs LAST so it also injects tls into the NetBird vhost appended above.
     if (settings.get('ssl_mode') or '') == 'custom':
         # Caddy runs unprivileged and can't read .config — deploy a caddy-readable copy
         # and point `tls` at THAT (see _sync_custom_cert_for_caddy).
@@ -13632,6 +13897,95 @@ def _get_tvr_version_info():
     return info
 
 
+_netbird_release_cache = {}
+
+
+def _netbird_version_tuple(ver):
+    """Parse semver-ish NetBird version to comparable tuple."""
+    import re
+    v = (ver or '').strip().lstrip('vV')
+    parts = []
+    for p in v.split('.')[:3]:
+        try:
+            parts.append(int(re.sub(r'[^0-9].*', '', p) or '0'))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _get_netbird_github_latest(repo, use_cache=True):
+    """Latest release tag from netbirdio/netbird or netbirdio/dashboard."""
+    import time as _time
+    import urllib.request as _ur
+    cache_key = repo
+    if use_cache:
+        cached = _netbird_release_cache.get(cache_key)
+        if cached and (_time.time() - cached.get('ts', 0) < 14400):
+            return cached.get('tag')
+    try:
+        req = _ur.Request(
+            f'https://api.github.com/repos/netbirdio/{repo}/releases/latest',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        resp = _ur.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+        tag = (data.get('tag_name') or '').strip()
+        if tag:
+            _netbird_release_cache[cache_key] = {'tag': tag, 'ts': _time.time()}
+            return tag
+    except Exception:
+        pass
+    return _netbird_release_cache.get(cache_key, {}).get('tag')
+
+
+def _netbird_docker_image_version(container_name):
+    """Read org.opencontainers.image.version from a running/stopped container."""
+    try:
+        r = subprocess.run(
+            ['docker', 'inspect', container_name,
+             '--format', '{{index .Config.Labels "org.opencontainers.image.version"}}'],
+            capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            return r.stdout.strip().lstrip('vV')
+    except Exception:
+        pass
+    return ''
+
+
+def _get_netbird_version_info():
+    """Return {version, update_available, latest} for NetBird server + dashboard images."""
+    out = {'version': '', 'update_available': False, 'latest': None}
+    nb_dir = NETBIRD_INSTALL_DIR
+    if not os.path.isfile(os.path.join(nb_dir, 'docker-compose.yml')):
+        return out
+    mgmt_ver = _netbird_docker_image_version('netbird-server')
+    dash_ver = _netbird_docker_image_version('netbird-dashboard')
+    parts = []
+    if mgmt_ver:
+        parts.append(mgmt_ver)
+    if dash_ver:
+        parts.append('dash ' + dash_ver)
+    out['version'] = ' · '.join(parts)
+    mgmt_latest = _get_netbird_github_latest('netbird')
+    dash_latest = _get_netbird_github_latest('dashboard')
+    mgmt_latest_clean = (mgmt_latest or '').lstrip('vV')
+    dash_latest_clean = (dash_latest or '').lstrip('vV')
+    mgmt_behind = bool(mgmt_ver and mgmt_latest_clean
+                       and _netbird_version_tuple(mgmt_latest_clean) > _netbird_version_tuple(mgmt_ver))
+    dash_behind = bool(dash_ver and dash_latest_clean
+                       and _netbird_version_tuple(dash_latest_clean) > _netbird_version_tuple(dash_ver))
+    if mgmt_behind or dash_behind:
+        out['update_available'] = True
+        latest_parts = []
+        if mgmt_behind:
+            latest_parts.append(mgmt_latest_clean)
+        if dash_behind:
+            latest_parts.append('dash ' + dash_latest_clean)
+        out['latest'] = ' · '.join(latest_parts)
+    return out
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards.
 
@@ -13685,6 +14039,8 @@ def get_all_module_versions():
         _set('webodm', _get_webodm_version_info)
     if modules.get('tak_video_restreamer', {}).get('installed'):
         _set('tak_video_restreamer', _get_tvr_version_info)
+    if modules.get('netbird', {}).get('installed'):
+        _set('netbird', _get_netbird_version_info)
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -22034,6 +22390,693 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         return None, None, None, None
 
 
+def _ensure_authentik_netbird_app(settings, plog=None):
+    """Create an OAuth2/OIDC provider + application in Authentik for NetBird UI login.
+    Returns (client_id, client_secret) or (None, None) on failure."""
+    import urllib.request as _urlreq
+    import urllib.error
+    def log(msg):
+        if plog:
+            plog(msg)
+    ak_url = _get_authentik_api_url(settings)
+    token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not token:
+        log('  ✗ No Authentik API token found in .env')
+        return None, None
+    _ak_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    ak_public = _get_authentik_base_url(settings)
+
+    slug = 'netbird'
+    provider_name = 'NetBird'
+
+    try:
+        # Get authorization + invalidation flows (same pattern as Node-RED / TAK Portal)
+        flow_pk, inv_flow_pk = None, None
+        for attempt in range(6):
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                auth_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                flow_pk = next((f['pk'] for f in auth_flows if 'implicit' in f.get('slug', '')), auth_flows[0]['pk'] if auth_flows else None)
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation&ordering=slug', headers=_ak_headers)
+                inv_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                inv_flow_pk = inv_flows[0]['pk'] if inv_flows else None
+            except Exception:
+                pass
+            if flow_pk and inv_flow_pk:
+                break
+            time.sleep(5)
+        if not flow_pk or not inv_flow_pk:
+            log(f'  ✗ Missing flows: auth={flow_pk}, invalidation={inv_flow_pk}')
+            return None, None
+        log('  ✓ Got authorization and invalidation flows')
+
+        # Look up Authentik's signing key (certificate-key pair) for RS256 token signing
+        signing_key_pk = None
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/crypto/certificatekeypairs/?has_key=true&ordering=name&page_size=50', headers=_ak_headers)
+            certs = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            signing_key_pk = next((c['pk'] for c in certs if 'authentik' in (c.get('name') or '').lower() and 'self-signed' in (c.get('name') or '').lower()), None)
+            if not signing_key_pk and certs:
+                signing_key_pk = certs[0]['pk']
+            if signing_key_pk:
+                log('  ✓ Got signing key for RS256 token signing')
+            else:
+                log('  ⚠ No signing key found — tokens will use HS256')
+        except Exception:
+            log('  ⚠ Could not look up signing keys')
+
+        # Look up OAuth2 scope property mappings (openid, email, profile)
+        scope_mapping_pks = []
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
+            mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            wanted_scopes = {'openid', 'email', 'profile'}
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in wanted_scopes]
+            if scope_mapping_pks:
+                log(f'  ✓ Got {len(scope_mapping_pks)} scope mappings (openid/email/profile)')
+            else:
+                log('  ⚠ No scope mappings found')
+        except Exception:
+            log('  ⚠ Could not look up scope mappings')
+
+        # Redirect URIs for Authentik OAuth2 provider (embedded IdP + external connector).
+        # Dashboard uses hash callbacks /#callback (netbird#5933); Authentik connector
+        # uses /oauth2/callback on the NetBird domain. All strict — no regex URIs.
+        netbird_domain = _get_service_domain(settings, 'netbird')
+        nb_base = f'https://{netbird_domain}'
+        redirect_uris_obj = [
+            {'matching_mode': 'strict', 'url': nb_base},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/#callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/#silent-callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/nb-auth'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/nb-silent-auth'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/peers'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/silent-callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/callback'},
+            {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/logout/callback'},
+            {'matching_mode': 'strict', 'url': 'http://localhost:53000/'},
+            {'matching_mode': 'strict', 'url': 'http://localhost:54000/'},
+        ]
+
+        _provider_extras = {}
+        if signing_key_pk:
+            _provider_extras['signing_key'] = signing_key_pk
+        if scope_mapping_pks:
+            _provider_extras['property_mappings'] = scope_mapping_pks
+
+        # Check if provider already exists; if so, update it
+        provider_pk = None
+        client_id, client_secret = '', ''
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=_ak_headers)
+            resp = _urlreq.urlopen(req, timeout=15)
+            existing = json.loads(resp.read().decode())['results']
+            for ex in existing:
+                if ex.get('name') == provider_name:
+                    ex_pk = ex.get('pk')
+                    req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/', headers=_ak_headers)
+                    detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                    if detail.get('client_id') and detail.get('client_secret'):
+                        provider_pk = ex_pk
+                        client_id = detail['client_id']
+                        client_secret = detail['client_secret']
+                        patch_data = {'redirect_uris': redirect_uris_obj, 'client_type': 'confidential'}
+                        patch_data.update(_provider_extras)
+                        try:
+                            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
+                                data=json.dumps(patch_data).encode(),
+                                headers=_ak_headers, method='PATCH')
+                            _urlreq.urlopen(req, timeout=10)
+                        except Exception:
+                            pass
+                        log(f'  ✓ Existing OAuth2 provider updated, client_id={client_id[:8]}...')
+                    else:
+                        try:
+                            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
+                                headers=_ak_headers, method='DELETE')
+                            _urlreq.urlopen(req, timeout=10)
+                        except Exception:
+                            pass
+                    break
+        except Exception:
+            pass
+
+        # Create provider if we don't already have one
+        if not provider_pk:
+            payload = {
+                'name': provider_name,
+                'authorization_flow': flow_pk,
+                'invalidation_flow': inv_flow_pk,
+                'client_type': 'confidential',
+                'redirect_uris': redirect_uris_obj,
+            }
+            payload.update(_provider_extras)
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
+                    data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
+                resp = _urlreq.urlopen(req, timeout=15)
+                p = json.loads(resp.read().decode())
+                provider_pk = p.get('pk')
+                client_id = p.get('client_id', '')
+                client_secret = p.get('client_secret', '')
+                log(f'  ✓ OAuth2 provider created, client_id={client_id[:8]}...')
+            except Exception as e:
+                body = ''
+                try:
+                    body = e.read().decode()[:500]
+                except Exception:
+                    pass
+                log(f'  ✗ OAuth2 provider create failed ({getattr(e, "code", "?")}): {body or str(e)[:200]}')
+
+        if not provider_pk or not client_id:
+            log('  ✗ No OAuth2 provider — cannot continue')
+            return None, None
+
+        # Create application in launcher list pointing to dashboard
+        _app_body = {
+            'name': provider_name,
+            'slug': slug,
+            'provider': provider_pk,
+            'meta_launch_url': f'https://{netbird_domain}',
+        }
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/',
+                data=json.dumps(_app_body).encode(),
+                headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log(f'  ✓ Application created')
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                try:
+                    req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
+                        data=json.dumps({'provider': provider_pk, 'meta_launch_url': f'https://{netbird_domain}'}).encode(),
+                        headers=_ak_headers, method='PATCH')
+                    _urlreq.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                log(f'  ✓ Application already exists (updated)')
+            else:
+                log(f'  ⚠ Application error: {str(e)[:80]}')
+
+        return client_id, client_secret
+
+    except urllib.error.HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode()[:500]
+        except Exception:
+            pass
+        log(f'  ✗ Authentik OAuth setup failed: HTTP {e.code}: {body}')
+        return None, None
+    except Exception as e:
+        log(f'  ✗ Authentik OAuth setup failed: {str(e)[:200]}')
+        return None, None
+
+
+
+_netbird_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+def _netbird_deploy_log(msg, status=None):
+    _netbird_deploy_status['log'].append(msg)
+    if status:
+        _netbird_deploy_status.update(status)
+
+def _netbird_mgmt_ssl_ctx():
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    return ctx
+
+
+def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http://localhost:33073', timeout=15):
+    """HTTP helper for NetBird management API (bootstrap uses loopback before Caddy)."""
+    import urllib.request as _req
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = f'Token {token}'
+    req = _req.Request(f'{base}{path}', method=method, data=data, headers=headers)
+    ctx = _netbird_mgmt_ssl_ctx() if base.startswith('https') else None
+    return _req.urlopen(req, timeout=timeout, context=ctx)
+
+
+def _netbird_peer_stats_from_db(nb_dir=None):
+    """Read peer counts from local management store (same-host, no PAT required)."""
+    import sqlite3
+    nb_dir = nb_dir or NETBIRD_INSTALL_DIR
+    db_path = os.path.join(nb_dir, 'data', 'store.db')
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=3)
+        row = conn.execute(
+            'SELECT COUNT(*), COALESCE(SUM(peer_status_connected), 0) FROM peers'
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {'total': int(row[0]), 'connected': int(row[1])}
+    except Exception:
+        return None
+
+
+def _netbird_peer_stats(settings):
+    """Return connected/total peer counts from management API or local store."""
+    pat = (settings.get('netbird_pat') or '').strip()
+    if pat:
+        try:
+            resp = _netbird_mgmt_request('/api/peers', token=pat, timeout=10)
+            data = json.loads(resp.read().decode())
+            peers = data if isinstance(data, list) else (data.get('items') or data.get('data') or [])
+            total = len(peers)
+            connected = sum(1 for p in peers if p.get('connected'))
+            return {'total': total, 'connected': connected}
+        except Exception:
+            pass
+    return _netbird_peer_stats_from_db()
+
+
+def _netbird_pat_is_valid(pat):
+    if not (pat or '').strip():
+        return False
+    try:
+        _netbird_mgmt_request('/api/users', token=pat.strip(), timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def _netbird_finalize_account_store(plog=None):
+    """Clear onboarding/user-approval gates that hide admin menus (Setup Keys, etc.)."""
+    import sqlite3
+    _log = plog or (lambda m: None)
+    db_path = os.path.join(NETBIRD_INSTALL_DIR, 'data', 'store.db')
+    if not os.path.isfile(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute(
+            'UPDATE account_onboardings SET onboarding_flow_pending=0, signup_form_pending=0'
+        )
+        conn.execute(
+            'UPDATE accounts SET settings_extra_user_approval_required=0'
+        )
+        conn.execute(
+            "UPDATE users SET pending_approval=0 WHERE role IN ('owner', 'admin')"
+        )
+        conn.commit()
+        conn.close()
+        _log('  ✓ Account onboarding/approval gates cleared')
+        return True
+    except Exception as ex:
+        _log(f'  ⚠ Account store finalize: {str(ex)[:120]}')
+        return False
+
+
+def _netbird_admin_credentials(settings):
+    """Initial setup owner mirrors Authentik administrator (akadmin)."""
+    fqdn = (settings.get('fqdn') or '').strip()
+    email = f'akadmin@{fqdn}' if fqdn else 'akadmin@localhost'
+    name = 'akadmin'
+    import secrets as _sec
+    password = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_PASSWORD')
+                or _sec.token_urlsafe(24))
+    return email, name, password
+
+
+def _netbird_wait_instance(plog, timeout_sec=120):
+    """Poll /api/instance until the management server responds."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            resp = _netbird_mgmt_request('/api/instance', timeout=5)
+            return json.loads(resp.read().decode())
+        except Exception:
+            time.sleep(2)
+    return None
+
+
+def _netbird_complete_setup(settings, plog):
+    """Create the NetBird owner (akadmin) via /api/setup and return a PAT.
+    Reuses settings['netbird_pat'] when setup was already completed."""
+    import urllib.error
+
+    instance = _netbird_wait_instance(plog)
+    if not instance:
+        plog('  ✗ Management server did not become ready')
+        return None
+
+    if instance.get('setup_required') is False:
+        pat = settings.get('netbird_pat') or ''
+        if pat and _netbird_pat_is_valid(pat):
+            plog('  ✓ Instance already set up — using stored PAT')
+            return pat
+        if pat:
+            plog('  ⚠ Stored PAT invalid — cleared (Authentik IDP step may need manual PAT)')
+            settings.pop('netbird_pat', None)
+            save_settings(settings)
+        plog('  ⚠ Instance set up but no valid PAT — IDP registration may fail')
+        return '__already_done__'
+
+    email, name, password = _netbird_admin_credentials(settings)
+    plog(f'  Running initial setup for {email} (name={name})...')
+    body = json.dumps({
+        'email': email,
+        'name': name,
+        'password': password,
+        'create_pat': True,
+        'pat_expire_in': 365,
+    }).encode()
+
+    try:
+        resp = _netbird_mgmt_request('/api/setup', method='POST', data=body, timeout=30)
+        result = json.loads(resp.read().decode())
+        pat = result.get('personal_access_token') or ''
+        if pat:
+            settings['netbird_pat'] = pat
+            settings['netbird_admin_email'] = email
+            save_settings(settings)
+            plog(f'  ✓ Setup complete — PAT saved (user={email})')
+            return pat
+        plog(f'  ⚠ Setup returned 200 without PAT (keys: {list(result.keys())})')
+        return None
+    except urllib.error.HTTPError as e:
+        if e.code == 412:
+            pat = settings.get('netbird_pat') or ''
+            plog('  ✓ Setup already completed (HTTP 412)')
+            return pat or '__already_done__'
+        err = ''
+        try:
+            err = e.read().decode()[:300]
+        except Exception:
+            pass
+        plog(f'  ✗ /api/setup failed HTTP {e.code}: {err}')
+        return None
+
+
+def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
+    """Register Authentik as external OIDC IDP (Management Setup — embedded dashboard)."""
+    import urllib.error
+    if not pat or pat == '__already_done__':
+        plog('  ⚠ No PAT available — skip IDP API registration')
+        return False
+
+    payload = json.dumps({
+        'name': 'Authentik',
+        'type': 'oidc',
+        'issuer': authentik_issuer,
+        'client_id': client_id,
+        'client_secret': client_secret or '',
+        'user_id_claim': 'sub',
+    }).encode()
+
+    idp_redirect = None
+    try:
+        resp = _netbird_mgmt_request('/api/identity-providers', method='POST', data=payload, token=pat, timeout=30)
+        body = json.loads(resp.read().decode())
+        idp_redirect = body.get('redirect_uri') or body.get('redirectURL') or body.get('redirect_url')
+        plog('  ✓ Authentik registered as external OIDC IDP')
+    except urllib.error.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode()[:300]
+        except Exception:
+            pass
+        if e.code in (400, 409, 422):
+            plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
+            try:
+                resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
+                idps = json.loads(resp.read().decode())
+                items = idps if isinstance(idps, list) else idps.get('items') or idps.get('data') or []
+                for item in items:
+                    if 'authentik' in (item.get('name') or '').lower():
+                        idp_redirect = item.get('redirect_uri') or item.get('redirectURL')
+                        break
+            except Exception:
+                pass
+        else:
+            plog(f'  ⚠ IDP registration failed HTTP {e.code}: {err_body[:200]}')
+            return False
+
+    netbird_domain = _get_service_domain(settings, 'netbird')
+    if not idp_redirect:
+        idp_redirect = f'https://{netbird_domain}/oauth2/callback'
+    plog(f'  IDP callback URI: {idp_redirect}')
+    _netbird_patch_authentik_idp_redirect(settings, idp_redirect, plog=plog)
+    return True
+
+
+def _netbird_patch_authentik_idp_redirect(settings, callback_url, plog=None):
+    """Ensure Authentik NetBird provider allows the embedded-IdP connector callback URL."""
+    import urllib.request as _urlreq
+    import urllib.error
+    _log = plog or (lambda m: None)
+    ak_url = _get_authentik_api_url(settings)
+    token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not token or not callback_url:
+        return
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    netbird_domain = _get_service_domain(settings, 'netbird')
+    nb_base = f'https://{netbird_domain}'
+    wanted = [
+        {'matching_mode': 'strict', 'url': callback_url},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/callback'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/logout/callback'},
+        {'matching_mode': 'strict', 'url': nb_base},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/#callback'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/#silent-callback'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/nb-auth'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/nb-silent-auth'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/peers'},
+        {'matching_mode': 'strict', 'url': f'{nb_base}/silent-callback'},
+    ]
+    seen = set()
+    redirect_uris_obj = []
+    for entry in wanted:
+        u = entry['url']
+        if u not in seen:
+            seen.add(u)
+            redirect_uris_obj.append(entry)
+    try:
+        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search=NetBird', headers=headers)
+        existing = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+        for ex in existing:
+            if ex.get('name') != 'NetBird':
+                continue
+            pk = ex.get('pk')
+            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{pk}/',
+                data=json.dumps({'redirect_uris': redirect_uris_obj}).encode(),
+                headers=headers, method='PATCH')
+            _urlreq.urlopen(req, timeout=10)
+            _log(f'  ✓ Authentik redirect URIs updated (incl. {callback_url})')
+            return
+    except Exception as ex:
+        _log(f'  ⚠ Authentik redirect URI patch: {str(ex)[:120]}')
+
+
+def _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True):
+    """Write config.yaml and docker-compose.yml for embedded-IdP NetBird.
+
+    Dashboard auth stays on https://<netbird>/oauth2 (same-origin token exchange).
+    Authentik is added as an external login provider after bootstrap via the API.
+    Hash-based OAuth callbacks (/#callback) are required by current dashboard images.
+    """
+    config_path = os.path.join(nb_dir, 'config.yaml')
+    compose_path = os.path.join(nb_dir, 'docker-compose.yml')
+    pat_env = 'true' if setup_pat_enabled else 'false'
+    pat_block = f"""    environment:
+      - NB_SETUP_PAT_ENABLED={pat_env}
+""" if setup_pat_enabled else ''
+
+    config_content = f"""# NetBird self-hosted (embedded IdP + Authentik external login)
+server:
+  listenAddress: ":443"
+  exposedAddress: "https://{netbird_domain}:443"
+  metricsPort: 9090
+  healthcheckAddress: ":9000"
+  auth:
+    issuer: "https://{netbird_domain}/oauth2"
+    audience: "netbird-dashboard"
+    userIDClaim: "sub"
+    dashboardRedirectURIs:
+      - "https://{netbird_domain}"
+      - "https://{netbird_domain}/"
+      - "https://{netbird_domain}/#callback"
+      - "https://{netbird_domain}/#silent-callback"
+      - "https://{netbird_domain}/nb-auth"
+      - "https://{netbird_domain}/nb-silent-auth"
+      - "https://{netbird_domain}/peers"
+      - "https://{netbird_domain}/silent-callback"
+    dashboardPostLogoutRedirectURIs:
+      - "https://{netbird_domain}"
+      - "https://{netbird_domain}/"
+  dataDir: "/var/lib/netbird/"
+  authSecret: "{auth_secret}"
+"""
+
+    compose_content = f"""services:
+  netbird-server:
+    image: {NETBIRD_SERVER_IMAGE}
+    container_name: netbird-server
+    restart: unless-stopped
+    ports:
+      - "33073:443"
+      - "10000:10000"
+      - "3478:3478/udp"
+    volumes:
+      - ./config.yaml:/etc/netbird/config.yaml
+      - ./data:/var/lib/netbird
+{pat_block}    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  dashboard:
+    image: {NETBIRD_DASHBOARD_IMAGE}
+    container_name: netbird-dashboard
+    restart: unless-stopped
+    ports:
+      - "8642:80"
+    environment:
+      - NETBIRD_MGMT_API_ENDPOINT=https://{netbird_domain}
+      - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://{netbird_domain}
+      - AUTH_AUDIENCE=netbird-dashboard
+      - AUTH_CLIENT_ID=netbird-dashboard
+      - AUTH_CLIENT_SECRET=
+      - AUTH_AUTHORITY=https://{netbird_domain}/oauth2
+      - USE_AUTH0=false
+      - AUTH_SUPPORTED_SCOPES=openid profile email offline_access
+      - AUTH_REDIRECT_URI=/#callback
+      - AUTH_SILENT_REDIRECT_URI=/#silent-callback
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+"""
+
+    with open(config_path, 'w') as f:
+        f.write(config_content)
+    with open(compose_path, 'w') as f:
+        f.write(compose_content)
+
+
+def _netbird_read_auth_secret(nb_dir):
+    """Preserve authSecret when rewriting compose files on redeploy."""
+    config_path = os.path.join(nb_dir, 'config.yaml')
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path) as f:
+            for line in f:
+                if line.strip().startswith('authSecret:'):
+                    return line.split(':', 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return None
+
+
+def _netbird_recreate_containers(nb_dir, plog):
+    """Recreate containers so dashboard picks up env var changes."""
+    import subprocess as _sp
+    r = _sp.run(['docker', 'compose', 'up', '-d', '--force-recreate'],
+                capture_output=True, text=True, cwd=nb_dir, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f'docker compose up --force-recreate failed: {r.stderr[:300]}')
+    plog('  ✓ Containers recreated')
+
+
+def _run_netbird_deploy(settings):
+    import subprocess as _sp
+    import secrets as _sec
+    plog = _netbird_deploy_log
+    nb_dir = NETBIRD_INSTALL_DIR
+
+    try:
+        plog('━━━ Step 1/6: Checking Docker ━━━')
+        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
+        if r.returncode != 0:
+            plog('  Docker not found — installing...')
+            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+                         shell=True, capture_output=True, text=True, timeout=300)
+            if r2.returncode != 0:
+                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
+            plog('✓ Docker installed')
+        else:
+            plog(f'✓ Docker present: {r.stdout.strip()}')
+
+        plog('')
+        plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
+        client_id, client_secret = _ensure_authentik_netbird_app(settings, plog=plog)
+        if not client_id or not client_secret:
+            raise RuntimeError('Authentik OIDC provisioning failed — ensure Authentik is running.')
+        plog(f'✓ Authentik provider ready (client_id={client_id[:12]}...)')
+
+        plog('')
+        plog('━━━ Step 3/6: Deploying NetBird Containers (bootstrap) ━━━')
+        os.makedirs(nb_dir, exist_ok=True)
+        os.makedirs(os.path.join(nb_dir, 'data'), exist_ok=True)
+
+        netbird_domain = _get_service_domain(settings, 'netbird')
+        authentik_domain = _get_service_domain(settings, 'authentik') or settings.get('fqdn', '').strip()
+        authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
+        auth_secret = _netbird_read_auth_secret(nb_dir) or _sec.token_hex(32)
+
+        setup_pat = not settings.get('netbird_pat')
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat)
+        plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
+
+        plog('  Pulling images...')
+        _sp.run(['docker', 'compose', 'pull'], capture_output=True, text=True, cwd=nb_dir)
+        r = _sp.run(['docker', 'compose', 'up', '-d'], capture_output=True, text=True, cwd=nb_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        plog('✓ Containers running')
+
+        plog('')
+        plog('━━━ Step 4/6: Initial Setup (akadmin) ━━━')
+        pat = _netbird_complete_setup(settings, plog)
+
+        plog('')
+        plog('━━━ Step 5/6: Authentik External IDP + Finalize Config ━━━')
+        auth_secret = _netbird_read_auth_secret(nb_dir) or auth_secret
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=False)
+        plog('  ✓ Embedded IdP config (AUTH_REDIRECT_URI=/#callback)')
+        pat = settings.get('netbird_pat') or (pat if pat not in (None, '__already_done__') else '')
+        if pat:
+            _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog)
+        else:
+            plog('  ⚠ No PAT — register Authentik manually in NetBird Settings → Identity Providers')
+        plog('  Recreating containers to apply config...')
+        _netbird_recreate_containers(nb_dir, plog)
+        _netbird_finalize_account_store(plog)
+        plog('✓ Click Authentik on the NetBird login page to sign in')
+
+        plog('')
+        plog('━━━ Step 6/6: Firewall & Reverse Proxy ━━━')
+        _sp.run(['sudo', 'ufw', 'allow', '3478/udp'], capture_output=True)
+        settings['netbird_enabled'] = True
+        save_settings(settings)
+        generate_caddyfile(settings)
+        _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        plog('✓ Caddy routes active — STUN 3478/udp allowed')
+
+        fqdn = settings.get('fqdn', 'localhost')
+        plog('')
+        plog('🎉 NetBird deployed successfully!')
+        plog(f'Dashboard: https://{netbird_domain}')
+        plog(f'Login: Authentik button on https://{netbird_domain} (embedded IdP + external SSO)')
+        plog(f'Bootstrap owner: akadmin@{fqdn}')
+        _netbird_deploy_status.update({'running': False, 'complete': True, 'error': False})
+
+    except Exception as e:
+        plog(f'✗ Deployment failed: {str(e)}')
+        _netbird_deploy_status.update({'running': False, 'error': True})
+
+
 def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
     """Set cookie_domain on all proxy providers so session is shared across subdomains (avoids stream. redirect loop)."""
     if not fqdn:
@@ -26069,6 +27112,480 @@ document.addEventListener('DOMContentLoaded',function(){
   }
 });
 async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'});if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='\u2014';document.getElementById('fedhub-remote-ram-value').textContent='\u2014';document.getElementById('fedhub-remote-disk-value').textContent='\u2014';document.getElementById('fedhub-remote-uptime-value').textContent='\u2014';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'\u2014')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'\u2014')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'\u2014')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'\u2014';}catch(e){}}
+</script>
+</body></html>
+'''
+
+
+NETBIRD_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>NetBird VPN — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700;display:flex;align-items:center;gap:12px}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
+.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all 0.2s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:0.9}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn-danger{background:var(--red);color:#fff}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-update{border-color:rgba(6,182,212,0.3)}.control-btn.btn-update:hover{background:rgba(6,182,212,0.08);color:var(--cyan)}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.terminal-block{background:#06090f;border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);position:relative;margin-top:8px}
+.terminal-copy{position:absolute;top:8px;right:8px;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:4px 8px;cursor:pointer;font-size:10px;font-family:sans-serif}
+.terminal-copy:hover{color:#fff;background:rgba(255,255,255,.1)}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1>
+      <img src="https://netbird.io/favicon.ico" alt="" style="height:32px;width:auto;object-fit:contain">
+      <span>NetBird VPN</span>{% if netbird_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ netbird_version }}</span>{% endif %}{% if netbird_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:4px">{{ netbird_latest }} available</span>{% endif %}
+    </h1>
+    <p>Zero-trust overlay WireGuard VPN with Authentik Identity Management and automatic NAT traversal</p>
+  </div>
+
+  {% if netbird.running %}
+    <div class="status-banner running"><div class="dot"></div>NetBird is running{% if netbird_version %} · {{ netbird_version }}{% endif %}{% if netbird_update_available and netbird_latest %} · <span style="color:var(--cyan)">{{ netbird_latest }} available</span>{% endif %}</div>
+  {% elif netbird.installed %}
+    <div class="status-banner stopped"><div class="dot"></div>NetBird is installed but stopped{% if netbird_version %} · {{ netbird_version }}{% endif %}{% if netbird_update_available and netbird_latest %} · <span style="color:var(--cyan)">{{ netbird_latest }} available</span>{% endif %}</div>
+  {% else %}
+    <div class="status-banner not-installed"><div class="dot"></div>NetBird is not installed</div>
+  {% endif %}
+
+  {% if netbird.installed %}
+    <div class="section-title">Controls</div>
+    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+      <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        {% if netbird.running %}
+          <button class="control-btn" onclick="controlNetbird('restart')">↻ Restart</button>
+          <button class="control-btn" onclick="loadNetbirdLogs()">📋 Container Logs</button>
+          <button class="control-btn btn-update" id="netbird-update-btn" onclick="netbirdUpdate()"{% if netbird_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)" title="Update available: {{ netbird_latest }}">●</span>{% endif %}</button>
+          <button class="control-btn btn-stop" onclick="controlNetbird('stop')">■ Stop</button>
+          <button class="control-btn btn-remove" onclick="document.getElementById('uninstall-netbird-modal').classList.add('open')">🗑 Remove</button>
+        {% else %}
+          <button class="control-btn btn-start" onclick="controlNetbird('start')">▶ Start</button>
+          <button class="control-btn" onclick="loadNetbirdLogs()">📋 Container Logs</button>
+          <button class="control-btn btn-update" id="netbird-update-btn" onclick="netbirdUpdate()"{% if netbird_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)" title="Update available: {{ netbird_latest }}">●</span>{% endif %}</button>
+          <button class="control-btn btn-remove" onclick="document.getElementById('uninstall-netbird-modal').classList.add('open')">🗑 Remove</button>
+        {% endif %}
+      </div>
+      <div id="netbird-update-status" style="display:none;margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+      <div id="netbird-control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Integration & Access Details</div>
+      <div class="info-grid">
+        <div class="info-item">
+          <div class="info-label">Dashboard (GUI)</div>
+          <div class="info-value">
+            <a href="{{ netbird_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">{{ netbird_url }} &#8599;</a>
+          </div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Connected Peers</div>
+          <div class="info-value" id="netbird-peer-count" style="color:var(--text-secondary)">Loading…</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Setup Keys (headless peers)</div>
+          <div class="info-value">
+            <a href="{{ netbird_url }}/settings?tab=setup-keys" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Settings → Setup Keys &#8599;</a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="border-color:rgba(16,185,129,.2)">
+      <div class="card-title" style="color:var(--green)">How to Connect Peer Clients</div>
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">
+        To add servers, operators, or mobile devices to your secure overlay network:
+      </p>
+
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Servers / headless Linux (setup key):</h4>
+      <p style="font-size:13px;color:var(--text-dim);line-height:1.5;margin-top:4px">
+        1. In the NetBird dashboard open <strong>Settings → Setup Keys</strong> (<a href="{{ netbird_url }}/settings?tab=setup-keys" target="_blank" rel="noopener" style="color:var(--cyan)">direct link</a>) and click <strong>Create Key</strong>.<br>
+        2. Copy the key, then on the server run:<br>
+        <code style="color:var(--cyan);font-family:'JetBrains Mono'">sudo netbird up --management-url {{ netbird_url }} --setup-key &lt;KEY&gt;</code>
+      </p>
+
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Linux Terminal Setup (interactive SSO):</h4>
+      <div class="terminal-block">
+        <button class="terminal-copy" onclick="copyText('linux-install-cmd')">Copy</button>
+        <span id="linux-install-cmd">curl -fsSL https://pkgs.netbird.io/install.sh | sh
+sudo netbird up --management-url {{ netbird_url }}</span>
+      </div>
+
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Desktop (macOS / Windows):</h4>
+      <p style="font-size:13px;color:var(--text-dim);line-height:1.5;margin-top:4px">
+        1. Download the desktop client from <a href="https://netbird.io/download" target="_blank" rel="noopener" style="color:var(--cyan)">netbird.io/download</a>.<br>
+        2. Open Preferences / Settings.<br>
+        3. Set the <strong>Management URL</strong> to: <code style="color:var(--cyan);font-family:'JetBrains Mono'">{{ netbird_url }}</code><br>
+        4. Click <strong>Connect</strong>. It will open Authentik in your browser. Log in, and the device will register.
+      </p>
+    </div>
+
+    <div class="card" id="netbird-logs-card" style="display:none">
+      <div class="card-title">Docker Container Logs</div>
+      <div class="log-box" id="netbird-container-logs">Loading logs...</div>
+    </div>
+
+  {% else %}
+    <!-- Not Installed / Setup view -->
+    <div class="card">
+      <div class="card-title">Install NetBird VPN Module</div>
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px">
+        Deploy a self-hosted NetBird VPN orchestrator locally. NetBird integrates zero-trust connection brokers and WireGuard meshes with Authentik OIDC Single Sign-On (SSO) automatically.
+      </p>
+      
+      <div style="background:rgba(59,130,246,.05);border:1px solid rgba(59,130,246,.2);padding:14px 18px;border-radius:8px;margin-bottom:20px">
+        <h4 style="font-size:13px;font-weight:600;color:var(--accent);margin-bottom:6px">Deployment Blueprint</h4>
+        <ul style="font-size:12px;color:var(--text-dim);line-height:1.5;padding-left:18px">
+          <li>Registers a dedicated NetBird Client Application and OIDC OAuth2 Provider in Authentik.</li>
+          <li>Generates a secure JSON Web Token keypair (RS256) for authentication handshake.</li>
+          <li>Sets up directories and configuration files under <code style="color:var(--cyan)">~/netbird</code>.</li>
+          <li>Launches `netbird-server` (combined controller) and Nginx-based `dashboard` container.</li>
+          <li>Updates Caddy reverse-proxy rules to terminate SSL/TLS at `netbird.{{ settings.fqdn or 'localhost' }}`.</li>
+        </ul>
+      </div>
+
+      <div id="deploy-actions">
+        <button class="btn btn-primary" onclick="startNetbirdDeploy()">🚀 Deploy NetBird Localhost</button>
+      </div>
+
+      <div id="netbird-install-progress" style="display:none;margin-top:20px">
+        <div class="section-title">Deployment Console</div>
+        <div class="log-box" id="netbird-deploy-logs" style="height:250px">Preparing to deploy...</div>
+      </div>
+    </div>
+  {% endif %}
+</div>
+
+<!-- Uninstall Password Modal -->
+<div class="modal-overlay" id="uninstall-netbird-modal">
+  <div class="modal">
+    <h3>Uninstall NetBird</h3>
+    <p>Are you sure you want to stop NetBird, remove its Docker containers, delete volumes/configurations under ~/netbird, and remove its domain endpoint? This action is permanent.</p>
+    <div class="form-group" style="margin-bottom:16px">
+      <label class="form-label">Admin Password</label>
+      <input type="password" id="uninstall-admin-password" class="form-input" placeholder="Enter administrative password">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="document.getElementById('uninstall-netbird-modal').classList.remove('open')">Cancel</button>
+      <button class="btn btn-danger" onclick="confirmUninstallNetbird()">Uninstall NetBird</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let logPoller = null;
+
+function copyText(elemId) {
+  const text = document.getElementById(elemId).innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('#' + elemId + ' ~ .terminal-copy') || event.target;
+    const oldText = btn.innerText;
+    btn.innerText = 'Copied!';
+    setTimeout(() => { btn.innerText = oldText; }, 1500);
+  });
+}
+
+function startNetbirdDeploy() {
+  document.getElementById('deploy-actions').style.display = 'none';
+  document.getElementById('netbird-install-progress').style.display = 'block';
+  const logBox = document.getElementById('netbird-deploy-logs');
+  logBox.textContent = 'Triggering background deployment agent...';
+
+  fetch('/api/netbird/deploy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin'
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.error) {
+      logBox.textContent += '\\nError triggering: ' + data.error;
+      document.getElementById('deploy-actions').style.display = 'block';
+      return;
+    }
+    // Poll logs
+    pollDeployLogs();
+  })
+  .catch(err => {
+    logBox.textContent += '\\nConnection error: ' + err;
+    document.getElementById('deploy-actions').style.display = 'block';
+  });
+}
+
+function pollDeployLogs() {
+  if (logPoller) clearInterval(logPoller);
+  const logBox = document.getElementById('netbird-deploy-logs');
+
+  logPoller = setInterval(() => {
+    fetch('/api/netbird/deploy-status', { credentials: 'same-origin' })
+    .then(res => res.json())
+    .then(status => {
+      logBox.textContent = status.log.join('\\n');
+      logBox.scrollTop = logBox.scrollHeight;
+
+      if (!status.running) {
+        clearInterval(logPoller);
+        if (status.complete && !status.error) {
+          logBox.textContent += '\\n\\n━━━ SUCCESS ━━━\\nNetBird deployed successfully. Reloading page in 3 seconds...';
+          setTimeout(() => { window.location.reload(); }, 3000);
+        } else {
+          logBox.textContent += '\\n\\n━━━ DEPLOYMENT FAILED ━━━\\nPlease review the console logs above.';
+          document.getElementById('deploy-actions').style.display = 'block';
+        }
+      }
+    })
+    .catch(err => {
+      console.error('Error polling deploy logs:', err);
+    });
+  }, 1000);
+}
+
+function controlNetbird(action) {
+  const statusDiv = document.getElementById('netbird-control-status');
+  statusDiv.textContent = 'Running container command: ' + action + '...';
+  
+  fetch('/api/netbird/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: action }),
+    credentials: 'same-origin'
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.error) {
+      statusDiv.textContent = 'Command failed: ' + data.error;
+      statusDiv.style.color = 'var(--red)';
+    } else {
+      statusDiv.textContent = 'Action completed successfully. Status: ' + (data.running ? 'Running' : 'Stopped');
+      statusDiv.style.color = data.running ? 'var(--green)' : 'var(--yellow)';
+      setTimeout(() => { window.location.reload(); }, 2000);
+    }
+  })
+  .catch(err => {
+    statusDiv.textContent = 'Error: ' + err;
+    statusDiv.style.color = 'var(--red)';
+  });
+}
+
+async function netbirdUpdate() {
+  const btn = document.getElementById('netbird-update-btn');
+  const statusDiv = document.getElementById('netbird-update-status');
+  const controlDiv = document.getElementById('netbird-control-status');
+  if (!btn || !statusDiv) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px"></span>Updating...';
+  statusDiv.style.display = 'block';
+  statusDiv.style.color = 'var(--text-secondary)';
+  statusDiv.textContent = 'Pulling latest netbird-server and dashboard images...';
+  if (controlDiv) controlDiv.textContent = '';
+  document.querySelectorAll('.control-btn').forEach(function(b) {
+    if (b !== btn) { b.disabled = true; b.style.opacity = '0.5'; }
+  });
+  try {
+    const res = await fetch('/api/netbird/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'update' }),
+      credentials: 'same-origin'
+    });
+    let data = {};
+    try { data = res.ok ? await res.json() : await res.json(); } catch (_) {}
+    if (!res.ok || !data.success) {
+      statusDiv.style.color = 'var(--red)';
+      statusDiv.textContent = '✗ ' + ((data.error || 'Update failed').slice(0, 120));
+    } else {
+      statusDiv.style.color = 'var(--green)';
+      statusDiv.textContent = '✓ Updated' + (data.pull ? ' — ' + data.pull : '') + (data.version ? ' (' + data.version + ')' : '');
+      setTimeout(function() { window.location.reload(); }, 1500);
+    }
+  } catch (err) {
+    statusDiv.style.color = 'var(--red)';
+    statusDiv.textContent = '✗ Update failed — ' + err;
+  }
+  btn.disabled = false;
+  btn.innerHTML = '⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)">●</span>{% endif %}';
+  document.querySelectorAll('.control-btn').forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
+}
+
+function loadNetbirdLogs() {
+  const logsCard = document.getElementById('netbird-logs-card');
+  const logBox = document.getElementById('netbird-container-logs');
+  
+  logsCard.style.display = 'block';
+  logBox.textContent = 'Loading logs from compose agent...';
+  
+  fetch('/api/netbird/logs', { credentials: 'same-origin' })
+  .then(res => res.json())
+  .then(data => {
+    logBox.textContent = data.lines.join('\\n');
+    logBox.scrollTop = logBox.scrollHeight;
+  })
+  .catch(err => {
+    logBox.textContent = 'Error loading logs: ' + err;
+  });
+}
+
+function loadNetbirdStats() {
+  const el = document.getElementById('netbird-peer-count');
+  if (!el) return;
+  fetch('/api/netbird/stats', { credentials: 'same-origin' })
+  .then(res => res.json())
+  .then(data => {
+    if (data.ok && data.connected != null) {
+      el.textContent = data.connected + ' of ' + data.total;
+      el.style.color = data.connected > 0 ? 'var(--green)' : 'var(--text-secondary)';
+    } else {
+      el.textContent = 'Unavailable';
+      el.style.color = 'var(--text-dim)';
+    }
+  })
+  .catch(() => {
+    el.textContent = 'Unavailable';
+    el.style.color = 'var(--text-dim)';
+  });
+}
+
+if (document.getElementById('netbird-peer-count')) {
+  loadNetbirdStats();
+  setInterval(loadNetbirdStats, 30000);
+}
+
+function confirmUninstallNetbird() {
+  const password = document.getElementById('uninstall-admin-password').value;
+  if (!password) {
+    alert('Please enter your administrative password.');
+    return;
+  }
+  
+  const modal = document.getElementById('uninstall-netbird-modal');
+  modal.classList.remove('open');
+
+  // Create full-screen progress overlay
+  let overlay = document.getElementById('netbird-uninstall-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'netbird-uninstall-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(8,11,20,0.92);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)';
+    overlay.innerHTML = `
+      <div style="text-align:center;max-width:420px;padding:40px">
+        <div id="uninstall-spinner" style="width:56px;height:56px;border:4px solid rgba(255,255,255,0.1);border-top-color:var(--cyan);border-radius:50%;margin:0 auto 24px;animation:spin 0.8s linear infinite"></div>
+        <div id="uninstall-check" style="display:none;width:56px;height:56px;border-radius:50%;background:var(--green);margin:0 auto 24px;line-height:56px;font-size:28px;color:#fff">✓</div>
+        <h3 id="uninstall-title" style="font-size:18px;font-weight:600;color:var(--text-primary);margin-bottom:8px">Removing NetBird…</h3>
+        <p id="uninstall-detail" style="font-size:13px;color:var(--text-dim);line-height:1.5">Stopping containers, cleaning up files, and updating proxy routes. This may take a moment.</p>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+  } else {
+    overlay.style.display = 'flex';
+    document.getElementById('uninstall-spinner').style.display = 'block';
+    document.getElementById('uninstall-check').style.display = 'none';
+    document.getElementById('uninstall-title').textContent = 'Removing NetBird…';
+    document.getElementById('uninstall-detail').textContent = 'Stopping containers, cleaning up files, and updating proxy routes. This may take a moment.';
+  }
+  
+  fetch('/api/netbird/uninstall', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: password }),
+    credentials: 'same-origin'
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.error) {
+      overlay.style.display = 'none';
+      alert('Failed to uninstall: ' + data.error);
+      return;
+    }
+    // Poll for completion
+    function pollStatus() {
+      fetch('/api/netbird/uninstall-status', { credentials: 'same-origin' })
+        .then(r => r.json())
+        .then(st => {
+          if (st.complete) {
+            document.getElementById('uninstall-spinner').style.display = 'none';
+            document.getElementById('uninstall-check').style.display = 'block';
+            if (st.error) {
+              document.getElementById('uninstall-title').textContent = 'Uninstall completed with errors';
+              document.getElementById('uninstall-detail').textContent = 'NetBird was removed but some cleanup steps may have failed. Redirecting…';
+            } else {
+              document.getElementById('uninstall-title').textContent = 'NetBird Removed';
+              document.getElementById('uninstall-detail').textContent = 'All containers and configuration have been cleaned up. Redirecting…';
+            }
+            setTimeout(() => { window.location.href = '/marketplace'; }, 2000);
+          } else {
+            setTimeout(pollStatus, 1500);
+          }
+        })
+        .catch(() => {
+          // Server may be restarting Caddy — retry
+          setTimeout(pollStatus, 2000);
+        });
+    }
+    setTimeout(pollStatus, 1500);
+  })
+  .catch(() => {
+    // Connection may have been cut by Caddy reload — still poll
+    function retryPoll() {
+      fetch('/api/netbird/uninstall-status', { credentials: 'same-origin' })
+        .then(r => r.json())
+        .then(st => {
+          if (st.complete) {
+            document.getElementById('uninstall-spinner').style.display = 'none';
+            document.getElementById('uninstall-check').style.display = 'block';
+            document.getElementById('uninstall-title').textContent = st.error ? 'Uninstall completed with errors' : 'NetBird Removed';
+            document.getElementById('uninstall-detail').textContent = 'Redirecting to marketplace…';
+            setTimeout(() => { window.location.href = '/marketplace'; }, 2000);
+          } else {
+            setTimeout(retryPoll, 2000);
+          }
+        })
+        .catch(() => setTimeout(retryPoll, 2500));
+    }
+    setTimeout(retryPoll, 3000);
+  });
+}
 </script>
 </body></html>
 '''
@@ -49829,7 +51346,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
@@ -50983,6 +52500,7 @@ fetchLogs();
 </body></html>'''
 
 
+
 # === Cesium 3D Tiles Template ===
 CESIUM_TILES_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cesium 3D Tiles — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -51430,7 +52948,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card{% if mod.get('_conflict_with') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if mod.get('_conflict_with') %}
