@@ -23065,6 +23065,21 @@ def _run_netbird_deploy(settings):
             _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog)
         else:
             plog('  ⚠ No PAT — register Authentik manually in NetBird Settings → Identity Providers')
+
+        # Lock VPN access to operators (review #4): bind the NetBird Authentik app to
+        # the "authentik Admins" policy, exactly like the console / Node-RED. Without
+        # this, ANY authenticated Authentik user could sign in and join the overlay.
+        try:
+            _ak_url = _get_authentik_api_url(settings)
+            _ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                         or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+            if _ak_token:
+                _ensure_app_access_policies(_ak_url, {'Authorization': f'Bearer {_ak_token}',
+                                                      'Content-Type': 'application/json'}, plog)
+                plog('  ✓ VPN access restricted to authentik Admins')
+        except Exception as _e:
+            plog(f'  ⚠ Access policy binding skipped: {str(_e)[:120]}')
+
         plog('  Recreating containers to apply config...')
         _netbird_recreate_containers(nb_dir, plog)
         _netbird_finalize_account_store(plog)
@@ -23562,7 +23577,7 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
             _log(f"  ✓ Policy exists: {policy_name}")
 
         # 3) Admin-only apps: bind the admin policy (infra-TAK, Node-RED). LDAP must be open to all authenticated users (QR registration, device bind). TAK Portal and MediaMTX: no binding = all authenticated users.
-        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red']
+        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird']
         user_visible_slugs = ['mediamtx', 'stream', 'tak-portal', 'ldap']  # no policy = visible to all authenticated users (LDAP needed for QR registration)
 
         all_apps = _api_get('core/applications/?page_size=100')['results']
