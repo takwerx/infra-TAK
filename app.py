@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.54-alpha"
+VERSION = "0.9.55-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -1242,6 +1242,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
+    parts.append(link('/hardening', '<span class="nav-icon material-symbols-outlined">verified_user</span>Harden This Box'))
     if os.path.exists('/etc/fail2ban'):
         parts.append(link('/fail2ban', f'<img src="{html.escape(FAIL2BAN_LOGO_URL)}" alt="Fail2ban" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Fail2ban</span>', 'Fail2ban'))
     gd = modules.get('guarddog', {})
@@ -2072,6 +2073,227 @@ def console_page():
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
+
+# ============================================================================
+# "Harden This Box" — Compliance Hardening Module  (v0.9.55, smell-test core)
+# ----------------------------------------------------------------------------
+# A post-assembly security-posture toggle. The DEFAULT is "standard" — a box
+# that never presses the button (cloud OR edge) behaves exactly as today; the
+# absence of hardening.json == standard posture, and every runtime hook below
+# no-ops unless posture == 'hardened'. Hardening is explicit, reversible, and
+# transactional (W6): apply runs controls in order and rolls back every applied
+# control if any one fails, so the flip can never half-land. Recovery is always
+# the on-box break-glass path (reset-console-password.sh) — never a network
+# backdoor. Controls land per W-item: W2 (session lock) here; W3/W4/W1 follow.
+# Parent plan: infra-TAK-notes/docs/PLAN-v0.9.55-harden-this-box.md
+# ============================================================================
+
+HARDENING_CONFIG = 'hardening.json'
+SESSION_IDLE_MAX_DEFAULT = 1800  # 30 min — CJIS idle-lock ceiling (W2), fleet-uniform constant
+
+def load_hardening():
+    """Load hardening.json from CONFIG_DIR. Never raises — {} on missing/error.
+    Missing file == Standard posture (today's behavior, both cloud and edge)."""
+    try:
+        p = os.path.join(CONFIG_DIR, HARDENING_CONFIG)
+        if os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_hardening(h):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    p = os.path.join(CONFIG_DIR, HARDENING_CONFIG)
+    with open(p, 'w') as f:
+        json.dump(h, f, indent=2)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+def _hardening_posture():
+    return (load_hardening().get('posture') or 'standard')
+
+def is_hardened():
+    return _hardening_posture() == 'hardened'
+
+# --- W2: 30-minute server-side session idle lock ---------------------------
+# The control's apply/verify/revert only records intent in hardening.json; the
+# authoritative enforcement is this before_request hook, which is always present
+# but only bites when posture == 'hardened'. Under the password-auth path this is
+# the full lock; under SSO (W1) it is mirrored by an Authentik session-duration
+# policy so the SSO layer agrees (handled when W1 lands).
+@app.before_request
+def _enforce_session_idle_lock():
+    try:
+        if not session.get('authenticated'):
+            return  # not logged in — nothing to lock
+        h = load_hardening()
+        if (h.get('posture') or 'standard') != 'hardened':
+            return
+        a = (h.get('applied') or {}).get('W2_session') or {}
+        idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        now = int(time.time())
+        last = session.get('last_activity')
+        if last is not None and (now - int(last)) > idle_max:
+            session.clear()
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+            return redirect(url_for('login'))
+        session['last_activity'] = now
+    except Exception:
+        # A lock failure must never brick a request — fail open to the normal flow.
+        return
+
+def _hardening_control_w2():
+    """W2 — 30-minute server-side session lock."""
+    def apply_(h, log):
+        h.setdefault('applied', {})['W2_session'] = {'idle_max_seconds': SESSION_IDLE_MAX_DEFAULT}
+        log('W2: session idle lock armed (%d min)' % (SESSION_IDLE_MAX_DEFAULT // 60))
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W2_session')
+        if not a:
+            return (False, 'session idle lock not applied')
+        return (True, 'idle lock = %d min' % (int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT)) // 60))
+    def revert(h, log):
+        (h.get('applied') or {}).pop('W2_session', None)
+        log('W2: session idle lock disarmed')
+        return True
+    return {'key': 'W2_session', 'title': '30-minute session lock',
+            'desc': 'Server-side idle timeout forces re-authentication after 30 minutes (CJIS 5.5.5).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
+def _hardening_registry():
+    """Ordered control list. Apply runs in order; revert runs in reverse.
+    W1 (the risky auth flip) is always LAST so a working revert exists before it.
+    Controls land as their W-item is built: W2 now; W3/W4/W1 appended later."""
+    return [
+        _hardening_control_w2(),
+    ]
+
+def _breakglass_status():
+    """W6 — confirm the on-box break-glass recovery path exists. The posture flip
+    must never permanently lock an operator out: recovery is reset-console-password.sh
+    run from an on-box shell (network-isolated, auditable), NOT a network ingress."""
+    script = os.path.join(BASE_DIR, 'reset-console-password.sh')
+    return {'present': os.path.exists(script), 'path': script,
+            'note': 'On-box shell only. Restores console password login if SSO/Authentik is down.'}
+
+def _hardening_history(h, action, result):
+    h.setdefault('history', []).append({
+        'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'actor': session.get('authentik_username') or 'console-admin',
+        'action': action, 'result': result})
+    # keep the tail bounded
+    h['history'] = h['history'][-200:]
+
+@app.route('/api/hardening/status')
+@login_required
+def hardening_status():
+    h = load_hardening()
+    controls = []
+    for c in _hardening_registry():
+        ok, detail = c['verify'](h)
+        controls.append({'key': c['key'], 'title': c['title'],
+                         'desc': c.get('desc', ''), 'pass': bool(ok), 'detail': detail})
+    return jsonify({
+        'posture': h.get('posture') or 'standard',
+        'controls': controls,
+        'breakglass': _breakglass_status(),
+        'idle_max_seconds': SESSION_IDLE_MAX_DEFAULT,
+        'history': (h.get('history') or [])[-10:],
+    })
+
+@app.route('/api/hardening/apply', methods=['POST'])
+@login_required
+def hardening_apply():
+    """W6-transactional flip to Hardened. Applies controls in order; on ANY failure
+    rolls back the controls already applied (reverse order) and stays Standard."""
+    h = load_hardening()
+    log_lines = []
+    log = log_lines.append
+    applied_ok = []
+    try:
+        for c in _hardening_registry():
+            if not c['apply'](h, log):
+                raise RuntimeError('apply failed: %s' % c['key'])
+            applied_ok.append(c)
+        h['posture'] = 'hardened'
+        _hardening_history(h, 'apply', 'hardened')
+        save_hardening(h)
+        return jsonify({'success': True, 'posture': 'hardened', 'log': log_lines})
+    except Exception as e:
+        for c in reversed(applied_ok):
+            try:
+                c['revert'](h, log)
+            except Exception:
+                log('rollback error on %s' % c.get('key'))
+        h['posture'] = 'standard'
+        _hardening_history(h, 'apply-rollback', str(e))
+        save_hardening(h)
+        return jsonify({'success': False, 'error': str(e), 'log': log_lines}), 500
+
+@app.route('/api/hardening/revert', methods=['POST'])
+@login_required
+def hardening_revert():
+    """Un-harden back to Standard. Reverts controls in reverse order. Audit (W3) is
+    one-way and intentionally not reverted (you don't un-audit)."""
+    h = load_hardening()
+    log_lines = []
+    log = log_lines.append
+    for c in reversed(_hardening_registry()):
+        try:
+            c['revert'](h, log)
+        except Exception:
+            log('revert error on %s' % c.get('key'))
+    h['posture'] = 'standard'
+    _hardening_history(h, 'revert', 'standard')
+    save_hardening(h)
+    return jsonify({'success': True, 'posture': 'standard', 'log': log_lines})
+
+@app.route('/api/hardening/report')
+@login_required
+def hardening_report():
+    """Readiness Report (W5 — minimal in skeleton, expanded when W5 lands)."""
+    h = load_hardening()
+    settings = load_settings()
+    rows = []
+    for c in _hardening_registry():
+        ok, detail = c['verify'](h)
+        badge = 'PASS' if ok else 'n/a'
+        color = '#10b981' if ok else '#94a3b8'
+        rows.append('<tr><td>%s</td><td>%s</td><td style="color:%s;font-weight:600">%s</td><td>%s</td></tr>'
+                    % (html.escape(c['key']), html.escape(c['title']), color, badge, html.escape(detail)))
+    bg = _breakglass_status()
+    report = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Readiness Report — infra-TAK</title>
+<style>body{font-family:Arial,Helvetica,sans-serif;margin:40px;color:#0f172a}h1{font-size:20px}
+table{border-collapse:collapse;width:100%;margin:16px 0}td,th{border:1px solid #cbd5e1;padding:8px 12px;font-size:13px;text-align:left}
+th{background:#f1f5f9}.meta{color:#475569;font-size:12px}</style></head><body>
+<h1>infra-TAK — Security Posture Readiness Report</h1>
+<p class="meta">Posture: <strong>%s</strong> &middot; Host: %s &middot; Console v%s</p>
+<table><tr><th>Control</th><th>Title</th><th>Status</th><th>Detail</th></tr>%s</table>
+<p class="meta">Break-glass recovery: %s (%s)</p>
+<p class="meta">This is the skeleton report; the full control-mapping and "what to tell your security
+office" template land with W5.</p>
+</body></html>''' % (
+        html.escape(h.get('posture') or 'standard'),
+        html.escape(settings.get('fqdn') or settings.get('server_ip') or 'unknown'),
+        html.escape(VERSION),
+        ''.join(rows),
+        'present' if bg['present'] else 'MISSING',
+        html.escape(bg['path']))
+    from flask import Response
+    return Response(report, mimetype='text/html')
+
+@app.route('/hardening')
+@login_required
+def hardening_page():
+    h = load_hardening()
+    return render_template_string(HARDENING_TEMPLATE,
+        version=VERSION, posture=(h.get('posture') or 'standard'))
 
 @app.route('/marketplace')
 @login_required
@@ -24404,6 +24626,124 @@ function control(action){document.getElementById('control-status').textContent=a
 fetch('/api/nodered/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){document.getElementById('control-status').textContent=d.running?'Running':'Stopped';setTimeout(function(){window.location.href=window.location.pathname+'?t='+Date.now();},1500);});}
 function loadLogs(){document.getElementById('logs-card').style.display='block';fetch('/api/nodered/logs?lines=80').then(function(r){return r.json();}).then(function(d){document.getElementById('container-logs').textContent=(d.entries||[]).join(String.fromCharCode(10))||'(no output)';});}
 function doUninstall(){var pw=document.getElementById('uninstall-password').value,msg=document.getElementById('uninstall-msg');msg.textContent='';fetch('/api/nodered/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
+</script>
+</body></html>
+'''
+
+HARDENING_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Harden This Box — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow:visible;line-height:1.35}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;text-decoration:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.ctl-row{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;border:1px solid var(--border);background:var(--bg-deep);border-radius:8px;margin-bottom:8px}
+.ctl-health{width:9px;height:9px;border-radius:50%;flex-shrink:0;margin-top:5px;background:var(--text-dim)}
+.ctl-health.pass{background:var(--green);box-shadow:0 0 5px var(--green)}
+.ctl-health.off{background:var(--text-dim)}
+.ctl-key{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);min-width:96px;flex-shrink:0;margin-top:2px}
+.ctl-body{flex:1}.ctl-title{font-weight:600;font-size:13px}.ctl-desc{color:var(--text-secondary);font-size:12px;line-height:1.5;margin-top:3px}
+.ctl-detail{color:var(--text-dim);font-size:11px;font-family:'JetBrains Mono',monospace;margin-top:4px}
+.bg-ok{color:var(--green);font-weight:600}.bg-bad{color:var(--red);font-weight:600}
+.hist-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:3px 0}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon material-symbols-outlined" style="font-size:24px">verified_user</span><span>Harden This Box</span></h1>
+  <p>Flip this assembled stack from the default <strong>Standard</strong> posture into <strong>Hardened</strong> — eliminating the on-sight disqualifiers a security reviewer fails a system for, then self-documenting what it did. Reversible, idempotent, with an on-box break-glass recovery path.</p></div>
+
+  <div id="posture-banner" class="status-banner stopped"><div class="dot"></div><span id="posture-text">Loading…</span></div>
+
+  <div class="card">
+    <div class="card-title">Posture controls</div>
+    <div id="controls">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Break-glass recovery (W6)</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6">If SSO/Authentik is ever down, console access is recovered from an <strong>on-box shell</strong> with <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code> — an access-controlled, auditable path, <strong>not</strong> a network backdoor. Hardening can never permanently lock you out.</p>
+    <p id="breakglass-status" style="margin-top:10px;font-size:12px;font-family:'JetBrains Mono',monospace"></p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Actions</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="apply-btn" class="btn btn-primary" onclick="doApply()"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture</button>
+      <button id="revert-btn" class="btn btn-ghost" onclick="doRevert()"><span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard</button>
+      <a class="btn btn-ghost" href="/api/hardening/report" target="_blank"><span class="material-symbols-outlined" style="font-size:18px">description</span>Readiness Report</a>
+      <span id="action-msg" style="font-size:12px;margin-left:6px"></span>
+    </div>
+    <div id="action-log" class="ctl-detail" style="margin-top:12px;white-space:pre-wrap"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Recent activity</div>
+    <div id="history" style="font-size:12px;color:var(--text-dim)">—</div>
+  </div>
+</div>
+<script>
+function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function setBusy(b){document.getElementById('apply-btn').disabled=b;document.getElementById('revert-btn').disabled=b;}
+function renderStatus(d){
+  var hardened=(d.posture==='hardened');
+  var banner=document.getElementById('posture-banner');
+  banner.className='status-banner '+(hardened?'running':'stopped');
+  document.getElementById('posture-text').innerHTML='Current posture: <strong>'+(hardened?'HARDENED':'STANDARD')+'</strong>'+(hardened?' — security controls enforced':' — default behavior, nothing enforced');
+  var html='';
+  (d.controls||[]).forEach(function(c){
+    var on=hardened&&c.pass;
+    html+='<div class="ctl-row"><div class="ctl-health '+(on?'pass':'off')+'"></div>'+
+      '<div class="ctl-key">'+esc(c.key)+'</div>'+
+      '<div class="ctl-body"><div class="ctl-title">'+esc(c.title)+'</div>'+
+      '<div class="ctl-desc">'+esc(c.desc||'')+'</div>'+
+      '<div class="ctl-detail">'+(on?'ENFORCED':'not applied')+' — '+esc(c.detail||'')+'</div></div></div>';
+  });
+  document.getElementById('controls').innerHTML=html||'No controls registered yet.';
+  var bg=d.breakglass||{};
+  document.getElementById('breakglass-status').innerHTML=(bg.present?'<span class="bg-ok">&#10003; recovery script present</span>':'<span class="bg-bad">&#10007; recovery script MISSING</span>')+' &middot; '+esc(bg.path||'');
+  var h=(d.history||[]);
+  document.getElementById('history').innerHTML=h.length?h.slice().reverse().map(function(e){return '<div class="hist-line">'+esc(e.ts)+'  '+esc(e.actor)+'  '+esc(e.action)+' -> '+esc(e.result)+'</div>';}).join(''):'No activity yet.';
+}
+function loadStatus(){
+  fetch('/api/hardening/status').then(function(r){return r.json();}).then(renderStatus).catch(function(){document.getElementById('controls').textContent='Failed to load status.';});
+}
+function postFlip(url,confirmMsg){
+  if(!confirm(confirmMsg))return;
+  setBusy(true);
+  var msg=document.getElementById('action-msg');msg.textContent='Working…';msg.style.color='var(--text-dim)';
+  document.getElementById('action-log').textContent='';
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json();}).then(function(d){
+    setBusy(false);
+    msg.textContent=d.success?('Done — posture: '+d.posture):('Error: '+(d.error||'failed'));
+    msg.style.color=d.success?'var(--green)':'var(--red)';
+    document.getElementById('action-log').textContent=(d.log||[]).join('\\n');
+    loadStatus();
+  }).catch(function(e){setBusy(false);msg.textContent='Request failed';msg.style.color='var(--red)';});
+}
+function doApply(){postFlip('/api/hardening/apply','Apply HARDENED posture? This enforces the security controls listed above. You can revert at any time, and on-box break-glass recovery always works.');}
+function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture? This relaxes the hardening controls back to default behavior.');}
+loadStatus();
 </script>
 </body></html>
 '''
