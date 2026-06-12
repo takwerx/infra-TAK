@@ -2271,13 +2271,118 @@ def _hardening_control_w3():
             'desc': 'Records who/what/when for admin actions locally (off-box shipping is .56).',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
+# --- W4: port / boundary assertions (read-only; verify, don't rebuild) ------
+# Reuses the existing UFW + fail2ban machinery and reports pass/fail for the W5
+# report. Mutates nothing. Where a TAK/Tomcat surface cannot be reliably evaluated
+# from here, the assertion is 'na' with an honest note — never a false green
+# (CLAUDE.md "no silent caps"). Deep Tomcat STIG remediation is .57.
+
+def _ufw_default_incoming_deny():
+    """True if UFW default incoming policy is deny/reject (from `ufw status verbose`)."""
+    try:
+        r = subprocess.run('sudo ufw status verbose 2>/dev/null || ufw status verbose 2>/dev/null || true',
+                            shell=True, capture_output=True, text=True, timeout=12)
+        for ln in (r.stdout or '').splitlines():
+            l = ln.lower().strip()
+            if l.startswith('default:'):
+                # e.g. "Default: deny (incoming), allow (outgoing), disabled (routed)"
+                inc = l.split('(incoming)')[0]
+                return ('deny' in inc or 'reject' in inc)
+    except Exception:
+        pass
+    return None
+
+def _service_is_active(name):
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', name]),
+                           capture_output=True, text=True, timeout=8)
+        return (r.stdout or '').strip() == 'active'
+    except Exception:
+        return None
+
+def _hardening_assertions():
+    """Read-only boundary assertions → list of {key,label,status,detail}.
+    status ∈ pass|fail|warn|na. Consumed by W4 verify, the page, and the W5 report."""
+    res = []
+    def add(key, label, status, detail):
+        res.append({'key': key, 'label': label, 'status': status, 'detail': detail})
+
+    fw = _firewall_status_local()
+    if not fw.get('supported'):
+        add('ufw_enabled', 'UFW firewall present', 'fail', fw.get('error') or 'UFW not installed')
+    else:
+        add('ufw_enabled', 'UFW firewall active', 'pass' if fw.get('enabled') else 'fail',
+            'active' if fw.get('enabled') else 'UFW installed but not enabled')
+        dd = _ufw_default_incoming_deny()
+        add('ufw_default_deny', 'UFW default-deny incoming',
+            'pass' if dd else ('na' if dd is None else 'fail'),
+            'deny by default' if dd else ('could not read default policy' if dd is None else 'default policy is not deny'))
+
+    if os.path.exists('/etc/fail2ban'):
+        active = _service_is_active('fail2ban')
+        add('fail2ban_active', 'fail2ban intrusion prevention',
+            'pass' if active else ('na' if active is None else 'fail'),
+            'active' if active else ('status unknown' if active is None else 'installed but not active'))
+    else:
+        add('fail2ban_active', 'fail2ban intrusion prevention', 'warn', 'not installed')
+
+    # Console :5001 reachability. In Hardened posture (W1) this should be localhost-only.
+    h = load_hardening()
+    w1 = (h.get('applied') or {}).get('W1_sso')
+    if w1 and w1.get('console_localhost_only'):
+        add('console_localhost', 'Admin console (:5001) not internet-exposed', 'pass',
+            'UFW-restricted to localhost; reached via SSO reverse proxy (W1)')
+    else:
+        add('console_localhost', 'Admin console (:5001) not internet-exposed', 'warn',
+            'open to network (Standard posture / W1 not applied)')
+
+    # TAK Tomcat surface — best-effort, honest 'na' where not evaluable here.
+    if os.path.exists('/opt/tak'):
+        webapps = '/opt/tak/webapps'
+        mgr = (os.path.isdir(os.path.join(webapps, 'manager'))
+               or os.path.isdir(os.path.join(webapps, 'host-manager'))) if os.path.isdir(webapps) else False
+        add('tak_tomcat_manager', 'Tomcat manager/host-manager app not deployed',
+            'fail' if mgr else 'pass',
+            'manager webapp present' if mgr else 'no manager/host-manager webapp')
+        add('tak_tomcat_mtls', 'TAK connectors mTLS client-cert (8443/8446)', 'na',
+            'shielded by mTLS+UFW+Caddy; full connector/AJP STIG audit is .57')
+    else:
+        add('tak_tomcat_manager', 'TAK Tomcat surface', 'na', 'TAK Server not installed on this host')
+
+    return res
+
+def _hardening_control_w4():
+    """W4 — port/boundary assertions. Read-only: apply/revert are no-ops; verify
+    fails only if a CRITICAL assertion (UFW/fail2ban) fails."""
+    def apply_(h, log):
+        h.setdefault('applied', {})['W4_assert'] = {'enabled': True}
+        log('W4: boundary assertions enabled (read-only)')
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W4_assert')
+        if not a:
+            return (False, 'assertions not enabled')
+        crit = {'ufw_enabled', 'fail2ban_active'}
+        fails = [x['key'] for x in _hardening_assertions() if x['status'] == 'fail' and x['key'] in crit]
+        if fails:
+            return (False, 'critical assertion failed: ' + ', '.join(fails))
+        return (True, 'boundary assertions pass (see report for full surface)')
+    def revert(h, log):
+        (h.get('applied') or {}).pop('W4_assert', None)
+        log('W4: boundary assertions disabled')
+        return True
+    return {'key': 'W4_assert', 'title': 'Port & Tomcat boundary assertions',
+            'desc': 'Verifies UFW deny-by-default, fail2ban, and TAK Tomcat shielding (read-only).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
 def _hardening_registry():
     """Ordered control list. Apply runs in order; revert runs in reverse.
     W1 (the risky auth flip) is always LAST so a working revert exists before it.
-    Controls land as their W-item is built: W2 now; W3/W4/W1 appended later."""
+    Controls land as their W-item is built: W2/W3/W4 now; W1 appended last."""
     return [
         _hardening_control_w2(),
         _hardening_control_w3(),
+        _hardening_control_w4(),
     ]
 
 def _breakglass_status():
@@ -2395,6 +2500,12 @@ office" template land with W5.</p>
         html.escape(bg['path']))
     from flask import Response
     return Response(report, mimetype='text/html')
+
+@app.route('/api/hardening/assertions')
+@login_required
+def hardening_assertions():
+    """W4 — read-only boundary assertions (UFW/fail2ban/console/TAK Tomcat)."""
+    return jsonify({'assertions': _hardening_assertions()})
 
 @app.route('/api/hardening/audit')
 @login_required
@@ -24797,6 +24908,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   <div class="card">
+    <div class="card-title">Boundary assertions (W4) — read-only</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">UFW, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
+    <div id="assertions">Loading…</div>
+  </div>
+
+  <div class="card">
     <div class="card-title">Break-glass recovery (W6)</div>
     <p style="font-size:13px;color:var(--text-secondary);line-height:1.6">If SSO/Authentik is ever down, console access is recovered from an <strong>on-box shell</strong> with <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code> — an access-controlled, auditable path, <strong>not</strong> a network backdoor. Hardening can never permanently lock you out.</p>
     <p id="breakglass-status" style="margin-top:10px;font-size:12px;font-family:'JetBrains Mono',monospace"></p>
@@ -24850,6 +24967,18 @@ function renderStatus(d){
 function loadStatus(){
   fetch('/api/hardening/status').then(function(r){return r.json();}).then(renderStatus).catch(function(){document.getElementById('controls').textContent='Failed to load status.';});
 }
+function loadAssertions(){
+  fetch('/api/hardening/assertions').then(function(r){return r.json();}).then(function(d){
+    var map={pass:['pass','&#10003;','var(--green)'],fail:['fail','&#10007;','var(--red)'],warn:['off','&#9888;','var(--yellow)'],na:['off','&#8211;','var(--text-dim)']};
+    var html=(d.assertions||[]).map(function(a){
+      var m=map[a.status]||map.na;
+      return '<div class="ctl-row"><div class="ctl-health '+m[0]+'" style="background:'+m[2]+'"></div>'+
+        '<div class="ctl-body"><div class="ctl-title">'+esc(a.label)+' <span style="color:'+m[2]+';font-family:JetBrains Mono,monospace;font-size:11px">'+a.status.toUpperCase()+'</span></div>'+
+        '<div class="ctl-detail">'+esc(a.detail||'')+'</div></div></div>';
+    }).join('');
+    document.getElementById('assertions').innerHTML=html||'No assertions.';
+  }).catch(function(){document.getElementById('assertions').textContent='Failed to load assertions.';});
+}
 function loadAudit(){
   fetch('/api/hardening/audit').then(function(r){return r.json();}).then(function(d){
     var el=document.getElementById('audit-log');
@@ -24868,12 +24997,12 @@ function postFlip(url,confirmMsg){
     msg.textContent=d.success?('Done — posture: '+d.posture):('Error: '+(d.error||'failed'));
     msg.style.color=d.success?'var(--green)':'var(--red)';
     document.getElementById('action-log').textContent=(d.log||[]).join('\\n');
-    loadStatus();loadAudit();
+    loadStatus();loadAssertions();loadAudit();
   }).catch(function(e){setBusy(false);msg.textContent='Request failed';msg.style.color='var(--red)';});
 }
 function doApply(){postFlip('/api/hardening/apply','Apply HARDENED posture? This enforces the security controls listed above. You can revert at any time, and on-box break-glass recovery always works.');}
 function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture? This relaxes the hardening controls back to default behavior.');}
-loadStatus();loadAudit();
+loadStatus();loadAssertions();loadAudit();
 </script>
 </body></html>
 '''
