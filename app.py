@@ -1994,12 +1994,15 @@ def login():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session.clear()
             session['authenticated'] = True
+            # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
+            audit('auth:login-password', 'console password / break-glass')
             return redirect(url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     return render_template_string(LOGIN_TEMPLATE, error=None, version=VERSION, login_logo_url=logo_url)
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    audit('auth:logout', '')
     session.clear()
     return redirect(url_for('index'))
 
@@ -2018,6 +2021,7 @@ def index():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['authenticated'] = True
+            audit('auth:login-password', 'console password / break-glass')
             return redirect(url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
@@ -2166,12 +2170,114 @@ def _hardening_control_w2():
             'desc': 'Server-side idle timeout forces re-authentication after 30 minutes (CJIS 5.5.5).',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
+# --- W3: local per-user audit log (JSONL) ----------------------------------
+# Records who/what/when for admin actions. Hardened-posture only, so a Standard
+# box writes nothing (today's behavior preserved). JSONL now → clean CEF/syslog
+# export when off-box shipping lands in .56. Off-box shipping + 365-day retention
+# are NOT in .55 — this is local-only.
+AUDIT_DIR_NAME = 'audit'
+AUDIT_LOG_NAME = 'console-audit.log'
+_AUDIT_MAX_BYTES = 5 * 1024 * 1024  # rotate to .1 past 5 MB; kept local
+
+def _audit_path():
+    return os.path.join(CONFIG_DIR, AUDIT_DIR_NAME, AUDIT_LOG_NAME)
+
+def audit(event, detail='', force=False):
+    """Append a structured JSONL audit line. Hardened-posture only unless force=True
+    (used for posture-flip events that may transition out of hardened). Never raises."""
+    try:
+        if not force and not is_hardened():
+            return
+        d = os.path.join(CONFIG_DIR, AUDIT_DIR_NAME)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, AUDIT_LOG_NAME)
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > _AUDIT_MAX_BYTES:
+                os.replace(p, p + '.1')
+        except Exception:
+            pass
+        try:
+            user = session.get('authentik_username') or ('console-admin' if session.get('authenticated') else 'anonymous')
+        except Exception:
+            user = 'system'
+        try:
+            ip = _client_ip()
+        except Exception:
+            ip = 'unknown'
+        line = json.dumps({
+            'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'user': user, 'ip': ip, 'event': event, 'detail': str(detail)[:500],
+        }, separators=(',', ':'))
+        with open(p, 'a') as f:
+            f.write(line + '\n')
+        try:
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _audit_tail(n=50):
+    out = []
+    try:
+        p = _audit_path()
+        if os.path.exists(p):
+            with open(p) as f:
+                for ln in f.readlines()[-n:]:
+                    try:
+                        out.append(json.loads(ln))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return out
+
+# Generic admin-action audit: one after_request hook attributes every state-changing
+# /api/* call instead of hand-instrumenting 300+ routes. Hardened-gated, with a
+# small denylist for poll/health noise.
+_AUDIT_SKIP_PATHS = ('/api/hardening/status', '/api/hardening/audit',
+                     '/api/guarddog/send-sms', '/api/guarddog/send-alert-email')
+
+@app.after_request
+def _audit_state_changes(response):
+    try:
+        if (request.method in ('POST', 'PUT', 'PATCH', 'DELETE')
+                and request.path.startswith('/api/')
+                and request.path not in _AUDIT_SKIP_PATHS
+                and is_hardened()):
+            audit('api:' + request.method + ' ' + request.path, 'status=%s' % response.status_code)
+    except Exception:
+        pass
+    return response
+
+def _hardening_control_w3():
+    """W3 — local per-user audit log. One-way (you don't un-audit), so revert keeps it."""
+    def apply_(h, log):
+        os.makedirs(os.path.join(CONFIG_DIR, AUDIT_DIR_NAME), exist_ok=True)
+        h.setdefault('applied', {})['W3_audit'] = {'path': _audit_path(), 'enabled': True}
+        log('W3: per-user audit log enabled at ' + _audit_path())
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W3_audit')
+        if not a:
+            return (False, 'audit not enabled')
+        d = os.path.join(CONFIG_DIR, AUDIT_DIR_NAME)
+        ok = os.path.isdir(d) and os.access(d, os.W_OK)
+        return (ok, ('writable: ' + _audit_path()) if ok else 'audit dir present but not writable')
+    def revert(h, log):
+        log('W3: audit log retained (one-way control)')
+        return True
+    return {'key': 'W3_audit', 'title': 'Per-user audit log',
+            'desc': 'Records who/what/when for admin actions locally (off-box shipping is .56).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
 def _hardening_registry():
     """Ordered control list. Apply runs in order; revert runs in reverse.
     W1 (the risky auth flip) is always LAST so a working revert exists before it.
     Controls land as their W-item is built: W2 now; W3/W4/W1 appended later."""
     return [
         _hardening_control_w2(),
+        _hardening_control_w3(),
     ]
 
 def _breakglass_status():
@@ -2224,6 +2330,7 @@ def hardening_apply():
         h['posture'] = 'hardened'
         _hardening_history(h, 'apply', 'hardened')
         save_hardening(h)
+        audit('hardening:apply', 'posture=hardened')
         return jsonify({'success': True, 'posture': 'hardened', 'log': log_lines})
     except Exception as e:
         for c in reversed(applied_ok):
@@ -2252,6 +2359,7 @@ def hardening_revert():
     h['posture'] = 'standard'
     _hardening_history(h, 'revert', 'standard')
     save_hardening(h)
+    audit('hardening:revert', 'posture=standard', force=True)
     return jsonify({'success': True, 'posture': 'standard', 'log': log_lines})
 
 @app.route('/api/hardening/report')
@@ -2287,6 +2395,14 @@ office" template land with W5.</p>
         html.escape(bg['path']))
     from flask import Response
     return Response(report, mimetype='text/html')
+
+@app.route('/api/hardening/audit')
+@login_required
+def hardening_audit():
+    """W3 — recent local audit lines (newest first). Local-only; .56 ships off-box."""
+    return jsonify({'enabled': bool((load_hardening().get('applied') or {}).get('W3_audit')),
+                    'path': _audit_path(),
+                    'lines': list(reversed(_audit_tail(80)))})
 
 @app.route('/hardening')
 @login_required
@@ -24701,6 +24817,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="card-title">Recent activity</div>
     <div id="history" style="font-size:12px;color:var(--text-dim)">—</div>
   </div>
+
+  <div class="card">
+    <div class="card-title">Audit log (W3) — local, who/what/when</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Newest first. Off-box immutable shipping with &ge;365-day retention lands in .56; this is the local record.</p>
+    <div id="audit-log" class="log-box" style="background:#070a12;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:300px;overflow:auto;white-space:pre-wrap">Loading…</div>
+  </div>
 </div>
 <script>
 function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
@@ -24728,6 +24850,14 @@ function renderStatus(d){
 function loadStatus(){
   fetch('/api/hardening/status').then(function(r){return r.json();}).then(renderStatus).catch(function(){document.getElementById('controls').textContent='Failed to load status.';});
 }
+function loadAudit(){
+  fetch('/api/hardening/audit').then(function(r){return r.json();}).then(function(d){
+    var el=document.getElementById('audit-log');
+    var lines=(d.lines||[]);
+    if(!lines.length){el.textContent=d.enabled?'No audit entries yet.':'Audit log inactive (apply Hardened posture to enable).';return;}
+    el.innerHTML=lines.map(function(e){return esc(e.ts)+'  '+esc(e.user)+'  ['+esc(e.ip)+']  '+esc(e.event)+(e.detail?('  '+esc(e.detail)):'');}).join('\\n');
+  }).catch(function(){document.getElementById('audit-log').textContent='Failed to load audit log.';});
+}
 function postFlip(url,confirmMsg){
   if(!confirm(confirmMsg))return;
   setBusy(true);
@@ -24738,12 +24868,12 @@ function postFlip(url,confirmMsg){
     msg.textContent=d.success?('Done — posture: '+d.posture):('Error: '+(d.error||'failed'));
     msg.style.color=d.success?'var(--green)':'var(--red)';
     document.getElementById('action-log').textContent=(d.log||[]).join('\\n');
-    loadStatus();
+    loadStatus();loadAudit();
   }).catch(function(e){setBusy(false);msg.textContent='Request failed';msg.style.color='var(--red)';});
 }
 function doApply(){postFlip('/api/hardening/apply','Apply HARDENED posture? This enforces the security controls listed above. You can revert at any time, and on-box break-glass recovery always works.');}
 function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture? This relaxes the hardening controls back to default behavior.');}
-loadStatus();
+loadStatus();loadAudit();
 </script>
 </body></html>
 '''
