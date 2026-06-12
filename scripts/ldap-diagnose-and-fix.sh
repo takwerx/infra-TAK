@@ -1,6 +1,5 @@
 #!/bin/bash
-# LDAP bind diagnostic and fix script — run on server (ssh root@REDACTED-HOST)
-# From docs/HANDOFF-LDAP-AUTHENTIK.md Section 0
+# LDAP bind diagnostic and fix script — run on the TAK host as root.
 set -e
 cd ~/authentik || { echo "~/authentik not found"; exit 1; }
 
