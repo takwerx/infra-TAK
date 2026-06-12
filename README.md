@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.52-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.52-alpha)**
+**Current release: [v0.9.53-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.53-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.53-alpha — 2026-06-11 — Self-hosted NetBird VPN module
+
+**Headline: stand up a private, self-hosted VPN for your TAK deployment in one click — with single sign-on built in.** NetBird gives you a zero-trust WireGuard overlay network deployed straight from the console — no SSH, no third-party VPN service, no cloud dependency. You sign in with your existing Authentik accounts (the same identity as the rest of your TAK stack), and access is restricted to operators: the VPN is bound to your admin group, so an ordinary SSO user can't join the network. Use it to securely reach your TAK box, or to link sites and remote sensors over an encrypted private overlay. The module pins vetted NetBird images for fleet-consistent installs and reloads the web proxy gracefully so other services stay online during deploy. **Upgrade:** the NetBird module appears in the console — deploy it when you want it; existing services are unaffected.
+
+Full notes: [v0.9.53-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.53-alpha).
 
 ### v0.9.52-alpha — 2026-06-11 — ArcGIS configurator: per-class polygon styling + decoded zone labels
 
