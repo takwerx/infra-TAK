@@ -2320,6 +2320,12 @@ def audit(event, detail='', force=False):
             os.chmod(p, 0o600)
         except Exception:
             pass
+        # W7: also queue the line for off-box shipping (fail-open; never blocks here).
+        try:
+            if _offbox_enabled():
+                _offbox_spool(line)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -2356,6 +2362,206 @@ def _audit_state_changes(response):
         pass
     return response
 
+# ---- W7: off-box immutable audit shipping (v0.9.56) -----------------------
+# Local JSONL (W3) stays the source of truth; W7 mirrors each audit line to an
+# off-box sink so the >=365-day copy lives where the box admin cannot rewrite it.
+# Pluggable: syslog/CEF -> SIEM, or S3-compatible Object-Lock (WORM) bucket.
+# Fail-open + buffered: audit() spools locally; a background thread flushes with
+# retry. A sink failure never blocks a request or the posture flip, and the
+# backlog is surfaced (never silently dropped). Resolves the retention-vs-load
+# tension with W8: short LOCAL Authentik/console retention, the compliance copy off-box.
+OFFBOX_SPOOL_NAME = 'offbox-spool.jsonl'
+OFFBOX_RETENTION_FLOOR = 365            # fleet floor (days); an agency may set higher, never lower
+_offbox_status = {'last_ship_ts': None, 'last_error': None, 'shipped_total': 0}
+_OFFBOX_LOCK = threading.Lock()
+
+def _offbox_spool_path():
+    return os.path.join(CONFIG_DIR, AUDIT_DIR_NAME, OFFBOX_SPOOL_NAME)
+
+def _offbox_config():
+    return (load_hardening().get('offbox_config') or {})
+
+def _offbox_enabled():
+    h = load_hardening()
+    if (h.get('posture') or 'standard') != 'hardened':
+        return False
+    if not (h.get('applied') or {}).get('W7_offbox', {}).get('active'):
+        return False
+    return (h.get('offbox_config') or {}).get('mode', 'off') in ('syslog', 's3objlock')
+
+def _offbox_spool(line_str):
+    try:
+        os.makedirs(os.path.join(CONFIG_DIR, AUDIT_DIR_NAME), exist_ok=True)
+        p = _offbox_spool_path()
+        with open(p, 'a') as f:
+            f.write(line_str + '\n')
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+def _offbox_backlog():
+    try:
+        p = _offbox_spool_path()
+        if not os.path.exists(p):
+            return 0
+        with open(p) as f:
+            return sum(1 for ln in f if ln.strip())
+    except Exception:
+        return 0
+
+def _offbox_to_cef(rec):
+    """Map one audit record to a CEF line (ArcSight-style) for SIEM ingestion."""
+    hdr = 'CEF:0|infra-TAK|console|%s|audit|%s|3|' % (VERSION, rec.get('event', 'event'))
+    ext = 'rt=%s suser=%s src=%s msg=%s' % (
+        rec.get('ts', ''), rec.get('user', ''), rec.get('ip', ''),
+        str(rec.get('detail', '')).replace('\n', ' ').replace('=', '\\='))
+    return hdr + ext
+
+def _offbox_ship_syslog(lines, cfg):
+    """Ship spooled audit lines as RFC5424/CEF over TCP (optionally TLS). Returns
+    (n_shipped, error_or_None); never raises — the error is surfaced via status."""
+    import socket as _socket, ssl as _ssl
+    sink = cfg.get('syslog') or {}
+    host = sink.get('host'); port = int(sink.get('port') or 6514)
+    if not host:
+        return (0, 'no syslog host configured')
+    use_tls = sink.get('tls', True)
+    fqdn = (load_settings().get('fqdn') or 'console')
+    try:
+        raw = _socket.create_connection((host, port), timeout=10)
+        sock = _ssl.create_default_context().wrap_socket(raw, server_hostname=host) if use_tls else raw
+    except Exception as e:
+        return (0, 'connect %s:%s failed: %s' % (host, port, str(e)[:120]))
+    n = 0
+    try:
+        for ln in lines:
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            # RFC5424 framing with octet-counting (TCP), local0.info; payload is CEF.
+            frame = '<134>1 %s %s infra-TAK - - - %s' % (rec.get('ts', '-'), fqdn, _offbox_to_cef(rec))
+            b = frame.encode()
+            sock.sendall(('%d ' % len(b)).encode() + b)
+            n += 1
+    except Exception as e:
+        return (n, 'send failed after %d: %s' % (n, str(e)[:120]))
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return (n, None)
+
+def _offbox_ship_s3(lines, cfg):
+    """Ship spooled lines as an immutable S3 Object-Lock (WORM) segment. NOT YET WIRED:
+    SigV4 + Object-Lock needs an S3 client and a real bucket to validate against. Structured
+    so the flush loop treats it as a real mode; returns (0, reason) so the backlog is RETAINED
+    and surfaced, never silently dropped. TODO(v0.9.56 W7): implement against a test bucket."""
+    return (0, 's3objlock sink not yet implemented (pending S3 client + test Object-Lock bucket)')
+
+def _offbox_flush_once():
+    """Flush the spool to the configured sink; drop only the confirmed-shipped prefix
+    (partial-success safe). Never raises."""
+    if not _offbox_enabled():
+        return
+    with _OFFBOX_LOCK:
+        p = _offbox_spool_path()
+        try:
+            if not os.path.exists(p):
+                return
+            with open(p) as f:
+                lines = [ln.rstrip('\n') for ln in f if ln.strip()]
+        except Exception:
+            return
+        if not lines:
+            return
+        cfg = _offbox_config()
+        mode = cfg.get('mode')
+        if mode == 'syslog':
+            n, err = _offbox_ship_syslog(lines, cfg)
+        elif mode == 's3objlock':
+            n, err = _offbox_ship_s3(lines, cfg)
+        else:
+            return
+        if n > 0:  # rewrite the spool with the un-shipped remainder
+            try:
+                rest = lines[n:]
+                with open(p, 'w') as f:
+                    f.write(('\n'.join(rest) + '\n') if rest else '')
+                os.chmod(p, 0o600)
+            except Exception:
+                pass
+        _offbox_status['shipped_total'] += n
+        _offbox_status['last_error'] = err
+        if not err:
+            _offbox_status['last_ship_ts'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def _offbox_shipper_loop():
+    while True:
+        try:
+            _offbox_flush_once()
+        except Exception:
+            pass
+        time.sleep(15)
+
+def _offbox_status_snapshot():
+    cfg = _offbox_config()
+    return {
+        'mode': cfg.get('mode', 'off'),
+        'enabled': _offbox_enabled(),
+        'retention_days': int(cfg.get('retention_days') or OFFBOX_RETENTION_FLOOR),
+        'backlog': _offbox_backlog(),
+        'last_ship_ts': _offbox_status['last_ship_ts'],
+        'last_error': _offbox_status['last_error'],
+        'shipped_total': _offbox_status['shipped_total'],
+        'syslog_host': (cfg.get('syslog') or {}).get('host'),
+        's3_bucket': (cfg.get('s3') or {}).get('bucket'),
+    }
+
+# Start the background shipper once (daemon; idle-cheap when W7 is off).
+try:
+    threading.Thread(target=_offbox_shipper_loop, daemon=True, name='offbox-shipper').start()
+except Exception:
+    pass
+
+def _hardening_control_w7():
+    """W7 — off-box immutable audit shipping. Activates the shipper when a sink is
+    configured; otherwise applies in an honest 'armed but no sink' state the report flags
+    (hardening can still complete, but the report tells the truth — no false green)."""
+    def apply_(h, log):
+        mode = (h.get('offbox_config') or {}).get('mode', 'off')
+        h.setdefault('applied', {})['W7_offbox'] = {'active': True, 'mode': mode}
+        if mode in ('syslog', 's3objlock'):
+            log('W7: off-box audit shipping active (mode=%s)' % mode)
+        else:
+            log('W7: off-box audit armed but NO sink configured — set one in Cyber Controls; '
+                'audit ships nowhere until then (local W3 audit still retained).')
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W7_offbox')
+        if not a:
+            return (False, 'off-box audit not applied')
+        cfg = h.get('offbox_config') or {}
+        mode = cfg.get('mode', 'off')
+        if mode not in ('syslog', 's3objlock'):
+            return (True, 'armed; no off-box sink configured (local audit only)')
+        err = _offbox_status.get('last_error')
+        bl = _offbox_backlog()
+        if err and bl:
+            return (False, 'sink error (%s); %d lines backlogged' % (str(err)[:60], bl))
+        return (True, 'shipping via %s; backlog=%d, retention>=%dd'
+                % (mode, bl, int(cfg.get('retention_days') or OFFBOX_RETENTION_FLOOR)))
+    def revert(h, log):
+        (h.get('applied') or {}).pop('W7_offbox', None)
+        log('W7: off-box shipping stopped; local audit + already-shipped immutable records retained')
+        return True
+    return {'key': 'W7_offbox', 'title': 'Off-box immutable audit',
+            'desc': 'Mirrors the audit trail off-box (syslog/CEF to a SIEM, or an S3 Object-Lock '
+                    'WORM bucket) so the >=365-day record lives where the box admin cannot rewrite '
+                    'it. Local audit (W3) stays the source of truth.',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
 def _hardening_control_w3():
     """W3 — local per-user audit log. One-way (you don't un-audit), so revert keeps it."""
     def apply_(h, log):
@@ -2374,7 +2580,7 @@ def _hardening_control_w3():
         log('W3: audit log retained (one-way control)')
         return True
     return {'key': 'W3_audit', 'title': 'Per-user audit log',
-            'desc': 'Records who/what/when for admin actions locally (off-box shipping is .56).',
+            'desc': 'Records who/what/when for admin actions locally; W7 ships these off-box immutably.',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
 # --- W4: port / boundary assertions (read-only; verify, don't rebuild) ------
@@ -2937,6 +3143,7 @@ def _hardening_registry():
         _hardening_control_w2(),
         _hardening_control_widle(),
         _hardening_control_w3(),
+        _hardening_control_w7(),
         _hardening_control_w4(),
         _hardening_control_w1(),
     ]
@@ -3165,10 +3372,66 @@ def hardening_assertions():
 @app.route('/api/hardening/audit')
 @login_required
 def hardening_audit():
-    """W3 — recent local audit lines (newest first). Local-only; .56 ships off-box."""
+    """W3 — recent local audit lines (newest first). W7 ships these off-box (status below)."""
     return jsonify({'enabled': bool((load_hardening().get('applied') or {}).get('W3_audit')),
                     'path': _audit_path(),
                     'lines': list(reversed(_audit_tail(80)))})
+
+# --- W7: off-box audit shipping config + status ----------------------------
+@app.route('/api/hardening/offbox/status')
+@login_required
+def hardening_offbox_status():
+    return jsonify(_offbox_status_snapshot())
+
+@app.route('/api/hardening/offbox/config', methods=['POST'])
+@login_required
+def hardening_offbox_config():
+    """Set the off-box sink. Body: {mode:'off'|'syslog'|'s3objlock', retention_days,
+    syslog:{host,port,tls}, s3:{endpoint,region,bucket,prefix,access_key,secret_key}}.
+    Sink credentials live in hardening.json (mode 600). Retention is floored at 365d."""
+    body = request.get_json(force=True, silent=True) or {}
+    mode = body.get('mode', 'off')
+    if mode not in ('off', 'syslog', 's3objlock'):
+        return jsonify({'error': 'invalid mode'}), 400
+    h = load_hardening()
+    cfg = h.get('offbox_config') or {}
+    cfg['mode'] = mode
+    cfg['retention_days'] = max(OFFBOX_RETENTION_FLOOR, int(body.get('retention_days') or OFFBOX_RETENTION_FLOOR))
+    if isinstance(body.get('syslog'), dict):
+        cfg['syslog'] = body['syslog']
+    if isinstance(body.get('s3'), dict):
+        cfg['s3'] = body['s3']
+    # If W7 is already applied, keep its recorded mode in step with the new config.
+    if (h.get('applied') or {}).get('W7_offbox'):
+        h['applied']['W7_offbox']['mode'] = mode
+    h['offbox_config'] = cfg
+    save_hardening(h)
+    audit('hardening:offbox-config', 'mode=%s retention=%dd' % (mode, cfg['retention_days']))
+    return jsonify({'success': True, 'status': _offbox_status_snapshot()})
+
+@app.route('/api/hardening/offbox/test', methods=['POST'])
+@login_required
+def hardening_offbox_test():
+    """Send one probe line to the configured sink and report the result."""
+    cfg = _offbox_config()
+    mode = cfg.get('mode')
+    probe = json.dumps({'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'user': 'console', 'ip': '127.0.0.1',
+                        'event': 'offbox:test', 'detail': 'connectivity probe'})
+    if mode == 'syslog':
+        n, err = _offbox_ship_syslog([probe], cfg)
+        return jsonify({'success': err is None, 'shipped': n, 'error': err})
+    if mode == 's3objlock':
+        n, err = _offbox_ship_s3([probe], cfg)
+        return jsonify({'success': err is None, 'shipped': n, 'error': err})
+    return jsonify({'success': False, 'error': 'no sink configured'})
+
+@app.route('/api/hardening/offbox/ship-now', methods=['POST'])
+@login_required
+def hardening_offbox_ship_now():
+    """Force a flush of the spool to the sink (else it flushes every 15s)."""
+    _offbox_flush_once()
+    return jsonify({'success': True, 'status': _offbox_status_snapshot()})
 
 @app.route('/hardening')
 @login_required
