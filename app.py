@@ -2127,8 +2127,12 @@ def is_hardened():
 # The control's apply/verify/revert only records intent in hardening.json; the
 # authoritative enforcement is this before_request hook, which is always present
 # but only bites when posture == 'hardened'. Under the password-auth path this is
-# the full lock; under SSO (W1) it is mirrored by an Authentik session-duration
-# policy so the SSO layer agrees (handled when W1 lands).
+# the full lock. KNOWN GAP under SSO (W1): clearing the Flask session redirects
+# through Caddy forward_auth, which re-validates against a still-live Authentik
+# session and silently re-authenticates — so the idle lock refreshes rather than
+# re-prompting. Making it re-prompt needs an Authentik session-duration mirror
+# (brand/flow), which is fleet-affecting and not yet built/tested — tracked as the
+# top W1 follow-up; do not claim a working SSO idle-lock until it is validated.
 @app.before_request
 def _enforce_session_idle_lock():
     try:
@@ -2327,13 +2331,21 @@ def _hardening_assertions():
         add('fail2ban_active', 'fail2ban intrusion prevention', 'warn', 'not installed')
 
     # Console :5001 reachability. In Hardened posture (W1) this should be localhost-only.
+    # Probe UFW directly (don't just trust the applied flag) so config drift surfaces.
     h = load_hardening()
     w1 = (h.get('applied') or {}).get('W1_sso')
-    if w1 and w1.get('console_localhost_only'):
-        add('console_localhost', 'Admin console (:5001) not internet-exposed', 'pass',
-            'UFW-restricted to localhost; reached via SSO reverse proxy (W1)')
+    port = str((load_settings().get('console_port') or 5001))
+    pub = _w1_console_port_public(port)
+    label = 'Admin console (:%s) not internet-exposed' % port
+    if pub:
+        add('console_localhost', label,
+            'fail' if (w1 and w1.get('console_localhost_only')) else 'warn',
+            'public UFW allow present on :%s' % port)
+    elif w1 and w1.get('console_localhost_only'):
+        add('console_localhost', label, 'pass',
+            'no public UFW allow; reached via SSO reverse proxy (W1)')
     else:
-        add('console_localhost', 'Admin console (:5001) not internet-exposed', 'warn',
+        add('console_localhost', label, 'warn',
             'open to network (Standard posture / W1 not applied)')
 
     # TAK Tomcat surface — best-effort, honest 'na' where not evaluable here.
@@ -2375,14 +2387,282 @@ def _hardening_control_w4():
             'desc': 'Verifies UFW deny-by-default, fail2ban, and TAK Tomcat shielding (read-only).',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
+# --- W1: console SSO + per-user MFA + :5001 lockdown (the auth flip; last) -----
+# Built LAST, behind W6's working revert. In Hardened posture the console is
+# reachable ONLY through the existing Caddy `infratak.<fqdn>` vhost (Authentik
+# forward_auth) — per-user SSO with enforced MFA. The shared-password login becomes
+# on-box break-glass (reset-console-password.sh + an SSH tunnel to 127.0.0.1:5001).
+# Three reversible moves, ordered so a fallback exists until the very last step:
+#   1. Authentik: require a configured MFA device on the console application
+#      (expression policy + binding + policy_engine_mode=all). REFUSES if no admin
+#      has MFA enrolled yet — that would lock every SSO user out of the console.
+#   2. Caddy: drop the unauthenticated `/login*` bypass so the password page is no
+#      longer a network ingress (generate_caddyfile keys off _w1_console_locked()).
+#   3. UFW: remove the public :5001 allow so direct-to-port access is dropped by
+#      default-deny; loopback (Caddy proxy + SSH tunnel) is UFW-exempt and still works.
+# Verifying the binding really lands is mandatory (the netbird PR#42 #4 trap:
+# "app has no policy binding"); `ak dump_config` is the release-time env audit.
+W1_MFA_POLICY_NAME = 'infratak-require-mfa'
+W1_MFA_POLICY_EXPR = 'return ak_user_has_authenticator(request.user)'
+
+def _w1_console_locked():
+    """True when W1 has locked the console (Caddy /login bypass dropped). Read by
+    generate_caddyfile so every Caddy regen — from anywhere — honors the posture."""
+    try:
+        return bool((load_hardening().get('applied') or {}).get('W1_sso', {}).get('caddy_login_locked'))
+    except Exception:
+        return False
+
+def _w1_console_port_public(port):
+    """True if UFW has an ALLOW for the console port open to Anywhere (not loopback).
+    None if UFW unsupported/disabled (can't assert lockdown)."""
+    fw = _firewall_status_local()
+    if not fw.get('supported') or not fw.get('enabled'):
+        return None
+    for ln in fw.get('rules', []):
+        l = ln.lower()
+        if port in l and 'allow' in l and 'anywhere' in l:
+            # a source-scoped rule (e.g. "from 127.0.0.1") is not a public allow
+            if 'from' not in l or '127.0.0.1' not in l:
+                return True
+    return False
+
+def _w1_ak_ctx():
+    """(ak_url, ak_headers, settings) for Authentik API; ak_url None if no token."""
+    settings = load_settings()
+    tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+           or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+    if not tok:
+        return (None, None, settings)
+    return (_get_authentik_api_url(settings),
+            {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}, settings)
+
+def _w1_ak_get(ak_url, path, ak_headers):
+    return json.loads(_ak_api_call(f'{ak_url}/api/v3/{path}', headers=ak_headers).read().decode())
+
+def _w1_console_app(ak_url, ak_headers, settings):
+    """Locate the console (infra-TAK) proxy application by matching the proxy
+    provider's external_host to infratak.<fqdn>. (app_pk, app_slug, prov_pk) or Nones."""
+    infratak_host = (_get_all_service_domains(settings).get('infratak') or '').lower()
+    if not infratak_host:
+        return (None, None, None)
+    provs = _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', [])
+    prov_pk = next((p.get('pk') for p in provs
+                    if infratak_host in (p.get('external_host') or '').lower()), None)
+    if not prov_pk:
+        return (None, None, None)
+    apps = _w1_ak_get(ak_url, 'core/applications/?superuser_full_list=true&page_size=100',
+                      ak_headers).get('results', [])
+    for a in apps:
+        if a.get('provider') == prov_pk:
+            return (a.get('pk'), a.get('slug'), prov_pk)
+    return (None, None, prov_pk)
+
+def _w1_mfa_device_count(ak_url, ak_headers):
+    """Count configured MFA devices instance-wide. 0 → applying W1 would lock every
+    SSO user out of the console, so apply refuses. None on error (treated as unknown)."""
+    try:
+        d = _w1_ak_get(ak_url, 'authenticators/admin/all/?page_size=1000', ak_headers)
+        return len(d if isinstance(d, list) else d.get('results', []))
+    except Exception:
+        return None
+
+def _w1_apply_mfa(h, log):
+    """Enforce per-user MFA on the console Authentik application. Idempotent; verifies
+    the binding actually lands before returning True. Stores pks for clean revert."""
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        log('W1: no Authentik token — cannot enforce SSO MFA'); return False
+    app_pk, app_slug, prov_pk = _w1_console_app(ak_url, ak_headers, settings)
+    if not app_pk:
+        log('W1: console Authentik application not found (infra-TAK proxy app missing)'); return False
+    n = _w1_mfa_device_count(ak_url, ak_headers)
+    if n == 0:
+        log('W1: REFUSING — no MFA devices enrolled in Authentik. Enroll TOTP/WebAuthn for '
+            'an admin first (Authentik > User settings) or every SSO login is locked out.')
+        return False
+    # Record identifiers into hardening.json AS WE GO so revert can clean up even if a
+    # later step fails (the outer transaction won't revert a control that returned False).
+    w1 = h.setdefault('applied', {}).setdefault('W1_sso', {})
+    w1.update({'ak_app_slug': app_slug, 'ak_app_pk': app_pk,
+               'ak_prior_engine_mode': _w1_ak_get(ak_url, f'core/applications/{app_slug}/',
+                                                  ak_headers).get('policy_engine_mode', 'any')})
+    # 1) expression policy requiring a configured authenticator
+    pols = _w1_ak_get(ak_url, f'policies/expression/?search={W1_MFA_POLICY_NAME}&page_size=100',
+                      ak_headers).get('results', [])
+    pol_pk = next((p.get('pk') for p in pols if p.get('name') == W1_MFA_POLICY_NAME), None)
+    if not pol_pk:
+        body = json.dumps({'name': W1_MFA_POLICY_NAME, 'execution_logging': False,
+                           'expression': W1_MFA_POLICY_EXPR}).encode()
+        pol_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/expression/', data=body,
+                            method='POST', headers=ak_headers).read().decode()).get('pk')
+        log('W1: created MFA-required policy (%s)' % W1_MFA_POLICY_NAME)
+    else:
+        log('W1: MFA-required policy already present')
+    w1['ak_mfa_policy_pk'] = pol_pk
+    # 2) bind policy → console application
+    binds = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100',
+                       ak_headers).get('results', [])
+    bind_pk = next((b.get('pk') for b in binds if b.get('policy') == pol_pk), None)
+    if not bind_pk:
+        body = json.dumps({'policy': pol_pk, 'target': app_pk, 'enabled': True,
+                           'order': 10, 'timeout': 30, 'failure_result': False}).encode()
+        bind_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/bindings/', data=body,
+                             method='POST', headers=ak_headers).read().decode()).get('pk')
+        log('W1: bound MFA policy to console application')
+    else:
+        log('W1: MFA policy already bound to console application')
+    w1['ak_mfa_binding_pk'] = bind_pk
+    save_hardening(h)  # persist pks before the (rarely-failing) verify, so revert can clean up
+    # 3) require ALL bindings (Admins group AND MFA), not ANY
+    if w1.get('ak_prior_engine_mode') != 'all':
+        _ak_api_call(f'{ak_url}/api/v3/core/applications/{app_slug}/',
+                     data=json.dumps({'policy_engine_mode': 'all'}).encode(),
+                     method='PATCH', headers=ak_headers)
+        log('W1: console app policy_engine_mode set to ALL (group AND MFA both required)')
+    # 4) VERIFY the binding really exists + enabled (netbird #4 trap)
+    binds2 = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100',
+                        ak_headers).get('results', [])
+    if not any(b.get('policy') == pol_pk and b.get('enabled') for b in binds2):
+        log('W1: VERIFY FAILED — MFA binding not present after apply'); return False
+    log('W1: SSO MFA enforcement verified on console application (%s)' % app_slug)
+    return True
+
+def _w1_revert_mfa(h, log):
+    """Undo the Authentik MFA enforcement: restore engine_mode, delete binding + policy."""
+    ak_url, ak_headers, _ = _w1_ak_ctx()
+    if not ak_url:
+        log('W1: no Authentik token — skipping MFA unbind'); return
+    w1 = (h.get('applied') or {}).get('W1_sso') or {}
+    try:
+        if w1.get('ak_app_slug'):
+            _ak_api_call(f'{ak_url}/api/v3/core/applications/{w1["ak_app_slug"]}/',
+                         data=json.dumps({'policy_engine_mode': w1.get('ak_prior_engine_mode', 'any')}).encode(),
+                         method='PATCH', headers=ak_headers)
+            log('W1: console app policy_engine_mode restored to %s' % w1.get('ak_prior_engine_mode', 'any'))
+    except Exception as e:
+        log('W1: engine_mode restore error: %s' % str(e)[:120])
+    try:
+        if w1.get('ak_mfa_binding_pk'):
+            _ak_api_call(f'{ak_url}/api/v3/policies/bindings/{w1["ak_mfa_binding_pk"]}/',
+                         method='DELETE', headers=ak_headers)
+            log('W1: MFA policy binding removed from console application')
+    except Exception as e:
+        log('W1: binding delete error: %s' % str(e)[:120])
+    try:
+        if w1.get('ak_mfa_policy_pk'):
+            _ak_api_call(f'{ak_url}/api/v3/policies/expression/{w1["ak_mfa_policy_pk"]}/',
+                         method='DELETE', headers=ak_headers)
+            log('W1: MFA-required policy deleted')
+    except Exception as e:
+        log('W1: policy delete error: %s' % str(e)[:120])
+
+def _w1_caddy_regen(log):
+    """Regenerate + validate + reload Caddy so the /login bypass state matches posture."""
+    try:
+        generate_caddyfile()  # writes CADDYFILE_PATH (honors _w1_console_locked())
+    except Exception as e:
+        log('W1: Caddyfile generation error: %s' % str(e)[:160]); return False
+    # Pre-validate if the caddy binary is reachable; otherwise rely on `systemctl
+    # reload caddy`, which validates internally and refuses a bad config.
+    if subprocess.run('command -v caddy >/dev/null 2>&1', shell=True).returncode == 0:
+        val = subprocess.run('caddy validate --config %s --adapter caddyfile 2>&1' % CADDYFILE_PATH,
+                             shell=True, capture_output=True, text=True, timeout=30)
+        if val.returncode != 0:
+            log('W1: caddy validate FAILED: %s' % (val.stdout or val.stderr or '')[-200:]); return False
+    rl = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    if rl.returncode != 0:
+        log('W1: caddy reload error: %s' % (rl.stdout or rl.stderr or '')[-160:]); return False
+    log('W1: Caddy reloaded'); return True
+
+def _w1_ufw_lock_console(log):
+    """Remove the public :5001 allow (v4+v6). Loopback stays exempt, so SSO + SSH-tunnel
+    break-glass keep working. Returns False if a public allow survives."""
+    port = str((load_settings().get('console_port') or 5001))
+    subprocess.run('sudo ufw delete allow %s/tcp >/dev/null 2>&1; '
+                   'sudo ufw delete allow %s >/dev/null 2>&1; true' % (port, port),
+                   shell=True, capture_output=True, timeout=30)
+    if _w1_console_port_public(port):
+        log('W1: WARNING — :%s still shows a public ALLOW after delete' % port); return False
+    log('W1: UFW public allow for :%s removed (console now localhost-only)' % port); return True
+
+def _w1_ufw_unlock_console(log):
+    port = str((load_settings().get('console_port') or 5001))
+    subprocess.run('sudo ufw allow %s/tcp >/dev/null 2>&1 || ufw allow %s/tcp >/dev/null 2>&1; true'
+                   % (port, port), shell=True, capture_output=True, timeout=30)
+    log('W1: UFW public allow for :%s restored (Standard)' % port)
+
+def _hardening_control_w1():
+    """W1 — console SSO + per-user MFA + :5001 lockdown. Highest risk, so it runs LAST
+    behind W6's working revert. apply is self-cleaning: any sub-step failure rolls back
+    every change W1 already made (the outer transaction does not revert a control that
+    returned False)."""
+    def apply_(h, log):
+        if not _ufw_default_incoming_deny():
+            log('W1: REFUSING — UFW default-incoming is not deny; locking :5001 would not '
+                'actually block external access. Set UFW default deny incoming first.')
+            return False
+        # 1) Authentik MFA (refuses if it would lock everyone out). On failure, clean up
+        # any Authentik objects it recorded before dropping the state.
+        if not _w1_apply_mfa(h, log):
+            _w1_revert_mfa(h, log)
+            (h.get('applied') or {}).pop('W1_sso', None)
+            save_hardening(h)
+            return False
+        w1 = h['applied']['W1_sso']
+        # 2) Caddy: drop the /login bypass (persist flag FIRST so generate_caddyfile sees it)
+        w1['caddy_login_locked'] = True
+        save_hardening(h)
+        if not _w1_caddy_regen(log):
+            w1['caddy_login_locked'] = False; save_hardening(h)
+            _w1_caddy_regen(log)            # restore Standard Caddy
+            _w1_revert_mfa(h, log)          # undo MFA — never leave it half-applied
+            (h.get('applied') or {}).pop('W1_sso', None)
+            return False
+        # 3) UFW: close the public :5001 allow
+        if not _w1_ufw_lock_console(log):
+            w1['caddy_login_locked'] = False; save_hardening(h)
+            _w1_caddy_regen(log)
+            _w1_revert_mfa(h, log)
+            (h.get('applied') or {}).pop('W1_sso', None)
+            return False
+        w1['console_localhost_only'] = True
+        log('W1: console is SSO+MFA only; :5001 localhost-only; password = on-box break-glass')
+        return True
+    def verify(h):
+        w1 = (h.get('applied') or {}).get('W1_sso')
+        if not w1:
+            return (False, 'SSO+MFA flip not applied')
+        port = str((load_settings().get('console_port') or 5001))
+        if _w1_console_port_public(port):
+            return (False, ':%s still has a public UFW allow' % port)
+        if not w1.get('ak_mfa_binding_pk'):
+            return (False, 'MFA policy not bound to console app')
+        return (True, 'SSO+MFA enforced; :%s localhost-only; break-glass on-box' % port)
+    def revert(h, log):
+        # reverse order: UFW unlock → Caddy restore → Authentik unbind
+        _w1_ufw_unlock_console(log)
+        w1 = h.setdefault('applied', {}).setdefault('W1_sso', {})
+        w1['caddy_login_locked'] = False
+        save_hardening(h)
+        _w1_caddy_regen(log)
+        _w1_revert_mfa(h, log)
+        (h.get('applied') or {}).pop('W1_sso', None)
+        log('W1: reverted — password login reachable, :5001 reopened, MFA unbound')
+        return True
+    return {'key': 'W1_sso', 'title': 'Console SSO + per-user MFA',
+            'desc': 'Per-user Authentik SSO with enforced MFA becomes the only network path to the '
+                    'console; :5001 is localhost-only and the shared password is on-box break-glass.',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
 def _hardening_registry():
     """Ordered control list. Apply runs in order; revert runs in reverse.
-    W1 (the risky auth flip) is always LAST so a working revert exists before it.
-    Controls land as their W-item is built: W2/W3/W4 now; W1 appended last."""
+    W1 (the risky auth flip) is always LAST so a working revert exists before it."""
     return [
         _hardening_control_w2(),
         _hardening_control_w3(),
         _hardening_control_w4(),
+        _hardening_control_w1(),
     ]
 
 def _breakglass_status():
@@ -2527,7 +2807,8 @@ def _hardening_report_html(h, settings):
         "This system (infra-TAK TAK stack) carries position and command-and-control data only. "
         "Per agency policy, criminal history (CHRI) and NCIC query results are NOT entered into TAK "
         "markers, chat, or data feeds. Administrative access to the console is per-user via SSO with "
-        "phishing-resistant MFA (AAL2); all administrative actions are logged with the acting user's "
+        "enforced MFA (TOTP or WebAuthn/FIDO2; use WebAuthn for phishing-resistant AAL2); all "
+        "administrative actions are logged with the acting user's "
         "identity and timestamp. The admin console is not exposed to the internet (reachable only "
         "through the authenticated reverse proxy). TLS is served with an agency- or CA-issued "
         "certificate. Break-glass recovery requires on-box shell access and is auditable — it is not a "
@@ -13227,16 +13508,20 @@ def generate_caddyfile(settings=None):
     lines.append(f"        reverse_proxy 127.0.0.1:8080")
     lines.append(f"    }}")
     if ak.get('installed'):
-        lines.append(f"    route /login* {{")
-        lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
-        lines.append(f"            transport http {{")
-        lines.append(f"                tls")
-        lines.append(f"                tls_insecure_skip_verify")
-        lines.append(f"                read_timeout 1h")
-        lines.append(f"                write_timeout 1h")
-        lines.append(f"            }}")
-        lines.append(f"        }}")
-        lines.append(f"    }}")
+        # W1 (Hardened posture): drop the unauthenticated /login bypass so the
+        # shared-password page is no longer a network ingress — SSO+MFA only.
+        # Standard posture keeps it so password login works without Authentik.
+        if not _w1_console_locked():
+            lines.append(f"    route /login* {{")
+            lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
+            lines.append(f"            transport http {{")
+            lines.append(f"                tls")
+            lines.append(f"                tls_insecure_skip_verify")
+            lines.append(f"                read_timeout 1h")
+            lines.append(f"                write_timeout 1h")
+            lines.append(f"            }}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
         lines.append(f"    route {{")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         lines.append(f"        forward_auth {ak_up} {{")
