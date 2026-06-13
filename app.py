@@ -25047,6 +25047,19 @@ function renderStatus(d){
   var banner=document.getElementById('posture-banner');
   banner.className='status-banner '+(hardened?'running':'stopped');
   document.getElementById('posture-text').innerHTML='Current posture: <strong>'+(hardened?'HARDENED':'STANDARD')+'</strong>'+(hardened?' — security controls enforced':' — default behavior, nothing enforced');
+  // Posture-aware action buttons: the blue (primary) button is always the move AWAY from current state.
+  var applyBtn=document.getElementById('apply-btn'),revertBtn=document.getElementById('revert-btn');
+  if(hardened){
+    applyBtn.className='btn btn-ghost';applyBtn.disabled=true;
+    applyBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">check</span>Hardened posture active';
+    revertBtn.className='btn btn-primary';revertBtn.disabled=false;
+    revertBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard';
+  }else{
+    applyBtn.className='btn btn-primary';applyBtn.disabled=false;
+    applyBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture';
+    revertBtn.className='btn btn-ghost';revertBtn.disabled=true;
+    revertBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard';
+  }
   var html='';
   (d.controls||[]).forEach(function(c){
     var on=hardened&&c.pass;
