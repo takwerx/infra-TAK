@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.54-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.54-alpha)**
+**Current release: [v0.9.55-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.55-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.55-alpha — 2026-06-13 — Cyber Controls: one-click SSO + MFA hardening
+
+**Headline: flip your whole TAK stack into a hardened security posture in one click — and back out just as easily.** The new **Cyber Controls** page adds a Standard↔Hardened toggle that closes the security gaps a reviewer fails a system for, then self-documents what it did. In Hardened posture: **per-user single sign-on with enforced multi-factor authentication on every app behind Authentik** (console, Node-RED, TAK Portal, WebODM, MediaMTX, NetBird), with MFA **force-enrolled at first login** so no account slips through; the **admin console is taken off the public internet** (reachable only through authenticated SSO) and its shared password becomes an **on-box break-glass** recovery, not a network login; a **30-minute idle auto-logout**; a **per-user audit log** (who/what/when); read-only **boundary checks** (firewall deny-by-default, intrusion prevention, TAK Tomcat exposure); and a printable **readiness report** plus an editable "what to tell your security office" statement. Every control is reversible with one click, and the on-box recovery path means hardening can never permanently lock you out. TAK clients (ATAK/iTAK/CloudTAK) and TAK Server keep their native authentication and are unaffected. Login screens also got plainer, on-brand wording. **Upgrade:** the Cyber Controls page appears automatically; the default stays **Standard** (no change to current behavior) — enroll an MFA device, then flip to Hardened when you're ready.
+
+Full notes: [v0.9.55-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.55-alpha).
 
 ### v0.9.54-alpha — 2026-06-12 — Guard Dog catches slow-disk stalls + CloudTAK update reliability
 
