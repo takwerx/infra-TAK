@@ -2494,8 +2494,8 @@ def _w1_setup_stage_pks(ak_url, ak_headers):
 # clearly. Idempotent; applied by a startup migration when Authentik is present.
 AK_BRAND_TITLE = 'infra-TAK'
 AK_AUTH_FLOW_TITLE = 'Sign in'
-AK_TOTP_FRIENDLY = 'Authenticator App — scan a QR code'
-AK_WEBAUTHN_FRIENDLY = 'Passkey'
+AK_TOTP_FRIENDLY = 'Authenticator App - Scan a QR code'
+AK_WEBAUTHN_FRIENDLY = 'Use a Passkey'
 
 def _ensure_authentik_login_copy(log=None):
     """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
