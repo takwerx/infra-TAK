@@ -2124,15 +2124,34 @@ def is_hardened():
     return _hardening_posture() == 'hardened'
 
 # --- W2: 30-minute server-side session idle lock ---------------------------
-# The control's apply/verify/revert only records intent in hardening.json; the
-# authoritative enforcement is this before_request hook, which is always present
-# but only bites when posture == 'hardened'. Under the password-auth path this is
-# the full lock. KNOWN GAP under SSO (W1): clearing the Flask session redirects
-# through Caddy forward_auth, which re-validates against a still-live Authentik
-# session and silently re-authenticates — so the idle lock refreshes rather than
-# re-prompting. Making it re-prompt needs an Authentik session-duration mirror
-# (brand/flow), which is fleet-affecting and not yet built/tested — tracked as the
-# top W1 follow-up; do not claim a working SSO idle-lock until it is validated.
+# --- W-IDLE (v0.9.56): make that lock truly re-prompt under SSO ------------
+WIDLE_STATE_KEY = 'WIDLE_sso'
+# The forward_auth embedded outpost's sign-out path. Lives on the protected host
+# (infratak.<fqdn>); Caddy routes /outpost.goauthentik.io/* to the Authentik outpost.
+# Hitting it clears the outpost session so the next request forces a full re-prompt.
+# (Confirm the exact path on a live forward_auth box before declaring the gap closed.)
+AK_FORWARD_AUTH_SIGNOUT = '/outpost.goauthentik.io/sign_out'
+
+def _widle_sso_logout_active(h):
+    """v0.9.56 W-IDLE — True when an idle lock must force a TRUE SSO re-prompt by signing the
+    browser out of the forward_auth outpost (not merely clearing the Flask session). Active only
+    when the W-IDLE control is applied AND W1 has SSO-locked the console (forward_auth is the
+    ingress that would otherwise silently re-auth). On the password break-glass path W1 is not
+    locked → False → W2 falls back to a plain session.clear()."""
+    try:
+        return bool((h.get('applied') or {}).get(WIDLE_STATE_KEY)) and _w1_console_locked()
+    except Exception:
+        return False
+
+# The W2 control's apply/verify/revert only record intent in hardening.json; the
+# authoritative enforcement is this before_request hook, always present but only
+# biting when posture == 'hardened'. On the password-auth path, clearing the Flask
+# session IS the full lock. Under SSO (W1) that alone is silently re-authed by
+# forward_auth against a still-live Authentik session — so when W-IDLE is armed we
+# additionally sign the browser out of the outpost, forcing a fresh login + MFA.
+# Fail-safe: the Flask session is cleared first, so even if sign-out is unreachable
+# the local lock still holds (it just may silently re-auth on that box — which is
+# why the SSO re-prompt is not claimed working until validated on a real box).
 @app.before_request
 def _enforce_session_idle_lock():
     try:
@@ -2146,9 +2165,12 @@ def _enforce_session_idle_lock():
         now = int(time.time())
         last = session.get('last_activity')
         if last is not None and (now - int(last)) > idle_max:
-            session.clear()
+            session.clear()  # local lock always holds, regardless of what follows
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+            if _widle_sso_logout_active(h):
+                # Sign out of the forward_auth outpost on this same host → next request re-prompts.
+                return redirect(request.host_url.rstrip('/') + AK_FORWARD_AUTH_SIGNOUT)
             return redirect(url_for('login'))
         session['last_activity'] = now
     except Exception:
@@ -2172,6 +2194,35 @@ def _hardening_control_w2():
         return True
     return {'key': 'W2_session', 'title': '30-minute session lock',
             'desc': 'Server-side idle timeout forces re-authentication after 30 minutes (CJIS 5.5.5).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
+def _hardening_control_widle():
+    """W-IDLE (v0.9.56) — make the W2 idle lock truly re-prompt under SSO. With W1's forward_auth
+    ingress, a plain session.clear() is silently re-authed by Authentik; this arms the W2 hook
+    (_enforce_session_idle_lock) to instead sign the browser out of the forward_auth outpost on
+    idle. State-only control — the enforcement is the always-present hook, gated on this applied
+    flag AND W1 having SSO-locked the console (so it is inert on a password-only box)."""
+    def apply_(h, log):
+        h.setdefault('applied', {})[WIDLE_STATE_KEY] = {
+            'mode': 'sso_signout', 'signout_path': AK_FORWARD_AUTH_SIGNOUT}
+        log('W-IDLE: SSO idle-lock re-prompt armed (forward_auth sign-out on %d-min idle)'
+            % (SESSION_IDLE_MAX_DEFAULT // 60))
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get(WIDLE_STATE_KEY)
+        if not a:
+            return (False, 'SSO idle-lock re-prompt not armed')
+        if not _w1_console_locked():
+            return (True, 'armed; inert until W1 SSO-locks the console')
+        return (True, 'idle lock forces SSO re-auth via %s' % a.get('signout_path', AK_FORWARD_AUTH_SIGNOUT))
+    def revert(h, log):
+        (h.get('applied') or {}).pop(WIDLE_STATE_KEY, None)
+        log('W-IDLE: SSO idle-lock re-prompt disarmed (W2 falls back to local session clear)')
+        return True
+    return {'key': WIDLE_STATE_KEY, 'title': 'SSO idle-lock re-prompt',
+            'desc': 'Under SSO the 30-minute idle lock signs you out of Authentik, so re-access needs '
+                    'a fresh login + MFA instead of a silent re-auth. Because an SSO session is shared, '
+                    'this logs you out of all Authentik-fronted apps at once.',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
 # --- W3: local per-user audit log (JSONL) ----------------------------------
@@ -2833,6 +2884,7 @@ def _hardening_registry():
     W1 (the risky auth flip) is always LAST so a working revert exists before it."""
     return [
         _hardening_control_w2(),
+        _hardening_control_widle(),
         _hardening_control_w3(),
         _hardening_control_w4(),
         _hardening_control_w1(),
