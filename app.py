@@ -2440,115 +2440,181 @@ def _w1_ak_ctx():
 def _w1_ak_get(ak_url, path, ak_headers):
     return json.loads(_ak_api_call(f'{ak_url}/api/v3/{path}', headers=ak_headers).read().decode())
 
-def _w1_console_app(ak_url, ak_headers, settings):
-    """Locate the console (infra-TAK) proxy application by matching the proxy
-    provider's external_host to infratak.<fqdn>. (app_pk, app_slug, prov_pk) or Nones."""
-    infratak_host = (_get_all_service_domains(settings).get('infratak') or '').lower()
-    if not infratak_host:
-        return (None, None, None)
-    provs = _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', [])
-    prov_pk = next((p.get('pk') for p in provs
-                    if infratak_host in (p.get('external_host') or '').lower()), None)
-    if not prov_pk:
-        return (None, None, None)
-    apps = _w1_ak_get(ak_url, 'core/applications/?superuser_full_list=true&page_size=100',
-                      ak_headers).get('results', [])
-    for a in apps:
-        if a.get('provider') == prov_pk:
-            return (a.get('pk'), a.get('slug'), prov_pk)
-    return (None, None, prov_pk)
-
-def _w1_mfa_device_count(ak_url, ak_headers):
-    """Count configured MFA devices instance-wide. 0 → applying W1 would lock every
-    SSO user out of the console, so apply refuses. None on error (treated as unknown)."""
+def _w1_login_apps(ak_url, ak_headers):
+    """All Authentik LOGIN applications behind Authentik = every app whose provider is NOT
+    an LDAP provider (the LDAP app is the TAK EUD bind path and MUST stay MFA-free, else
+    ATAK/iTAK auth breaks). Returns [(slug, app_pk)]. No hard-coded slugs (fleet-robust)."""
+    ldap_pks = set()
     try:
-        d = _w1_ak_get(ak_url, 'authenticators/admin/all/?page_size=1000', ak_headers)
-        return len(d if isinstance(d, list) else d.get('results', []))
+        for p in _w1_ak_get(ak_url, 'providers/ldap/?page_size=100', ak_headers).get('results', []):
+            ldap_pks.add(p.get('pk'))
     except Exception:
-        return None
+        pass
+    out = []
+    for a in _w1_ak_get(ak_url, 'core/applications/?superuser_full_list=true&page_size=100',
+                        ak_headers).get('results', []):
+        prov = a.get('provider')
+        if prov and prov not in ldap_pks:
+            out.append((a.get('slug'), a.get('pk')))
+    return out
 
-def _w1_apply_mfa(h, log):
-    """Enforce per-user MFA on the console Authentik application. Idempotent; verifies
-    the binding actually lands before returning True. Stores pks for clean revert."""
-    ak_url, ak_headers, settings = _w1_ak_ctx()
-    if not ak_url:
-        log('W1: no Authentik token — cannot enforce SSO MFA'); return False
-    app_pk, app_slug, prov_pk = _w1_console_app(ak_url, ak_headers, settings)
-    if not app_pk:
-        log('W1: console Authentik application not found (infra-TAK proxy app missing)'); return False
-    n = _w1_mfa_device_count(ak_url, ak_headers)
-    if n == 0:
-        log('W1: REFUSING — no MFA devices enrolled in Authentik. Enroll TOTP/WebAuthn for '
-            'an admin first (Authentik > User settings) or every SSO login is locked out.')
-        return False
-    # Record identifiers into hardening.json AS WE GO so revert can clean up even if a
-    # later step fails (the outer transaction won't revert a control that returned False).
-    w1 = h.setdefault('applied', {}).setdefault('W1_sso', {})
-    w1.update({'ak_app_slug': app_slug, 'ak_app_pk': app_pk,
-               'ak_prior_engine_mode': _w1_ak_get(ak_url, f'core/applications/{app_slug}/',
-                                                  ak_headers).get('policy_engine_mode', 'any')})
-    # 1) expression policy requiring a configured authenticator
+def _w1_mfa_validate_stage(ak_url, ak_headers):
+    """The authenticator-validate stage bound to default-authentication-flow (the WEB login
+    flow — NOT the LDAP flow). Force-enroll is configured here. (stage_pk, detail) or (None,None)."""
+    flows = _w1_ak_get(ak_url, 'flows/instances/?slug=default-authentication-flow', ak_headers).get('results', [])
+    if not flows:
+        return (None, None)
+    flow_pk = flows[0].get('pk')
+    for b in _w1_ak_get(ak_url, f'flows/bindings/?target={flow_pk}&page_size=100', ak_headers).get('results', []):
+        st = b.get('stage_obj') or {}
+        name = (st.get('name') or '') + ' ' + (st.get('verbose_name') or '')
+        if 'validat' in name.lower():
+            try:
+                d = _w1_ak_get(ak_url, f'stages/authenticator/validate/{st.get("pk")}/', ak_headers)
+                if 'not_configured_action' in d:
+                    return (st.get('pk'), d)
+            except Exception:
+                continue
+    return (None, None)
+
+def _w1_setup_stage_pks(ak_url, ak_headers):
+    """TOTP + WebAuthn authenticator SETUP stage pks (configuration_stages for force-enroll)."""
+    pks = []
+    for kind in ('totp', 'webauthn'):
+        try:
+            for s in _w1_ak_get(ak_url, f'stages/authenticator/{kind}/?page_size=20', ak_headers).get('results', []):
+                pks.append(s.get('pk'))
+        except Exception:
+            pass
+    return pks
+
+def _w1_ensure_mfa_policy(ak_url, ak_headers, log):
+    """Ensure the shared require-MFA expression policy exists; return its pk."""
     pols = _w1_ak_get(ak_url, f'policies/expression/?search={W1_MFA_POLICY_NAME}&page_size=100',
                       ak_headers).get('results', [])
     pol_pk = next((p.get('pk') for p in pols if p.get('name') == W1_MFA_POLICY_NAME), None)
-    if not pol_pk:
-        body = json.dumps({'name': W1_MFA_POLICY_NAME, 'execution_logging': False,
-                           'expression': W1_MFA_POLICY_EXPR}).encode()
-        pol_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/expression/', data=body,
-                            method='POST', headers=ak_headers).read().decode()).get('pk')
-        log('W1: created MFA-required policy (%s)' % W1_MFA_POLICY_NAME)
-    else:
-        log('W1: MFA-required policy already present')
+    if pol_pk:
+        return pol_pk
+    body = json.dumps({'name': W1_MFA_POLICY_NAME, 'execution_logging': False,
+                       'expression': W1_MFA_POLICY_EXPR}).encode()
+    pol_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/expression/', data=body,
+                        method='POST', headers=ak_headers).read().decode()).get('pk')
+    log('W1: created MFA-required policy (%s)' % W1_MFA_POLICY_NAME)
+    return pol_pk
+
+def _w1_apply_mfa(h, log):
+    """All-or-none: enforce per-user MFA on EVERY Authentik login app + force MFA enrollment
+    globally on the WEB auth flow. Lockout-safe order — force-enroll FIRST (a device-less user
+    is walked through enrollment at login instead of being denied), THEN bind the deny-policy
+    to each app. Idempotent; verifies each binding lands (per-app netbird #4 trap); records
+    everything for clean revert. The LDAP flow is never touched (TAK client auth unaffected)."""
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        log('W1: no Authentik token — cannot enforce SSO MFA'); return False
+    w1 = h.setdefault('applied', {}).setdefault('W1_sso', {})
+
+    # 0) shared require-MFA policy
+    pol_pk = _w1_ensure_mfa_policy(ak_url, ak_headers, log)
     w1['ak_mfa_policy_pk'] = pol_pk
-    # 2) bind policy → console application
-    binds = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100',
-                       ak_headers).get('results', [])
-    bind_pk = next((b.get('pk') for b in binds if b.get('policy') == pol_pk), None)
-    if not bind_pk:
-        body = json.dumps({'policy': pol_pk, 'target': app_pk, 'enabled': True,
-                           'order': 10, 'timeout': 30, 'failure_result': False}).encode()
-        bind_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/bindings/', data=body,
-                             method='POST', headers=ak_headers).read().decode()).get('pk')
-        log('W1: bound MFA policy to console application')
-    else:
-        log('W1: MFA policy already bound to console application')
-    w1['ak_mfa_binding_pk'] = bind_pk
-    save_hardening(h)  # persist pks before the (rarely-failing) verify, so revert can clean up
-    # 3) require ALL bindings (Admins group AND MFA), not ANY
-    if w1.get('ak_prior_engine_mode') != 'all':
-        _ak_api_call(f'{ak_url}/api/v3/core/applications/{app_slug}/',
-                     data=json.dumps({'policy_engine_mode': 'all'}).encode(),
+
+    # 1) FORCE-ENROLL FIRST on the web auth flow — after this, nobody can be locked out
+    stage_pk, stage = _w1_mfa_validate_stage(ak_url, ak_headers)
+    if not stage_pk:
+        log("W1: could not locate the web MFA validate stage — aborting (won't bind deny-policies "
+            'without the force-enroll safety net)'); return False
+    setup_pks = _w1_setup_stage_pks(ak_url, ak_headers)
+    if not setup_pks:
+        log('W1: no TOTP/WebAuthn setup stages found — aborting (force-enroll needs a setup stage)')
+        return False
+    if 'ak_force_enroll' not in w1:  # record the TRUE prior only once
+        w1['ak_force_enroll'] = {'stage_pk': stage_pk,
+                                 'prior_not_configured_action': stage.get('not_configured_action'),
+                                 'prior_configuration_stages': stage.get('configuration_stages') or []}
+        save_hardening(h)
+    if stage.get('not_configured_action') != 'configure' or not stage.get('configuration_stages'):
+        _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/validate/{stage_pk}/',
+                     data=json.dumps({'not_configured_action': 'configure',
+                                      'configuration_stages': setup_pks}).encode(),
                      method='PATCH', headers=ak_headers)
-        log('W1: console app policy_engine_mode set to ALL (group AND MFA both required)')
-    # 4) VERIFY the binding really exists + enabled (netbird #4 trap)
-    binds2 = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100',
-                        ak_headers).get('results', [])
-    if not any(b.get('policy') == pol_pk and b.get('enabled') for b in binds2):
-        log('W1: VERIFY FAILED — MFA binding not present after apply'); return False
-    log('W1: SSO MFA enforcement verified on console application (%s)' % app_slug)
+        log('W1: force-enroll ON (web login walks device-less users through TOTP/WebAuthn setup)')
+    chk = _w1_ak_get(ak_url, f'stages/authenticator/validate/{stage_pk}/', ak_headers)
+    if chk.get('not_configured_action') != 'configure' or not chk.get('configuration_stages'):
+        log('W1: VERIFY FAILED — force-enroll did not stick; aborting before binding deny-policies')
+        return False
+
+    # 2) bind require-MFA to EVERY login app + policy_engine_mode=all
+    apps = _w1_login_apps(ak_url, ak_headers)
+    if not apps:
+        log('W1: no Authentik login apps found — aborting'); return False
+    rec = w1.setdefault('ak_apps', {})
+    for slug, app_pk in apps:
+        prior_mode = _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode', 'any')
+        binds = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100', ak_headers).get('results', [])
+        bind_pk = next((b.get('pk') for b in binds if b.get('policy') == pol_pk), None)
+        if not bind_pk:
+            body = json.dumps({'policy': pol_pk, 'target': app_pk, 'enabled': True,
+                               'order': 10, 'timeout': 30, 'failure_result': False}).encode()
+            bind_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/bindings/', data=body,
+                                 method='POST', headers=ak_headers).read().decode()).get('pk')
+        rec[slug] = {'app_pk': app_pk, 'binding_pk': bind_pk,
+                     'prior_engine_mode': (rec.get(slug, {}).get('prior_engine_mode') or prior_mode)}
+        if prior_mode != 'all':
+            _ak_api_call(f'{ak_url}/api/v3/core/applications/{slug}/',
+                         data=json.dumps({'policy_engine_mode': 'all'}).encode(),
+                         method='PATCH', headers=ak_headers)
+        save_hardening(h)
+        binds2 = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100', ak_headers).get('results', [])
+        if not any(b.get('policy') == pol_pk and b.get('enabled') for b in binds2):
+            log('W1: VERIFY FAILED — MFA binding missing on app %s' % slug); return False
+    w1['ak_app_slug'] = 'infratak'  # console marker for W4 assertion compatibility
+    log('W1: MFA enforced on %d Authentik apps + force-enroll ON (%s)'
+        % (len(apps), ', '.join(s for s, _ in apps)))
     return True
 
 def _w1_revert_mfa(h, log):
-    """Undo the Authentik MFA enforcement: restore engine_mode, delete binding + policy."""
+    """Undo MFA-everywhere: restore the force-enroll stage, delete each app binding + restore
+    its engine_mode, delete the shared policy. Idempotent; never raises."""
     ak_url, ak_headers, _ = _w1_ak_ctx()
     if not ak_url:
         log('W1: no Authentik token — skipping MFA unbind'); return
     w1 = (h.get('applied') or {}).get('W1_sso') or {}
-    try:
-        if w1.get('ak_app_slug'):
+    fe = w1.get('ak_force_enroll') or {}
+    if fe.get('stage_pk'):
+        try:
+            _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/validate/{fe["stage_pk"]}/',
+                         data=json.dumps({'not_configured_action': fe.get('prior_not_configured_action') or 'skip',
+                                          'configuration_stages': fe.get('prior_configuration_stages') or []}).encode(),
+                         method='PATCH', headers=ak_headers)
+            log('W1: force-enroll restored to prior (%s)' % (fe.get('prior_not_configured_action') or 'skip'))
+        except Exception as e:
+            log('W1: force-enroll restore error: %s' % str(e)[:120])
+    for slug, info in (w1.get('ak_apps') or {}).items():
+        try:
+            if info.get('binding_pk'):
+                _ak_api_call(f'{ak_url}/api/v3/policies/bindings/{info["binding_pk"]}/',
+                             method='DELETE', headers=ak_headers)
+        except Exception as e:
+            log('W1: binding delete error (%s): %s' % (slug, str(e)[:100]))
+        try:
+            _ak_api_call(f'{ak_url}/api/v3/core/applications/{slug}/',
+                         data=json.dumps({'policy_engine_mode': info.get('prior_engine_mode', 'any')}).encode(),
+                         method='PATCH', headers=ak_headers)
+        except Exception as e:
+            log('W1: engine_mode restore error (%s): %s' % (slug, str(e)[:100]))
+    if w1.get('ak_apps'):
+        log('W1: MFA bindings removed from %d apps; engine_mode restored' % len(w1['ak_apps']))
+    # Backward-compat: pre-MFA-everywhere single-app state (ak_app_slug/ak_mfa_binding_pk).
+    if w1.get('ak_app_slug') and not w1.get('ak_apps'):
+        try:
+            if w1.get('ak_mfa_binding_pk'):
+                _ak_api_call(f'{ak_url}/api/v3/policies/bindings/{w1["ak_mfa_binding_pk"]}/',
+                             method='DELETE', headers=ak_headers)
             _ak_api_call(f'{ak_url}/api/v3/core/applications/{w1["ak_app_slug"]}/',
                          data=json.dumps({'policy_engine_mode': w1.get('ak_prior_engine_mode', 'any')}).encode(),
                          method='PATCH', headers=ak_headers)
-            log('W1: console app policy_engine_mode restored to %s' % w1.get('ak_prior_engine_mode', 'any'))
-    except Exception as e:
-        log('W1: engine_mode restore error: %s' % str(e)[:120])
-    try:
-        if w1.get('ak_mfa_binding_pk'):
-            _ak_api_call(f'{ak_url}/api/v3/policies/bindings/{w1["ak_mfa_binding_pk"]}/',
-                         method='DELETE', headers=ak_headers)
-            log('W1: MFA policy binding removed from console application')
-    except Exception as e:
-        log('W1: binding delete error: %s' % str(e)[:120])
+            log('W1: legacy single-app MFA binding reverted (%s)' % w1['ak_app_slug'])
+        except Exception as e:
+            log('W1: legacy revert error: %s' % str(e)[:100])
     try:
         if w1.get('ak_mfa_policy_pk'):
             _ak_api_call(f'{ak_url}/api/v3/policies/expression/{w1["ak_mfa_policy_pk"]}/',
@@ -2636,9 +2702,13 @@ def _hardening_control_w1():
         port = str((load_settings().get('console_port') or 5001))
         if _w1_console_port_public(port):
             return (False, ':%s still has a public UFW allow' % port)
-        if not w1.get('ak_mfa_binding_pk'):
-            return (False, 'MFA policy not bound to console app')
-        return (True, 'SSO+MFA enforced; :%s localhost-only; break-glass on-box' % port)
+        napps = len(w1.get('ak_apps') or {})
+        if not napps:
+            return (False, 'MFA policy not bound to any Authentik app')
+        if not (w1.get('ak_force_enroll') or {}).get('stage_pk'):
+            return (False, 'MFA force-enroll not configured')
+        return (True, 'SSO+MFA on %d Authentik apps + force-enroll; :%s localhost-only; break-glass on-box'
+                % (napps, port))
     def revert(h, log):
         # reverse order: UFW unlock → Caddy restore → Authentik unbind
         _w1_ufw_unlock_console(log)
@@ -2650,9 +2720,11 @@ def _hardening_control_w1():
         (h.get('applied') or {}).pop('W1_sso', None)
         log('W1: reverted — password login reachable, :5001 reopened, MFA unbound')
         return True
-    return {'key': 'W1_sso', 'title': 'Console SSO + per-user MFA',
-            'desc': 'Per-user Authentik SSO with enforced MFA becomes the only network path to the '
-                    'console; :5001 is localhost-only and the shared password is on-box break-glass.',
+    return {'key': 'W1_sso', 'title': 'SSO + per-user MFA (all Authentik apps)',
+            'desc': 'Per-user MFA is enforced on every app behind Authentik (console, Node-RED, TAK '
+                    'Portal, WebODM, MediaMTX, NetBird) with force-enrollment at first login; the '
+                    'console :5001 is localhost-only and its shared password is on-box break-glass. '
+                    'TAK Server, CloudTAK and TAK clients use their own native auth (not behind Authentik).',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
 def _hardening_registry():
