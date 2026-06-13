@@ -2164,15 +2164,26 @@ def _enforce_session_idle_lock():
         idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
         now = int(time.time())
         last = session.get('last_activity')
+        # "Activity" must mean a real USER action, not the page's own background polling.
+        # The console dashboard auto-refreshes /api/metrics every 5s, module cards every 8s,
+        # etc. — if every request reset the clock, last_activity would never age past a few
+        # seconds and the idle lock could NEVER fire while a tab is open (it silently didn't —
+        # caught in v0.9.56 W-IDLE validation; the shipped W2 lock had the same hole). So a
+        # read-only GET to /api/* (a poll/data-fetch) does NOT count as activity; only a page
+        # navigation (non-/api GET) or a state-changing call (POST/PUT/PATCH/DELETE) does.
+        is_poll = request.path.startswith('/api/') and request.method == 'GET'
         if last is not None and (now - int(last)) > idle_max:
-            session.clear()  # local lock always holds, regardless of what follows
             if request.path.startswith('/api/'):
+                # Don't reset the clock or kill the SSO session on a background poll — just
+                # signal expiry. The true re-prompt fires on the next full-page navigation.
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+            session.clear()  # local lock always holds, regardless of what follows
             if _widle_sso_logout_active(h):
                 # Sign out of the forward_auth outpost on this same host → next request re-prompts.
                 return redirect(request.host_url.rstrip('/') + AK_FORWARD_AUTH_SIGNOUT)
             return redirect(url_for('login'))
-        session['last_activity'] = now
+        if not is_poll:
+            session['last_activity'] = now
     except Exception:
         # A lock failure must never brick a request — fail open to the normal flow.
         return
