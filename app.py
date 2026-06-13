@@ -313,16 +313,23 @@ def _request_host_is_ip():
 
 @app.before_request
 def ensure_session_cookie_domain():
-    """When access is via IP (backdoor), do not set cookie domain so the cookie is sent. Otherwise use FQDN for cross-subdomain."""
-    if _request_host_is_ip():
+    """Pin the session cookie to the FQDN ONLY when the request actually arrives on the FQDN
+    (SSO at infratak.<fqdn>, which needs the cross-subdomain cookie). For ANY other host — a bare
+    IP, `localhost`, or the SSH-tunnel break-glass path — use a host-only cookie. Otherwise the
+    browser silently drops a `.<fqdn>`-scoped cookie that was set over localhost/IP, the session
+    never persists, and the break-glass login bounces back to /login ('flash'). The earlier code
+    only special-cased a literal IP, so `https://localhost:5001` break-glass was broken on every
+    box that has an FQDN configured. (Found 2026-06-13 validating W-IDLE break-glass on test6.)"""
+    host = (request.host or '').split(':')[0].lower()
+    fqdn = ''
+    try:
+        fqdn = (load_settings().get('fqdn') or '').split(':')[0].lower()
+    except Exception:
+        fqdn = ''
+    if fqdn and (host == fqdn or host.endswith('.' + fqdn)):
+        app.config['SESSION_COOKIE_DOMAIN'] = '.' + fqdn
+    else:
         app.config['SESSION_COOKIE_DOMAIN'] = False
-    elif not app.config.get('SESSION_COOKIE_DOMAIN'):
-        try:
-            s = load_settings()
-            if s.get('fqdn'):
-                app.config['SESSION_COOKIE_DOMAIN'] = '.' + s['fqdn'].split(':')[0]
-        except Exception:
-            pass
 
     # Baseline rate limiting
     ip = _client_ip()
