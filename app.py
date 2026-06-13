@@ -2905,8 +2905,8 @@ def _hardening_report_html(h, settings):
     for c in _hardening_registry():
         ok, detail = c['verify'](h)
         st = 'pass' if ok else ('na' if posture != 'hardened' else 'fail')
-        ctl_rows.append('<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>'
-                        % (html.escape(c['key']), html.escape(c['title']), badge(st), html.escape(detail)))
+        ctl_rows.append('<tr><td>%s</td><td>%s</td><td>%s</td></tr>'
+                        % (html.escape(c['title']), badge(st), html.escape(detail)))
 
     # Boundary assertions (W4)
     asrt_rows = []
@@ -2964,7 +2964,7 @@ th{background:#f1f5f9}.meta{color:#475569;font-size:12px}code{background:#f1f5f9
     parts.append('<p class="note">Self-deploy evidence document. infra-TAK is not "CJIS certified" — no software is. '
                  'This maps the technical controls this box provides versus those the agency and cloud provider own.</p>')
 
-    parts.append('<h2>1. Posture controls</h2><table><tr><th>Control</th><th>Title</th><th>Status</th><th>Detail</th></tr>'
+    parts.append('<h2>1. Posture controls</h2><table><tr><th>Control</th><th>Status</th><th>Detail</th></tr>'
                  + ''.join(ctl_rows) + '</table>')
 
     parts.append('<h2>2. Boundary assertions (read-only)</h2><table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>'
@@ -25621,7 +25621,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .ctl-health{width:9px;height:9px;border-radius:50%;flex-shrink:0;margin-top:5px;background:var(--text-dim)}
 .ctl-health.pass{background:var(--green);box-shadow:0 0 5px var(--green)}
 .ctl-health.off{background:var(--text-dim)}
-.ctl-key{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);min-width:96px;flex-shrink:0;margin-top:2px}
 .ctl-body{flex:1}.ctl-title{font-weight:600;font-size:13px}.ctl-desc{color:var(--text-secondary);font-size:12px;line-height:1.5;margin-top:3px}
 .ctl-detail{color:var(--text-dim);font-size:11px;font-family:'JetBrains Mono',monospace;margin-top:4px}
 .bg-ok{color:var(--green);font-weight:600}.bg-bad{color:var(--red);font-weight:600}
@@ -25699,7 +25698,6 @@ function renderStatus(d){
   (d.controls||[]).forEach(function(c){
     var on=hardened&&c.pass;
     html+='<div class="ctl-row"><div class="ctl-health '+(on?'pass':'off')+'"></div>'+
-      '<div class="ctl-key">'+esc(c.key)+'</div>'+
       '<div class="ctl-body"><div class="ctl-title">'+esc(c.title)+'</div>'+
       '<div class="ctl-desc">'+esc(c.desc||'')+'</div>'+
       '<div class="ctl-detail">'+(on?'ENFORCED':'not applied')+' — '+esc(c.detail||'')+'</div></div></div>';
