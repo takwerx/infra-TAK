@@ -2488,6 +2488,57 @@ def _w1_setup_stage_pks(ak_url, ak_headers):
             pass
     return pks
 
+# --- Fleet-uniform Authentik login/MFA copy (clearer than the stock "authentik" text) -
+# Replaces "Welcome to authentik!" / "TOTP Device" / "WebAuthn device" with plain-English
+# wording on every box. Independent of hardening posture — login screens should always read
+# clearly. Idempotent; applied by a startup migration when Authentik is present.
+AK_BRAND_TITLE = 'infra-TAK'
+AK_AUTH_FLOW_TITLE = 'Sign in'
+AK_TOTP_FRIENDLY = 'Authenticator App — scan a QR code'
+AK_WEBAUTHN_FRIENDLY = 'Passkey'
+
+def _ensure_authentik_login_copy(log=None):
+    """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
+    header, and the TOTP/WebAuthn enrollment button labels. Only PATCHes a field that differs
+    (so it's a no-op on subsequent boots). Never raises. Returns True if anything changed."""
+    def _l(m):
+        if log:
+            log(m)
+    ak_url, ak_headers, _ = _w1_ak_ctx()
+    if not ak_url:
+        return False
+    changed = False
+    try:
+        brands = _w1_ak_get(ak_url, 'core/brands/', ak_headers).get('results', [])
+        if brands and brands[0].get('branding_title') != AK_BRAND_TITLE:
+            bid = brands[0].get('brand_uuid') or brands[0].get('pk')
+            _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
+                         data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
+                         method='PATCH', headers=ak_headers)
+            changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
+    except Exception as e:
+        _l('Authentik brand title copy: %s' % str(e)[:100])
+    try:
+        flows = _w1_ak_get(ak_url, 'flows/instances/?slug=default-authentication-flow', ak_headers).get('results', [])
+        if flows and flows[0].get('title') != AK_AUTH_FLOW_TITLE:
+            _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
+                         data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
+                         method='PATCH', headers=ak_headers)
+            changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
+    except Exception as e:
+        _l('Authentik flow title copy: %s' % str(e)[:100])
+    for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
+        try:
+            for s in _w1_ak_get(ak_url, f'stages/authenticator/{kind}/?page_size=20', ak_headers).get('results', []):
+                if s.get('friendly_name') != friendly:
+                    _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
+                                 data=json.dumps({'friendly_name': friendly}).encode(),
+                                 method='PATCH', headers=ak_headers)
+                    changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+        except Exception as e:
+            _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+    return changed
+
 def _w1_ensure_mfa_policy(ak_url, ak_headers, log):
     """Ensure the shared require-MFA expression policy exists; return its pk."""
     pols = _w1_ak_get(ak_url, f'policies/expression/?search={W1_MFA_POLICY_NAME}&page_size=100',
@@ -57209,6 +57260,15 @@ def _startup_migrations():
                     _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_tune_err:
             print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
+
+        # v0.9.55: Fleet-uniform login/MFA copy — replace the stock "Welcome to authentik!" /
+        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Idempotent no-op
+        # once applied; gated on Authentik being present + reachable.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _ensure_authentik_login_copy(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_copy_err:
+            print(f"Startup migration: authentik login copy error (non-fatal): {ak_copy_err}")
 
         # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
         # the recursion fix below, because the recursion fix restarts authentik-server,
