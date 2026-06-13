@@ -2467,39 +2467,137 @@ def hardening_revert():
     audit('hardening:revert', 'posture=standard', force=True)
     return jsonify({'success': True, 'posture': 'standard', 'log': log_lines})
 
+def _hardening_tls_posture(settings):
+    """Honest TLS line for the report. self-deploy boxes vary; never claim FIPS."""
+    mode = (settings.get('ssl_mode') or '').strip().lower()
+    if mode == 'custom':
+        return ('Operator-supplied certificate (BYO TLS, v0.9.51 custom-cert module).',
+                'pass')
+    if mode in ('fqdn', 'letsencrypt'):
+        return ("Let's Encrypt CA-issued certificate.", 'pass')
+    return ('Self-signed certificate — browsers will warn. Remediate with a CA-issued '
+            'or DNS-validated cert (Caddy/custom-cert module) before review.', 'warn')
+
+def _hardening_report_html(h, settings):
+    posture = h.get('posture') or 'standard'
+    host = html.escape(settings.get('fqdn') or settings.get('server_ip') or 'unknown')
+    generated = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    bg = _breakglass_status()
+    tls_text, tls_status = _hardening_tls_posture(settings)
+
+    def badge(status):
+        c = {'pass': '#047857', 'fail': '#b91c1c', 'warn': '#a16207', 'na': '#475569'}.get(status, '#475569')
+        return '<span style="color:%s;font-weight:700">%s</span>' % (c, status.upper())
+
+    # Controls (W2/W3/W4 verify)
+    ctl_rows = []
+    for c in _hardening_registry():
+        ok, detail = c['verify'](h)
+        st = 'pass' if ok else ('na' if posture != 'hardened' else 'fail')
+        ctl_rows.append('<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>'
+                        % (html.escape(c['key']), html.escape(c['title']), badge(st), html.escape(detail)))
+
+    # Boundary assertions (W4)
+    asrt_rows = []
+    for a in _hardening_assertions():
+        asrt_rows.append('<tr><td>%s</td><td>%s</td><td>%s</td></tr>'
+                         % (html.escape(a['label']), badge(a['status']), html.escape(a['detail'])))
+
+    # Control-mapping (provides / agency owns / hosting owns)
+    mapping = [
+        ('Unique-user ID + MFA for admin access', 'infra-TAK (W1 SSO+MFA via Authentik)',
+         'Provision per-user accounts; enroll MFA tokens'),
+        ('30-minute idle session lock', 'infra-TAK (W2)', '—'),
+        ('Audit trail: who/what/when', 'infra-TAK (W3 local)',
+         'Off-box retention &ge;365d to your SIEM/WORM (.56)'),
+        ('Network boundary / least-exposure', 'infra-TAK (W4 UFW+fail2ban, TAK mTLS)',
+         'Cloud security groups / NLB if used'),
+        ('TLS in transit', 'infra-TAK (Caddy/custom-cert)',
+         'FIPS-validated termination = cloud LB or on-prem terminator (.58)'),
+        ('Encryption at rest (CJI stores)', 'Deferred (.58 LUKS/Ubuntu Pro FIPS)',
+         'Provider disk encryption / agency policy'),
+        ('Physical security, US-soil, screened personnel', '—',
+         'Cloud provider (CJIS Security Addendum) + agency'),
+        ('Personnel screening, training, IR plan, agreements', '—', 'Agency (attestation)'),
+    ]
+    map_rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>'
+                       % (m[0], m[1], m[2]) for m in mapping)
+
+    cjso = (
+        "This system (infra-TAK TAK stack) carries position and command-and-control data only. "
+        "Per agency policy, criminal history (CHRI) and NCIC query results are NOT entered into TAK "
+        "markers, chat, or data feeds. Administrative access to the console is per-user via SSO with "
+        "phishing-resistant MFA (AAL2); all administrative actions are logged with the acting user's "
+        "identity and timestamp. The admin console is not exposed to the internet (reachable only "
+        "through the authenticated reverse proxy). TLS is served with an agency- or CA-issued "
+        "certificate. Break-glass recovery requires on-box shell access and is auditable — it is not a "
+        "network backdoor. Hosting is on a US-sovereign cloud region (or agency on-prem); the cloud "
+        "provider owns the physical, personnel, and data-center CJIS controls under its Security Addendum.")
+
+    parts = []
+    parts.append('''<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Security Posture Readiness Report — infra-TAK</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:40px;color:#0f172a;line-height:1.5;max-width:960px}
+h1{font-size:21px;margin-bottom:4px}h2{font-size:15px;margin:26px 0 8px;border-bottom:2px solid #e2e8f0;padding-bottom:4px}
+table{border-collapse:collapse;width:100%;margin:10px 0}td,th{border:1px solid #cbd5e1;padding:7px 11px;font-size:12.5px;text-align:left;vertical-align:top}
+th{background:#f1f5f9}.meta{color:#475569;font-size:12px}code{background:#f1f5f9;padding:1px 5px;border-radius:3px;font-size:11.5px}
+.box{background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px;padding:14px 16px;font-size:12.5px;white-space:pre-wrap}
+.note{font-size:11.5px;color:#64748b;margin-top:4px}
+@media print{body{margin:0}}
+</style></head><body>''')
+    parts.append('<h1>infra-TAK — Security Posture Readiness Report</h1>')
+    parts.append('<p class="meta">Posture: <strong>%s</strong> &middot; Host: %s &middot; Console v%s &middot; Generated %s</p>'
+                 % (html.escape(posture.upper()), host, html.escape(VERSION), html.escape(generated)))
+    parts.append('<p class="note">Self-deploy evidence document. infra-TAK is not "CJIS certified" — no software is. '
+                 'This maps the technical controls this box provides versus those the agency and cloud provider own.</p>')
+
+    parts.append('<h2>1. Posture controls</h2><table><tr><th>Control</th><th>Title</th><th>Status</th><th>Detail</th></tr>'
+                 + ''.join(ctl_rows) + '</table>')
+
+    parts.append('<h2>2. Boundary assertions (read-only)</h2><table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>'
+                 + ''.join(asrt_rows) + '</table>')
+
+    parts.append('<h2>3. TLS / cryptography</h2>')
+    parts.append('<p style="font-size:12.5px">In transit: %s %s</p>' % (badge(tls_status), html.escape(tls_text)))
+    parts.append('<p class="note"><strong>FIPS (honest):</strong> in-transit uses TLS 1.2+ but Caddy/Go is '
+                 '<strong>not</strong> a FIPS-validated cryptographic module — remediate per policy with a FIPS-validated '
+                 'cloud LB or on-prem terminator (.58). At-rest CJI encryption is deferred to .58 (LUKS / Ubuntu Pro FIPS). '
+                 'FIPS 140-2 validations move to NIST&rsquo;s historical list 2026-09-21; target FIPS 140-3 for new procurement.</p>')
+
+    parts.append('<h2>4. Control mapping — who owns what</h2>'
+                 '<table><tr><th>Control area</th><th>infra-TAK provides</th><th>Agency / hosting owns</th></tr>'
+                 + map_rows + '</table>')
+
+    parts.append('<h2>5. Break-glass recovery</h2>')
+    parts.append('<p style="font-size:12.5px">Recovery path: <code>%s</code> &mdash; %s Status: %s.</p>'
+                 % (html.escape(bg['path']), html.escape(bg['note']),
+                    badge('pass' if bg['present'] else 'fail')))
+
+    parts.append('<h2>6. What to tell your security office</h2>')
+    parts.append('<p class="note">Editable starting statement for your CJSO/ISSO — adjust to your environment:</p>')
+    parts.append('<div class="box">%s</div>' % html.escape(cjso))
+
+    parts.append('<h2>7. Deployment guidance — reverse proxy / load balancer</h2>')
+    parts.append('<p style="font-size:12.5px"><strong>No load balancer &ne; non-compliant.</strong> The actual auth '
+                 'boundary is UFW deny-by-default + mTLS client-cert on the TAK Tomcat connectors — a box with no LB is '
+                 'fully defensible on that alone. On real clouds a Network Load Balancer in <strong>TCP passthrough</strong> '
+                 'in front of :8089/:8443 is optional (IP-hiding, flood absorption, HA). An on-box reverse proxy is a '
+                 '<em>want</em>, not a need; any proxy in front of TAK must be TCP passthrough (terminating TLS breaks '
+                 'TAK&rsquo;s client-cert auth). On-box HAProxy is not needed; multi-node HA is out of scope (single-box by design).</p>')
+
+    parts.append('</body></html>')
+    return ''.join(parts)
+
 @app.route('/api/hardening/report')
 @login_required
 def hardening_report():
-    """Readiness Report (W5 — minimal in skeleton, expanded when W5 lands)."""
-    h = load_hardening()
-    settings = load_settings()
-    rows = []
-    for c in _hardening_registry():
-        ok, detail = c['verify'](h)
-        badge = 'PASS' if ok else 'n/a'
-        color = '#10b981' if ok else '#94a3b8'
-        rows.append('<tr><td>%s</td><td>%s</td><td style="color:%s;font-weight:600">%s</td><td>%s</td></tr>'
-                    % (html.escape(c['key']), html.escape(c['title']), color, badge, html.escape(detail)))
-    bg = _breakglass_status()
-    report = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Readiness Report — infra-TAK</title>
-<style>body{font-family:Arial,Helvetica,sans-serif;margin:40px;color:#0f172a}h1{font-size:20px}
-table{border-collapse:collapse;width:100%;margin:16px 0}td,th{border:1px solid #cbd5e1;padding:8px 12px;font-size:13px;text-align:left}
-th{background:#f1f5f9}.meta{color:#475569;font-size:12px}</style></head><body>
-<h1>infra-TAK — Security Posture Readiness Report</h1>
-<p class="meta">Posture: <strong>%s</strong> &middot; Host: %s &middot; Console v%s</p>
-<table><tr><th>Control</th><th>Title</th><th>Status</th><th>Detail</th></tr>%s</table>
-<p class="meta">Break-glass recovery: %s (%s)</p>
-<p class="meta">This is the skeleton report; the full control-mapping and "what to tell your security
-office" template land with W5.</p>
-</body></html>''' % (
-        html.escape(h.get('posture') or 'standard'),
-        html.escape(settings.get('fqdn') or settings.get('server_ip') or 'unknown'),
-        html.escape(VERSION),
-        ''.join(rows),
-        'present' if bg['present'] else 'MISSING',
-        html.escape(bg['path']))
+    """W5 — self-service Readiness Report (printable HTML): control verify results,
+    W4 boundary assertions, TLS/FIPS honesty, control-mapping (provides/agency/hosting
+    owns), break-glass statement, editable CJSO template, and NLB deployment guidance."""
+    html_doc = _hardening_report_html(load_hardening(), load_settings())
     from flask import Response
-    return Response(report, mimetype='text/html')
+    return Response(html_doc, mimetype='text/html')
 
 @app.route('/api/hardening/assertions')
 @login_required
