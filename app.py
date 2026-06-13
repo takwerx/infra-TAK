@@ -2184,12 +2184,17 @@ def _enforce_session_idle_lock():
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
             session.clear()  # local lock always holds, regardless of what follows
             if _widle_sso_logout_active(h):
-                # Sign out of the forward_auth outpost so the next request re-prompts. Target the
-                # SSO Host over https explicitly — Caddy terminates TLS and proxies to gunicorn as
-                # http, and request.host_url could be the loopback :5001 break-glass origin, so
-                # neither the scheme nor host_url can be trusted here. request.host is the SSO host
-                # (infratak.<fqdn>) because _widle_sso_logout_active only fires on forward_auth requests.
-                return redirect('https://%s%s' % (request.host, AK_FORWARD_AUTH_SIGNOUT))
+                # Sign out of the forward_auth outpost so the next request re-prompts. Use the
+                # ABSOLUTE SSO URL captured at apply time — request.host/host_url are the loopback
+                # upstream Caddy proxies to (127.0.0.1:5001), not the SSO vhost. Lazily fall back to
+                # https://infratak.<fqdn> for sessions armed before this URL was stored.
+                surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
+                if not surl:
+                    fqdn = (load_settings() or {}).get('fqdn')
+                    if fqdn:
+                        surl = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
+                if surl:
+                    return redirect(surl)
             return redirect(url_for('login'))
         if not is_poll:
             session['last_activity'] = now
@@ -2223,10 +2228,29 @@ def _hardening_control_widle():
     idle. State-only control — the enforcement is the always-present hook, gated on this applied
     flag AND W1 having SSO-locked the console (so it is inert on a password-only box)."""
     def apply_(h, log):
+        # Capture the console's ABSOLUTE SSO sign-out URL now. It can't be built per-request:
+        # Caddy proxies to gunicorn with the upstream Host (127.0.0.1:5001), so request.host /
+        # request.host_url are the loopback origin, not the SSO vhost. Derive it from the
+        # infra-TAK proxy provider's external_host (fallback: https://infratak.<fqdn>).
+        ak_url, ak_headers, settings = _w1_ak_ctx()
+        signout_url = None
+        try:
+            if ak_url:
+                for p in _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', []):
+                    eh = (p.get('external_host') or '').rstrip('/')
+                    if eh and 'infratak' in eh:
+                        signout_url = eh + AK_FORWARD_AUTH_SIGNOUT
+                        break
+        except Exception as e:
+            log('W-IDLE: proxy lookup failed (%s)' % str(e)[:80])
+        if not signout_url:
+            fqdn = (settings or {}).get('fqdn')
+            if fqdn:
+                signout_url = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
         h.setdefault('applied', {})[WIDLE_STATE_KEY] = {
-            'mode': 'sso_signout', 'signout_path': AK_FORWARD_AUTH_SIGNOUT}
-        log('W-IDLE: SSO idle-lock re-prompt armed (forward_auth sign-out on %d-min idle)'
-            % (SESSION_IDLE_MAX_DEFAULT // 60))
+            'mode': 'sso_signout', 'signout_path': AK_FORWARD_AUTH_SIGNOUT, 'signout_url': signout_url}
+        log('W-IDLE: SSO idle-lock re-prompt armed (sign-out → %s)'
+            % (signout_url or '(unresolved → /login fallback)'))
         return True
     def verify(h):
         a = (h.get('applied') or {}).get(WIDLE_STATE_KEY)
@@ -2234,7 +2258,7 @@ def _hardening_control_widle():
             return (False, 'SSO idle-lock re-prompt not armed')
         if not _w1_console_locked():
             return (True, 'armed; inert until W1 SSO-locks the console')
-        return (True, 'idle lock forces SSO re-auth via %s' % a.get('signout_path', AK_FORWARD_AUTH_SIGNOUT))
+        return (True, 'idle lock forces SSO re-auth via %s' % (a.get('signout_url') or AK_FORWARD_AUTH_SIGNOUT))
     def revert(h, log):
         (h.get('applied') or {}).pop(WIDLE_STATE_KEY, None)
         log('W-IDLE: SSO idle-lock re-prompt disarmed (W2 falls back to local session clear)')
