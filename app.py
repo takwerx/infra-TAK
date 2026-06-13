@@ -26115,6 +26115,78 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div><!-- /mediamtx-enabled-section -->
 </div><!-- /MediaMTX RTSP Jail card -->
 
+<!-- TAK Portal Form Jail -->
+<div class="card" id="takportal-jail-card" style="display:none">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>TAK Portal Form Jail</span>
+<span class="badge badge-red" id="takportal-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="takportal-refresh-btn" onclick="manualTpjRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="takportal-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="takportal-toggle" onchange="toggleTpjJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="takportal-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="takportal-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Bans IPs that <strong>fail</strong> the public <code>/lookup</code> (apparatus credential) and <code>/request-access</code> (self-enrollment) forms — defense-in-depth behind the page CAPTCHA. Successful lookups never count toward a ban. Reads the TAK Portal request log <code>/var/log/tak-portal/lookup.log</code>, which is also the apparatus-lookup audit.</div>
+<div id="takportal-log-hint" style="display:none;font-size:11px;color:var(--yellow);margin-top:8px"></div>
+
+<div id="takportal-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="takportal-banned-toggle" onclick="toggleTpjBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="takportal-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="takportal-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" id="takportal-watching-toggle" onclick="toggleTpjWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="takportal-stat-failed">0</div>
+<div class="stat-label">Currently Watching <span style="font-size:10px;color:var(--text-dim)" id="takportal-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="takportal-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="takportal-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="takportal-ban-search" oninput="filterTpjBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="takportal-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div id="takportal-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within the find window, not yet banned</div>
+<input type="text" id="takportal-watching-search" oninput="filterTpjWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="takportal-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="takportal-cfg-maxretry" value="5" min="1" max="100">
+<div class="form-hint">Failed attempts before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (seconds)</label>
+<input class="form-input" type="number" id="takportal-cfg-findtime" value="600" min="10" max="86400">
+<div class="form-hint">Window to count failures</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="takportal-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveTpjConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /takportal-enabled-section -->
+</div><!-- /TAK Portal Form Jail card -->
+
 <!-- TAK Server Jail -->
 <div class="card" id="tak-jail-card" style="display:none">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -27038,6 +27110,185 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   loadMtxStatus();
   setInterval(function(){ loadMtxStatus(); if (_mtxWatchingPanelOpen) _loadMtxWatchingList(); }, 30000);
+})();
+
+// TAK Portal Form Jail
+(function(){
+  var card = document.getElementById(\'takportal-jail-card\');
+  if (!card) return;
+
+  function loadTpjStatus() {
+    fetch(\'/api/fail2ban/takportal/status\').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      card.style.display = \'\';
+      var badge  = document.getElementById(\'takportal-jail-badge\');
+      var toggle = document.getElementById(\'takportal-toggle\');
+      var sec    = document.getElementById(\'takportal-enabled-section\');
+      var hint   = document.getElementById(\'takportal-log-hint\');
+      if (badge) {
+        if (d.jail_enabled) { badge.className=\'badge badge-green\'; badge.innerHTML=\'<span class="dot dot-pulse"></span>Active\'; }
+        else                { badge.className=\'badge badge-red\';   badge.innerHTML=\'<span class="dot"></span>Disabled\'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      var trk = document.getElementById(\'takportal-toggle-track\');
+      var thb = document.getElementById(\'takportal-toggle-thumb\');
+      if (trk) trk.style.background = d.jail_enabled ? \'var(--green)\' : \'var(--border)\';
+      if (thb) thb.style.transform  = d.jail_enabled ? \'translateX(18px)\' : \'\';
+      if (sec) sec.style.display = d.jail_enabled ? \'\' : \'none\';
+      if (hint) {
+        if (d.jail_enabled && !d.log_present) {
+          hint.style.display = \'\';
+          hint.innerHTML = \'⚠ Jail armed, but the portal log \'+(d.log_path||\'\')+\' has no entries yet — waiting for the TAK Portal writer. It will act as soon as lines arrive.\';
+        } else { hint.style.display = \'none\'; }
+      }
+      if (d.jail_enabled) {
+        document.getElementById(\'takportal-stat-banned\').textContent       = d.currently_banned !== undefined ? d.currently_banned : 0;
+        document.getElementById(\'takportal-stat-failed\').textContent       = d.currently_failed !== undefined ? d.currently_failed : 0;
+        document.getElementById(\'takportal-stat-total-banned\').textContent = d.total_banned      !== undefined ? d.total_banned      : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById(\'takportal-cfg-maxretry\').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById(\'takportal-cfg-findtime\').value = cfg.findtime;
+        if (cfg.bantime)  document.getElementById(\'takportal-cfg-bantime\').value  = Math.round(cfg.bantime / 60);
+        var ips = d.banned_ips || [];
+        window._tpjBannedIps = ips;
+        renderTpjBanList(ips);
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleTpjJail = function() {
+    var enabled = document.getElementById(\'takportal-toggle\').checked;
+    if (!enabled) {
+      fetch(\'/api/fail2ban/takportal/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast(\'TAK Portal form jail disabled.\', \'success\'); loadTpjStatus(); }
+          else { showToast(d.error || \'Failed to disable\', \'error\'); loadTpjStatus(); }
+        }).catch(function(){ showToast(\'Network error\', \'error\'); loadTpjStatus(); });
+    } else {
+      saveTpjConfig();
+    }
+  };
+
+  window.saveTpjConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById(\'takportal-cfg-maxretry\').value) || 5,
+      findtime: parseInt(document.getElementById(\'takportal-cfg-findtime\').value)  || 600,
+      bantime:  (parseInt(document.getElementById(\'takportal-cfg-bantime\').value)  || 60) * 60
+    };
+    fetch(\'/api/fail2ban/takportal/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(\'TAK Portal form jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadTpjStatus(); }
+        else showToast(d.error || \'Save failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window._tpjBannedIps = [];
+  window.renderTpjBanList = function(ips) {
+    var c = document.getElementById(\'takportal-ban-list-container\'); if (!c) return;
+    if (!ips.length) { c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\'; return; }
+    var rows = ips.map(function(ip){
+      return \'<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTpjIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.filterTpjBanList = function() {
+    var q = (document.getElementById(\'takportal-ban-search\').value || \'\').trim().toLowerCase();
+    var filtered = q ? window._tpjBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._tpjBannedIps;
+    renderTpjBanList(filtered);
+  };
+
+  var _tpjWatchingPanelOpen = false;
+  window._tpjWatchingList = [];
+
+  window.renderTpjWatchingList = function(list) {
+    var c = document.getElementById(\'takportal-watching-list\'); if (!c) return;
+    if (!list.length) { c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently being watched.</div>\'; return; }
+    var rows = list.map(function(w){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+w.ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">\'+w.attempts+\'</td>\'+
+        \'<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">\'+w.last_seen+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banTpjIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Attempts</th><th style="padding:4px 8px">Last Seen</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.filterTpjWatchingList = function() {
+    var q = (document.getElementById(\'takportal-watching-search\').value || \'\').trim().toLowerCase();
+    window.renderTpjWatchingList(q ? window._tpjWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._tpjWatchingList);
+  };
+
+  function _loadTpjWatchingList() {
+    fetch(\'/api/fail2ban/takportal/watching\').then(function(r){ return r.json(); }).then(function(d){
+      window._tpjWatchingList = d.watching || [];
+      var s = document.getElementById(\'takportal-watching-search\');
+      var q = s ? s.value.trim().toLowerCase() : \'\';
+      window.renderTpjWatchingList(q ? window._tpjWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._tpjWatchingList);
+    }).catch(function(){
+      var el = document.getElementById(\'takportal-watching-list\');
+      if (el) el.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\';
+    });
+  }
+
+  window.toggleTpjWatchingPanel = function() {
+    _tpjWatchingPanelOpen = !_tpjWatchingPanelOpen;
+    var panel  = document.getElementById(\'takportal-watching-panel\');
+    var caret  = document.getElementById(\'takportal-watching-caret\');
+    var toggle = document.getElementById(\'takportal-watching-toggle\');
+    if (_tpjWatchingPanelOpen) {
+      if (panel)  panel.style.display = \'block\';
+      if (caret)  caret.textContent = \'▲ hide\';
+      if (toggle) toggle.style.borderColor = \'var(--yellow)\';
+      _loadTpjWatchingList();
+    } else {
+      if (panel)  panel.style.display = \'none\';
+      if (caret)  caret.textContent = \'▼ details\';
+      if (toggle) toggle.style.borderColor = \'\';
+    }
+  };
+
+  window.toggleTpjBanPanel = function() {
+    var panel = document.getElementById(\'takportal-ban-panel\');
+    var caret = document.getElementById(\'takportal-banned-caret\');
+    if (!panel) return;
+    var open = panel.style.display !== \'none\';
+    panel.style.display = open ? \'none\' : \'\';
+    if (caret) caret.textContent = open ? \'▼ details\' : \'▲ details\';
+    if (!open) { var s = document.getElementById(\'takportal-ban-search\'); if(s) s.value=\'\'; renderTpjBanList(window._tpjBannedIps); }
+  };
+
+  window.unbanTpjIP = function(ip) {
+    if (!confirm(\'Unban \' + ip + \' from the TAK Portal form jail?\')) return;
+    fetch(\'/api/fail2ban/takportal/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadTpjStatus(); }
+        else showToast(d.error || \'Unban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.banTpjIP = function(ip) {
+    if (!confirm(\'Manually ban \' + ip + \' from the TAK Portal form jail now?\')) return;
+    fetch(\'/api/fail2ban/takportal/ban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' banned.\', \'success\'); loadTpjStatus(); if (_tpjWatchingPanelOpen) _loadTpjWatchingList(); }
+        else showToast(d.error || \'Ban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.manualTpjRefresh = function() {
+    _spinIcon(\'takportal-refresh-icon\', true);
+    var btn = document.getElementById(\'takportal-refresh-btn\');
+    if (btn) btn.disabled = true;
+    loadTpjStatus();
+    if (_tpjWatchingPanelOpen) _loadTpjWatchingList();
+    setTimeout(function(){ _spinIcon(\'takportal-refresh-icon\', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadTpjStatus();
+  setInterval(function(){ loadTpjStatus(); if (_tpjWatchingPanelOpen) _loadTpjWatchingList(); }, 30000);
 })();
 
 // Repeat Offender Protection
