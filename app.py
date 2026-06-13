@@ -1242,7 +1242,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
-    parts.append(link('/hardening', '<span class="nav-icon material-symbols-outlined">shield_toggle</span>Cyber Controls'))
+    parts.append(link('/hardening', '<span class="nav-icon material-symbols-outlined" style="font-size:26px">shield_toggle</span>Cyber Controls'))
     if os.path.exists('/etc/fail2ban'):
         parts.append(link('/fail2ban', f'<img src="{html.escape(FAIL2BAN_LOGO_URL)}" alt="Fail2ban" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Fail2ban</span>', 'Fail2ban'))
     gd = modules.get('guarddog', {})
