@@ -6579,6 +6579,225 @@ def fail2ban_mediamtx_unban_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+# --- TAK Portal public-form jail (/lookup apparatus credential + /request-access) ---
+# Bans source IPs that accumulate FAILED attempts on the portal's public forms
+# (bad domain / bad username / captcha fail) — i.e. enumeration of apparatus
+# call-signs or self-enrollment abuse. Defense-in-depth BEHIND the page's CAPTCHA.
+# Reads a structured log the TAK Portal writes (one line per attempt) — the SAME
+# file that serves as the apparatus-lookup audit. Contract the portal must honor:
+#   <ts> ip=<CLIENT_IP> page=<lookup|request-access> result=<ok|bad_domain|bad_user|captcha_fail|rate_limited> email=<x> rig=<y>
+# The IP MUST be the real client (Caddy X-Forwarded-For), or fail2ban bans Caddy.
+TAKPORTAL_F2B_LOG = '/var/log/tak-portal/lookup.log'
+
+def _f2b_portal_jail_enabled():
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-takportal.conf')
+
+def _f2b_read_portal_jail_config():
+    """Read current thresholds + ignoreip from the infratak-takportal jail config."""
+    cfg = {'maxretry': 5, 'findtime': 600, 'bantime': 3600, 'ignoreip': ''}
+    jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
+    if not os.path.exists(jail_path):
+        return cfg
+    try:
+        with open(jail_path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime', 'bantime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
+    """Write the takportal filter + infratak-takportal jail. Ensures the log file
+    exists so fail2ban can start the jail before the portal ships its log writer."""
+    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+
+    # Ensure the logpath exists (empty is fine) — fail2ban refuses a missing logpath.
+    try:
+        os.makedirs(os.path.dirname(TAKPORTAL_F2B_LOG), exist_ok=True)
+        if not os.path.exists(TAKPORTAL_F2B_LOG):
+            with open(TAKPORTAL_F2B_LOG, 'a'):
+                pass
+            try: os.chmod(TAKPORTAL_F2B_LOG, 0o664)
+            except Exception: pass
+    except Exception:
+        pass
+
+    filter_path = '/etc/fail2ban/filter.d/takportal.conf'
+    filter_conf = (
+        "[Definition]\n"
+        "# Ban on FAILED public-form attempts only (result=ok is never matched), so\n"
+        "# legitimate repeat use of /lookup is never punished. Real client IP = ip=<HOST>.\n"
+        "failregex = ^.*\\bip=<HOST>\\b.*\\bresult=(bad_domain|bad_user|captcha_fail)\\b.*$\n"
+        "ignoreregex =\n"
+    )
+    with open(filter_path, 'w') as _f:
+        _f.write(filter_conf)
+
+    guarddog_action = ""
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = "\n         infratak-guarddog"
+    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    jail_conf = (
+        "[takportal]\n"
+        "enabled  = true\n"
+        "filter   = takportal\n"
+        f"logpath  = {TAKPORTAL_F2B_LOG}\n"
+        f"maxretry = {maxretry}\n"
+        f"findtime = {findtime}\n"
+        f"bantime  = {bantime}\n"
+        f"{ignoreip_line}"
+        f"action   = ufw{guarddog_action}\n"
+    )
+    with open('/etc/fail2ban/jail.d/infratak-takportal.conf', 'w') as _f:
+        _f.write(jail_conf)
+
+
+@app.route('/api/fail2ban/takportal/status')
+@login_required
+def fail2ban_takportal_status_api():
+    """Return fail2ban status for the takportal jail (apparatus lookup / request-access)."""
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    try:
+        r = subprocess.run(['fail2ban-client', 'status', 'takportal'],
+                           capture_output=True, text=True, timeout=10)
+        status = _f2b_parse_status(r.stdout)
+        status['available']      = True
+        status['daemon_running'] = (subprocess.run(
+            ['systemctl', 'is-active', 'fail2ban'],
+            capture_output=True, text=True).stdout.strip() == 'active')
+        status['jail_enabled'] = _f2b_portal_jail_enabled()
+        status['jail_config']  = _f2b_read_portal_jail_config()
+        status['log_present']  = os.path.exists(TAKPORTAL_F2B_LOG)
+        status['log_path']     = TAKPORTAL_F2B_LOG
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/fail2ban/takportal/config', methods=['POST'])
+@login_required
+def fail2ban_takportal_config_api():
+    """Enable/disable the takportal jail and update its thresholds."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data    = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', False))
+    if not enabled:
+        jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
+        if os.path.exists(jail_path):
+            os.remove(jail_path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    try:
+        maxretry = max(1,  min(100,     int(data.get('maxretry', 5))))
+        findtime = max(10, min(86400,   int(data.get('findtime', 600))))
+        bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
+        ignoreip = str(data.get('ignoreip', '')).strip()
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    try:
+        _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip)
+        _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                              capture_output=True, text=True)
+        if _svc.stdout.strip() != 'active':
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
+                           capture_output=True)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True,
+                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime,
+                        'log_present': os.path.exists(TAKPORTAL_F2B_LOG)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/takportal/watching')
+@login_required
+def fail2ban_takportal_watching_api():
+    """IPs seen failing the takportal jail (found but not yet banned)."""
+    import re as _re_watch
+    log_path = '/var/log/fail2ban.log'
+    result = []
+    try:
+        found_re = _re_watch.compile(r'\[takportal\] Found (\d[\d.:a-fA-F]+)')
+        ban_re   = _re_watch.compile(r'\[takportal\] Ban (\d[\d.:a-fA-F]+)')
+        unban_re = _re_watch.compile(r'\[takportal\] Unban (\d[\d.:a-fA-F]+)')
+        ts_re    = _re_watch.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+        found_data = {}
+        banned_ips = set()
+        with open(log_path) as _lf:
+            for line in _lf:
+                m = ban_re.search(line)
+                if m: banned_ips.add(m.group(1)); continue
+                m = unban_re.search(line)
+                if m: banned_ips.discard(m.group(1)); continue
+                m = found_re.search(line)
+                if m:
+                    ip = m.group(1)
+                    ts_m = ts_re.match(line)
+                    ts = ts_m.group(1) if ts_m else ''
+                    if ip not in found_data:
+                        found_data[ip] = {'count': 0, 'last_seen': ts}
+                    found_data[ip]['count'] += 1
+                    found_data[ip]['last_seen'] = ts
+        for ip, data in found_data.items():
+            if ip not in banned_ips:
+                result.append({'ip': ip, 'attempts': data['count'], 'last_seen': data['last_seen']})
+        result.sort(key=lambda x: x['attempts'], reverse=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200], 'watching': []}), 500
+    return jsonify({'ok': True, 'watching': result})
+
+
+@app.route('/api/fail2ban/takportal/ban', methods=['POST'])
+@login_required
+def fail2ban_takportal_ban_api():
+    """Manually ban an IP in the takportal jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip = (data.get('ip') or '').strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'takportal', 'banip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Ban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/takportal/unban', methods=['POST'])
+@login_required
+def fail2ban_takportal_unban_api():
+    """Unban a specific IP from the takportal jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'takportal', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 def _f2b_recidive_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-recidive.conf')
 
