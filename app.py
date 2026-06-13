@@ -2134,12 +2134,17 @@ AK_FORWARD_AUTH_SIGNOUT = '/outpost.goauthentik.io/sign_out'
 
 def _widle_sso_logout_active(h):
     """v0.9.56 W-IDLE — True when an idle lock must force a TRUE SSO re-prompt by signing the
-    browser out of the forward_auth outpost (not merely clearing the Flask session). Active only
-    when the W-IDLE control is applied AND W1 has SSO-locked the console (forward_auth is the
-    ingress that would otherwise silently re-auth). On the password break-glass path W1 is not
-    locked → False → W2 falls back to a plain session.clear()."""
+    browser out of the forward_auth outpost (not merely clearing the Flask session). Requires:
+    the W-IDLE control applied, W1 has SSO-locked the console, AND this very request arrived
+    through forward_auth — it carries the X-Authentik-Username header the local Caddy proxy
+    injects. That last check is essential: the console is ALSO reachable on the loopback
+    break-glass path (127.0.0.1:5001 direct / SSH tunnel) where there is no outpost to sign out
+    of and /outpost.goauthentik.io/* is not served by gunicorn (a sign-out redirect there just
+    times out). On that path this returns False and W2 falls back to the plain console /login."""
     try:
-        return bool((h.get('applied') or {}).get(WIDLE_STATE_KEY)) and _w1_console_locked()
+        if not ((h.get('applied') or {}).get(WIDLE_STATE_KEY) and _w1_console_locked()):
+            return False
+        return bool(request.headers.get('X-Authentik-Username'))
     except Exception:
         return False
 
@@ -2179,8 +2184,12 @@ def _enforce_session_idle_lock():
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
             session.clear()  # local lock always holds, regardless of what follows
             if _widle_sso_logout_active(h):
-                # Sign out of the forward_auth outpost on this same host → next request re-prompts.
-                return redirect(request.host_url.rstrip('/') + AK_FORWARD_AUTH_SIGNOUT)
+                # Sign out of the forward_auth outpost so the next request re-prompts. Target the
+                # SSO Host over https explicitly — Caddy terminates TLS and proxies to gunicorn as
+                # http, and request.host_url could be the loopback :5001 break-glass origin, so
+                # neither the scheme nor host_url can be trusted here. request.host is the SSO host
+                # (infratak.<fqdn>) because _widle_sso_logout_active only fires on forward_auth requests.
+                return redirect('https://%s%s' % (request.host, AK_FORWARD_AUTH_SIGNOUT))
             return redirect(url_for('login'))
         if not is_poll:
             session['last_activity'] = now
