@@ -2558,7 +2558,13 @@ def _w1_apply_mfa(h, log):
                                  method='POST', headers=ak_headers).read().decode()).get('pk')
         rec[slug] = {'app_pk': app_pk, 'binding_pk': bind_pk,
                      'prior_engine_mode': (rec.get(slug, {}).get('prior_engine_mode') or prior_mode)}
-        if prior_mode != 'all':
+        # Set engine_mode=all (group AND MFA both required). Re-read and retry once: an app
+        # with another binding (e.g. the Admins-group binding) MUST be 'all' or that binding
+        # alone would satisfy 'any' and bypass the MFA requirement.
+        for _try in (1, 2):
+            cur = _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode')
+            if cur == 'all':
+                break
             _ak_api_call(f'{ak_url}/api/v3/core/applications/{slug}/',
                          data=json.dumps({'policy_engine_mode': 'all'}).encode(),
                          method='PATCH', headers=ak_headers)
@@ -2566,6 +2572,8 @@ def _w1_apply_mfa(h, log):
         binds2 = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100', ak_headers).get('results', [])
         if not any(b.get('policy') == pol_pk and b.get('enabled') for b in binds2):
             log('W1: VERIFY FAILED — MFA binding missing on app %s' % slug); return False
+        if _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode') != 'all':
+            log('W1: VERIFY FAILED — %s policy_engine_mode is not "all"' % slug); return False
     w1['ak_app_slug'] = 'infratak'  # console marker for W4 assertion compatibility
     log('W1: MFA enforced on %d Authentik apps + force-enroll ON (%s)'
         % (len(apps), ', '.join(s for s, _ in apps)))
