@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.55-alpha"
+VERSION = "0.9.56-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2497,6 +2497,16 @@ AK_AUTH_FLOW_TITLE = 'Sign in'
 AK_TOTP_FRIENDLY = 'Authenticator App - Scan a QR code'
 AK_WEBAUTHN_FRIENDLY = 'Use a Passkey'
 
+# v0.9.56 W8 — Authentik event retention is a fleet-uniform constant, NOT the 365-day stock
+# default. The stock default grows authentik_events_event unbounded (200k+ rows / 200MB+ on
+# aged boxes); Authentik's periodic retention sweep over that table spikes authentik-postgresql
+# CPU (field report: 327% bursts on a 32GB box). Authentik's own docs recommend a SHORT local
+# retention when events are forwarded off-box — which the W7 off-box audit sink provides, so the
+# >=365-day compliance copy lives off-box while local Postgres stays light. Fleet constant (no
+# per-operator value, no max(cur,target)); applied as an idempotent startup migration on EVERY
+# box (pure load/hygiene fix, posture-independent). See memory authentik-event-retention-pg-cpu.
+AK_EVENT_RETENTION = 'days=30'
+
 def _ensure_authentik_login_copy(log=None):
     """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
     header, and the TOTP/WebAuthn enrollment button labels. Only PATCHes a field that differs
@@ -2538,6 +2548,38 @@ def _ensure_authentik_login_copy(log=None):
         except Exception as e:
             _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
     return changed
+
+def _ensure_authentik_event_retention(log=None):
+    """v0.9.56 W8 — codify Authentik's event retention to the fleet constant AK_EVENT_RETENTION.
+    The stock 365-day default lets authentik_events_event grow to 200k+ rows; the periodic
+    retention sweep over that table spikes authentik-postgresql CPU on modest hardware. We pin a
+    short LOCAL retention (the >=365d compliance copy lives off-box via W7). Idempotent: only
+    PATCHes when the live value differs, so it's a no-op on subsequent boots. Posture-independent
+    (every box). Never raises; never restarts Postgres (a PG restart under load triggers the
+    dramatiq-worker spiral — the retention sweep needs no restart). Returns True if it changed.
+
+    Event retention is a System Settings singleton: GET/PATCH /api/v3/admin/settings/, field
+    `event_retention` (authentik timedelta string, e.g. 'days=30'). One-time backlog reclaim
+    (VACUUM of authentik_events_event) is an operator step, not done here."""
+    def _l(m):
+        if log:
+            log(m)
+    ak_url, ak_headers, _ = _w1_ak_ctx()
+    if not ak_url:
+        return False
+    try:
+        cur = (_w1_ak_get(ak_url, 'admin/settings/', ak_headers) or {}).get('event_retention')
+        if cur == AK_EVENT_RETENTION:
+            return False
+        _ak_api_call(f'{ak_url}/api/v3/admin/settings/',
+                     data=json.dumps({'event_retention': AK_EVENT_RETENTION}).encode(),
+                     method='PATCH', headers=ak_headers)
+        _l('Authentik event retention %s → %s (off-box holds the compliance copy)'
+           % (cur or 'default', AK_EVENT_RETENTION))
+        return True
+    except Exception as e:
+        _l('Authentik event retention: %s' % str(e)[:100])
+        return False
 
 def _w1_ensure_mfa_policy(ak_url, ak_headers, log):
     """Ensure the shared require-MFA expression policy exists; return its pk."""
@@ -57267,6 +57309,15 @@ def _startup_migrations():
                 _ensure_authentik_login_copy(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_copy_err:
             print(f"Startup migration: authentik login copy error (non-fatal): {ak_copy_err}")
+
+        # v0.9.56 W8: Pin Authentik event retention to the fleet constant (stock 365-day default
+        # grows authentik_events_event unbounded → periodic sweep spikes authentik-postgresql CPU).
+        # Idempotent no-op once pinned; gated on Authentik present; never restarts Postgres.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _ensure_authentik_event_retention(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_evt_err:
+            print(f"Startup migration: authentik event retention error (non-fatal): {ak_evt_err}")
 
         # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
         # the recursion fix below, because the recursion fix restarts authentik-server,
