@@ -385,7 +385,7 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.2.3"   # fleet-validated — safe for all customers
-AUTHENTIK_DEV_RELEASE    = "2026.5.0"   # under validation on dev channel (2026-05-22)
+AUTHENTIK_DEV_RELEASE    = "2026.5.3"   # under validation on dev channel — conn_max_age idle-CPU spin fix (#22580/#22679, in 2026.5.2+); 2026-06-13
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -15317,6 +15317,23 @@ def _get_authentik_version_info():
                     out['ahead_of_vetted'] = True
             except Exception:
                 out['update_available'] = True
+    # Dev channel only: surface when UPSTREAM has shipped a release newer than our pin,
+    # so the operator learns about new Authentik releases (e.g. a bugfix) without anyone
+    # editing the pin first. Awareness ONLY — never changes what Update installs (the pin).
+    # No GitHub call on main: main stays pinned-and-quiet by design.
+    out['upstream_latest'] = None
+    out['upstream_newer'] = False
+    if _channel == 'dev':
+        try:
+            _up = _get_authentik_latest_release_tag()
+            if _up:
+                out['upstream_latest'] = _up
+                _pin = tuple(int(x) for x in re.findall(r'\d+', target))
+                _ut = tuple(int(x) for x in re.findall(r'\d+', _up))
+                if _ut > _pin:
+                    out['upstream_newer'] = True
+        except Exception:
+            pass
     return out
 
 
@@ -43485,9 +43502,9 @@ body{display:flex;min-height:100vh}
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% if ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin (v{{ ak_version_info.dev_release }}). Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} upstream</span>{% endif %}{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% if ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin (v{{ ak_version_info.dev_release }}). Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} upstream</span>{% endif %}{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
