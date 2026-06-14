@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.57.1-alpha"
+VERSION = "0.9.58-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -6618,6 +6618,60 @@ def _f2b_parse_status(raw):
             result['banned_ips'] = [ip.strip() for ip in ips_raw.split() if ip.strip()]
     return result
 
+def _f2b_local_subnets():
+    """Derive the box's directly-attached *private* IPv4 subnets (CIDR) from the
+    global-scope addresses on its NICs. On a gateway/proxy/VNet-fronted deploy the
+    upstream gateway usually lives on the box's own attached subnet, so trusting
+    that subnet keeps the gateway from ever being banned — the CORAZ total-outage
+    failure mode ([[fail2ban-bans-azure-gateway]]). RFC1918 only: on a direct-public
+    box the attached subnet is public, and we must NOT whitelist public neighbours.
+    Best-effort; returns [] on any failure (so the jail still gets localhost)."""
+    subnets = []
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        net = ipaddress.ip_network(parts[i + 1], strict=False)
+                        if net.is_private and str(net) not in subnets:
+                            subnets.append(str(net))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return subnets
+
+def _f2b_fleet_ignore_cidrs():
+    """Operator-configured fleet-wide trusted CIDRs (settings 'fail2ban_ignore_cidrs').
+    Use this for an upstream gateway/proxy/LB that does NOT share the box's attached
+    subnet (e.g. Azure App Gateway backends on a sibling /24). Survives a jail regen
+    because every writer re-derives ignoreip from settings on each write."""
+    try:
+        raw = load_settings().get('fail2ban_ignore_cidrs', '') or ''
+    except Exception:
+        raw = ''
+    return [c.strip() for c in raw.replace(',', ' ').split() if c.strip()]
+
+def _f2b_trusted_ignoreip(extra=''):
+    """Build the full ignoreip whitelist for ANY infra-TAK jail, fleet-uniform:
+    localhost + the box's attached private subnet(s) + operator fleet CIDRs + the
+    per-jail operator whitelist (extra). Identical code path on every box; dedups so
+    it is idempotent even if `extra` still carries the localhost tokens."""
+    parts, seen = [], set()
+    candidates = ['127.0.0.1/8', '::1']
+    candidates += _f2b_local_subnets()
+    candidates += _f2b_fleet_ignore_cidrs()
+    candidates += str(extra or '').replace(',', ' ').split()
+    for c in candidates:
+        c = c.strip()
+        if c and c not in seen:
+            seen.add(c)
+            parts.append(c)
+    return ' '.join(parts)
+
 def _f2b_read_jail_config():
     """Read current thresholds and ignoreip from the infratak-authentik jail config file."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
@@ -6645,7 +6699,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[authentik]\n"
         "enabled  = true\n"
@@ -6691,7 +6745,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog-takserver"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[takserver]\n"
         "enabled  = true\n"
@@ -6737,7 +6791,7 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[sshd]\n"
         "enabled  = true\n"
@@ -7255,8 +7309,11 @@ def _f2b_read_mediamtx_jail_config():
         pass
     return cfg
 
-def _f2b_write_mediamtx_jail(maxretry, findtime, bantime):
-    """Write the mediamtx-rtsp filter file and infratak-mediamtx-rtsp jail config."""
+def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
+    """Write the mediamtx-rtsp filter file and infratak-mediamtx-rtsp jail config.
+    This jail is the one that banned the Azure App Gateway on CORAZ (its health
+    probes look like RTSP opens from the gateway IPs) — so it MUST honour the same
+    trusted-ignoreip whitelist as every other jail ([[fail2ban-bans-azure-gateway]])."""
     os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
     os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
 
@@ -7284,7 +7341,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime):
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
-        "ignoreip = 127.0.0.1/8 ::1\n"
+        f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
         f"action   = ufw{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
@@ -7498,7 +7555,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[takportal]\n"
         "enabled  = true\n"
@@ -7656,6 +7713,79 @@ def fail2ban_takportal_unban_api():
 def _f2b_recidive_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-recidive.conf')
 
+def _f2b_rewrite_all_jails():
+    """Re-derive and re-write every currently-enabled infra-TAK jail from its stored
+    thresholds. Used after the fleet trusted-CIDR whitelist changes so the new value
+    propagates to ALL jails at once (each writer re-reads settings via
+    _f2b_trusted_ignoreip). Returns the list of jails rewritten."""
+    done = []
+    if _f2b_authentik_jail_enabled():
+        c = _f2b_read_jail_config()
+        _f2b_write_jail_config(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        done.append('authentik')
+    if _f2b_tak_jail_enabled():
+        c = _f2b_read_tak_jail_config()
+        _f2b_write_tak_jail_config(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        done.append('takserver')
+    if _f2b_ssh_jail_enabled():
+        c = _f2b_read_ssh_jail_config()
+        _f2b_write_ssh_jail_config(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        done.append('sshd')
+    if _f2b_mediamtx_jail_enabled():
+        c = _f2b_read_mediamtx_jail_config()
+        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'])
+        done.append('mediamtx-rtsp')
+    if _f2b_portal_jail_enabled():
+        c = _f2b_read_portal_jail_config()
+        _f2b_write_portal_jail(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        done.append('takportal')
+    if _f2b_recidive_enabled():
+        c = _f2b_read_recidive_config()
+        _f2b_write_recidive_config(c['maxretry'], c['findtime'])
+        done.append('recidive')
+    return done
+
+
+@app.route('/api/fail2ban/trusted-cidrs', methods=['GET', 'POST'])
+@login_required
+def fail2ban_trusted_cidrs_api():
+    """Fleet-wide trusted-upstream whitelist (settings 'fail2ban_ignore_cidrs').
+    On a gateway/proxy/VNet-fronted deploy, ALL inbound traffic appears to come from
+    the upstream's handful of IPs; a jail trip then bans the gateway itself and every
+    vhost 502s ([[fail2ban-bans-azure-gateway]]). Operators add the gateway subnet
+    here once and it is baked into every jail's ignoreip — and re-baked on every jail
+    regen, so a MediaMTX redeploy can never re-expose the box."""
+    if request.method == 'GET':
+        return jsonify({
+            'ok': True,
+            'cidrs': _f2b_fleet_ignore_cidrs(),
+            'local_subnets': _f2b_local_subnets(),
+            'effective': _f2b_trusted_ignoreip(),
+        })
+    data = request.get_json(silent=True) or {}
+    raw = str(data.get('cidrs', '') or '').replace(',', ' ').split()
+    cleaned = []
+    for c in raw:
+        c = c.strip()
+        if not c:
+            continue
+        try:
+            ipaddress.ip_network(c, strict=False)  # validate CIDR / bare IP
+        except Exception:
+            return jsonify({'ok': False, 'error': f'Invalid CIDR/IP: {c}'}), 400
+        if c not in cleaned:
+            cleaned.append(c)
+    s = load_settings()
+    s['fail2ban_ignore_cidrs'] = ' '.join(cleaned)
+    save_settings(s)
+    rewritten = _f2b_rewrite_all_jails()
+    try:
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'cidrs': cleaned, 'rewritten': rewritten,
+                    'effective': _f2b_trusted_ignoreip()})
+
 def _f2b_read_recidive_config():
     cfg = {'maxretry': 3, 'findtime': 86400}
     path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
@@ -7684,10 +7814,13 @@ def _f2b_write_recidive_config(maxretry, findtime):
         "bantime  = -1\n"
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
+        f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         "action   = ufw\n"
     )
     with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
         _f.write(jail_conf)
+    # NOTE: _f2b_write_recidive_config takes no ignoreip arg — the recidive jail's
+    # ignoreip is always the fleet trusted set (no per-jail operator override needed).
     # Ensure fail2ban SQLite persistence so permanent bans survive restarts
     local_path = '/etc/fail2ban/fail2ban.local'
     db_line = 'dbfile = /var/lib/fail2ban/fail2ban.sqlite3\n'
@@ -26795,6 +26928,24 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 {% else %}
 
+<!-- Trusted Upstream Networks (fleet-wide ignoreip) -->
+<div class="card" id="f2b-trusted-card" style="margin-bottom:8px">
+<div class="card-title">🌐 Trusted Upstream Networks</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:6px;line-height:1.6">
+If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure App Gateway, an Nginx/HAProxy in front, etc.), inbound traffic appears to come from the upstream\'s handful of IPs. A jail trip could then ban the <strong>gateway itself</strong> — and since it is the only way in, <strong>every site 502s</strong> while the box is perfectly healthy. Add the upstream\'s subnet(s) here and they are whitelisted in <strong>every</strong> jail, and re-applied automatically on each jail rebuild. Localhost and the box\'s own attached private subnet are always trusted.
+</div>
+<div style="margin-top:14px">
+<label class="form-label">Trusted CIDRs / IPs</label>
+<input class="form-input" id="f2b-trusted-cidrs" type="text" placeholder="e.g. 10.35.77.0/24  10.0.0.0/8" style="font-family:monospace" oninput="renderChips(\'f2b-trusted-cidrs\',\'f2b-trusted-chips\')">
+<div id="f2b-trusted-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div id="f2b-trusted-auto" style="font-size:11px;color:var(--text-dim);margin-top:10px"></div>
+<div style="display:flex;align-items:center;gap:12px;margin-top:14px">
+<button class="btn btn-primary" onclick="saveTrustedCidrs()">Save trusted networks</button>
+<span id="f2b-trusted-msg" style="font-size:12px"></span>
+</div>
+</div>
+
 <!-- Repeat Offender Protection -->
 <div class="card" id="recidive-card" style="margin-bottom:8px">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -27471,6 +27622,38 @@ function unbanIP(ip) {
     }).catch(()=>showToast(\'Network error\', \'error\'));
 }
 
+function loadTrustedCidrs() {
+  fetch(\'/api/fail2ban/trusted-cidrs\').then(r=>r.json()).then(d=>{
+    if (!d.ok) return;
+    var el = document.getElementById(\'f2b-trusted-cidrs\');
+    if (el) { el.value = (d.cidrs || []).join(\' \'); renderChips(\'f2b-trusted-cidrs\',\'f2b-trusted-chips\'); }
+    var auto = document.getElementById(\'f2b-trusted-auto\');
+    if (auto) {
+      var locals = (d.local_subnets || []);
+      auto.innerHTML = \'Always trusted: <code>127.0.0.1/8 ::1</code>\' +
+        (locals.length ? \' &nbsp;·&nbsp; auto-detected private subnet(s): <code>\' + locals.join(\'</code> <code>\') + \'</code>\' : \'\');
+    }
+  }).catch(()=>{});
+}
+
+function saveTrustedCidrs() {
+  var msg = document.getElementById(\'f2b-trusted-msg\');
+  var val = (document.getElementById(\'f2b-trusted-cidrs\').value || \'\').trim();
+  if (msg) { msg.style.color = \'var(--text-dim)\'; msg.textContent = \'Saving…\'; }
+  fetch(\'/api/fail2ban/trusted-cidrs\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({cidrs: val})})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) {
+        if (msg) { msg.style.color = \'var(--green)\'; msg.textContent = \'Saved — applied to \' + (d.rewritten||[]).length + \' jail(s).\'; }
+        showToast(\'Trusted networks saved and applied to all jails.\', \'success\');
+        loadTrustedCidrs();
+      } else {
+        if (msg) { msg.style.color = \'var(--red)\'; msg.textContent = d.error || \'Save failed\'; }
+        showToast(d.error || \'Save failed\', \'error\');
+      }
+    }).catch(()=>{ if (msg) { msg.style.color = \'var(--red)\'; msg.textContent = \'Network error\'; } showToast(\'Network error\', \'error\'); });
+}
+
+loadTrustedCidrs();
 loadStatus();
 loadLog();
 setInterval(function(){ loadStatus(); loadLog(); }, 30000);
