@@ -12970,8 +12970,49 @@ def _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_po
 _CERT_PASS_SAFE_RE = re.compile(r'^[a-zA-Z0-9!@#%^+=_.,:-]+$')
 
 def _get_tak_cert_password(settings):
-    """Current TAK cert export password (default atakatak)."""
-    return (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+    """The password the TAK cert actually opens with — ground truth over a possibly-stale
+    settings field. Order: (1) CAPASS from /opt/tak/certs/cert-metadata.sh (what makeCert.sh
+    used); (2) whichever of the configured value / 'atakatak' actually decrypts admin.p12
+    (probed with openssl, legacy + modern); (3) the configured value or the fleet default.
+    Never raises; always returns a non-empty string. Every caller (cert open/gen, Portal
+    TAK_API_P12_PASSPHRASE, metrics, FedHub) only ever gets a value that works, so they
+    strictly improve. v0.9.56: fixes Portal sync on boxes whose passphrase diverged from the
+    password the cert was built with (CORAZ: settings said 'Takserver#atak!', cert was
+    'atakatak')."""
+    configured = (settings.get('tak_cert_password') or '').strip()
+    # (1) CAPASS from cert-metadata.sh — the password makeCert.sh actually used.
+    try:
+        meta = '/opt/tak/certs/cert-metadata.sh'
+        if os.path.exists(meta):
+            with open(meta) as f:
+                for ln in f:
+                    s = ln.strip()
+                    if s.startswith('CAPASS='):
+                        v = s.split('=', 1)[1].strip().strip('"').strip("'")
+                        if v:
+                            return v
+    except Exception:
+        pass
+    # (2) Probe admin.p12 — return whichever candidate opens it (legacy RC2 or modern).
+    try:
+        p12 = '/opt/tak/certs/files/admin.p12'
+        if os.path.exists(p12):
+            for cand in [configured, 'atakatak']:
+                if not cand:
+                    continue
+                for extra in (['-legacy'], []):
+                    try:
+                        r = subprocess.run(['openssl', 'pkcs12', '-in', p12, '-passin',
+                                            'pass:' + cand, '-noout'] + extra,
+                                           capture_output=True, timeout=10)
+                        if r.returncode == 0:
+                            return cand
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    # (3) Fallback: configured value, else the fleet default.
+    return configured or 'atakatak'
 
 
 def _get_fedhub_cert_password(settings):
@@ -15924,7 +15965,18 @@ def _takportal_build_settings_dict(settings):
     # server_ip breaks TLS hostname verification ("identity could not be verified").
     # Fall back to server_ip for IP-only / no-FQDN installs; then Docker host aliases.
     tak_dns = (_get_takserver_host(settings) or '').strip()
-    if settings.get('fqdn') and tak_dns:
+    tak_local = os.path.isdir('/opt/tak')
+    if tak_local:
+        # TAK is on THIS box → connect to the local JVM via the Docker host alias, NOT
+        # takserver.<fqdn>. On gateway-fronted / load-balanced deploys (cloud is co-primary)
+        # the FQDN resolves to a TLS-terminating front end (App Gateway / LB) whose cert does
+        # not chain to TAK's CA, so the portal's rejectUnauthorized handshake is rejected. The
+        # portal validates the CA chain (checkServerIdentity:()=>undefined), not the hostname,
+        # so the local hop works regardless of SAN. Container has ExtraHosts
+        # host.docker.internal:host-gateway. Recomputed every build (deterministic; never
+        # preserved — TAK_URL is intentionally NOT in PRESERVE_TAKPORTAL_KEYS).
+        tak_url_host = 'host.docker.internal'
+    elif settings.get('fqdn') and tak_dns:
         tak_url_host = tak_dns
     elif server_ip and server_ip not in ('localhost', '127.0.0.1'):
         tak_url_host = server_ip
@@ -20210,6 +20262,20 @@ def run_cloudtak_deploy(cfg=None):
         with open(override_path, 'w') as f:
             f.write(override_yml)
         plog("  docker-compose.override.yml written (api → host.docker.internal for :5001)")
+
+        # v0.9.56: harden base-compose port bindings BEFORE `up -d`. The Step-2 clone pulls
+        # upstream CloudTAK, whose base compose republishes every port on 0.0.0.0 — incl. media
+        # "${MEDIA_PORT_API:-9997}:9997". Since v0.9.48 Caddy binds <localIP>:9997 for the CloudTAK
+        # video vhost, so a wildcard 0.0.0.0:9997 publish COLLIDES and the Caddy reload in Step 5/7
+        # dies ("address already in use") → blank map.<fqdn>. Same patch the startup migration /
+        # update auto-harden run; idempotent (skips 127.0.0.1:*-prefixed lines), so the later passes
+        # are no-ops. Previously only ran on console startup/update, not deploy — a box deployed long
+        # after the last console restart (CORAZ) stayed broken until hand-fixed.
+        try:
+            if _patch_cloudtak_compose_ports(cloudtak_dir):
+                plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
+        except Exception as _ppe:
+            plog(f"  WARNING: compose port-harden failed (Caddy :9997 may collide): {_ppe}")
 
         api_url = ''
         media_url = ''
