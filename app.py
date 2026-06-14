@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.57-alpha"
+VERSION = "0.9.57.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -384,7 +384,7 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
-AUTHENTIK_VETTED_RELEASE = "2026.2.3"   # fleet-validated — safe for all customers
+AUTHENTIK_VETTED_RELEASE = "2026.5.3"   # v0.9.57.1: promoted dev→vetted — conn_max_age idle-CPU spin fix (#22580, fixed 2026.5.2); 2026.2.3→2026.5.3 jump validated live on CORAZ prod + test6/8/12 soak
 AUTHENTIK_DEV_RELEASE    = "2026.5.3"   # under validation on dev channel — conn_max_age idle-CPU spin fix (#22580/#22679, in 2026.5.2+); 2026-06-13
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).

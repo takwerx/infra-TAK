@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.57-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.57-alpha)**
+**Current release: [v0.9.57.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.57.1-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.57.1-alpha — 2026-06-14 — Authentik 2026.5.3 for all deployments
+
+**Headline: every deployment now updates to Authentik 2026.5.3 — the performance-fixed release — not just dev-channel boxes.** v0.9.57 fixed the Authentik high-CPU / sluggish-sign-on issue by moving to Authentik 2026.5.3, but only for boxes on the development channel; standard deployments stayed on the older 2026.2.3. This patch promotes 2026.5.3 to **all** deployments, so your identity provider updates to the current, performance-validated release on the next console update — snappier single sign-on and lower idle CPU. The 2026.2.3 → 2026.5.3 upgrade path was validated on a live production deployment and the test fleet. **Upgrade:** Authentik pulls 2026.5.3 and restarts automatically on the next console update.
+
+Full notes: [v0.9.57.1-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.57.1-alpha).
 
 ### v0.9.57-alpha — 2026-06-14 — Authentik performance fix + self-healing, console reliability, and TAK Portal QR enrollment
 
