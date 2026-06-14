@@ -420,7 +420,7 @@ except Exception:
     print(5001)
 " 2>/dev/null || echo 5001)
 
-    GUNICORN_ARGS="--bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300 --graceful-timeout 30"
+    GUNICORN_ARGS="--bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 300 --graceful-timeout 30"
     if [ -f "$CERT_DIR/console.crt" ] && [ -f "$CERT_DIR/console.key" ]; then
         GUNICORN_ARGS="$GUNICORN_ARGS --certfile=$CERT_DIR/console.crt --keyfile=$CERT_DIR/console.key"
     fi

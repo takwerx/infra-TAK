@@ -34,7 +34,7 @@ if __name__ == '__main__':
                 _svc_c = _f.read()
             if 'python3' in _svc_c and 'app.py' in _svc_c:
                 print('[auto-upgrade] Upgrading systemd service to gunicorn...')
-                _exec_line = f'{_gunicorn} --bind 0.0.0.0:{_port} --workers 1 --threads 4 --timeout 300 --graceful-timeout 30'
+                _exec_line = f'{_gunicorn} --bind 0.0.0.0:{_port} --workers 1 --threads 8 --timeout 300 --graceful-timeout 30'
                 if _ssl_args:
                     _exec_line += ' ' + ' '.join(_ssl_args)
                 _exec_line += ' app:app'
@@ -44,7 +44,7 @@ if __name__ == '__main__':
                 _sp.run(['systemctl', 'daemon-reload'], capture_output=True)
 
         _args = [_gunicorn, '--bind', f'0.0.0.0:{_port}',
-                 '--workers', '1', '--threads', '4',
+                 '--workers', '1', '--threads', '8',
                  '--timeout', '300', '--graceful-timeout', '30']
         _args.extend(_ssl_args)
         _args.append('app:app')
@@ -290,7 +290,7 @@ def _ensure_gunicorn_upgrade(console_dir=None):
     ssl_args = ''
     if os.path.exists(os.path.join(cert_dir, 'console.crt')):
         ssl_args = f' --certfile={cert_dir}/console.crt --keyfile={cert_dir}/console.key'
-    exec_line = (f'{venv_gunicorn} --bind 0.0.0.0:{port} --workers 1 --threads 4 '
+    exec_line = (f'{venv_gunicorn} --bind 0.0.0.0:{port} --workers 1 --threads 8 '
                  f'--timeout 300 --graceful-timeout 30{ssl_args} app:app')
     content = re.sub(r'^ExecStart=.*$', f'ExecStart={exec_line}', content, flags=re.MULTILINE)
     with open(svc, 'w') as f:
@@ -53889,6 +53889,12 @@ async function toggleResourceBreakdown(hostId){
     }
     div.style.display='block';
 }
+/* v0.9.57: cap read/poll fetches with a client-side timeout so a slow poll on a busy box
+   ABORTS (freeing the single-worker console's thread) instead of hanging forever and
+   starving on-demand button clicks (the "what's using CPU/RAM" / "check for release"
+   fails that cleared on a page reload). Whitelisted to read endpoints only — the
+   long-running action endpoints (update/apply, *_control, deploy) are never touched. */
+(function(){if(window.__fetchTO)return;window.__fetchTO=1;var _f=window.fetch.bind(window);var L=[['/api/metrics',10000],['/api/modules/version',15000],['/api/modules',12000],['/api/host-resource-usage',30000],['/api/update/check',15000],['/api/guarddog',12000]];window.fetch=function(u,o){o=o||{};if(typeof u==='string'&&!o.signal){for(var i=0;i<L.length;i++){if(u.indexOf(L[i][0])===0){var c=new AbortController();o.signal=c.signal;var t=setTimeout(function(){try{c.abort()}catch(e){}},L[i][1]);return _f(u,o).finally(function(){clearTimeout(t)});}}}return _f(u,o);};})();
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
