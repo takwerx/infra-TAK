@@ -12969,50 +12969,52 @@ def _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_po
 
 _CERT_PASS_SAFE_RE = re.compile(r'^[a-zA-Z0-9!@#%^+=_.,:-]+$')
 
+_TAK_CERT_PW_CACHE = {}  # (configured, admin.p12 mtime) -> resolved password; mtime change re-probes
+
 def _get_tak_cert_password(settings):
     """The password the TAK cert actually opens with — ground truth over a possibly-stale
-    settings field. Order: (1) CAPASS from /opt/tak/certs/cert-metadata.sh (what makeCert.sh
-    used); (2) whichever of the configured value / 'atakatak' actually decrypts admin.p12
-    (probed with openssl, legacy + modern); (3) the configured value or the fleet default.
-    Never raises; always returns a non-empty string. Every caller (cert open/gen, Portal
-    TAK_API_P12_PASSPHRASE, metrics, FedHub) only ever gets a value that works, so they
-    strictly improve. v0.9.56: fixes Portal sync on boxes whose passphrase diverged from the
-    password the cert was built with (CORAZ: settings said 'Takserver#atak!', cert was
-    'atakatak')."""
+    settings field. Probes admin.p12 with the configured value then 'atakatak' (legacy RC2 +
+    modern) and returns whichever decrypts it; falls back to the configured value or the fleet
+    default when there's nothing to probe. Never raises; always returns a non-empty string.
+    Every caller (cert open/gen, Portal TAK_API_P12_PASSPHRASE, metrics, FedHub) only ever gets
+    a value that works, so they strictly improve. Result is memoised on the admin.p12 mtime so
+    the 18 callers don't each spawn openssl (cache invalidates when the cert is regenerated).
+    v0.9.56: fixes Portal sync when the configured passphrase diverged from the cert (CORAZ:
+    settings 'Takserver#atak!', cert 'atakatak'). NOTE: cert-metadata.sh is deliberately NOT
+    used — its CAPASS line is a shell default expression (CAPASS=${CAPASS:-atakatak}) that is
+    unreliable read literally (returns the expression) OR sourced (resolved EMPTY on test6)."""
     configured = (settings.get('tak_cert_password') or '').strip()
-    # (1) CAPASS from cert-metadata.sh — the password makeCert.sh actually used.
+    p12 = '/opt/tak/certs/files/admin.p12'
     try:
-        meta = '/opt/tak/certs/cert-metadata.sh'
-        if os.path.exists(meta):
-            with open(meta) as f:
-                for ln in f:
-                    s = ln.strip()
-                    if s.startswith('CAPASS='):
-                        v = s.split('=', 1)[1].strip().strip('"').strip("'")
-                        if v:
-                            return v
+        mtime = os.path.getmtime(p12) if os.path.exists(p12) else None
     except Exception:
-        pass
-    # (2) Probe admin.p12 — return whichever candidate opens it (legacy RC2 or modern).
-    try:
-        p12 = '/opt/tak/certs/files/admin.p12'
-        if os.path.exists(p12):
-            for cand in [configured, 'atakatak']:
-                if not cand:
-                    continue
-                for extra in (['-legacy'], []):
-                    try:
-                        r = subprocess.run(['openssl', 'pkcs12', '-in', p12, '-passin',
-                                            'pass:' + cand, '-noout'] + extra,
-                                           capture_output=True, timeout=10)
-                        if r.returncode == 0:
-                            return cand
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-    # (3) Fallback: configured value, else the fleet default.
-    return configured or 'atakatak'
+        mtime = None
+    if mtime is None:
+        return configured or 'atakatak'      # nothing to probe → today's behavior
+    key = (configured, mtime)
+    if key in _TAK_CERT_PW_CACHE:
+        return _TAK_CERT_PW_CACHE[key]
+    result = None
+    seen = set()
+    for cand in (configured, 'atakatak'):
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        for extra in (['-legacy'], []):
+            try:
+                r = subprocess.run(['openssl', 'pkcs12', '-in', p12, '-passin', 'pass:' + cand,
+                                    '-noout'] + extra, capture_output=True, timeout=10)
+                if r.returncode == 0:
+                    result = cand
+                    break
+            except Exception:
+                continue
+        if result:
+            break
+    if result is None:
+        result = configured or 'atakatak'    # cert opens with neither candidate → don't guess
+    _TAK_CERT_PW_CACHE[key] = result
+    return result
 
 
 def _get_fedhub_cert_password(settings):
