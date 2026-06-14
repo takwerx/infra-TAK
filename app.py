@@ -1768,22 +1768,40 @@ def _parse_dd_speed_mbs(stderr_or_stdout):
     return None
 
 
-_disk_speed_cache = {'result': None, 'ts': 0.0}
+import threading as _threading
+_disk_speed_cache = {'result': None, 'ts': 0.0, 'running': False}
+_disk_speed_lock = _threading.Lock()
 
 def _run_disk_speed_test_local(use_cache=True):
-    """Cached wrapper around the 256 MiB dsync benchmark. The raw benchmark writes
-    256 MiB and is slow on throttled/loaded disks — running it on every
-    /api/host-resource-usage click is what made that endpoint 'Request failed'
-    under load (e.g. during a post-update auto-deploy). Cache the result ~10 min so
-    the interactive endpoint returns fast (just ps) instead of re-benchmarking, and
-    to spare SSD writes. Pass use_cache=False to force a fresh run."""
+    """NON-BLOCKING cached disk benchmark. The raw 256 MiB oflag=dsync write is slow
+    on throttled/loaded disks (the SSD-Nodes boxes throttle intermittently), and
+    running it synchronously on every /api/host-resource-usage click hogged a thread
+    on the 1-worker console — which starved that endpoint AND "check for new release"
+    (both 'Request failed'). This wrapper NEVER blocks the request: it returns the
+    cached value immediately and, when the cache is cold/stale (>10 min), kicks the
+    benchmark off in a background thread so the number appears on a later poll.
+    First-ever call returns {} (no disk number yet) rather than waiting."""
     import time as _t
-    if use_cache and _disk_speed_cache['result'] is not None and (_t.time() - _disk_speed_cache['ts'] < 600):
+    now = _t.time()
+    have = _disk_speed_cache['result'] is not None
+    if use_cache and have and (now - _disk_speed_cache['ts'] < 600):
         return _disk_speed_cache['result']
-    res = _run_disk_speed_test_local_impl()
-    _disk_speed_cache['result'] = res
-    _disk_speed_cache['ts'] = _t.time()
-    return res
+    def _refresh():
+        try:
+            r = _run_disk_speed_test_local_impl()
+        except Exception:
+            r = {}
+        _disk_speed_cache['result'] = r
+        _disk_speed_cache['ts'] = _t.time()
+        _disk_speed_cache['running'] = False
+    with _disk_speed_lock:
+        if not _disk_speed_cache['running']:
+            _disk_speed_cache['running'] = True
+            try:
+                _threading.Thread(target=_refresh, daemon=True).start()
+            except Exception:
+                _disk_speed_cache['running'] = False
+    return _disk_speed_cache['result'] if have else {}
 
 def _run_disk_speed_test_local_impl():
     """Run 256 MiB sync write (oflag=dsync). Returns dict with disk_speed_test_write_mbs or disk_speed_test_error.
