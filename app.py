@@ -44109,21 +44109,35 @@ async function akUpdate(){
     btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating...';
     document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
     status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Pulling latest Authentik image and restarting… (may take 2–5 min)';
+    // v0.9.58 (#5): a long Authentik image pull can outlast a fronting proxy/gateway's
+    // response timeout, which then returns an HTML 502/504 page; the old r.json() then
+    // threw "Unexpected token '<'" and showed a scary failure even though the update was
+    // still running on the box (seen on CORAZ). Detect the gateway-timeout / non-JSON
+    // case and tell the operator to wait, instead of surfacing a parse error.
+    function _akUpdateStillRunning(){
+        status.style.color='var(--cyan)';
+        status.innerHTML='⏳ Authentik update is still running in the background — the image pull can exceed the gateway timeout. This page will refresh automatically in a few minutes (or refresh manually once Authentik is back). Do not re-click Update.';
+        btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating…';
+        setTimeout(()=>location.reload(),180000);
+    }
     try{
         var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});
-        var d=await r.json();
-        if(d.success){
+        var d=null,parseFail=false;
+        try{ d=await r.json(); }catch(_pe){ parseFail=true; }
+        if(parseFail||r.status===502||r.status===504){ _akUpdateStillRunning(); return; }
+        if(d&&d.success){
             status.style.color='var(--green)';status.textContent='✓ Authentik updated successfully. Reloading…';
             setTimeout(()=>location.reload(),2500);
         }else{
-            status.style.color='var(--red)';status.textContent='✗ Update failed: '+(d.error||'unknown error');
+            status.style.color='var(--red)';status.textContent='✗ Update failed: '+((d&&d.error)||'unknown error');
             btn.disabled=false;btn.innerHTML='⬆ Update';
             document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
         }
     }catch(e){
-        status.style.color='var(--red)';status.textContent='✗ Error: '+e.message;
-        btn.disabled=false;btn.innerHTML='⬆ Update';
-        document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+        // The POST itself dropped (proxy reset / timeout mid-pull) — same long-running
+        // case, not a real failure. Surface the wait message, log the real error for debug.
+        try{console.error('akUpdate transport error (treating as still-running):',e);}catch(_le){}
+        _akUpdateStillRunning();
     }
 }
 async function akControl(action){
