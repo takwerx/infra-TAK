@@ -13411,6 +13411,13 @@ def _write_takportal_override():
             "# _patch_takportal_compose_ports() (compose-version-agnostic).\n"
             "services:\n"
             "  tak-portal:\n"
+            # v0.9.56: the portal reaches a LOCAL TAK Server via host.docker.internal:8443
+            # (see _takportal_build_settings_dict TAK_URL). Unlike CloudTAK's api container,
+            # the TAK-Portal compose does NOT define this alias, so without this mapping the
+            # portal can't resolve host.docker.internal and loses TAK contact. Takes effect on
+            # container RECREATE (compose up -d), not a plain restart.
+            "    extra_hosts:\n"
+            "      - \"host.docker.internal:host-gateway\"\n"
             "    networks:\n"
             "      - default\n"
             f"      - {INFRATAK_DOCKER_NETWORK}\n"
