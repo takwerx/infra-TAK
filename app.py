@@ -45840,6 +45840,105 @@ def _ensure_authentik_tasklog_purge_script(plog=None):
         _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
 
 
+def _auto_authentik_channel_purge(plog=None):
+    """v0.9.57 (B2): inline self-heal for the Authentik Channels-over-Postgres backlog
+    (django_channels_postgres_message).
+
+    On a healthy 2026.5.3 worker this table stays small (~hundreds of rows). During a
+    pre-2026.5.3 conn_max_age spin it balloons to MILLIONS of EXPIRED rows, and
+    Authentik's own clean_expired_models() then times out trying to delete them in one
+    transaction (upstream #20644) → authentik-worker-1 pegs ~150% forever. This catches a
+    ballooned table on every console boot and clears it in BATCHES (which the worker's
+    one-shot delete can't), so a box that already spun self-heals WITHOUT SSH. Pairs with
+    the 2026.5.3 pin (prevents new ballooning) and W8 (event retention).
+
+    Deletes ONLY expired messages (`expires < now()`) — never live ones; never blocks
+    login; idempotent; non-raising. Runs on every console boot via _startup_migrations
+    (no version/Update gate). See memory authentik-worker-channels-dramatiq-uuid-crashloop.
+    """
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        return  # Authentik not installed on this host
+
+    # statement_timeout=0 for the mutating ops: Authentik sets a statement_timeout that
+    # cancels a long DELETE/VACUUM mid-flight (seen live on test8). Reads use the default.
+    _PG = ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
+    _PG_NT = ['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=0',
+              'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
+    try:
+        _up = subprocess.run(
+            ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+            capture_output=True, text=True, timeout=10
+        )
+        if _up.returncode != 0 or _up.stdout.strip() != 'true':
+            return
+
+        def _count():
+            r = subprocess.run(
+                _PG + ['-t', '-A', '-c', 'SELECT count(*) FROM django_channels_postgres_message'],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode != 0:
+                return None
+            try:
+                return int((r.stdout or '0').strip())
+            except ValueError:
+                return None
+
+        _n0 = _count()
+        if _n0 is None:
+            return  # table absent (older Authentik) or query failed — leave alone
+        _THRESHOLD = 100000  # healthy ~hundreds; only act on a genuine balloon
+        if _n0 < _THRESHOLD:
+            return  # Healthy — silent no-op
+
+        _log(f"Authentik channels: {_n0} rows (>= {_THRESHOLD}) — batched purge of EXPIRED messages (v0.9.57 B2)")
+
+        _BATCH = 500000
+        _MAX_ITERS = 80  # cap = 40M rows; backstop against a runaway loop
+        _deleted = 0
+        for _i in range(_MAX_ITERS):
+            r = subprocess.run(
+                _PG_NT + ['-t', '-A', '-c',
+                          "WITH d AS (DELETE FROM django_channels_postgres_message "
+                          "WHERE id IN (SELECT id FROM django_channels_postgres_message "
+                          f"WHERE expires < now() LIMIT {_BATCH}) RETURNING 1) SELECT count(*) FROM d"],
+                capture_output=True, text=True, timeout=300
+            )
+            if r.returncode != 0:
+                _log(f"Authentik channels: batch DELETE non-zero: {(r.stderr or '')[:200]}")
+                break
+            try:
+                _b = int((r.stdout or '0').strip())
+            except ValueError:
+                _b = 0
+            _deleted += _b
+            if _b == 0:
+                break
+
+        # VACUUM with PARALLEL 0 — REQUIRED: the container /dev/shm (64 MB) is too small
+        # for parallel-vacuum workers ("could not resize shared memory segment … No space
+        # left on device", hit live on test8). Reclaim failure is non-fatal — the DELETE
+        # already frees the rows (un-pegs the worker); autovacuum finishes the reclaim.
+        _vac = subprocess.run(
+            _PG_NT + ['-c', 'VACUUM (ANALYZE, PARALLEL 0) django_channels_postgres_message;'],
+            capture_output=True, text=True, timeout=900
+        )
+        if _vac.returncode != 0:
+            _log(f"Authentik channels: VACUUM non-zero (non-fatal): {(_vac.stderr or '')[:160]}")
+
+        _n1 = _count()
+        _log(f"Authentik channels: purged {_deleted} expired rows ({_n0} -> {_n1}); "
+             f"clean_expired_models will stop timing out on the next cycle")
+    except Exception as _e:
+        _log(f"Authentik channels purge: skipped ({str(_e)[:120]})")
+
+
 def _auto_authentik_tasklog_purge(plog=None):
     """v0.9.26: inline multi-tier cleanup of authentik_tasks_task + authentik_tasks_tasklog.
 
@@ -57770,6 +57869,12 @@ def _startup_migrations():
             _auto_authentik_tasklog_purge(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _atl_e:
             print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
+        # v0.9.57 (B2): self-heal a ballooned Channels-over-Postgres backlog
+        # (django_channels_postgres_message). Silent no-op when healthy (< 100k rows).
+        try:
+            _auto_authentik_channel_purge(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _ach_e:
+            print(f"Startup migration: channel purge error (non-fatal): {_ach_e}", flush=True)
 
         # v0.9.31: Clear stale `failed` state on takauthentiktasklogpurge.service
         # when the on-disk script is already the v0.9.26+ fixed version.
