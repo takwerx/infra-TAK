@@ -56703,6 +56703,48 @@ def _startup_ensure_console_runtime_max_sec():
 _startup_ensure_console_runtime_max_sec()
 
 
+# v0.9.58 (#4): startup migration — ensure the console gunicorn unit runs --threads 8.
+# The v0.9.57 4→8 bump was only written by start.sh (fresh install) and the legacy
+# python3→gunicorn auto-upgrade shim; an ALREADY-gunicorn unit (every existing box)
+# was never rewritten — _ensure_gunicorn_upgrade() early-returns once 'gunicorn' is in
+# the unit. So a plain `git checkout + restart` kept --threads 4 and the 1-worker
+# console still starved its 4 threads under load (the poller fix needs the headroom).
+# Rewrite here so manual deploys converge too. Effective on the next restart (same as
+# the RuntimeMaxSec migration above; guaranteed within 24h by RuntimeMaxSec).
+def _startup_ensure_console_gunicorn_threads():
+    try:
+        svc = '/etc/systemd/system/takwerx-console.service'
+        if not os.path.exists(svc):
+            return
+        with open(svc) as f:
+            content = f.read()
+        m = re.search(r'^ExecStart=.*$', content, flags=re.MULTILINE)
+        if not m or 'gunicorn' not in m.group(0):
+            return  # legacy python3 unit — handled by the __main__ auto-upgrade shim
+        exec_line = m.group(0)
+        if re.search(r'--threads\s+8(\s|$)', exec_line):
+            return  # already 8 — idempotent no-op
+        if re.search(r'--threads\s+\d+', exec_line):
+            new_exec = re.sub(r'--threads\s+\d+', '--threads 8', exec_line)
+        elif re.search(r'--workers\s+\d+', exec_line):
+            new_exec = re.sub(r'(--workers\s+\d+)', r'\1 --threads 8', exec_line, count=1)
+        else:
+            return  # unexpected ExecStart shape — leave it alone
+        if new_exec == exec_line:
+            return
+        content = content.replace(exec_line, new_exec, 1)
+        with open(svc, 'w') as f:
+            f.write(content)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        print('Startup migration: console gunicorn --threads → 8 (v0.9.58 #4; effective next restart)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print(f'Startup migration: gunicorn threads patch warning (non-fatal): {_e}')
+
+_startup_ensure_console_gunicorn_threads()
+
+
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
 # and force-recreate containers if the loopback binding is absent.
 # Runs on every console startup so restarts self-heal without needing Update Now.
