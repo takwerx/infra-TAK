@@ -13453,19 +13453,28 @@ def _write_takportal_override():
         return False
     try:
         _ensure_infratak_docker_network()
+        settings = load_settings()
+        tak_dns = (_get_takserver_host(settings) or '').strip()
+        # v0.9.57: container host aliases for the Portal's server-side mTLS to the local TAK JVM.
+        # host.docker.internal always maps to the docker host (172.17.0.1). When TAK is on-box
+        # AND an FQDN is set, ALSO alias takserver.<fqdn> → host-gateway so the Portal's mTLS to
+        # https://takserver.<fqdn>:8443/Marti resolves to the local JVM INSIDE the container —
+        # on both normal boxes (skips the public-IP hairpin) and gateway-fronted boxes (skips the
+        # App Gateway cert mismatch; the Portal validates the CA chain, not the hostname). That
+        # lets TAK_URL stay the real FQDN so QR enrollment hosts are correct (see
+        # _takportal_build_settings_dict). extra_hosts take effect on container RECREATE
+        # (compose up -d), not a plain restart.
+        _extra_hosts = "      - \"host.docker.internal:host-gateway\"\n"
+        if settings.get('fqdn') and tak_dns and os.path.isdir('/opt/tak'):
+            _extra_hosts += f"      - \"{tak_dns}:host-gateway\"\n"
         content = (
             "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
             "# Port hardening is applied directly to docker-compose.yml by\n"
             "# _patch_takportal_compose_ports() (compose-version-agnostic).\n"
             "services:\n"
             "  tak-portal:\n"
-            # v0.9.56: the portal reaches a LOCAL TAK Server via host.docker.internal:8443
-            # (see _takportal_build_settings_dict TAK_URL). Unlike CloudTAK's api container,
-            # the TAK-Portal compose does NOT define this alias, so without this mapping the
-            # portal can't resolve host.docker.internal and loses TAK contact. Takes effect on
-            # container RECREATE (compose up -d), not a plain restart.
             "    extra_hosts:\n"
-            "      - \"host.docker.internal:host-gateway\"\n"
+            f"{_extra_hosts}"
             "    networks:\n"
             "      - default\n"
             f"      - {INFRATAK_DOCKER_NETWORK}\n"
@@ -16038,19 +16047,17 @@ def _takportal_build_settings_dict(settings):
     # Prefer takserver.<fqdn> when FQDN is set — TAK certs are issued for DNS names; using
     # server_ip breaks TLS hostname verification ("identity could not be verified").
     # Fall back to server_ip for IP-only / no-FQDN installs; then Docker host aliases.
+    # v0.9.57: TAK_URL host = takserver.<fqdn> when an FQDN is set, so the Portal's QR
+    # enrollment host (derived from TAK_URL's hostname) points devices at the real DNS name,
+    # NOT host.docker.internal. The Portal's server-side mTLS to the local JVM is handled
+    # separately by a takserver.<fqdn>:host-gateway alias in the container's extra_hosts (see
+    # _write_takportal_override) — that resolves the FQDN to 172.17.0.1 INSIDE the container on
+    # both normal and gateway-fronted boxes (the Portal validates the CA chain, not the
+    # hostname). Reverts c384fc8's host.docker.internal override, which leaked into every QR.
+    # Recomputed every build (deterministic; never preserved — TAK_URL is intentionally NOT in
+    # PRESERVE_TAKPORTAL_KEYS).
     tak_dns = (_get_takserver_host(settings) or '').strip()
-    tak_local = os.path.isdir('/opt/tak')
-    if tak_local:
-        # TAK is on THIS box → connect to the local JVM via the Docker host alias, NOT
-        # takserver.<fqdn>. On gateway-fronted / load-balanced deploys (cloud is co-primary)
-        # the FQDN resolves to a TLS-terminating front end (App Gateway / LB) whose cert does
-        # not chain to TAK's CA, so the portal's rejectUnauthorized handshake is rejected. The
-        # portal validates the CA chain (checkServerIdentity:()=>undefined), not the hostname,
-        # so the local hop works regardless of SAN. Container has ExtraHosts
-        # host.docker.internal:host-gateway. Recomputed every build (deterministic; never
-        # preserved — TAK_URL is intentionally NOT in PRESERVE_TAKPORTAL_KEYS).
-        tak_url_host = 'host.docker.internal'
-    elif settings.get('fqdn') and tak_dns:
+    if settings.get('fqdn') and tak_dns:
         tak_url_host = tak_dns
     elif server_ip and server_ip not in ('localhost', '127.0.0.1'):
         tak_url_host = server_ip
