@@ -9471,7 +9471,7 @@ def run_guarddog_deploy(alert_email):
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
-            'tak-metrics-collector.py', 'tak-updates-watch.sh'
+            'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -9558,6 +9558,8 @@ def run_guarddog_deploy(alert_email):
             ('takdiskguard.timer', '[Unit]\nDescription=Run TAK disk monitor every hour\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=1h\nUnit=takdiskguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takdiskioguard.service', '[Unit]\nDescription=Guard Dog Disk I/O Performance Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-diskio-watch.sh\n'),
             ('takdiskioguard.timer', '[Unit]\nDescription=Run disk I/O benchmark every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takdiskioguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takswapreclaim.service', '[Unit]\nDescription=Guard Dog Swap Reclaim (stale-swap hygiene)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-swap-reclaim.sh\n'),
+            ('takswapreclaim.timer', '[Unit]\nDescription=Run swap reclaim every 10 minutes\n\n[Timer]\nOnBootSec=12min\nOnUnitActiveSec=10min\nUnit=takswapreclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
@@ -9711,6 +9713,7 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
+                  'takswapreclaim.timer',
                   'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
