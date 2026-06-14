@@ -2489,11 +2489,96 @@ def _offbox_ship_syslog(lines, cfg):
     return (n, None)
 
 def _offbox_ship_s3(lines, cfg):
-    """Ship spooled lines as an immutable S3 Object-Lock (WORM) segment. NOT YET WIRED:
-    SigV4 + Object-Lock needs an S3 client and a real bucket to validate against. Structured
-    so the flush loop treats it as a real mode; returns (0, reason) so the backlog is RETAINED
-    and surfaced, never silently dropped. TODO(v0.9.56 W7): implement against a test bucket."""
-    return (0, 's3objlock sink not yet implemented (pending S3 client + test Object-Lock bucket)')
+    """Ship the spooled audit lines as ONE immutable S3 Object-Lock (WORM) segment via a
+    SigV4-signed PUT — no boto3 dependency. Object-Lock mode=COMPLIANCE with
+    retain-until = now + retention_days makes the object un-deletable / un-overwritable
+    (even by the account root) until that date — the WORM guarantee for ≥365d audit.
+    Path-style when an `endpoint` is configured (MinIO — the validation target — and any
+    S3-compatible store); AWS virtual-host style otherwise. Fail-CLOSED: returns
+    (0, reason) on ANY error so the spool is RETAINED and surfaced, never dropped.
+    Returns (n_shipped, error_or_None); never raises.
+    Validate (v0.9.58 #3) against a local MinIO Object-Lock bucket: write probe →
+    confirm immutable read-back → attempt delete/overwrite → confirm REFUSED."""
+    import hashlib as _hl, hmac as _hmac, urllib.request as _ur, urllib.error as _ue
+    s3 = cfg.get('s3') or {}
+    bucket = (s3.get('bucket') or '').strip().strip('/')
+    region = (s3.get('region') or 'us-east-1').strip()
+    access_key = (s3.get('access_key') or '').strip()
+    secret_key = (s3.get('secret_key') or '').strip()
+    if not (bucket and access_key and secret_key):
+        return (0, 's3 sink incomplete (need bucket + access_key + secret_key)')
+    endpoint = (s3.get('endpoint') or '').strip().rstrip('/')
+    prefix = (s3.get('prefix') or 'infratak-audit').strip().strip('/')
+    retention_days = max(OFFBOX_RETENTION_FLOOR, int(cfg.get('retention_days') or OFFBOX_RETENTION_FLOOR))
+
+    body = ('\n'.join(lines) + '\n').encode('utf-8')
+    payload_hash = _hl.sha256(body).hexdigest()
+    now = datetime.utcnow()
+    amzdate = now.strftime('%Y%m%dT%H%M%SZ')
+    datestamp = now.strftime('%Y%m%d')
+    retain_until = (now + timedelta(days=retention_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    fqdn = (load_settings().get('fqdn') or 'console').split(':')[0]
+    key = '%s/%s/%s/audit-%s-%s.jsonl' % (prefix, fqdn, now.strftime('%Y/%m/%d'),
+                                          amzdate, payload_hash[:12])
+
+    if endpoint:  # path-style: <endpoint>/<bucket>/<key>  (MinIO / S3-compatible)
+        host = endpoint.split('://', 1)[-1].split('/', 1)[0]
+        raw_uri = '/%s/%s' % (bucket, key)
+        url = '%s/%s/%s' % (endpoint, bucket, key)
+    else:         # AWS virtual-host: <bucket>.s3.<region>.amazonaws.com/<key>
+        host = '%s.s3.%s.amazonaws.com' % (bucket, region)
+        raw_uri = '/' + key
+        url = 'https://%s/%s' % (host, key)
+    # canonical URI: encode each path segment, preserve the slashes
+    canonical_uri = '/'.join(_ur.quote(seg, safe='') for seg in raw_uri.split('/'))
+
+    headers = {
+        'host': host,
+        'content-type': 'application/x-ndjson',
+        'x-amz-content-sha256': payload_hash,
+        'x-amz-date': amzdate,
+        'x-amz-object-lock-mode': 'COMPLIANCE',
+        'x-amz-object-lock-retain-until-date': retain_until,
+    }
+    signed_headers = ';'.join(sorted(headers))
+    canonical_headers = ''.join('%s:%s\n' % (k, headers[k]) for k in sorted(headers))
+    canonical_request = '\n'.join(['PUT', canonical_uri, '', canonical_headers,
+                                   signed_headers, payload_hash])
+
+    algorithm = 'AWS4-HMAC-SHA256'
+    scope = '%s/%s/s3/aws4_request' % (datestamp, region)
+    string_to_sign = '\n'.join([algorithm, amzdate, scope,
+                                _hl.sha256(canonical_request.encode()).hexdigest()])
+
+    def _sign(k, msg):
+        return _hmac.new(k, msg.encode(), _hl.sha256).digest()
+    k_signing = _sign(_sign(_sign(_sign(('AWS4' + secret_key).encode(), datestamp),
+                                  region), 's3'), 'aws4_request')
+    signature = _hmac.new(k_signing, string_to_sign.encode(), _hl.sha256).hexdigest()
+    authz = '%s Credential=%s/%s, SignedHeaders=%s, Signature=%s' % (
+        algorithm, access_key, scope, signed_headers, signature)
+
+    req = _ur.Request(url, data=body, method='PUT')
+    for k in headers:
+        req.add_header(k, headers[k])
+    req.add_header('Authorization', authz)
+    try:
+        resp = _ur.urlopen(req, timeout=20)
+        code = resp.getcode()
+        resp.read()
+        if 200 <= code < 300:
+            return (len(lines), None)
+        return (0, 's3 PUT returned HTTP %s' % code)
+    except _ue.HTTPError as e:
+        detail = ''
+        try:
+            detail = e.read().decode('utf-8', 'replace')[:200]
+        except Exception:
+            pass
+        return (0, 's3 PUT HTTP %s: %s' % (e.code, detail))
+    except Exception as e:
+        return (0, 's3 PUT failed: %s' % str(e)[:160])
 
 def _offbox_flush_once():
     """Flush the spool to the configured sink; drop only the confirmed-shipped prefix
