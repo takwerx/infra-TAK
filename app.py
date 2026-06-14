@@ -54073,7 +54073,7 @@ async function toggleResourceBreakdown(hostId){
     if(div.style.display==='block'){div.style.display='none';return;}
     if(!div.getAttribute('data-loaded')){
         div.style.display='block';div.textContent='Loading\u2026';
-        try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
+        try{var r=await fetchRetry('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
         catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
         return;
     }
@@ -54085,6 +54085,27 @@ async function toggleResourceBreakdown(hostId){
    fails that cleared on a page reload). Whitelisted to read endpoints only — the
    long-running action endpoints (update/apply, *_control, deploy) are never touched. */
 (function(){if(window.__fetchTO)return;window.__fetchTO=1;var _f=window.fetch.bind(window);var L=[['/api/metrics',10000],['/api/modules/version',15000],['/api/modules',12000],['/api/host-resource-usage',30000],['/api/update/check',15000],['/api/guarddog',12000]];window.fetch=function(u,o){o=o||{};if(typeof u==='string'&&!o.signal){for(var i=0;i<L.length;i++){if(u.indexOf(L[i][0])===0){var c=new AbortController();o.signal=c.signal;var t=setTimeout(function(){try{c.abort()}catch(e){}},L[i][1]);return _f(u,o).finally(function(){clearTimeout(t)});}}}return _f(u,o);};})();
+/* v0.9.58 (#1): on-demand button fetches fail silently on the FIRST transient miss
+   (a momentary thread-starvation, an aborted poll, a 5xx) and strand the operator
+   until they reload the page. fetchRetry() auto-retries a transient failure 1-2x with
+   a short backoff so a blip just succeeds. Use ONLY for short read/idempotent calls —
+   never for update/apply, deploys, or non-idempotent POSTs. Pairs with __fetchTO above
+   (each retry gets a fresh timeout). */
+async function fetchRetry(url,opts,tries){
+  opts=opts||{}; tries=(tries==null)?2:tries; var lastErr;
+  for(var a=0;a<tries;a++){
+    try{
+      var r=await fetch(url,opts);
+      if(r.status>=500&&a<tries-1){await new Promise(function(res){setTimeout(res,350*(a+1));});continue;}
+      return r;
+    }catch(e){
+      lastErr=e;
+      if(a<tries-1){await new Promise(function(res){setTimeout(res,350*(a+1));});continue;}
+      throw e;
+    }
+  }
+  throw lastErr;
+}
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
@@ -54344,7 +54365,7 @@ async function checkUpdate(forceRefresh){
     if(btn){btn.disabled=true;btn.textContent='Checking...';}
     try{
         var url='/api/update/check';if(forceRefresh)url+='?refresh=1';
-        var r=await fetch(url,{credentials:'same-origin',cache:'no-store'});
+        var r=await fetchRetry(url,{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
         if(d.update_available){
             document.getElementById('update-banner').style.display='block';
@@ -54425,7 +54446,7 @@ async function confirmDevChannel(){
     if(!pw){if(err)err.textContent='Password required';return;}
     if(err)err.textContent='';
     try{
-        var r=await fetch('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'dev',password:pw}),credentials:'same-origin'});
+        var r=await fetchRetry('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'dev',password:pw}),credentials:'same-origin'});
         var d=await r.json();
         if(d.ok){
             closeDevModal();
@@ -54442,7 +54463,7 @@ async function setUpdateChannel(ch){
     var st=document.getElementById('ch-status');
     if(st)st.textContent='Saving…';
     try{
-        var r=await fetch('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch}),credentials:'same-origin'});
+        var r=await fetchRetry('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch}),credentials:'same-origin'});
         var d=await r.json();
         if(d.ok){
             _currentChannel=ch;
