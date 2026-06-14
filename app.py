@@ -1768,7 +1768,24 @@ def _parse_dd_speed_mbs(stderr_or_stdout):
     return None
 
 
-def _run_disk_speed_test_local():
+_disk_speed_cache = {'result': None, 'ts': 0.0}
+
+def _run_disk_speed_test_local(use_cache=True):
+    """Cached wrapper around the 256 MiB dsync benchmark. The raw benchmark writes
+    256 MiB and is slow on throttled/loaded disks — running it on every
+    /api/host-resource-usage click is what made that endpoint 'Request failed'
+    under load (e.g. during a post-update auto-deploy). Cache the result ~10 min so
+    the interactive endpoint returns fast (just ps) instead of re-benchmarking, and
+    to spare SSD writes. Pass use_cache=False to force a fresh run."""
+    import time as _t
+    if use_cache and _disk_speed_cache['result'] is not None and (_t.time() - _disk_speed_cache['ts'] < 600):
+        return _disk_speed_cache['result']
+    res = _run_disk_speed_test_local_impl()
+    _disk_speed_cache['result'] = res
+    _disk_speed_cache['ts'] = _t.time()
+    return res
+
+def _run_disk_speed_test_local_impl():
     """Run 256 MiB sync write (oflag=dsync). Returns dict with disk_speed_test_write_mbs or disk_speed_test_error.
     Uses oflag=dsync to match start.sh and Guard Dog — measures real hardware throughput, not buffer cache."""
     path = _disk_speed_test_path()
