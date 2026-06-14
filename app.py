@@ -6019,7 +6019,7 @@ def guarddog_page():
     guarddog_monitors_tak = [
         {'name': 'Port 8089', 'id': 'port8089', 'interval': '1 min', 'desc': 'Checks that TAK Server port 8089 is listening and accepting connections. Auto-restarts TAK Server after 3 consecutive failures.'},
         {'name': 'Process', 'id': 'process', 'interval': '1 min', 'desc': 'Verifies all 5 TAK Server Java processes (messaging, api, config, plugins, retention). Auto-restart after 3 consecutive failures.'},
-        {'name': 'Network', 'id': 'network', 'interval': '1 min', 'desc': 'Pings Cloudflare (1.1.1.1) and Google (8.8.8.8). Alerts only (no restart) after 3 failures — helps distinguish network issues from server issues.'},
+        {'name': 'Network', 'id': 'network', 'interval': '1 min', 'desc': 'Pings Cloudflare (1.1.1.1) and Google (8.8.8.8); if ICMP is blocked (common on Azure/cloud) it falls back to a TCP connect to confirm egress. Alerts only (no restart) after 3 failures — helps distinguish network issues from server issues.'},
     ]
     if not is_two_server:
         guarddog_monitors_tak.extend([
@@ -8168,10 +8168,20 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run('pgrep -f "takserver" 2>/dev/null | head -1', shell=True, capture_output=True, text=True, timeout=3)
             return bool(r.stdout.strip())
         if monitor_id == 'network':
+            # ICMP first — fast path where ping is allowed.
             for host in ('1.1.1.1', '8.8.8.8'):
                 r = subprocess.run(['ping', '-c', '1', '-W', '2', host], capture_output=True, timeout=4)
                 if r.returncode == 0:
                     return True
+            # ICMP filtered (e.g. Azure NSG blocks outbound ping) — confirm real egress
+            # via TCP before declaring the network down. Mirrors _detect_local_ip()'s
+            # trust model: TCP/UDP egress is the truth, ICMP is not.
+            for host, port in (('1.1.1.1', 443), ('8.8.8.8', 53)):
+                try:
+                    with socket.create_connection((host, port), timeout=2):
+                        return True
+                except OSError:
+                    continue
             return False
         if monitor_id == 'postgresql':
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql']), capture_output=True, text=True, timeout=3)
@@ -53602,8 +53612,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
-<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
-<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
 {% for host in uu_hosts %}
 <div class="metric-card" style="position:relative" title="OS/apt automatic upgrades on this host." data-uu-target="{{ host.id }}">
@@ -53742,7 +53752,7 @@ async function toggleResourceBreakdown(hostId){
     }
     div.style.display='block';
 }
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
         for(var k in mods){
@@ -55240,8 +55250,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endif %}
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
-<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
-<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
 </div>
 <div class="section-title">Marketplace</div>
@@ -55271,7 +55281,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 <script>
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
 </script></body></html>'''
 
 # === TAK Server Template ===
