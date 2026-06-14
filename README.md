@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.56-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.56-alpha)**
+**Current release: [v0.9.57-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.57-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.57-alpha — 2026-06-14 — Authentik performance fix + self-healing, console reliability, and TAK Portal QR enrollment
+
+**Headline: Authentik runs cool again, the console dashboard stays responsive under load, and TAK Portal enrollment QR codes point devices at the right server.** Authentik is updated to **2026.5.3**, which fixes an upstream bug that pegged the identity provider's CPU and made single sign-on feel sluggish even on an idle system — logins are snappy again. A box that had already built up a large Authentik background-task backlog now **clears it automatically** on the next console restart, so the high-CPU condition self-heals without any manual database work. The **console dashboard** is more reliable on busy boxes: the "What's using CPU/RAM" and "Check for new release" buttons no longer fail while the page's background refreshes are running, and the memory gauge now reads accurately. **Guard Dog** no longer raises a false "network down" alert on cloud/Azure hosts that block ping (it confirms real internet egress another way), and it now **reclaims leftover swap** automatically after a memory spike. And **TAK Portal** enrollment QR codes once again carry your server's real hostname instead of an internal Docker address, so scanning a QR enrolls a device correctly — while the Portal still reaches an on-box TAK Server reliably. **Upgrade:** applied automatically on the next console restart.
+
+Full notes: [v0.9.57-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.57-alpha).
 
 ### v0.9.56-alpha — 2026-06-14 — Portal & CloudTAK deploy reliability + Authentik database hygiene
 
