@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.55-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.55-alpha)**
+**Current release: [v0.9.56-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.56-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.56-alpha — 2026-06-14 — Portal & CloudTAK deploy reliability + Authentik database hygiene
+
+**Headline: cloud and gateway-fronted deployments get more reliable — TAK Portal reconnects to a local TAK Server even behind a load balancer, fresh CloudTAK deploys come up clean, and Authentik stops growing its database without bound.** TAK Portal now reaches an on-box TAK Server through the Docker host even when your domain resolves to a TLS-terminating front end (an App Gateway or load balancer) whose certificate doesn't chain to TAK's CA — the case that previously left the Portal unable to sync — and it derives the TAK certificate password from the certificate itself, so a mismatched setting can't silently break the connection. Fresh **CloudTAK** deploys now harden their container ports *before* the containers start, so the video port no longer collides with the web proxy and leaves a blank map page — the map serves correctly on the first deploy. **Authentik** event-log retention is now capped to a sane window instead of the year-long default that let the events table — and its CPU cost — grow without bound. In the hardened security posture, the **30-minute idle auto-logout now truly re-prompts** through single sign-on instead of silently refreshing, and a new **off-box audit option** (syslog/CEF to your SIEM) keeps a tamper-resistant copy of the console's audit trail. **Upgrade:** applied automatically on the next console restart; the CloudTAK port fix takes effect on its next deploy.
+
+Full notes: [v0.9.56-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.56-alpha).
 
 ### v0.9.55-alpha — 2026-06-13 — Cyber Controls: one-click SSO + MFA hardening
 
