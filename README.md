@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.57.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.57.1-alpha)**
+**Current release: [v0.9.58-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.58-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.58-alpha — 2026-06-15 — Console reliability behind SSO + gateway-safe brute-force protection
+
+**Headline: the console dashboard stays usable on SSO-protected deployments, and brute-force protection can no longer accidentally lock out your own gateway.** On deployments where the console sits behind single sign-on, the dashboard's background calls — the **"Check for new release"** and **"What's using CPU/RAM"** buttons and the live gauges — could fail once your login session lapsed: the page still looked logged in, but those controls quietly errored until you reloaded. The console now handles an expired session cleanly so the buttons keep working as expected. Brute-force protection (fail2ban) gains a **trusted-upstream whitelist**: on a box behind a reverse proxy, load balancer, or cloud gateway, the upstream's address is never banned — preventing a self-inflicted outage where one traffic blip could block every site at once. The console's web server also picks up its full thread count on a plain restart (not only via Update Now), so busy single-worker consoles stay responsive. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v0.9.58-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.58-alpha).
 
 ### v0.9.57.1-alpha — 2026-06-14 — Authentik 2026.5.3 for all deployments
 
