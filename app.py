@@ -2244,6 +2244,40 @@ def _enforce_session_idle_lock():
         # A lock failure must never brick a request — fail open to the normal flow.
         return
 
+# v0.9.58: inject the idle-lock 401 handler into EVERY console HTML page. The 30-min
+# W2/W-IDLE lock returns 401 {login_required} to /api/* once a session idle-times-out;
+# without this, a button on ANY page just shows "request failed" while the stale page
+# still looks logged in (reported on test6). The ~20 module pages are standalone
+# templates with no shared base, so one after_request hook covers them all at once.
+# The injected JS is self-guarded (window.__auth401) → idempotent; only text/html 200
+# bodies are touched (JSON/static/redirects skipped).
+_IDLE_LOCK_401_JS = (
+    "<script>(function(){if(window.__auth401)return;window.__auth401=1;"
+    "var _f=window.fetch.bind(window);window.fetch=function(u,o){return _f(u,o).then(function(r){try{"
+    "if(r&&r.status===401&&typeof u==='string'&&u.indexOf('/api/')===0&&!window.__auth401fired){"
+    "var last=parseInt(sessionStorage.getItem('__auth401_t')||'0',10);var nowt=Math.floor(Date.now()/1000);"
+    "if(nowt-last>15){window.__auth401fired=1;sessionStorage.setItem('__auth401_t',String(nowt));"
+    "var d=document.createElement('div');d.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99999;"
+    "background:#1e3a8a;color:#fff;font-family:sans-serif;font-size:13px;text-align:center;padding:11px;"
+    "box-shadow:0 2px 10px rgba(0,0,0,.45)';"
+    "d.textContent='\U0001F512 Logged out after 30 minutes idle (session lock) — sending you to sign in again…';"
+    "(document.body||document.documentElement).appendChild(d);setTimeout(function(){location.reload();},1300);}}"
+    "}catch(e){}return r;});};})();</script>"
+)
+
+@app.after_request
+def _inject_idle_lock_handler(response):
+    try:
+        if ('text/html' in (response.content_type or '')
+                and response.status_code == 200
+                and not response.direct_passthrough):
+            body = response.get_data(as_text=True)
+            if '</body>' in body and '__auth401' not in body:
+                response.set_data(body.replace('</body>', _IDLE_LOCK_401_JS + '</body>', 1))
+    except Exception:
+        pass
+    return response
+
 def _hardening_control_w2():
     """W2 — 30-minute server-side session lock."""
     def apply_(h, log):
@@ -54210,39 +54244,8 @@ async function toggleResourceBreakdown(hostId){
    fails that cleared on a page reload). Whitelisted to read endpoints only — the
    long-running action endpoints (update/apply, *_control, deploy) are never touched. */
 (function(){if(window.__fetchTO)return;window.__fetchTO=1;var _f=window.fetch.bind(window);var L=[['/api/metrics',10000],['/api/modules/version',15000],['/api/modules',12000],['/api/host-resource-usage',30000],['/api/update/check',15000],['/api/guarddog',12000]];window.fetch=function(u,o){o=o||{};if(typeof u==='string'&&!o.signal){for(var i=0;i<L.length;i++){if(u.indexOf(L[i][0])===0){var c=new AbortController();o.signal=c.signal;var t=setTimeout(function(){try{c.abort()}catch(e){}},L[i][1]);return _f(u,o).finally(function(){clearTimeout(t)});}}}return _f(u,o);};})();
-/* v0.9.58: honor the W2/W-IDLE 30-minute idle lock. On a hardened box, once the
-   session idle-times-out the server returns 401 {login_required:true} to /api/* calls
-   (app.py _enforce_session_idle_lock). The dashboard buttons/pollers don't understand
-   that and just show "request failed" — while navigating to another page silently
-   re-auths and "fixes" it, which is baffling. This global wrapper catches that 401 and
-   does the obvious thing: tell the user the session locked and reload to re-authenticate
-   (a full-page nav triggers the proper re-auth/SSO re-prompt the lock intends). One-shot,
-   loop-guarded (15s) so a failed re-auth can't reload-storm. Not a .58 regression — the
-   lock predates .58 — but .58 is where we make it not look broken. */
-(function(){
-  if(window.__auth401)return; window.__auth401=1;
-  var _f=window.fetch.bind(window);
-  window.fetch=function(u,o){
-    return _f(u,o).then(function(r){
-      try{
-        if(r&&r.status===401&&typeof u==='string'&&u.indexOf('/api/')===0&&!window.__auth401fired){
-          var last=parseInt(sessionStorage.getItem('__auth401_t')||'0',10);
-          var nowt=Math.floor(Date.now()/1000);
-          if(nowt-last>15){
-            window.__auth401fired=1;
-            sessionStorage.setItem('__auth401_t',String(nowt));
-            var d=document.createElement('div');
-            d.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99999;background:#1e3a8a;color:#fff;font-family:sans-serif;font-size:13px;text-align:center;padding:11px;box-shadow:0 2px 10px rgba(0,0,0,.45)';
-            d.textContent='🔒 Logged out after 30 minutes idle (session lock) — sending you to sign in again…';
-            (document.body||document.documentElement).appendChild(d);
-            setTimeout(function(){location.reload();},1300);
-          }
-        }
-      }catch(e){}
-      return r;
-    });
-  };
-})();
+/* v0.9.58: idle-lock 401 handler is injected on EVERY console page globally via the
+   _inject_idle_lock_handler after_request hook (app.py) — no longer inline here. */
 /* v0.9.58 (#1): on-demand button fetches fail silently on the FIRST transient miss
    (a momentary thread-starvation, an aborted poll, a 5xx) and strand the operator
    until they reload the page. fetchRetry() auto-retries a transient failure 1-2x with
