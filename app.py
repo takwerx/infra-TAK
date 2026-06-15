@@ -54233,7 +54233,7 @@ async function toggleResourceBreakdown(hostId){
             sessionStorage.setItem('__auth401_t',String(nowt));
             var d=document.createElement('div');
             d.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99999;background:#1e3a8a;color:#fff;font-family:sans-serif;font-size:13px;text-align:center;padding:11px;box-shadow:0 2px 10px rgba(0,0,0,.45)';
-            d.textContent='🔒 Session locked after 30 minutes idle — re-authenticating…';
+            d.textContent='🔒 Logged out after 30 minutes idle (session lock) — sending you to sign in again…';
             (document.body||document.documentElement).appendChild(d);
             setTimeout(function(){location.reload();},1300);
           }
