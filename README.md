@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.59-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.59-alpha)**
+**Current release: [v0.9.60-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.60-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.60-alpha — 2026-06-15 — EUD Remote Assist: accurate version checks and an on-demand update check
+
+**Headline: the EUD Remote Assist module now reports its available version reliably and refreshes the moment you ask it to.** The module's "newest version available" check has been reworked to query GitHub directly and cache results sensibly, so the displayed version stays accurate and no longer gets stuck. A new **🔄 Check** button lets you re-check for a newer release on demand — handy when a new build has just been published — and the installed-version and update-ready indicators update in place without a full page reload. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v0.9.60-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.60-alpha).
 
 ### v0.9.59-alpha — 2026-06-15 — EUD Remote Assist: remotely manage your Android devices
 
