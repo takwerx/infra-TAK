@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.59-alpha"
+VERSION = "0.9.60-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -6516,7 +6516,9 @@ def _run_remote_assist_deploy(settings):
         _remote_assist_deploy_status.update({'running': False, 'error': True})
 
 
-_remote_assist_release_cache = {'sha': None, 'version': None, 'tag': None, 'ts': 0}
+REMOTE_ASSIST_UPSTREAM_CACHE_TTL = 1800  # 30 min — dashboard polls; /api/remote-assist/version bypasses via fresh=True
+
+_remote_assist_upstream_cache = {'version': None, 'sha': None, 'version_ts': 0, 'sha_ts': 0}
 
 
 def _remote_assist_github_repo_path():
@@ -6524,6 +6526,10 @@ def _remote_assist_github_repo_path():
     import re as _re
     m = _re.search(r'github\.com[:/]([^/]+/[^/.]+)', REMOTE_ASSIST_REPO or '')
     return m.group(1) if m else 'cfd2474/EUD_Remote_Assist_Portal'
+
+
+def _remote_assist_github_headers():
+    return {'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'}
 
 
 def _remote_assist_version_tuple(ver):
@@ -6541,78 +6547,58 @@ def _remote_assist_version_tuple(ver):
     return tuple(parts)
 
 
-def _get_remote_assist_latest_commit_sha(use_cache=True):
-    """Latest commit on main for EUD_Remote_Assist_Portal (deploy tracks main, not tags)."""
+def _fetch_remote_assist_upstream(*, fresh=False):
+    """Upstream VERSION + main SHA via GitHub API (contents + git ref — not raw.githubusercontent.com).
+
+    Two lightweight API calls replace the old raw VERSION fetch plus commits/tags list (which
+    burned unauthenticated rate limit and cached stale semver for 4h). Separate TTLs per field;
+    fresh=True bypasses cache (used by /api/remote-assist/version and page load).
+    Returns stale cache on failure rather than None."""
     import time as _time
+    import base64 as _b64
     import urllib.request as _ur
-    if use_cache and _remote_assist_release_cache['sha'] and (_time.time() - _remote_assist_release_cache['ts'] < 14400):
-        return _remote_assist_release_cache['sha']
     repo = _remote_assist_github_repo_path()
-    try:
-        req = _ur.Request(
-            f'https://api.github.com/repos/{repo}/commits/main',
-            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=10) as resp:
-            sha = (json.loads(resp.read().decode()).get('sha') or '').strip() or None
-            if sha:
-                _remote_assist_release_cache['sha'] = sha
-                _remote_assist_release_cache['ts'] = _time.time()
-            return sha
-    except Exception as e:
-        print(f"version-info: remote-assist latest-commit check failed (non-fatal): {e}", flush=True)
-        return _remote_assist_release_cache.get('sha') or None
+    now = _time.time()
+    c = _remote_assist_upstream_cache
+    out = {'version': c.get('version'), 'sha': c.get('sha')}
 
+    need_version = fresh or not c.get('version') or (now - c.get('version_ts', 0) >= REMOTE_ASSIST_UPSTREAM_CACHE_TTL)
+    need_sha = fresh or not c.get('sha') or (now - c.get('sha_ts', 0) >= REMOTE_ASSIST_UPSTREAM_CACHE_TTL)
+    if not need_version and not need_sha:
+        return out
 
-def _get_remote_assist_latest_release_tag(use_cache=True):
-    """Highest semver GitHub tag (v2.0.0, v1.3.3, …) for display — not the update gate."""
-    import time as _time
-    import urllib.request as _ur
-    if use_cache and _remote_assist_release_cache.get('tag') and (_time.time() - _remote_assist_release_cache['ts'] < 14400):
-        return _remote_assist_release_cache['tag']
-    repo = _remote_assist_github_repo_path()
-    best_tag = _remote_assist_release_cache.get('tag')
-    try:
-        req = _ur.Request(
-            f'https://api.github.com/repos/{repo}/tags?per_page=100',
-            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=10) as resp:
-            tags = json.loads(resp.read().decode())
-        best = None
-        for t in tags or []:
-            name = (t.get('name') or '').strip()
-            if not name or not name[0].lower() == 'v' or not name[1:2].isdigit():
-                continue
-            if best is None or _remote_assist_version_tuple(name) > _remote_assist_version_tuple(best):
-                best = name
-        if best:
-            _remote_assist_release_cache['tag'] = best
-            _remote_assist_release_cache['ts'] = _time.time()
-            return best
-    except Exception as e:
-        print(f"version-info: remote-assist tag check failed (non-fatal): {e}", flush=True)
-    return best_tag
-
-
-def _get_remote_assist_latest_version(use_cache=True):
-    """Latest VERSION file on main (upstream source of truth since v2.0.0)."""
-    import time as _time
-    import urllib.request as _ur
-    if use_cache and _remote_assist_release_cache.get('version') and (_time.time() - _remote_assist_release_cache['ts'] < 14400):
-        return _remote_assist_release_cache['version']
-    repo = _remote_assist_github_repo_path()
-    try:
-        req = _ur.Request(
-            f'https://raw.githubusercontent.com/{repo}/main/VERSION',
-            headers={'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=10) as resp:
-            ver = (resp.read().decode().strip().lstrip('vV') or None)
+    if need_version:
+        try:
+            req = _ur.Request(
+                f'https://api.github.com/repos/{repo}/contents/VERSION?ref=main',
+                headers=_remote_assist_github_headers())
+            with _ur.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode())
+            raw = (data.get('content') or '').replace('\n', '')
+            ver = (_b64.b64decode(raw).decode().strip().lstrip('vV') or None) if raw else None
             if ver:
-                _remote_assist_release_cache['version'] = ver
-                _remote_assist_release_cache['ts'] = _time.time()
-            return ver
-    except Exception as e:
-        print(f"version-info: remote-assist VERSION check failed (non-fatal): {e}", flush=True)
-        return _remote_assist_release_cache.get('version') or None
+                c['version'] = ver
+                c['version_ts'] = now
+                out['version'] = ver
+        except Exception as e:
+            print(f"version-info: remote-assist GitHub VERSION fetch failed (non-fatal): {e}", flush=True)
+
+    if need_sha:
+        try:
+            req = _ur.Request(
+                f'https://api.github.com/repos/{repo}/git/ref/heads/main',
+                headers=_remote_assist_github_headers())
+            with _ur.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode())
+            sha = ((data.get('object') or {}).get('sha') or '').strip() or None
+            if sha:
+                c['sha'] = sha
+                c['sha_ts'] = now
+                out['sha'] = sha
+        except Exception as e:
+            print(f"version-info: remote-assist GitHub main ref fetch failed (non-fatal): {e}", flush=True)
+
+    return out
 
 
 def _get_remote_assist_running_version():
@@ -6629,14 +6615,16 @@ def _get_remote_assist_running_version():
         return ''
 
 
-def _get_remote_assist_version_info():
-    """Return {version, update_available, latest, latest_tag, running} for EUD Remote Assist.
+def _get_remote_assist_version_info(*, fresh=False):
+    """Return {version, update_available, latest, latest_tag, running, is_current} for EUD Remote Assist.
 
-    Compares local VERSION file to upstream main VERSION (per docs/versioning.md).
-    Falls back to git SHA when VERSION is missing on old checkouts.
+    Compares local VERSION to upstream main VERSION via GitHub API (per docs/versioning.md).
+    Falls back to git SHA when VERSION is missing on old checkouts. Pass fresh=True to bypass
+    the 30-minute upstream cache (page load + /api/remote-assist/version polling).
     """
     import subprocess as _sp
-    info = {'version': '', 'update_available': False, 'latest': None, 'latest_tag': None, 'running': ''}
+    info = {'version': '', 'update_available': False, 'latest': None, 'latest_tag': None,
+            'running': '', 'is_current': False}
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     settings = load_settings()
     local_ver = ''
@@ -6660,20 +6648,24 @@ def _get_remote_assist_version_info():
     elif settings.get('remote_assist_commit_sha'):
         info['version'] = settings['remote_assist_commit_sha']
 
-    latest_ver = _get_remote_assist_latest_version()
+    upstream = _fetch_remote_assist_upstream(fresh=fresh)
+    latest_ver = upstream.get('version')
+    latest_full = upstream.get('sha')
     if latest_ver:
         info['latest'] = latest_ver
+        info['latest_tag'] = latest_ver
         if local_ver and _remote_assist_version_tuple(latest_ver) > _remote_assist_version_tuple(local_ver):
             info['update_available'] = True
+    if not info['update_available'] and latest_full and local_full and local_full != latest_full:
+        info['update_available'] = True
+        if not info['latest']:
+            info['latest'] = latest_full[:7]
     if not info['update_available']:
-        latest_full = _get_remote_assist_latest_commit_sha()
-        if latest_full and local_full and local_full != latest_full:
-            info['update_available'] = True
-            if not info['latest']:
-                info['latest'] = latest_full[:7]
-    latest_tag = _get_remote_assist_latest_release_tag()
-    if latest_tag:
-        info['latest_tag'] = latest_tag.lstrip('vV')
+        if local_ver and latest_ver and _remote_assist_version_tuple(local_ver) >= _remote_assist_version_tuple(latest_ver):
+            if not local_full or not latest_full or local_full == latest_full:
+                info['is_current'] = True
+        elif local_full and latest_full and local_full == latest_full:
+            info['is_current'] = True
     running = _get_remote_assist_running_version()
     if running:
         info['running'] = running
@@ -6751,6 +6743,8 @@ def _run_remote_assist_update():
         save_settings(s)
         label = f'v{ra_version}' if ra_version else new_sha
         plog(f'✓ EUD Remote Assist updated to {label}')
+        _remote_assist_upstream_cache.update({'version_ts': 0, 'sha_ts': 0})
+        _fetch_remote_assist_upstream(fresh=True)
         _remote_assist_update_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as exc:
         plog(f'ERROR: {exc}')
@@ -6760,7 +6754,8 @@ def _run_remote_assist_update():
 @app.route('/api/remote-assist/version')
 @login_required
 def remote_assist_version_api():
-    return jsonify(_get_remote_assist_version_info())
+    fresh = request.args.get('fresh', '1').lower() in ('1', 'true', 'yes')
+    return jsonify(_get_remote_assist_version_info(fresh=fresh))
 
 
 @app.route('/api/remote-assist/update', methods=['POST'])
@@ -6792,7 +6787,7 @@ def remote_assist_page():
         _remote_assist_deploy_status.update({'complete': False, 'error': False})
     ra_host = _get_service_domain(settings, 'remote_assist')
     ra_url = f'https://{ra_host}' if ra_host else ''
-    ra_vinfo = _get_remote_assist_version_info() if ra.get('installed') else {}
+    ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
     r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
         settings=settings, ra=ra, version=VERSION,
@@ -56650,7 +56645,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if ra.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn btn-update{% if ra_vinfo.get('update_available') %} btn-update-active{% endif %}" onclick="startRaUpdate()" id="ra-update-btn"{% if ra_vinfo.get('update_available') %} title="Update available: v{{ ra_vinfo.get('latest') }}"{% else %} title="Already on latest release"{% endif %}>⬆ Update{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan)">●</span>{% endif %}</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn btn-update{% if ra_vinfo.get('update_available') %} btn-update-active{% endif %}" onclick="startRaUpdate()" id="ra-update-btn"{% if ra_vinfo.get('update_available') %} title="Update available: v{{ ra_vinfo.get('latest') }}"{% else %} title="Already on latest release"{% endif %}>⬆ Update{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan)">●</span>{% endif %}</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if ra.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn btn-update{% if ra_vinfo.get('update_available') %} btn-update-active{% endif %}" onclick="startRaUpdate()" id="ra-update-btn"{% if ra_vinfo.get('update_available') %} title="Update available: v{{ ra_vinfo.get('latest') }}"{% else %} title="Already on latest release"{% endif %}>⬆ Update{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan)">●</span>{% endif %}</button><button class="control-btn" onclick="refreshRaVersion(true)" id="ra-check-btn" title="Check GitHub for a newer version">🔄 Check</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn btn-update{% if ra_vinfo.get('update_available') %} btn-update-active{% endif %}" onclick="startRaUpdate()" id="ra-update-btn"{% if ra_vinfo.get('update_available') %} title="Update available: v{{ ra_vinfo.get('latest') }}"{% else %} title="Already on latest release"{% endif %}>⬆ Update{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan)">●</span>{% endif %}</button><button class="control-btn" onclick="refreshRaVersion(true)" id="ra-check-btn" title="Check GitHub for a newer version">🔄 Check</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
@@ -56659,8 +56654,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   {% if authentik_installed and settings.fqdn %}<div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)"><div class="card-title">&#128274; Protected by Authentik</div><p style="font-size:13px;color:var(--text-secondary);line-height:1.5">The admin portal uses Authentik OIDC. Access is restricted to <strong>authentik Admins</strong> — the same group as the infra-TAK console. Device APIs use per-device secrets and are not gated by Authentik.</p></div>{% endif %}
   <div class="card"><div class="card-title">Access</div><div class="info-grid">
     {% if ra_url %}<div class="info-item"><div class="info-label">Admin portal</div><div class="info-value"><a href="{{ ra_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">{{ ra_url }}</a> &#8599;</div></div>{% endif %}
-    {% if ra_vinfo.get('version') or ra_commit %}<div class="info-item"><div class="info-label">Installed version</div><div class="info-value">v{{ ra_vinfo.get('version') or ra_commit }}{% if ra_vinfo.get('running') and ra_vinfo.get('running') != ra_vinfo.get('version') %} <span style="color:var(--yellow)">(running v{{ ra_vinfo.get('running') }})</span>{% endif %}</div></div>{% endif %}
-    {% if ra_vinfo.get('latest') %}<div class="info-item"><div class="info-label">Newest version available</div><div class="info-value">v{{ ra_vinfo.get('latest') }}{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan);font-size:11px">update ready</span>{% else %} <span style="color:var(--text-dim);font-size:11px">current</span>{% endif %}</div></div>{% endif %}
+    {% if ra_vinfo.get('version') or ra_commit %}<div class="info-item"><div class="info-label">Installed version</div><div class="info-value" id="ra-installed-version">v{{ ra_vinfo.get('version') or ra_commit }}{% if ra_vinfo.get('running') and ra_vinfo.get('running') != ra_vinfo.get('version') %} <span id="ra-running-mismatch" style="color:var(--yellow)">(running v{{ ra_vinfo.get('running') }})</span>{% endif %}</div></div>{% endif %}
+    <div class="info-item" id="ra-latest-row"{% if not ra_vinfo.get('latest') %} style="display:none"{% endif %}><div class="info-label">Newest version available</div><div class="info-value" id="ra-latest-version">{% if ra_vinfo.get('latest') %}v{{ ra_vinfo.get('latest') }} <span id="ra-latest-status" style="font-size:11px{% if ra_vinfo.get('update_available') %};color:var(--cyan){% else %};color:var(--text-dim){% endif %}">{% if ra_vinfo.get('update_available') %}update ready{% elif ra_vinfo.get('is_current') %}current{% endif %}</span>{% else %}<span style="color:var(--text-dim)">checking…</span>{% endif %}</div></div>
   </div></div>
   <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
   {% else %}
@@ -56713,6 +56708,32 @@ function poll(){fetch('/api/remote-assist/update-status',{credentials:'same-orig
 var el=document.getElementById('ra-update-log');if(el&&s.log)el.textContent=s.log.join(String.fromCharCode(10));
 if(!s.running){clearInterval(raUpdateInterval);if(btn){btn.disabled=false;btn.innerHTML=origHTML;btn.style.opacity='1';}if(s.complete)setTimeout(function(){location.reload();},2000);else if(s.error)alert('Update failed: '+s.error);}});}
 poll();raUpdateInterval=setInterval(poll,800);});}
+function refreshRaVersion(manual){
+  var cb=document.getElementById('ra-check-btn');var cbHTML=cb?cb.innerHTML:'';
+  if(manual&&cb){cb.disabled=true;cb.innerHTML='Checking…';}
+  function restoreCheckBtn(){if(manual&&cb){cb.disabled=false;cb.innerHTML=cbHTML;}}
+  fetch('/api/remote-assist/version?fresh=1',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var row=document.getElementById('ra-latest-row');var latestEl=document.getElementById('ra-latest-version');var btn=document.getElementById('ra-update-btn');
+    if(!latestEl){restoreCheckBtn();return;}
+    if(row)row.style.display='';
+    var st='';
+    if(d.update_available)st=' <span id="ra-latest-status" style="color:var(--cyan);font-size:11px">update ready</span>';
+    else if(d.is_current)st=' <span id="ra-latest-status" style="color:var(--text-dim);font-size:11px">current</span>';
+    if(d.latest)latestEl.innerHTML='v'+d.latest+st;
+    else latestEl.innerHTML='<span style="color:var(--text-dim)">unavailable</span>';
+    if(btn){
+      if(d.update_available){btn.classList.add('btn-update-active');btn.title='Update available: v'+(d.latest||'');}
+      else{btn.classList.remove('btn-update-active');btn.title='Already on latest release';}
+    }
+    if(d.version){
+      var inst=document.getElementById('ra-installed-version');if(inst){
+        var runNote=(d.running&&d.running!==d.version)?' <span style="color:var(--yellow)">(running v'+d.running+')</span>':'';
+        inst.innerHTML='v'+d.version+runNote;
+      }
+    }
+    restoreCheckBtn();
+  }).catch(function(){restoreCheckBtn();});
+}
 </script>
 </body></html>'''
 
