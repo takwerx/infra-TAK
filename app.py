@@ -399,6 +399,13 @@ CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
 TVR_REPO = "https://github.com/raytheonbbn/tak-video-restreamer.git"
 TVR_INSTALL_DIR = os.path.expanduser("~/tak-video-restreamer")
 NETBIRD_INSTALL_DIR = os.path.expanduser("~/netbird")
+# CFD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
+REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
+REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/cfd-remote-assist")
+REMOTE_ASSIST_PORT = 8767
+REMOTE_ASSIST_DEVICE_PORT = 8448
+REMOTE_ASSIST_OIDC_SLUG = "cfd-remote-assist"
+REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # Fleet-vetted NetBird image pins — NEVER ':latest' (boxes deployed days apart must
 # converge to one version; netbirdio pushes new minors every few days). Bump these in an
 # infra-TAK release after T&E. Current values = what ':latest' resolved to on 2026-06-10.
@@ -1159,6 +1166,46 @@ def detect_modules():
         'priority': 14,
     }
 
+    # CFD Remote Assist Portal
+    ra_enabled = settings.get('remote_assist_enabled', False)
+    ra_running = False
+    if ra_enabled:
+        try:
+            _ra_r = subprocess.run(
+                ['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+                capture_output=True, text=True, timeout=3)
+            ra_running = 'Up' in (_ra_r.stdout or '')
+        except Exception:
+            pass
+    else:
+        try:
+            _ra_r = subprocess.run(
+                ['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+                capture_output=True, text=True, timeout=3)
+            if 'Up' in (_ra_r.stdout or ''):
+                _s = load_settings()
+                _s['remote_assist_enabled'] = True
+                save_settings(_s)
+                ra_enabled = True
+                ra_running = True
+        except Exception:
+            pass
+    # Dev-channel gate: only surface EUD Remote Assist in the marketplace on dev-channel
+    # boxes, or on any box where it is already installed. Main-channel boxes never see it
+    # until a future promotion release. (marketplace_page has no per-module gating, so the
+    # gate must live here in detect_modules.)
+    if settings.get('update_channel') == 'dev' or ra_enabled:
+        modules['remote_assist'] = {
+            'name': 'EUD Remote Assist',
+            'installed': bool(ra_enabled),
+            'running': ra_running,
+            'description': 'Remotely manage company Android devices — location, ping, screen view & touch',
+            'icon': '📱',
+            'icon_url': REMOTE_ASSIST_LOGO_URL,
+            'route': '/remote-assist',
+            'priority': 15,
+        }
+
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_custom_banner(settings):
@@ -1321,6 +1368,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     nb = modules.get('netbird', {})
     if nb.get('installed'):
         parts.append(link('/netbird', '<img src="https://netbird.io/favicon.ico" alt="NetBird" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>NetBird VPN</span>', 'NetBird VPN'))
+    ra = modules.get('remote_assist', {})
+    if ra.get('installed'):
+        parts.append(link('/remote-assist', f'<img src="{REMOTE_ASSIST_LOGO_URL}" alt="EUD Remote Assist" class="nav-icon" style="height:22px;width:auto;max-width:140px;object-fit:contain;display:block">', 'EUD Remote Assist'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -6083,6 +6133,800 @@ def netbird_uninstall_api():
 @login_required
 def netbird_uninstall_status_api():
     return jsonify(_netbird_uninstall_status)
+
+
+# ── CFD Remote Assist Portal ──────────────────────────────────────────────────
+
+_remote_assist_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+_remote_assist_uninstall_status = {'running': False, 'complete': False, 'error': False}
+
+
+def _remote_assist_restore_tracked_files(ra_dir):
+    """Discard legacy infra-TAK patches to tracked files so git pull succeeds (v2.1.0+ uses .env only)."""
+    import subprocess as _sp
+    if not os.path.isdir(os.path.join(ra_dir, '.git')):
+        return
+    _sp.run(['git', '-C', ra_dir, 'checkout', '--', 'docker-compose.yml'],
+            capture_output=True, text=True, timeout=30)
+
+
+def _remote_assist_read_version_file(ra_dir):
+    """Semver from upstream VERSION file (source of truth since v2.0.0)."""
+    try:
+        with open(os.path.join(ra_dir, 'VERSION')) as f:
+            return f.read().strip().lstrip('vV')
+    except Exception:
+        return ''
+
+
+def _remote_assist_deploy_log(msg):
+    _remote_assist_deploy_status['log'].append(msg)
+
+
+def _remote_assist_compose_files(ra_dir):
+    return os.path.join(ra_dir, 'docker-compose.yml')
+
+
+def _remote_assist_compose_cmd(ra_dir, *args):
+    return ['docker', 'compose', '-f', _remote_assist_compose_files(ra_dir), *args]
+
+
+def _ensure_authentik_remote_assist_app(settings, plog=None):
+    """Create Authentik OAuth2/OIDC provider + application for Remote Assist admin portal."""
+    import urllib.request as _urlreq
+    import urllib.error
+
+    def log(msg):
+        if plog:
+            plog(msg)
+
+    ak_url = _get_authentik_api_url(settings)
+    token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+             or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+    if not token:
+        log('  ✗ No Authentik API token found in .env')
+        return None, None
+    _ak_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    slug = REMOTE_ASSIST_OIDC_SLUG
+    provider_name = 'CFD Remote Assist'
+    portal_domain = _get_service_domain(settings, 'remote_assist')
+    portal_base = f'https://{portal_domain}'
+    device_base = f'https://{portal_domain}:{REMOTE_ASSIST_DEVICE_PORT}'
+    redirect_uris_obj = [
+        {'matching_mode': 'strict', 'url': portal_base},
+        {'matching_mode': 'strict', 'url': f'{portal_base}/'},
+        {'matching_mode': 'strict', 'url': f'{portal_base}/callback'},
+        {'matching_mode': 'strict', 'url': f'{portal_base}/silent-callback'},
+    ]
+
+    try:
+        flow_pk, inv_flow_pk = None, None
+        for attempt in range(6):
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                auth_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                flow_pk = next((f['pk'] for f in auth_flows if 'implicit' in f.get('slug', '')), auth_flows[0]['pk'] if auth_flows else None)
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation&ordering=slug', headers=_ak_headers)
+                inv_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                inv_flow_pk = inv_flows[0]['pk'] if inv_flows else None
+            except Exception:
+                pass
+            if flow_pk and inv_flow_pk:
+                break
+            time.sleep(5)
+        if not flow_pk or not inv_flow_pk:
+            log(f'  ✗ Missing Authentik flows: auth={flow_pk}, invalidation={inv_flow_pk}')
+            return None, None
+        log('  ✓ Got authorization and invalidation flows')
+
+        signing_key_pk = None
+        scope_mapping_pks = []
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/crypto/certificatekeypairs/?has_key=true&ordering=name&page_size=50', headers=_ak_headers)
+            certs = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            signing_key_pk = next((c['pk'] for c in certs if 'authentik' in (c.get('name') or '').lower()), None)
+            if not signing_key_pk and certs:
+                signing_key_pk = certs[0]['pk']
+        except Exception:
+            pass
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
+            mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in {'openid', 'email', 'profile'}]
+        except Exception:
+            pass
+
+        _provider_extras = {}
+        if signing_key_pk:
+            _provider_extras['signing_key'] = signing_key_pk
+        if scope_mapping_pks:
+            _provider_extras['property_mappings'] = scope_mapping_pks
+
+        provider_pk = None
+        client_id = ''
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=_ak_headers)
+            existing = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            for ex in existing:
+                if ex.get('name') == provider_name:
+                    ex_pk = ex.get('pk')
+                    req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/', headers=_ak_headers)
+                    detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                    if detail.get('client_id'):
+                        provider_pk = ex_pk
+                        client_id = detail['client_id']
+                        # Browser portal is a public SPA (oidc-client-ts + PKCE). Confidential
+                        # clients require client_secret at /token/ — causes HTTP 400 on sign-in.
+                        patch_data = {
+                            'redirect_uris': redirect_uris_obj,
+                            'client_type': 'public',
+                            'grant_types': ['authorization_code', 'refresh_token'],
+                        }
+                        patch_data.update(_provider_extras)
+                        try:
+                            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
+                                data=json.dumps(patch_data).encode(), headers=_ak_headers, method='PATCH')
+                            _urlreq.urlopen(req, timeout=10)
+                        except Exception:
+                            pass
+                        log(f'  ✓ Existing OAuth2 provider updated (public SPA), client_id={client_id[:8]}...')
+                    break
+        except Exception:
+            pass
+
+        if not provider_pk:
+            payload = {
+                'name': provider_name,
+                'authorization_flow': flow_pk,
+                'invalidation_flow': inv_flow_pk,
+                'client_type': 'public',
+                'client_id': slug,
+                'redirect_uris': redirect_uris_obj,
+                'grant_types': ['authorization_code', 'refresh_token'],
+            }
+            payload.update(_provider_extras)
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
+                    data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
+                p = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                provider_pk = p.get('pk')
+                client_id = p.get('client_id', '')
+                log(f'  ✓ OAuth2 provider created (public SPA), client_id={client_id[:8]}...')
+            except Exception as e:
+                body = ''
+                try:
+                    body = e.read().decode()[:500]
+                except Exception:
+                    pass
+                log(f'  ✗ OAuth2 provider create failed: {body or str(e)[:200]}')
+
+        if not provider_pk or not client_id:
+            log('  ✗ No OAuth2 provider — cannot continue')
+            return None, None
+
+        _app_body = {
+            'name': provider_name,
+            'slug': slug,
+            'provider': provider_pk,
+            'meta_launch_url': portal_base,
+        }
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/',
+                data=json.dumps(_app_body).encode(), headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log('  ✓ Application created')
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                try:
+                    req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
+                        data=json.dumps({'provider': provider_pk, 'meta_launch_url': portal_base}).encode(),
+                        headers=_ak_headers, method='PATCH')
+                    _urlreq.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                log('  ✓ Application already exists (updated)')
+            else:
+                log(f'  ⚠ Application error: {str(e)[:80]}')
+
+        try:
+            _ak_url = _get_authentik_api_url(settings)
+            _ak_token = token
+            if _ak_token:
+                _ensure_app_access_policies(_ak_url, {'Authorization': f'Bearer {_ak_token}',
+                                                      'Content-Type': 'application/json'}, plog)
+                log('  ✓ Portal access restricted to infra-TAK administrators (authentik Admins)')
+        except Exception as _e:
+            log(f'  ⚠ Access policy binding skipped: {str(_e)[:120]}')
+
+        return client_id, ''
+    except Exception as e:
+        log(f'  ✗ Authentik OAuth setup failed: {str(e)[:200]}')
+        return None, None
+
+
+def _deregister_authentik_oauth2_app(settings, app_slug, prov_name, plog=None):
+    """Remove OAuth2 application + provider from Authentik. Idempotent, non-fatal."""
+    _log = plog or (lambda m: None)
+    import urllib.request as _req
+    ak_token = (
+        _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+        _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    )
+    if not ak_token:
+        return False
+    ak_url = _get_authentik_api_url(settings)
+    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+    def _del(url):
+        try:
+            _req.urlopen(_req.Request(url, headers=ak_headers, method='DELETE'), timeout=10)
+            return True
+        except Exception as e:
+            if getattr(e, 'code', None) == 404:
+                return True
+            return False
+
+    provider_pk = None
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/core/applications/{app_slug}/', headers=ak_headers)
+        app = json.loads(_req.urlopen(r, timeout=10).read().decode())
+        provider_pk = app.get('provider')
+    except Exception:
+        pass
+    if not provider_pk and prov_name:
+        try:
+            r = _req.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(prov_name)}', headers=ak_headers)
+            results = json.loads(_req.urlopen(r, timeout=10).read().decode()).get('results', [])
+            match = next((p for p in results if (p.get('name') or '').strip() == prov_name), None)
+            if match:
+                provider_pk = match.get('pk')
+        except Exception:
+            pass
+    if _del(f'{ak_url}/api/v3/core/applications/{app_slug}/'):
+        _log(f"  ✓ Authentik application '{app_slug}' removed")
+    if provider_pk and _del(f'{ak_url}/api/v3/providers/oauth2/{provider_pk}/'):
+        _log(f"  ✓ Authentik OAuth2 provider '{prov_name}' removed")
+    return True
+
+
+def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
+    ak_domain = _get_service_domain(settings, 'authentik')
+    portal_domain = _get_service_domain(settings, 'remote_assist')
+    portal_base = f'https://{portal_domain}'
+    device_base = f'https://{portal_domain}:{REMOTE_ASSIST_DEVICE_PORT}'
+    oidc_issuer = f'https://{ak_domain}/application/o/{REMOTE_ASSIST_OIDC_SLUG}/'
+    oidc_jwks = f'{oidc_issuer.rstrip("/")}/jwks/'
+    env_lines = [
+        f'POSTGRES_USER=cfd',
+        f'POSTGRES_PASSWORD={pg_password}',
+        f'POSTGRES_DB=cfd_remote_assist',
+        f'PUBLIC_BASE_URL={device_base}',
+        f'OIDC_ISSUER={oidc_issuer}',
+        f'OIDC_AUDIENCE={client_id}',
+        f'OIDC_CLIENT_ID={client_id}',
+        f'OIDC_JWKS_URI={oidc_jwks}',
+        f'CORS_ORIGIN={portal_base}',
+        f'NGINX_BIND_ADDR=127.0.0.1',
+        f'HTTP_PORT={REMOTE_ASSIST_PORT}',
+        f'NGINX_ENABLE_TLS=false',
+        f'PHONEDB_TLS_INSECURE=true',
+    ]
+    env_path = os.path.join(ra_dir, '.env')
+    with open(env_path, 'w') as f:
+        f.write('\n'.join(env_lines) + '\n')
+    os.chmod(env_path, 0o600)
+
+
+def _run_remote_assist_deploy(settings):
+    import subprocess as _sp
+    import secrets as _sec
+    plog = _remote_assist_deploy_log
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    try:
+        fqdn = (settings.get('fqdn') or '').strip()
+        if not fqdn:
+            raise RuntimeError('FQDN required — configure Caddy SSL first (Marketplace needs a domain for OIDC).')
+
+        plog('━━━ Step 1/6: Checking Docker ━━━')
+        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
+        if r.returncode != 0:
+            plog('  Docker not found — installing...')
+            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+                         shell=True, capture_output=True, text=True, timeout=300)
+            if r2.returncode != 0:
+                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
+            plog('✓ Docker installed')
+        else:
+            plog(f'✓ Docker present: {r.stdout.strip()}')
+
+        plog('')
+        plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
+        client_id, client_secret = _ensure_authentik_remote_assist_app(settings, plog=plog)
+        if not client_id:
+            raise RuntimeError('Authentik OIDC provisioning failed — ensure Authentik is running.')
+
+        plog('')
+        plog('━━━ Step 3/6: Cloning Repository ━━━')
+        if os.path.isdir(os.path.join(ra_dir, '.git')):
+            plog(f'  Repo already at {ra_dir} — pulling latest...')
+            _remote_assist_restore_tracked_files(ra_dir)
+            r = _sp.run(['git', '-C', ra_dir, 'pull', '--ff-only'], capture_output=True, text=True, timeout=120)
+            plog((r.stdout + r.stderr).strip() or '(no output)')
+        else:
+            os.makedirs(ra_dir, exist_ok=True)
+            plog(f'  Cloning {REMOTE_ASSIST_REPO} → {ra_dir}')
+            r = _sp.run(['git', 'clone', '--depth=1', REMOTE_ASSIST_REPO, ra_dir],
+                        capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                raise RuntimeError(f'git clone failed: {r.stderr[:300]}')
+            plog('✓ Repository cloned')
+
+        sha_r = _sp.run(['git', '-C', ra_dir, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True)
+        commit_sha = sha_r.stdout.strip() or 'unknown'
+        plog(f'  Commit SHA: {commit_sha}')
+        _sp.run(['git', '-C', ra_dir, 'fetch', '--tags', '--depth', '1'],
+                capture_output=True, text=True, timeout=60)
+
+        plog('')
+        plog('━━━ Step 4/6: Writing Configuration ━━━')
+        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
+        ra_version = _remote_assist_read_version_file(ra_dir)
+        plog(f'✓ .env written (NGINX_BIND_ADDR=127.0.0.1 HTTP_PORT={REMOTE_ASSIST_PORT})')
+        if ra_version:
+            plog(f'  Portal release: v{ra_version}')
+
+        plog('')
+        plog('━━━ Step 5/6: Building & Starting Containers ━━━')
+        plog('  ⏳ First build compiles server + web — allow 5–10 min...')
+        r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
+                    capture_output=True, text=True, timeout=900, cwd=ra_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up --build failed:\n{(r.stderr or r.stdout)[-600:]}')
+        plog('✓ Containers built and started')
+        _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
+                capture_output=True, text=True, timeout=120, cwd=ra_dir)
+        plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
+
+        plog('')
+        plog('━━━ Step 6/6: Firewall & Reverse Proxy ━━━')
+        _sp.run(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp'], capture_output=True)
+        plog(f'  ✓ ufw deny {REMOTE_ASSIST_PORT}/tcp (loopback/Caddy-only)')
+        _sp.run(['ufw', 'allow', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'], capture_output=True)
+        plog(f'  ✓ ufw allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API)')
+        s = load_settings()
+        s['remote_assist_enabled'] = True
+        s['remote_assist_pg_password'] = pg_password
+        s['remote_assist_commit_sha'] = commit_sha
+        s['remote_assist_oidc_client_id'] = client_id
+        if ra_version:
+            s['remote_assist_version'] = ra_version
+        save_settings(s)
+        generate_caddyfile(s)
+        _sp.run('systemctl restart caddy 2>&1',
+                shell=True, capture_output=True, text=True, timeout=90)
+        plog('✓ Caddy restarted (8448 listener requires full restart)')
+
+        portal_url = f'https://{_get_service_domain(s, "remote_assist")}'
+        device_url = f'{portal_url}:{REMOTE_ASSIST_DEVICE_PORT}'
+        plog('')
+        plog('🎉 Remote Assist deployed successfully!')
+        plog(f'Admin portal: {portal_url}')
+        plog(f'Device API:   {device_url}')
+        plog('Sign in with Authentik — infra-TAK administrators only (authentik Admins group).')
+        _remote_assist_deploy_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog(f'✗ Deployment failed: {exc}')
+        _remote_assist_deploy_status.update({'running': False, 'error': True})
+
+
+_remote_assist_release_cache = {'sha': None, 'version': None, 'tag': None, 'ts': 0}
+
+
+def _remote_assist_github_repo_path():
+    """cfd2474/EUD_Remote_Assist_Portal from REMOTE_ASSIST_REPO."""
+    import re as _re
+    m = _re.search(r'github\.com[:/]([^/]+/[^/.]+)', REMOTE_ASSIST_REPO or '')
+    return m.group(1) if m else 'cfd2474/EUD_Remote_Assist_Portal'
+
+
+def _remote_assist_version_tuple(ver):
+    """Parse semver-ish tag (v1.3.3) to comparable tuple."""
+    import re as _re
+    v = (ver or '').strip().lstrip('vV')
+    parts = []
+    for p in v.split('.')[:3]:
+        try:
+            parts.append(int(_re.sub(r'[^0-9].*', '', p) or '0'))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _get_remote_assist_latest_commit_sha(use_cache=True):
+    """Latest commit on main for EUD_Remote_Assist_Portal (deploy tracks main, not tags)."""
+    import time as _time
+    import urllib.request as _ur
+    if use_cache and _remote_assist_release_cache['sha'] and (_time.time() - _remote_assist_release_cache['ts'] < 14400):
+        return _remote_assist_release_cache['sha']
+    repo = _remote_assist_github_repo_path()
+    try:
+        req = _ur.Request(
+            f'https://api.github.com/repos/{repo}/commits/main',
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=10) as resp:
+            sha = (json.loads(resp.read().decode()).get('sha') or '').strip() or None
+            if sha:
+                _remote_assist_release_cache['sha'] = sha
+                _remote_assist_release_cache['ts'] = _time.time()
+            return sha
+    except Exception as e:
+        print(f"version-info: remote-assist latest-commit check failed (non-fatal): {e}", flush=True)
+        return _remote_assist_release_cache.get('sha') or None
+
+
+def _get_remote_assist_latest_release_tag(use_cache=True):
+    """Highest semver GitHub tag (v2.0.0, v1.3.3, …) for display — not the update gate."""
+    import time as _time
+    import urllib.request as _ur
+    if use_cache and _remote_assist_release_cache.get('tag') and (_time.time() - _remote_assist_release_cache['ts'] < 14400):
+        return _remote_assist_release_cache['tag']
+    repo = _remote_assist_github_repo_path()
+    best_tag = _remote_assist_release_cache.get('tag')
+    try:
+        req = _ur.Request(
+            f'https://api.github.com/repos/{repo}/tags?per_page=100',
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=10) as resp:
+            tags = json.loads(resp.read().decode())
+        best = None
+        for t in tags or []:
+            name = (t.get('name') or '').strip()
+            if not name or not name[0].lower() == 'v' or not name[1:2].isdigit():
+                continue
+            if best is None or _remote_assist_version_tuple(name) > _remote_assist_version_tuple(best):
+                best = name
+        if best:
+            _remote_assist_release_cache['tag'] = best
+            _remote_assist_release_cache['ts'] = _time.time()
+            return best
+    except Exception as e:
+        print(f"version-info: remote-assist tag check failed (non-fatal): {e}", flush=True)
+    return best_tag
+
+
+def _get_remote_assist_latest_version(use_cache=True):
+    """Latest VERSION file on main (upstream source of truth since v2.0.0)."""
+    import time as _time
+    import urllib.request as _ur
+    if use_cache and _remote_assist_release_cache.get('version') and (_time.time() - _remote_assist_release_cache['ts'] < 14400):
+        return _remote_assist_release_cache['version']
+    repo = _remote_assist_github_repo_path()
+    try:
+        req = _ur.Request(
+            f'https://raw.githubusercontent.com/{repo}/main/VERSION',
+            headers={'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=10) as resp:
+            ver = (resp.read().decode().strip().lstrip('vV') or None)
+            if ver:
+                _remote_assist_release_cache['version'] = ver
+                _remote_assist_release_cache['ts'] = _time.time()
+            return ver
+    except Exception as e:
+        print(f"version-info: remote-assist VERSION check failed (non-fatal): {e}", flush=True)
+        return _remote_assist_release_cache.get('version') or None
+
+
+def _get_remote_assist_running_version():
+    """Running portal version from loopback /version (device API path on nginx)."""
+    import urllib.request as _ur
+    try:
+        req = _ur.Request(
+            f'http://127.0.0.1:{REMOTE_ASSIST_PORT}/version',
+            headers={'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            return (data.get('version') or '').strip().lstrip('vV')
+    except Exception:
+        return ''
+
+
+def _get_remote_assist_version_info():
+    """Return {version, update_available, latest, latest_tag, running} for EUD Remote Assist.
+
+    Compares local VERSION file to upstream main VERSION (per docs/versioning.md).
+    Falls back to git SHA when VERSION is missing on old checkouts.
+    """
+    import subprocess as _sp
+    info = {'version': '', 'update_available': False, 'latest': None, 'latest_tag': None, 'running': ''}
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    settings = load_settings()
+    local_ver = ''
+    if os.path.isdir(ra_dir):
+        local_ver = _remote_assist_read_version_file(ra_dir)
+    if not local_ver:
+        local_ver = (settings.get('remote_assist_version') or '').strip()
+    local_full = ''
+    if os.path.isdir(os.path.join(ra_dir, '.git')):
+        try:
+            r = _sp.run(['git', 'rev-parse', 'HEAD'],
+                        capture_output=True, text=True, timeout=5, cwd=ra_dir)
+            if r.returncode == 0:
+                local_full = r.stdout.strip()
+        except Exception:
+            pass
+    if local_ver:
+        info['version'] = local_ver
+    elif local_full:
+        info['version'] = local_full[:7]
+    elif settings.get('remote_assist_commit_sha'):
+        info['version'] = settings['remote_assist_commit_sha']
+
+    latest_ver = _get_remote_assist_latest_version()
+    if latest_ver:
+        info['latest'] = latest_ver
+        if local_ver and _remote_assist_version_tuple(latest_ver) > _remote_assist_version_tuple(local_ver):
+            info['update_available'] = True
+    if not info['update_available']:
+        latest_full = _get_remote_assist_latest_commit_sha()
+        if latest_full and local_full and local_full != latest_full:
+            info['update_available'] = True
+            if not info['latest']:
+                info['latest'] = latest_full[:7]
+    latest_tag = _get_remote_assist_latest_release_tag()
+    if latest_tag:
+        info['latest_tag'] = latest_tag.lstrip('vV')
+    running = _get_remote_assist_running_version()
+    if running:
+        info['running'] = running
+    return info
+
+
+_remote_assist_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _run_remote_assist_update():
+    import subprocess as _sp
+    import secrets as _sec
+    global _remote_assist_update_status
+    log = []
+    def plog(msg):
+        log.append(msg)
+        _remote_assist_update_status['log'] = list(log)
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    try:
+        settings = load_settings()
+        plog('━━━ Step 1/5: Pulling latest source ━━━')
+        _remote_assist_restore_tracked_files(ra_dir)
+        r = _sp.run(['git', '-C', ra_dir, 'pull', '--ff-only'],
+                    capture_output=True, text=True, timeout=120)
+        plog((r.stdout + r.stderr).strip() or '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'git pull failed: {r.stderr[:300]}')
+        _sp.run(['git', '-C', ra_dir, 'fetch', '--tags', '--depth', '1'],
+                capture_output=True, text=True, timeout=60)
+
+        plog('')
+        plog('━━━ Step 2/5: Refreshing Authentik + .env ━━━')
+        client_id = settings.get('remote_assist_oidc_client_id')
+        if not client_id:
+            client_id, _ = _ensure_authentik_remote_assist_app(settings, plog=plog)
+        if not client_id:
+            raise RuntimeError('Authentik OIDC client_id missing')
+        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
+        ra_version = _remote_assist_read_version_file(ra_dir)
+        plog(f'✓ .env written (loopback nginx → 127.0.0.1:{REMOTE_ASSIST_PORT})')
+        if ra_version:
+            plog(f'  Portal release: v{ra_version}')
+
+        plog('')
+        plog('━━━ Step 3/5: Rebuilding containers ━━━')
+        r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
+                    capture_output=True, text=True, timeout=900, cwd=ra_dir)
+        plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
+        _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
+                capture_output=True, text=True, timeout=120, cwd=ra_dir)
+        plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
+
+        plog('')
+        plog('━━━ Step 4/5: Verifying running version ━━━')
+        running_ver = _get_remote_assist_running_version()
+        if running_ver:
+            plog(f'  GET /version → v{running_ver}')
+            if ra_version and running_ver != ra_version:
+                plog(f'  ⚠ VERSION file is v{ra_version} but container reports v{running_ver}')
+
+        plog('')
+        plog('━━━ Step 5/5: Saving new version ━━━')
+        sha_r = _sp.run(['git', '-C', ra_dir, 'rev-parse', '--short', 'HEAD'],
+                        capture_output=True, text=True, timeout=5)
+        new_sha = sha_r.stdout.strip() or 'unknown'
+        s = load_settings()
+        s['remote_assist_commit_sha'] = new_sha
+        s['remote_assist_pg_password'] = pg_password
+        s['remote_assist_oidc_client_id'] = client_id
+        if ra_version:
+            s['remote_assist_version'] = ra_version
+        save_settings(s)
+        label = f'v{ra_version}' if ra_version else new_sha
+        plog(f'✓ EUD Remote Assist updated to {label}')
+        _remote_assist_update_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog(f'ERROR: {exc}')
+        _remote_assist_update_status.update({'running': False, 'complete': False, 'error': str(exc)})
+
+
+@app.route('/api/remote-assist/version')
+@login_required
+def remote_assist_version_api():
+    return jsonify(_get_remote_assist_version_info())
+
+
+@app.route('/api/remote-assist/update', methods=['POST'])
+@login_required
+def remote_assist_update_api():
+    global _remote_assist_update_status
+    if _remote_assist_update_status.get('running'):
+        return jsonify({'started': False, 'error': 'Update already in progress'})
+    _remote_assist_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
+    threading.Thread(target=_run_remote_assist_update, daemon=True).start()
+    return jsonify({'started': True})
+
+
+@app.route('/api/remote-assist/update-status')
+@login_required
+def remote_assist_update_status_api():
+    return jsonify(_remote_assist_update_status)
+
+
+@app.route('/remote-assist')
+@login_required
+def remote_assist_page():
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    ra = modules.get('remote_assist', {})
+    ak = modules.get('authentik', {})
+    if ra.get('installed') and not _remote_assist_deploy_status.get('running', False):
+        _remote_assist_deploy_status.update({'complete': False, 'error': False})
+    ra_host = _get_service_domain(settings, 'remote_assist')
+    ra_url = f'https://{ra_host}' if ra_host else ''
+    ra_vinfo = _get_remote_assist_version_info() if ra.get('installed') else {}
+    ra_commit = settings.get('remote_assist_commit_sha', '')
+    r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
+        settings=settings, ra=ra, version=VERSION,
+        authentik_installed=ak.get('installed'),
+        ra_host=ra_host, ra_url=ra_url,
+        ra_vinfo=ra_vinfo, ra_commit=ra_commit,
+        remote_assist_logo_url=REMOTE_ASSIST_LOGO_URL,
+        deploying=_remote_assist_deploy_status.get('running', False),
+        deploy_done=_remote_assist_deploy_status.get('complete', False)))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+@app.route('/api/remote-assist/deploy', methods=['POST'])
+@login_required
+def remote_assist_deploy_api():
+    if _remote_assist_deploy_status.get('running'):
+        return jsonify({'success': False, 'error': 'Deploy already in progress'})
+    _remote_assist_deploy_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    settings = load_settings()
+    threading.Thread(target=_run_remote_assist_deploy, args=(settings,), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/remote-assist/deploy-status')
+@login_required
+def remote_assist_deploy_status_api():
+    return jsonify(_remote_assist_deploy_status)
+
+
+@app.route('/api/remote-assist/repair-authentik', methods=['POST'])
+@login_required
+def remote_assist_repair_authentik_api():
+    """Re-apply Authentik OIDC provider (public SPA + grant_types + admin policy)."""
+    settings = load_settings()
+    log = []
+    client_id, _ = _ensure_authentik_remote_assist_app(settings, plog=log.append)
+    if not client_id:
+        return jsonify({'success': False, 'log': log}), 500
+    return jsonify({'success': True, 'log': log})
+
+
+@app.route('/api/remote-assist/control', methods=['POST'])
+@login_required
+def remote_assist_control_api():
+    import subprocess as _sp
+    data = request.get_json() or {}
+    action = data.get('action', '').strip().lower()
+    if action not in ('start', 'stop', 'restart'):
+        return jsonify({'success': False, 'error': 'Invalid action'}), 400
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    compose_path = _remote_assist_compose_files(ra_dir)
+    if not os.path.exists(compose_path):
+        return jsonify({'success': False, 'error': 'Compose file not found — deploy first'}), 404
+    cmd_map = {
+        'start': _remote_assist_compose_cmd(ra_dir, 'up', '-d'),
+        'stop': _remote_assist_compose_cmd(ra_dir, 'stop'),
+        'restart': _remote_assist_compose_cmd(ra_dir, 'restart'),
+    }
+    r = _sp.run(cmd_map[action], capture_output=True, text=True, timeout=120, cwd=ra_dir)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': (r.stderr or r.stdout)[:300]})
+    running = False
+    try:
+        _st = _sp.run(['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+                      capture_output=True, text=True, timeout=5)
+        running = 'Up' in (_st.stdout or '')
+    except Exception:
+        pass
+    return jsonify({'success': True, 'running': running})
+
+
+@app.route('/api/remote-assist/logs')
+@login_required
+def remote_assist_logs_api():
+    import subprocess as _sp
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    try:
+        r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'logs', '--tail', '150', 'server'),
+                    capture_output=True, text=True, timeout=20, cwd=ra_dir)
+        raw = (r.stdout + r.stderr).splitlines()
+        return jsonify({'entries': raw[-150:]})
+    except Exception as e:
+        return jsonify({'entries': [], 'error': str(e)})
+
+
+@app.route('/api/remote-assist/uninstall', methods=['POST'])
+@login_required
+def remote_assist_uninstall_api():
+    data = request.json or {}
+    password = data.get('password', '')
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'error': 'Invalid admin password'}), 403
+    if _remote_assist_uninstall_status.get('running'):
+        return jsonify({'success': True, 'message': 'Uninstall already in progress'})
+
+    def _do_uninstall():
+        import subprocess as _sp
+        _remote_assist_uninstall_status.update({'running': True, 'complete': False, 'error': False})
+        try:
+            ra_dir = REMOTE_ASSIST_INSTALL_DIR
+            compose_path = _remote_assist_compose_files(ra_dir)
+            if os.path.exists(compose_path):
+                _sp.run(_remote_assist_compose_cmd(ra_dir, 'down', '-v'),
+                        capture_output=True, timeout=120, cwd=ra_dir)
+            settings = load_settings()
+            settings['remote_assist_enabled'] = False
+            settings.pop('remote_assist_pg_password', None)
+            settings.pop('remote_assist_commit_sha', None)
+            settings.pop('remote_assist_oidc_client_id', None)
+            settings.pop('remote_assist_version', None)
+            save_settings(settings)
+            generate_caddyfile(settings)
+            _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=90)
+            _deregister_authentik_oauth2_app(settings, REMOTE_ASSIST_OIDC_SLUG, 'CFD Remote Assist')
+            _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': False})
+        except Exception:
+            _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': True})
+
+    threading.Thread(target=_do_uninstall, daemon=True).start()
+    return jsonify({'success': True, 'message': 'Uninstall started'})
+
+
+@app.route('/api/remote-assist/uninstall-status')
+@login_required
+def remote_assist_uninstall_status_api():
+    return jsonify(_remote_assist_uninstall_status)
 
 
 # ── Guard Dog (TAK Server hardening / 7 monitors) ─────────────────────────────
@@ -12472,6 +13316,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'cesium_tiles': '3dtiles',
     'webodm': 'webodm',
     'netbird': 'netbird',
+    'remote_assist': 'remote',
 }
 
 def _get_service_domain(settings, service_key):
@@ -14847,6 +15692,39 @@ def generate_caddyfile(settings=None):
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'netbird'), nb_host)
 
+    ra_mod = modules.get('remote_assist', {})
+    if ra_mod.get('installed'):
+        ra_host = sd.get('remote_assist') or _get_service_domain(settings, 'remote_assist')
+        ra_up = f'127.0.0.1:{REMOTE_ASSIST_PORT}'
+        ra_proxy = (
+            f'        flush_interval -1\n'
+            f'        transport http {{\n'
+            f'            read_timeout 1h\n'
+            f'            write_timeout 1h\n'
+            f'        }}'
+        )
+        lines.append(f"# CFD Remote Assist — admin portal (443). Device API is on :{REMOTE_ASSIST_DEVICE_PORT} only.")
+        lines.append(f"{ra_host} {{")
+        lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
+        lines.append(f"    respond @ra_device 404")
+        lines.append(f"    reverse_proxy {ra_up} {{")
+        lines.append(ra_proxy)
+        lines.append(f"    }}")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'remote_assist'), ra_host)
+        lines.append(f"# CFD Remote Assist — Android device API (TLS :{REMOTE_ASSIST_DEVICE_PORT})")
+        lines.append(f"{ra_host}:{REMOTE_ASSIST_DEVICE_PORT} {{")
+        lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
+        lines.append(f"    handle @ra_device {{")
+        lines.append(f"        reverse_proxy {ra_up} {{")
+        lines.append(ra_proxy)
+        lines.append(f"        }}")
+        lines.append(f"    }}")
+        lines.append(f"    respond 404")
+        lines.append(f"}}")
+        lines.append("")
+
     # v0.9.51 — Custom certificate (bring-your-own-cert) mode. When ssl_mode == 'custom'
     # the operator has uploaded a full-chain PEM + key on the Caddy page; Caddy must serve
     # THAT cert (no ACME) on every site. We inject a `tls <cert> <key>` directive into each
@@ -16211,6 +17089,8 @@ def get_all_module_versions():
         _set('tak_video_restreamer', _get_tvr_version_info)
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
+    if modules.get('remote_assist', {}).get('installed'):
+        _set('remote_assist', _get_remote_assist_version_info)
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -25661,7 +26541,7 @@ def _authentik_enable_show_password(ak_url, ak_headers, plog=None):
 
 
 def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
-    """Restrict infra-TAK, Node-RED (and LDAP) to authentik Admins. TAK Portal and MediaMTX open to all authenticated users.
+    """Restrict infra-TAK, Node-RED, NetBird, Remote Assist (and LDAP) to authentik Admins. TAK Portal and MediaMTX open to all authenticated users.
     Creates a 'Group membership: authentik Admins' policy and binds it only to admin-only apps. No binding on TAK Portal/MediaMTX = everyone sees them.
     Idempotent — safe to call on every deploy."""
     import urllib.request as _req
@@ -25769,8 +26649,8 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         else:
             _log(f"  ✓ Policy exists: {policy_name}")
 
-        # 3) Admin-only apps: bind the admin policy (infra-TAK, Node-RED). LDAP must be open to all authenticated users (QR registration, device bind). TAK Portal and MediaMTX: no binding = all authenticated users.
-        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird']
+        # 3) Admin-only apps: bind the admin policy (infra-TAK, Node-RED, NetBird, Remote Assist). LDAP must be open to all authenticated users (QR registration, device bind). TAK Portal and MediaMTX: no binding = all authenticated users.
+        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird', REMOTE_ASSIST_OIDC_SLUG]
         user_visible_slugs = ['mediamtx', 'stream', 'tak-portal', 'ldap']  # no policy = visible to all authenticated users (LDAP needed for QR registration)
 
         all_apps = _api_get('core/applications/?page_size=100')['results']
@@ -54152,11 +55032,11 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:{% if key == 'remote_assist' %}32px{% else %}36px{% endif %};width:auto;max-width:{% if key == 'takserver' %}72px{% elif key == 'remote_assist' %}100%{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
@@ -55713,6 +56593,134 @@ function showToast(msg){
 }
 </script></body></html>'''
 
+REMOTE_ASSIST_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>EUD Remote Assist — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
+.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn-danger{background:var(--red);color:#fff}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-update{border-color:rgba(6,182,212,0.2);color:var(--text-dim);opacity:0.75}.control-btn.btn-update:hover{opacity:1;background:rgba(6,182,212,0.06);color:var(--text-secondary);border-color:rgba(6,182,212,0.35)}
+.control-btn.btn-update.btn-update-active{opacity:1;border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan);color:var(--text-primary)}.control-btn.btn-update.btn-update-active:hover{background:rgba(6,182,212,0.1);color:var(--cyan)}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header"><h1 style="display:flex;flex-direction:column;align-items:flex-start;gap:6px"><img src="{{ remote_assist_logo_url }}" alt="EUD Remote Assist" style="height:40px;width:auto;max-width:320px;object-fit:contain"></h1></div>
+  {% if ra.running %}<div class="status-banner running"><div class="dot"></div>EUD Remote Assist is running</div>
+  {% elif ra.installed %}<div class="status-banner stopped"><div class="dot"></div>EUD Remote Assist is installed but stopped</div>
+  {% else %}<div class="status-banner not-installed"><div class="dot"></div>EUD Remote Assist is not installed</div>{% endif %}
+  {% if ra.installed %}
+  <div class="section-title" style="margin-top:20px">Controls</div>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+  <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+  {% if ra.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn btn-update{% if ra_vinfo.get('update_available') %} btn-update-active{% endif %}" onclick="startRaUpdate()" id="ra-update-btn"{% if ra_vinfo.get('update_available') %} title="Update available: v{{ ra_vinfo.get('latest') }}"{% else %} title="Already on latest release"{% endif %}>⬆ Update{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan)">●</span>{% endif %}</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn btn-update{% if ra_vinfo.get('update_available') %} btn-update-active{% endif %}" onclick="startRaUpdate()" id="ra-update-btn"{% if ra_vinfo.get('update_available') %} title="Update available: v{{ ra_vinfo.get('latest') }}"{% else %} title="Already on latest release"{% endif %}>⬆ Update{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan)">●</span>{% endif %}</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  </div>
+  <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+  <div id="ra-update-card" style="display:none" class="card"><div class="card-title">Update log</div><div class="log-box" id="ra-update-log"></div></div>
+  <div class="card"><p style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin:0">Server-based web platform for remotely managing company-owned Android devices. Supports device registration, location tracking, ping requests, WebSocket command delivery, and WebRTC screen viewing with remote touch control.</p><p style="font-size:12px;color:var(--text-dim);margin:12px 0 0;line-height:1.5">The administrator user guide and deployment docs are linked from the project <a href="https://github.com/cfd2474/EUD_Remote_Assist_Portal/blob/main/README.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">README</a>.</p></div>
+  {% if authentik_installed and settings.fqdn %}<div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)"><div class="card-title">&#128274; Protected by Authentik</div><p style="font-size:13px;color:var(--text-secondary);line-height:1.5">The admin portal uses Authentik OIDC. Access is restricted to <strong>authentik Admins</strong> — the same group as the infra-TAK console. Device APIs use per-device secrets and are not gated by Authentik.</p></div>{% endif %}
+  <div class="card"><div class="card-title">Access</div><div class="info-grid">
+    {% if ra_url %}<div class="info-item"><div class="info-label">Admin portal</div><div class="info-value"><a href="{{ ra_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">{{ ra_url }}</a> &#8599;</div></div>{% endif %}
+    {% if ra_vinfo.get('version') or ra_commit %}<div class="info-item"><div class="info-label">Installed version</div><div class="info-value">v{{ ra_vinfo.get('version') or ra_commit }}{% if ra_vinfo.get('running') and ra_vinfo.get('running') != ra_vinfo.get('version') %} <span style="color:var(--yellow)">(running v{{ ra_vinfo.get('running') }})</span>{% endif %}</div></div>{% endif %}
+    {% if ra_vinfo.get('latest') %}<div class="info-item"><div class="info-label">Newest version available</div><div class="info-value">v{{ ra_vinfo.get('latest') }}{% if ra_vinfo.get('update_available') %} <span style="color:var(--cyan);font-size:11px">update ready</span>{% else %} <span style="color:var(--text-dim);font-size:11px">current</span>{% endif %}</div></div>{% endif %}
+  </div></div>
+  <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
+  {% else %}
+  <div class="card"><div class="card-title">Deploy EUD Remote Assist</div>
+  {% if not settings.fqdn %}<div style="background:rgba(234,179,8,.1);border:1px solid rgba(234,179,8,.3);border-radius:8px;padding:14px;margin-bottom:16px;font-size:13px;color:var(--yellow)">Configure your domain on the <a href="/caddy" style="color:var(--cyan)">Caddy SSL</a> page first — OIDC requires a public FQDN.</div>{% endif %}
+  <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px;line-height:1.5">Clones <a href="https://github.com/cfd2474/EUD_Remote_Assist_Portal" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">EUD Remote Assist Portal</a> into Docker, provisions Authentik OIDC, and exposes the portal at <code style="color:var(--cyan)">https://remote.{{ settings.fqdn if settings.fqdn else '&lt;your-domain&gt;' }}</code>. First deploy builds server and web images — allow 5–10 minutes.</p>
+  <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">The administrator user guide and deployment docs are linked from the project <a href="https://github.com/cfd2474/EUD_Remote_Assist_Portal/blob/main/README.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">README</a>.</p>
+  {% if settings.fqdn %}<p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">After deploy, open <a href="https://remote.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">remote.{{ settings.fqdn }}</a> and sign in with Authentik.</p>{% endif %}
+  <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()" {% if not settings.fqdn %}disabled{% endif %}>&#x1f680; Deploy EUD Remote Assist</button></div>
+  {% endif %}
+  {% if deploying %}<div class="card" id="deploy-log-card"><div class="card-title">Deploy log</div><div class="log-box" id="deploy-log">Initializing...</div></div>{% endif %}
+  <div class="card" id="log-card" style="display:none"><div class="card-title">Deploy log</div><div class="log-box" id="deploy-log-dyn">Waiting...</div></div>
+</div>
+<div class="modal-overlay" id="uninstall-modal"><div class="modal">
+  <h3>&#x26a0; Uninstall EUD Remote Assist?</h3><p>This will stop and remove the containers and database volume. Device data in PostgreSQL will be deleted.</p>
+  <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
+  <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
+<script>
+var logInterval=null;
+function pickLogEl(){var lc=document.getElementById('log-card');return (lc&&lc.style.display!=='none'?document.getElementById('deploy-log-dyn'):null)||document.getElementById('deploy-log')||document.getElementById('deploy-log-dyn');}
+function startDeploy(){var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;document.getElementById('log-card').style.display='block';var logEl=document.getElementById('deploy-log-dyn');if(logEl)logEl.textContent='Starting...';
+fetch('/api/remote-assist/deploy',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(!d.success){var dyn=document.getElementById('deploy-log-dyn');if(dyn)dyn.textContent='Error: '+(d.error||'Deploy failed');if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.onclick=function(){btn.textContent='\u1f680 Deploy EUD Remote Assist';btn.style.background='';startDeploy();};}return;}
+pollLog();});}
+function pollLog(){function doPoll(){var logEl=pickLogEl();fetch('/api/remote-assist/deploy-status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(d.log&&d.log.length){if(logEl){if(logEl.textContent==='Starting...'||logEl.textContent==='Waiting...')logEl.textContent='';logEl.textContent=d.log.join(String.fromCharCode(10))+String.fromCharCode(10);logEl.scrollTop=logEl.scrollHeight;}}
+if(!d.running){clearInterval(logInterval);var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=false;
+if(d.error){if(logEl)logEl.textContent+=(logEl.textContent?String.fromCharCode(10,10):'')+'\u2717 Deployment failed (see log above).';if(btn){btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.onclick=function(){btn.textContent='\u1f680 Deploy EUD Remote Assist';btn.style.background='';startDeploy();};}}
+else if(d.complete){if(logEl)logEl.textContent+=(logEl.textContent?String.fromCharCode(10,10):'')+'Deploy complete - page will reload in 15s (or refresh now).';setTimeout(function(){location.reload();},15000);}}});}
+doPoll();logInterval=setInterval(doPoll,800);}
+if(document.getElementById('deploy-log-card')){pollLog();}
+function control(action){var st=document.getElementById('control-status');if(st)st.textContent=action+'...';
+fetch('/api/remote-assist/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(st)st.textContent=d.running?'Running':'Stopped';if(d.error){alert(d.error);return;}setTimeout(function(){window.location.href=window.location.pathname+'?t='+Date.now();},1500);});}
+function loadLogs(){document.getElementById('logs-card').style.display='block';fetch('/api/remote-assist/logs',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){document.getElementById('container-logs').textContent=(d.entries||[]).join(String.fromCharCode(10))||'(no output)';});}
+function doUninstall(){var pw=document.getElementById('uninstall-password').value,msg=document.getElementById('uninstall-msg');msg.textContent='';
+fetch('/api/remote-assist/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(d.error){msg.textContent=d.error;return;}msg.textContent='Removing...';var iv=setInterval(function(){
+fetch('/api/remote-assist/uninstall-status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(s){
+if(s.complete){clearInterval(iv);msg.textContent='Done. Reloading...';setTimeout(function(){location.reload();},800);}});},1000);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
+var raUpdateInterval=null;
+function startRaUpdate(){var btn=document.getElementById('ra-update-btn');var card=document.getElementById('ra-update-card');var origHTML=btn?btn.innerHTML:'';if(btn){btn.disabled=true;btn.innerHTML='Updating\u2026';btn.style.opacity='0.75';}if(card){card.style.display='block';card.scrollIntoView({behavior:'smooth',block:'nearest'});}
+fetch('/api/remote-assist/update',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(!d.started){alert(d.error||'Update failed to start');if(btn){btn.disabled=false;btn.innerHTML=origHTML;btn.style.opacity='1';}return;}
+function poll(){fetch('/api/remote-assist/update-status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(s){
+var el=document.getElementById('ra-update-log');if(el&&s.log)el.textContent=s.log.join(String.fromCharCode(10));
+if(!s.running){clearInterval(raUpdateInterval);if(btn){btn.disabled=false;btn.innerHTML=origHTML;btn.style.opacity='1';}if(s.complete)setTimeout(function(){location.reload();},2000);else if(s.error)alert('Update failed: '+s.error);}});}
+poll();raUpdateInterval=setInterval(poll,800);});}
+</script>
+</body></html>'''
+
 # === Marketplace Template (all services, deploy from here) ===
 MARKETPLACE_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Marketplace — infra-TAK</title>
 <style>
@@ -55788,7 +56796,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card{% if mod.get('_conflict_with') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:{% if key == 'remote_assist' %}32px{% else %}36px{% endif %};width:auto;max-width:{% if key == 'takserver' %}72px{% elif key == 'remote_assist' %}100%{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>

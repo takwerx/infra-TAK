@@ -30,3 +30,7 @@ STATUS.md
 TESTING.md
 ssdnodes-firewall-request.md
 pull-dev-and-restart.sh
+
+# Local operator credentials and secrets — never commit
+.local/
+.local/eud-remote-assist-upstream-handoff.md
