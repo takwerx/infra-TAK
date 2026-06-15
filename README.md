@@ -340,9 +340,9 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ## Changelog
 
-### v0.9.59-alpha — 2026-06-15 — EUD Remote Assist: remotely manage your Android devices (dev channel)
+### v0.9.59-alpha — 2026-06-15 — EUD Remote Assist: remotely manage your Android devices
 
-**Headline: a new marketplace module for remotely managing company-owned Android end-user devices — device registration, live location, ping, and full screen view with remote touch — all behind your existing single sign-on.** Deploy **EUD Remote Assist** from the Marketplace and the console clones it into Docker, provisions an Authentik OIDC application, and publishes an admin portal at `https://remote.<your-domain>`. Sign-in is restricted to the same administrators as the console (the *authentik Admins* group); Android devices connect over a dedicated, separately-firewalled device API. One-click deploy, update, start/stop, logs, and removal are built in, with the portal's own version tracked alongside the console's other modules. **Availability:** this module ships on the **dev update channel** only for now — it appears in the Marketplace on dev-channel boxes (or anywhere it's already installed) and is hidden on the stable channel until a future promotion release. **Upgrade:** applied automatically on the next console update.
+**Headline: a new marketplace module for remotely managing company-owned Android end-user devices — device registration, live location, ping, and full screen view with remote touch — all behind your existing single sign-on.** Deploy **EUD Remote Assist** from the Marketplace and the console clones it into Docker, provisions an Authentik OIDC application, and publishes an admin portal at `https://remote.<your-domain>`. Sign-in is restricted to the same administrators as the console (the *authentik Admins* group); Android devices connect over a dedicated, separately-firewalled device API. One-click deploy, update, start/stop, logs, and removal are built in, with the portal's own version tracked alongside the console's other modules. **Upgrade:** applied automatically on the next console update; open the Marketplace and choose **EUD Remote Assist** to deploy (requires a configured domain and Authentik).
 
 Full notes: [v0.9.59-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.59-alpha).
 

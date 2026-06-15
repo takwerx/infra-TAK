@@ -1190,21 +1190,16 @@ def detect_modules():
                 ra_running = True
         except Exception:
             pass
-    # Dev-channel gate: only surface EUD Remote Assist in the marketplace on dev-channel
-    # boxes, or on any box where it is already installed. Main-channel boxes never see it
-    # until a future promotion release. (marketplace_page has no per-module gating, so the
-    # gate must live here in detect_modules.)
-    if settings.get('update_channel') == 'dev' or ra_enabled:
-        modules['remote_assist'] = {
-            'name': 'EUD Remote Assist',
-            'installed': bool(ra_enabled),
-            'running': ra_running,
-            'description': 'Remotely manage company Android devices — location, ping, screen view & touch',
-            'icon': '📱',
-            'icon_url': REMOTE_ASSIST_LOGO_URL,
-            'route': '/remote-assist',
-            'priority': 15,
-        }
+    modules['remote_assist'] = {
+        'name': 'EUD Remote Assist',
+        'installed': bool(ra_enabled),
+        'running': ra_running,
+        'description': 'Remotely manage company Android devices — location, ping, screen view & touch',
+        'icon': '📱',
+        'icon_url': REMOTE_ASSIST_LOGO_URL,
+        'route': '/remote-assist',
+        'priority': 15,
+    }
 
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
