@@ -6703,13 +6703,24 @@ def _f2b_parse_status(raw):
             result['banned_ips'] = [ip.strip() for ip in ips_raw.split() if ip.strip()]
     return result
 
+# Virtual / container / overlay interface prefixes whose subnets must NOT be auto-trusted:
+# docker bridges (172.17-31/16), libvirt, k8s CNIs, VPN/mesh links. These are RFC1918 but
+# are NOT the LAN/VNet a real upstream gateway lives on — auto-trusting them just bloats
+# ignoreip with noise (a box can have ~10 docker /16s). Only the physical NIC's subnet is
+# the one a proxy/gateway shares. (Found during v0.9.58 #6 field test: the test fleet's
+# jails would have picked up 9 docker bridges each.)
+_F2B_VIRTUAL_IFACE_PREFIXES = ('lo', 'docker', 'br-', 'br0', 'veth', 'virbr', 'vnet',
+                               'flannel', 'cni', 'cali', 'kube', 'tailscale', 'nb-',
+                               'wg', 'zt', 'tun', 'tap', 'cilium', 'ovs', 'weave')
+
 def _f2b_local_subnets():
     """Derive the box's directly-attached *private* IPv4 subnets (CIDR) from the
-    global-scope addresses on its NICs. On a gateway/proxy/VNet-fronted deploy the
-    upstream gateway usually lives on the box's own attached subnet, so trusting
-    that subnet keeps the gateway from ever being banned — the CORAZ total-outage
-    failure mode ([[fail2ban-bans-azure-gateway]]). RFC1918 only: on a direct-public
-    box the attached subnet is public, and we must NOT whitelist public neighbours.
+    global-scope addresses on its PHYSICAL NICs. On a gateway/proxy/VNet-fronted deploy
+    the upstream gateway usually lives on the box's own attached subnet, so trusting that
+    subnet keeps the gateway from ever being banned — the CORAZ total-outage failure mode
+    ([[fail2ban-bans-azure-gateway]]). Two guards: RFC1918 only (a direct-public box's
+    attached subnet is public — never whitelist public neighbours), and virtual/container
+    interfaces are skipped (docker bridges, CNIs, VPN links — noise, not a gateway LAN).
     Best-effort; returns [] on any failure (so the jail still gets localhost)."""
     subnets = []
     try:
@@ -6717,6 +6728,11 @@ def _f2b_local_subnets():
                            capture_output=True, text=True, timeout=5)
         for line in r.stdout.splitlines():
             parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]  # strip veth peer suffix (eth0@if5)
+            if ifname.startswith(_F2B_VIRTUAL_IFACE_PREFIXES):
+                continue
             for i, tok in enumerate(parts):
                 if tok == 'inet' and i + 1 < len(parts):
                     try:
@@ -6756,6 +6772,16 @@ def _f2b_trusted_ignoreip(extra=''):
             seen.add(c)
             parts.append(c)
     return ' '.join(parts)
+
+def _f2b_operator_extra(stored):
+    """Strip the fleet-computed tokens (localhost + attached private subnets + fleet CIDRs)
+    from a jail's stored ignoreip, leaving ONLY the per-jail operator entries. Lets a
+    re-write re-derive the fleet part fresh each time, so a REMOVED fleet/gateway CIDR
+    actually propagates out of every jail instead of staying baked into the stored line."""
+    fleet = {'127.0.0.1/8', '::1'}
+    fleet.update(_f2b_local_subnets())
+    fleet.update(_f2b_fleet_ignore_cidrs())
+    return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
 def _f2b_read_jail_config():
     """Read current thresholds and ignoreip from the infratak-authentik jail config file."""
@@ -7806,15 +7832,15 @@ def _f2b_rewrite_all_jails():
     done = []
     if _f2b_authentik_jail_enabled():
         c = _f2b_read_jail_config()
-        _f2b_write_jail_config(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        _f2b_write_jail_config(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
         done.append('authentik')
     if _f2b_tak_jail_enabled():
         c = _f2b_read_tak_jail_config()
-        _f2b_write_tak_jail_config(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        _f2b_write_tak_jail_config(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
         done.append('takserver')
     if _f2b_ssh_jail_enabled():
         c = _f2b_read_ssh_jail_config()
-        _f2b_write_ssh_jail_config(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        _f2b_write_ssh_jail_config(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
         done.append('sshd')
     if _f2b_mediamtx_jail_enabled():
         c = _f2b_read_mediamtx_jail_config()
@@ -7822,7 +7848,7 @@ def _f2b_rewrite_all_jails():
         done.append('mediamtx-rtsp')
     if _f2b_portal_jail_enabled():
         c = _f2b_read_portal_jail_config()
-        _f2b_write_portal_jail(c['maxretry'], c['findtime'], c['bantime'], c.get('ignoreip', ''))
+        _f2b_write_portal_jail(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
         done.append('takportal')
     if _f2b_recidive_enabled():
         c = _f2b_read_recidive_config()
@@ -56863,6 +56889,51 @@ def _startup_ensure_console_gunicorn_threads():
         print(f'Startup migration: gunicorn threads patch warning (non-fatal): {_e}')
 
 _startup_ensure_console_gunicorn_threads()
+
+
+# v0.9.58 (#6): startup migration — re-apply the trusted-upstream ignoreip to every
+# enabled fail2ban jail on boot, so the gateway/VNet whitelist + the mediamtx/recidive
+# baseline activate on a plain restart, not only when an operator next touches a jail
+# config. Without this, the v0.9.58 #6 fix stayed latent until a jail write (found during
+# field test: a restarted box kept its pre-.58 jails). Idempotent: rewrites + reloads ONLY
+# when the desired trusted set isn't already present in every jail — a silent no-op after
+# the first boot and on direct-public boxes with no private NIC subnet. Unions existing
+# per-jail operator entries (never drops them) and dedups (fixes doubled-localhost).
+def _startup_reapply_f2b_trusted_ignoreip():
+    try:
+        if not os.path.isdir('/etc/fail2ban/jail.d'):
+            return
+        import glob as _glob
+        jails = _glob.glob('/etc/fail2ban/jail.d/infratak-*.conf')
+        if not jails:
+            return
+        want = set(_f2b_trusted_ignoreip().split())
+        need = False
+        for jp in jails:
+            cur = set()
+            try:
+                with open(jp) as _jf:
+                    for line in _jf:
+                        line = line.strip()
+                        if line.startswith('ignoreip'):
+                            cur = set(line.split('=', 1)[1].split())
+                            break
+            except Exception:
+                continue
+            if not want.issubset(cur):
+                need = True
+                break
+        if not need:
+            return
+        changed = _f2b_rewrite_all_jails()
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        print('Startup migration: re-applied fail2ban trusted ignoreip to %s (v0.9.58 #6)' % (changed or []))
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: f2b trusted-ignoreip re-apply warning (non-fatal): %s' % _e)
+
+_startup_reapply_f2b_trusted_ignoreip()
 
 
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
