@@ -2272,18 +2272,29 @@ def _enforce_session_idle_lock():
 # templates with no shared base, so one after_request hook covers them all at once.
 # The injected JS is self-guarded (window.__auth401) → idempotent; only text/html 200
 # bodies are touched (JSON/static/redirects skipped).
+# Recovers from BOTH session-expiry failure modes the SSO/hardening work introduced:
+#  (1) a clean 401 from the console's idle-lock / login_required, AND
+#  (2) a fetch REJECTION when the Authentik forward-auth proxy 302-redirects an /api XHR
+#      to the cross-origin OAuth URL on the tak.<fqdn> subdomain — the browser can't follow
+#      that cross-origin redirect, so the background fetch dies with a CORS/network error and
+#      the button shows nothing useful. A full-page reload IS allowed to follow that redirect,
+#      so we reload to re-auth. One-shot, 15s loop-guard.
 _IDLE_LOCK_401_JS = (
     "<script>(function(){if(window.__auth401)return;window.__auth401=1;"
-    "var _f=window.fetch.bind(window);window.fetch=function(u,o){return _f(u,o).then(function(r){try{"
-    "if(r&&r.status===401&&typeof u==='string'&&u.indexOf('/api/')===0&&!window.__auth401fired){"
+    "function _recover(){try{"
     "var last=parseInt(sessionStorage.getItem('__auth401_t')||'0',10);var nowt=Math.floor(Date.now()/1000);"
-    "if(nowt-last>15){window.__auth401fired=1;sessionStorage.setItem('__auth401_t',String(nowt));"
+    "if(window.__auth401fired||nowt-last<=15)return;"
+    "window.__auth401fired=1;sessionStorage.setItem('__auth401_t',String(nowt));"
     "var d=document.createElement('div');d.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99999;"
     "background:#1e3a8a;color:#fff;font-family:sans-serif;font-size:13px;text-align:center;padding:11px;"
     "box-shadow:0 2px 10px rgba(0,0,0,.45)';"
-    "d.textContent='\U0001F512 Logged out after 30 minutes idle (session lock) — sending you to sign in again…';"
-    "(document.body||document.documentElement).appendChild(d);setTimeout(function(){location.reload();},1300);}}"
-    "}catch(e){}return r;});};})();</script>"
+    "d.textContent='\U0001F512 Session expired — signing you back in…';"
+    "(document.body||document.documentElement).appendChild(d);setTimeout(function(){location.reload();},1300);"
+    "}catch(e){}}"
+    "var _f=window.fetch.bind(window);window.fetch=function(u,o){"
+    "var isApi=(typeof u==='string'&&u.indexOf('/api/')>=0);"
+    "return _f(u,o).then(function(r){if(isApi&&r&&r.status===401)_recover();return r;},"
+    "function(err){if(isApi)_recover();throw err;});};})();</script>"
 )
 
 @app.after_request
