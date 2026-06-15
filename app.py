@@ -763,12 +763,39 @@ def _warm_update_cache_bg():
 
 threading.Thread(target=_warm_update_cache_bg, daemon=True).start()
 
+_json_file_cache = {}  # path -> ((mtime_ns, size), text); invalidated on any file change
+
+def _load_json_cached(p):
+    """Read+parse a small JSON config with an mtime/size cache: one stat() per call, a
+    real disk read only when the file actually changes. Returns a FRESH dict each call
+    (json.loads) so callers can safely read-modify-write. {} on missing/unreadable.
+    v0.9.58: the before_request hooks (cookie-domain :314, idle-lock :2202) call
+    load_settings()/load_hardening() on EVERY request — uncached that is 2 disk reads +
+    JSON parses per request, on every poller and button. On a busy/slow-disk single-worker
+    console that serialized into thread-starvation → 'request failed' on the CPU/RAM &
+    check-release buttons (regression introduced with the W1/W2/W-IDLE work; never seen in
+    the first 4 months). stat() is ~microseconds; the file is re-read only after a save
+    (save_settings/save_hardening bump mtime), so reads stay correct."""
+    try:
+        st = os.stat(p)
+    except OSError:
+        return {}
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _json_file_cache.get(p)
+    if not cached or cached[0] != key:
+        try:
+            with open(p) as f:
+                cached = (key, f.read())
+        except OSError:
+            return {}
+        _json_file_cache[p] = cached
+    try:
+        return json.loads(cached[1])
+    except Exception:
+        return {}
+
 def load_settings():
-    p = os.path.join(CONFIG_DIR, 'settings.json')
-    if os.path.exists(p):
-        with open(p) as f:
-            return json.load(f)
-    return {}
+    return _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
 
 def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -2138,16 +2165,10 @@ HARDENING_CONFIG = 'hardening.json'
 SESSION_IDLE_MAX_DEFAULT = 1800  # 30 min — CJIS idle-lock ceiling (W2), fleet-uniform constant
 
 def load_hardening():
-    """Load hardening.json from CONFIG_DIR. Never raises — {} on missing/error.
-    Missing file == Standard posture (today's behavior, both cloud and edge)."""
-    try:
-        p = os.path.join(CONFIG_DIR, HARDENING_CONFIG)
-        if os.path.exists(p):
-            with open(p) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+    """Load hardening.json from CONFIG_DIR (mtime-cached via _load_json_cached — see there
+    for the per-request thread-starvation regression this fixes). Never raises — {} on
+    missing/error. Missing file == Standard posture (both cloud and edge)."""
+    return _load_json_cached(os.path.join(CONFIG_DIR, HARDENING_CONFIG))
 
 def save_hardening(h):
     os.makedirs(CONFIG_DIR, exist_ok=True)
