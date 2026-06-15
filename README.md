@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.58-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.58-alpha)**
+**Current release: [v0.9.59-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.59-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -339,6 +339,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.59-alpha — 2026-06-15 — EUD Remote Assist: remotely manage your Android devices (dev channel)
+
+**Headline: a new marketplace module for remotely managing company-owned Android end-user devices — device registration, live location, ping, and full screen view with remote touch — all behind your existing single sign-on.** Deploy **EUD Remote Assist** from the Marketplace and the console clones it into Docker, provisions an Authentik OIDC application, and publishes an admin portal at `https://remote.<your-domain>`. Sign-in is restricted to the same administrators as the console (the *authentik Admins* group); Android devices connect over a dedicated, separately-firewalled device API. One-click deploy, update, start/stop, logs, and removal are built in, with the portal's own version tracked alongside the console's other modules. **Availability:** this module ships on the **dev update channel** only for now — it appears in the Marketplace on dev-channel boxes (or anywhere it's already installed) and is hidden on the stable channel until a future promotion release. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v0.9.59-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.59-alpha).
 
 ### v0.9.58-alpha — 2026-06-15 — Console reliability behind SSO + gateway-safe brute-force protection
 
