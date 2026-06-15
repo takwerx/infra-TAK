@@ -2265,50 +2265,12 @@ def _enforce_session_idle_lock():
         # A lock failure must never brick a request — fail open to the normal flow.
         return
 
-# v0.9.58: inject the idle-lock 401 handler into EVERY console HTML page. The 30-min
-# W2/W-IDLE lock returns 401 {login_required} to /api/* once a session idle-times-out;
-# without this, a button on ANY page just shows "request failed" while the stale page
-# still looks logged in (reported on test6). The ~20 module pages are standalone
-# templates with no shared base, so one after_request hook covers them all at once.
-# The injected JS is self-guarded (window.__auth401) → idempotent; only text/html 200
-# bodies are touched (JSON/static/redirects skipped).
-# Recovers from BOTH session-expiry failure modes the SSO/hardening work introduced:
-#  (1) a clean 401 from the console's idle-lock / login_required, AND
-#  (2) a fetch REJECTION when the Authentik forward-auth proxy 302-redirects an /api XHR
-#      to the cross-origin OAuth URL on the tak.<fqdn> subdomain — the browser can't follow
-#      that cross-origin redirect, so the background fetch dies with a CORS/network error and
-#      the button shows nothing useful. A full-page reload IS allowed to follow that redirect,
-#      so we reload to re-auth. One-shot, 15s loop-guard.
-_IDLE_LOCK_401_JS = (
-    "<script>(function(){if(window.__auth401)return;window.__auth401=1;"
-    "function _recover(){try{"
-    "var last=parseInt(sessionStorage.getItem('__auth401_t')||'0',10);var nowt=Math.floor(Date.now()/1000);"
-    "if(window.__auth401fired||nowt-last<=15)return;"
-    "window.__auth401fired=1;sessionStorage.setItem('__auth401_t',String(nowt));"
-    "var d=document.createElement('div');d.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99999;"
-    "background:#1e3a8a;color:#fff;font-family:sans-serif;font-size:13px;text-align:center;padding:11px;"
-    "box-shadow:0 2px 10px rgba(0,0,0,.45)';"
-    "d.textContent='\U0001F512 Session expired — signing you back in…';"
-    "(document.body||document.documentElement).appendChild(d);setTimeout(function(){location.reload();},1300);"
-    "}catch(e){}}"
-    "var _f=window.fetch.bind(window);window.fetch=function(u,o){"
-    "var isApi=(typeof u==='string'&&u.indexOf('/api/')>=0);"
-    "return _f(u,o).then(function(r){if(isApi&&r&&r.status===401)_recover();return r;},"
-    "function(err){if(isApi)_recover();throw err;});};})();</script>"
-)
-
-@app.after_request
-def _inject_idle_lock_handler(response):
-    try:
-        if ('text/html' in (response.content_type or '')
-                and response.status_code == 200
-                and not response.direct_passthrough):
-            body = response.get_data(as_text=True)
-            if '</body>' in body and '__auth401' not in body:
-                response.set_data(body.replace('</body>', _IDLE_LOCK_401_JS + '</body>', 1))
-    except Exception:
-        pass
-    return response
+# v0.9.58: the auto-reload "Session expired — signing you back in…" band-aid was REMOVED.
+# It masked the real problem (and reload-looped when the Authentik proxy session lapsed
+# fast). The real fix is in generate_caddyfile(): /api/* now BYPASSES the Authentik
+# forward_auth, so background XHR hit the console directly and get a clean same-origin 401
+# (or just succeed via the console session) instead of a cross-origin OAuth redirect that
+# the browser CORS-blocks. No client-side reload hack needed.
 
 def _hardening_control_w2():
     """W2 — 30-minute server-side session lock."""
@@ -14480,7 +14442,16 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         lines.append(f"    route {{")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-        lines.append(f"        forward_auth {ak_up} {{")
+        # v0.9.58: background /api XHR must NOT go through forward_auth. An unauthenticated
+        # XHR gets 302-redirected to the cross-origin Authentik OAuth URL (tak.<fqdn>), which
+        # the browser CORS-blocks — that is the console "request failed" on the CPU/RAM,
+        # check-release, etc. buttons once the proxy session lapses. /api is still protected
+        # by the console's own @login_required (clean SAME-origin 401) and the W2 idle-lock,
+        # so SSO+MFA on every PAGE is unchanged; only the silent API calls skip the redirect.
+        lines.append(f"        @needs_sso {{")
+        lines.append(f"            not path /api/*")
+        lines.append(f"        }}")
+        lines.append(f"        forward_auth @needs_sso {ak_up} {{")
         lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
         lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
         lines.append(f"            trusted_proxies private_ranges")
