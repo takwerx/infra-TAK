@@ -836,6 +836,85 @@ def save_auth(auth_dict):
         json.dump(auth_dict, f, indent=4)
     os.chmod(p, 0o600)
 
+# ==========================================================================
+# v10.0.1 — Platform detection (arch × distro × install-method)
+# ==========================================================================
+# These four helpers are the foundation of multi-platform deployability
+# (ARM64 + RHEL/Rocky folded into one code path). They are PURE READERS — no
+# privileged calls, no side effects beyond a one-time back-fill of settings.json
+# for boxes installed before these keys existed. On the field-validated
+# amd64-Ubuntu path every one of them returns its legacy-equivalent default
+# ('amd64' / 'debian' / 'native'), so that path stays byte-identical.
+
+def _arch_normalize(machine):
+    """Map a raw `uname -m` value to infra-TAK's two arch tokens. Anything that
+    isn't clearly aarch64 → 'amd64' (the validated default path)."""
+    m = (machine or '').strip().lower()
+    if m in ('aarch64', 'arm64'):
+        return 'arm64'
+    return 'amd64'  # x86_64, amd64, i686, unknown — all take the amd64 path
+
+def _host_arch():
+    """'amd64' | 'arm64' — host CPU architecture.
+
+    Prefers settings.json's 'arch' (written by start.sh at install). For boxes
+    installed before the key existed, back-fills it once from live `uname` and
+    persists it so subsequent calls hit the cached settings read. Used to force
+    the container TAK path on arm64 (no native arm TAK .deb/.rpm exists)."""
+    s = load_settings()
+    a = s.get('arch')
+    if a in ('amd64', 'arm64'):
+        return a
+    try:
+        a = _arch_normalize(os.uname().machine)
+    except Exception:
+        a = 'amd64'
+    # one-time back-fill for pre-v10.0.1 boxes (load_settings is mtime-cached;
+    # the save bumps mtime so the next read returns the populated value)
+    try:
+        s = load_settings()
+        s['arch'] = a
+        save_settings(s)
+    except Exception:
+        pass
+    return a
+
+def _distro_family():
+    """'debian' | 'rhel' — package-manager family, derived from settings.
+
+    apt → 'debian', dnf → 'rhel'. Defaults to 'debian' (the original,
+    byte-identical path) whenever the signal is missing/unknown, so existing
+    amd64-Ubuntu boxes are never re-routed."""
+    s = load_settings()
+    pm = (s.get('pkg_mgr') or '').strip().lower()
+    if pm == 'dnf':
+        return 'rhel'
+    if pm == 'apt':
+        return 'debian'
+    # pkg_mgr unset/unknown — fall back to os_type prefix
+    ot = (s.get('os_type') or '').strip().lower()
+    if ot.startswith(('rocky', 'rhel', 'almalinux', 'centos')):
+        return 'rhel'
+    return 'debian'
+
+def _tak_install_method():
+    """'native' | 'container' — how TAK Server is (or will be) installed here.
+
+    Returns the persisted 'tak_install_method' (set at deploy time) when present.
+    When unset, returns the platform DEFAULT: arm64 → 'container' (no native arm
+    TAK package), everything else → 'native'. Existing amd64 .deb boxes have no
+    key and correctly resolve to 'native'."""
+    s = load_settings()
+    m = s.get('tak_install_method')
+    if m in ('native', 'container'):
+        return m
+    return 'container' if _host_arch() == 'arm64' else 'native'
+
+def _tak_is_container():
+    """True when TAK Server runs as a container (vs native systemd service).
+    The control shim (Phase 3) routes systemctl/exec sites on this."""
+    return _tak_install_method() == 'container'
+
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
     # Trust Authentik headers only when request came from local reverse proxy.

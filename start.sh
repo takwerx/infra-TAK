@@ -143,26 +143,42 @@ detect_os() {
                 PKG_MGR="apt"
             fi
             ;;
-        rocky|rhel)
+        rocky|rhel|almalinux|centos)
+            # v10.0.1: whole EL9 family (RHEL/Rocky/AlmaLinux/CentOS Stream),
+            # not just "rocky" — same dnf/firewalld/SELinux/CRB behavior. The
+            # os_type prefix stays "rocky-" so existing `'rocky' in os_type`
+            # checks keep matching; the real family signal is PKG_MGR=dnf.
             if [[ "$OS_VERSION" == 9* ]]; then
                 OS_TYPE="rocky-9"
                 PKG_MGR="dnf"
             else
-                echo -e "${YELLOW}WARNING: $OS_NAME not tested. Rocky 9 recommended.${NC}"
+                echo -e "${YELLOW}WARNING: $OS_NAME not tested. EL9 (Rocky/RHEL/Alma 9) recommended.${NC}"
                 OS_TYPE="rocky-$OS_VERSION"
                 PKG_MGR="dnf"
             fi
             ;;
         *)
             echo -e "${YELLOW}WARNING: $OS_NAME is not officially supported.${NC}"
-            echo -e "${YELLOW}Supported: Ubuntu 22.04/24.04, Debian 12, Rocky Linux 9${NC}"
+            echo -e "${YELLOW}Supported: Ubuntu 22.04/24.04, Debian 12, EL9 (Rocky/RHEL/AlmaLinux/CentOS 9)${NC}"
             OS_TYPE="$OS_ID-$OS_VERSION"
             PKG_MGR="unknown"
             ;;
     esac
 
+    # v10.0.1: CPU architecture (amd64 | arm64). arm64 targets NVIDIA Jetson
+    # Orin (JetPack 6 / Ubuntu 22.04), Ampere, Graviton. Anything unrecognized
+    # falls back to amd64 — the field-validated default path. app.py reads this
+    # via _host_arch() to force the container TAK path on arm64 (no native arm
+    # TAK package exists).
+    case "$(uname -m)" in
+        x86_64|amd64)   ARCH="amd64" ;;
+        aarch64|arm64)  ARCH="arm64" ;;
+        *)              ARCH="amd64" ;;
+    esac
+
     echo -e "  Detected: ${GREEN}$OS_NAME${NC}"
     echo -e "  Type:     ${GREEN}$OS_TYPE${NC}"
+    echo -e "  Arch:     ${GREEN}$ARCH${NC}"
     echo ""
 }
 
@@ -352,6 +368,7 @@ EOF
     "os_type": "$OS_TYPE",
     "os_name": "$OS_NAME",
     "pkg_mgr": "$PKG_MGR",
+    "arch": "$ARCH",
     "console_port": 5001,
     "install_dir": "$INSTALL_DIR",
     "created": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
