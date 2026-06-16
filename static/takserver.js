@@ -956,10 +956,25 @@ function uploadFile(file){
             if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;
             var mode=getTakDeploymentMode();
             function allowed(p){var n=(p.filename||'').toLowerCase();var hasCore=n.indexOf('core')!==-1;var hasDb=n.indexOf('database')!==-1;if(mode==='two_server')return hasCore||hasDb;return !hasCore&&!hasDb;}
+            // v10.0.1: immediate platform/arch validation — wrong package type for
+            // this box is rejected inline at upload time (same UX as the core/db
+            // split check), and the bad file is deleted from the upload store.
+            var _ua=document.getElementById('upload-area')||{};
+            var _arch=(_ua.getAttribute&&_ua.getAttribute('data-arch'))||'';
+            var _os=(_ua.getAttribute&&_ua.getAttribute('data-os-type'))||'';
+            function platformPkgError(p){
+                var n=(p.filename||'').toLowerCase();
+                var t=(p.pkg_type||'').toLowerCase();
+                if(!t){t=n.indexOf('.zip')!==-1?'docker':n.indexOf('.rpm')!==-1?'rpm':n.indexOf('.deb')!==-1?'deb':'';}
+                if(_arch==='arm64'){if(t!=='docker')return 'arm64 runs TAK in a container — upload the takserver-docker-X.X.zip from tak.gov (.deb/.rpm are amd64-only).';return null;}
+                if(_os.indexOf('rocky')!==-1||_os.indexOf('rhel')!==-1){if(t==='deb')return 'Rocky/RHEL needs the .rpm — not a .deb. Download takserver-X.X.noarch.rpm from tak.gov.';return null;}
+                if(_os.indexOf('ubuntu')!==-1){if(t==='rpm')return 'Ubuntu needs the .deb — not a .rpm. Download takserver_X.X_all.deb from tak.gov.';return null;}
+                return null;
+            }
             function reject(msg,fn){bar.style.background='var(--red)';pc.style.color='var(--red)';pc.textContent=msg;var xBtn=document.createElement('span');xBtn.textContent=' \u2717';xBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;opacity:0.7';xBtn.title='Dismiss';xBtn.onclick=function(ev){ev.stopPropagation();var row=document.getElementById(id);if(row)row.remove()};pc.appendChild(xBtn);if(fn){fetch('/api/upload/takserver/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})}).catch(function(){})}}
             var added=0;
-            if(d.packages&&d.packages.length){d.packages.forEach(function(p){if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'Wrong package — this is a split package (database/core only). Upload the single takserver .deb instead.',p.filename);return;}if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push(p);added++;}});}
-            else if(d.package){var p=d.package;if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'Wrong package — this is a split package (database/core only). Upload the single takserver .deb instead.',p.filename);}else if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb});added++;}}
+            if(d.packages&&d.packages.length){d.packages.forEach(function(p){var pErr=platformPkgError(p);if(pErr){reject(pErr,p.filename);return;}if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'Wrong package — this is a split package (database/core only). Upload the single takserver .deb instead.',p.filename);return;}if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push(p);added++;}});}
+            else if(d.package){var p=d.package;var pErr=platformPkgError(p);if(pErr){reject(pErr,p.filename);}else if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'Wrong package — this is a split package (database/core only). Upload the single takserver .deb instead.',p.filename);}else if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb});added++;}}
             if(added>0||(d.gpg_key||d.policy)){bar.style.background='var(--green)';pc.style.color='var(--green)';var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
         }
         else{bar.style.background='var(--red)';pc.textContent='\u2717';pc.style.color='var(--red)'}
@@ -1245,12 +1260,18 @@ function updateUploadHint(){
     var el=document.getElementById('upload-requirements-hint');
     if(!el)return;
     var mode=getTakDeploymentMode();
-    var osType=(document.getElementById('upload-area')||{}).getAttribute('data-os-type')||'';
+    var ua=document.getElementById('upload-area')||{};
+    var osType=(ua.getAttribute&&ua.getAttribute('data-os-type'))||'';
+    var arch=(ua.getAttribute&&ua.getAttribute('data-arch'))||'';
+    var isArm=arch==='arm64';
     var ubuntu=osType.indexOf('ubuntu')!==-1;
     var rocky=osType.indexOf('rocky')!==-1||osType.indexOf('rhel')!==-1;
     var line2='<br><span style="color:var(--text-dim);font-size:11px">Select all at once or add files one at a time</span>';
     var html;
-    if(mode==='two_server'){
+    if(isArm){
+      // arm64 has no native TAK package — always the official Docker bundle.
+      html='<strong style="color:var(--text-secondary)">arm64 — container deploy:</strong><br>Required: <span style="color:var(--cyan)">takserver-docker-X.X-RELEASE-XX.zip</span> (official Docker bundle from tak.gov)<br><span style="color:var(--text-dim);font-size:11px">arm64 runs TAK Server in a container — .deb/.rpm are amd64-only. One Server only.</span>'+line2;
+    }else if(mode==='two_server'){
       if(ubuntu)html='<strong style="color:var(--text-secondary)">Split server (Ubuntu) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-database_X.X_all.deb</span> and <span style="color:var(--cyan)">takserver-core_X.X_all.deb</span><br>Optional: <span style="color:var(--text-secondary)">deb_policy.pol</span> + <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else if(rocky)html='<strong style="color:var(--text-secondary)">Split server (Rocky/RHEL) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-database</span> and <span style="color:var(--cyan)">takserver-core</span> .rpm<br>Optional: <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else html='<strong style="color:var(--text-secondary)">Split server:</strong><br>Required: <span style="color:var(--cyan)">takserver-database</span> and <span style="color:var(--cyan)">takserver-core</span> .deb or .rpm<br>Optional: .pol + .key'+line2;
