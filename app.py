@@ -915,6 +915,59 @@ def _tak_is_container():
     The control shim (Phase 3) routes systemctl/exec sites on this."""
     return _tak_install_method() == 'container'
 
+# --------------------------------------------------------------------------
+# v10.0.1 — Container TAK Server constants + control shim (Phase 3)
+# --------------------------------------------------------------------------
+# The container path (arm64, or operator-selected on amd64) runs TAK Server as
+# two Docker containers built from the official takserver-docker-*.zip
+# (Dockerfile.takserver on eclipse-temurin:17-jammy, Dockerfile.takserver-db on
+# postgres:15.1 — both multi-arch, so they build natively on aarch64). Host
+# /opt/tak is SYMLINKED to the bundle's tak/ dir, so every existing host-side
+# /opt/tak file operation (CoreConfig sed, cert files, the _patch_* helpers)
+# works unchanged; only binary EXECUTION (makeCert/keytool/UserManager) needs
+# `docker exec`. Mirrors the proven installTAK docker sequence.
+TAK_CONTAINER = 'takserver'          # app container name (and image tag)
+TAK_DB_CONTAINER = 'takserver-db'    # db container name
+TAK_DOCKER_NET = 'takserver'         # docker network
+TAK_DB_VOLUME = 'takserver_pgsql'    # named volume for postgres data
+TAK_DOCKER_ROOT = os.path.join(os.path.expanduser('~'), 'tak-docker')  # unzip target
+
+def _tak_exec(inner_cmd):
+    """Return a shell string that runs `inner_cmd` in the TAK Server context.
+      native    → `sudo -u tak bash -c '<inner>'`
+      container → `docker exec <TAK_CONTAINER> bash -c '<inner>'`
+    Used by the v10.0.1 container deploy; the native .deb deploy path is NOT
+    routed through this (it stays byte-identical). New privileged surface
+    (docker exec) is logged for the v10.0.5 sudoers allowlist (NON-ROOT-COMMANDS:
+    docker)."""
+    if _tak_is_container():
+        return f"docker exec {TAK_CONTAINER} bash -c {shlex.quote(inner_cmd)}"
+    return f"sudo -u tak bash -c {shlex.quote(inner_cmd)}"
+
+def _tak_systemctl(action):
+    """Return a shell string for a TAK Server lifecycle action.
+      native    → `systemctl <action> takserver`
+      container → docker equivalent (start/stop/restart map to `docker <action>`;
+                  `is-active` → `docker inspect` running-state; enable/daemon-reload
+                  are no-ops since the container uses --restart=always).
+    NON-ROOT-COMMANDS: docker."""
+    if _tak_is_container():
+        if action == 'restart':
+            return f"docker restart {TAK_CONTAINER}"
+        if action == 'start':
+            return f"docker start {TAK_CONTAINER}"
+        if action == 'stop':
+            return f"docker stop {TAK_CONTAINER}"
+        if action == 'is-active':
+            # prints 'active' when the container is running, else 'inactive' —
+            # matches the string `systemctl is-active` returns so callers parse
+            # it the same way.
+            return (f"sh -c \"[ \\\"$(docker inspect -f '{{{{.State.Running}}}}' "
+                    f"{TAK_CONTAINER} 2>/dev/null)\\\" = true ] && echo active || echo inactive\"")
+        if action in ('enable', 'daemon-reload'):
+            return 'true'  # no-op: container has --restart=always
+    return f"systemctl {action} takserver"
+
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
     # Trust Authentik headers only when request came from local reverse proxy.
@@ -50627,6 +50680,10 @@ def upload_takserver_package():
                 os.remove(fp)
                 return jsonify({'error': f'RPM uploaded but system is {os_type}. Need .deb.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'rpm', 'size_mb': sz})
+        elif fn.endswith('.zip') and 'docker' in fn.lower():
+            # v10.0.1: official takserver-docker-*.zip — container deploy (arm64
+            # forced, or operator-selected on amd64).
+            results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'docker', 'size_mb': sz})
         elif fn.endswith('.key') or 'gpg' in fn.lower():
             results['gpg_key'] = {'filename': fn, 'filepath': fp, 'size_mb': sz}
         elif fn.endswith('.pol') or 'policy' in fn.lower():
@@ -50658,7 +50715,7 @@ def check_existing_uploads():
             continue
         sz = os.path.getsize(fp)
         sz_mb = round(sz / (1024*1024), 1)
-        if fn.endswith('.deb') or fn.endswith('.rpm'):
+        if fn.endswith('.deb') or fn.endswith('.rpm') or (fn.endswith('.zip') and 'docker' in fn.lower()):
             files['packages'].append({'filename': fn, 'filepath': fp, 'size_mb': sz_mb})
         elif fn.endswith('.key') or 'gpg' in fn.lower():
             files['gpg_key'] = {'filename': fn, 'filepath': fp, 'size_mb': sz_mb}
@@ -52710,6 +52767,47 @@ def deploy_takserver():
             _sanitize_cert_field(data.get(key, ''), field)
     except ValueError as e:
         return jsonify({'error': str(e)[:200]}), 400
+
+    # ── v10.0.1: container path (arm64 forced, or operator-selected on amd64) ──
+    # Uses the official takserver-docker-*.zip instead of a .deb/.rpm. Branches
+    # here and returns BEFORE the byte-identical .deb selection logic below.
+    _method = (data.get('install_method') if data.get('install_method') in ('native', 'container')
+               else _tak_install_method())
+    if _method == 'container':
+        zips = [f for f in os.listdir(UPLOAD_DIR) if f.lower().endswith('.zip') and 'docker' in f.lower()]
+        if not zips:
+            return jsonify({'error': 'No takserver-docker .zip found. Upload the official takserver-docker-*.zip bundle (container deploy — required on arm64).'}), 400
+        selected_zip = sorted(zips)[-1]
+        try:
+            _int_days = max(1, min(3652, int(data.get('intermediate_ca_validity_days') or 730)))
+        except (TypeError, ValueError):
+            _int_days = 730
+        try:
+            _iss_days = max(1, min(3652, int(data.get('issued_cert_validity_days') or _int_days)))
+        except (TypeError, ValueError):
+            _iss_days = _int_days
+        if _iss_days > _int_days:
+            return jsonify({'error': f'Issued cert validity ({_iss_days} days) cannot exceed intermediate CA validity ({_int_days} days)'}), 400
+        c_config = {
+            'install_method': 'container',
+            'package_path': os.path.join(UPLOAD_DIR, selected_zip),
+            'cert_country': data.get('cert_country', 'US'), 'cert_state': data.get('cert_state', 'CA'),
+            'cert_city': data.get('cert_city', ''), 'cert_org': data.get('cert_org', ''),
+            'cert_ou': data.get('cert_ou', ''), 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
+            'intermediate_ca_name': data.get('intermediate_ca_name', 'INTERMEDIATE-CA-01'),
+            'intermediate_ca_validity_days': _int_days, 'issued_cert_validity_days': _iss_days,
+            'enable_admin_ui': data.get('enable_admin_ui', False),
+            'enable_webtak': data.get('enable_webtak', False),
+            'webadmin_password': data.get('webadmin_password', ''),
+        }
+        cert_password = (data.get('cert_password') or data.get('tak_cert_password') or '').strip()
+        if cert_password:
+            _s = load_settings(); _s['tak_cert_password'] = cert_password; save_settings(_s)
+        deploy_log.clear()
+        deploy_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_deploy, args=(c_config,), daemon=True).start()
+        return jsonify({'success': True})
+
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     if not pkg_files: return jsonify({'error': 'No package file found.'}), 400
     if is_two_server:
@@ -52800,7 +52898,238 @@ def wait_for_package_lock():
     return wait_for_unattended_upgrade_worker(
         log_step, deploy_log, lambda: deploy_status.get('cancelled'))
 
+def _tak_container_running(name):
+    """True if the named docker container exists and is in the running state."""
+    try:
+        r = subprocess.run(
+            ['docker', 'inspect', '-f', '{{.State.Running}}', name],
+            capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and r.stdout.strip() == 'true'
+    except Exception:
+        return False
+
+
+def _deploy_takserver_container(config):
+    """v10.0.1 — Deploy TAK Server as Docker containers from the official
+    takserver-docker-*.zip. Used on arm64 (forced — no native arm TAK package)
+    and selectable on amd64. Mirrors the proven installTAK docker sequence and
+    reuses the host-side cert/CoreConfig helpers via the /opt/tak symlink.
+
+    Single-server (bundled PostGIS container) only in v1. Two-server / external
+    DB and Authentik/LDAP auto-wiring are NOT done here — TAK comes up with
+    certs + admin + CoreConfig + firewall; LDAP is the post-deploy one-click
+    'Connect TAK Server to LDAP' (same fallback the .deb path degrades to).
+
+    FIRST CUT — validate on a real arm64 box; the container init timing and
+    configureInDocker behavior are the likely tuning points. Verbose logging is
+    intentional so the first deploy gives a clean debug trace."""
+    try:
+        deploy_status['cancelled'] = False
+        s0 = load_settings()
+        cert_pass = _get_tak_cert_password(s0)
+        zip_path = config['package_path']
+        root_ca = config['root_ca_name']; int_ca = config['intermediate_ca_name']
+        log_step("=" * 50); log_step("TAK Server Deployment Starting (CONTAINER / arm64-capable)"); log_step("=" * 50)
+        log_step(f"  Bundle: {os.path.basename(zip_path)}")
+        log_step(f"  Arch: {_host_arch()} | method: container")
+
+        # ── Step 1/9: Docker prerequisite ───────────────────────────────────
+        log_step(""); log_step("━━━ Step 1/9: Docker Prerequisite ━━━")
+        if not run_cmd('docker --version', "Checking Docker..."):
+            log_step("✗ Docker is not installed/usable — install Docker first (Marketplace deploys it).")
+            deploy_status.update({'error': True, 'running': False}); return
+        run_cmd('systemctl start docker > /dev/null 2>&1', check=False)
+
+        # ── Step 2/9: Unpack bundle + symlink /opt/tak ──────────────────────
+        log_step(""); log_step("━━━ Step 2/9: Unpacking TAK docker bundle ━━━")
+        run_cmd(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', check=False)
+        run_cmd(f'mkdir -p {shlex.quote(TAK_DOCKER_ROOT)}')
+        if not run_cmd(f'cd {shlex.quote(TAK_DOCKER_ROOT)} && unzip -oq {shlex.quote(zip_path)}', "Extracting bundle..."):
+            log_step("✗ Failed to unzip the takserver-docker bundle."); deploy_status.update({'error': True, 'running': False}); return
+        # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
+        try:
+            entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
+                       if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()]
+            build_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0]) if entries else TAK_DOCKER_ROOT
+        except Exception:
+            build_ctx = TAK_DOCKER_ROOT
+        tak_dir = os.path.join(build_ctx, 'tak')
+        if not os.path.isfile(os.path.join(build_ctx, 'docker', 'Dockerfile.takserver')):
+            log_step(f"✗ Dockerfile.takserver not found under {build_ctx}/docker — is this an official takserver-docker zip?")
+            deploy_status.update({'error': True, 'running': False}); return
+        log_step(f"  Build context: {build_ctx}")
+        # Symlink host /opt/tak → the bundle's tak/ so all host-side /opt/tak
+        # logic (CoreConfig sed, cert files, _patch_* helpers) works unchanged.
+        run_cmd('[ -L /opt/tak ] && rm -f /opt/tak; [ -d /opt/tak ] && rm -rf /opt/tak; true', check=False)
+        run_cmd(f'ln -sfn {shlex.quote(tak_dir)} /opt/tak', "Symlinking /opt/tak → bundle tak/...")
+        log_step("✓ Bundle unpacked and /opt/tak symlinked")
+
+        # ── Step 3/9: Build images (multi-arch base → native arm64 build) ───
+        log_step(""); log_step("━━━ Step 3/9: Building TAK Server images ━━━")
+        log_step("  (first build pulls postgres:15.1 + eclipse-temurin:17-jammy — minutes on arm64)")
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1', "Building takserver_db image..."):
+            log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1', "Building takserver image..."):
+            log_step("✗ takserver image build failed."); deploy_status.update({'error': True, 'running': False}); return
+        log_step("✓ Images built")
+
+        # ── Step 4/9: Network, volume, run DB + first takserver (cert-gen) ──
+        log_step(""); log_step("━━━ Step 4/9: Starting containers ━━━")
+        run_cmd(f'docker rm -f {TAK_CONTAINER} {TAK_DB_CONTAINER} 2>/dev/null; true', check=False)
+        run_cmd(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', "Ensuring docker network...")
+        run_cmd(f'docker volume create {TAK_DB_VOLUME} >/dev/null 2>&1; true', check=False)
+        run_cmd(
+            f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
+            f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
+            f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db',
+            "Starting database container...")
+        # First takserver run WITHOUT host ports — just to init the bundle
+        # (configureInDocker copies CoreConfig.example → CoreConfig.xml, lays out
+        # certs/) and give us a container to `docker exec` cert generation into.
+        run_cmd(
+            f'docker run -v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always '
+            f'--network {TAK_DOCKER_NET} --name {TAK_CONTAINER} -d {TAK_CONTAINER}',
+            "Starting TAK Server container (init pass)...")
+        log_step("  Waiting up to 2 min for container init (configureInDocker)...")
+        _ready = False
+        for _ in range(24):
+            time.sleep(5)
+            if deploy_status.get('cancelled'): return
+            if _tak_container_running(TAK_CONTAINER) and os.path.exists('/opt/tak/certs/makeCert.sh'):
+                _ready = True; break
+        if not _ready:
+            log_step("⚠ Container did not report ready in 2 min — continuing; check `docker logs takserver`.")
+        else:
+            log_step("✓ Containers up; bundle initialized")
+
+        # ── Step 5/9: Firewall ──────────────────────────────────────────────
+        log_step(""); log_step("━━━ Step 5/9: Configuring Firewall ━━━")
+        for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
+            run_cmd(f'ufw allow {p} > /dev/null 2>&1', check=False)
+        run_cmd('ufw --force enable > /dev/null 2>&1', check=False)
+        log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
+
+        # ── Step 6/9: Certificates (docker exec; files land in symlinked /opt/tak) ─
+        log_step(""); log_step("━━━ Step 6/9: Generating Certificates ━━━")
+        log_step(f"  Root CA: {root_ca} | Intermediate CA: {int_ca}")
+        run_cmd('rm -rf /opt/tak/certs/files', check=False)
+        run_cmd('cd /opt/tak/certs && cp cert-metadata.sh cert-metadata.sh.original 2>/dev/null; true', check=False)
+        for var, val in [('COUNTRY', config['cert_country']), ('STATE', config['cert_state']),
+                         ('CITY', config['cert_city']), ('ORGANIZATION', config['cert_org']),
+                         ('ORGANIZATIONAL_UNIT', config['cert_ou'])]:
+            if val:
+                run_cmd(f'''sed -i 's/^{var}=.*/{var}="{val}"/' /opt/tak/certs/cert-metadata.sh''', check=False)
+        int_validity_days = config.get('intermediate_ca_validity_days', 730)
+        run_cmd(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
+        _patch_openssl_string_mask(log_step)
+        _patch_cert_metadata_password(cert_pass)
+        # Container TAK user is uid 1000 — chown so makeCert (run as that user
+        # inside the container) can write the cert files on the shared mount.
+        run_cmd('chown -R 1000:1000 /opt/tak/certs 2>/dev/null; true', check=False)
+        log_step(f"Creating Root CA: {root_ca}...")
+        run_cmd(_tak_exec(f'cd /opt/tak/certs && echo "{root_ca}" | ./makeRootCa.sh') + ' 2>&1', quiet=True)
+        log_step(f"Creating Intermediate CA: {int_ca}...")
+        run_cmd(_tak_exec(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"') + ' 2>&1', quiet=True)
+        log_step("Creating server certificate...")
+        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh server takserver') + ' 2>&1', quiet=True)
+        log_step("Creating admin certificate...")
+        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh client admin') + ' 2>&1', quiet=True)
+        log_step("Creating user certificate...")
+        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh client user') + ' 2>&1', quiet=True)
+        run_cmd(_tak_exec(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt') + ' 2>&1', check=False)
+        log_step("✓ Certificates created and truststore built")
+
+        # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
+        log_step(""); log_step("━━━ Step 7/9: Configuring CoreConfig.xml ━━━")
+        if not os.path.exists('/opt/tak/CoreConfig.xml') and os.path.exists('/opt/tak/CoreConfig.example.xml'):
+            run_cmd('cp /opt/tak/CoreConfig.example.xml /opt/tak/CoreConfig.xml', "Seeding CoreConfig.xml from example...", check=False)
+        run_cmd('sed -i \'s|<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>|<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>|g\' /opt/tak/CoreConfig.xml', "Enabling X.509 auth on 8089...", check=False)
+        run_cmd(f'sed -i "s|truststoreFile=\\"certs/files/truststore-root.jks|truststoreFile=\\"certs/files/truststore-{int_ca}.jks|g" /opt/tak/CoreConfig.xml', "Setting intermediate CA truststore...", check=False)
+        _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
+        issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
+        cert_block = (f'<certificateSigning CA="TAKServer"><certificateConfig>\\n'
+            f'<nameEntries>\\n<nameEntry name="O" value="{config["cert_org"]}"/>\\n'
+            f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\\n</nameEntries>\\n'
+            f'</certificateConfig>\\n<TAKServerCAConfig keystore="JKS" '
+            f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
+            f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />\\n'
+            f'</certificateSigning>\\n<vbm enabled="false"/>')
+        run_cmd(f'sed -i \'s|<vbm enabled="false"/>|{cert_block}|g\' /opt/tak/CoreConfig.xml', "Enabling certificate enrollment...", check=False)
+        run_cmd('sed -i \'s|<auth>|<auth x509useGroupCache="true">|g\' /opt/tak/CoreConfig.xml', check=False)
+        admin_ui = str(config.get('enable_admin_ui', False)).lower()
+        webtak = str(config.get('enable_webtak', False)).lower()
+        if config.get('enable_admin_ui') or config.get('enable_webtak'):
+            log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
+            run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/|g\' /opt/tak/CoreConfig.xml', check=False)
+        _sanitize_coreconfig_name_entries()
+        log_step("✓ CoreConfig.xml configured")
+
+        # ── Step 8/9: Re-run takserver WITH host ports (two-phase) ──────────
+        log_step(""); log_step("━━━ Step 8/9: Final TAK Server run (publishing ports) ━━━")
+        run_cmd(f'docker rm -f {TAK_CONTAINER} 2>/dev/null; true', check=False)
+        run_cmd('rm -f /opt/tak/CoreConfig.xml.backup 2>/dev/null; true', check=False)
+        run_cmd(
+            f'docker run -v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always '
+            f'-p 8089:8089 -p 8443:8443 -p 8446:8446 '
+            f'--network {TAK_DOCKER_NET} --name {TAK_CONTAINER} -d {TAK_CONTAINER}',
+            "Starting TAK Server (ports 8089/8443/8446)...")
+        log_step("  Waiting for messaging microservice to come up (up to 10 min)...")
+        _up = False
+        for waited in range(0, 600, 10):
+            time.sleep(10)
+            if deploy_status.get('cancelled'): return
+            r = subprocess.run(f'docker exec {TAK_CONTAINER} grep -q "Started TAK Server messaging Microservice" /opt/tak/logs/takserver-messaging.log 2>/dev/null',
+                               shell=True, capture_output=True)
+            if r.returncode == 0:
+                _up = True; log_step("✓ TAK Server messaging microservice started"); break
+            if waited and waited % 60 == 0:
+                deploy_log.append(f"  ⏳ {waited//60} min …")
+        if not _up:
+            log_step("⚠ Did not see 'messaging Microservice started' within 10 min — admin promote may need a retry. Check `docker logs takserver`.")
+
+        # ── Step 9/9: Promote admin ─────────────────────────────────────────
+        log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
+        run_cmd(_tak_exec('java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem') + ' 2>&1', "Promoting admin certificate...", check=False)
+        webadmin_pass = config.get('webadmin_password', '')
+        if webadmin_pass:
+            log_step("Creating webadmin user (flat-file)...")
+            run_cmd(_tak_exec(f'java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin') + ' 2>&1', check=False)
+        run_cmd(_tak_systemctl('restart'), "Restarting TAK Server...", check=False)
+        time.sleep(15)
+
+        # ── Persist method + regen Caddy + finish ───────────────────────────
+        settings = load_settings()
+        settings['tak_install_method'] = 'container'
+        if webadmin_pass:
+            settings['webadmin_password'] = webadmin_pass
+        save_settings(settings)
+        if settings.get('fqdn'):
+            try:
+                generate_caddyfile(settings)
+                subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+                log_step("  ✓ Caddy config updated for TAK Server")
+            except Exception as _ce:
+                log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
+        ip = settings.get('server_ip', 'YOUR-IP')
+        log_step(""); log_step("=" * 50)
+        log_step("✓ TAK Server (container) deployment complete")
+        log_step(f"  Admin UI:  https://{settings.get('fqdn') or ip}:8446")
+        log_step(f"  Clients:   {settings.get('fqdn') or ip}:8089 (TLS/x509)")
+        log_step("  LDAP/Authentik: use 'Connect TAK Server to LDAP' on the TAK Server page if Authentik is deployed.")
+        log_step("=" * 50)
+        deploy_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        log_step(f"✗ Container deploy error: {str(e)[:300]}")
+        deploy_status.update({'running': False, 'complete': False, 'error': True})
+
+
 def run_takserver_deploy(config):
+    # v10.0.1 dispatch: arm64 (or operator-selected) container deploys route to
+    # the Docker path; everything else falls through to the byte-identical .deb
+    # body below. (Native .rpm for amd64-RHEL is a separate follow-up once the
+    # Rocky box is up.)
+    if config.get('install_method') == 'container':
+        return _deploy_takserver_container(config)
     try:
         deploy_status['cancelled'] = False
         cert_pass = _get_tak_cert_password(load_settings())
@@ -57462,7 +57791,7 @@ function takPurgeFailed(){
 <div class="upload-hint" id="upload-requirements-hint">
 <span style="color:var(--text-dim);font-size:12px">One server: takserver .deb/.rpm + optional .pol and .key — Split server: takserver-core and takserver-database.</span>
 </div>
-<input type="file" id="file-input" style="display:none" multiple {% if 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
+<input type="file" id="file-input" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.zip,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.zip,.key"{% else %}accept=".deb,.rpm,.zip,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
 </div>
 <div id="progress-area"></div>
 <div id="upload-results" style="display:none">
@@ -57470,7 +57799,7 @@ function takPurgeFailed(){
 <div id="upload-files-list" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary)"></div>
 <div id="add-more-area" style="margin-top:16px;text-align:center">
 <button onclick="var i=document.getElementById('file-input-more');i.value='';i.click()" style="padding:8px 20px;background:transparent;color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">+ Add more files</button>
-<input type="file" id="file-input-more" style="display:none" multiple {% if 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleAddMore(event)">
+<input type="file" id="file-input-more" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.zip,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.zip,.key"{% else %}accept=".deb,.rpm,.zip,.key,.pol"{% endif %} onchange="handleAddMore(event)">
 </div>
 <div id="deploy-btn-area" style="margin-top:20px;text-align:center;display:none">
 <button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>
