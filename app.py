@@ -53607,14 +53607,31 @@ def kernel_patch_status_api():
         running_kernel = subprocess.run(['uname', '-r'], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         running_kernel = 'unknown'
-    try:
-        upgradable_out = subprocess.run(
-            'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
-            shell=True, capture_output=True, text=True, timeout=20
-        ).stdout.strip()
-        upgradable_count = int(upgradable_out) if upgradable_out.isdigit() else 0
-    except Exception:
-        upgradable_count = 0
+    # v10.0.1: the "is a kernel update pending?" probe is package-manager
+    # specific. The apt path is byte-identical to pre-v10 (the #1 regression
+    # surface). The dnf path (EL9: RHEL/Rocky/Alma/CentOS) uses `dnf
+    # check-update`, whose exit code 100 means "updates available" — scoped to
+    # the kernel packages so the banner means the same thing on every distro.
+    if (load_settings().get('pkg_mgr', 'apt') or 'apt').lower() == 'dnf':
+        try:
+            r = subprocess.run(
+                'dnf -q check-update kernel kernel-core 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=30
+            )
+            # dnf check-update: 100 = updates available, 0 = up to date, 1 = error.
+            # Treat error/timeout as "no banner" (same fail-safe as the apt branch).
+            upgradable_count = 1 if r.returncode == 100 else 0
+        except Exception:
+            upgradable_count = 0
+    else:
+        try:
+            upgradable_out = subprocess.run(
+                'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
+                shell=True, capture_output=True, text=True, timeout=20
+            ).stdout.strip()
+            upgradable_count = int(upgradable_out) if upgradable_out.isdigit() else 0
+        except Exception:
+            upgradable_count = 0
     data = {
         'running_kernel': running_kernel,
         'upgradable': upgradable_count > 0,
@@ -53759,6 +53776,10 @@ def _kernel_patch_start_job():
         os.makedirs(os.path.dirname(_KERNEL_PATCH_LOGFILE), exist_ok=True)
     except Exception:
         pass
+    # v10.0.1: which OS-upgrade command this job runs is package-manager
+    # specific. The apt script below is byte-identical to pre-v10 (critical
+    # regression surface); the dnf override for EL9 is applied right after.
+    pkg_mgr = (load_settings().get('pkg_mgr', 'apt') or 'apt').lower()
     # Bash script body. Written to a tmp file rather than inlined into the
     # systemd-run argv to keep the unit definition compact.
     script = (
@@ -53790,6 +53811,28 @@ def _kernel_patch_start_job():
         '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
     )
+    if pkg_mgr == 'dnf':
+        # EL9 (RHEL/Rocky/Alma/CentOS) path. Full `dnf -y upgrade`, the OS-wide
+        # equivalent of apt full-upgrade, with the TAK Server packages EXCLUDED —
+        # the SAME invariant the apt path enforces via apt-mark hold: OS patching
+        # must never sweep in an operator-driven, backup-gated TAK major upgrade
+        # (v0.9.44 field incident — a kernel patch pulled takserver 5.6->5.7 and
+        # wedged the package DB). `--exclude='takserver*'` covers takserver and
+        # takserver-fed-hub and needs no versionlock plugin. systemd-run, the
+        # detached-cgroup rationale, and the reboot-pending signal are all
+        # distro-agnostic, so only this script body changes. dnf runs as root
+        # inside the transient unit (no new direct sudo call from the console);
+        # logged for the v10.0.5 sudoers allowlist (NON-ROOT-COMMANDS: dnf).
+        script = (
+            '#!/bin/bash\n'
+            'set -o pipefail\n'
+            'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
+            'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) [dnf/EL9] ==="\n'
+            'echo "[$(TS)] dnf -y upgrade (TAK Server packages excluded)"\n'
+            "dnf -y upgrade --exclude='takserver*' 2>&1 \\\n"
+            '  || { rc=$?; echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc)"; exit $rc; }\n'
+            'echo "[$(TS)] === DONE — safe to reboot ==="\n'
+        )
     _script_path = '/var/lib/infratak-kernel-patch.sh'
     try:
         with open(_script_path, 'w') as _sf:
@@ -55015,7 +55058,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">apt-get full-upgrade</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
 <div style="display:flex;gap:8px">
 <button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
@@ -55400,7 +55443,7 @@ function dismissKernelBanner(){
     // we just hide the UI. The job continues to run regardless.
 }
 async function startKernelPatch(){
-    if(!confirm("Start kernel patch?\\n\\nThis will run apt-get full-upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\\u2019s a separate explicit click.\\n\\nContinue?"))return;
+    if(!confirm("Start kernel patch?\\n\\nThis will run a full OS package upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\\u2019s a separate explicit click.\\n\\nContinue?"))return;
     var banner=document.getElementById('kernel-patch-banner');
     _kpatchShowState('running');
     document.getElementById('kpatch-pid').textContent='starting...';
