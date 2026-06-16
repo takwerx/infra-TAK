@@ -52944,8 +52944,26 @@ def _deploy_takserver_container(config):
         log_step(""); log_step("━━━ Step 2/9: Unpacking TAK docker bundle ━━━")
         run_cmd(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', check=False)
         run_cmd(f'mkdir -p {shlex.quote(TAK_DOCKER_ROOT)}')
-        if not run_cmd(f'cd {shlex.quote(TAK_DOCKER_ROOT)} && unzip -oq {shlex.quote(zip_path)}', "Extracting bundle..."):
-            log_step("✗ Failed to unzip the takserver-docker bundle."); deploy_status.update({'error': True, 'running': False}); return
+        # Extract with Python's zipfile rather than shelling to `unzip` — minimal
+        # cloud images (incl. this arm64 AMI) ship without unzip (exit 127), and
+        # this is cross-distro with no package install. zipfile does NOT restore
+        # unix permission bits, so re-apply them from external_attr — the bundle's
+        # makeCert.sh/makeRootCa.sh/configureInDocker.sh MUST stay executable.
+        log_step("Extracting bundle (Python zipfile — no unzip dependency)...")
+        try:
+            import zipfile
+            with zipfile.ZipFile(zip_path) as zf:
+                for info in zf.infolist():
+                    out_path = zf.extract(info, TAK_DOCKER_ROOT)
+                    mode = (info.external_attr >> 16) & 0xFFFF
+                    if mode and not info.is_dir():
+                        try:
+                            os.chmod(out_path, mode)
+                        except OSError:
+                            pass
+        except Exception as _ze:
+            log_step(f"✗ Failed to extract the takserver-docker bundle: {str(_ze)[:200]}")
+            deploy_status.update({'error': True, 'running': False}); return
         # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
         try:
             entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
@@ -57779,13 +57797,13 @@ function takPurgeFailed(){
 <div id="deploy-mode-first" style="margin-bottom:20px;padding:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">1. Deployment mode</div>
 <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px">
-<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">(single takserver .deb/.rpm)</span></label>
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">{% if settings.get('arch') == 'arm64' %}(takserver-docker .zip — container){% else %}(single takserver .deb/.rpm){% endif %}</span></label>
 <label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_split" value="two_server" style="accent-color:var(--accent)"> Split Server <span style="color:var(--text-dim);font-size:12px">(takserver-database + takserver-core)</span></label>
 <label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_external_db" value="external_db" style="accent-color:var(--accent)"> External / Managed DB <span style="color:var(--text-dim);font-size:12px">(AWS RDS, Azure, Cloud SQL)</span></label>
 </div>
 <div id="deploy-mode-first-hint" style="font-size:12px;color:var(--text-dim)">Choose One Server for a standard install. Split Server uses separate DB and core packages. External / Managed DB points TAK Server at your cloud-hosted PostgreSQL.</div>
 </div>
-<div class="upload-area" id="upload-area" data-os-type="{{ settings.get('os_type', '') }}" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="var i=document.getElementById('file-input');i.value='';i.click()">
+<div class="upload-area" id="upload-area" data-os-type="{{ settings.get('os_type', '') }}" data-arch="{{ settings.get('arch', '') }}" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="var i=document.getElementById('file-input');i.value='';i.click()">
 <div class="upload-icon">📦</div><div class="upload-text">Drop your TAK Server files here</div>
 <div class="upload-hint" style="margin-bottom:6px"><span style="color:var(--text-dim);font-size:12px">Slow upload? Use the backdoor — open <strong>https://{{ settings.get('server_ip', 'SERVER_IP') }}:5001</strong> and upload from the TAK Server page there (skips proxy, no timeout).</span></div>
 <div class="upload-hint" id="upload-requirements-hint">
