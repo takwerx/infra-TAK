@@ -50645,6 +50645,15 @@ def takserver_services():
                     'cpu': '', 'mem_mb': '', 'mem_pct': '',
                     'status': 'stopped'
                 })
+        elif _tak_is_container():
+            # v10.0.1: single-server container deploy — PostgreSQL runs in the
+            # takserver-db container, not as a host systemd service.
+            pg_running = _tak_container_running(TAK_DB_CONTAINER)
+            services.append({
+                'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
+                'cpu': '', 'mem_mb': '', 'mem_pct': '',
+                'status': 'running' if pg_running else 'stopped'
+            })
         else:
             pg = subprocess.run("systemctl is-active postgresql", shell=True, capture_output=True, text=True, timeout=5)
             services.append({
