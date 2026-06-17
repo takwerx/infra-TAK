@@ -968,6 +968,26 @@ def _tak_systemctl(action):
             return 'true'  # no-op: container has --restart=always
     return f"systemctl {action} takserver"
 
+def _takserver_running_local():
+    """True if local TAK Server is running — container-aware. native →
+    `systemctl is-active takserver`; container → the takserver container's
+    running state via `docker inspect`. Used by detect_modules, the Guard Dog
+    health check, and the start/restart status so the UI reflects reality on a
+    container box (native systemctl is-active is meaningless there)."""
+    if _tak_is_container():
+        try:
+            r = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER],
+                               capture_output=True, text=True, timeout=10)
+            return r.returncode == 0 and r.stdout.strip() == 'true'
+        except Exception:
+            return False
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() == 'active'
+    except Exception:
+        return False
+
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
     # Trust Authentik headers only when request came from local reverse proxy.
@@ -1037,8 +1057,10 @@ def detect_modules():
     tak_installed = os.path.exists('/opt/tak') and os.path.exists('/opt/tak/CoreConfig.xml')
     tak_running = False
     if tak_installed:
-        r = _run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
-        tak_running = r.stdout.strip() == 'active'
+        # v10.0.1: container-aware — native systemctl is-active is meaningless
+        # when TAK runs as a Docker container (arm64). _takserver_running_local
+        # branches on install method (docker inspect vs systemctl).
+        tak_running = _takserver_running_local()
     modules['takserver'] = {'name': 'TAK Server', 'installed': tak_installed, 'running': tak_running,
         'description': 'Team Awareness Kit Server', 'icon': '🗺️', 'icon_url': TAK_LOGO_URL, 'route': '/takserver', 'priority': 1}
     # Authentik - Identity Provider (local or remote deployment)
@@ -9132,10 +9154,10 @@ def _guarddog_health_check(service_id):
     """Quick health check for one service. Returns True if healthy, False otherwise. Used for UI and optional monitors."""
     try:
         if service_id == 'takserver':
-            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True, timeout=3)
-            if r.returncode != 0:
+            # v10.0.1: container-aware liveness (docker inspect vs systemctl).
+            if not _takserver_running_local():
                 return False
-            # Optional: also check 8089
+            # Also check 8089 is listening (host-published for the container).
             r2 = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=2)
             return 'LISTEN' in (r2.stdout or '')
         if service_id == 'authentik':
@@ -50395,10 +50417,11 @@ def takserver_control():
             changed, msg = _resync_ldap_credential_to_coreconfig()
             if changed:
                 results['ldap_resync'] = msg
-        subprocess.run(_sudo_wrap(['systemctl', action, 'takserver']), capture_output=True, text=True, timeout=60)
+        # v10.0.1: container-aware lifecycle — _tak_systemctl maps start/stop/
+        # restart to `docker ...` in container mode (native systemctl on .deb).
+        subprocess.run(_tak_systemctl(action), shell=True, capture_output=True, text=True, timeout=120)
         time.sleep(3)
-        s = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
-        results['core'] = {'success': True, 'running': s.stdout.strip() == 'active'}
+        results['core'] = {'success': True, 'running': _takserver_running_local()}
     return jsonify({'success': True, 'results': results, 'action': action, 'target': target,
                     'running': results.get('core', {}).get('running', None)})
 
