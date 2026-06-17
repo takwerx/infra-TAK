@@ -16019,6 +16019,120 @@ def wait_for_unattended_upgrade_worker(log_fn, log_list, cancelled_check=None):
         log_list.append(f"  ⏳ {m:02d}:{s:02d}")
 
 
+def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=True):
+    """v10.0.1 — container variant of install_le_cert_on_8446. Same outcome (wire
+    the Caddy LE / custom cert onto TAK's 8446 enrollment connector so clients
+    trust it), adapted for the Docker TAK path: openssl on the host writes the p12
+    to the SHARED /opt/tak mount, keytool runs via `docker exec` (no Java on the
+    host), ownership is the container uid (1000), and lifecycle uses `docker` not
+    systemctl. Mirrors the live-validated sequence. Returns True on success."""
+    import re, shutil, time as _t
+    s = load_settings()
+    cert_pass = _get_tak_cert_password(s)
+    custom_mode = (s.get('ssl_mode') or '') == 'custom'
+    if custom_mode:
+        cert_crt, cert_key = _custom_cert_paths()
+        cert_dir = os.path.dirname(cert_crt); cert_label = 'custom'
+    else:
+        cert_dir = (f"/var/lib/caddy/.local/share/caddy/certificates/"
+                    f"acme-v02.api.letsencrypt.org-directory/{takserver_host}")
+        cert_crt = f"{cert_dir}/{takserver_host}.crt"
+        cert_key = f"{cert_dir}/{takserver_host}.key"
+        cert_label = 'LE'
+    core_config = '/opt/tak/CoreConfig.xml'
+    if wait_for_cert and not custom_mode:
+        waited = 0
+        while not (os.path.exists(cert_crt) and os.path.exists(cert_key)) and waited < 120:
+            log_fn(f"  Waiting for {cert_label} cert files... ({waited}s)"); _t.sleep(10); waited += 10
+    if not (os.path.exists(cert_crt) and os.path.exists(cert_key)):
+        log_fn(f"  ⚠ {cert_label} cert not found at {cert_dir} — skipping 8446 cert wire-up")
+        return False
+    log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
+    p12 = '/opt/tak/certs/files/takserver-le.p12'
+    jks = '/opt/tak/certs/files/takserver-le.jks'
+    # Step A: cert → PKCS12 on the shared mount (host openssl; the container reads it there)
+    r = subprocess.run(
+        f'openssl pkcs12 -export -in {shlex.quote(cert_crt)} -inkey {shlex.quote(cert_key)} '
+        f'-out {p12} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
+        shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        log_fn(f"  ⚠ PKCS12 conversion failed: {r.stderr.strip()[:200]}"); return False
+    # Step B: PKCS12 → JKS via docker exec (the container has Java/keytool; host arm64 does not)
+    r = subprocess.run(
+        _tak_exec('cd /opt/tak/certs/files && rm -f takserver-le.jks && '
+                  f'keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} '
+                  f'-deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks '
+                  '-srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt') + ' 2>&1',
+        shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        log_fn(f"  ⚠ JKS conversion failed: {(r.stderr or r.stdout).strip()[:200]}"); return False
+    subprocess.run(f'chown 1000:1000 {jks} {p12} 2>/dev/null; true', shell=True)
+    log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
+    # Step C: patch CoreConfig 8446 connector → LetsEncrypt keystore (host-side via symlink).
+    # TAK-in-container preserves CoreConfig across docker restart (verified), so no stop-first.
+    try:
+        with open(core_config) as f:
+            content = f.read()
+        shutil.copy(core_config, core_config + '.bak-le')
+        new_connector = (
+            '<connector port="8446" clientAuth="false" _name="LetsEncrypt" '
+            'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
+            f'keystorePass="{cert_pass}" enableAdminUI="true" enableWebtak="true" '
+            'enableNonAdminUI="false"/>')
+        patched = re.sub(r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
+                         new_connector, content, count=1)
+        if patched != content and '_name="LetsEncrypt"' in patched and 'takserver-le.jks' in patched:
+            with open(core_config, 'w') as f:
+                f.write(patched)
+            log_fn("  ✓ CoreConfig.xml 8446 connector patched to LE cert")
+        else:
+            log_fn("  ⚠ 8446 connector not matched — check CoreConfig.xml manually"); return False
+    except Exception as ce:
+        log_fn(f"  ⚠ CoreConfig patch error: {ce}"); return False
+    # Step D: renewal script (container-flavored) + host systemd timer (Caddy auto-renews;
+    # re-import whenever TAK's keystore cert differs from Caddy's current cert).
+    renewal = f'''#!/bin/bash
+set -euo pipefail
+TAK_DOMAIN="{takserver_host}"
+CERT_CRT="{cert_crt}"
+CERT_KEY="{cert_key}"
+P12={p12}
+JKS={jks}
+LOG=/var/log/takserver-cert-renewal.log
+log(){{ echo "[$(date -Is)] $*" | tee -a "$LOG"; }}
+[ -f "$CERT_CRT" ] && [ -f "$CERT_KEY" ] || {{ log "ERROR: Caddy cert files not found for $TAK_DOMAIN"; exit 1; }}
+CADDY_FP=$(openssl x509 -in "$CERT_CRT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+TAK_FP=$(docker exec {TAK_CONTAINER} keytool -list -rfc -keystore "$JKS" -storepass {shlex.quote(cert_pass)} 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)
+[ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ] && {{ log "TAK keystore already current."; exit 0; }}
+log "Refreshing TAK keystore from Caddy's current cert..."
+openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" -out "$P12" -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
+docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt"
+chown 1000:1000 "$JKS" "$P12" 2>/dev/null || true
+docker restart {TAK_CONTAINER}
+log "TAK keystore refreshed and container restarted."
+'''
+    try:
+        _write_priv('/opt/tak/renew-letsencrypt.sh', renewal)
+        subprocess.run('chmod +x /opt/tak/renew-letsencrypt.sh', shell=True)
+        svc = ('[Unit]\nDescription=TAK Server LE Cert Renewal (container)\n'
+               'After=network.target docker.service\n\n[Service]\nType=oneshot\n'
+               'ExecStart=/opt/tak/renew-letsencrypt.sh\n')
+        timer = ('[Unit]\nDescription=TAK Server Certificate Renewal Timer\n'
+                 'Requires=takserver-cert-renewal.service\n\n[Timer]\nOnCalendar=daily\n'
+                 'Persistent=true\n\n[Install]\nWantedBy=timers.target\n')
+        _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
+        _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
+        subprocess.run('systemctl daemon-reload && systemctl enable --now takserver-cert-renewal.timer 2>/dev/null; true',
+                       shell=True, capture_output=True)
+        log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
+    except Exception as _re:
+        log_fn(f"  ⚠ renewal timer setup skipped: {str(_re)[:120]}")
+    # Step E: restart container so 8446 picks up the LE keystore
+    subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=120)
+    log_fn("  ✓ TAK Server (container) restarted — 8446 now serving the trusted cert")
+    return True
+
+
 def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     """
     Install the Caddy-managed Let's Encrypt cert on TAK Server's port 8446
@@ -16033,6 +16147,11 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         log_fn:         Logging function (plog or log_step)
         wait_for_cert:  If True, poll up to 120s for cert files before giving up
     """
+    # v10.0.1: Docker TAK uses a container-adapted path (keytool via docker exec,
+    # JKS on the shared /opt/tak mount, docker lifecycle). Native .deb path below
+    # is byte-identical to pre-v10.
+    if _tak_is_container():
+        return _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert)
     import re, shutil
 
     _s8446 = load_settings()
@@ -53183,12 +53302,38 @@ def _deploy_takserver_container(config):
                 log_step("  ✓ Caddy config updated for TAK Server")
             except Exception as _ce:
                 log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
+
+        # v10.0.1: make the container deploy self-sufficient like the .deb path —
+        # auto-connect LDAP when Authentik is present, then wire the LE cert onto
+        # 8446. Without these, enrollment fails: 'invalid credentials' (TAK can't
+        # see Authentik/Portal users) and 'identity could not be verified' (8446
+        # serves the self-signed PKI cert). Order mirrors the .deb deploy.
+        # Auto-connect to LDAP if Authentik is already deployed
+        try:
+            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            if ak_installed and not _coreconfig_has_ldap():
+                log_step(""); log_step("━━━ Connecting TAK Server to LDAP (Authentik detected) ━━━")
+                ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
+                if ldap_ok:
+                    log_step(f"✓ {ldap_msg}")
+                else:
+                    log_step(f"⚠ LDAP auto-connect: {ldap_msg} — use 'Connect TAK Server to LDAP' after deploy")
+        except Exception as e:
+            log_step(f"⚠ LDAP auto-connect failed: {str(e)[:120]} — use 'Connect TAK Server to LDAP' after deploy")
+        # Wire the Let's Encrypt cert onto the 8446 enrollment connector (trusted
+        # cert so ATAK/iTAK don't reject the server identity).
+        if settings.get('fqdn'):
+            log_step(""); log_step("━━━ Installing trusted cert on 8446 (enrollment) ━━━")
+            try:
+                install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
+            except Exception as _le:
+                log_step(f"  ⚠ LE cert on 8446 failed (non-fatal): {str(_le)[:120]}")
+
         ip = settings.get('server_ip', 'YOUR-IP')
         log_step(""); log_step("=" * 50)
         log_step("✓ TAK Server (container) deployment complete")
         log_step(f"  Admin UI:  https://{settings.get('fqdn') or ip}:8446")
         log_step(f"  Clients:   {settings.get('fqdn') or ip}:8089 (TLS/x509)")
-        log_step("  LDAP/Authentik: use 'Connect TAK Server to LDAP' on the TAK Server page if Authentik is deployed.")
         log_step("=" * 50)
         deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
