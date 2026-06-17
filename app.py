@@ -52992,10 +52992,35 @@ def _deploy_takserver_container(config):
         log_step("✓ Images built")
 
         # ── Step 4/9: Network, volume, run DB + first takserver (cert-gen) ──
+        # ── Step 3.5: martiuser DB password INTO CoreConfig BEFORE the DB inits ─
+        # The DB container's configureInDocker → takserver-setup-db.sh reads the
+        # martiuser password straight out of /opt/tak/CoreConfig.xml at init and
+        # provisions the role with it. pg_hba.conf is `md5`, so an empty password
+        # → "Skipping schema changes, no DB password" → TAK can never auth. So we
+        # MUST seed CoreConfig.xml and set the connection password BEFORE starting
+        # the DB container (this is what installTAK does at its line 1302, before
+        # its docker run). At this point cert_block isn't added yet, so the only
+        # password="" in the file is the <connection> one — a global sed is safe.
+        log_step(""); log_step("━━━ Step 3.5/9: Database credentials ━━━")
+        import secrets as _secrets
+        _alpha = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        db_pass = ''.join(_secrets.choice(_alpha) for _ in range(20))
+        try:
+            _sdb = load_settings(); _sdb['tak_db_password'] = db_pass; save_settings(_sdb)
+        except Exception:
+            pass
+        run_cmd('[ -f /opt/tak/CoreConfig.xml ] || cp /opt/tak/CoreConfig.example.xml /opt/tak/CoreConfig.xml', "Seeding CoreConfig.xml from example...", check=False)
+        run_cmd(f"sed -i 's/password=\"\"/password=\"{db_pass}\"/g' /opt/tak/CoreConfig.xml /opt/tak/CoreConfig.example.xml",
+                "Setting martiuser DB password in CoreConfig (before DB init)...", check=False)
+        log_step("✓ DB password set in CoreConfig (martiuser will be provisioned with it)")
+
         log_step(""); log_step("━━━ Step 4/9: Starting containers ━━━")
         run_cmd(f'docker rm -f {TAK_CONTAINER} {TAK_DB_CONTAINER} 2>/dev/null; true', check=False)
         run_cmd(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', "Ensuring docker network...")
-        run_cmd(f'docker volume create {TAK_DB_VOLUME} >/dev/null 2>&1; true', check=False)
+        # Wipe any stale DB volume so postgres re-inits and takserver-setup-db.sh
+        # re-provisions martiuser with the CURRENT password — an existing volume
+        # keeps the old/empty-password role and auth fails.
+        run_cmd(f'docker volume rm {TAK_DB_VOLUME} >/dev/null 2>&1; docker volume create {TAK_DB_VOLUME} >/dev/null 2>&1; true', check=False)
         run_cmd(
             f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
             f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
@@ -53059,8 +53084,8 @@ def _deploy_takserver_container(config):
 
         # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
         log_step(""); log_step("━━━ Step 7/9: Configuring CoreConfig.xml ━━━")
-        if not os.path.exists('/opt/tak/CoreConfig.xml') and os.path.exists('/opt/tak/CoreConfig.example.xml'):
-            run_cmd('cp /opt/tak/CoreConfig.example.xml /opt/tak/CoreConfig.xml', "Seeding CoreConfig.xml from example...", check=False)
+        # CoreConfig.xml was already seeded + DB-password-set in Step 3.5 (before
+        # the DB init). Here we layer the cert/enrollment patches on top.
         run_cmd('sed -i \'s|<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>|<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>|g\' /opt/tak/CoreConfig.xml', "Enabling X.509 auth on 8089...", check=False)
         run_cmd(f'sed -i "s|truststoreFile=\\"certs/files/truststore-root.jks|truststoreFile=\\"certs/files/truststore-{int_ca}.jks|g" /opt/tak/CoreConfig.xml', "Setting intermediate CA truststore...", check=False)
         _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
