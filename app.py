@@ -46759,8 +46759,15 @@ def _apply_ldap_to_coreconfig():
     ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
     if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
         return False, 'CoreConfig was written but adminGroup="ROLE_ADMIN" is missing — 8446 would show WebTAK for everyone. Run Connect LDAP again.'
-    # Restart TAK Server
-    r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    # Restart TAK Server so it reloads the LDAP <auth>. v10.0.1: container-aware —
+    # native systemctl restart fails on a Docker TAK (no systemd unit), which left
+    # the LDAP patch on disk but never loaded (→ enrollment 'invalid credentials').
+    # Verified: TAK-in-container preserves CoreConfig across `docker restart`, so a
+    # plain restart suffices. Native branch is byte-identical to pre-v10.
+    if _tak_is_container():
+        r = subprocess.run(_tak_systemctl('restart') + ' 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+    else:
+        r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         return False, f'CoreConfig patched but TAK Server restart failed: {r.stderr.strip()[:120]}'
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
