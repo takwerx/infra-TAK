@@ -24018,10 +24018,12 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
                        shell=True, capture_output=True)
         subprocess.run('ufw reload 2>/dev/null; true', shell=True, capture_output=True)
         _log(f'  UFW: allowed {host} → port 25 (console Postfix)')
-    # Restart Authentik containers on remote
-    _log('  Restarting Authentik containers on remote...')
+    # Recreate ONLY server + worker (SMTP env) — recreating the whole stack races
+    # the just-recreated LDAP outpost → name conflict (see local variant). --no-deps
+    # leaves db/redis/ldap untouched.
+    _log('  Recreating Authentik server + worker for SMTP on remote (ldap/db/redis untouched)...')
     _ok, _out = _module_run(deploy_cfg,
-        'cd ~/authentik && docker compose up -d --force-recreate 2>&1', timeout=120)
+        'cd ~/authentik && docker compose up -d --force-recreate --no-deps --remove-orphans server worker 2>&1', timeout=120)
     if not _ok:
         raise RuntimeError(f'Authentik restart failed on remote: {(_out or "")[:300]}')
     _log('  ✓ Authentik restarted')
@@ -24148,9 +24150,16 @@ services:
             subprocess.run('firewall-cmd --reload 2>/dev/null; true', shell=True, capture_output=True)
             _log("  firewalld: allowed Docker networks → port 25")
 
-    _log("  Restarting Authentik containers...")
+    # Recreate ONLY server + worker (they read the SMTP env). Recreating the whole
+    # stack with --force-recreate races the LDAP outpost — which was just recreated
+    # with its injected token in Step 11 — producing an 'authentik-ldap-1 name
+    # already in use' conflict that aborts the compose op mid-recreate, leaving
+    # server/postgres/redis down + orphan containers (Authentik DOWN after a
+    # "successful" deploy → broken LDAP flow → 8446 WebTAK). --no-deps leaves
+    # postgres/redis/ldap untouched. --remove-orphans cleans any prior orphan.
+    _log("  Recreating Authentik server + worker for SMTP (ldap/db/redis untouched)...")
     r = subprocess.run(
-        f'cd {ak_dir} && docker compose up -d --force-recreate',
+        f'cd {ak_dir} && docker compose up -d --force-recreate --no-deps --remove-orphans server worker',
         shell=True, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f'Authentik restart failed: {r.stderr or r.stdout}')
