@@ -50869,6 +50869,10 @@ def takserver_uninstall():
         subprocess.run(['docker', 'volume', 'rm', TAK_DB_VOLUME], capture_output=True, timeout=30)
         subprocess.run(['docker', 'network', 'rm', TAK_DOCKER_NET], capture_output=True, timeout=30)
         subprocess.run(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', shell=True, capture_output=True, timeout=60)
+        # Remove the /opt/tak symlink explicitly. After ~/tak-docker is gone it is a
+        # DANGLING symlink, which the native `if os.path.exists('/opt/tak')` cleanup
+        # below skips (exists() follows the link → False), leaving it behind.
+        subprocess.run('rm -f /opt/tak 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
         # Reset the persisted method/credentials so detection falls back to the
         # platform default (arm64 still defaults to container; a redeploy re-sets it).
         try:
