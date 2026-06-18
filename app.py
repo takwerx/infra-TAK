@@ -53543,6 +53543,19 @@ def _deploy_takserver_container(config):
         # FIRST 8446 login lands on the Admin GUI, not WebTAK — same as the .deb
         # deploy. Without this the container box needs a manual 'Resync LDAP to TAK
         # Server' (the flow-repair retry below is exactly what that button does).
+        if _get_authentik_env_content(settings):
+            # First ensure the SERVICE ACCOUNT bind works: on a fresh Authentik
+            # deploy adm_ldapservice's DB password can diverge from the .env (the
+            # deploy's "bind verified via docker log" is a false positive), so the
+            # SA bind fails 'Invalid credentials 49' → TAK can't query ANY groups →
+            # every user lands on WebTAK. This sets the pw to the .env value + verifies
+            # the bind (the other half of what 'Resync LDAP to TAK Server' does).
+            # See memory authentik-ldapservice-password-mismatch-fresh-deploy.
+            try:
+                _sa_ok, _sa_msg = _ensure_authentik_ldap_service_account()
+                log_step(f"  {'✓' if _sa_ok else '⚠'} LDAP service-account bind: {_sa_msg}")
+            except Exception as _sae:
+                log_step(f"  ⚠ LDAP service-account sync error (non-fatal): {str(_sae)[:120]}")
         if webadmin_pass and _get_authentik_env_content(settings):
             sync_ok = False
             sync_err = None
