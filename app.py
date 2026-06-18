@@ -968,6 +968,35 @@ def _tak_systemctl(action):
             return 'true'  # no-op: container has --restart=always
     return f"systemctl {action} takserver"
 
+def _ensure_tak_on_authentik_network():
+    """v10.0.1 — when TAK runs as a container, join it to Authentik's docker
+    network so it can reach the LDAP outpost by container name (the outpost only
+    publishes on the host's 127.0.0.1, unreachable from inside the TAK container).
+    Returns (network_name, ldap_container_name) or (None, None) if N/A or not found.
+    Idempotent — a repeat `docker network connect` is a harmless no-op."""
+    if not _tak_is_container():
+        return None, None
+    try:
+        r = subprocess.run('docker ps --filter name=authentik-ldap --format "{{.Names}}"',
+                           shell=True, capture_output=True, text=True, timeout=10)
+        names = [n for n in (r.stdout or '').splitlines() if n.strip()]
+        if not names:
+            return None, None
+        ldap_name = names[0]
+        ri = subprocess.run(
+            ['docker', 'inspect', '-f',
+             '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}', ldap_name],
+            capture_output=True, text=True, timeout=10)
+        nets = (ri.stdout or '').split()
+        if not nets:
+            return None, None
+        net = nets[0]
+        subprocess.run(['docker', 'network', 'connect', net, TAK_CONTAINER],
+                       capture_output=True, text=True, timeout=15)
+        return net, ldap_name
+    except Exception:
+        return None, None
+
 def _takserver_running_local():
     """True if local TAK Server is running — container-aware. native →
     `systemctl is-active takserver`; container → the takserver container's
@@ -45962,8 +45991,22 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     """
     import xml.etree.ElementTree as ET
 
+    # v10.0.1: when TAK runs as a container and Authentik is LOCAL, ldap_host
+    # '127.0.0.1' is the CONTAINER's own loopback — not the host where the LDAP
+    # outpost publishes (127.0.0.1:389->3389). TAK then can't reach LDAP →
+    # enrollment "invalid credentials". Join TAK to Authentik's docker network and
+    # use the LDAP container's name + its in-container port (3389). Native/.deb and
+    # remote-Authentik paths are unchanged (ldap_host:389 as before).
+    _ldap_port = 389
+    if _tak_is_container() and ldap_host in ('127.0.0.1', 'localhost'):
+        _net, _ldap_name = _ensure_tak_on_authentik_network()
+        if _ldap_name:
+            ldap_host = _ldap_name
+            _ldap_port = 3389
+            if plog:
+                plog(f"  ✓ container TAK joined Authentik net '{_net}'; LDAP via {ldap_host}:{_ldap_port}")
     _ldap_attrs = {
-        'url': f'ldap://{ldap_host}:389',
+        'url': f'ldap://{ldap_host}:{_ldap_port}',
         'userstring': 'cn={username},ou=users,dc=takldap',
         'updateinterval': '30',
         'groupprefix': 'cn=tak_',
@@ -50807,6 +50850,26 @@ def takserver_uninstall():
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
     steps = []
+    # v10.0.1: container TAK teardown FIRST. The native systemctl/apt steps below
+    # are no-ops on a Docker TAK (no unit, no package) and --restart=always would
+    # just respawn the containers, so do the real teardown here. Confirmed by the
+    # uninstall test: native Remove left containers/volume/network/bundle behind.
+    if _tak_is_container():
+        for c in (TAK_CONTAINER, TAK_DB_CONTAINER):
+            subprocess.run(['docker', 'rm', '-f', c], capture_output=True, timeout=60)
+        subprocess.run(['docker', 'volume', 'rm', TAK_DB_VOLUME], capture_output=True, timeout=30)
+        subprocess.run(['docker', 'network', 'rm', TAK_DOCKER_NET], capture_output=True, timeout=30)
+        subprocess.run(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', shell=True, capture_output=True, timeout=60)
+        # Reset the persisted method/credentials so detection falls back to the
+        # platform default (arm64 still defaults to container; a redeploy re-sets it).
+        try:
+            _us = load_settings()
+            _us.pop('tak_install_method', None)
+            _us.pop('tak_db_password', None)
+            save_settings(_us)
+        except Exception:
+            pass
+        steps.append('Container TAK removed (containers, volume, network, ~/tak-docker)')
     # Stop service
     subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
     subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
