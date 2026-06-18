@@ -14459,6 +14459,120 @@ def _patch_coreconfig_passwords(cert_pass, log_fn=None):
         pass
 
 
+def _patch_coreconfig_cert_enrollment(coreconfig_path, int_ca, cert_pass, config, log_fn=None):
+    """v10.0.1 — version-tolerant CoreConfig patching for cert ENROLLMENT, via
+    ElementTree (NOT sed). Used by the CONTAINER deploy: the takserver-docker
+    bundle ships CoreConfig.example.xml formatted differently from the .deb
+    (absolute cert paths, `<vbm/>` with no attrs), which silently broke the
+    .deb path's string-seds when copied into the container. ElementTree matches
+    elements by tag/attribute regardless of formatting, so it's correct on any
+    TAK version/bundle. The native .deb path is untouched (its seds work on the
+    .deb's CoreConfig format — field-validated on 5.7-RELEASE43).
+
+    Three patches (all confirmed against TAK Server Config Guide v5.7):
+      1. §21.1 — the main <security>/<tls> truststoreFile → certs/files/
+         truststore-<int_ca>.jks. With a CUSTOM intermediate CA the default
+         `truststore-root.jks` does NOT exist (makeCert names it after the CA),
+         so leaving it dangling = "peer not verified" on 8089 (the red dot).
+      2. §22/App C — add <certificateSigning CA="TAKServer"> with the makeCert
+         signing keystore so 8446 can issue client certs (else getCertificateConfig
+         500 → "registration failed").
+      3. §9.6 — auth="x509" on the 8089 tls <input> so LDAP group lookup uses the
+         cert CN. (Connection works without it; groups need it.)
+    Returns (ok, changed_summary). Non-fatal on parse error (returns False)."""
+    import xml.etree.ElementTree as ET
+    import re as _re_ce
+    org = config.get('cert_org', '') or ''
+    ou = config.get('cert_ou', '') or ''
+    try:
+        issued_days = str(int(config.get('issued_cert_validity_days')
+                              or config.get('intermediate_ca_validity_days') or 730))
+    except (TypeError, ValueError):
+        issued_days = '730'
+    try:
+        with open(coreconfig_path, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        m = _re_ce.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', raw)
+        ns_uri = m.group(1) if m else 'http://bbn.com/marti/xml/config'
+        ET.register_namespace('', ns_uri)
+        tree = ET.parse(coreconfig_path)
+        root = tree.getroot()
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠ cert-enrollment patch: CoreConfig parse failed ({str(e)[:120]}) — patch manually")
+        return False, f'parse failed: {e}'
+    nsp = root.tag.split('}')[0] + '}' if '}' in root.tag else ''
+    def q(tag):
+        return f'{nsp}{tag}'
+    def lt(e):
+        return e.tag.split('}', 1)[1] if '}' in e.tag else e.tag
+    changed = []
+
+    # (1) main <tls> truststore (the non-fed one, under <security>)
+    sec = root.find(q('security'))
+    if sec is None:
+        sec = root.find('security')
+    if sec is not None:
+        for tls in list(sec):
+            if lt(tls) != 'tls':
+                continue
+            tf = tls.get('truststoreFile') or ''
+            if 'fed' in tf.lower():   # skip the federation tls block
+                continue
+            new_tf = f'certs/files/truststore-{int_ca}.jks'
+            if tf != new_tf:
+                tls.set('truststoreFile', new_tf)
+                changed.append('truststore')
+            break
+
+    # (2) <certificateSigning> — remove any existing (incl. template) and add clean
+    existing_cs = root.find(q('certificateSigning'))
+    if existing_cs is None:
+        existing_cs = root.find('certificateSigning')
+    if existing_cs is not None:
+        root.remove(existing_cs)
+    cs = ET.SubElement(root, q('certificateSigning'))
+    cs.set('CA', 'TAKServer')
+    cc = ET.SubElement(cs, q('certificateConfig'))
+    ne = ET.SubElement(cc, q('nameEntries'))
+    for nm, val in (('O', org), ('OU', ou)):
+        e = ET.SubElement(ne, q('nameEntry'))
+        e.set('name', nm)
+        e.set('value', val)
+    cacfg = ET.SubElement(cs, q('TAKServerCAConfig'))
+    cacfg.set('keystore', 'JKS')
+    cacfg.set('keystoreFile', f'certs/files/{int_ca}-signing.jks')
+    cacfg.set('keystorePass', cert_pass)
+    cacfg.set('validityDays', issued_days)
+    cacfg.set('signatureAlg', 'SHA256WithRSA')
+    changed.append('certificateSigning')
+
+    # (3) auth="x509" on the 8089 tls <input>
+    net = root.find(q('network'))
+    if net is None:
+        net = root.find('network')
+    if net is not None:
+        for inp in list(net):
+            if lt(inp) != 'input':
+                continue
+            if inp.get('port') == '8089' and inp.get('protocol') == 'tls':
+                if inp.get('auth') != 'x509':
+                    inp.set('auth', 'x509')
+                    changed.append('8089 x509')
+                break
+
+    try:
+        tree.write(coreconfig_path, encoding='UTF-8', xml_declaration=True)
+    except PermissionError:
+        tmp = coreconfig_path + '.cert-enroll.xml'
+        tree.write(tmp, encoding='UTF-8', xml_declaration=True)
+        subprocess.run(['sudo', 'cp', os.path.abspath(tmp), coreconfig_path],
+                       capture_output=True, text=True, timeout=10)
+    if log_fn:
+        log_fn(f"  ✓ CoreConfig cert-enrollment patched ({', '.join(changed) if changed else 'already ok'})")
+    return True, ', '.join(changed)
+
+
 import re as _re_module
 _ASN1_PRINTABLE_RE = _re_module.compile(r"^[A-Za-z0-9 '()+,\-./:=?]*$")
 
@@ -53244,18 +53358,17 @@ def _deploy_takserver_container(config):
         log_step(""); log_step("━━━ Step 7/9: Configuring CoreConfig.xml ━━━")
         # CoreConfig.xml was already seeded + DB-password-set in Step 3.5 (before
         # the DB init). Here we layer the cert/enrollment patches on top.
-        run_cmd('sed -i \'s|<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>|<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>|g\' /opt/tak/CoreConfig.xml', "Enabling X.509 auth on 8089...", check=False)
-        run_cmd(f'sed -i "s|truststoreFile=\\"certs/files/truststore-root.jks|truststoreFile=\\"certs/files/truststore-{int_ca}.jks|g" /opt/tak/CoreConfig.xml', "Setting intermediate CA truststore...", check=False)
+        # The cert/enrollment patches — truststore → INT-CA (fixes 8089 "peer not
+        # verified" / red dot), <certificateSigning> (fixes 8446 "registration
+        # failed"), and 8089 x509 — go through the version-tolerant ElementTree
+        # patcher. The takserver-docker bundle's CoreConfig format (absolute paths,
+        # `<vbm/>`) silently breaks the string-seds the .deb path uses, so we patch
+        # as XML here. The .deb path keeps its field-validated seds (untouched).
+        _ok_ce, _msg_ce = _patch_coreconfig_cert_enrollment(
+            '/opt/tak/CoreConfig.xml', int_ca, cert_pass, config, log_fn=log_step)
+        if not _ok_ce:
+            log_step(f"  ⚠ cert-enrollment patch failed ({_msg_ce}) — enrollment may need a manual fix")
         _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
-        issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
-        cert_block = (f'<certificateSigning CA="TAKServer"><certificateConfig>\\n'
-            f'<nameEntries>\\n<nameEntry name="O" value="{config["cert_org"]}"/>\\n'
-            f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\\n</nameEntries>\\n'
-            f'</certificateConfig>\\n<TAKServerCAConfig keystore="JKS" '
-            f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
-            f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />\\n'
-            f'</certificateSigning>\\n<vbm enabled="false"/>')
-        run_cmd(f'sed -i \'s|<vbm enabled="false"/>|{cert_block}|g\' /opt/tak/CoreConfig.xml', "Enabling certificate enrollment...", check=False)
         run_cmd('sed -i \'s|<auth>|<auth x509useGroupCache="true">|g\' /opt/tak/CoreConfig.xml', check=False)
         admin_ui = str(config.get('enable_admin_ui', False)).lower()
         webtak = str(config.get('enable_webtak', False)).lower()
