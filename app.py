@@ -53467,10 +53467,22 @@ def _deploy_takserver_container(config):
         # ── Step 9/9: Promote admin ─────────────────────────────────────────
         log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
         run_cmd(_tak_exec('java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem') + ' 2>&1', "Promoting admin certificate...", check=False)
+        # v10.0.1: webadmin handling mirrors the .deb path. When Authentik is
+        # present, webadmin lives in Authentik/LDAP ONLY — creating a flat-file
+        # webadmin shadows LDAP and makes 8446 land on WebTAK instead of the Admin
+        # GUI (the flat-file user has no ROLE_ADMIN group). So remove the shadow;
+        # the Authentik sync (finish section) puts webadmin in tak_ROLE_ADMIN.
         webadmin_pass = config.get('webadmin_password', '')
+        _s_wa = load_settings()
+        authentik_for_webadmin = bool(webadmin_pass and _get_authentik_env_content(_s_wa))
         if webadmin_pass:
-            log_step("Creating webadmin user (flat-file)...")
-            run_cmd(_tak_exec(f'java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin') + ' 2>&1', check=False)
+            if authentik_for_webadmin:
+                log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file; avoids 8446 WebTAK shadow).")
+                _remove_webadmin_from_userauth()
+            else:
+                log_step("Creating webadmin user (flat-file)...")
+                run_cmd(_tak_exec(f'java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin') + ' 2>&1', check=False)
+                log_step("✓ webadmin user created")
         run_cmd(_tak_systemctl('restart'), "Restarting TAK Server...", check=False)
         time.sleep(15)
 
@@ -53513,6 +53525,42 @@ def _deploy_takserver_container(config):
                 install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
             except Exception as _le:
                 log_step(f"  ⚠ LE cert on 8446 failed (non-fatal): {str(_le)[:120]}")
+
+        # v10.0.1: sync webadmin to Authentik (with the LDAP flow repair) so the
+        # FIRST 8446 login lands on the Admin GUI, not WebTAK — same as the .deb
+        # deploy. Without this the container box needs a manual 'Resync LDAP to TAK
+        # Server' (the flow-repair retry below is exactly what that button does).
+        if webadmin_pass and _get_authentik_env_content(settings):
+            sync_ok = False
+            sync_err = None
+            for attempt in range(2):
+                ok, err = _ensure_authentik_webadmin(skip_bind_verify=False)
+                if ok:
+                    sync_ok = True
+                    log_step("  ✓ webadmin synced to Authentik (tak_ROLE_ADMIN)")
+                    break
+                sync_err = (err or 'Unknown sync error')[:120]
+                if attempt == 0:
+                    log_step(f"  ℹ webadmin sync attempt 1 failed: {sync_err} — repairing LDAP flow and retrying...")
+                    try:
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        log_step("  ✓ LDAP flow repaired (cleared recursion spiral)" if ok_flow
+                                 else f"  ⚠ LDAP flow repair: {err_flow} — retrying anyway")
+                    except Exception as _fe:
+                        log_step(f"  ⚠ LDAP flow repair error (non-fatal): {str(_fe)[:120]}")
+                    time.sleep(15)
+            if not sync_ok:
+                log_step(f"  ⚠ webadmin Authentik sync not verified: {sync_err}")
+                log_step("     Fix: TAK Server page → 'Resync LDAP to TAK Server', then log in to 8446 (user: webadmin).")
+            else:
+                _remove_webadmin_from_userauth()
+                log_step("  ✓ Removed flat-file webadmin shadow (8446 → LDAP/Admin GUI)")
+            # Proactively migrate the LDAP outpost to FQDN routing (matches .deb;
+            # prevents the heavy-load internal-routing flow spiral).
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(log_step)
+            except Exception as _oe:
+                log_step(f"  ⚠ LDAP outpost routing migration skipped (non-fatal): {str(_oe)[:120]}")
 
         ip = settings.get('server_ip', 'YOUR-IP')
         log_step(""); log_step("=" * 50)
