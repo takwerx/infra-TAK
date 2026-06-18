@@ -46961,10 +46961,13 @@ def _ensure_authentik_ldap_service_account():
             # console's first deploy on a fresh box). Operator next action:
             # re-run deploy or trigger Update Now.
             return False, 'LDAP bind confirmed failing after API password set — check ldap-authentication-flow policy bindings'
-        # Inconclusive across all attempts — likely ldapsearch not installable on
-        # this distro. Keep prior permissive behavior: assume API success means
-        # password was written; let downstream operator workflow catch any issue.
-        return True, 'LDAP service account configured (bind verification inconclusive — ldapsearch unavailable). Proceeding.'
+        # Inconclusive across all attempts. _ensure_ldapsearch() ran above, so this
+        # is usually NOT a missing client — it's the outpost being mid-recreate/spiral
+        # while we probe (e.g. the webadmin-sync tail recreates the LDAP container right
+        # after this call). The set_password API call above already succeeded, so the
+        # password IS written; the 5-min watchdog re-verifies once the outpost settles.
+        # Keep permissive behavior: API success means the password was set.
+        return True, 'LDAP service account password set (API ok); live bind verification inconclusive (outpost likely mid-recreate — watchdog will re-verify). Proceeding.'
     except urllib.error.HTTPError as e:
         body = ''
         try:
