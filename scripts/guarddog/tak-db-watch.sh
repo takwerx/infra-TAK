@@ -1,4 +1,8 @@
 #!/bin/bash
+# v10.0.1: container-aware via _gd-tak-lib.sh. Native (deb/rpm) behaviour is
+# byte-identical (the lib's native branch emits the same systemctl calls);
+# container mode targets the takserver-db container.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/db_alert_sent"
@@ -13,8 +17,8 @@ if [ -f "$LAST_RESTART_FILE" ]; then
   fi
 fi
 
-if ! systemctl is-active --quiet postgresql 2>/dev/null; then
-  if ! systemctl is-active --quiet postgresql-15 2>/dev/null; then
+if ! gd_db_running; then
+  if true; then  # DB-down already determined by gd_db_running (native svc or db container)
     if [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find $ALERT_SENT_FILE -mmin +60 2>/dev/null)" ]; then
       touch "$ALERT_SENT_FILE"
       
@@ -45,10 +49,10 @@ Restart PostgreSQL:
         /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
         rm -f "$TMPF"
       fi
-      systemctl restart postgresql 2>/dev/null || systemctl restart postgresql-15 2>/dev/null || true
-      
+      gd_db_restart || true
+
       mkdir -p /var/log/takguard
-      if systemctl is-active --quiet postgresql 2>/dev/null || systemctl is-active --quiet postgresql-15 2>/dev/null; then
+      if gd_db_running; then
         echo "$(date): PostgreSQL was down, restarted successfully" >> /var/log/takguard/restarts.log
       else
         echo "$(date): PostgreSQL was down, restart FAILED" >> /var/log/takguard/restarts.log

@@ -15,6 +15,11 @@
 #   SSH_KEY_PLACEHOLDER        → SSH private key path
 #   SSH_USER_PLACEHOLDER       → SSH user
 #   ALERT_EMAIL_PLACEHOLDER    → Alert email
+#
+# v10.0.1: single-server local mode dispatches through _gd-tak-lib.sh so a
+# containerized DB (takserver-db) is queried/repacked via docker exec. The
+# two-server SSH path and the native-local path are unchanged.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 GUARDDOG_CONF="/opt/tak-guarddog/guarddog.conf"
@@ -78,7 +83,7 @@ psql_scalar() {
       "${SSH_USER}@${SSH_TARGET}" \
       "sudo -u postgres psql -d cot -t -A -c $(printf '%q' "$sql")" 2>/dev/null) || return 1
   else
-    out=$(sudo -u postgres psql -d cot -t -A -c "$sql" 2>/dev/null) || return 1
+    out=$(gd_psql_scalar "$sql" cot) || return 1
   fi
   echo "${out}" | tr -d '[:space:]'
 }
@@ -93,7 +98,9 @@ remote_cmd() {
     # v0.9.29 CRIT-07: was `eval "$cmd"`. Replaced with `bash -c` so the
     # command is interpreted exactly once. All callers pass shell strings
     # that need a shell (pipes, &&, command substitution).
-    bash -c "$cmd" 2>&1
+    # v10.0.1: gd_db_shell == `bash -c` on native, `docker exec <db> bash -c`
+    # in container mode (for pg_repack install / pg_config inside the image).
+    gd_db_shell "$cmd"
   fi
 }
 
@@ -136,14 +143,24 @@ if [ "$INSTALL_CHECK" = "missing" ]; then
 fi
 
 # Ensure extension is created in the database
-remote_cmd "sudo -u postgres psql -d cot -c 'CREATE EXTENSION IF NOT EXISTS pg_repack;'" >/dev/null 2>&1
+if [ "$TWO_SERVER_MODE" = "1" ]; then
+  remote_cmd "sudo -u postgres psql -d cot -c 'CREATE EXTENSION IF NOT EXISTS pg_repack;'" >/dev/null 2>&1
+else
+  # native-local → sudo -u postgres psql; container → docker exec -u postgres
+  gd_psql_raw "CREATE EXTENSION IF NOT EXISTS pg_repack;" cot >/dev/null 2>&1
+fi
 
 # Record size before repack
 SIZE_BEFORE=$COT_GB
 
 # Run pg_repack on the cot database
 log_line "DB-REPACK: starting online repack of cot database (${SIZE_BEFORE}GB)"
-REPACK_OUTPUT=$(remote_cmd "sudo -u postgres pg_repack -d cot --no-superuser-check --wait-timeout=30 2>&1")
+if [ "$TWO_SERVER_MODE" = "1" ]; then
+  REPACK_OUTPUT=$(remote_cmd "sudo -u postgres pg_repack -d cot --no-superuser-check --wait-timeout=30 2>&1")
+else
+  # native-local → sudo -u postgres pg_repack; container → docker exec -u postgres
+  REPACK_OUTPUT=$(gd_db_pg pg_repack -d cot --no-superuser-check --wait-timeout=30)
+fi
 REPACK_RC=$?
 
 if [ $REPACK_RC -ne 0 ]; then

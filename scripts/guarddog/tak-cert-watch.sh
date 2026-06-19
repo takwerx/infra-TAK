@@ -1,4 +1,10 @@
 #!/bin/bash
+# v10.0.1: container-aware via _gd-tak-lib.sh. The LE JKS lives at the same
+# /opt/tak/certs/files path in both modes (bind-mounted), but a container box
+# has no host keytool — gd_keytool runs it inside the takserver container.
+# Native behaviour is byte-identical. (The cert-renewal timer is named
+# takserver-cert-renewal.timer in BOTH modes, so the alert body is correct.)
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/cert_alert_sent"
@@ -9,11 +15,11 @@ if [ -f "$JKS" ]; then
   TEMP_CERT="/tmp/takserver-le-temp.pem"
   # install_le_cert_on_8446() creates the LE JKS with alias = TAK hostname (e.g. takserver.example.com),
   # not the literal string "takserver". Wrong alias => empty export => bogus DAYS_LEFT and false alert emails.
-  ALIAS=$(keytool -list -keystore "$JKS" -storepass "$CERT_PASS" 2>/dev/null | awk -F', ' '/PrivateKeyEntry/ {print $1; exit}')
+  ALIAS=$(gd_keytool -list -keystore "$JKS" -storepass "$CERT_PASS" | awk -F', ' '/PrivateKeyEntry/ {print $1; exit}')
   if [ -z "$ALIAS" ]; then
     ALIAS="takserver"
   fi
-  keytool -exportcert -keystore "$JKS" -storepass "$CERT_PASS" -alias "$ALIAS" -rfc > "$TEMP_CERT" 2>/dev/null
+  gd_keytool -exportcert -keystore "$JKS" -storepass "$CERT_PASS" -alias "$ALIAS" -rfc > "$TEMP_CERT" 2>/dev/null
 
   if [ -s "$TEMP_CERT" ] && openssl x509 -in "$TEMP_CERT" -noout -enddate >/dev/null 2>&1; then
     EXPIRY_DATE=$(openssl x509 -enddate -noout -in "$TEMP_CERT" | cut -d= -f2)

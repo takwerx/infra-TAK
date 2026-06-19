@@ -16,6 +16,11 @@
 #   SSH_KEY_PLACEHOLDER        → SSH private key path
 #   SSH_USER_PLACEHOLDER       → SSH user
 #   ALERT_EMAIL_PLACEHOLDER    → Alert email (empty = no email)
+#
+# v10.0.1: single-server local psql goes through _gd-tak-lib.sh so a
+# containerized DB (takserver-db) is reached via docker exec; the two-server
+# SSH path and native-local path are unchanged.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 GUARDDOG_CONF="/opt/tak-guarddog/guarddog.conf"
@@ -81,7 +86,7 @@ psql_scalar() {
       "${SSH_USER}@${SSH_TARGET}" \
       "sudo -u postgres psql -d cot -t -A -c $(printf '%q' "$sql")" 2>/dev/null
   else
-    sudo -u postgres psql -d cot -t -A -c "$sql" 2>/dev/null
+    gd_psql_scalar "$sql" cot
   fi
 }
 
@@ -94,7 +99,7 @@ psql_raw() {
       "${SSH_USER}@${SSH_TARGET}" \
       "sudo -u postgres psql -d cot -c $(printf '%q' "$sql")" 2>/dev/null
   else
-    sudo -u postgres psql -d cot -c "$sql" 2>/dev/null
+    gd_psql_raw "$sql" cot
   fi
 }
 

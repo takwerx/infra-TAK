@@ -14,6 +14,11 @@
 # Only starts services that are actually installed; skips the rest.
 # Companion to tak-boot-sequencer.sh which stops these before TAK starts.
 
+# v10.0.1: container-aware via _gd-tak-lib.sh. The 8089 wait and service
+# orchestration are host-level and unchanged; only the "messaging crashed"
+# fallback restart targets the takserver container in container mode.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+
 MAX_WAIT_TAK=900
 MAX_WAIT_AK=300
 INTERVAL=10
@@ -35,9 +40,14 @@ while [ $_t -lt $MAX_WAIT_TAK ]; do
 
   if [ $_t -ge 120 ] && [ $_msg_restarted -eq 0 ] && [ $((_t % 60)) -eq 0 ]; then
     if grep -q "Started TAK Server config Microservice" /opt/tak/logs/takserver-config.log 2>/dev/null; then
-      if ! pgrep -f "spring.profiles.active=messaging" >/dev/null 2>&1; then
+      if ! gd_tak_pgrep "spring.profiles.active=messaging"; then
         _log "Config ready but messaging crashed — restarting messaging"
-        service takserver-messaging start 2>/dev/null
+        if gd_is_container; then
+          # All JVMs share one container — restart it to recover messaging.
+          gd_tak_restart
+        else
+          service takserver-messaging start 2>/dev/null
+        fi
         _msg_restarted=1
       fi
     fi

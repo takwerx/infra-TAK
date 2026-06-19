@@ -6,6 +6,9 @@
 #
 # Two-server mode: reads /opt/tak-guarddog/guarddog.conf and queries DB size on Server One via SSH.
 # Placeholders replaced at deploy time (two-server): SSH_KEY_PLACEHOLDER, SSH_USER_PLACEHOLDER
+# v10.0.1: single-server local DB access goes through _gd-tak-lib.sh so a
+# containerized DB (takserver-db) is queried via docker exec; native unchanged.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/cotdb_alert_sent"
@@ -36,8 +39,8 @@ if [ "$TWO_SERVER" = "true" ] && [ -n "$DB_HOST" ] && [ -n "$SSH_KEY" ] && [ -f 
     "${SSH_USER}@${DB_HOST}" \
     "sudo -u postgres psql -t -A -c \"SELECT COALESCE(pg_database_size('cot'), 0);\"" \
     2>/dev/null || echo "0")
-elif command -v psql >/dev/null 2>&1; then
-  COT_SIZE=$(sudo -u postgres psql -t -A -c "SELECT COALESCE(pg_database_size('cot'), 0);" 2>/dev/null || echo "0")
+elif gd_psql_present; then
+  COT_SIZE=$(gd_psql_scalar "SELECT COALESCE(pg_database_size('cot'), 0);" || echo "0")
 fi
 
 # If cot doesn't exist or we couldn't connect, try sum of all non-template DBs (fallback)

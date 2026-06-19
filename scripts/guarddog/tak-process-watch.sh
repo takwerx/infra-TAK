@@ -1,4 +1,8 @@
 #!/bin/bash
+# v10.0.1: container-aware via _gd-tak-lib.sh. On a container box the gate, the
+# JVM pgrep checks, and the restart all target the takserver container; native
+# (deb/rpm) behaviour is byte-identical.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/process_alert_sent"
@@ -15,13 +19,13 @@ fi
 
 # TAK takes ~5 min to fully start; checking for missing processes during startup is invalid.
 STARTUP_GRACE=600
-_tak_mono=$(systemctl show takserver --property=ActiveEnterTimestampMonotonic --value 2>/dev/null || echo "")
-if [ -n "$_tak_mono" ] && [ "$_tak_mono" != "0" ]; then
-  _tak_age=$(( UPTIME_SECS - _tak_mono / 1000000 ))
+_tak_started=$(gd_tak_started_monotonic)
+if [ -n "$_tak_started" ]; then
+  _tak_age=$(( UPTIME_SECS - _tak_started ))
   [ "$_tak_age" -ge 0 ] && [ "$_tak_age" -lt "$STARTUP_GRACE" ] && exit 0
 fi
 
-if ! systemctl is-active --quiet takserver; then
+if ! gd_tak_running; then
   rm -f "$FAIL_COUNT_FILE"
   exit 0
 fi
@@ -37,23 +41,23 @@ fi
 
 MISSING_PROCESSES=()
 
-if ! pgrep -f "spring.profiles.active=messaging" > /dev/null; then
+if ! gd_tak_pgrep "spring.profiles.active=messaging"; then
   MISSING_PROCESSES+=("messaging")
 fi
 
-if ! pgrep -f "spring.profiles.active=api" > /dev/null; then
+if ! gd_tak_pgrep "spring.profiles.active=api"; then
   MISSING_PROCESSES+=("api")
 fi
 
-if ! pgrep -f "spring.profiles.active=config" > /dev/null; then
+if ! gd_tak_pgrep "spring.profiles.active=config"; then
   MISSING_PROCESSES+=("config")
 fi
 
-if ! pgrep -f "takserver-pm.jar" > /dev/null; then
+if ! gd_tak_pgrep "takserver-pm.jar"; then
   MISSING_PROCESSES+=("plugins")
 fi
 
-if ! pgrep -f "takserver-retention.jar" > /dev/null; then
+if ! gd_tak_pgrep "takserver-retention.jar"; then
   MISSING_PROCESSES+=("retention")
 fi
 
@@ -132,13 +136,9 @@ Check logs after restart:
       date +%s > "$LAST_RESTART_FILE"
       echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
 
-      # Clean restart: stop → kill orphan Java processes → clear Ignite cache → start
-      systemctl stop takserver
-      sleep 2
-      pkill -9 -u tak 2>/dev/null || true
-      sleep 1
-      rm -rf /opt/tak/work
-      systemctl start takserver
+      # Clean restart: native → stop, kill orphan Java (tak user), clear Ignite,
+      # start; container → docker restart (handled by gd_tak_restart).
+      gd_tak_restart
 
       sleep 30
       rm -f "$RESTART_LOCK"

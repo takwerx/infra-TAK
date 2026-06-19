@@ -9508,9 +9508,24 @@ def _monitor_health_check(monitor_id):
                     continue
             return False
         if monitor_id == 'postgresql':
+            # v10.0.1: container TAK runs PostgreSQL in the takserver-db container,
+            # not a host postgresql.service — check the container's running state
+            # there (native is byte-identical: systemctl is-active postgresql).
+            if _tak_is_container():
+                r = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER],
+                                   capture_output=True, text=True, timeout=5)
+                return r.returncode == 0 and r.stdout.strip() == 'true'
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql']), capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if monitor_id == 'cotdb':
+            # v10.0.1: container → docker exec -u postgres (peer auth); native →
+            # sudo -u postgres psql. Both query the same cot database size.
+            if _tak_is_container():
+                r = subprocess.run(
+                    ['docker', 'exec', '-u', 'postgres', TAK_DB_CONTAINER,
+                     'psql', '-tAc', "SELECT pg_database_size('cot')"],
+                    capture_output=True, text=True, timeout=8)
+                return r.returncode == 0 and r.stdout.strip().isdigit()
             r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             return r.returncode == 0 and r.stdout.strip().isdigit()
         if monitor_id == 'oom':
@@ -10792,6 +10807,10 @@ def run_guarddog_deploy(alert_email):
         if is_two_server and s1_host:
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
+            # v10.0.1: shared TAK/DB dispatch lib sourced by the DB/process/cert
+            # watch scripts (native vs container). No-op on deb boxes (its native
+            # branch emits the identical commands); enables container mode here.
+            '_gd-tak-lib.sh',
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
@@ -10863,6 +10882,12 @@ def run_guarddog_deploy(alert_email):
         gd_conf = {}
         if is_two_server and s1_host:
             gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+        # v10.0.1: container TAK — tell _gd-tak-lib.sh to dispatch DB/process/cert
+        # work via docker exec against these containers (absent → native mode).
+        if _tak_is_container():
+            gd_conf['tak_mode'] = 'container'
+            gd_conf['tak_container'] = TAK_CONTAINER
+            gd_conf['db_container'] = TAK_DB_CONTAINER
         # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
         gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
         with open('/opt/tak-guarddog/guarddog.conf', 'w') as f:
@@ -10978,13 +11003,19 @@ def run_guarddog_deploy(alert_email):
             with open(path, 'w') as f:
                 f.write(content)
         plog("✓ Systemd units installed")
-        # TAK Server soft start: start after network and PostgreSQL to avoid boot race / restart loops
-        tak_dropin_dir = '/etc/systemd/system/takserver.service.d'
-        os.makedirs(tak_dropin_dir, exist_ok=True)
-        tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
-        with open(tak_dropin, 'w') as f:
-            f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
-        plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
+        # TAK Server soft start: start after network and PostgreSQL to avoid boot race / restart loops.
+        # v10.0.1: skip on container TAK — there is no host takserver.service to
+        # attach a drop-in to (the container uses --restart=always), so the boot
+        # sequencer / ExecStartPre never fires. Writing it would be inert clutter.
+        if _tak_is_container():
+            plog("✓ Container TAK — skipping native soft-start drop-in (container uses --restart=always)")
+        else:
+            tak_dropin_dir = '/etc/systemd/system/takserver.service.d'
+            os.makedirs(tak_dropin_dir, exist_ok=True)
+            tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
+            with open(tak_dropin, 'w') as f:
+                f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+            plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
             r = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
@@ -53590,6 +53621,31 @@ def _deploy_takserver_container(config):
                 _ensure_authentik_ldap_outpost_on_fqdn(log_step)
             except Exception as _oe:
                 log_step(f"  ⚠ LDAP outpost routing migration skipped (non-fatal): {str(_oe)[:120]}")
+
+        # v10.0.1: auto-deploy Guard Dog so it runs from the start — mirrors the
+        # .deb tail (run_takserver_deploy). run_guarddog_deploy() writes the
+        # container fields into guarddog.conf (via _tak_is_container()) so the
+        # monitors target the takserver / takserver-db containers, not host
+        # postgresql/systemd. run_guarddog_deploy has its own try/except, so a
+        # Guard Dog hiccup never fails the TAK deploy.
+        if not os.path.exists('/opt/tak-guarddog'):
+            log_step("")
+            log_step("━━━ Guard Dog (monitoring) — installing automatically ━━━")
+            alert_email = (load_settings().get('guarddog_alert_email') or '').strip()
+            run_guarddog_deploy(alert_email)
+            if guarddog_deploy_status.get('complete') and not guarddog_deploy_status.get('error'):
+                log_step("✓ Guard Dog installed. Configure notifications on the Guard Dog page.")
+            elif os.path.exists('/opt/tak-guarddog') and not _guarddog_is_enabled():
+                # Partial install (e.g. enable failed): ensure timers are enabled so Guard Dog runs
+                log_step("Enabling Guard Dog timers…")
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+                for t in _guarddog_timer_list():
+                    subprocess.run(_sudo_wrap(['systemctl', 'enable', t]), capture_output=True, timeout=5)
+                    subprocess.run(_sudo_wrap(['systemctl', 'start', t]), capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-health.service']), capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+                if _guarddog_is_enabled():
+                    log_step("✓ Guard Dog enabled. Configure notifications on the Guard Dog page.")
 
         ip = settings.get('server_ip', 'YOUR-IP')
         log_step(""); log_step("=" * 50)

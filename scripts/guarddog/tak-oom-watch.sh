@@ -1,4 +1,8 @@
 #!/bin/bash
+# v10.0.1: container-aware via _gd-tak-lib.sh. The OOM log lives at the same
+# /opt/tak/logs path in both modes (bind-mounted); only the restart targets the
+# takserver container instead of systemd. Native behaviour is byte-identical.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 LOGFILE="/opt/tak/logs/takserver-messaging.log"
@@ -14,9 +18,9 @@ fi
 
 # Don't act if TAK was started recently (OOM log entry may be stale from previous run)
 STARTUP_GRACE=600
-_tak_mono=$(systemctl show takserver --property=ActiveEnterTimestampMonotonic --value 2>/dev/null || echo "")
-if [ -n "$_tak_mono" ] && [ "$_tak_mono" != "0" ]; then
-  _tak_age=$(( UPTIME_SECS - _tak_mono / 1000000 ))
+_tak_started=$(gd_tak_started_monotonic)
+if [ -n "$_tak_started" ]; then
+  _tak_age=$(( UPTIME_SECS - _tak_started ))
   [ "$_tak_age" -ge 0 ] && [ "$_tak_age" -lt "$STARTUP_GRACE" ] && exit 0
 fi
 
@@ -77,17 +81,18 @@ Consider reviewing Data Retention settings in TAK Server UI.
     fi
     echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
 
-    # Clean restart: stop → kill orphan Java processes → clear Ignite cache → rotate log → start
-    systemctl stop $SERVICE
+    # Clean restart: native → stop, kill orphan Java (tak user), clear Ignite;
+    # container → docker stop (then docker start below). Rotate the log BETWEEN
+    # stop and start so the post-restart OOM check comes up clean.
+    gd_tak_stop
     sleep 2
-    pkill -9 -u tak 2>/dev/null || true
+    gd_is_container || pkill -9 -u tak 2>/dev/null || true
     sleep 1
     rm -rf /opt/tak/work
-    # Rotate the messaging log before restart so post-restart OOM check comes up clean.
     # TAK writes to a new file on startup; keep last 3 pre-OOM logs for forensics.
     mv /opt/tak/logs/takserver-messaging.log "/opt/tak/logs/takserver-messaging.log.pre-oom-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
     ls -t /opt/tak/logs/takserver-messaging.log.pre-oom-* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
-    systemctl start $SERVICE
+    gd_tak_start
   fi
 else
   rm -f "$STATEFILE"
