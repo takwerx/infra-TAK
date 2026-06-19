@@ -968,6 +968,155 @@ def _tak_systemctl(action):
             return 'true'  # no-op: container has --restart=always
     return f"systemctl {action} takserver"
 
+# --------------------------------------------------------------------------
+# v10.0.1 — Package-manager + firewall abstraction (Phase 1)
+# --------------------------------------------------------------------------
+# Thin apt↔dnf and ufw↔firewalld shims so the TAK/module/firewall paths run
+# unchanged on Debian/Ubuntu and gain a RHEL/Rocky (EL9 family) branch. Every
+# helper is a NO-OP-equivalent on apt/ufw boxes (it takes the exact same branch
+# the inline code took before), so the field-validated amd64-Ubuntu path stays
+# byte-identical. New privileged surface (dnf/firewall-cmd) is routed through
+# _sudo_wrap for the v10.0.5 non-root migration (NON-ROOT-COMMANDS: dnf,
+# firewall-cmd) and runs as argv lists (no shell) so quoting is safe.
+
+def _pkg_mgr():
+    """'apt' | 'dnf' — the host package manager. Mirrors _distro_family's
+    derivation but returns the concrete tool name. Defaults to 'apt' (the
+    original byte-identical path) whenever the signal is missing."""
+    s = load_settings()
+    pm = (s.get('pkg_mgr') or '').strip().lower()
+    if pm in ('apt', 'dnf'):
+        return pm
+    return 'dnf' if _distro_family() == 'rhel' else 'apt'
+
+def _pkg_lock_wait(log_fn=None, log_list=None):
+    """Block until the package manager is free to use.
+      apt → existing wait_for_apt_lock (unattended-upgrades/dpkg lock).
+      dnf → wait out any running dnf/yum (the Rocky-script pgrep loop).
+    No-op-equivalent on apt boxes (delegates to the original waiter)."""
+    if _pkg_mgr() == 'apt':
+        return wait_for_apt_lock(log_fn or (lambda *_a, **_k: None),
+                                 log_list if log_list is not None else [])
+    waited = 0
+    while subprocess.run("pgrep -f 'dnf|yum' >/dev/null 2>&1 || [ -f /var/run/yum.pid ]",
+                         shell=True).returncode == 0:
+        if log_fn and waited % 10 == 0:
+            log_fn(f"⏳ Waiting for dnf/yum to finish... {waited}s")
+        time.sleep(2)
+        waited += 2
+        if waited > 1800:  # 30-min safety valve — never hang a deploy forever
+            if log_fn:
+                log_fn("⚠ dnf/yum still busy after 30 min — proceeding anyway")
+            break
+    return True
+
+def _pkg_install(pkgs, repo=None, log_fn=None, timeout=1800):
+    """Install package(s) with the host package manager. Returns (ok, output).
+      apt → DEBIAN_FRONTEND=noninteractive apt-get install -y …
+      dnf → (optionally `dnf install -y <repo-rpm-or-url>` first) then dnf install -y …
+    `pkgs` may be a str or list; entries may be package names, local .rpm/.deb
+    paths, or URLs. No-op-equivalent on apt boxes."""
+    if isinstance(pkgs, str):
+        pkgs = [pkgs]
+    pm = _pkg_mgr()
+    if pm == 'dnf':
+        if repo:
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', repo]),
+                           capture_output=True, text=True, timeout=timeout)
+        cmd = _sudo_wrap(['dnf', 'install', '-y'] + list(pkgs))
+        env = None
+    else:
+        cmd = _sudo_wrap(['apt-get', 'install', '-y'] + list(pkgs))
+        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  pkg install error ({pm}): {str(e)[:200]}")
+        return False, str(e)
+    out = (r.stdout or '') + (r.stderr or '')
+    ok = r.returncode == 0
+    if log_fn and not ok:
+        log_fn(f"  pkg install failed ({pm}): {out.strip()[:300]}")
+    return ok, out
+
+def _pkg_remove(pkgs, purge=False, timeout=600):
+    """Remove package(s). apt remove/purge ↔ dnf remove. Returns (ok, output)."""
+    if isinstance(pkgs, str):
+        pkgs = [pkgs]
+    if _pkg_mgr() == 'dnf':
+        cmd = _sudo_wrap(['dnf', 'remove', '-y'] + list(pkgs))
+        env = None
+    else:
+        cmd = _sudo_wrap(['apt-get', 'purge' if purge else 'remove', '-y'] + list(pkgs))
+        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception as e:
+        return False, str(e)
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+def _fw_backend():
+    """'ufw' | 'firewalld' | None — which host firewall to drive. Prefers the
+    family-native tool when both are present (Debian→ufw, RHEL→firewalld), so a
+    box converges to one backend deterministically."""
+    have_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
+    have_fwd = subprocess.run('command -v firewall-cmd >/dev/null 2>&1', shell=True).returncode == 0
+    if _distro_family() == 'rhel':
+        if have_fwd:
+            return 'firewalld'
+        if have_ufw:
+            return 'ufw'
+    else:
+        if have_ufw:
+            return 'ufw'
+        if have_fwd:
+            return 'firewalld'
+    return 'firewalld' if have_fwd else ('ufw' if have_ufw else None)
+
+def _fw_allow(port, proto='tcp'):
+    """Open a port in the host firewall (ufw or firewalld). Returns (ok, msg).
+    No-op-safe (ok=True) when no firewall is installed."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    try:
+        if be == 'firewalld':
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--add-port={port}/{proto}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', 'allow', f'{port}/{proto}']),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+def _fw_remove(port, proto='tcp'):
+    """Close a previously-opened port (ufw delete allow ↔ firewalld remove-port)."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    try:
+        if be == 'firewalld':
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--remove-port={port}/{proto}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', '--force', 'delete', 'allow', f'{port}/{proto}']),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
 def _ensure_tak_on_authentik_network():
     """v10.0.1 — when TAK runs as a container, join it to Authentik's docker
     network so it can reach the LDAP outpost by container name (the outpost only
@@ -7560,11 +7709,37 @@ def guarddog_deploy_log_api():
         'running': guarddog_deploy_status['running'], 'complete': guarddog_deploy_status['complete'],
         'error': guarddog_deploy_status['error']})
 
+def _firewalld_status_local():
+    """Return local firewall status for UI on firewalld (RHEL/Rocky) hosts.
+    Mirrors the UFW dict shape so the UI renders both identically. firewalld has
+    no rule numbering, so rules_numbered mirrors rules."""
+    try:
+        rs = subprocess.run(_sudo_wrap(['firewall-cmd', '--state']),
+                            capture_output=True, text=True, timeout=12)
+        enabled = (rs.stdout or '').strip() == 'running'
+        rp = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-ports']),
+                            capture_output=True, text=True, timeout=12)
+        svc = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-services']),
+                             capture_output=True, text=True, timeout=12)
+        ports = [p for p in (rp.stdout or '').split() if p.strip()]
+        services = [s for s in (svc.stdout or '').split() if s.strip()]
+        rules = [f'{p} (public)' for p in ports] + [f'{s} [service] (public)' for s in services]
+        raw = f"state: {'running' if enabled else 'not running'}\nports: {' '.join(ports)}\nservices: {' '.join(services)}"
+        return {'supported': True, 'enabled': enabled, 'rules': rules,
+                'rules_numbered': list(rules), 'raw': raw, 'raw_numbered': raw,
+                'backend': 'firewalld'}
+    except Exception as e:
+        return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': [], 'rules_numbered': []}
+
+
 def _firewall_status_local():
-    """Return local firewall status for UI (UFW only)."""
+    """Return local firewall status for UI (UFW or firewalld)."""
+    be = _fw_backend()
+    if be == 'firewalld':
+        return _firewalld_status_local()
     has_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
     if not has_ufw:
-        return {'supported': False, 'error': 'UFW not installed on this host', 'enabled': False, 'rules': [], 'rules_numbered': []}
+        return {'supported': False, 'error': 'No supported firewall (UFW/firewalld) installed on this host', 'enabled': False, 'rules': [], 'rules_numbered': []}
     try:
         r = subprocess.run(
             'sudo ufw status 2>/dev/null || ufw status 2>/dev/null || true',
@@ -7620,11 +7795,12 @@ def firewall_open_port_api():
         return jsonify({'success': False, 'error': 'Protocol must be tcp or udp'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = f'sudo ufw allow {port}/{proto} >/dev/null 2>&1 || ufw allow {port}/{proto} >/dev/null 2>&1 || true'
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        ok, msg = _fw_allow(port, proto)
         st2 = _firewall_status_local()
+        if not ok:
+            return jsonify({'success': False, 'error': (msg or 'firewall command failed')[:160], 'status': st2}), 500
         return jsonify({'success': True, 'message': f'Opened {port}/{proto}', 'status': st2})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:160]}), 500
@@ -7642,11 +7818,12 @@ def firewall_close_port_api():
         return jsonify({'success': False, 'error': 'Protocol must be tcp or udp'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = f'sudo ufw --force delete allow {port}/{proto} >/dev/null 2>&1 || ufw --force delete allow {port}/{proto} >/dev/null 2>&1 || true'
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        ok, msg = _fw_remove(port, proto)
         st2 = _firewall_status_local()
+        if not ok:
+            return jsonify({'success': False, 'error': (msg or 'firewall command failed')[:160], 'status': st2}), 500
         return jsonify({'success': True, 'message': f'Closed {port}/{proto}', 'status': st2})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:160]}), 500
