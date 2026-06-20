@@ -54182,47 +54182,7 @@ def run_takserver_deploy(config):
         if webadmin_pass:
             if authentik_for_webadmin:
                 log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file UserManager; avoids 8446 shadowing).")
-                # v10.0.1: wire the Authentik admin identity so 8446 lands on the Admin
-                # GUI, not WebTAK. Ported from the container deploy — the native (deb+rpm)
-                # path previously only removed the flat-file shadow without syncing an
-                # Authentik admin, so every login landed on WebTAK (the documented
-                # webadmin→WebTAK issue). Only runs when Authentik is present.
-                # 1) SA bind: a fresh Authentik deploy's adm_ldapservice pw can diverge
-                #    from .env → SA bind fails 'Invalid credentials 49' → TAK can't query
-                #    groups → everyone lands on WebTAK. Sync pw to .env + verify bind.
-                try:
-                    _sa_ok, _sa_msg = _ensure_authentik_ldap_service_account()
-                    log_step(f"  {'✓' if _sa_ok else '⚠'} LDAP service-account bind: {_sa_msg}")
-                except Exception as _sae:
-                    log_step(f"  ⚠ LDAP service-account sync error (non-fatal): {str(_sae)[:120]}")
-                # 2) webadmin → Authentik admin group, retry once with LDAP-flow repair
-                _sync_ok = False; _sync_err = None
-                for _attempt in range(2):
-                    _wok, _werr = _ensure_authentik_webadmin(skip_bind_verify=False)
-                    if _wok:
-                        _sync_ok = True
-                        log_step("  ✓ webadmin synced to Authentik (tak_ROLE_ADMIN)")
-                        break
-                    _sync_err = (_werr or 'Unknown sync error')[:120]
-                    if _attempt == 0:
-                        log_step(f"  ℹ webadmin sync attempt 1 failed: {_sync_err} — repairing LDAP flow and retrying...")
-                        try:
-                            _fok, _ferr = _ensure_ldap_flow_authentication_none()
-                            log_step("  ✓ LDAP flow repaired (cleared recursion spiral)" if _fok else f"  ⚠ LDAP flow repair: {_ferr} — retrying anyway")
-                        except Exception as _fe:
-                            log_step(f"  ⚠ LDAP flow repair error (non-fatal): {str(_fe)[:120]}")
-                        time.sleep(15)
-                if _sync_ok:
-                    _remove_webadmin_from_userauth()
-                    log_step("  ✓ Removed flat-file webadmin shadow (8446 → LDAP/Admin GUI)")
-                else:
-                    log_step(f"  ⚠ webadmin Authentik sync not verified: {_sync_err}")
-                    log_step("     Fix: TAK Server page → 'Resync LDAP to TAK Server', then log in to 8446 (user: webadmin).")
-                # 3) migrate LDAP outpost to FQDN routing (prevents heavy-load spiral)
-                try:
-                    _ensure_authentik_ldap_outpost_on_fqdn(log_step)
-                except Exception as _oe:
-                    log_step(f"  ⚠ LDAP outpost routing migration skipped (non-fatal): {str(_oe)[:120]}")
+                _remove_webadmin_from_userauth()
             else:
                 # v0.9.12: shlex.quote the password so any future operator-supplied
                 # value with shell metacharacters is safely literalized instead of
