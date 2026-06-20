@@ -19613,22 +19613,39 @@ def run_mediamtx_deploy():
             _run_mediamtx_deploy_remote(settings, deploy_cfg, plog)
             return
 
-        # Step 1: install deps (distro-branched). RHEL/Rocky has no apt; ffmpeg lives
-        # in EPEL and needs CRB enabled (mirrors the mediamtx-installer rocky-9
-        # reference script). EPEL/CRB may already be on from a prior TAK Server
-        # deploy — both steps are idempotent. The .deb branch (else) is unchanged.
+        # Step 1: install deps (distro-branched). RHEL/Rocky has no apt. EPEL+CRB are
+        # enabled for the general dep set; full ffmpeg comes from RPM Fusion (below).
+        # EPEL/CRB may already be on from a prior TAK Server deploy — idempotent.
+        # The .deb branch (else) is unchanged.
         plog("━━━ Step 1/7: Installing Dependencies ━━━")
         if _distro_family() == 'rhel':
             subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'epel-release', 'dnf-plugins-core']),
                            capture_output=True, text=True, timeout=300)
             subprocess.run('dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null; true',
                            shell=True, capture_output=True, text=True, timeout=120)
-            ok, out = _pkg_install(['wget', 'tar', 'curl', 'ffmpeg', 'openssl', 'python3', 'python3-pip'],
+            # Core deps (required). The MediaMTX binary is pure Go and doesn't need
+            # ffmpeg, so install core deps strictly, then ffmpeg separately.
+            ok, out = _pkg_install(['wget', 'tar', 'curl', 'openssl', 'python3', 'python3-pip'],
                                    log_fn=plog, timeout=900)
             if not ok:
                 plog(f"✗ dnf install failed: {(out or '')[-200:]}")
                 mediamtx_deploy_status.update({'running': False, 'error': True})
                 return
+            # ffmpeg: required for recording, the MP4-download conversion, and the
+            # test stream. RHEL/EPEL only ship `ffmpeg-free` (NO libx264/libx265);
+            # full ffmpeg matching the Ubuntu apt build lives in RPM Fusion. Add the
+            # RPM Fusion free repo, then install ffmpeg; fall back to ffmpeg-free.
+            # Warn-not-fail: core MediaMTX streaming works without ffmpeg — only the
+            # recording / MP4 export / test-stream features need it.
+            _rhel_ver = (subprocess.run('rpm -E %rhel', shell=True, capture_output=True, text=True).stdout.strip() or '9')
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y',
+                f'https://download1.rpmfusion.org/free/el/rpmfusion-free-release-{_rhel_ver}.noarch.rpm']),
+                capture_output=True, text=True, timeout=300)
+            ff_ok, _ = _pkg_install(['ffmpeg'], timeout=900)
+            if not ff_ok:
+                ff_ok, _ = _pkg_install(['ffmpeg-free'], timeout=600)
+            plog("✓ ffmpeg installed (recording / MP4 export / test stream)" if ff_ok else
+                 "⚠ ffmpeg unavailable — MediaMTX streaming OK, but recording / MP4 download / test stream need ffmpeg (RPM Fusion repo unreachable?)")
         else:
             wait_for_apt_lock(plog, mediamtx_deploy_log)
             r = subprocess.run('apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1',
