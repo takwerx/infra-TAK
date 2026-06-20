@@ -1117,6 +1117,78 @@ def _fw_remove(port, proto='tcp'):
         return False, str(e)[:160]
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
+def _selinux_allow_caddy_port(port, log=None):
+    """On RHEL + SELinux Enforcing, let confined Caddy (httpd_t) bind a
+    non-standard TCP port by labeling it http_port_t. No-op on Debian, when
+    SELinux is not enforcing, or when the port is already labeled. Idempotent.
+
+    Caddy on EL runs as httpd_t; the built-in http_port_t set covers
+    80/443/8443/9000 etc. but NOT e.g. 9997 (CloudTAK video vhost) — so the bind
+    fails 'permission denied', Caddy rejects the whole config, the reload fails,
+    and the affected 443 vhost serves nothing (browser ERR_SSL_PROTOCOL_ERROR).
+    Root-caused on aws-rocky 2026-06-20. NON-ROOT-COMMANDS: semanage, dnf."""
+    try:
+        if _distro_family() != 'rhel':
+            return False
+        port = int(port)
+        enf = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=5)
+        if (enf.stdout or '').strip() != 'Enforcing':
+            return False
+        # Already labeled http_port_t? (idempotent — also true for the built-ins)
+        cur = subprocess.run('semanage port -l 2>/dev/null', shell=True, capture_output=True, text=True, timeout=15)
+        for ln in (cur.stdout or '').splitlines():
+            f = ln.split()
+            if len(f) >= 3 and f[0] == 'http_port_t' and f[1] == 'tcp' \
+                    and str(port) in [p.strip(',') for p in f[2:]]:
+                return False
+        if subprocess.run('command -v semanage >/dev/null 2>&1', shell=True).returncode != 0:
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'policycoreutils-python-utils']),
+                           capture_output=True, text=True, timeout=180)
+        add = subprocess.run(_sudo_wrap(['semanage', 'port', '-a', '-t', 'http_port_t', '-p', 'tcp', str(port)]),
+                             capture_output=True, text=True, timeout=30)
+        ok = add.returncode == 0
+        if not ok:  # already defined under another label → modify instead
+            mod = subprocess.run(_sudo_wrap(['semanage', 'port', '-m', '-t', 'http_port_t', '-p', 'tcp', str(port)]),
+                                 capture_output=True, text=True, timeout=30)
+            ok = mod.returncode == 0
+            if not ok and log:
+                log(f"  ⚠ SELinux: could not label tcp/{port} http_port_t — {((add.stderr or '') + (mod.stderr or '')).strip()[:140]}")
+        if ok and log:
+            log(f"  ✓ SELinux: tcp/{port} labeled http_port_t (Caddy may now bind it)")
+        return ok
+    except Exception as e:
+        if log:
+            log(f"  ⚠ SELinux port-label tcp/{port} error (non-fatal): {str(e)[:120]}")
+        return False
+
+
+def _selinux_sync_caddy_ports(log=None):
+    """RHEL self-heal: scan the on-disk Caddyfile for listener ports and ensure
+    each non-standard one is labeled http_port_t so confined Caddy can bind it.
+    Returns the count newly labeled (caller decides whether to reload Caddy).
+    No-op off-RHEL. Catches 9997 (CloudTAK video) and any future module port."""
+    if _distro_family() != 'rhel':
+        return 0
+    try:
+        import re as _re_cp
+        with open(CADDYFILE_PATH, 'r') as f:
+            cad = f.read()
+    except Exception:
+        return 0
+    ports = set()
+    # Site addresses like "host:9997 {" or ":9997 {" — capture the port before '{'.
+    for m in _re_cp.finditer(r'(?m)^[^#\n]*?:(\d{2,5})\s*\{', cad):
+        ports.add(int(m.group(1)))
+    _default_http = {80, 81, 443, 488, 2019, 8008, 8009, 8443, 9000}
+    n = 0
+    for p in sorted(ports):
+        if p in _default_http:
+            continue
+        if _selinux_allow_caddy_port(p, log=log):
+            n += 1
+    return n
+
+
 def _docker_install_cmd():
     """Shell command that installs Docker Engine for THIS host's distro family.
       Debian/Ubuntu → the get.docker.com convenience script (works as-is).
@@ -16293,6 +16365,17 @@ def generate_caddyfile(settings=None):
     os.makedirs(os.path.dirname(CADDYFILE_PATH), exist_ok=True)
     with open(CADDYFILE_PATH, 'w') as f:
         f.write(caddyfile)
+    # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
+    # http_port_t (80/443/8443/9000…). A non-standard listener — e.g. the
+    # CloudTAK video vhost on :9997 — is denied (name_bind) so the reload fails
+    # and that 443 vhost serves nothing (ERR_SSL_PROTOCOL_ERROR). Label any
+    # non-standard listener port we just wrote BEFORE callers reload Caddy.
+    # No-op on Debian / non-enforcing. Single choke point — covers every reload
+    # site. Root-caused on aws-rocky (CloudTAK) 2026-06-20.
+    try:
+        _selinux_sync_caddy_ports()
+    except Exception:
+        pass
     return caddyfile
 
 
@@ -60989,6 +61072,24 @@ def _startup_migrations():
             )
         except Exception as ip_imds_err:
             print(f"Startup migration: server_ip IMDS self-heal error (non-fatal): {ip_imds_err}")
+
+        # v10.0.1 (RHEL) — self-heal SELinux labels for non-standard Caddy
+        # listener ports. Confined Caddy (httpd_t) can't bind e.g. :9997 (CloudTAK
+        # video) unless the port is http_port_t, so its reload fails and the vhost
+        # serves nothing. generate_caddyfile() now labels on write, but a box whose
+        # CloudTAK was deployed before this fix is stuck until something relabels +
+        # reloads — do it here. No-op off-RHEL / when nothing needs labeling.
+        # See `_selinux_sync_caddy_ports`. Root-caused on aws-rocky 2026-06-20.
+        try:
+            _ct_labeled = _selinux_sync_caddy_ports(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+            if _ct_labeled:
+                subprocess.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+                               shell=True, capture_output=True, text=True, timeout=60)
+                print(f"Startup migration: relabeled {_ct_labeled} Caddy port(s) for SELinux and reloaded Caddy", flush=True)
+        except Exception as caddy_selinux_err:
+            print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")
 
         # v0.9.44 — silently clear a `takserver` dpkg half-configured state left by the
         # non-idempotent 5.7 .deb postinstall. TAK Server keeps running fine, but the
