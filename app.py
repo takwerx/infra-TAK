@@ -1119,13 +1119,17 @@ def _fw_remove(port, proto='tcp'):
 
 def _selinux_allow_caddy_port(port, log=None):
     """On RHEL + SELinux Enforcing, let confined Caddy (httpd_t) bind a
-    non-standard TCP port by labeling it http_port_t. No-op on Debian, when
-    SELinux is not enforcing, or when the port is already labeled. Idempotent.
+    non-standard port by labeling it http_port_t for BOTH tcp AND udp. No-op on
+    Debian, when SELinux is not enforcing, or when both protocols are already
+    labeled. Idempotent. Returns True if it changed anything.
 
     Caddy on EL runs as httpd_t; the built-in http_port_t set covers
     80/443/8443/9000 etc. but NOT e.g. 9997 (CloudTAK video vhost) — so the bind
-    fails 'permission denied', Caddy rejects the whole config, the reload fails,
-    and the affected 443 vhost serves nothing (browser ERR_SSL_PROTOCOL_ERROR).
+    fails 'permission denied', Caddy rejects the whole config, and the affected
+    443 vhost serves nothing (browser ERR_SSL_PROTOCOL_ERROR). BOTH protocols are
+    required: an HTTPS site listener also opens an HTTP/3 QUIC listener on the
+    SAME port over UDP, and SELinux port labels are per-protocol — labeling only
+    tcp leaves the UDP/QUIC bind denied and Caddy still exits 1 on start.
     Root-caused on aws-rocky 2026-06-20. NON-ROOT-COMMANDS: semanage, dnf."""
     try:
         if _distro_family() != 'rhel':
@@ -1134,31 +1138,39 @@ def _selinux_allow_caddy_port(port, log=None):
         enf = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=5)
         if (enf.stdout or '').strip() != 'Enforcing':
             return False
-        # Already labeled http_port_t? (idempotent — also true for the built-ins)
+        # Which protocols already have this port under http_port_t? (idempotent)
+        have = {'tcp': False, 'udp': False}
         cur = subprocess.run('semanage port -l 2>/dev/null', shell=True, capture_output=True, text=True, timeout=15)
         for ln in (cur.stdout or '').splitlines():
             f = ln.split()
-            if len(f) >= 3 and f[0] == 'http_port_t' and f[1] == 'tcp' \
+            if len(f) >= 3 and f[0] == 'http_port_t' and f[1] in ('tcp', 'udp') \
                     and str(port) in [p.strip(',') for p in f[2:]]:
-                return False
+                have[f[1]] = True
+        if have['tcp'] and have['udp']:
+            return False
         if subprocess.run('command -v semanage >/dev/null 2>&1', shell=True).returncode != 0:
             subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'policycoreutils-python-utils']),
                            capture_output=True, text=True, timeout=180)
-        add = subprocess.run(_sudo_wrap(['semanage', 'port', '-a', '-t', 'http_port_t', '-p', 'tcp', str(port)]),
-                             capture_output=True, text=True, timeout=30)
-        ok = add.returncode == 0
-        if not ok:  # already defined under another label → modify instead
-            mod = subprocess.run(_sudo_wrap(['semanage', 'port', '-m', '-t', 'http_port_t', '-p', 'tcp', str(port)]),
+        changed = False
+        for proto in ('tcp', 'udp'):
+            if have[proto]:
+                continue
+            add = subprocess.run(_sudo_wrap(['semanage', 'port', '-a', '-t', 'http_port_t', '-p', proto, str(port)]),
                                  capture_output=True, text=True, timeout=30)
-            ok = mod.returncode == 0
-            if not ok and log:
-                log(f"  ⚠ SELinux: could not label tcp/{port} http_port_t — {((add.stderr or '') + (mod.stderr or '')).strip()[:140]}")
-        if ok and log:
-            log(f"  ✓ SELinux: tcp/{port} labeled http_port_t (Caddy may now bind it)")
-        return ok
+            ok = add.returncode == 0
+            if not ok:  # already defined under another label → modify instead
+                mod = subprocess.run(_sudo_wrap(['semanage', 'port', '-m', '-t', 'http_port_t', '-p', proto, str(port)]),
+                                     capture_output=True, text=True, timeout=30)
+                ok = mod.returncode == 0
+                if not ok and log:
+                    log(f"  ⚠ SELinux: could not label {proto}/{port} http_port_t — {((add.stderr or '') + (mod.stderr or '')).strip()[:140]}")
+            changed = changed or ok
+        if changed and log:
+            log(f"  ✓ SELinux: tcp+udp/{port} labeled http_port_t (Caddy may now bind it)")
+        return changed
     except Exception as e:
         if log:
-            log(f"  ⚠ SELinux port-label tcp/{port} error (non-fatal): {str(e)[:120]}")
+            log(f"  ⚠ SELinux port-label /{port} error (non-fatal): {str(e)[:120]}")
         return False
 
 
@@ -1176,8 +1188,11 @@ def _selinux_sync_caddy_ports(log=None):
     except Exception:
         return 0
     ports = set()
-    # Site addresses like "host:9997 {" or ":9997 {" — capture the port before '{'.
-    for m in _re_cp.finditer(r'(?m)^[^#\n]*?:(\d{2,5})\s*\{', cad):
+    # Site-address openers only — "host:9997 {" / ":9997 {" at column 0. The
+    # leading \S excludes INDENTED reverse_proxy / forward_auth upstream lines
+    # (e.g. "    reverse_proxy 127.0.0.1:5000 {"), which are not Caddy listeners
+    # and must not be relabeled (they belong to other services).
+    for m in _re_cp.finditer(r'(?m)^\S[^#\n]*?:(\d{2,5})\s*\{', cad):
         ports.add(int(m.group(1)))
     _default_http = {80, 81, 443, 488, 2019, 8008, 8009, 8443, 9000}
     n = 0
