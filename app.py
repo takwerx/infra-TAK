@@ -58576,7 +58576,7 @@ function takPurgeFailed(){
 <div class="upload-hint" id="upload-requirements-hint">
 <span style="color:var(--text-dim);font-size:12px">One server: takserver .deb/.rpm + optional .pol and .key — Split server: takserver-core and takserver-database.</span>
 </div>
-<input type="file" id="file-input" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.zip,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.zip,.key"{% else %}accept=".deb,.rpm,.zip,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
+<input type="file" id="file-input" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
 </div>
 <div id="progress-area"></div>
 <div id="upload-results" style="display:none">
@@ -58584,7 +58584,7 @@ function takPurgeFailed(){
 <div id="upload-files-list" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary)"></div>
 <div id="add-more-area" style="margin-top:16px;text-align:center">
 <button onclick="var i=document.getElementById('file-input-more');i.value='';i.click()" style="padding:8px 20px;background:transparent;color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">+ Add more files</button>
-<input type="file" id="file-input-more" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.zip,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.zip,.key"{% else %}accept=".deb,.rpm,.zip,.key,.pol"{% endif %} onchange="handleAddMore(event)">
+<input type="file" id="file-input-more" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleAddMore(event)">
 </div>
 <div id="deploy-btn-area" style="margin-top:20px;text-align:center;display:none">
 <button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>

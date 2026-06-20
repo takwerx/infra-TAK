@@ -967,8 +967,8 @@ function uploadFile(file){
                 var t=(p.pkg_type||'').toLowerCase();
                 if(!t){t=n.indexOf('.zip')!==-1?'docker':n.indexOf('.rpm')!==-1?'rpm':n.indexOf('.deb')!==-1?'deb':'';}
                 if(_arch==='arm64'){if(t!=='docker')return 'arm64 runs TAK in a container — upload the takserver-docker-X.X.zip from tak.gov (.deb/.rpm are amd64-only).';return null;}
-                if(_os.indexOf('rocky')!==-1||_os.indexOf('rhel')!==-1){if(t==='deb')return 'Rocky/RHEL needs the .rpm — not a .deb. Download takserver-X.X.noarch.rpm from tak.gov.';return null;}
-                if(_os.indexOf('ubuntu')!==-1){if(t==='rpm')return 'Ubuntu needs the .deb — not a .rpm. Download takserver_X.X_all.deb from tak.gov.';return null;}
+                if(_os.indexOf('rocky')!==-1||_os.indexOf('rhel')!==-1){if(t!=='rpm')return 'Rocky/RHEL needs the native takserver .rpm'+(t==='docker'?' — the docker .zip is the arm64 path':'')+'. Download takserver-X.X.noarch.rpm from tak.gov.';return null;}
+                if(_os.indexOf('ubuntu')!==-1){if(t!=='deb')return 'Ubuntu needs the native takserver .deb'+(t==='docker'?' — the docker .zip is the arm64 path':'')+'. Download takserver_X.X_all.deb from tak.gov.';return null;}
                 return null;
             }
             function reject(msg,fn){bar.style.background='var(--red)';pc.style.color='var(--red)';pc.textContent=msg;var xBtn=document.createElement('span');xBtn.textContent=' \u2717';xBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;opacity:0.7';xBtn.title='Dismiss';xBtn.onclick=function(ev){ev.stopPropagation();var row=document.getElementById(id);if(row)row.remove()};pc.appendChild(xBtn);if(fn){fetch('/api/upload/takserver/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})}).catch(function(){})}}
@@ -977,7 +977,16 @@ function uploadFile(file){
             else if(d.package){var p=d.package;var pErr=platformPkgError(p);if(pErr){reject(pErr,p.filename);}else if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'Wrong package — this is a split package (database/core only). Upload the single takserver .deb instead.',p.filename);}else if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb});added++;}}
             if(added>0||(d.gpg_key||d.policy)){bar.style.background='var(--green)';pc.style.color='var(--green)';var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
         }
-        else{bar.style.background='var(--red)';pc.textContent='\u2717';pc.style.color='var(--red)'}
+        else{
+            // Non-200 (e.g. backend platform gate rejected the package). Surface the
+            // server's error message + a dismiss \u2717 instead of a bare red line.
+            var _emsg='Upload rejected';
+            try{var _ed=JSON.parse(xhr.responseText);if(_ed&&_ed.error)_emsg=_ed.error;}catch(_e){}
+            bar.style.background='var(--red)';pc.style.color='var(--red)';
+            lbl.innerHTML=file.name+' \u2014 <span style="color:var(--red)">'+_emsg+'</span>';
+            pc.textContent='\u2717';
+            var _xb=document.createElement('span');_xb.textContent=' \u2717';_xb.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;opacity:0.8';_xb.title='Dismiss';_xb.onclick=function(ev){ev.stopPropagation();var _rr=document.getElementById(id);if(_rr)_rr.remove()};pc.appendChild(_xb);
+        }
         uploadsInProgress--;if(uploadsInProgress===0)updateUploadSummary()
     };
     xhr.onerror=()=>{delete window['xhr_'+id];document.getElementById(id+'-bar').style.background='var(--red)';document.getElementById(id+'-pct').textContent='\u2717';uploadsInProgress--;if(uploadsInProgress===0)updateUploadSummary()};
