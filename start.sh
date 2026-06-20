@@ -257,7 +257,7 @@ install_dependencies() {
             fi
             if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-                python3 python3-pip python3-venv openssl sshpass git > "$apt_log" 2>&1; then
+                python3 python3-pip python3-venv openssl sshpass git wget > "$apt_log" 2>&1; then
                 echo -e "${RED}  apt-get install failed:${NC}"
                 tail -30 "$apt_log"
                 rm -f "$apt_log"
@@ -266,7 +266,7 @@ install_dependencies() {
             rm -f "$apt_log"
             ;;
         dnf)
-            if ! dnf install -y python3 python3-pip openssl sshpass git > "$apt_log" 2>&1; then
+            if ! dnf install -y python3 python3-pip openssl sshpass git wget > "$apt_log" 2>&1; then
                 echo -e "${RED}  dnf install failed:${NC}"
                 tail -30 "$apt_log"
                 rm -f "$apt_log"

@@ -44171,7 +44171,9 @@ entries:
             plog("\u2501\u2501\u2501 Step 5/10: Downloading Docker Compose File \u2501\u2501\u2501")
             _compose_fresh_download = False
             if not os.path.exists(compose_path):
-                r = subprocess.run(f'wget -q -O {compose_path} https://goauthentik.io/docker-compose.yml 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+                # curl (not wget): Rocky/RHEL minimal ships curl but not wget. -fsSL fails
+                # loudly on HTTP errors and follows redirects. (v10.0.1 universal-installer)
+                r = subprocess.run(f'curl -fsSL -o {compose_path} https://goauthentik.io/docker-compose.yml 2>&1', shell=True, capture_output=True, text=True, timeout=30)
                 if r.returncode != 0 or not os.path.exists(compose_path):
                     plog("\u2717 Failed to download docker-compose.yml")
                     authentik_deploy_status.update({'running': False, 'error': True})
