@@ -1117,6 +1117,29 @@ def _fw_remove(port, proto='tcp'):
         return False, str(e)[:160]
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
+def _docker_install_cmd():
+    """Shell command that installs Docker Engine for THIS host's distro family.
+      Debian/Ubuntu → the get.docker.com convenience script (works as-is).
+      RHEL family   → get.docker.com adds Docker's linux/rocky/$releasever repo,
+                      which ships NO docker-ce packages ("Unable to find a match");
+                      use Docker's CentOS repo — the supported repo for the
+                      RHEL-compatible family (Rocky/Alma/RHEL). The `rm -f` clears
+                      any empty rocky repo a prior get.docker.com run left behind.
+    Returns a string for `subprocess.run(..., shell=True)` (run as root, matching
+    the existing get.docker.com sites). NON-ROOT-COMMANDS: dnf, dnf config-manager,
+    systemctl. Validated on Rocky 9.8: installs docker-ce 29.x + starts it.
+    Note: distro family is the LOCAL box; remote/two-server docker installs are
+    NOT routed here (they target a remote host)."""
+    if _distro_family() == 'rhel':
+        return (
+            'dnf -y install dnf-plugins-core && '
+            'rm -f /etc/yum.repos.d/docker-ce.repo && '
+            'dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && '
+            'dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin && '
+            'systemctl enable --now docker'
+        )
+    return 'curl -fsSL https://get.docker.com | sh'
+
 def _ensure_tak_on_authentik_network():
     """v10.0.1 — when TAK runs as a container, join it to Authentik's docker
     network so it can reach the LDAP outpost by container name (the outpost only
@@ -6759,7 +6782,7 @@ def _run_remote_assist_deploy(settings):
         r = _sp.run(['docker', '--version'], capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
                          shell=True, capture_output=True, text=True, timeout=300)
             if r2.returncode != 0:
                 raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
@@ -18293,7 +18316,7 @@ def run_takportal_deploy():
         r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("Docker not found. Installing...")
-            subprocess.run('curl -fsSL https://get.docker.com | sh', shell=True, capture_output=True, text=True, timeout=300)
+            subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
             r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
             if r2.returncode != 0:
                 plog("\u2717 Failed to install Docker")
@@ -21952,7 +21975,7 @@ def run_cloudtak_deploy(cfg=None):
         r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("  Docker not found — installing...")
-            subprocess.run('curl -fsSL https://get.docker.com | sh', shell=True, capture_output=True, text=True, timeout=300)
+            subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
             r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
             if r2.returncode != 0:
                 plog("✗ Failed to install Docker")
@@ -24858,7 +24881,7 @@ def _run_tvr_deploy(settings):
         r = _sp.run(['docker', '--version'], capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
                          shell=True, capture_output=True, text=True, timeout=300)
             if r2.returncode != 0:
                 raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
@@ -26670,7 +26693,7 @@ def _run_netbird_deploy(settings):
         r = _sp.run(['docker', '--version'], capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
                          shell=True, capture_output=True, text=True, timeout=300)
             if r2.returncode != 0:
                 raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
@@ -43861,7 +43884,7 @@ def run_authentik_deploy(reconfigure=False):
             r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
             if r.returncode != 0:
                 plog("Docker not found. Installing...")
-                subprocess.run('curl -fsSL https://get.docker.com | sh', shell=True, capture_output=True, text=True, timeout=300)
+                subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
                 r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
                 if r2.returncode != 0:
                     plog("\u2717 Failed to install Docker")
