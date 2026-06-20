@@ -20320,6 +20320,15 @@ WantedBy=multi-user.target
 
                 subprocess.run('systemctl restart mediamtx', shell=True, capture_output=True)
                 time.sleep(2)
+                # Caddy's /hls-proxy reverse_proxy only emits https:// when the stream
+                # cert exists at generate-time (_get_mediamtx_hls_upstream). On a fresh
+                # box the Step-7 Caddyfile was written before the LE cert had issued, so
+                # it may still proxy plain HTTP to MediaMTX's now-HTTPS HLS port → browser
+                # 400 ("Client sent an HTTP request to an HTTPS server"). We just confirmed
+                # the cert AND flipped hlsEncryption: yes, so regenerate Caddy now to
+                # switch /hls-proxy to the https backend (closes the encrypt-vs-gen race).
+                _caddy_regenerate_if_fqdn()
+                plog("✓ Caddy regenerated — /hls-proxy now matches the HTTPS HLS backend")
             else:
                 plog(f"  ⚠ Cert not found after 60s — SSL not wired")
                 plog(f"  Go to Caddy page, reload, then restart MediaMTX to retry")
