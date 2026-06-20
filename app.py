@@ -18442,7 +18442,14 @@ def run_takportal_deploy():
             plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
 
         plog("  Building image (this may take a minute)...")
-        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build 2>&1', shell=True, capture_output=True, text=True, timeout=900)
+        # Build + create the container WITHOUT starting it. The first boot otherwise
+        # runs TAK Portal's Authentik users-fetch against the shipped placeholder
+        # settings ("your-authentik-url" / "your-real-token-here") and dumps a
+        # harmless-but-alarming ENOTFOUND stack trace into the logs on every fresh
+        # install. We seed real settings.json into the created container below, then
+        # start — so the first boot already has live config. No-op-safe on redeploy
+        # (an already-running container just gets re-seeded + restarted in Step 6).
+        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build --no-start 2>&1', shell=True, capture_output=True, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
@@ -18456,6 +18463,34 @@ def run_takportal_deploy():
 
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
+
+        # Seed real settings.json into the created (not-yet-started) container so the
+        # first boot uses live config instead of the placeholder defaults — kills the
+        # ENOTFOUND startup noise. docker cp works on a created/stopped container, and
+        # the infratak network was attached above so authentik-server-1 resolves on
+        # boot. Step 6 re-writes settings.json idempotently (and adds the SSH-onboarded
+        # flag) after the post-start cert/SSH sync, so this is purely a head-start.
+        try:
+            import json as _json_seed
+            _seed_dict = _takportal_build_settings_dict(load_settings())
+            _fd_seed, _tmp_seed = tempfile.mkstemp(suffix='.json', prefix='tak-portal-seed-')
+            try:
+                with os.fdopen(_fd_seed, 'w') as _sf:
+                    _sf.write(_json_seed.dumps(_seed_dict, indent=2))
+                subprocess.run(
+                    f'docker cp {shlex.quote(_tmp_seed)} tak-portal:/usr/src/app/data/settings.json',
+                    shell=True, capture_output=True, text=True, timeout=10)
+                plog("  ✓ Seeded settings.json before first start (suppresses placeholder Authentik fetch)")
+            finally:
+                try:
+                    os.remove(_tmp_seed)
+                except OSError:
+                    pass
+        except Exception as _seed_e:
+            plog(f"  ⚠ Could not pre-seed settings.json: {str(_seed_e)[:80]} (first boot may log a harmless placeholder error)")
+
+        # Start the container now that real settings are in place
+        subprocess.run(f'cd {portal_dir} && docker compose start 2>&1', shell=True, capture_output=True, text=True, timeout=120)
 
         # Wait for container to be healthy
         plog("  Waiting for container...")
