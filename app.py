@@ -19597,6 +19597,15 @@ paths:
                 _module_run(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
                 plog(f"✓ SSL certificates synced — RTSPS and HTTPS HLS enabled")
                 ssl_ok = True
+                # The Caddyfile's /hls-proxy reverse_proxy only switches to https when
+                # the stream cert exists at generate-time (see _get_mediamtx_hls_upstream).
+                # We just enabled HLS-over-TLS on MediaMTX, so regenerate Caddy NOW —
+                # otherwise it keeps proxying plain HTTP to MediaMTX's HTTPS HLS port and
+                # the browser gets 400 "Client sent an HTTP request to an HTTPS server"
+                # (the encrypt-enable-vs-Caddy-gen ordering race — Caddy was generated
+                # before the LE stream cert had provisioned).
+                _caddy_regenerate_if_fqdn()
+                plog("✓ Caddy regenerated — /hls-proxy now matches the HTTPS HLS backend")
                 # Create cert-sync script on infra-TAK host for renewals
                 rcfg = deploy_cfg.get('remote', {})
                 ssh_user = rcfg.get('ssh_user', 'root')
