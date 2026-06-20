@@ -21995,6 +21995,16 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             # Tier 3: store 9002 → loopback
             _ct = _re.sub(r'(\s+- )"?9002:9002"?', r'\g<1>"127.0.0.1:9002:9002"', _ct)
 
+            # v10.0.1 (arm64 only): upstream pins postgis/postgis:<tag>, which is
+            # amd64-only (no arm64 manifest) → the container crash-loops with
+            # "exec format error" on aarch64, taking the api/migrations down with it.
+            # imresamu/postgis mirrors the SAME tag scheme with an arm64 build added,
+            # so swap only the registry/namespace and keep CloudTAK's exact PG/PostGIS
+            # tag. No-op on amd64 (the validated path is byte-identical). Lives here so
+            # it is re-applied after every clone/git-checkout, like the port patches.
+            if _host_arch() == 'arm64':
+                _ct = _re.sub(r'(image:\s*)postgis/postgis:', r'\g<1>imresamu/postgis:', _ct)
+
             if _ct != _orig:
                 with open(_path, 'w') as f:
                     f.write(_ct)
