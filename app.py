@@ -53799,6 +53799,22 @@ def _deploy_takserver_container(config):
             except Exception as _oe:
                 log_step(f"  ⚠ LDAP outpost routing migration skipped (non-fatal): {str(_oe)[:120]}")
 
+        # v10.0.1: a (re)deploy regenerates the TAK CA + admin.p12, so refresh the
+        # TAK Portal client cert + CA if the portal is present — otherwise the
+        # portal keeps the OLD-CA, legacy-algo tak-client.p12 (which its Node 22 /
+        # OpenSSL 3 can't read) and the dashboard shows no connected users / uptime
+        # (Marti stats 503), even though enrollment via 8446 still works. No-ops
+        # cleanly if TAK Portal isn't installed. See memory
+        # takportal-stale-client-cert-on-redeploy.
+        try:
+            if subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
+                              shell=True, capture_output=True, text=True).returncode == 0:
+                log_step(""); log_step("━━━ Refreshing TAK Portal certs (CA changed on redeploy) ━━━")
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log_step, restart=True)
+                log_step(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
+        except Exception as _tpe:
+            log_step(f"  ⚠ TAK Portal cert sync skipped (non-fatal): {str(_tpe)[:120]}")
+
         # v10.0.1: auto-deploy Guard Dog so it runs from the start — mirrors the
         # .deb tail (run_takserver_deploy). run_guarddog_deploy() writes the
         # container fields into guarddog.conf (via _tak_is_container()) so the
@@ -54430,46 +54446,135 @@ def takserver_federation_firewall():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
-@app.route('/api/takserver/sync-portal-ca', methods=['POST'])
-@login_required
-def takserver_sync_portal_ca():
-    """Copy current server CA to TAK Portal exactly like deploy Step 5: tak-ca.pem only (TAK_CA_PATH). Same source: takserver.pem or ca.pem+root-ca.pem bundle."""
-    cert_dir = '/opt/tak/certs/files'
+def _takportal_sync_certs(plog=None, restart=False):
+    """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
+      - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
+        emits legacy RC2-40-CBC which the portal's Node 22 / OpenSSL 3 cannot read)
+      - data/certs/tak-ca.pem      (server CA chain for the portal truststore)
+
+    Mirrors run_takportal_deploy Step 5; idempotent; safe to call on every TAK
+    (re)deploy / CA change / resync. Returns (success, message).
+
+    v10.0.1 — why this exists: a container TAK redeploy and the old
+    'sync portal CA' action refreshed ONLY the CA, leaving tak-client.p12 as the
+    OLD-CA + legacy-algo cert. The portal then couldn't read its client cert →
+    Marti stats 503 (no connected users / uptime), while enrollment still worked
+    (that path goes through Authentik/8446, not this cert). Both halves must
+    refresh together. See memory takportal-stale-client-cert-on-redeploy.
+    Works the same on native and container boxes (the portal is always a
+    container and admin.p12 is always at /opt/tak/certs/files)."""
+    def _log(m):
+        if plog:
+            plog(m)
     r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
+        return (False, 'TAK Portal container is not running')
+    cert_dir = '/opt/tak/certs/files'
     subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
-    # Same CA source logic as deploy Step 5: takserver.pem (full chain) or build from ca.pem + root-ca.pem
+    cert_pass = _get_tak_cert_password(load_settings())
+    # --- client cert: admin.p12 -> modern PKCS12 -> tak-client.p12 ---
+    ok_client = False
+    admin_p12 = os.path.join(cert_dir, 'admin.p12')
+    if not os.path.exists(admin_p12):
+        for name in ['webadmin.p12', 'admin.p12']:
+            p = os.path.join(cert_dir, name)
+            if os.path.exists(p):
+                admin_p12 = p
+                break
+    if os.path.exists(admin_p12):
+        fd_p12, modern_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-admin-')
+        os.close(fd_p12)
+        fd_pem, tmp_pem = tempfile.mkstemp(suffix='.pem', prefix='tak-portal-pem-')
+        os.close(fd_pem)
+        # Re-encode in TWO stages via a temp PEM file — NOT a stdin pipe.
+        # v10.0.1: `openssl pkcs12 -export` does NOT reliably read PEM from stdin
+        # on OpenSSL 3.0.x (Ubuntu 22.04), so the old
+        # `openssl pkcs12 -in ... | openssl pkcs12 -export -out ...` pipe silently
+        # produced an empty file and fell back to copying the unreadable LEGACY
+        # p12 — the real reason the portal could never read its client cert.
+        # -legacy is required to READ TAK's RC2-40-CBC admin.p12; the export stage
+        # defaults to modern AES, which the portal's Node 22 / OpenSSL 3 can read.
+        subprocess.run(
+            f'openssl pkcs12 -in {shlex.quote(admin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy -out {shlex.quote(tmp_pem)} 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=30)
+        if os.path.exists(tmp_pem) and os.path.getsize(tmp_pem) > 0:
+            subprocess.run(
+                f'openssl pkcs12 -export -in {shlex.quote(tmp_pem)} -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)} 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=30)
+        try:
+            os.remove(tmp_pem)
+        except OSError:
+            pass
+        if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
+            subprocess.run(f'docker cp {shlex.quote(modern_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+            _log("  ✓ tak-client.p12 refreshed (admin.p12 re-encoded to modern PKCS12)")
+            ok_client = True
+        else:
+            subprocess.run(f'docker cp {shlex.quote(admin_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+            _log("  ⚠ tak-client.p12 copied in LEGACY format (re-encode failed — portal may not read it)")
+            ok_client = True
+        try:
+            os.remove(modern_p12)
+        except OSError:
+            pass
+    else:
+        _log("  ⚠ admin.p12 not found in /opt/tak/certs/files/ — client cert not refreshed")
+    # --- CA chain: takserver.pem (full chain) or ca.pem+root-ca.pem -> tak-ca.pem ---
+    ok_ca = False
     tak_ca_src = None
+    ca_bundle_path = None
     takserver_pem = os.path.join(cert_dir, 'takserver.pem')
     if os.path.isfile(takserver_pem):
         tak_ca_src = takserver_pem
     else:
-        int_ca = os.path.join(cert_dir, 'ca.pem')
-        root_ca = os.path.join(cert_dir, 'root-ca.pem')
         bundle_parts = []
-        for ca_file in [int_ca, root_ca]:
+        for ca_file in [os.path.join(cert_dir, 'ca.pem'), os.path.join(cert_dir, 'root-ca.pem')]:
             if os.path.isfile(ca_file):
                 with open(ca_file, 'r') as f:
                     content = f.read().strip()
                 if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
                     bundle_parts.append(content)
-        if not bundle_parts:
-            return jsonify({'success': False, 'error': 'No takserver.pem or valid ca.pem/root-ca.pem in certs/files'}), 500
-        ca_bundle_path = '/tmp/tak-portal-sync-ca.pem'
-        with open(ca_bundle_path, 'w') as f:
-            f.write('\n'.join(bundle_parts) + '\n')
-        tak_ca_src = ca_bundle_path
-    cp = subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True, timeout=10)
-    if tak_ca_src.startswith('/tmp/'):
-        try:
-            os.remove(tak_ca_src)
-        except Exception:
-            pass
-    if cp.returncode != 0:
-        return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:200]}), 500
-    subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True, timeout=30)
-    return jsonify({'success': True, 'message': 'Server CA copied to data/certs/tak-ca.pem and portal restarted (same as deploy).'})
+        if bundle_parts:
+            fd_ca, ca_bundle_path = tempfile.mkstemp(suffix='.pem', prefix='tak-ca-bundle-')
+            with os.fdopen(fd_ca, 'w') as f:
+                f.write('\n'.join(bundle_parts) + '\n')
+            tak_ca_src = ca_bundle_path
+    if tak_ca_src:
+        subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True, timeout=10)
+        _log("  ✓ tak-ca.pem refreshed (server CA chain)")
+        ok_ca = True
+        if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
+            try:
+                os.remove(tak_ca_src)
+            except OSError:
+                pass
+    else:
+        _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
+    if restart and (ok_client or ok_ca):
+        subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True, timeout=30)
+    if ok_client and ok_ca:
+        return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
+    if ok_ca and not ok_client:
+        return (False, 'CA refreshed but client cert (admin.p12) not found')
+    if ok_client and not ok_ca:
+        return (False, 'Client cert refreshed but CA not found')
+    return (False, 'No certs refreshed (admin.p12 / CA not found in certs/files)')
+
+
+@app.route('/api/takserver/sync-portal-ca', methods=['POST'])
+@login_required
+def takserver_sync_portal_ca():
+    """Resync TAK Portal to TAK Server: refresh BOTH the client cert
+    (data/certs/tak-client.p12) and the CA (data/certs/tak-ca.pem), then restart.
+    v10.0.1: previously copied ONLY the CA, which left a stale/legacy client cert
+    after a CA change → Marti stats 503. Now delegates to _takportal_sync_certs."""
+    r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
+    ok, msg = _takportal_sync_certs(restart=True)
+    if not ok:
+        return jsonify({'success': False, 'error': msg}), 500
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/certs/list')
