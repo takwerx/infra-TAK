@@ -51073,12 +51073,12 @@ def takserver_uninstall():
             steps.append('External DB cleanup skipped — no credentials stored (run Provision Database on next deploy)')
         # The .deb installer always creates a local martiuser + cot DB regardless of deployment
         # mode. Clean them up so re-deploys don't hit stale-password noise in the postinstall.
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         steps.append('Cleaned up local PostgreSQL side-effect (cot database, martiuser)')
     else:
         # Local PostgreSQL (single-server or two-server mode)
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         steps.append('Cleaned up local PostgreSQL (cot database, martiuser)')
     # Clean up GPG verification artifacts
@@ -53889,6 +53889,12 @@ def run_takserver_deploy(config):
             # Java default → 17 (arch-aware)
             _jarch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
             run_cmd(f'alternatives --set java java-17-openjdk.{_jarch} 2>/dev/null; true', check=False, quiet=True)
+            # The rpm ships only CoreConfig.example.xml (the .deb postinst creates
+            # CoreConfig.xml; the rpm does not). Seed it so the SHARED Step 8 CoreConfig
+            # seds have a file to edit — without this Step 8 fails "CoreConfig.xml not
+            # found" on every rpm box. Mirrors the container deploy's seed (line ~53493).
+            run_cmd('[ -f /opt/tak/CoreConfig.xml ] || cp /opt/tak/CoreConfig.example.xml /opt/tak/CoreConfig.xml', "Seeding CoreConfig.xml from example...", check=False)
+            run_cmd('chown tak:tak /opt/tak/CoreConfig.xml 2>/dev/null; true', check=False, quiet=True)
             log_step("✓ TAK Server installed")
         else:
             settings = load_settings()
@@ -55394,7 +55400,7 @@ def run_full_uninstall():
                     break
         if os.path.exists('/opt/tak'):
             subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run('rm -rf /usr/share/debsig/keyrings/* /etc/debsig/policies/* 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
         for f in os.listdir(UPLOAD_DIR):
