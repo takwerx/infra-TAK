@@ -51000,9 +51000,15 @@ def takserver_uninstall():
     if _distro_family() == 'rhel':
         # EL9 native: dnf remove the rpm, then drop the SELinux policy module that
         # the rpm's apply-selinux.sh loaded (else a reinstall warns it's already there).
+        # IMPORTANT: clean_requirements_on_remove=False — by default `dnf remove
+        # takserver` CASCADES out postgresql15 (and psql) as now-orphaned deps, which
+        # runs BEFORE the cot/martiuser drop below → the drop fails (no psql) and a
+        # redeploy inherits a stale martiuser with a mismatched password. Keeping
+        # postgres (matches the .deb uninstall, which doesn't cascade it) lets the
+        # later DROP DATABASE cot / DROP USER martiuser actually run.
         _rpm_installed = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
         if _rpm_installed.startswith('takserver'):
-            subprocess.run('dnf remove -y takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+            subprocess.run('dnf remove -y --setopt=clean_requirements_on_remove=False takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
             _after = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
             if not _after.startswith('takserver') or 'not installed' in _after.lower():
                 steps.append('Removed TAK Server rpm (dnf)')
