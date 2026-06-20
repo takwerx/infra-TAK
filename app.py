@@ -53740,9 +53740,10 @@ def _deploy_takserver_container(config):
 
 def run_takserver_deploy(config):
     # v10.0.1 dispatch: arm64 (or operator-selected) container deploys route to
-    # the Docker path; everything else falls through to the byte-identical .deb
-    # body below. (Native .rpm for amd64-RHEL is a separate follow-up once the
-    # Rocky box is up.)
+    # the Docker path. Everything else runs the body below, which branches Steps
+    # 2/3/4/6 on _distro_family(): RHEL family → native .rpm (PGDG/dnf + SELinux +
+    # firewalld); Debian/Ubuntu → the byte-identical .deb path (every `else` here
+    # is the original apt code verbatim). Steps 1/5/7/8/9 are shared.
     if config.get('install_method') == 'container':
         return _deploy_takserver_container(config)
     try:
@@ -53759,15 +53760,32 @@ def run_takserver_deploy(config):
         log_step("✓ System limits configured")
 
         log_step(""); log_step("━━━ Step 2/9: PostgreSQL Repository ━━━")
-        run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y lsb-release > /dev/null 2>&1', "Installing prerequisites...", check=False)
-        run_cmd('install -d /usr/share/postgresql-common/pgdg', check=False)
-        run_cmd('curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc 2>/dev/null', "Adding PostgreSQL GPG key...")
-        run_cmd('echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list')
-        run_cmd('apt-get update -qq > /dev/null 2>&1', "Updating package lists...")
-        log_step("✓ PostgreSQL repository configured")
+        if _distro_family() == 'rhel':
+            # EL9 native: EPEL + PostgreSQL Global Dev Group (PGDG) repo + Java 17 + CRB.
+            # Ports reference/rocky-scripts/rock9_tak/Rocky_9_TAK_Server_install.sh (steps 2–6).
+            # NOTE: deliberately NO blanket `dnf update -y` (the standalone script does it on a
+            # fresh box; here other modules are already installed and a full update mid-deploy is
+            # an unnecessary fleet risk) — the rpm install resolves its deps from these repos.
+            _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            run_cmd('dnf install -y epel-release 2>&1', "Installing EPEL...", check=False)
+            run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
+            run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
+            run_cmd('dnf install -y java-17-openjdk-devel 2>&1', "Installing Java 17 (OpenJDK)...", check=False)
+            run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
+            run_cmd('dnf makecache 2>&1', "Refreshing package metadata...", check=False, quiet=True)
+            log_step("✓ EPEL + PostgreSQL (PGDG) repo + Java 17 + CRB configured")
+        else:
+            run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y lsb-release > /dev/null 2>&1', "Installing prerequisites...", check=False)
+            run_cmd('install -d /usr/share/postgresql-common/pgdg', check=False)
+            run_cmd('curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc 2>/dev/null', "Adding PostgreSQL GPG key...")
+            run_cmd('echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list')
+            run_cmd('apt-get update -qq > /dev/null 2>&1', "Updating package lists...")
+            log_step("✓ PostgreSQL repository configured")
 
         log_step(""); log_step("━━━ Step 3/9: Package Verification ━━━")
-        if config.get('gpg_key_path') and config.get('policy_path'):
+        if _distro_family() == 'rhel':
+            log_step("RPM install (dnf verifies repo/package GPG signatures) — skipping debsig")
+        elif config.get('gpg_key_path') and config.get('policy_path'):
             log_step("GPG key and policy found — verifying...")
             run_cmd('DEBIAN_FRONTEND=noninteractive apt-get install -y debsig-verify', check=False)
             r = subprocess.run(f"grep 'id=' {config['policy_path']} | head -1 | sed 's/.*id=\"\\([^\"]*\\)\".*/\\1/'", shell=True, capture_output=True, text=True)
@@ -53796,6 +53814,46 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 4/9: Installing TAK Server ━━━")
         if config.get('two_server') and os.path.exists('/opt/tak'):
             log_step("✓ TAK Server core already installed (two-server step 6) — skipping")
+        elif _distro_family() == 'rhel':
+            # EL9 native .rpm install (ports reference/rocky-scripts steps 7–10:
+            # dnf install rpm → SELinux apply-selinux.sh → alternatives --set java).
+            log_step(f"Installing {pkg_name} (dnf)...")
+            _rpm_ok = subprocess.run(f'rpm -qp {pkg} > /dev/null 2>&1', shell=True, capture_output=True, timeout=30)
+            if _rpm_ok.returncode != 0:
+                log_step("✗ FATAL: the uploaded .rpm is corrupted or incomplete (rpm -qp failed).")
+                log_step("  Delete the upload, download a fresh takserver-*.noarch.rpm from tak.gov, re-upload, and retry.")
+                deploy_status.update({'error': True, 'running': False}); return
+            # half-removed self-heal: rpm DB says installed but /opt/tak is gone
+            _pre = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+            if _pre.startswith('takserver') and not os.path.exists('/opt/tak'):
+                log_step("  Detected half-removed takserver (rpm installed, /opt/tak missing) — removing before reinstall...")
+                subprocess.run('dnf remove -y takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+            run_cmd(f'dnf install -y {pkg} 2>&1', "Installing TAK Server rpm (resolving deps from PGDG/EPEL/CRB)...", check=False)
+            if not os.path.exists('/opt/tak'):
+                log_step("  /opt/tak missing after install — forcing reinstall...")
+                run_cmd(f'dnf reinstall -y {pkg} 2>&1 || dnf install -y {pkg} 2>&1', check=False)
+            if not os.path.exists('/opt/tak'):
+                log_step("✗ FATAL: /opt/tak not found after rpm install — run `dnf remove -y takserver && rm -rf /opt/tak` on the host and retry")
+                deploy_status.update({'error': True, 'running': False}); return
+            # SELinux: TAK runs under enforcing; the rpm ships apply-selinux.sh — apply + verify.
+            run_cmd('dnf install -y checkpolicy 2>&1', check=False, quiet=True)
+            _enf = subprocess.run('getenforce 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+            if _enf == 'Enforcing':
+                if os.path.exists('/opt/tak/apply-selinux.sh'):
+                    run_cmd('cd /opt/tak && ./apply-selinux.sh 2>&1', "Applying TAK Server SELinux policy...", check=False)
+                    _mod = subprocess.run("semodule -l 2>/dev/null | grep -i takserver", shell=True, capture_output=True, text=True).stdout.strip()
+                    if _mod:
+                        log_step(f"  ✓ SELinux policy applied ({_mod.splitlines()[0]})")
+                    else:
+                        log_step("  ⚠ SELinux: takserver module not listed after apply-selinux.sh — TAK may hit AVC denials under enforcing")
+                else:
+                    log_step("  ⚠ /opt/tak/apply-selinux.sh missing — TAK SELinux policy not applied")
+            else:
+                log_step(f"  SELinux {_enf or 'unavailable'} — skipping TAK SELinux policy")
+            # Java default → 17 (arch-aware)
+            _jarch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            run_cmd(f'alternatives --set java java-17-openjdk.{_jarch} 2>/dev/null; true', check=False, quiet=True)
+            log_step("✓ TAK Server installed")
         else:
             settings = load_settings()
             if settings.get('pkg_mgr', 'apt') == 'apt':
@@ -53898,10 +53956,17 @@ def run_takserver_deploy(config):
         log_step("✓ TAK Server started")
 
         log_step(""); log_step("━━━ Step 6/9: Configuring Firewall ━━━")
-        for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
-            run_cmd(f'ufw allow {p} > /dev/null 2>&1')
-        run_cmd('ufw --force enable > /dev/null 2>&1')
-        log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
+        if _distro_family() == 'rhel':
+            # firewalld via _fw_allow (no-op if firewalld absent — cloud boxes rely on the
+            # provider security group; bare-metal with no host firewall = ports already open).
+            for _fp in (22, 8089, 8443, 8446, 5001):
+                _fw_allow(_fp, 'tcp')
+            log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
+        else:
+            for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
+                run_cmd(f'ufw allow {p} > /dev/null 2>&1')
+            run_cmd('ufw --force enable > /dev/null 2>&1')
+            log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
 
         log_step(""); log_step("━━━ Step 7/9: Generating Certificates ━━━")
         root_ca, int_ca = config['root_ca_name'], config['intermediate_ca_name']
