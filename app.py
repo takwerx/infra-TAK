@@ -19188,7 +19188,9 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     plog("")
     plog("━━━ Step 3/7: Downloading & Installing MediaMTX (remote) ━━━")
     url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}/mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
-    cmd = f'cd /tmp && wget -q -O mediamtx.tar.gz "{url}" && tar -xzf mediamtx.tar.gz && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && rm -f mediamtx.tar.gz'
+    # restorecon relabels the binary to bin_t on RHEL/SELinux (mv from /tmp keeps
+    # tmp_t → systemd 203/EXEC); no-op on Debian (|| true). Universal one-liner.
+    cmd = f'cd /tmp && wget -q -O mediamtx.tar.gz "{url}" && tar -xzf mediamtx.tar.gz && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && (restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && rm -f mediamtx.tar.gz'
     ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
     if not ok:
         plog(f"✗ Download/install failed: {(out or '')[-200:]}")
@@ -19706,6 +19708,13 @@ def run_mediamtx_deploy():
             return
         subprocess.run(f'tar -xzf {tmp}/mediamtx.tar.gz -C {tmp}', shell=True, capture_output=True)
         subprocess.run(f'mv -f {tmp}/mediamtx /usr/local/bin/mediamtx && chmod +x /usr/local/bin/mediamtx', shell=True, capture_output=True)
+        # RHEL/SELinux: the binary was downloaded under /tmp (tmp_t) and `mv` preserves
+        # that label, so systemd refuses to exec it → 203/EXEC "Permission denied" and
+        # the service crash-loops. restorecon relabels /usr/local/bin/mediamtx to bin_t
+        # (chcon fallback). No-op on Debian (restorecon/chcon absent → || true).
+        if _distro_family() == 'rhel':
+            subprocess.run('restorecon -v /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null; true',
+                           shell=True, capture_output=True, text=True, timeout=30)
         subprocess.run(f'rm -rf {tmp}', shell=True, capture_output=True)
         plog(f"✓ MediaMTX v{version} installed to /usr/local/bin/mediamtx")
 
