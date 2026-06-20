@@ -915,6 +915,25 @@ def _tak_is_container():
     The control shim (Phase 3) routes systemctl/exec sites on this."""
     return _tak_install_method() == 'container'
 
+# v10.0.1 — modules with no arm64 build. WebODM photogrammetry images and the
+# Federation Hub TAK .deb/.rpm package are amd64-only, so a LOCAL install on an
+# arm64 host is impossible. The marketplace card is gated off with this message
+# and the local deploy path refuses. The gate is scoped to LOCAL installs only —
+# a remote deploy targets another host's CPU arch, so the backend block fires on
+# the local branch only and never on a remote (SSH) deploy.
+_ARM64_LOCAL_UNAVAILABLE_MODULES = {
+    'webodm': 'WebODM photogrammetry images are amd64-only — not available on ARM (aarch64).',
+    'fedhub': 'Federation Hub is distributed only as an amd64 TAK package — not available on ARM (aarch64).',
+}
+
+def _module_arch_blocked(key):
+    """Reason string if module `key` has no build for THIS host's CPU arch, else
+    None. arm64 only — amd64 is the byte-identical baseline where nothing is
+    gated (the helper returns None and every caller is a no-op)."""
+    if _host_arch() == 'arm64':
+        return _ARM64_LOCAL_UNAVAILABLE_MODULES.get(key)
+    return None
+
 # --------------------------------------------------------------------------
 # v10.0.1 — Container TAK Server constants + control shim (Phase 3)
 # --------------------------------------------------------------------------
@@ -4082,8 +4101,12 @@ def marketplace_page():
     settings = load_settings()
     all_modules = detect_modules()
     modules = {k: m for k, m in all_modules.items() if not m.get('installed')}
-    # Annotate any uninstalled module that conflicts with an already-installed module
+    # Annotate any uninstalled module that conflicts with an already-installed module,
+    # or that has no build for this host's CPU arch (arm64 — WebODM/Fed Hub).
     for key, mod in modules.items():
+        ab = _module_arch_blocked(key)
+        if ab:
+            mod['_arch_blocked'] = ab
         for conflict_key in (mod.get('conflicts') or []):
             if all_modules.get(conflict_key, {}).get('installed'):
                 mod['_conflict_with'] = all_modules[conflict_key].get('name', conflict_key)
@@ -12051,6 +12074,14 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         settings = load_settings()
         cfg = _get_fedhub_deployment_config(settings)
         is_remote = cfg.get('target_mode') == 'remote'
+        # v10.0.1: no arm64 Fed Hub package — refuse a LOCAL install on aarch64.
+        # (Remote installs target another host's arch, so they pass through.)
+        if not is_remote:
+            _ab = _module_arch_blocked('fedhub')
+            if _ab:
+                plog(f'✗ {_ab} Deploy Federation Hub to a SEPARATE amd64 host (configure the SSH target below).')
+                status_dict.update({'running': False, 'complete': True, 'error': True})
+                return
         # v0.9.46: refuse a NEW local install when TAK Server is on this box (no co-location).
         # Grandfathered local hubs (already deployed) are left alone.
         if not is_remote and not cfg.get('deployed') and _takserver_installed_local():
@@ -23911,6 +23942,12 @@ def _run_webodm_deploy(settings):
     deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
     if deploy_cfg.get('target_mode') == 'remote':
         _run_webodm_deploy_remote(settings, deploy_cfg, plog)
+        return
+    # v10.0.1 — no arm64 WebODM image; a local install on aarch64 cannot run.
+    _ab = _module_arch_blocked('webodm')
+    if _ab:
+        plog(f'✗ {_ab} Deploy WebODM to a separate amd64 host instead (configure the SSH target on this page).')
+        _webodm_deploy_status.update({'running': False, 'complete': True, 'error': _ab})
         return
     wo_dir = os.path.expanduser('~/webodm')
     wo_port = settings.get('webodm_port', 8765)
@@ -58510,12 +58547,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% else %}
 {% for key, mod in modules.items() %}
-<a class="module-card{% if mod.get('_conflict_with') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
+<a class="module-card{% if mod.get('_conflict_with') or mod.get('_arch_blocked') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:{% if key == 'remote_assist' %}32px{% else %}36px{% endif %};width:auto;max-width:{% if key == 'takserver' %}72px{% elif key == 'remote_assist' %}100%{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
-{% if mod.get('_conflict_with') %}
+{% if mod.get('_arch_blocked') %}
+<div class="conflict-banner">🚫 Not available on this architecture — {{ mod._arch_blocked }}</div>
+{% elif mod.get('_conflict_with') %}
 <div class="conflict-banner">🚫 Cannot deploy — <strong>{{ mod._conflict_with }}</strong> is already installed and uses the same ports. Uninstall it first.</div>
 {% else %}
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
