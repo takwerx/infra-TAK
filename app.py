@@ -6928,10 +6928,16 @@ def _run_remote_assist_deploy(settings):
 
         plog('')
         plog('━━━ Step 6/6: Firewall & Reverse Proxy ━━━')
-        _sp.run(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp'], capture_output=True)
-        plog(f'  ✓ ufw deny {REMOTE_ASSIST_PORT}/tcp (loopback/Caddy-only)')
-        _sp.run(['ufw', 'allow', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'], capture_output=True)
-        plog(f'  ✓ ufw allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API)')
+        if _distro_family() == 'rhel':
+            # No ufw on RHEL (bare argv ufw aborts the deploy). The proxy port is
+            # Caddy-only via firewalld default-deny / SG; the Android device API port
+            # reaches the box via the cloud SG. Proper firewalld = firewall-parity track.
+            plog(f'  (RHEL: ufw absent — {REMOTE_ASSIST_PORT} Caddy-only via firewalld default-deny/SG; device API {REMOTE_ASSIST_DEVICE_PORT} via SG)')
+        else:
+            _sp.run(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp'], capture_output=True)
+            plog(f'  ✓ ufw deny {REMOTE_ASSIST_PORT}/tcp (loopback/Caddy-only)')
+            _sp.run(['ufw', 'allow', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'], capture_output=True)
+            plog(f'  ✓ ufw allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API)')
         s = load_settings()
         s['remote_assist_enabled'] = True
         s['remote_assist_pg_password'] = pg_password
@@ -23948,9 +23954,17 @@ def _run_webodm_deploy(settings):
         if r.returncode != 0:
             plog(f'Pull warning (non-fatal): {r.stderr[:200]}')
 
-        plog('Hardening UFW — blocking direct access to WebODM ports…')
-        for _wo_ufw_port in [wo_port, 3001]:
-            _sp.run(['ufw', 'deny', f'{_wo_ufw_port}/tcp'], capture_output=True)
+        plog('Hardening firewall — blocking direct access to WebODM ports…')
+        if _distro_family() == 'rhel':
+            # No ufw on RHEL — and the bare `ufw` argv call raises FileNotFoundError
+            # (no shell/fallback) which aborts the deploy. firewalld default-denies
+            # un-opened ports and the cloud security group covers external access, so
+            # the WebODM ports are already not externally reachable. (Firewalld-native
+            # deny is part of the firewall-parity track.)
+            plog('  (RHEL: ufw absent — WebODM ports covered by firewalld default-deny / cloud SG)')
+        else:
+            for _wo_ufw_port in [wo_port, 3001]:
+                _sp.run(['ufw', 'deny', f'{_wo_ufw_port}/tcp'], capture_output=True)
 
         plog('Starting WebODM containers…')
         r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
@@ -25239,15 +25253,22 @@ def _run_tvr_deploy(settings):
 
         # Step 5: UFW rules
         plog('')
-        plog('━━━ Step 5/6: Configuring Firewall (UFW) ━━━')
-        for port_proto in ['8554/tcp', '8555/tcp', '1935/tcp', '8890/udp']:
-            _sp.run(['ufw', 'allow', port_proto], capture_output=True)
-            plog(f'  ✓ ufw allow {port_proto}')
-        # Block direct access to web UI and HLS — Caddy is the only entry point
-        # TVR web UI is on host port 3100 (not 3000 — that's TAK Portal)
-        for port_proto in ['3100/tcp', '8888/tcp']:
-            _sp.run(['ufw', 'deny', port_proto], capture_output=True)
-            plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
+        plog('━━━ Step 5/6: Configuring Firewall ━━━')
+        if _distro_family() == 'rhel':
+            # No ufw on RHEL — a bare argv `ufw` call raises FileNotFoundError and
+            # aborts the deploy. Stream ports reach the box via the cloud SG; the web
+            # UI / HLS are blocked from direct access by firewalld default-deny / SG
+            # (Caddy is the entry point). Proper firewalld allow/deny = firewall-parity track.
+            plog('  (RHEL: ufw absent — stream ports via SG; web UI/HLS Caddy-only via firewalld default-deny/SG)')
+        else:
+            for port_proto in ['8554/tcp', '8555/tcp', '1935/tcp', '8890/udp']:
+                _sp.run(['ufw', 'allow', port_proto], capture_output=True)
+                plog(f'  ✓ ufw allow {port_proto}')
+            # Block direct access to web UI and HLS — Caddy is the only entry point
+            # TVR web UI is on host port 3100 (not 3000 — that's TAK Portal)
+            for port_proto in ['3100/tcp', '8888/tcp']:
+                _sp.run(['ufw', 'deny', port_proto], capture_output=True)
+                plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
 
         # Step 6: Save settings + regenerate Caddyfile
         plog('')
