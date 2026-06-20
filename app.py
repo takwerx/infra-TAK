@@ -51582,7 +51582,7 @@ def upload_takserver_package():
         if fn.endswith('.deb'):
             if _arch == 'arm64':
                 os.remove(fp)
-                return jsonify({'error': f'.deb uploaded but this is an arm64 system — no native arm TAK package exists. Upload the takserver-docker .zip.'}), 400
+                return jsonify({'error': f'.deb uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
             if _distro_family() == 'rhel':
                 os.remove(fp)
                 return jsonify({'error': f'.deb uploaded but system is {os_type} (RHEL family). Need a takserver .rpm.'}), 400
@@ -51590,14 +51590,16 @@ def upload_takserver_package():
         elif fn.endswith('.rpm'):
             if _arch == 'arm64':
                 os.remove(fp)
-                return jsonify({'error': f'.rpm uploaded but this is an arm64 system — no native arm TAK package exists. Upload the takserver-docker .zip.'}), 400
+                return jsonify({'error': f'.rpm uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
             if _distro_family() != 'rhel':
                 os.remove(fp)
                 return jsonify({'error': f'.rpm uploaded but system is {os_type}. Need a takserver .deb.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'rpm', 'size_mb': sz})
         elif fn.endswith('.zip') and 'docker' in fn.lower():
-            # official takserver-docker-*.zip — the CONTAINER path. Native arch (amd64)
-            # must use its native package; only arm64 (no native arm pkg) takes the zip.
+            # official takserver-docker-*.zip — the CONTAINER path. amd64 must use its
+            # native package (.deb/.rpm); arm64 is container-only here, so it takes the
+            # zip. (The TAK deb/rpm are arch-neutral — _all/.noarch — but arm64 deploys
+            # via the container path: it's the supported, field-validated arm path.)
             if _arch != 'arm64':
                 os.remove(fp)
                 return jsonify({'error': f'Docker .zip uploaded but this is an amd64 {os_type} system — upload the native takserver {_native_ext}. (The docker .zip is the arm64 path.)'}), 400
