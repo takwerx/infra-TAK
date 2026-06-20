@@ -8135,6 +8135,20 @@ def _f2b_read_jail_config():
         pass
     return cfg
 
+def _f2b_banaction():
+    """fail2ban ban action per host firewall family. Debian → 'ufw'; RHEL has no
+    ufw, so use 'iptables-multiport' (works on Rocky 9 via the nft-backed iptables
+    compat, with or without firewalld active — firewalld is off on cloud boxes).
+    The infratak-guarddog notify action is appended on top of this by each jail.
+    (Firewalld-native banaction is part of the broader firewall-parity work.)"""
+    return 'iptables-multiport' if _distro_family() == 'rhel' else 'ufw'
+
+
+def _f2b_sshd_logpath():
+    """sshd auth log path: Debian → /var/log/auth.log; RHEL → /var/log/secure."""
+    return '/var/log/secure' if _distro_family() == 'rhel' else '/var/log/auth.log'
+
+
 def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Rewrite the infratak-authentik jail config with new thresholds and ignoreip whitelist."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
@@ -8152,7 +8166,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
@@ -8198,7 +8212,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
@@ -8239,12 +8253,12 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
         "[sshd]\n"
         "enabled  = true\n"
         "filter   = sshd\n"
-        "logpath  = /var/log/auth.log\n"
+        f"logpath  = {_f2b_sshd_logpath()}\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
@@ -8785,7 +8799,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     with open(jail_path, 'w') as _f:
@@ -9008,7 +9022,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open('/etc/fail2ban/jail.d/infratak-takportal.conf', 'w') as _f:
         _f.write(jail_conf)
@@ -9258,7 +9272,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
-        "action   = ufw\n"
+        f"action   = {_f2b_banaction()}\n"
     )
     with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
         _f.write(jail_conf)
@@ -60155,7 +60169,7 @@ def _fail2ban_install_and_configure(plog):
         "maxretry = 5\n"
         "findtime = 600\n"
         "bantime  = 3600\n"
-        "action   = ufw\n"
+        f"action   = {_f2b_banaction()}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
     with open(jail_path, 'w') as _f:
