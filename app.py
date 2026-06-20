@@ -51115,19 +51115,35 @@ def upload_takserver_package():
         fp = os.path.join(UPLOAD_DIR, fn)
         f.save(fp)
         sz = round(os.path.getsize(fp) / (1024*1024), 1)
+        # v10.0.1 platform gate: the accepted package type is fixed by arch+distro,
+        # mirroring the existing .deb/.rpm cross-rejection. arm64 → docker .zip only
+        # (no native arm TAK package exists); amd64 RHEL → .rpm only; amd64 Debian/
+        # Ubuntu → .deb only. Reject anything else up-front so a box can't be deployed
+        # with the wrong package by accident.
+        _arch = _host_arch()
+        _native_ext = '.rpm' if _distro_family() == 'rhel' else '.deb'
         if fn.endswith('.deb'):
-            if 'rocky' in os_type:
+            if _arch == 'arm64':
                 os.remove(fp)
-                return jsonify({'error': f'DEB uploaded but system is {os_type}. Need .rpm.'}), 400
+                return jsonify({'error': f'.deb uploaded but this is an arm64 system — no native arm TAK package exists. Upload the takserver-docker .zip.'}), 400
+            if _distro_family() == 'rhel':
+                os.remove(fp)
+                return jsonify({'error': f'.deb uploaded but system is {os_type} (RHEL family). Need a takserver .rpm.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'deb', 'size_mb': sz})
         elif fn.endswith('.rpm'):
-            if 'ubuntu' in os_type:
+            if _arch == 'arm64':
                 os.remove(fp)
-                return jsonify({'error': f'RPM uploaded but system is {os_type}. Need .deb.'}), 400
+                return jsonify({'error': f'.rpm uploaded but this is an arm64 system — no native arm TAK package exists. Upload the takserver-docker .zip.'}), 400
+            if _distro_family() != 'rhel':
+                os.remove(fp)
+                return jsonify({'error': f'.rpm uploaded but system is {os_type}. Need a takserver .deb.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'rpm', 'size_mb': sz})
         elif fn.endswith('.zip') and 'docker' in fn.lower():
-            # v10.0.1: official takserver-docker-*.zip — container deploy (arm64
-            # forced, or operator-selected on amd64).
+            # official takserver-docker-*.zip — the CONTAINER path. Native arch (amd64)
+            # must use its native package; only arm64 (no native arm pkg) takes the zip.
+            if _arch != 'arm64':
+                os.remove(fp)
+                return jsonify({'error': f'Docker .zip uploaded but this is an amd64 {os_type} system — upload the native takserver {_native_ext}. (The docker .zip is the arm64 path.)'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'docker', 'size_mb': sz})
         elif fn.endswith('.key') or 'gpg' in fn.lower():
             results['gpg_key'] = {'filename': fn, 'filepath': fp, 'size_mb': sz}
