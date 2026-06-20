@@ -55,6 +55,20 @@ detect_server_ip() {
         "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" \
         2>/dev/null || true)
     if [ -z "$public_ip" ]; then
+        # AWS IMDSv2 (token) — modern AMIs (esp. ARM/Graviton) default to
+        # HttpTokens=required, which 401s the token-less IMDSv1 call below.
+        local aws_tok
+        aws_tok=$(curl -s --max-time 2 -X PUT \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+            http://169.254.169.254/latest/api/token 2>/dev/null || true)
+        if [ -n "$aws_tok" ]; then
+            public_ip=$(curl -s --max-time 2 \
+                -H "X-aws-ec2-metadata-token: $aws_tok" \
+                http://169.254.169.254/latest/meta-data/public-ipv4 \
+                2>/dev/null || true)
+        fi
+    fi
+    if [ -z "$public_ip" ]; then
         public_ip=$(curl -s --max-time 2 \
             http://169.254.169.254/latest/meta-data/public-ipv4 \
             2>/dev/null || true)

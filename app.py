@@ -37850,13 +37850,31 @@ def _detect_cloud_public_ip():
         except Exception:
             pass
     elif cloud == 'aws':
+        # Try IMDSv2 (token) FIRST — modern AMIs (esp. ARM/Graviton) default to
+        # HttpTokens=required, which 401s the token-less IMDSv1 call. Without this
+        # the public IP silently falls through to the echo services and, if egress
+        # hiccups, to hostname -I (private). Root-caused on aws-arm 2026-06-20.
+        _aws_token = ''
         try:
-            with _ur.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=2) as r:
-                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
-            if _body and _ipv4.match(_body):
-                return _body, 'aws-imds-direct'
+            _treq = _ur.Request(
+                'http://169.254.169.254/latest/api/token',
+                method='PUT',
+                headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'},
+            )
+            with _ur.urlopen(_treq, timeout=2) as r:
+                _aws_token = (r.read() or b'').decode('utf-8', 'replace').strip()
         except Exception:
             pass
+        _imds_hdrs = ([{'X-aws-ec2-metadata-token': _aws_token}] if _aws_token else []) + [{}]
+        for _hdrs in _imds_hdrs:
+            try:
+                _mreq = _ur.Request('http://169.254.169.254/latest/meta-data/public-ipv4', headers=_hdrs)
+                with _ur.urlopen(_mreq, timeout=2) as r:
+                    _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+                if _body and _ipv4.match(_body):
+                    return _body, 'aws-imds-direct'
+            except Exception:
+                continue
 
     # Step 3: cloud VM with no direct public IP — fall through to echo services
     # (safe because the cloud-VM precondition has already been established).
