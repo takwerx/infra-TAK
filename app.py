@@ -59076,7 +59076,7 @@ function takPurgeFailed(){
 <div class="upload-icon">📦</div><div class="upload-text">Drop your TAK Server files here</div>
 <div class="upload-hint" style="margin-bottom:6px"><span style="color:var(--text-dim);font-size:12px">Slow upload? Use the backdoor — open <strong>https://{{ settings.get('server_ip', 'SERVER_IP') }}:5001</strong> and upload from the TAK Server page there (skips proxy, no timeout).</span></div>
 <div class="upload-hint" id="upload-requirements-hint">
-<span style="color:var(--text-dim);font-size:12px">One server: takserver .deb/.rpm + optional .pol and .key — Split server: takserver-core and takserver-database.</span>
+<span style="color:var(--text-dim);font-size:12px">{% if settings.get('arch') == 'arm64' %}One server: takserver-docker .zip (container build — no native arm package) + optional .key.{% else %}One server: takserver .deb/.rpm + optional .pol and .key — Split server: takserver-core and takserver-database.{% endif %}</span>
 </div>
 <input type="file" id="file-input" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
 </div>
