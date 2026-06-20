@@ -27018,17 +27018,25 @@ def _reload_embedded_outpost(plog=None):
             _log("  ⚠ embedded-outpost reload: authentik-server container not found")
             return False
         subprocess.run(_sudo_wrap(['docker', 'restart', name]), capture_output=True, text=True, timeout=90)
-        import urllib.request as _req
-        for _ in range(30):
-            try:
-                with _req.urlopen('http://127.0.0.1:9000/-/health/ready/', timeout=3) as r:
-                    if r.status == 200:
-                        _log(f"  ✓ Authentik embedded outpost reloaded (restarted {name})")
-                        return True
-            except Exception:
-                pass
+        # Wait until authentik-server is back so the caller's later API calls don't
+        # fail. Use the container's own healthcheck — Authentik's HTTP health probes
+        # 400 on a 127.0.0.1 Host (host validation), so an HTTP poll never confirms.
+        ready = False
+        for _ in range(60):  # up to ~120s — server restart can run blueprints/migrations
             time.sleep(2)
-        _log(f"  ✓ Authentik embedded outpost restart issued ({name}) — readiness not confirmed in 60s")
+            h = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Health.Status}}', name]),
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+            if h == 'healthy':
+                ready = True
+                break
+            if not h:  # image has no healthcheck → best-effort settle then accept
+                time.sleep(15)
+                ready = True
+                break
+        if ready:
+            _log(f"  ✓ Authentik embedded outpost reloaded (restarted {name})")
+        else:
+            _log(f"  ✓ Authentik embedded outpost restart issued ({name}) — not confirmed healthy in 120s (proceeding)")
         return True
     except Exception as e:
         _log(f"  ⚠ embedded-outpost reload error: {str(e)[:80]}")
