@@ -26996,9 +26996,50 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
 
 
+def _reload_embedded_outpost(plog=None):
+    """Force the Authentik embedded outpost to reload its provider/host list by
+    restarting the authentik-server container (the embedded proxy outpost runs
+    INSIDE that process).
+
+    Why: after a proxy provider is added to the embedded outpost via the API, the
+    RUNNING outpost does not reliably hot-reload — the new external_host returns an
+    Authentik 'Not Found' until the server restarts. Observed on BOTH Ubuntu and
+    RHEL; there is no clean API to force a reload. We restart only the `server`
+    container (not worker/db/redis/ldap) to keep the SSO blip minimal, then wait
+    for the API to come back so the caller's subsequent Authentik calls don't fail.
+    Best-effort; idempotent caller-gated (only invoked when the outpost actually
+    changed). NON-ROOT-COMMANDS: docker."""
+    _log = plog or (lambda m: None)
+    try:
+        names = subprocess.run("docker ps --filter name=authentik-server --format '{{.Names}}'",
+                               shell=True, capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        name = names[0].strip() if names else ''
+        if not name:
+            _log("  ⚠ embedded-outpost reload: authentik-server container not found")
+            return False
+        subprocess.run(_sudo_wrap(['docker', 'restart', name]), capture_output=True, text=True, timeout=90)
+        import urllib.request as _req
+        for _ in range(30):
+            try:
+                with _req.urlopen('http://127.0.0.1:9000/-/health/ready/', timeout=3) as r:
+                    if r.status == 200:
+                        _log(f"  ✓ Authentik embedded outpost reloaded (restarted {name})")
+                        return True
+            except Exception:
+                pass
+            time.sleep(2)
+        _log(f"  ✓ Authentik embedded outpost restart issued ({name}) — readiness not confirmed in 60s")
+        return True
+    except Exception as e:
+        _log(f"  ⚠ embedded-outpost reload error: {str(e)[:80]}")
+        return False
+
+
 def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=None):
     """Add given provider PKs to the embedded outpost. Never removes existing providers.
-    GET full outpost, normalize providers to PKs, append any missing from provider_pks_to_add, PATCH only if we added and didn't shorten."""
+    GET full outpost, normalize providers to PKs, append any missing from provider_pks_to_add, PATCH only if we added and didn't shorten.
+    On a real change, restart authentik-server so the embedded outpost reloads the
+    new host (it won't hot-reload on its own — Authentik 'Not Found' otherwise)."""
     if not provider_pks_to_add:
         return False
     import urllib.request as _req
@@ -27034,6 +27075,11 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
         _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
             data=json.dumps({'providers': current_pks}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
         _log("  ✓ Providers added to embedded outpost")
+        # The PATCH lands in the DB but the running embedded outpost won't hot-reload
+        # the new host — restart authentik-server so the new vhost serves instead of
+        # returning an Authentik 'Not Found'. Only here (added > 0), so idempotent
+        # re-runs don't restart Authentik.
+        _reload_embedded_outpost(plog=plog)
         return True
     except Exception as e:
         _log(f"  ⚠ Outpost error: {str(e)[:80]}")
