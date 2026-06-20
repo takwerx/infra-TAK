@@ -8182,14 +8182,25 @@ def _f2b_selfheal_rhel_jails(plog=None):
                     f.write(new)
                 changed = True
                 _log(f"  fail2ban self-heal: patched {os.path.basename(path)} (ufw→{banaction}, auth.log→secure)")
-        if changed:
-            act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
-                                 capture_output=True, text=True).stdout.strip()
+        # The recidive jail reads fail2ban's OWN log (/var/log/fail2ban.log). On a box
+        # where fail2ban never started cleanly (it was failing on the ufw action), that
+        # file was never created → "Have not found any log file for recidive jail" →
+        # fail2ban still won't start. Pre-create it (logtarget already points there) so
+        # the jail loads on this start.
+        if not os.path.exists('/var/log/fail2ban.log'):
+            subprocess.run(_sudo_wrap(['touch', '/var/log/fail2ban.log']), capture_output=True, timeout=10)
+            changed = True
+            _log("  fail2ban self-heal: created /var/log/fail2ban.log (recidive jail reads it)")
+        # Bring fail2ban up if jails are configured but it isn't running (clears the
+        # failed state left by the pre-fix ufw config).
+        act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                             capture_output=True, text=True).stdout.strip()
+        if changed or act != 'active':
             if act == 'active':
                 subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, text=True, timeout=30)
             else:
                 subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']), capture_output=True, text=True, timeout=30)
-            _log("  ✓ fail2ban self-heal: stale jails repaired for RHEL and fail2ban reloaded")
+            _log("  ✓ fail2ban self-heal: jails repaired for RHEL and fail2ban (re)started")
         return changed
     except Exception as e:
         _log(f"  ⚠ fail2ban self-heal error (non-fatal): {str(e)[:120]}")
@@ -9323,6 +9334,13 @@ def _f2b_write_recidive_config(maxretry, findtime):
     )
     with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
         _f.write(jail_conf)
+    # The recidive jail reads fail2ban's own log; pre-create it so the jail loads on
+    # the very first start (on RHEL fail2ban never creates it until a clean start —
+    # chicken/egg). Harmless no-op where the file already exists (e.g. Debian).
+    try:
+        subprocess.run(_sudo_wrap(['touch', '/var/log/fail2ban.log']), capture_output=True, timeout=10)
+    except Exception:
+        pass
     # NOTE: _f2b_write_recidive_config takes no ignoreip arg — the recidive jail's
     # ignoreip is always the fleet trusted set (no per-jail operator override needed).
     # Ensure fail2ban SQLite persistence so permanent bans survive restarts
