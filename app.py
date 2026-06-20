@@ -19613,15 +19613,30 @@ def run_mediamtx_deploy():
             _run_mediamtx_deploy_remote(settings, deploy_cfg, plog)
             return
 
-        # Step 1: Wait for apt lock / install deps
+        # Step 1: install deps (distro-branched). RHEL/Rocky has no apt; ffmpeg lives
+        # in EPEL and needs CRB enabled (mirrors the mediamtx-installer rocky-9
+        # reference script). EPEL/CRB may already be on from a prior TAK Server
+        # deploy — both steps are idempotent. The .deb branch (else) is unchanged.
         plog("━━━ Step 1/7: Installing Dependencies ━━━")
-        wait_for_apt_lock(plog, mediamtx_deploy_log)
-        r = subprocess.run('apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1',
-            shell=True, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            plog(f"✗ apt install failed: {r.stdout[-200:]}")
-            mediamtx_deploy_status.update({'running': False, 'error': True})
-            return
+        if _distro_family() == 'rhel':
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'epel-release', 'dnf-plugins-core']),
+                           capture_output=True, text=True, timeout=300)
+            subprocess.run('dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null; true',
+                           shell=True, capture_output=True, text=True, timeout=120)
+            ok, out = _pkg_install(['wget', 'tar', 'curl', 'ffmpeg', 'openssl', 'python3', 'python3-pip'],
+                                   log_fn=plog, timeout=900)
+            if not ok:
+                plog(f"✗ dnf install failed: {(out or '')[-200:]}")
+                mediamtx_deploy_status.update({'running': False, 'error': True})
+                return
+        else:
+            wait_for_apt_lock(plog, mediamtx_deploy_log)
+            r = subprocess.run('apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1',
+                shell=True, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                plog(f"✗ apt install failed: {r.stdout[-200:]}")
+                mediamtx_deploy_status.update({'running': False, 'error': True})
+                return
         plog("✓ Dependencies installed (wget, ffmpeg, python3)")
 
         # Install Python packages (try with --break-system-packages for newer pip, else without)
