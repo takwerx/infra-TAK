@@ -18402,92 +18402,16 @@ def run_takportal_deploy():
         # Step 5: Copy TAK Server certs into container
         plog("")
         plog("\u2501\u2501\u2501 Step 5/6: Copying TAK Server Certificates \u2501\u2501\u2501")
-        cert_dir = '/opt/tak/certs/files'
-        webadmin_p12 = os.path.join(cert_dir, 'admin.p12')
-        tak_ca = os.path.join(cert_dir, 'truststore-root.p12')
-        # Find the actual cert files
-        if not os.path.exists(webadmin_p12):
-            # Try alternate names
-            for name in ['webadmin.p12', 'admin.p12']:
-                p = os.path.join(cert_dir, name)
-                if os.path.exists(p):
-                    webadmin_p12 = p
-                    break
-        if not os.path.exists(tak_ca):
-            for name in ['truststore-root.p12', 'tak-ca.pem', 'ca.pem']:
-                p = os.path.join(cert_dir, name)
-                if os.path.exists(p):
-                    tak_ca = p
-                    break
-        # Create certs dir in container data volume (persists across rebuilds)
-        subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
-        certs_copied = True
-        if os.path.exists(webadmin_p12):
-            # Re-encode P12 with modern encryption (AES-256-CBC) — TAK Server generates
-            # legacy RC2-40-CBC which Node.js 22+ / OpenSSL 3.x rejects
-            fd_p12, modern_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-admin-')
-            os.close(fd_p12)
-            cert_pass = _get_tak_cert_password(load_settings())
-            r = subprocess.run(
-                f'openssl pkcs12 -in {shlex.quote(webadmin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)}',
-                shell=True, capture_output=True, text=True, timeout=30)
-            if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                subprocess.run(f'docker cp {shlex.quote(modern_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                try:
-                    os.remove(modern_p12)
-                except OSError:
-                    pass
-                plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (re-encoded for modern OpenSSL)")
-            else:
-                try:
-                    os.remove(modern_p12)
-                except OSError:
-                    pass
-                subprocess.run(f'docker cp {webadmin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (legacy format, re-encode failed)")
-        else:
-            plog("\u26a0 admin.p12 not found in /opt/tak/certs/files/")
-            certs_copied = False
-        # Copy CA chain for TAK Portal. takserver.pem contains the full chain
-        # (server + intermediate + root) which is what TAK Portal expects.
-        # Fallback to building a bundle from ca.pem + root-ca.pem if needed.
-        tak_ca_src = None
-        ca_bundle_path = None
-        takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-        if os.path.exists(takserver_pem):
-            tak_ca_src = takserver_pem
-            plog(f"  Using takserver.pem (full chain)")
-        else:
-            # Build bundle from individual CA files
-            int_ca = os.path.join(cert_dir, 'ca.pem')
-            root_ca = os.path.join(cert_dir, 'root-ca.pem')
-            bundle_parts = []
-            for ca_file in [int_ca, root_ca]:
-                if os.path.exists(ca_file):
-                    with open(ca_file, 'r') as f:
-                        content = f.read().strip()
-                    if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
-                        bundle_parts.append(content)
-            if bundle_parts:
-                fd_ca, ca_bundle_path = tempfile.mkstemp(suffix='.pem', prefix='tak-ca-bundle-')
-                with os.fdopen(fd_ca, 'w') as f:
-                    f.write('\n'.join(bundle_parts) + '\n')
-                tak_ca_src = ca_bundle_path
-                plog(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
-        if tak_ca_src:
-            subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
-            if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
-                try:
-                    os.remove(tak_ca_src)
-                except OSError:
-                    pass
-            plog(f"  -> data/certs/tak-ca.pem")
-        else:
-            plog("\u26a0 No CA cert files found in /opt/tak/certs/files/")
-            certs_copied = False
-        if certs_copied:
+        # v10.0.1: delegate to _takportal_sync_certs — copies BOTH the client cert
+        # (admin.p12 re-encoded to modern PKCS12 via a temp file; the old stdin
+        # pipe silently failed on OpenSSL 3 and shipped an unreadable legacy cert)
+        # and the CA chain. restart=False: Step 6 writes settings.json and the
+        # deploy restarts the container afterwards.
+        _certs_ok, _certs_msg = _takportal_sync_certs(plog=plog)
+        if _certs_ok:
             plog("\u2713 Certificates copied to container data volume")
+        else:
+            plog(f"\u26a0 Certificate copy: {_certs_msg}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -50340,58 +50264,12 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 7/7: Updating TAK Portal certificates...")
-            portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
-                                            shell=True, capture_output=True).returncode == 0
-            if portal_running:
-                run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', check=False)
-                admin_p12 = os.path.join(cert_dir, 'admin.p12')
-                modern_p12 = '/tmp/tak-portal-admin-modern.p12'
-                subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
-                    shell=True, capture_output=True, text=True, timeout=30)
-                if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                    run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    os.remove(modern_p12)
-                    log("  ✓ admin.p12 copied to TAK Portal (re-encoded)")
-                else:
-                    run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    log("  ✓ admin.p12 copied to TAK Portal")
-                # Keep TAK Portal CA source identical to original deploy behavior:
-                # prefer takserver.pem (full server chain), fallback to ca.pem + root-ca.pem.
-                tak_ca_src = None
-                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-                if os.path.exists(takserver_pem):
-                    tak_ca_src = takserver_pem
-                    log("  Using takserver.pem (full chain)")
-                else:
-                    int_ca = os.path.join(cert_dir, 'ca.pem')
-                    root_ca = os.path.join(cert_dir, 'root-ca.pem')
-                    bundle_parts = []
-                    for ca_file in [int_ca, root_ca]:
-                        if os.path.exists(ca_file):
-                            with open(ca_file, 'r') as f:
-                                content = f.read().strip()
-                            if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
-                                bundle_parts.append(content)
-                    if bundle_parts:
-                        ca_bundle_path = '/tmp/tak-ca-bundle-rotate.pem'
-                        with open(ca_bundle_path, 'w') as f:
-                            f.write('\n'.join(bundle_parts) + '\n')
-                        tak_ca_src = ca_bundle_path
-                        log(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
-                if tak_ca_src:
-                    run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                    if tak_ca_src.startswith('/tmp/'):
-                        try:
-                            os.remove(tak_ca_src)
-                        except Exception:
-                            pass
-                    log("  ✓ CA chain copied to TAK Portal")
-                run('docker restart tak-portal 2>/dev/null', check=False)
-                log("  ✓ TAK Portal restarted with new certificates")
-            else:
-                log("  TAK Portal not running — will update on next deploy")
+            # v10.0.1: delegate to _takportal_sync_certs — refreshes client cert +
+            # CA via a temp-file re-encode (the old stdin pipe failed on OpenSSL 3
+            # and shipped an unreadable legacy cert). restart=True so the portal
+            # picks up the new CA-signed cert.
+            _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+            log(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
 
             log("")
             log("Restarting TAK Server...")
@@ -50484,37 +50362,9 @@ def takserver_revoke_old_ca():
         subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=90)
 
         # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
-        portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True).returncode == 0
-        if portal_running:
-            subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
-            admin_p12 = os.path.join(cert_dir, 'admin.p12')
-            modern_p12 = '/tmp/tak-portal-admin-modern.p12'
-            subprocess.run(
-                f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
-                shell=True, capture_output=True, text=True, timeout=30)
-            if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                os.remove(modern_p12)
-            else:
-                subprocess.run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-            takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-            if os.path.isfile(takserver_pem):
-                subprocess.run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
-            else:
-                bundle = '/tmp/tak-ca-bundle-revoke.pem'
-                int_pem = os.path.join(cert_dir, 'ca.pem')
-                root_pem = os.path.join(cert_dir, 'root-ca.pem')
-                if os.path.isfile(int_pem) and os.path.isfile(root_pem):
-                    with open(bundle, 'w') as f:
-                        f.write(open(int_pem).read())
-                        f.write(open(root_pem).read())
-                    subprocess.run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
-                    try:
-                        os.remove(bundle)
-                    except Exception:
-                        pass
-            subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True)
+        # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
+        # client cert + CA; restart so the portal picks up the new chain).
+        _takportal_sync_certs(restart=True)
 
         msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
                f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
@@ -50690,35 +50540,11 @@ def takserver_rotate_rootca():
                                             shell=True, capture_output=True).returncode == 0
             if portal_running:
                 log("  Updating TAK Portal certificates...")
-                run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', check=False)
-                admin_p12 = os.path.join(cert_dir, 'admin.p12')
-                modern_p12 = '/tmp/tak-portal-admin-modern.p12'
-                r_enc = subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
-                    shell=True, capture_output=True, text=True, timeout=30)
-                if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                    run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    os.remove(modern_p12)
-                    log("  ✓ admin.p12 copied to TAK Portal (re-encoded)")
-                else:
-                    run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    log("  ✓ admin.p12 copied to TAK Portal")
-                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-                if os.path.exists(takserver_pem):
-                    run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                    log("  ✓ CA chain copied to TAK Portal")
-                else:
-                    int_pem = os.path.join(cert_dir, 'ca.pem')
-                    root_pem = os.path.join(cert_dir, 'root-ca.pem')
-                    bundle = '/tmp/tak-ca-bundle.pem'
-                    run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
-                    if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
-                        run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                        os.remove(bundle)
-                        log("  ✓ CA bundle copied to TAK Portal")
-                run('docker restart tak-portal 2>/dev/null', check=False)
-                log("  ✓ TAK Portal restarted with new certificates")
+                # v10.0.1: delegate to _takportal_sync_certs — temp-file re-encode
+                # of the client cert + CA (the old stdin pipe failed on OpenSSL 3
+                # and shipped an unreadable legacy cert). restart=True.
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+                log(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
             else:
                 log("  TAK Portal not running — skip cert copy (will update on next TAK Portal deploy)")
 
