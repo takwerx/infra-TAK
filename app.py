@@ -8151,6 +8151,51 @@ def _f2b_sshd_logpath():
     return '/var/log/secure' if _distro_family() == 'rhel' else '/var/log/auth.log'
 
 
+def _f2b_selfheal_rhel_jails(plog=None):
+    """RHEL self-heal: repair fail2ban jail configs written by a pre-RHEL-port build.
+    A jail with `action = ufw` (no ufw on RHEL) makes the WHOLE fail2ban daemon fail
+    to start ('Unable to read action ufw'); and the sshd jail's
+    `logpath = /var/log/auth.log` never matches (RHEL logs to /var/log/secure).
+    Rewrite both in place across /etc/fail2ban/jail.d/*.conf, then reload (or restart
+    if it's down) so the fix takes effect. No-op on Debian / when nothing is stale /
+    when fail2ban isn't installed. Idempotent."""
+    if _distro_family() != 'rhel':
+        return False
+    _log = plog or (lambda m: None)
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return False
+    try:
+        import glob as _glob
+        banaction = _f2b_banaction()  # iptables-allports on RHEL
+        changed = False
+        for path in _glob.glob(os.path.join(jaild, '*.conf')):
+            try:
+                with open(path) as f:
+                    txt = f.read()
+            except Exception:
+                continue
+            new = re.sub(r'(?m)^(\s*action\s*=\s*)ufw\b', r'\g<1>' + banaction, txt)
+            new = new.replace('/var/log/auth.log', '/var/log/secure')
+            if new != txt:
+                with open(path, 'w') as f:
+                    f.write(new)
+                changed = True
+                _log(f"  fail2ban self-heal: patched {os.path.basename(path)} (ufw→{banaction}, auth.log→secure)")
+        if changed:
+            act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                                 capture_output=True, text=True).stdout.strip()
+            if act == 'active':
+                subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, text=True, timeout=30)
+            else:
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']), capture_output=True, text=True, timeout=30)
+            _log("  ✓ fail2ban self-heal: stale jails repaired for RHEL and fail2ban reloaded")
+        return changed
+    except Exception as e:
+        _log(f"  ⚠ fail2ban self-heal error (non-fatal): {str(e)[:120]}")
+        return False
+
+
 def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Rewrite the infratak-authentik jail config with new thresholds and ignoreip whitelist."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
@@ -60700,6 +60745,15 @@ def _startup_migrations():
                 print(f"Startup migration: {_crt_msg}", flush=True)
         except Exception as _crt_e:
             print(f"Startup migration: console-restart timer error: {_crt_e}", flush=True)
+
+        # v10.0.1 (RHEL) — self-heal fail2ban jail configs written by a pre-RHEL-port
+        # build (`action = ufw` → whole daemon won't start; sshd logpath auth.log →
+        # secure). Run EARLY so a slow/failing LDAP-resync migration below can't delay
+        # it. No-op on Debian / when nothing stale. See `_f2b_selfheal_rhel_jails`.
+        try:
+            _f2b_selfheal_rhel_jails(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e:
+            print(f"Startup migration: fail2ban self-heal error (non-fatal): {_f2b_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
         fh_raw = s.get('fedhub_deployment', {})
