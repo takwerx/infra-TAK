@@ -19265,7 +19265,7 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     version = m.group(1)
     ok, arch_out = _module_run(deploy_cfg, 'uname -m', timeout=10)
     arch_raw = (arch_out or '').strip() or 'x86_64'
-    arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64v8', 'armv7l': 'armv7'}
+    arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
     mtx_arch = arch_map.get(arch_raw, 'amd64')
     plog(f"  Version: {version}, arch: {arch_raw} → {mtx_arch}")
 
@@ -19764,7 +19764,7 @@ def run_mediamtx_deploy():
         # Step 2: Detect architecture and latest version
         plog("")
         plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
-        arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64v8', 'armv7l': 'armv7'}
+        arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
         arch_raw = subprocess.run('uname -m', shell=True, capture_output=True, text=True).stdout.strip()
         mtx_arch = arch_map.get(arch_raw, 'amd64')
         plog(f"  Architecture: {arch_raw} → {mtx_arch}")
@@ -25311,8 +25311,9 @@ def _run_tvr_deploy(settings):
         # linux_amd64 release tarball, so on aarch64 the bundled mediamtx binary is
         # wrong-arch and crash-loops with "exec format error" at runtime (the
         # python:3.11-slim base is multi-arch, so the image itself builds fine).
-        # Rewrite the embedded download to linux_arm64v8 (matches infra-TAK's own
-        # aarch64→arm64v8 map for the standalone MediaMTX module) before the build.
+        # Rewrite the embedded download to linux_arm64 (bluenviron's arm64 asset is
+        # named `_linux_arm64`, NOT `_linux_arm64v8` — matches infra-TAK's own
+        # aarch64→arm64 map for the standalone MediaMTX module) before the build.
         # No-op on amd64 — the upstream Dockerfile is used unchanged.
         if _host_arch() == 'arm64':
             _tvr_dockerfile = os.path.join(tvr_dir, 'Dockerfile')
@@ -25321,8 +25322,8 @@ def _run_tvr_deploy(settings):
                     _dfc = _df.read()
                 if '_linux_amd64' in _dfc and 'mediamtx_' in _dfc:
                     with open(_tvr_dockerfile, 'w') as _df:
-                        _df.write(_dfc.replace('_linux_amd64', '_linux_arm64v8'))
-                    plog('  ✓ arm64: patched TVR Dockerfile MediaMTX binary linux_amd64 → linux_arm64v8')
+                        _df.write(_dfc.replace('_linux_amd64', '_linux_arm64'))
+                    plog('  ✓ arm64: patched TVR Dockerfile MediaMTX binary linux_amd64 → linux_arm64')
                 else:
                     plog('  ⚠ arm64: TVR Dockerfile MediaMTX amd64 pattern not found — bundled mediamtx may be wrong-arch')
             except Exception as _de:
