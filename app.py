@@ -1484,7 +1484,7 @@ def detect_modules():
         'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
     # Cesium 3D Tiles — pure static file serving via Caddy; no container needed
     ct_enabled = settings.get('cesium_tiles_enabled', False)
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     modules['cesium_tiles'] = {
         'name': 'Cesium 3D Tiles',
         'installed': bool(ct_enabled),
@@ -16289,7 +16289,7 @@ def generate_caddyfile(settings=None):
     ct_mod = modules.get('cesium_tiles', {})
     if ct_mod.get('installed'):
         ct_host = sd.get('cesium_tiles') or _get_service_domain(settings, 'cesium_tiles')
-        ct_dir_abs = os.path.expanduser('~/cesium-tiles')
+        ct_dir_abs = _cesium_dir()
         lines.append(f"# Cesium 3D Tiles — static file server (CORS enabled for ATAK WebView)")
         lines.append(f"{ct_host} {{")
         lines.append(f"    root * {ct_dir_abs}")
@@ -23309,6 +23309,34 @@ def emailrelay_uninstall():
 
 # ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
 
+def _cesium_dir():
+    """Tiles storage dir. Ubuntu (baseline, unchanged): ~/cesium-tiles. RHEL: the
+    console runs from /root (dr-xr-x---), which the confined `caddy` user CANNOT
+    traverse, so Caddy's file_server 403s. Serve from /var/lib/cesium-tiles instead
+    — caddy-readable + SELinux httpd_sys_content_t (see _cesium_ensure_dir)."""
+    if _distro_family() == 'rhel':
+        return '/var/lib/cesium-tiles'
+    return os.path.expanduser('~/cesium-tiles')
+
+
+def _cesium_ensure_dir():
+    """Create the tiles dir and, on RHEL, make it servable by confined Caddy:
+    world-traversable perms (755) + httpd_sys_content_t label, then relabel so any
+    just-uploaded tiles inherit it. No-op extras on Debian. Returns the dir path."""
+    d = _cesium_dir()
+    os.makedirs(d, exist_ok=True)
+    if _distro_family() == 'rhel':
+        try:
+            subprocess.run(_sudo_wrap(['chmod', '755', d]), capture_output=True, timeout=10)
+            subprocess.run(
+                f"semanage fcontext -a -t httpd_sys_content_t '{d}(/.*)?' 2>/dev/null; "
+                f"restorecon -RF {shlex.quote(d)} 2>/dev/null; true",
+                shell=True, capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+    return d
+
+
 @app.route('/cesium-tiles')
 @login_required
 def cesium_tiles_page():
@@ -23327,7 +23355,7 @@ def cesium_tiles_page():
 def _cesium_list_datasets(settings):
     """Scan ~/cesium-tiles/ and return a list of dataset dicts for each subdir with tileset.json."""
     import glob as _glob
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     if not os.path.isdir(ct_dir):
         return []
     fqdn = (settings.get('fqdn') or '').strip()
@@ -23378,8 +23406,7 @@ def cesium_tiles_enable():
     settings = load_settings()
     settings['cesium_tiles_enabled'] = True
     save_settings(settings)
-    ct_dir = os.path.expanduser('~/cesium-tiles')
-    os.makedirs(ct_dir, exist_ok=True)
+    ct_dir = _cesium_ensure_dir()  # mkdir + (RHEL) caddy-readable perms + SELinux label
     if (settings.get('fqdn') or '').strip():
         generate_caddyfile(settings)
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
@@ -23408,7 +23435,7 @@ def cesium_tiles_uninstall():
     if (s.get('fqdn') or '').strip():
         generate_caddyfile(s)
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     try:
         if os.path.isdir(ct_dir):
             shutil.rmtree(ct_dir)
@@ -23430,8 +23457,8 @@ def cesium_tiles_upload():
     import zipfile
     import tempfile
     import shutil
-    ct_dir = os.path.expanduser('~/cesium-tiles')
-    os.makedirs(ct_dir, exist_ok=True)
+    ct_dir = _cesium_dir()
+    _cesium_ensure_dir()  # create + (RHEL) caddy-readable perms + httpd_sys_content_t (new files inherit it)
     dataset_name = (request.form.get('name') or '').strip()
     if not dataset_name:
         return jsonify({'success': False, 'error': 'Dataset name is required'})
@@ -23510,8 +23537,8 @@ def cesium_tiles_upload():
 def cesium_tiles_upload_folder():
     import re as _re_ctf
     import shutil
-    ct_dir = os.path.expanduser('~/cesium-tiles')
-    os.makedirs(ct_dir, exist_ok=True)
+    ct_dir = _cesium_dir()
+    _cesium_ensure_dir()  # create + (RHEL) caddy-readable perms + httpd_sys_content_t (new files inherit it)
     raw_name = (request.form.get('name') or '').strip()
     if not raw_name:
         return jsonify({'success': False, 'error': 'Dataset name is required'})
@@ -23555,7 +23582,7 @@ def cesium_tiles_delete(name):
     import re as _re_ctd
     if not _re_ctd.match(r'^[A-Za-z0-9_\-]+$', name):
         return jsonify({'success': False, 'error': 'Invalid dataset name'})
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     target = os.path.join(ct_dir, name)
     # Prevent path traversal
     if not os.path.abspath(target).startswith(os.path.abspath(ct_dir)):
@@ -60796,12 +60823,23 @@ def _startup_migrations():
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
 
-        # Ensure cesium-tiles directory exists when the module is enabled
+        # Ensure cesium-tiles dir exists + is servable when the module is enabled.
         if s.get('cesium_tiles_enabled'):
-            ct_dir = os.path.expanduser('~/cesium-tiles')
-            if not os.path.isdir(ct_dir):
-                os.makedirs(ct_dir, exist_ok=True)
-                print("Startup migration: created ~/cesium-tiles/")
+            _cesium_ensure_dir()  # idempotent: create + (RHEL) caddy-readable perms + SELinux label
+            # RHEL self-heal: a box enabled before the path move still has a Caddyfile
+            # pointing at the non-traversable ~/cesium-tiles (Caddy 403). If the cesium
+            # vhost root is stale, regenerate + reload so it serves the new dir.
+            if (s.get('fqdn') or '').strip():
+                try:
+                    with open(CADDYFILE_PATH) as _cf:
+                        _cad = _cf.read()
+                except Exception:
+                    _cad = ''
+                if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
+                    generate_caddyfile(s)
+                    subprocess.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+                                   shell=True, capture_output=True, text=True, timeout=60)
+                    print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
 
         # Ensure webodm working directories exist when the module is enabled
         if s.get('webodm_enabled'):
