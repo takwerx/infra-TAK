@@ -63,11 +63,18 @@ fi
 # ── 2. Wait for PostgreSQL ──
 _REMOTE_DB=""
 if id -u postgres &>/dev/null; then
-  # Local PostgreSQL — use psql directly
-  _log "Waiting for local PostgreSQL..."
+  # Local PostgreSQL — readiness probe via a TCP connect to the loopback
+  # listener (bash builtin /dev/tcp). Universal across distros: needs no
+  # sudo/sudoers and no psql on PATH, so it works for the unprivileged 'tak'
+  # service user everywhere. The old `sudo -u postgres psql` failed on RHEL —
+  # the .rpm ships no sudoers entry for tak (the .deb does) — so the probe
+  # never succeeded, the loop burned the full MAX_WAIT, and systemd killed
+  # start-pre at TimeoutStartSec → takserver.service failed (timeout).
+  # Mirrors the remote-DB branch below, which already uses a pure TCP check.
+  _log "Waiting for local PostgreSQL (127.0.0.1:5432)..."
   _t=0
   while [ $_t -lt $MAX_WAIT ]; do
-    if sudo -u postgres psql -c "SELECT 1" &>/dev/null; then
+    if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then
       _log "PostgreSQL ready (${_t}s)"
       break
     fi

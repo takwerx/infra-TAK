@@ -11219,7 +11219,11 @@ def run_guarddog_deploy(alert_email):
             os.makedirs(tak_dropin_dir, exist_ok=True)
             tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
             with open(tak_dropin, 'w') as f:
-                f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+                # TimeoutStartSec must exceed the boot sequencer's MAX_WAIT (120s):
+                # systemd's 90s default would otherwise kill start-pre mid-wait and
+                # mark the unit failed(timeout) before the sequencer's "proceed anyway"
+                # fallback can fire. Universal hardening — applies to every distro.
+                f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
