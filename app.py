@@ -25307,6 +25307,27 @@ def _run_tvr_deploy(settings):
         commit_sha = sha_r.stdout.strip() or 'unknown'
         plog(f'  Commit SHA: {commit_sha}')
 
+        # v10.0.1 (arm64): the upstream TVR Dockerfile hardcodes the MediaMTX
+        # linux_amd64 release tarball, so on aarch64 the bundled mediamtx binary is
+        # wrong-arch and crash-loops with "exec format error" at runtime (the
+        # python:3.11-slim base is multi-arch, so the image itself builds fine).
+        # Rewrite the embedded download to linux_arm64v8 (matches infra-TAK's own
+        # aarch64→arm64v8 map for the standalone MediaMTX module) before the build.
+        # No-op on amd64 — the upstream Dockerfile is used unchanged.
+        if _host_arch() == 'arm64':
+            _tvr_dockerfile = os.path.join(tvr_dir, 'Dockerfile')
+            try:
+                with open(_tvr_dockerfile) as _df:
+                    _dfc = _df.read()
+                if '_linux_amd64' in _dfc and 'mediamtx_' in _dfc:
+                    with open(_tvr_dockerfile, 'w') as _df:
+                        _df.write(_dfc.replace('_linux_amd64', '_linux_arm64v8'))
+                    plog('  ✓ arm64: patched TVR Dockerfile MediaMTX binary linux_amd64 → linux_arm64v8')
+                else:
+                    plog('  ⚠ arm64: TVR Dockerfile MediaMTX amd64 pattern not found — bundled mediamtx may be wrong-arch')
+            except Exception as _de:
+                plog(f'  ⚠ arm64: could not patch TVR Dockerfile for arm64 (mediamtx may fail): {_de}')
+
         # Step 3: Write infra-TAK compose + mediaMTX.yml
         plog('')
         plog('━━━ Step 3/6: Writing Configuration ━━━')
