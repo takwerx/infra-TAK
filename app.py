@@ -16855,6 +16855,28 @@ def run_caddy_deploy(domain):
             subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y caddy 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120, env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
             r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
+        elif r.returncode != 0 and pkg_mgr == 'dnf':
+            # v10.0.1 (RHEL): on some EL9 boxes the @caddy/caddy COPR rpm reports a
+            # successful install but its payload (the /usr/bin/caddy binary) never
+            # extracts — `which caddy` then fails and the deploy dies here. The rpm
+            # SCRIPTLETS do run, so the caddy user, systemd unit, SELinux fcontext
+            # (httpd_exec_t on /usr/bin/caddy) and firewall ports are already set up;
+            # only the binary is missing. Guarantee it by fetching the official
+            # static build and applying the fcontext the scriptlet installed.
+            # Validated on Rocky 9.6 under SELinux Enforcing (downloads, labels
+            # httpd_exec_t, `caddy version` runs). Arch-aware for arm64.
+            plog("  Binary missing after dnf install (known EL9 COPR payload quirk) — installing official static binary...")
+            _caddy_arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+            subprocess.run(
+                f'curl -fsSL "https://caddyserver.com/api/download?os=linux&arch={_caddy_arch}" -o /usr/bin/caddy 2>&1',
+                shell=True, capture_output=True, text=True, timeout=180)
+            subprocess.run('chmod +x /usr/bin/caddy 2>&1', shell=True, capture_output=True, text=True)
+            # label for SELinux (rpm scriptlet already added the httpd_exec_t fcontext rule);
+            # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
+            subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
+                shell=True, capture_output=True, text=True)
+            subprocess.run('mkdir -p /etc/caddy 2>/dev/null; true', shell=True, capture_output=True, text=True)
+            r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("✗ Caddy binary not found after install")
             caddy_deploy_status.update({'running': False, 'error': True})
