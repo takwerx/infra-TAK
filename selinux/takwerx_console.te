@@ -1,0 +1,42 @@
+module takwerx_console 1.0;
+
+# infra-TAK console — SELinux policy for RHEL/Rocky (EL9 family).
+#
+# The console runs as a systemd service (gunicorn) from the operator's in-home
+# clone (~/infra-TAK). Under SELinux enforcing, systemd (init_t) cannot traverse
+# the home (user_home_dir_t) nor read/exec the venv entrypoint (user_home_t), so
+# the unit crash-loops with 203/EXEC and nothing binds the console port. Ubuntu
+# has no SELinux so this never surfaced.
+#
+# This module grants the minimum needed: init_t may TRAVERSE the home and
+# READ/EXEC the gunicorn entrypoint there, then TRANSITION (entrypoint) into the
+# unconfined service domain — which performs all runtime file I/O (config
+# writes, cert reads, .so loads, socket binds). init_t itself gets read/exec
+# only — NO write/create — so this does not broaden init_t's write reach into
+# user homes. The console unit carries
+# SELinuxContext=system_u:system_r:unconfined_service_t:s0 so the running
+# process lands in that unconfined domain; the rest of the box (TAK Server,
+# Authentik, etc.) stays confined under enforcing.
+#
+# Installed by start.sh on SELinux-capable hosts (semodule -i). Built with:
+#   checkmodule -M -m -o takwerx_console.mod takwerx_console.te
+#   semodule_package -o takwerx_console.pp -m takwerx_console.mod
+#   semodule -i takwerx_console.pp
+
+require {
+    type init_t;
+    type unconfined_service_t;
+    type user_home_t;
+    type user_home_dir_t;
+    class dir search;
+    class lnk_file read;
+    class file { open read getattr execute execute_no_trans map ioctl entrypoint };
+}
+
+# systemd (init_t): traverse home, read + exec the venv entrypoint.
+allow init_t user_home_dir_t:dir search;
+allow init_t user_home_t:file { open read getattr execute execute_no_trans map ioctl };
+allow init_t user_home_t:lnk_file read;
+
+# Enter the unconfined service domain via the in-home entrypoint binary.
+allow unconfined_service_t user_home_t:file entrypoint;

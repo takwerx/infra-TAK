@@ -492,6 +492,42 @@ EOF
     systemctl enable takwerx-console > /dev/null 2>&1
 }
 
+# v10.0.1 (RHEL/SELinux): install the console's SELinux policy module so systemd
+# (init_t) can traverse the in-home clone, read+exec the gunicorn venv entrypoint
+# there, and transition into the unconfined service domain (paired with the
+# unit's SELinuxContext directive). Without it the service crash-loops 203/EXEC
+# under enforcing. Compiled on-box from the shipped .te so it matches the host's
+# policy version. No-op on non-SELinux hosts (Debian/Ubuntu: getenforce absent).
+# Validated on Rocky 9.6 under Enforcing (systemd-run init_t exec+import+read+bind
+# all succeed, zero denials).
+install_selinux_console_policy() {
+    command -v getenforce >/dev/null 2>&1 || return 0
+    [ "$(getenforce 2>/dev/null)" = "Disabled" ] && return 0
+    local te="$INSTALL_DIR/selinux/takwerx_console.te"
+    [ -f "$te" ] || { echo -e "${YELLOW}  ⚠ SELinux policy source missing ($te) — console may not start under enforcing${NC}"; return 0; }
+    # already current? (idempotent re-runs skip the rebuild)
+    if semodule -l 2>/dev/null | grep -q '^takwerx_console'; then
+        echo "  ✓ SELinux console policy already installed"
+        return 0
+    fi
+    if ! command -v checkmodule >/dev/null 2>&1; then
+        dnf install -y checkpolicy >/dev/null 2>&1 || true
+    fi
+    if ! command -v checkmodule >/dev/null 2>&1 || ! command -v semodule_package >/dev/null 2>&1; then
+        echo -e "${YELLOW}  ⚠ SELinux policy tools unavailable — console may not start under enforcing${NC}"
+        return 0
+    fi
+    local tmp; tmp=$(mktemp -d)
+    if checkmodule -M -m -o "$tmp/takwerx_console.mod" "$te" >/dev/null 2>&1 \
+       && semodule_package -o "$tmp/takwerx_console.pp" -m "$tmp/takwerx_console.mod" >/dev/null 2>&1 \
+       && semodule -i "$tmp/takwerx_console.pp" >/dev/null 2>&1; then
+        echo "  ✓ SELinux console policy installed (takwerx_console)"
+    else
+        echo -e "${YELLOW}  ⚠ SELinux console policy failed to install — console may not start under enforcing${NC}"
+    fi
+    rm -rf "$tmp"
+}
+
 # ==========================================
 # Main
 # ==========================================
@@ -508,6 +544,9 @@ fi
 
 # Always use self-signed cert for console (Caddy handles FQDN SSL)
 generate_self_signed_cert
+
+# RHEL/SELinux: install the console policy module before the unit starts
+install_selinux_console_policy
 
 # Create and start systemd service
 create_service
