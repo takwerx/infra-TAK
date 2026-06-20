@@ -37975,6 +37975,60 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
         return False
 
 
+def _refresh_server_ip_from_imds_direct(plog=None):
+    """Self-heal: keep settings.server_ip synced to the instance's
+    DIRECTLY-ATTACHED cloud public IP (AWS/Azure IMDS), on every boot.
+
+    Why (aws-arm, 2026-06-20): a cloud VM WITHOUT an Elastic/static IP gets a
+    NEW ephemeral public IP on every stop/start. start.sh only detects at
+    install, and the one-shot private->public migration
+    (_patch_settings_server_ip_prefer_cloud_public) won't touch an already-
+    public-but-now-stale server_ip — so the banner / IP access URL drift to a
+    dead IP. There is no manual Settings → Server IP control to fix it by hand.
+
+    Safe gating (all required):
+      - _detect_cloud_public_ip() returns (ip, source) with source ending in
+        'imds-direct' — IMDS reports this public IP as directly attached to the
+        NIC (ground truth). An Elastic/static IP appears here too, so EIP boxes
+        simply stay pinned to the EIP (cur == ip → no-op). Echo/NAT-derived IPs
+        (source '*-nat') are NEVER used to override, so load-balancer /
+        NAT-gateway deployments (instance public IP != operator-facing LB IP)
+        are left untouched.
+      - the detected public IP differs from the stored server_ip.
+    Off-cloud / bare-metal / on-prem: _detect_cloud_public_ip() returns
+    (None, None) → no-op. NOT one-shot (unlike the v0.9.29 migration): an
+    ephemeral-IP box must re-sync on every restart. Mirrors the
+    _refresh_stale_private_server_ip pattern for the cloud-public case.
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        ip, source = _detect_cloud_public_ip()
+        if not ip or not source or not source.endswith('imds-direct'):
+            return False
+        s = load_settings()
+        cur = (s.get('server_ip') or '').strip()
+        if cur == ip:
+            return False
+        s['server_ip'] = ip
+        s['server_ip_imds_synced'] = {
+            'at': datetime.utcnow().isoformat() + 'Z',
+            'from': cur or '(unset)',
+            'to': ip,
+            'source': source,
+            'version': VERSION,
+        }
+        save_settings(s)
+        plog(f"  server_ip self-heal: {cur or '(unset)'} → {ip} (IMDS direct-attached public, source={source})")
+        return True
+    except Exception as e:
+        try:
+            plog(f"  server_ip self-heal: error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
 def _list_local_ipv4s():
     """Return the set of IPv4 addresses currently assigned to this host
     (loopback excluded). Used to decide whether a stored settings.server_ip
@@ -60920,6 +60974,21 @@ def _startup_migrations():
             )
         except Exception as ip_stale_err:
             print(f"Startup migration: server_ip stale-refresh error (non-fatal): {ip_stale_err}")
+
+        # v10.0.1 — self-heal settings.server_ip to the instance's directly-
+        # attached cloud public IP (AWS/Azure IMDS) on every boot. A cloud VM
+        # without an Elastic/static IP gets a NEW public IP on each stop/start;
+        # the one-shot private->public migration above won't fix an already-
+        # public-but-stale value, and there's no manual Server IP control. Only
+        # acts on IMDS 'imds-direct' sources (EIP boxes stay pinned; LB/NAT
+        # boxes are never clobbered). No-op off-cloud. NOT one-shot.
+        # See `_refresh_server_ip_from_imds_direct`. Root-caused on aws-arm.
+        try:
+            _refresh_server_ip_from_imds_direct(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ip_imds_err:
+            print(f"Startup migration: server_ip IMDS self-heal error (non-fatal): {ip_imds_err}")
 
         # v0.9.44 — silently clear a `takserver` dpkg half-configured state left by the
         # non-idempotent 5.7 .deb postinstall. TAK Server keeps running fine, but the
