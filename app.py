@@ -9715,8 +9715,13 @@ def _monitor_health_check(monitor_id):
                 r = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER],
                                    capture_output=True, text=True, timeout=5)
                 return r.returncode == 0 and r.stdout.strip() == 'true'
-            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql']), capture_output=True, text=True, timeout=3)
-            return r.returncode == 0
+            # native: Debian/Ubuntu uses the `postgresql` meta-service; RHEL/EL uses
+            # `postgresql-15.service` (PGDG). Either being active means PG is up.
+            for _pgsvc in ('postgresql', 'postgresql-15'):
+                r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _pgsvc]), capture_output=True, text=True, timeout=3)
+                if r.returncode == 0 and r.stdout.strip() == 'active':
+                    return True
+            return False
         if monitor_id == 'cotdb':
             # v10.0.1: container → docker exec -u postgres (peer auth); native →
             # sudo -u postgres psql. Both query the same cot database size.
@@ -50992,31 +50997,46 @@ def takserver_uninstall():
     # `apt-get install` becomes a no-op ("already newest version") that leaves
     # a half-installed system. See deploy Step 4 self-heal for the matching
     # recovery path.
-    pkg_status = subprocess.run(
-        "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
-        shell=True, capture_output=True, text=True
-    ).stdout.strip()
-    if pkg_status:
-        # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
-        # stderr so silent failures don't pretend success.
-        purge_ok = False
-        for cmd in (
-            'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
-            'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
-            'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
-        ):
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-            after = subprocess.run(
-                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
-                shell=True, capture_output=True, text=True
-            ).stdout.strip()
-            if not after or 'not-installed' in after:
-                purge_ok = True
-                break
-        if purge_ok:
-            steps.append('Purged TAK Server package')
-        else:
-            steps.append('⚠ Could not purge takserver package (still registered with dpkg) — manual cleanup required')
+    if _distro_family() == 'rhel':
+        # EL9 native: dnf remove the rpm, then drop the SELinux policy module that
+        # the rpm's apply-selinux.sh loaded (else a reinstall warns it's already there).
+        _rpm_installed = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+        if _rpm_installed.startswith('takserver'):
+            subprocess.run('dnf remove -y takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+            _after = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+            if not _after.startswith('takserver') or 'not installed' in _after.lower():
+                steps.append('Removed TAK Server rpm (dnf)')
+            else:
+                subprocess.run('rpm -e --noscripts --nodeps takserver 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+                steps.append('Force-removed TAK Server rpm')
+        # remove the takserver SELinux module (named takserver-policy on EL9)
+        subprocess.run('semodule -r takserver-policy 2>/dev/null; semodule -r takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=60)
+    else:
+        pkg_status = subprocess.run(
+            "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if pkg_status:
+            # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
+            # stderr so silent failures don't pretend success.
+            purge_ok = False
+            for cmd in (
+                'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+            ):
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+                after = subprocess.run(
+                    "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                    shell=True, capture_output=True, text=True
+                ).stdout.strip()
+                if not after or 'not-installed' in after:
+                    purge_ok = True
+                    break
+            if purge_ok:
+                steps.append('Purged TAK Server package')
+            else:
+                steps.append('⚠ Could not purge takserver package (still registered with dpkg) — manual cleanup required')
     # Clean up /opt/tak
     if os.path.exists('/opt/tak'):
         subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
