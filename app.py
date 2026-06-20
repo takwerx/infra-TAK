@@ -711,7 +711,10 @@ MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
 # Authentik official brand icon (external URL)
-AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/main/website/static/img/icon_left_brand_colour.svg"
+# Pinned to an immutable tag, NOT `main`: goauthentik moved this asset out of
+# website/static/img on main → the old `.../main/...` URL now 404s (broken logo
+# everywhere, all platforms — browser-loaded so arch-independent). A tag ref can't move.
+AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/version-2024.12/website/static/img/icon_left_brand_colour.svg"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
 CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
 FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/1087378?s=128&v=4"
