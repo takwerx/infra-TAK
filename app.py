@@ -8136,12 +8136,14 @@ def _f2b_read_jail_config():
     return cfg
 
 def _f2b_banaction():
-    """fail2ban ban action per host firewall family. Debian → 'ufw'; RHEL has no
-    ufw, so use 'iptables-multiport' (works on Rocky 9 via the nft-backed iptables
-    compat, with or without firewalld active — firewalld is off on cloud boxes).
-    The infratak-guarddog notify action is appended on top of this by each jail.
-    (Firewalld-native banaction is part of the broader firewall-parity work.)"""
-    return 'iptables-multiport' if _distro_family() == 'rhel' else 'ufw'
+    """fail2ban ban action per host firewall family. Debian → 'ufw' (bans the IP on
+    ALL traffic). RHEL has no ufw → 'iptables-allports', the all-ports equivalent
+    (NOT iptables-multiport — that needs a port list and only blocks specific ports).
+    Works on Rocky 9 via nft-backed iptables, with OR without firewalld active
+    (firewalld is off on cloud boxes that rely on the security group). The
+    infratak-guarddog notify action is appended on top by each jail. (Firewalld-
+    native banaction — firewallcmd-* — is part of the broader firewall-parity work.)"""
+    return 'iptables-allports' if _distro_family() == 'rhel' else 'ufw'
 
 
 def _f2b_sshd_logpath():
