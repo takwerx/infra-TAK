@@ -257,7 +257,7 @@ install_dependencies() {
             fi
             if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-                python3 python3-pip python3-venv openssl sshpass > "$apt_log" 2>&1; then
+                python3 python3-pip python3-venv openssl sshpass git > "$apt_log" 2>&1; then
                 echo -e "${RED}  apt-get install failed:${NC}"
                 tail -30 "$apt_log"
                 rm -f "$apt_log"
@@ -266,7 +266,7 @@ install_dependencies() {
             rm -f "$apt_log"
             ;;
         dnf)
-            if ! dnf install -y python3 python3-pip openssl sshpass > "$apt_log" 2>&1; then
+            if ! dnf install -y python3 python3-pip openssl sshpass git > "$apt_log" 2>&1; then
                 echo -e "${RED}  dnf install failed:${NC}"
                 tail -30 "$apt_log"
                 rm -f "$apt_log"
@@ -450,6 +450,22 @@ except Exception:
         SERVICE_HOME="/root"
     fi
 
+    # v10.0.1 (RHEL/SELinux): under SELinux enforcing, systemd (init_t) cannot
+    # traverse the operator's home (user_home_dir_t) nor exec the gunicorn venv
+    # there (user_home_t) — the service crash-loops with 203/EXEC and nothing
+    # binds the console port. Relabeling the venv does NOT help (the /home
+    # traversal is still denied). The console is a trusted root admin service, so
+    # run it in the unconfined service domain; the rest of the box (TAK Server,
+    # etc.) stays confined/enforcing. Validated on Rocky 9.6 under Enforcing with
+    # DEFAULT labels (no relabel, no relocation): exec + import compiled deps +
+    # read app.py + bind socket all succeed, zero AVC denials. On Debian/Ubuntu
+    # `getenforce` is absent, so the directive is omitted and the unit is
+    # byte-identical to today's.
+    SELINUX_DIRECTIVE=""
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
+        SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+    fi
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=infra-TAK - Team Awareness Kit Infrastructure Platform
@@ -458,7 +474,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
+${SELINUX_DIRECTIVE:+$SELINUX_DIRECTIVE
+}ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
