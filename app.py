@@ -22004,6 +22004,16 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             # it is re-applied after every clone/git-checkout, like the port patches.
             if _host_arch() == 'arm64':
                 _ct = _re.sub(r'(image:\s*)postgis/postgis:', r'\g<1>imresamu/postgis:', _ct)
+                # tiles (pmtiles) won't run on arm64: its @mapbox/vtquery@0.6.0
+                # native addon has no arm64 build and only compiles via the
+                # deprecated mason toolchain (amd64-only C++ deps). Stop the
+                # crash-loop — restart 'always' → 'no' so it exits once and stays
+                # quiet. pmtiles generation is unavailable on arm64 (non-core; the
+                # map + all other CloudTAK features work). Targets the tiles
+                # service uniquely via its dockerfile path.
+                _ct = _re.sub(
+                    r"(dockerfile:\s*\./tasks/pmtiles/Dockerfile\.compose\s*\n\s*restart:\s*)'?always'?",
+                    r"\g<1>'no'", _ct, count=1)
 
             if _ct != _orig:
                 with open(_path, 'w') as f:
@@ -22013,6 +22023,70 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             pass
         break  # only patch the first matching file
     return changed
+
+
+def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
+    """arm64 only: build media-infra from source and tag it as the exact image
+    CloudTAK's compose pins, so `docker compose up` uses the local arm64 build
+    instead of pulling the amd64-only ghcr.io/dfpc-coe/media-infra:<tag> (which
+    crash-loops with "exec format error" on aarch64).
+
+    media-infra's bases (golang:*-alpine, bluenviron/mediamtx:*-ffmpeg) are
+    multi-arch and it compiles its Go server from source, so it builds natively
+    on arm64 — dfpc-coe just never publishes an arm64 image. Compose has no
+    pull_policy (default 'missing'), so a locally-present tag shadows the pull.
+
+    No-op on amd64 (returns False; the published image is used unchanged).
+    Non-fatal: a failure WARNs and returns False — the deploy continues (media is
+    a non-core video proxy; core CloudTAK runs without it). The compose media
+    ports are untouched (9997/HLS already loopback-bound), so this is port-safe.
+    """
+    if _host_arch() != 'arm64':
+        return False
+    import re as _re
+    _log = plog or (lambda _m: None)
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    image_ref = None
+    for _fname in ('compose.yaml', 'docker-compose.yml'):
+        _p = os.path.join(cloudtak_dir, _fname)
+        if not os.path.exists(_p):
+            continue
+        try:
+            with open(_p) as f:
+                _m = _re.search(r'image:\s*(ghcr\.io/dfpc-coe/media-infra:\S+)', f.read())
+            if _m:
+                image_ref = _m.group(1).strip().strip('"\'')
+        except Exception:
+            pass
+        break
+    if not image_ref:
+        _log("  ⚠ arm64: media-infra image pin not found in compose — media may crash-loop")
+        return False
+    tag = image_ref.rsplit(':', 1)[-1]
+    src_dir = os.path.join(cloudtak_dir, 'media-infra-src')
+    _log(f"  arm64: building media-infra {tag} from source (no arm64 image is published)…")
+    try:
+        subprocess.run(f'rm -rf {shlex.quote(src_dir)}', shell=True, timeout=30)
+        r = subprocess.run(
+            f'git clone --depth 1 --branch {shlex.quote(tag)} '
+            f'https://github.com/dfpc-coe/media-infra.git {shlex.quote(src_dir)}',
+            shell=True, capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            _log(f"  ✗ media-infra clone failed (media will be unavailable): {(r.stderr or '')[:200]}")
+            return False
+        r = subprocess.run(
+            f'docker build -t {shlex.quote(image_ref)} {shlex.quote(src_dir)}',
+            shell=True, capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0:
+            _tail = '\n'.join((r.stdout or r.stderr or '').splitlines()[-8:])
+            _log(f"  ✗ media-infra arm64 build failed (media will be unavailable):\n{_tail}")
+            return False
+        _log(f"  ✓ media-infra {tag} built for arm64 → tagged {image_ref} (local image shadows the amd64 pull)")
+        return True
+    except Exception as e:
+        _log(f"  ✗ media-infra arm64 build error (media will be unavailable): {str(e)[:200]}")
+        return False
 
 
 def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', total_timeout=180, ssh_cfg=None):
@@ -22392,6 +22466,14 @@ def run_cloudtak_deploy(cfg=None):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
             plog(f"  WARNING: compose port-harden failed (Caddy :9997 may collide): {_ppe}")
+
+        # v10.0.1 (arm64 only): the media-infra image is amd64-only on ghcr; build it
+        # from source on-box and tag it as the pinned image so `up` uses the arm64
+        # build (no-op on amd64). Non-fatal — media is a non-core video proxy.
+        try:
+            _cloudtak_build_arm64_media(cloudtak_dir, plog=plog)
+        except Exception as _me:
+            plog(f"  WARNING: arm64 media-infra build step errored (media may be unavailable): {_me}")
 
         api_url = ''
         media_url = ''
