@@ -16862,21 +16862,34 @@ def run_caddy_deploy(domain):
             # SCRIPTLETS do run, so the caddy user, systemd unit, SELinux fcontext
             # (httpd_exec_t on /usr/bin/caddy) and firewall ports are already set up;
             # only the binary is missing. Guarantee it by fetching the official
-            # static build and applying the fcontext the scriptlet installed.
-            # Validated on Rocky 9.6 under SELinux Enforcing (downloads, labels
-            # httpd_exec_t, `caddy version` runs). Arch-aware for arm64.
+            # static build. Download to a TEMP file and VERIFY it runs before
+            # installing — a partial/transient download would otherwise pass a
+            # mere `which` check and then fail caddy.service with 203/EXEC. Then
+            # atomically install + apply the fcontext the scriptlet set. Arch-aware.
+            # Validated on Rocky 9.6 under SELinux Enforcing.
             plog("  Binary missing after dnf install (known EL9 COPR payload quirk) — installing official static binary...")
             _caddy_arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+            _caddy_dl = '/tmp/caddy.download'
+            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
             subprocess.run(
-                f'curl -fsSL "https://caddyserver.com/api/download?os=linux&arch={_caddy_arch}" -o /usr/bin/caddy 2>&1',
-                shell=True, capture_output=True, text=True, timeout=180)
-            subprocess.run('chmod +x /usr/bin/caddy 2>&1', shell=True, capture_output=True, text=True)
-            # label for SELinux (rpm scriptlet already added the httpd_exec_t fcontext rule);
-            # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
-            subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
-                shell=True, capture_output=True, text=True)
-            subprocess.run('mkdir -p /etc/caddy 2>/dev/null; true', shell=True, capture_output=True, text=True)
-            r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
+                f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_caddy_arch}" -o {_caddy_dl}',
+                shell=True, capture_output=True, text=True, timeout=300)
+            subprocess.run(f'chmod +x {_caddy_dl} 2>/dev/null; true', shell=True, capture_output=True, text=True)
+            # verify the downloaded binary actually executes before trusting it
+            _caddy_ver = subprocess.run(f'{_caddy_dl} version', shell=True, capture_output=True, text=True, timeout=20)
+            if _caddy_ver.returncode == 0:
+                subprocess.run(f'install -m 0755 {_caddy_dl} /usr/bin/caddy', shell=True, capture_output=True, text=True, timeout=30)
+                # label for SELinux (rpm scriptlet already added the httpd_exec_t fcontext rule);
+                # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
+                subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
+                    shell=True, capture_output=True, text=True)
+                subprocess.run('mkdir -p /etc/caddy 2>/dev/null; true', shell=True, capture_output=True, text=True)
+                plog(f"  ✓ official static caddy {(_caddy_ver.stdout or '').split()[0] if _caddy_ver.stdout else ''} installed")
+            else:
+                plog(f"  ✗ static caddy download did not validate: {((_caddy_ver.stderr or _caddy_ver.stdout) or 'no output').strip()[:160]}")
+            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
+            # functional final check (not mere presence) so we never false-report success
+            r = subprocess.run('caddy version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("✗ Caddy binary not found after install")
             caddy_deploy_status.update({'running': False, 'error': True})
