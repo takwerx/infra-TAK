@@ -399,12 +399,12 @@ CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
 TVR_REPO = "https://github.com/raytheonbbn/tak-video-restreamer.git"
 TVR_INSTALL_DIR = os.path.expanduser("~/tak-video-restreamer")
 NETBIRD_INSTALL_DIR = os.path.expanduser("~/netbird")
-# CFD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
+# EUD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
-REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/cfd-remote-assist")
+REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/eud-remote-assist")
 REMOTE_ASSIST_PORT = 8767
 REMOTE_ASSIST_DEVICE_PORT = 8448
-REMOTE_ASSIST_OIDC_SLUG = "cfd-remote-assist"
+REMOTE_ASSIST_OIDC_SLUG = "eud-remote-assist"
 REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # Fleet-vetted NetBird image pins — NEVER ':latest' (boxes deployed days apart must
 # converge to one version; netbirdio pushes new minors every few days). Bump these in an
@@ -1750,13 +1750,13 @@ def detect_modules():
         'priority': 14,
     }
 
-    # CFD Remote Assist Portal
+    # EUD Remote Assist Portal
     ra_enabled = settings.get('remote_assist_enabled', False)
     ra_running = False
     if ra_enabled:
         try:
             _ra_r = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+                ['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
                 capture_output=True, text=True, timeout=3)
             ra_running = 'Up' in (_ra_r.stdout or '')
         except Exception:
@@ -1764,7 +1764,7 @@ def detect_modules():
     else:
         try:
             _ra_r = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+                ['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
                 capture_output=True, text=True, timeout=3)
             if 'Up' in (_ra_r.stdout or ''):
                 _s = load_settings()
@@ -6750,7 +6750,7 @@ def netbird_uninstall_status_api():
     return jsonify(_netbird_uninstall_status)
 
 
-# ── CFD Remote Assist Portal ──────────────────────────────────────────────────
+# ── EUD Remote Assist Portal ──────────────────────────────────────────────────
 
 _remote_assist_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
 _remote_assist_uninstall_status = {'running': False, 'complete': False, 'error': False}
@@ -6804,7 +6804,7 @@ def _ensure_authentik_remote_assist_app(settings, plog=None):
     _ak_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
     slug = REMOTE_ASSIST_OIDC_SLUG
-    provider_name = 'CFD Remote Assist'
+    provider_name = 'EUD Remote Assist'
     portal_domain = _get_service_domain(settings, 'remote_assist')
     portal_base = f'https://{portal_domain}'
     device_base = f'https://{portal_domain}:{REMOTE_ASSIST_DEVICE_PORT}'
@@ -7015,7 +7015,7 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
     env_lines = [
         f'POSTGRES_USER=cfd',
         f'POSTGRES_PASSWORD={pg_password}',
-        f'POSTGRES_DB=cfd_remote_assist',
+        f'POSTGRES_DB=eud_remote_assist',
         f'PUBLIC_BASE_URL={device_base}',
         f'OIDC_ISSUER={oidc_issuer}',
         f'OIDC_AUDIENCE={client_id}',
@@ -7479,7 +7479,7 @@ def remote_assist_control_api():
         return jsonify({'success': False, 'error': (r.stderr or r.stdout)[:300]})
     running = False
     try:
-        _st = _sp.run(['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+        _st = _sp.run(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
                       capture_output=True, text=True, timeout=5)
         running = 'Up' in (_st.stdout or '')
     except Exception:
@@ -7531,7 +7531,7 @@ def remote_assist_uninstall_api():
             generate_caddyfile(settings)
             _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
                     shell=True, capture_output=True, text=True, timeout=90)
-            _deregister_authentik_oauth2_app(settings, REMOTE_ASSIST_OIDC_SLUG, 'CFD Remote Assist')
+            _deregister_authentik_oauth2_app(settings, REMOTE_ASSIST_OIDC_SLUG, 'EUD Remote Assist')
             _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': False})
         except Exception:
             _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': True})
@@ -16654,7 +16654,7 @@ def generate_caddyfile(settings=None):
             f'            write_timeout 1h\n'
             f'        }}'
         )
-        lines.append(f"# CFD Remote Assist — admin portal (443). Device API is on :{REMOTE_ASSIST_DEVICE_PORT} only.")
+        lines.append(f"# EUD Remote Assist — admin portal (443). Device API is on :{REMOTE_ASSIST_DEVICE_PORT} only.")
         lines.append(f"{ra_host} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
@@ -16665,7 +16665,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'remote_assist'), ra_host)
-        lines.append(f"# CFD Remote Assist — Android device API (TLS :{REMOTE_ASSIST_DEVICE_PORT})")
+        lines.append(f"# EUD Remote Assist — Android device API (TLS :{REMOTE_ASSIST_DEVICE_PORT})")
         lines.append(f"{ra_host}:{REMOTE_ASSIST_DEVICE_PORT} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
@@ -61454,6 +61454,21 @@ def _startup_migrations():
             generate_caddyfile(s)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # v0.9.61: inject OIDC_ADMIN_GROUP into existing remote assist .env
+        if s.get('remote_assist_enabled') or 'remote_assist' in s.get('modules', {}):
+            ra_env_path = os.path.expanduser('~/eud-remote-assist/.env')
+            if os.path.exists(ra_env_path):
+                try:
+                    with open(ra_env_path, 'r') as f:
+                        ra_env_content = f.read()
+                    if 'OIDC_ADMIN_GROUP=' not in ra_env_content:
+                        with open(ra_env_path, 'a') as f:
+                            f.write('\nOIDC_ADMIN_GROUP=authentik Admins\n')
+                        subprocess.run(['docker', 'compose', '-f', os.path.expanduser('~/eud-remote-assist/docker-compose.yml'), 'up', '-d', 'server'], capture_output=True, timeout=30)
+                        print("Startup migration: Added OIDC_ADMIN_GROUP to remote assist .env and recreated backend container", flush=True)
+                except Exception as e:
+                    print(f"Startup migration: error updating remote assist .env: {e}", flush=True)
 
         # Ensure cesium-tiles dir exists + is servable when the module is enabled.
         if s.get('cesium_tiles_enabled'):
