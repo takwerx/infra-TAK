@@ -7531,7 +7531,10 @@ def takserver_js():
 @app.route('/firewall')
 @login_required
 def firewall_page():
-    return render_template_string(FIREWALL_TEMPLATE, version=VERSION)
+    be = _fw_backend()
+    fw_name = 'firewalld' if be == 'firewalld' else 'UFW'
+    return render_template_string(FIREWALL_TEMPLATE, version=VERSION,
+                                  fw_name=fw_name, fw_backend=(be or 'none'))
 
 @app.route('/guarddog')
 @login_required
@@ -7936,10 +7939,17 @@ def _firewalld_status_local():
                             capture_output=True, text=True, timeout=12)
         svc = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-services']),
                              capture_output=True, text=True, timeout=12)
+        rr = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-rich-rules']),
+                            capture_output=True, text=True, timeout=12)
         ports = [p for p in (rp.stdout or '').split() if p.strip()]
         services = [s for s in (svc.stdout or '').split() if s.strip()]
-        rules = [f'{p} (public)' for p in ports] + [f'{s} [service] (public)' for s in services]
-        raw = f"state: {'running' if enabled else 'not running'}\nports: {' '.join(ports)}\nservices: {' '.join(services)}"
+        rich = [r.strip() for r in (rr.stdout or '').splitlines() if r.strip()]
+        rules = ([f'{p} (public)' for p in ports]
+                 + [f'{s} [service] (public)' for s in services]
+                 + [f'{r} [source-rule]' for r in rich])
+        raw = (f"state: {'running' if enabled else 'not running'}\n"
+               f"ports: {' '.join(ports)}\nservices: {' '.join(services)}"
+               + (f"\nsource rules:\n  " + "\n  ".join(rich) if rich else ''))
         return {'supported': True, 'enabled': enabled, 'rules': rules,
                 'rules_numbered': list(rules), 'raw': raw, 'raw_numbered': raw,
                 'backend': 'firewalld'}
@@ -8066,13 +8076,26 @@ def firewall_restrict_source_api():
         return jsonify({'success': False, 'error': 'Action must be allow or deny'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = (
-            f'sudo ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || '
-            f'ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || true'
-        )
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        be = _fw_backend()
+        if be == 'firewalld':
+            # ufw `allow/deny from X to any port Y` ↔ firewalld rich rule (accept/reject).
+            fam = 'ipv6' if ':' in source else 'ipv4'
+            verb = 'accept' if action == 'allow' else 'reject'
+            rule = (f'rule family="{fam}" source address="{source}" '
+                    f'port port="{port}" protocol="{proto}" {verb}')
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--add-rich-rule={rule}']),
+                           capture_output=True, text=True, timeout=15)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                           capture_output=True, text=True, timeout=15)
+        else:
+            cmd = (
+                f'sudo ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || '
+                f'ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || true'
+            )
+            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
         st2 = _firewall_status_local()
         return jsonify({'success': True, 'message': f'{action.upper()} from {source} to {port}/{proto}', 'status': st2})
     except Exception as e:
@@ -8088,10 +8111,37 @@ def firewall_delete_rule_api():
         return jsonify({'success': False, 'error': 'Rule number must be a positive integer'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = f'sudo ufw --force delete {number} >/dev/null 2>&1 || ufw --force delete {number} >/dev/null 2>&1 || true'
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        be = _fw_backend()
+        if be == 'firewalld':
+            # firewalld has no rule numbering — map the UI's displayed number to the
+            # Nth entry of the same ordered list the status reader produces (ports →
+            # services → source-rules) and remove the matching object.
+            rules = st.get('rules_numbered') or st.get('rules') or []
+            if number > len(rules):
+                return jsonify({'success': False, 'error': f'No rule #{number} (only {len(rules)} present)'}), 400
+            entry = rules[number - 1]
+            if entry.endswith('[source-rule]'):
+                rich = entry[:-len(' [source-rule]')].strip()
+                subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                           f'--remove-rich-rule={rich}']),
+                               capture_output=True, text=True, timeout=15)
+            elif '[service]' in entry:
+                svc = entry.split()[0]
+                subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                           f'--remove-service={svc}']),
+                               capture_output=True, text=True, timeout=15)
+            else:
+                portspec = entry.split()[0]  # e.g. '8080/tcp'
+                subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                           f'--remove-port={portspec}']),
+                               capture_output=True, text=True, timeout=15)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                           capture_output=True, text=True, timeout=15)
+        else:
+            cmd = f'sudo ufw --force delete {number} >/dev/null 2>&1 || ufw --force delete {number} >/dev/null 2>&1 || true'
+            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
         st2 = _firewall_status_local()
         return jsonify({'success': True, 'message': f'Deleted rule #{number}', 'status': st2})
     except Exception as e:
@@ -30822,7 +30872,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <div class="main">
   <div class="page-header">
     <h1><span class="material-symbols-outlined">shield_locked</span>Firewall</h1>
-    <p>Always-on UFW controls. Open/close ports, restrict by source IP/CIDR, and remove numbered rules.</p>
+    <p>Always-on {{ fw_name }} controls. Open/close ports, restrict by source IP/CIDR, and remove rules.</p>
   </div>
 
   <details class="card" open>
@@ -30868,7 +30918,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <input class="form-input" type="number" id="fw-rule-num" min="1" placeholder="Rule #" style="max-width:120px">
         <button class="btn" type="button" id="fw-del-btn" onclick="fwDeleteRule()" style="border-color:var(--red);color:var(--red)">Delete rule</button>
       </div>
-      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use numbers shown in "Current Rules" (from <code>ufw status numbered</code>).</p>
+      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use the numbers shown in "Current Rules" ({{ 'firewalld has no native rule numbers — the number maps to the position in the list above' if fw_backend=='firewalld' else 'from ufw status numbered' }}).</p>
     </div>
   </details>
 </div>
