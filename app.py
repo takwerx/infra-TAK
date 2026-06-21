@@ -7108,10 +7108,14 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 6/6: Firewall & Reverse Proxy ━━━')
         if _distro_family() == 'rhel':
-            # No ufw on RHEL (bare argv ufw aborts the deploy). The proxy port is
-            # Caddy-only via firewalld default-deny / SG; the Android device API port
-            # reaches the box via the cloud SG. Proper firewalld = firewall-parity track.
-            plog(f'  (RHEL: ufw absent — {REMOTE_ASSIST_PORT} Caddy-only via firewalld default-deny/SG; device API {REMOTE_ASSIST_DEVICE_PORT} via SG)')
+            # No ufw on RHEL (bare argv ufw aborts the deploy). The admin/proxy port stays
+            # closed — it's loopback/Caddy-only and firewalld default-deny covers it. But the
+            # Android device API port is a real inbound listener (host Caddy), so it must be
+            # opened in firewalld explicitly: the cloud SG sits IN FRONT of the host firewall,
+            # so 'SG handles it' is not enough — firewalld still drops 8448 at the host.
+            _sp.run(f'firewall-cmd --permanent --add-port={REMOTE_ASSIST_DEVICE_PORT}/tcp 2>/dev/null; firewall-cmd --reload 2>/dev/null; true',
+                    shell=True, capture_output=True, timeout=30)
+            plog(f'  ✓ firewalld allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API); {REMOTE_ASSIST_PORT} Caddy-only (loopback)')
         else:
             _sp.run(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp'], capture_output=True)
             plog(f'  ✓ ufw deny {REMOTE_ASSIST_PORT}/tcp (loopback/Caddy-only)')
@@ -61517,6 +61521,22 @@ def _startup_migrations():
                         print("Startup migration: Added OIDC_ADMIN_GROUP to remote assist .env and recreated backend container", flush=True)
                 except Exception as e:
                     print(f"Startup migration: error updating remote assist .env: {e}", flush=True)
+
+        # v10.0.1: RHEL boxes deployed before the firewalld fix have the Remote Assist device
+        # API port closed (firewalld default-deny, and the old deploy branch only logged 'via SG').
+        # Open it idempotently so already-deployed RHEL boxes heal on a console restart instead of
+        # needing an RA redeploy. Admin port stays closed (loopback/Caddy-only). Ubuntu uses ufw.
+        if s.get('remote_assist_enabled') and _distro_family() == 'rhel':
+            try:
+                _q = subprocess.run(['firewall-cmd', '--query-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'],
+                                    capture_output=True, text=True, timeout=10)
+                if (_q.stdout or '').strip() != 'yes':
+                    subprocess.run(['firewall-cmd', '--permanent', '--add-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'],
+                                   capture_output=True, timeout=15)
+                    subprocess.run(['firewall-cmd', '--reload'], capture_output=True, timeout=15)
+                    print(f"Startup migration: firewalld opened {REMOTE_ASSIST_DEVICE_PORT}/tcp for RHEL Remote Assist device API", flush=True)
+            except Exception as e:
+                print(f"Startup migration: error opening RA device port in firewalld: {e}", flush=True)
 
         # Ensure cesium-tiles dir exists + is servable when the module is enabled.
         if s.get('cesium_tiles_enabled'):
