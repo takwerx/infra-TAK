@@ -35036,6 +35036,143 @@ async function doUninstallPortal(){
 authentik_deploy_log = []
 authentik_deploy_status = {'running': False, 'complete': False, 'error': False}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v10.0.1: serialize Authentik `docker compose` operations against the deploy.
+#
+# The Authentik/TAK deploy and the background spiral monitor (_authentik_spiral_
+# monitor) BOTH issue `docker compose` operations against the ~/authentik project,
+# in the SAME gunicorn process. On a fresh deploy the monitor's first 10-min tick
+# can land mid-deploy and — false-positiving on a freshly-booted outpost's normal
+# transient "stage recursion / failed to execute flow" markers — fire a routing
+# repair whose `docker compose up` races the deploy's own compose calls. Concurrent
+# `docker compose up` on one project corrupts container state: observed live on
+# aws-arm (2026-06-21) leaving authentik-postgresql-1 force-recreated but never
+# started ("Created", Running=false), so authentik-server-1 could no longer resolve
+# host `postgresql` ("Temporary failure in name resolution") → 502 on its own
+# `ak healthcheck` → server UNHEALTHY → its API 500s → the LDAP service-account sync
+# + webadmin sync (and the manual Resync button) all fail → 8446 lands on WebTAK
+# instead of the Admin GUI.
+#
+# Fix: a process-wide "deploy active" guard. Deploy entry points set it (via the
+# @_with_authentik_deploy_guard decorator); the spiral monitor stands down while it
+# is set, plus a short cooldown so the post-deploy settle isn't disturbed. Both run
+# in the same process, so a plain counter under a lock is sufficient (and reentrant-
+# safe across the Authentik-then-TAK deploy sequence).
+# ─────────────────────────────────────────────────────────────────────────────
+_authentik_deploy_guard_lock = _threading.Lock()
+_authentik_deploy_active_count = [0]
+_authentik_deploy_settled_until = [0.0]
+
+def _authentik_deploy_guard_enter():
+    with _authentik_deploy_guard_lock:
+        _authentik_deploy_active_count[0] += 1
+
+def _authentik_deploy_guard_exit(cooldown_secs=300):
+    with _authentik_deploy_guard_lock:
+        if _authentik_deploy_active_count[0] > 0:
+            _authentik_deploy_active_count[0] -= 1
+        if _authentik_deploy_active_count[0] == 0:
+            _authentik_deploy_settled_until[0] = time.time() + cooldown_secs
+
+def _authentik_deploy_in_progress():
+    with _authentik_deploy_guard_lock:
+        return _authentik_deploy_active_count[0] > 0 or time.time() < _authentik_deploy_settled_until[0]
+
+def _with_authentik_deploy_guard(fn):
+    """Decorator: mark an Authentik/TAK deploy as in-progress for its whole duration
+    so the spiral monitor won't run concurrent `docker compose` on the authentik
+    project. See the block comment above."""
+    import functools
+    @functools.wraps(fn)
+    def _wrapped(*a, **kw):
+        _authentik_deploy_guard_enter()
+        try:
+            return fn(*a, **kw)
+        finally:
+            _authentik_deploy_guard_exit()
+    return _wrapped
+
+
+def _wait_for_authentik_stack_healthy(plog, timeout=240):
+    """v10.0.1: Wait for the LOCAL Authentik stack to report healthy before the deploy
+    runs the LDAP service-account / webadmin sync (both hit the Authentik API and fail
+    with a 500 while authentik-server is unhealthy). Also SELF-HEALS the fresh-deploy
+    failure mode: if a core container (postgresql/server/worker) was left stopped by a
+    recreate race, a one-shot full `docker compose up -d` (no --no-deps) starts it back
+    up. Returns True if the server reports healthy (or is up with no healthcheck), else
+    False (caller proceeds non-fatally). No-ops cleanly for REMOTE Authentik."""
+    try:
+        settings = load_settings()
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+            return True  # remote Authentik — not locally healable from here
+    except Exception:
+        pass
+    ak_dir = os.path.expanduser('~/authentik')
+    if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+        return True
+    core = ['authentik-postgresql-1', 'authentik-server-1', 'authentik-worker-1']
+    healed = False
+    deadline = time.time() + timeout
+    last_log = 0.0
+    while time.time() < deadline:
+        # Any core container not running? (created/exited == the recreate-race signature)
+        stopped = []
+        for c in core:
+            r = subprocess.run(f'docker inspect --format "{{{{.State.Running}}}}" {c} 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=10)
+            if (r.stdout or '').strip() != 'true':
+                stopped.append(c)
+        if stopped and not healed:
+            plog(f"  ⚠ Authentik stack: {', '.join(stopped)} not running — starting the stack (docker compose up -d)…")
+            subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1',
+                shell=True, capture_output=True, text=True, timeout=180)
+            healed = True
+            time.sleep(10)
+            continue
+        # Server reporting healthy? (or up with no healthcheck defined)
+        hr = subprocess.run('docker inspect --format "{{.State.Health.Status}}" authentik-server-1 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=10)
+        status = (hr.stdout or '').strip()
+        if status == 'healthy':
+            return True
+        if status in ('', '<no value>') and not stopped:
+            return True  # running, no healthcheck — best signal we have
+        if time.time() - last_log > 25:
+            plog(f"  … waiting for Authentik server to become healthy (status: {status or 'unknown'})")
+            last_log = time.time()
+        time.sleep(8)
+    plog(f"  ⚠ Authentik server did not report healthy within {timeout}s — proceeding (sync may need a retry/Resync)")
+    return False
+
+
+def _sync_authentik_ldap_sa_with_retry(plog, attempts=3):
+    """v10.0.1: Wait for Authentik to be healthy, then run the LDAP service-account
+    sync, retrying on a TRANSIENT Authentik API failure (500/502/503/timeout/DNS) —
+    the fresh-deploy window where authentik-server is briefly unhealthy. a25cd5d added
+    the SA-sync call but not this robustness, so a single API 500 left 8446 on WebTAK.
+    Returns (ok, msg)."""
+    last = (False, '')
+    for i in range(attempts):
+        _wait_for_authentik_stack_healthy(plog, timeout=240 if i == 0 else 90)
+        try:
+            ok, msg = _ensure_authentik_ldap_service_account()
+        except Exception as e:
+            ok, msg = False, f'exception: {str(e)[:120]}'
+        last = (ok, msg)
+        if ok:
+            return ok, msg
+        transient = any(s in (msg or '') for s in
+            ('500', '502', '503', 'timed out', 'timeout', "Can't contact",
+             'Temporary failure', 'Connection refused', 'not ready'))
+        if not transient or i == attempts - 1:
+            return ok, msg
+        plog(f"  ℹ LDAP SA-sync attempt {i + 1} hit a transient Authentik error "
+             f"({(msg or '')[:70]}) — waiting for Authentik to settle and retrying…")
+        time.sleep(20)
+    return last
+
+
 @app.route('/authentik')
 @login_required
 def authentik_page():
@@ -44222,6 +44359,17 @@ def _authentik_spiral_monitor():
             if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
                 continue
 
+            # v10.0.1: stand down while a deploy is in progress (or just finished).
+            # The deploy issues its own `docker compose` ops against this project; a
+            # concurrent compose up from this monitor races and can leave a core
+            # container (e.g. postgresql) force-recreated-but-not-started, which makes
+            # authentik-server unhealthy and breaks the LDAP SA / webadmin sync on a
+            # fresh deploy. See the _with_authentik_deploy_guard block comment.
+            if _authentik_deploy_in_progress():
+                print("[spiral monitor] deploy in progress (or just finished) — standing down this cycle "
+                      "(avoids concurrent docker compose on the authentik project)", flush=True)
+                continue
+
             # PROACTIVE pass first: if outpost is on internal routing and all preconditions
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
             # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
@@ -44252,6 +44400,7 @@ def _authentik_spiral_monitor():
                 pass
 
 
+@_with_authentik_deploy_guard
 def run_authentik_deploy(reconfigure=False):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -50034,7 +50183,10 @@ def takserver_connect_ldap():
     changed, resync_msg = _resync_ldap_credential_to_coreconfig()
     if changed:
         diag.append(f'Credential resync: {resync_msg}')
-    ok, msg = _ensure_authentik_ldap_service_account()
+    # v10.0.1: wait for Authentik healthy (self-heal a stopped container) + retry on
+    # a transient API 500 — on an unhealthy fresh-deploy Authentik this button used to
+    # fail with "Authentik API 500: <!DOCTYPE html>…" and leave 8446 on WebTAK.
+    ok, msg = _sync_authentik_ldap_sa_with_retry(lambda m: diag.append(m.strip()))
     if not ok:
         if '-w' in (msg or ''):
             msg = 'ldapsearch timed out or failed (check Authentik LDAP outpost logs)'
@@ -53964,6 +54116,7 @@ def _tak_container_running(name):
         return False
 
 
+@_with_authentik_deploy_guard
 def _deploy_takserver_container(config):
     """v10.0.1 — Deploy TAK Server as Docker containers from the official
     takserver-docker-*.zip. Used on arm64 (forced — no native arm TAK package)
@@ -54259,7 +54412,9 @@ def _deploy_takserver_container(config):
             # the bind (the other half of what 'Resync LDAP to TAK Server' does).
             # See memory authentik-ldapservice-password-mismatch-fresh-deploy.
             try:
-                _sa_ok, _sa_msg = _ensure_authentik_ldap_service_account()
+                # v10.0.1: wait for Authentik to be healthy (self-heal a stopped
+                # container) + retry on a transient API 500, instead of firing once.
+                _sa_ok, _sa_msg = _sync_authentik_ldap_sa_with_retry(log_step)
                 log_step(f"  {'✓' if _sa_ok else '⚠'} LDAP service-account bind: {_sa_msg}")
             except Exception as _sae:
                 log_step(f"  ⚠ LDAP service-account sync error (non-fatal): {str(_sae)[:120]}")
@@ -54348,6 +54503,7 @@ def _deploy_takserver_container(config):
         deploy_status.update({'running': False, 'complete': False, 'error': True})
 
 
+@_with_authentik_deploy_guard
 def run_takserver_deploy(config):
     # v10.0.1 dispatch: arm64 (or operator-selected) container deploys route to
     # the Docker path. Everything else runs the body below, which branches Steps
@@ -54803,7 +54959,9 @@ def run_takserver_deploy(config):
         # Resync button once (the pre-fix behaviour).
         if _get_authentik_env_content(load_settings()):
             try:
-                ok_sa, msg_sa = _ensure_authentik_ldap_service_account()
+                # v10.0.1: wait for Authentik to be healthy (self-heal a stopped
+                # container) + retry on a transient API 500, instead of firing once.
+                ok_sa, msg_sa = _sync_authentik_ldap_sa_with_retry(log_step)
                 if ok_sa:
                     log_step("  ✓ LDAP service-account password synced to Authentik (8446 admin bind)")
                 else:
