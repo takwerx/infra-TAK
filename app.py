@@ -3324,7 +3324,26 @@ def _hardening_control_w3():
 # (CLAUDE.md "no silent caps"). Deep Tomcat STIG remediation is .57.
 
 def _ufw_default_incoming_deny():
-    """True if UFW default incoming policy is deny/reject (from `ufw status verbose`)."""
+    """True if the host firewall denies incoming by default. firewalld: the default
+    zone is default-drop unless its target is ACCEPT (so an active firewalld with the
+    public zone IS deny-by-default). UFW: parse `ufw status verbose`. None = can't read.
+    Name kept for back-compat; covers both backends."""
+    if _fw_backend() == 'firewalld':
+        try:
+            rs = subprocess.run(_sudo_wrap(['firewall-cmd', '--state']),
+                                capture_output=True, text=True, timeout=8)
+            if (rs.stdout or '').strip() != 'running':
+                return False
+            dz = subprocess.run(_sudo_wrap(['firewall-cmd', '--get-default-zone']),
+                                capture_output=True, text=True, timeout=8)
+            zone = (dz.stdout or '').strip() or 'public'
+            tg = subprocess.run(_sudo_wrap(['firewall-cmd', f'--zone={zone}', '--get-target']),
+                                capture_output=True, text=True, timeout=8)
+            # target 'default'/'%%REJECT%%'/'DROP'/'REJECT' all drop unsolicited incoming;
+            # only an explicit ACCEPT target opens the zone.
+            return (tg.stdout or '').strip().upper() != 'ACCEPT'
+        except Exception:
+            return None
     try:
         r = subprocess.run('sudo ufw status verbose 2>/dev/null || ufw status verbose 2>/dev/null || true',
                             shell=True, capture_output=True, text=True, timeout=12)
@@ -3354,13 +3373,14 @@ def _hardening_assertions():
         res.append({'key': key, 'label': label, 'status': status, 'detail': detail})
 
     fw = _firewall_status_local()
+    fw_name = 'firewalld' if fw.get('backend') == 'firewalld' else 'UFW'
     if not fw.get('supported'):
-        add('ufw_enabled', 'UFW firewall present', 'fail', fw.get('error') or 'UFW not installed')
+        add('ufw_enabled', 'Host firewall present', 'fail', fw.get('error') or 'no UFW/firewalld installed')
     else:
-        add('ufw_enabled', 'UFW firewall active', 'pass' if fw.get('enabled') else 'fail',
-            'active' if fw.get('enabled') else 'UFW installed but not enabled')
+        add('ufw_enabled', f'{fw_name} firewall active', 'pass' if fw.get('enabled') else 'fail',
+            'active' if fw.get('enabled') else f'{fw_name} installed but not enabled')
         dd = _ufw_default_incoming_deny()
-        add('ufw_default_deny', 'UFW default-deny incoming',
+        add('ufw_default_deny', f'{fw_name} default-deny incoming',
             'pass' if dd else ('na' if dd is None else 'fail'),
             'deny by default' if dd else ('could not read default policy' if dd is None else 'default policy is not deny'))
 
@@ -3382,10 +3402,10 @@ def _hardening_assertions():
     if pub:
         add('console_localhost', label,
             'fail' if (w1 and w1.get('console_localhost_only')) else 'warn',
-            'public UFW allow present on :%s' % port)
+            'public firewall allow present on :%s' % port)
     elif w1 and w1.get('console_localhost_only'):
         add('console_localhost', label, 'pass',
-            'no public UFW allow; reached via SSO reverse proxy (W1)')
+            'no public firewall allow; reached via SSO reverse proxy (W1)')
     else:
         add('console_localhost', label, 'warn',
             'open to network (Standard posture / W1 not applied)')
@@ -3456,11 +3476,18 @@ def _w1_console_locked():
         return False
 
 def _w1_console_port_public(port):
-    """True if UFW has an ALLOW for the console port open to Anywhere (not loopback).
-    None if UFW unsupported/disabled (can't assert lockdown)."""
+    """True if the host firewall exposes the console port to the public (not loopback).
+    None if the firewall is unsupported/disabled (can't assert lockdown). Backend-aware:
+    UFW shows 'ALLOW ... Anywhere'; firewalld shows a bare '<port>/tcp (public)' entry
+    (a loopback/source restriction would instead be a [source-rule], not a bare port)."""
     fw = _firewall_status_local()
     if not fw.get('supported') or not fw.get('enabled'):
         return None
+    if fw.get('backend') == 'firewalld':
+        for ln in fw.get('rules', []):
+            if f'{port}/tcp' in ln and '[source-rule]' not in ln and '[service]' not in ln:
+                return True
+        return False
     for ln in fw.get('rules', []):
         l = ln.lower()
         if port in l and 'allow' in l and 'anywhere' in l:
@@ -3785,21 +3812,31 @@ def _w1_caddy_regen(log):
     log('W1: Caddy reloaded'); return True
 
 def _w1_ufw_lock_console(log):
-    """Remove the public :5001 allow (v4+v6). Loopback stays exempt, so SSO + SSH-tunnel
-    break-glass keep working. Returns False if a public allow survives."""
-    port = str((load_settings().get('console_port') or 5001))
-    subprocess.run('sudo ufw delete allow %s/tcp >/dev/null 2>&1; '
-                   'sudo ufw delete allow %s >/dev/null 2>&1; true' % (port, port),
-                   shell=True, capture_output=True, timeout=30)
-    if _w1_console_port_public(port):
-        log('W1: WARNING — :%s still shows a public ALLOW after delete' % port); return False
-    log('W1: UFW public allow for :%s removed (console now localhost-only)' % port); return True
+    """Remove the public :5001 allow. Loopback stays exempt (UFW loopback rule / firewalld
+    trusted `lo`), so SSO reverse-proxy + SSH-tunnel break-glass keep working. Backend-aware
+    (UFW delete allow ↔ firewalld remove-port). Returns False if a public allow survives."""
+    port = int(load_settings().get('console_port') or 5001)
+    be = _fw_backend()
+    if be == 'firewalld':
+        _fw_remove(port, 'tcp')
+    else:
+        subprocess.run('sudo ufw delete allow %s/tcp >/dev/null 2>&1; '
+                       'sudo ufw delete allow %s >/dev/null 2>&1; true' % (port, port),
+                       shell=True, capture_output=True, timeout=30)
+    fw_name = 'firewalld' if be == 'firewalld' else 'UFW'
+    if _w1_console_port_public(str(port)):
+        log('W1: WARNING — :%s still shows a public allow after removal' % port); return False
+    log('W1: %s public allow for :%s removed (console now localhost-only)' % (fw_name, port)); return True
 
 def _w1_ufw_unlock_console(log):
-    port = str((load_settings().get('console_port') or 5001))
-    subprocess.run('sudo ufw allow %s/tcp >/dev/null 2>&1 || ufw allow %s/tcp >/dev/null 2>&1; true'
-                   % (port, port), shell=True, capture_output=True, timeout=30)
-    log('W1: UFW public allow for :%s restored (Standard)' % port)
+    port = int(load_settings().get('console_port') or 5001)
+    be = _fw_backend()
+    if be == 'firewalld':
+        _fw_allow(port, 'tcp')
+    else:
+        subprocess.run('sudo ufw allow %s/tcp >/dev/null 2>&1 || ufw allow %s/tcp >/dev/null 2>&1; true'
+                       % (port, port), shell=True, capture_output=True, timeout=30)
+    log('W1: %s public allow for :%s restored (Standard)' % ('firewalld' if be == 'firewalld' else 'UFW', port))
 
 def _hardening_control_w1():
     """W1 — console SSO + per-user MFA + :5001 lockdown. Highest risk, so it runs LAST
@@ -3808,8 +3845,8 @@ def _hardening_control_w1():
     returned False)."""
     def apply_(h, log):
         if not _ufw_default_incoming_deny():
-            log('W1: REFUSING — UFW default-incoming is not deny; locking :5001 would not '
-                'actually block external access. Set UFW default deny incoming first.')
+            log('W1: REFUSING — host firewall default-incoming is not deny; locking :5001 would '
+                'not actually block external access. Enable the firewall (deny-by-default) first.')
             return False
         # 1) Authentik MFA (refuses if it would lock everyone out). On failure, clean up
         # any Authentik objects it recorded before dropping the state.
@@ -3844,7 +3881,7 @@ def _hardening_control_w1():
             return (False, 'SSO+MFA flip not applied')
         port = str((load_settings().get('console_port') or 5001))
         if _w1_console_port_public(port):
-            return (False, ':%s still has a public UFW allow' % port)
+            return (False, ':%s still has a public firewall allow' % port)
         napps = len(w1.get('ak_apps') or {})
         if not napps:
             return (False, 'MFA policy not bound to any Authentik app')
