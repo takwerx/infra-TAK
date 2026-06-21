@@ -6848,7 +6848,7 @@ def _ensure_authentik_remote_assist_app(settings, plog=None):
         try:
             req = _urlreq.Request(f'{ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
             mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
-            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in {'openid', 'email', 'profile'}]
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in {'openid', 'email', 'profile', 'groups'}]
         except Exception:
             pass
 
@@ -7021,6 +7021,7 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
         f'OIDC_AUDIENCE={client_id}',
         f'OIDC_CLIENT_ID={client_id}',
         f'OIDC_JWKS_URI={oidc_jwks}',
+        f'OIDC_ADMIN_GROUP=authentik Admins',
         f'CORS_ORIGIN={portal_base}',
         f'NGINX_BIND_ADDR=127.0.0.1',
         f'HTTP_PORT={REMOTE_ASSIST_PORT}',
