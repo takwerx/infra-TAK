@@ -17389,6 +17389,27 @@ def run_caddy_deploy(domain):
 
         plog("")
         plog("━━━ Step 4/4: Starting Caddy ━━━")
+        # v10.0.1 (RHEL): the @caddy/caddy COPR rpm intermittently leaves /usr/bin/caddy
+        # MISSING even after a `which caddy` passed at install — the binary can extract and
+        # then vanish before we get here (rpm -V shows it `missing`; systemd then dies with
+        # 203/EXEC). Re-verify FUNCTIONALLY right before start and self-heal with the official
+        # static binary, so a missing/broken binary can never reach systemd. Idempotent.
+        if pkg_mgr == 'dnf' and subprocess.run('caddy version', shell=True, capture_output=True).returncode != 0:
+            plog("  Caddy binary missing/non-functional before start — installing official static binary…")
+            _ca = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
+            subprocess.run(f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_ca}" -o /tmp/caddy.download',
+                           shell=True, capture_output=True, timeout=300)
+            subprocess.run('chmod +x /tmp/caddy.download 2>/dev/null; true', shell=True, capture_output=True)
+            _cv = subprocess.run('/tmp/caddy.download version', shell=True, capture_output=True, text=True, timeout=20)
+            if _cv.returncode == 0:
+                subprocess.run('install -m 0755 /tmp/caddy.download /usr/bin/caddy', shell=True, capture_output=True, timeout=30)
+                subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
+                               shell=True, capture_output=True)
+                plog(f"  ✓ official static caddy {(_cv.stdout or '').split()[0] if _cv.stdout else ''} installed")
+            else:
+                plog(f"  ✗ static caddy download did not validate: {((_cv.stderr or _cv.stdout) or 'no output').strip()[:160]}")
+            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
         subprocess.run('systemctl enable caddy 2>/dev/null; true', shell=True, capture_output=True)
         r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
