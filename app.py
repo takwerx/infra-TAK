@@ -7315,7 +7315,13 @@ def _run_remote_assist_update():
         settings = load_settings()
         plog('━━━ Step 1/5: Pulling latest source ━━━')
         _remote_assist_restore_tracked_files(ra_dir)
-        r = _sp.run(['git', '-C', ra_dir, 'pull', '--ff-only'],
+        # Ensure remote URL is correct (handles repository rename)
+        _sp.run(['git', '-C', ra_dir, 'remote', 'set-url', 'origin', REMOTE_ASSIST_REPO],
+                capture_output=True, text=True, timeout=10)
+        # Explicitly fetch main to handle shallow clones properly
+        _sp.run(['git', '-C', ra_dir, 'fetch', 'origin', 'main', '--depth', '1'],
+                capture_output=True, text=True, timeout=120)
+        r = _sp.run(['git', '-C', ra_dir, 'reset', '--hard', 'origin/main'],
                     capture_output=True, text=True, timeout=120)
         plog((r.stdout + r.stderr).strip() or '(no output)')
         if r.returncode != 0:
