@@ -3464,7 +3464,7 @@ def _hardening_assertions():
             'fail' if mgr else 'pass',
             'manager webapp present' if mgr else 'no manager/host-manager webapp')
         add('tak_tomcat_mtls', 'TAK connectors mTLS client-cert (8443/8446)', 'na',
-            'shielded by mTLS+UFW+Caddy; full connector/AJP STIG audit is .57')
+            'shielded by mTLS+firewall+Caddy; full connector/AJP STIG audit is .57')
     else:
         add('tak_tomcat_manager', 'TAK Tomcat surface', 'na', 'TAK Server not installed on this host')
 
@@ -3491,7 +3491,7 @@ def _hardening_control_w4():
         log('W4: boundary assertions disabled')
         return True
     return {'key': 'W4_assert', 'title': 'Port & Tomcat boundary assertions',
-            'desc': 'Verifies UFW deny-by-default, fail2ban, and TAK Tomcat shielding (read-only).',
+            'desc': 'Verifies host-firewall deny-by-default, fail2ban, and TAK Tomcat shielding (read-only).',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
 # --- W1: console SSO + per-user MFA + :5001 lockdown (the auth flip; last) -----
@@ -4157,7 +4157,7 @@ th{background:#f1f5f9}.meta{color:#475569;font-size:12px}code{background:#f1f5f9
 
     parts.append('<h2>7. Deployment guidance — reverse proxy / load balancer</h2>')
     parts.append('<p style="font-size:12.5px"><strong>No load balancer &ne; non-compliant.</strong> The actual auth '
-                 'boundary is UFW deny-by-default + mTLS client-cert on the TAK Tomcat connectors — a box with no LB is '
+                 'boundary is host-firewall deny-by-default + mTLS client-cert on the TAK Tomcat connectors — a box with no LB is '
                  'fully defensible on that alone. On real clouds a Network Load Balancer in <strong>TCP passthrough</strong> '
                  'in front of :8089/:8443 is optional (IP-hiding, flood absorption, HA). An on-box reverse proxy is a '
                  '<em>want</em>, not a need; any proxy in front of TAK must be TCP passthrough (terminating TLS breaks '
@@ -28709,7 +28709,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <div class="card">
     <div class="card-title">Boundary assertions (W4) — read-only</div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">UFW, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Host firewall, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
     <div id="assertions">Loading…</div>
   </div>
 
