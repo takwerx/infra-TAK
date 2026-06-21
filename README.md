@@ -10,7 +10,7 @@ Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
-**Universal installer.** Supported platforms: **Ubuntu 22.04 LTS**, **Rocky Linux / RHEL 9**, and **ARM64** (aarch64, e.g. Jetson Orin). The same one-clone install detects your OS, package manager (`apt`/`dnf`), and architecture and configures the firewall (ufw on Debian, firewalld on RHEL) automatically. *ARM64 caveats: Cesium 3D-tiles (pmtiles) and Federation Hub are not yet available on ARM — see the release notes.*
+**Universal installer.** Supported platforms: **Ubuntu 22.04 LTS**, **Rocky Linux / RHEL 9**, and **ARM64** (aarch64, e.g. Jetson Orin). The same one-clone install detects your OS, package manager (`apt`/`dnf`), and architecture and configures the firewall (ufw on Ubuntu, firewalld on RHEL) automatically. *Ubuntu is pinned to **22.04** — newer Ubuntu (24.04) and other Debian-family distros wait on TAK Server's certificate tooling supporting OpenSSL 3.x. ARM64 caveats: Cesium 3D-tiles (pmtiles) and Federation Hub are not yet available on ARM — see the release notes.*
 
 ## Universal recovery (SSH)
 
@@ -80,7 +80,7 @@ sudo ./start.sh
 **Branches:** Default clone uses **main** (stable; tagged releases). For latest features and fixes before they're merged to main, use the **dev** branch: `git clone --depth 1 -b dev https://github.com/takwerx/infra-TAK.git`. The README and changelog here reflect main; dev may include remote deployment, UI tweaks, and fixes not yet in a release.
 
 The script will:
-1. Detect your OS, package manager (**Ubuntu/Debian `apt`** or **Rocky/RHEL 9 `dnf`**), and architecture (**x86-64 or ARM64**) — and on RHEL install + start **firewalld** automatically
+1. Detect your OS, package manager (**Ubuntu 22.04 `apt`** or **Rocky/RHEL 9 `dnf`**), and architecture (**x86-64 or ARM64**) — and on RHEL install + start **firewalld** automatically
 2. Wait if automatic updates hold **apt/dpkg**, then install Python dependencies
 3. Ask you to set an admin password
 4. Start the web console
