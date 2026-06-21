@@ -4,13 +4,13 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.60-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.60-alpha)**
+**Current release: [v10.0.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.1-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
-**Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
+**Universal installer.** Supported platforms: **Ubuntu 22.04 LTS**, **Rocky Linux / RHEL 9**, and **ARM64** (aarch64, e.g. Jetson Orin). The same one-clone install detects your OS, package manager (`apt`/`dnf`), and architecture and configures the firewall (ufw on Debian, firewalld on RHEL) automatically. *ARM64 caveats: Cesium 3D-tiles (pmtiles) and Federation Hub are not yet available on ARM — see the release notes.*
 
 ## Universal recovery (SSH)
 
@@ -80,7 +80,7 @@ sudo ./start.sh
 **Branches:** Default clone uses **main** (stable; tagged releases). For latest features and fixes before they're merged to main, use the **dev** branch: `git clone --depth 1 -b dev https://github.com/takwerx/infra-TAK.git`. The README and changelog here reflect main; dev may include remote deployment, UI tweaks, and fixes not yet in a release.
 
 The script will:
-1. Detect your OS (**Ubuntu 22.04 only** for now; goal is a universal installer)
+1. Detect your OS, package manager (**Ubuntu/Debian `apt`** or **Rocky/RHEL 9 `dnf`**), and architecture (**x86-64 or ARM64**) — and on RHEL install + start **firewalld** automatically
 2. Wait if automatic updates hold **apt/dpkg**, then install Python dependencies
 3. Ask you to set an admin password
 4. Start the web console
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.1-alpha — 2026-06-21 — infra-TAK runs everywhere: Rocky / RHEL 9 and ARM64, not just Ubuntu
+
+**Headline: the universal-installer goal is here — infra-TAK now deploys and self-manages on Rocky Linux / RHEL 9 and on ARM64 hardware, in addition to Ubuntu 22.04, from the same single-clone install.** The installer detects your OS, package manager, and CPU architecture and configures the whole stack accordingly — including the firewall, which now works **identically on RHEL's firewalld and Ubuntu's ufw**: the firewall page and the one-click **Cyber Controls** hardening (default-deny, console lockdown, SSO + MFA) behave the same on every platform, with no change to how you use them. Fresh RHEL installs come up **hands-free** — firewalld is installed and started automatically (without ever locking you out), TLS/Caddy self-heals around an EL9 packaging quirk that could otherwise abort the very first deploy, and service-health detection understands RHEL's package and service names. This release also folds in **EUD Remote Assist** improvements: cleaner module naming, administrator rights passed through from your single sign-on, hardened security headers, more reliable in-place updates, the device API correctly opened on RHEL, and a clean automatic migration from the previous install. **ARM64 caveats:** Cesium 3D-tiles (pmtiles) and Federation Hub are not yet available on ARM. **Upgrade:** applied automatically on the next console update; existing Ubuntu deployments are unaffected.
+
+Full notes: [v10.0.1-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.1-alpha).
 
 ### v0.9.60-alpha — 2026-06-15 — EUD Remote Assist: accurate version checks and an on-demand update check
 
