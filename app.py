@@ -3485,11 +3485,8 @@ def _w1_console_port_public(port):
     fw = _firewall_status_local()
     if not fw.get('supported') or not fw.get('enabled'):
         return None
-    if fw.get('backend') == 'firewalld':
-        for ln in fw.get('rules', []):
-            if f'{port}/tcp' in ln and '[source-rule]' not in ln and '[service]' not in ln:
-                return True
-        return False
+    # Both backends now render rows as '<port>  ALLOW IN  <Anywhere|source>', so one
+    # check works universally: a public allow = the port ALLOWed from Anywhere.
     for ln in fw.get('rules', []):
         l = ln.lower()
         if port in l and 'allow' in l and 'anywhere' in l:
@@ -7966,10 +7963,26 @@ def guarddog_deploy_log_api():
         'running': guarddog_deploy_status['running'], 'complete': guarddog_deploy_status['complete'],
         'error': guarddog_deploy_status['error']})
 
+def _parse_firewalld_rich(rule):
+    """Parse a firewalld rich-rule string into (to, action, frm) mirroring UFW columns.
+    e.g. 'rule family="ipv4" source address="10.0.0.5" port port="389" protocol="tcp" accept'
+    → ('389/tcp', 'ALLOW IN', '10.0.0.5')."""
+    import re
+    src = ''
+    m = re.search(r'source address="([^"]+)"', rule)
+    if m:
+        src = m.group(1)
+    pm = re.search(r'port port="([^"]+)" protocol="([^"]+)"', rule)
+    to = (f'{pm.group(1)}/{pm.group(2)}' if pm else (rule[:24] + '…'))
+    action = 'DENY IN' if (' reject' in rule or ' drop' in rule) else 'ALLOW IN'
+    return (to, action, src or 'Anywhere')
+
+
 def _firewalld_status_local():
-    """Return local firewall status for UI on firewalld (RHEL/Rocky) hosts.
-    Mirrors the UFW dict shape so the UI renders both identically. firewalld has
-    no rule numbering, so rules_numbered mirrors rules."""
+    """Return local firewall status NORMALIZED to the exact same shape + line format
+    UFW produces, so the Firewall UI renders identically on every OS — firewalld is
+    just the backend. Rows are '<to>  ALLOW IN/DENY IN  <Anywhere|source>'; a parallel
+    rules_meta lets delete-by-number map a row back to the precise firewalld object."""
     try:
         rs = subprocess.run(_sudo_wrap(['firewall-cmd', '--state']),
                             capture_output=True, text=True, timeout=12)
@@ -7983,19 +7996,29 @@ def _firewalld_status_local():
         ports = [p for p in (rp.stdout or '').split() if p.strip()]
         services = [s for s in (svc.stdout or '').split() if s.strip()]
         rich = [r.strip() for r in (rr.stdout or '').splitlines() if r.strip()]
-        rules = ([f'{p} (public)' for p in ports]
-                 + [f'{s} [service] (public)' for s in services]
-                 + [f'{r} [source-rule]' for r in rich])
-        # firewalld has no native rule numbers — synthesize stable position numbers
-        # ([ 1], [ 2]…) so the UI shows them and "Delete Rule by Number" is usable.
-        # The delete route parses the CLEAN `rules` list (same order) by that index.
-        numbered = [f'[{i + 1:2d}] {r}' for i, r in enumerate(rules)]
-        raw = (f"state: {'running' if enabled else 'not running'}\n"
-               f"ports: {' '.join(ports)}\nservices: {' '.join(services)}"
-               + (f"\nsource rules:\n  " + "\n  ".join(rich) if rich else ''))
+        # Normalize to UFW's columns + a parallel meta list. firewalld has no native
+        # rule numbers, so we synthesize stable [ N] positions; the default-drop public
+        # zone denies unopened ports implicitly, and explicit reject rich-rules render
+        # as DENY IN to mirror UFW's deny rows.
+        rows, meta = [], []
+        for p in ports:
+            rows.append((p, 'ALLOW IN', 'Anywhere')); meta.append({'kind': 'port', 'value': p})
+        for s in services:
+            rows.append((s, 'ALLOW IN', 'Anywhere')); meta.append({'kind': 'service', 'value': s})
+        for r in rich:
+            to, action, frm = _parse_firewalld_rich(r)
+            rows.append((to, action, frm)); meta.append({'kind': 'rich', 'value': r})
+
+        def _fmt(idx, row, numbered):
+            to, action, frm = row
+            pfx = f'[{idx + 1:2d}] ' if numbered else ''
+            return f'{pfx}{to:<26}{action:<12}{frm}'
+        rules = [_fmt(i, row, False) for i, row in enumerate(rows)]
+        numbered = [_fmt(i, row, True) for i, row in enumerate(rows)]
+        raw = f"state: {'running' if enabled else 'not running'}\n" + "\n".join(numbered)
         return {'supported': True, 'enabled': enabled, 'rules': rules,
-                'rules_numbered': numbered, 'raw': raw, 'raw_numbered': raw,
-                'backend': 'firewalld'}
+                'rules_numbered': numbered, 'rules_meta': meta,
+                'raw': raw, 'raw_numbered': raw, 'backend': 'firewalld'}
     except Exception as e:
         return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': [], 'rules_numbered': []}
 
@@ -8158,28 +8181,21 @@ def firewall_delete_rule_api():
     try:
         be = _fw_backend()
         if be == 'firewalld':
-            # firewalld has no rule numbering — map the UI's displayed [ N] to the Nth
-            # entry of the CLEAN ordered list (ports → services → source-rules; same
-            # order the [ N] display is built from) and remove the matching object.
-            rules = st.get('rules') or []
-            if number > len(rules):
-                return jsonify({'success': False, 'error': f'No rule #{number} (only {len(rules)} present)'}), 400
-            entry = rules[number - 1]
-            if entry.endswith('[source-rule]'):
-                rich = entry[:-len(' [source-rule]')].strip()
-                subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
-                                           f'--remove-rich-rule={rich}']),
-                               capture_output=True, text=True, timeout=15)
-            elif '[service]' in entry:
-                svc = entry.split()[0]
-                subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
-                                           f'--remove-service={svc}']),
-                               capture_output=True, text=True, timeout=15)
+            # firewalld has no rule numbering — map the displayed [ N] to the Nth entry
+            # of rules_meta (same order as the rendered rows) and remove the precise
+            # firewalld object (port / service / rich-rule).
+            meta = st.get('rules_meta') or []
+            if number > len(meta):
+                return jsonify({'success': False, 'error': f'No rule #{number} (only {len(meta)} present)'}), 400
+            m = meta[number - 1]
+            if m['kind'] == 'rich':
+                arg = f"--remove-rich-rule={m['value']}"
+            elif m['kind'] == 'service':
+                arg = f"--remove-service={m['value']}"
             else:
-                portspec = entry.split()[0]  # e.g. '8080/tcp'
-                subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
-                                           f'--remove-port={portspec}']),
-                               capture_output=True, text=True, timeout=15)
+                arg = f"--remove-port={m['value']}"
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent', arg]),
+                           capture_output=True, text=True, timeout=15)
             subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
                            capture_output=True, text=True, timeout=15)
         else:
@@ -30961,7 +30977,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <input class="form-input" type="number" id="fw-rule-num" min="1" placeholder="Rule #" style="max-width:120px">
         <button class="btn" type="button" id="fw-del-btn" onclick="fwDeleteRule()" style="border-color:var(--red);color:var(--red)">Delete rule</button>
       </div>
-      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use the numbers shown in "Current Rules" ({{ 'firewalld has no native rule numbers — the number maps to the position in the list above' if fw_backend=='firewalld' else 'from ufw status numbered' }}).</p>
+      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use the numbers shown in "Current Rules" above.</p>
     </div>
   </details>
 </div>
