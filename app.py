@@ -51641,11 +51641,18 @@ def takserver_services():
                 'status': 'running' if pg_running else 'stopped'
             })
         else:
-            pg = subprocess.run("systemctl is-active postgresql", shell=True, capture_output=True, text=True, timeout=5)
+            # Native host PostgreSQL: Debian/Ubuntu use the unsuffixed `postgresql`
+            # meta-service; RHEL/EL (PGDG) use `postgresql-15`. EITHER being active
+            # means PG is up. Probing only `postgresql` false-reds every Rocky/RHEL
+            # native box ("PostgreSQL stopped") even though postgresql-15 is serving
+            # cot fine — same EL/Debian split already handled at the deploy probe.
+            pg = subprocess.run("systemctl is-active postgresql postgresql-15 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=5)
+            pg_active = 'active' in (pg.stdout or '').split()
             services.append({
                 'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
                 'cpu': '', 'mem_mb': '', 'mem_pct': '',
-                'status': 'running' if pg.stdout.strip() == 'active' else 'stopped'
+                'status': 'running' if pg_active else 'stopped'
             })
     except Exception as e:
         services.append({'name': 'Error', 'icon': '❌', 'status': str(e)[:200]})
