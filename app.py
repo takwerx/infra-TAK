@@ -1120,6 +1120,102 @@ def _fw_remove(port, proto='tcp'):
         return False, str(e)[:160]
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
+def _fw_ensure_installed(log=None):
+    """v10.0.1: Ensure a host firewall is present AND enabled. On RHEL/Rocky,
+    firewalld is ALWAYS installed + enabled (operator decision 2026-06-21: many
+    deploys are NOT in the cloud, so there's no security group to fall back on; this
+    matches Debian's always-on ufw, gives fleet-uniform state, and the hardening W4
+    controls need a host firewall to assert against). Idempotent — no-op if already
+    present + active.
+
+    LOCKOUT SAFETY: SSH must stay reachable. firewalld's default `public` zone ships
+    with the `ssh` service open, but we add it explicitly BEFORE enabling so a box
+    behind a cloud security group (SSH arrives via the SG, not a host rule) is never
+    cut off when firewalld goes default-deny. Debian path is unchanged (start.sh owns
+    ufw). Returns the active backend ('ufw'|'firewalld'|None)."""
+    def _log(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+    if _distro_family() != 'rhel':
+        return _fw_backend()  # Debian/Ubuntu: ufw is ensured by start.sh
+    have_fwd = subprocess.run('command -v firewall-cmd >/dev/null 2>&1', shell=True).returncode == 0
+    if not have_fwd:
+        _log("  firewall: installing firewalld (RHEL always-on host firewall)…")
+        try:
+            _pkg_install(['firewalld'], log_fn=log)
+        except Exception as e:
+            _log(f"  ⚠ firewalld install failed: {str(e)[:120]}")
+            return _fw_backend()
+    # Keep SSH reachable BEFORE the firewall goes active (lockout guard).
+    subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent', '--add-service=ssh']),
+                   capture_output=True, text=True, timeout=20)
+    subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'firewalld']),
+                   capture_output=True, text=True, timeout=60)
+    subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                   capture_output=True, text=True, timeout=20)
+    r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'firewalld']),
+                       capture_output=True, text=True, timeout=10)
+    active = (r.stdout or '').strip() == 'active'
+    _log("  ✓ firewalld installed + active (SSH preserved)" if active
+         else "  ⚠ firewalld did not become active after enable")
+    return 'firewalld' if active else _fw_backend()
+
+
+def _fw_allow_from(source, port, proto='tcp'):
+    """Open a port ONLY from a source IP/CIDR. ufw `allow from X to any port Y` ↔
+    firewalld rich rule. v4/v6 family auto-detected from the source. Returns (ok,msg);
+    no-op-safe when no firewall is present."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    fam = 'ipv6' if ':' in str(source) else 'ipv4'
+    try:
+        if be == 'firewalld':
+            rule = (f'rule family="{fam}" source address="{source}" '
+                    f'port port="{port}" protocol="{proto}" accept')
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--add-rich-rule={rule}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', 'allow', 'from', str(source),
+                                           'to', 'any', 'port', str(port), 'proto', proto]),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+
+def _fw_deny(port, proto='tcp'):
+    """Ensure a port is NOT publicly reachable. ufw: explicit `deny`. firewalld: the
+    default `public` zone already drops anything not opened, so this removes any allow
+    for the port (firewalld has no positive 'deny' in a default-drop zone). (ok,msg)."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    try:
+        if be == 'firewalld':
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--remove-port={port}/{proto}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', 'deny', f'{port}/{proto}']),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+
 def _selinux_allow_caddy_port(port, log=None):
     """On RHEL + SELinux Enforcing, let confined Caddy (httpd_t) bind a
     non-standard port by labeling it http_port_t for BOTH tcp AND udp. No-op on
