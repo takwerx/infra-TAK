@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+# infra-TAK: ufw → firewalld translation shim (RHEL/firewalld hosts only).
+#
+# WHY: infra-TAK's firewall policy is expressed as `ufw ...` calls scattered across
+# every module deploy. On Debian those drive UFW directly. On RHEL there is no UFW —
+# so infra-TAK installs THIS script as /usr/local/sbin/ufw (only when no real ufw is
+# present), and every existing `ufw allow / deny / allow-from / delete / enable / status`
+# call is translated to the firewalld equivalent. Result: ONE firewall policy that is
+# byte-for-byte the same on every OS, with zero per-module branching. Debian is
+# untouched (it uses the real ufw; this shim is never installed there).
+#
+# DESIGN: each rule is applied to BOTH the runtime and the --permanent config (so it
+# takes effect immediately AND survives reboot, with no reload race). firewalld's
+# default-drop `public` zone means "not opened == denied"; explicit `deny`/`reject`
+# add a reject rich-rule so the deny is also visible (mirrors UFW's deny rows).
+# Unknown/unsupported ufw forms are accepted as harmless no-ops (exit 0) so a deploy
+# can never break on an un-handled invocation.
+#
+# Handles the ufw subset infra-TAK actually uses:
+#   ufw [--force] allow|deny|limit PORT[/proto]
+#   ufw [--force] allow|deny       from SRC [to any] port PORT [proto P]
+#   ufw [--force] delete allow|deny PORT[/proto]
+#   ufw [--force] delete allow|deny from SRC [to any] port PORT [proto P]
+#   ufw [--force] enable|disable|reload|default ...|logging ...|status [numbered|verbose]
+import sys
+import subprocess
+
+ZONE = 'public'
+
+
+def _fc(args, permanent):
+    cmd = ['firewall-cmd']
+    if permanent:
+        cmd.append('--permanent')
+    cmd += [f'--zone={ZONE}'] + args
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _apply(args):
+    # runtime (immediate) + permanent (persist) — no reload needed.
+    _fc(args, permanent=False)
+    _fc(args, permanent=True)
+
+
+def _norm(port):
+    """'5001' -> ('5001','tcp'); '5001/udp' -> ('5001','udp'). Non-numeric -> (None,_)."""
+    p, _, proto = port.partition('/')
+    if not p.isdigit():
+        return (None, 'tcp')
+    return (p, (proto or 'tcp'))
+
+
+def _fam(src):
+    return 'ipv6' if ':' in src else 'ipv4'
+
+
+def _rich(src, pnum, proto, verb):
+    base = f'rule family="{_fam(src)}" '
+    if src:
+        base += f'source address="{src}" '
+    return base + f'port port="{pnum}" protocol="{proto}" {verb}'
+
+
+def _parse_from(rest):
+    """rest starts after 'from'. Returns (src, pnum, proto) or (None,None,None)."""
+    src = rest[0] if rest else ''
+    pnum = None
+    proto = 'tcp'
+    i = 0
+    while i < len(rest):
+        if rest[i] == 'port' and i + 1 < len(rest):
+            pnum, proto = _norm(rest[i + 1])
+        elif rest[i] == 'proto' and i + 1 < len(rest):
+            proto = rest[i + 1]
+        i += 1
+    return (src, pnum, proto)
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != '--force']
+    if not args:
+        return 0
+    cmd = args[0]
+
+    if cmd in ('enable',):
+        subprocess.run(['systemctl', 'enable', '--now', 'firewalld'], capture_output=True)
+        return 0
+    if cmd in ('disable', 'default', 'logging', 'version', 'app', 'reset'):
+        return 0  # no-op (we never disable; default policy is the zone's job)
+    if cmd == 'reload':
+        subprocess.run(['firewall-cmd', '--reload'], capture_output=True)
+        return 0
+    if cmd == 'status':
+        state = subprocess.run(['firewall-cmd', '--state'], capture_output=True, text=True)
+        print('Status: active' if (state.stdout or '').strip() == 'running' else 'Status: inactive')
+        return 0
+
+    if cmd in ('allow', 'deny', 'reject', 'limit'):
+        rest = args[1:]
+        if rest and rest[0] == 'from':
+            src, pnum, proto = _parse_from(rest[1:])
+            if not pnum:
+                return 0
+            verb = 'reject' if cmd in ('deny', 'reject') else 'accept'
+            _apply([f'--add-rich-rule={_rich(src, pnum, proto, verb)}'])
+            return 0
+        if not rest:
+            return 0
+        pnum, proto = _norm(rest[0])
+        if not pnum:
+            return 0  # named app profile etc. — ignore
+        if cmd in ('allow', 'limit'):
+            _apply([f'--add-port={pnum}/{proto}'])
+        else:  # deny/reject a port from anywhere: ensure closed + show a DENY row
+            _apply([f'--remove-port={pnum}/{proto}'])
+            _apply([f'--add-rich-rule={_rich("", pnum, proto, "reject")}'])
+        return 0
+
+    if cmd == 'delete':
+        rest = args[1:]
+        if not rest:
+            return 0
+        sub = rest[0]  # allow | deny
+        tail = rest[1:]
+        if tail and tail[0] == 'from':
+            src, pnum, proto = _parse_from(tail[1:])
+            if not pnum:
+                return 0
+            verb = 'reject' if sub == 'deny' else 'accept'
+            _apply([f'--remove-rich-rule={_rich(src, pnum, proto, verb)}'])
+            return 0
+        if not tail:
+            return 0
+        pnum, proto = _norm(tail[0])
+        if not pnum:
+            return 0
+        if sub == 'allow':
+            _apply([f'--remove-port={pnum}/{proto}'])
+        else:
+            _apply([f'--remove-rich-rule={_rich("", pnum, proto, "reject")}'])
+        return 0
+
+    return 0  # anything else — no-op, never break a deploy
+
+
+if __name__ == '__main__':
+    sys.exit(main())

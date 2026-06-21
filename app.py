@@ -1161,7 +1161,40 @@ def _fw_ensure_installed(log=None):
     active = (r.stdout or '').strip() == 'active'
     _log("  ✓ firewalld installed + active (SSH preserved)" if active
          else "  ⚠ firewalld did not become active after enable")
+    _fw_install_shim(_log)
     return 'firewalld' if active else _fw_backend()
+
+
+def _fw_install_shim(log=None):
+    """Install the ufw→firewalld translation shim at /usr/local/sbin/ufw on RHEL, so
+    every module deploy's existing `ufw ...` call drives firewalld unchanged (one
+    universal firewall policy, no per-module branching). No-op on Debian and when a
+    REAL ufw is present (we never shadow the genuine tool). Idempotent — re-copies to
+    pick up updates. State-safe: installs a script, changes no firewall rules."""
+    def _log(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+    if _distro_family() != 'rhel':
+        return False
+    real_ufw = any(os.path.exists(p) for p in ('/usr/sbin/ufw', '/usr/bin/ufw', '/sbin/ufw'))
+    if real_ufw:
+        return False
+    src = os.path.join(BASE_DIR, 'scripts', 'ufw-firewalld-shim')
+    if not os.path.exists(src):
+        return False
+    try:
+        r = subprocess.run(_sudo_wrap(['install', '-m', '0755', src, '/usr/local/sbin/ufw']),
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            _log("  ✓ ufw→firewalld shim installed (/usr/local/sbin/ufw) — module ufw calls now drive firewalld")
+            return True
+        _log(f"  ⚠ ufw shim install failed: {((r.stderr or '') + (r.stdout or ''))[:120]}")
+    except Exception as e:
+        _log(f"  ⚠ ufw shim install error: {str(e)[:120]}")
+    return False
 
 
 def _fw_allow_from(source, port, proto='tcp'):
@@ -64108,6 +64141,14 @@ def _post_update_auto_deploy():
 
 _startup_migrations()
 _post_update_auto_deploy()
+
+# Universal firewall: on RHEL, ensure the ufw→firewalld translation shim is present so
+# every module deploy's `ufw ...` call drives firewalld (state-safe — installs a script,
+# changes no rules; no-op on Debian / when a real ufw exists).
+try:
+    _fw_install_shim(lambda m: print(f"[startup] {m}", flush=True))
+except Exception as _e:
+    print(f"[startup] ufw shim install skipped (non-fatal): {_e}", flush=True)
 
 # v0.8.5: periodic LDAP routing spiral monitor (self-healing for boxes whose spiral
 # manifests after the post-update one-shot check). Idempotent, rate-limited (max 1
