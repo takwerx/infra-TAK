@@ -61461,6 +61461,48 @@ def _startup_migrations():
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
 
+        # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
+        # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
+        # Update/Uninstall buttons now target eud paths and can no longer see an old cfd stack,
+        # so a box that installed Remote Assist before the rename would be stranded (old
+        # containers hold ports 8767/8448 → a fresh eud deploy collides). We remove the old
+        # compose stack + DB volume, force-kill any lingering cfd-remote-assist-* containers,
+        # deregister the old Authentik app/provider, drop the source dir, and mark the module
+        # not-installed so the operator reinstalls fresh (= eud). Idempotent: the old dir is
+        # removed at the end, and the guard requires it present with no eud dir yet, so this
+        # runs at most once and is a no-op on fresh boxes.
+        _ra_old_dir = os.path.expanduser('~/cfd-remote-assist')
+        _ra_new_dir = os.path.expanduser('~/eud-remote-assist')
+        if os.path.isdir(_ra_old_dir) and not os.path.isdir(_ra_new_dir):
+            try:
+                print("Startup migration: tearing down legacy cfd-remote-assist install (renamed to eud)", flush=True)
+                _old_compose = os.path.join(_ra_old_dir, 'docker-compose.yml')
+                if os.path.exists(_old_compose):
+                    subprocess.run(['docker', 'compose', '-f', _old_compose, 'down', '-v', '--remove-orphans'],
+                                   capture_output=True, timeout=120)
+                # Belt-and-suspenders: force-remove any container still named cfd-remote-assist-*
+                _ra_old_ids = subprocess.run(['docker', 'ps', '-aq', '--filter', 'name=cfd-remote-assist'],
+                                             capture_output=True, text=True, timeout=15).stdout.split()
+                if _ra_old_ids:
+                    subprocess.run(['docker', 'rm', '-f', *_ra_old_ids], capture_output=True, timeout=60)
+                # Deregister the old Authentik application + provider (legacy slug/name).
+                try:
+                    _deregister_authentik_oauth2_app(s, 'cfd-remote-assist', 'CFD Remote Assist')
+                except Exception:
+                    pass
+                shutil.rmtree(_ra_old_dir, ignore_errors=True)
+                # Reflect reality: no RA install until the operator reinstalls fresh (= eud).
+                s['remote_assist_enabled'] = False
+                save_settings(s)
+                s = load_settings()
+                # Drop the now-dead RA vhost from Caddy so its subdomain doesn't 502.
+                if (s.get('fqdn') or '').strip():
+                    generate_caddyfile(s)
+                    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+                print("Startup migration: legacy cfd-remote-assist removed — reinstall EUD Remote Assist from the console to recreate it", flush=True)
+            except Exception as e:
+                print(f"Startup migration: error tearing down legacy cfd-remote-assist: {e}", flush=True)
+
         # v0.9.61: inject OIDC_ADMIN_GROUP into existing remote assist .env
         if s.get('remote_assist_enabled') or 'remote_assist' in s.get('modules', {}):
             ra_env_path = os.path.expanduser('~/eud-remote-assist/.env')
