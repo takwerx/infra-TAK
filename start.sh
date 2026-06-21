@@ -580,18 +580,18 @@ if [ "$PKG_MGR" = "dnf" ]; then
     # Install firewalld if the image didn't ship it (cloud RHEL AMIs often strip it).
     command -v firewall-cmd >/dev/null 2>&1 || dnf install -y firewalld >/dev/null 2>&1
     if command -v firewall-cmd >/dev/null 2>&1; then
-        # SSH + console first (lockout guard: a cloud box's SSH arrives via the security
-        # group, so default-deny without 22 open would strand it even though the SG allows).
+        # Start firewalld FIRST — `firewall-cmd` (even --permanent) needs the daemon
+        # running, and the default `public` zone already allows ssh, so SSH survives.
+        systemctl enable --now firewalld >/dev/null 2>&1 || true
+        # Now add console + SSH explicitly, then seed from current PUBLIC listeners so a
+        # re-run on a box that already has modules doesn't strand their ports (a fresh box
+        # only has SSH + console here). Module deploys open their ports later via the shim.
         firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
         firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
-        # Seed from current PUBLIC listeners so a re-run on a box that already has modules
-        # deployed doesn't strand their ports (a fresh box only has SSH + console here).
-        # Module deploys open their own ports afterward via the ufw->firewalld shim.
         for _p in $(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vE '^127\.0\.0\.1:|^\[::1\]:' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un); do
             [ "$_p" = "111" ] && continue   # rpcbind — never expose
             firewall-cmd --permanent --add-port=${_p}/tcp >/dev/null 2>&1 || true
         done
-        systemctl enable --now firewalld >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 else
