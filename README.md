@@ -67,6 +67,9 @@ No more SSH. No more editing XML by hand. No more running scripts and hoping.
 ## Quick Start
 
 ```bash
+# Ensure git is installed (Ubuntu usually has it; bare RHEL/Rocky cloud AMIs often don't)
+command -v git >/dev/null 2>&1 || sudo apt-get install -y git 2>/dev/null || sudo dnf install -y git
+
 git clone --depth 1 https://github.com/takwerx/infra-TAK.git
 cd infra-TAK
 sudo ./start.sh
