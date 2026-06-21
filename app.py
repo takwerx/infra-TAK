@@ -7986,11 +7986,15 @@ def _firewalld_status_local():
         rules = ([f'{p} (public)' for p in ports]
                  + [f'{s} [service] (public)' for s in services]
                  + [f'{r} [source-rule]' for r in rich])
+        # firewalld has no native rule numbers — synthesize stable position numbers
+        # ([ 1], [ 2]…) so the UI shows them and "Delete Rule by Number" is usable.
+        # The delete route parses the CLEAN `rules` list (same order) by that index.
+        numbered = [f'[{i + 1:2d}] {r}' for i, r in enumerate(rules)]
         raw = (f"state: {'running' if enabled else 'not running'}\n"
                f"ports: {' '.join(ports)}\nservices: {' '.join(services)}"
                + (f"\nsource rules:\n  " + "\n  ".join(rich) if rich else ''))
         return {'supported': True, 'enabled': enabled, 'rules': rules,
-                'rules_numbered': list(rules), 'raw': raw, 'raw_numbered': raw,
+                'rules_numbered': numbered, 'raw': raw, 'raw_numbered': raw,
                 'backend': 'firewalld'}
     except Exception as e:
         return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': [], 'rules_numbered': []}
@@ -8154,10 +8158,10 @@ def firewall_delete_rule_api():
     try:
         be = _fw_backend()
         if be == 'firewalld':
-            # firewalld has no rule numbering — map the UI's displayed number to the
-            # Nth entry of the same ordered list the status reader produces (ports →
-            # services → source-rules) and remove the matching object.
-            rules = st.get('rules_numbered') or st.get('rules') or []
+            # firewalld has no rule numbering — map the UI's displayed [ N] to the Nth
+            # entry of the CLEAN ordered list (ports → services → source-rules; same
+            # order the [ N] display is built from) and remove the matching object.
+            rules = st.get('rules') or []
             if number > len(rules):
                 return jsonify({'success': False, 'error': f'No rule #{number} (only {len(rules)} present)'}), 400
             entry = rules[number - 1]
