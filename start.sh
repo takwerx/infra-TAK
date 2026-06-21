@@ -572,13 +572,32 @@ sleep 1
 # Start the console
 systemctl start takwerx-console
 
-# Ensure backdoor port 5001 is allowed (so when UFW is enabled later, e.g. by TAK Server deploy, we don't lock ourselves out)
-if command -v ufw >/dev/null 2>&1; then
-    ufw allow 5001/tcp >/dev/null 2>&1 || true
-fi
-if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
+# Host firewall: keep the console + SSH reachable, and on RHEL bring up ALWAYS-ON
+# firewalld (operator decision 2026-06-21 — many deploys aren't in a cloud with a
+# security group, and the Cyber-Controls W4 checks need a host firewall to assert
+# against). On Debian, ufw is enabled later by the TAK Server deploy; just open 5001.
+if [ "$PKG_MGR" = "dnf" ]; then
+    # Install firewalld if the image didn't ship it (cloud RHEL AMIs often strip it).
+    command -v firewall-cmd >/dev/null 2>&1 || dnf install -y firewalld >/dev/null 2>&1
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        # SSH + console first (lockout guard: a cloud box's SSH arrives via the security
+        # group, so default-deny without 22 open would strand it even though the SG allows).
+        firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
+        # Seed from current PUBLIC listeners so a re-run on a box that already has modules
+        # deployed doesn't strand their ports (a fresh box only has SSH + console here).
+        # Module deploys open their own ports afterward via the ufw->firewalld shim.
+        for _p in $(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vE '^127\.0\.0\.1:|^\[::1\]:' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un); do
+            [ "$_p" = "111" ] && continue   # rpcbind — never expose
+            firewall-cmd --permanent --add-port=${_p}/tcp >/dev/null 2>&1 || true
+        done
+        systemctl enable --now firewalld >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+else
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 5001/tcp >/dev/null 2>&1 || true
+    fi
 fi
 
 # Get access URL — on Azure/AWS the private IP is returned by hostname -I
