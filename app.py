@@ -1179,17 +1179,27 @@ def _fw_install_shim(log=None):
                 pass
     if _distro_family() != 'rhel':
         return False
-    real_ufw = any(os.path.exists(p) for p in ('/usr/sbin/ufw', '/usr/bin/ufw', '/sbin/ufw'))
-    if real_ufw:
-        return False
+    # Install at /usr/sbin/ufw so BOTH `ufw` (root PATH) and `sudo ufw` (sudo
+    # secure_path excludes /usr/local/sbin on RHEL) resolve to the shim. Never shadow
+    # a REAL ufw: if any ufw exists without our marker, leave it alone.
+    marker = 'firewalld translation shim'
+    dst = '/usr/sbin/ufw'
+    for p in ('/usr/sbin/ufw', '/usr/bin/ufw', '/sbin/ufw'):
+        if os.path.exists(p):
+            try:
+                with open(p, 'r', errors='ignore') as _f:
+                    if marker not in _f.read(600):
+                        return False  # a real ufw — do not shadow
+            except Exception:
+                return False
     src = os.path.join(BASE_DIR, 'scripts', 'ufw-firewalld-shim')
     if not os.path.exists(src):
         return False
     try:
-        r = subprocess.run(_sudo_wrap(['install', '-m', '0755', src, '/usr/local/sbin/ufw']),
+        r = subprocess.run(_sudo_wrap(['install', '-m', '0755', src, dst]),
                            capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
-            _log("  ✓ ufw→firewalld shim installed (/usr/local/sbin/ufw) — module ufw calls now drive firewalld")
+            _log(f"  ✓ ufw→firewalld shim installed ({dst}) — module ufw calls now drive firewalld")
             return True
         _log(f"  ⚠ ufw shim install failed: {((r.stderr or '') + (r.stdout or ''))[:120]}")
     except Exception as e:
