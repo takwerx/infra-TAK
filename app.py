@@ -54445,10 +54445,20 @@ def _deploy_takserver_container(config):
 
         # ── Step 5/9: Firewall ──────────────────────────────────────────────
         log_step(""); log_step("━━━ Step 5/9: Configuring Firewall ━━━")
-        for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
-            run_cmd(f'ufw allow {p} > /dev/null 2>&1', check=False)
-        run_cmd('ufw --force enable > /dev/null 2>&1', check=False)
-        log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
+        if _distro_family() == 'rhel':
+            be = _fw_backend()
+            for _fp in (22, 8089, 8443, 8446, 5001):
+                _fw_allow(_fp, 'tcp')
+            if be == 'firewalld':
+                log_step("✓ Firewall configured — firewalld active (22, 8089, 8443, 8446, 5001)")
+            else:
+                log_step("ⓘ No host firewall active (firewalld not installed) — relying on the "
+                         "provider security group; TAK ports left reachable")
+        else:
+            for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
+                run_cmd(f'ufw allow {p} > /dev/null 2>&1', check=False)
+            run_cmd('ufw --force enable > /dev/null 2>&1', check=False)
+            log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
 
         # ── Step 6/9: Certificates (docker exec; files land in symlinked /opt/tak) ─
         log_step(""); log_step("━━━ Step 6/9: Generating Certificates ━━━")
@@ -54919,11 +54929,19 @@ def run_takserver_deploy(config):
 
         log_step(""); log_step("━━━ Step 6/9: Configuring Firewall ━━━")
         if _distro_family() == 'rhel':
-            # firewalld via _fw_allow (no-op if firewalld absent — cloud boxes rely on the
-            # provider security group; bare-metal with no host firewall = ports already open).
+            # firewalld via _fw_allow (no-op if firewalld absent). Report HONESTLY: only
+            # claim "configured" when a backend is actually active — otherwise say the box
+            # has no host firewall (relying on the provider security group). Always-on
+            # firewalld on RHEL is gated on the module-port sweep (see PLAN-firewall-
+            # cybercontrols-multiplatform.md) so default-deny can't strand a module's port.
+            be = _fw_backend()
             for _fp in (22, 8089, 8443, 8446, 5001):
                 _fw_allow(_fp, 'tcp')
-            log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
+            if be == 'firewalld':
+                log_step("✓ Firewall configured — firewalld active (22, 8089, 8443, 8446, 5001)")
+            else:
+                log_step("ⓘ No host firewall active (firewalld not installed) — relying on the "
+                         "provider security group; TAK ports left reachable")
         else:
             for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
                 run_cmd(f'ufw allow {p} > /dev/null 2>&1')
