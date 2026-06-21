@@ -54791,6 +54791,25 @@ def run_takserver_deploy(config):
                 log_step("Creating webadmin user (flat-file)...")
                 run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin 2>&1", check=False)
                 log_step("✓ webadmin user created")
+        # v10.0.1: sync the LDAP service-account (adm_ldapservice) password into
+        # Authentik on this NATIVE (.deb/.rpm) deploy. Without it the SA password
+        # stays mismatched (Authentik DB ≠ CoreConfig) → TAK's SA bind fails err 49
+        # → group resolution dies → webadmin (even when correctly in tak_ROLE_ADMIN)
+        # can't be confirmed admin → 8446 drops to WebTAK. The container path already
+        # does this (c7b18ad); mirror it here so amd64/RHEL self-heal too — the same
+        # canonical call the "Connect TAK Server to LDAP" route uses. The resync +
+        # restart that follow then align CoreConfig and reload TAK with the now-
+        # matching credential. Non-fatal: a miss just means the operator runs the
+        # Resync button once (the pre-fix behaviour).
+        if _get_authentik_env_content(load_settings()):
+            try:
+                ok_sa, msg_sa = _ensure_authentik_ldap_service_account()
+                if ok_sa:
+                    log_step("  ✓ LDAP service-account password synced to Authentik (8446 admin bind)")
+                else:
+                    log_step(f"  ⚠ LDAP service-account sync: {msg_sa} — run 'Connect TAK Server to LDAP' if 8446 shows WebTAK")
+            except Exception as _sae:
+                log_step(f"  ⚠ LDAP service-account sync error (non-fatal): {str(_sae)[:120]}")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             log_step(f"  NameEntry fix: {ne_msg}")
