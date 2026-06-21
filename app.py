@@ -3337,10 +3337,12 @@ def _ufw_default_incoming_deny():
             dz = subprocess.run(_sudo_wrap(['firewall-cmd', '--get-default-zone']),
                                 capture_output=True, text=True, timeout=8)
             zone = (dz.stdout or '').strip() or 'public'
-            tg = subprocess.run(_sudo_wrap(['firewall-cmd', f'--zone={zone}', '--get-target']),
+            # --get-target requires --permanent; without it firewall-cmd errors out.
+            tg = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}', '--get-target']),
                                 capture_output=True, text=True, timeout=8)
             # target 'default'/'%%REJECT%%'/'DROP'/'REJECT' all drop unsolicited incoming;
-            # only an explicit ACCEPT target opens the zone.
+            # only an explicit ACCEPT target opens the zone. (Empty/err → treat as deny,
+            # since an active firewalld public zone drops unsolicited traffic by design.)
             return (tg.stdout or '').strip().upper() != 'ACCEPT'
         except Exception:
             return None
