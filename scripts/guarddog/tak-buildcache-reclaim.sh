@@ -60,7 +60,10 @@ fi
 
 # Reclaim build cache older than the keep window. -f = no prompt; NO -a (keep recent).
 RAW=$(docker builder prune -f --filter "until=${KEEP_WINDOW}" 2>>"$LOG")
-RECLAIMED=$(echo "$RAW" | awk -F': ' '/Total reclaimed space/{print $2}')
+# Parse the reclaimed size from the summary line. Docker 29.x / containerd
+# snapshotter prints "Total:\t52.4GB"; older Docker prints "Total reclaimed
+# space: 52.4GB". Match either by grabbing the size token off any "Total" line.
+RECLAIMED=$(echo "$RAW" | grep -iE '^Total' | grep -oiE '[0-9.]+ ?[KMGTP]?i?B' | tail -1)
 [ -z "$RECLAIMED" ] && RECLAIMED="0B"
 
 disk_after=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
