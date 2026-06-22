@@ -60148,6 +60148,22 @@ def _auto_update_guarddog():
                 f.write(content)
             os.chmod(dest, 0o755)
             updated += 1
+        # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
+        # (the startup auto-update copies scripts but historically never installed new
+        # timers — that gap left the daily reclaim un-scheduled until someone clicked
+        # "Update Guard Dog"). Install+enable it here if the script is present but the
+        # timer unit is missing, so the scheduled baseline lands on console restart too.
+        # (The hourly self-heal in tak-disk-watch.sh already protects the box regardless.)
+        _bc_script = '/opt/tak-guarddog/tak-buildcache-reclaim.sh'
+        _bc_tmr = '/etc/systemd/system/takbuildcachereclaim.timer'
+        if os.path.isfile(_bc_script) and not os.path.isfile(_bc_tmr):
+            with open('/etc/systemd/system/takbuildcachereclaim.service', 'w') as _f:
+                _f.write(f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={_bc_script}\n')
+            with open(_bc_tmr, 'w') as _f:
+                _f.write('[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
+            subprocess.run('systemctl daemon-reload', shell=True, capture_output=True, timeout=10)
+            subprocess.run('systemctl enable --now takbuildcachereclaim.timer', shell=True, capture_output=True, timeout=10)
+            print("Guard Dog: installed takbuildcachereclaim.timer on startup.")
         if updated > 0:
             subprocess.run('systemctl daemon-reload', shell=True, capture_output=True, timeout=10)
             subprocess.run('systemctl restart takremotedbauthguard.timer 2>/dev/null; true', shell=True, capture_output=True, timeout=10)

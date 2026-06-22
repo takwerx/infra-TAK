@@ -8,6 +8,18 @@ CRITICAL_THRESHOLD=90
 ROOT_USAGE=$(df / | awk 'NR==2 {print $5}' | sed 's/%//')
 LOGS_USAGE=$(df /opt/tak/logs 2>/dev/null | awk 'NR==2 {print $5}' | sed 's/%//' || echo "0")
 
+# Self-heal (v10.0.2): before alerting, reclaim dead Docker build cache if the root
+# disk is getting tight. The reclaim script owns the authoritative threshold + 7-day
+# keep-window and self-gates; this hourly hook just pokes it when disk is high so a box
+# recovers WITHIN THE HOUR instead of waiting for the daily 04:30 timer. Riding this
+# already-hourly monitor means the self-heal deploys on a plain pull+restart (no
+# "Update Guard Dog" needed). Re-read usage after so the alert reflects post-reclaim state.
+RECLAIM_TRIGGER_PCT=70
+if [ -n "$ROOT_USAGE" ] && [ "$ROOT_USAGE" -ge "$RECLAIM_TRIGGER_PCT" ] && [ -x /opt/tak-guarddog/tak-buildcache-reclaim.sh ]; then
+  /opt/tak-guarddog/tak-buildcache-reclaim.sh >/dev/null 2>&1
+  ROOT_USAGE=$(df / | awk 'NR==2 {print $5}' | sed 's/%//')
+fi
+
 NEED_ALERT=false
 ALERT_MSG=""
 
