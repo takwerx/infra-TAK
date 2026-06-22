@@ -34,3 +34,6 @@ pull-dev-and-restart.sh
 # Local operator credentials and secrets — never commit
 .local/
 .local/eud-remote-assist-upstream-handoff.md
+
+# Claude Code project guidance — local only, full copy mirrored in private infra-TAK-notes
+CLAUDE.md
