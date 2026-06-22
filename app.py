@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.1-alpha"
+VERSION = "10.0.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -7654,6 +7654,7 @@ def guarddog_page():
     guarddog_monitors_tak.extend([
         {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
         {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
+        {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Daily (4:30am)', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). Prunes only cache older than 7 days, and only when the root disk is at/above 70% — keeps recent cache so rebuilds stay fast. Never touches images, containers, or volumes.'},
         {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
         {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
     ])
@@ -7715,6 +7716,7 @@ def guarddog_page():
         return None
 
     _autovacuum_last    = _timer_last_run('/var/log/takguard/autovacuum_last.txt')
+    _buildcache_last    = _timer_last_run('/var/log/takguard/buildcache_reclaim_last.txt')
     _ak_tasklog_installed = os.path.isfile('/opt/tak-guarddog/tak-authentik-tasklog-purge.sh')
     _ak_tasklog_last      = _timer_last_run('/opt/tak-guarddog/authentik_tasklog_purge_last.txt')
 
@@ -7734,6 +7736,7 @@ def guarddog_page():
         deploying=guarddog_deploy_status.get('running', False),
         deploy_done=guarddog_deploy_status.get('complete', False),
         autovacuum_last=_autovacuum_last,
+        buildcache_last=_buildcache_last,
         ak_tasklog_installed=_ak_tasklog_installed,
         ak_tasklog_last=_ak_tasklog_last)
 
@@ -10951,6 +10954,16 @@ def guarddog_update():
                 f.write(f'[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter={_after4}\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart={rg_script}\n')
             with open(rg_tmr_path, 'w') as f:
                 f.write('[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n')
+        # Build-cache reclaim timer (daily 4:30am) — install if script exists but timer doesn't.
+        # Cross-platform (docker + df only); no DB/SSH placeholders, no After= DB ordering.
+        bc_script = '/opt/tak-guarddog/tak-buildcache-reclaim.sh'
+        bc_svc_path = '/etc/systemd/system/takbuildcachereclaim.service'
+        bc_tmr_path = '/etc/systemd/system/takbuildcachereclaim.timer'
+        if os.path.isfile(bc_script) and not os.path.isfile(bc_tmr_path):
+            with open(bc_svc_path, 'w') as f:
+                f.write(f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={bc_script}\n')
+            with open(bc_tmr_path, 'w') as f:
+                f.write('[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
         # TAK Portal timer — install if script exists but timer doesn't
         tp_script = '/opt/tak-guarddog/tak-takportal-watch.sh'
         tp_svc_path = '/etc/systemd/system/taktakportalguard.service'
@@ -10984,6 +10997,8 @@ def guarddog_update():
             new_timers.append('takcotdbguard.timer')
         if os.path.isfile(rp_tmr_path):
             new_timers.append('takdbrepack.timer')
+        if os.path.isfile(bc_tmr_path):
+            new_timers.append('takbuildcachereclaim.timer')
         if os.path.isfile(tp_tmr_path):
             new_timers.append('taktakportalguard.timer')
         if os.path.isfile(_ak_tl_tmr_path):
@@ -11453,7 +11468,8 @@ def run_guarddog_deploy(alert_email):
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
-            'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh'
+            'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
+            'tak-buildcache-reclaim.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -11548,6 +11564,8 @@ def run_guarddog_deploy(alert_email):
             ('takdiskioguard.timer', '[Unit]\nDescription=Run disk I/O benchmark every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takdiskioguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takswapreclaim.service', '[Unit]\nDescription=Guard Dog Swap Reclaim (stale-swap hygiene)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-swap-reclaim.sh\n'),
             ('takswapreclaim.timer', '[Unit]\nDescription=Run swap reclaim every 10 minutes\n\n[Timer]\nOnBootSec=12min\nOnUnitActiveSec=10min\nUnit=takswapreclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takbuildcachereclaim.service', '[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-buildcache-reclaim.sh\n'),
+            ('takbuildcachereclaim.timer', '[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
@@ -11711,7 +11729,7 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
-                  'takswapreclaim.timer',
+                  'takswapreclaim.timer', 'takbuildcachereclaim.timer',
                   'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
@@ -28963,6 +28981,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
             <span class="guard-item-desc" style="flex:1">Install or reinstall the health agent on the remote database server (use if the Health Agent check above is red):</span>
             <button type="button" class="btn btn-ghost gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px;flex-shrink:0">Deploy health agent to Server One / remote server</button>
             <span class="gd-deploy-agent-msg-inline" style="font-size:12px;min-width:80px"></span>
+          </div>
+          {% endif %}
+          {% if m.id == 'buildcache' and buildcache_last %}
+          <div class="guard-item" style="padding-left:28px;margin-top:-4px;margin-bottom:8px">
+            <span class="guard-item-desc" style="flex:1;color:var(--text-dim)">Last run: <span style="color:var(--cyan)">{{ buildcache_last }}</span></span>
           </div>
           {% endif %}
           {% endfor %}
