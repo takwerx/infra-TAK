@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.1-alpha)**
+**Current release: [v10.0.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.2-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.2-alpha — 2026-06-22 — Guard Dog reclaims runaway Docker build cache before it fills your disk
+
+**Headline: Guard Dog now automatically reclaims dead Docker build cache, a hidden disk hog that can quietly fill a server's root disk and look like a database or log problem when it isn't.** Servers that update containers over time (CloudTAK and other module rebuilds) silently accumulate tens — sometimes hundreds — of gigabytes of stale Docker BuildKit cache. On a smaller disk that can climb toward 100% and start breaking things, even when TAK's own database and logs are perfectly healthy. Guard Dog now watches for this and cleans it up on its own: it keeps the **last 7 days** of cache so rebuilds stay fast, and only acts when the **root disk is getting tight (70%+)**, so boxes with plenty of room are left untouched. It **self-heals within the hour** (riding the existing hourly disk monitor) and also runs a **daily** pass, and it **never touches your running containers, images, or named volumes** — only dead build cache. Reclaimed space is logged and shown on the Guard Dog page. Works identically on **Ubuntu 22.04, Rocky / RHEL 9, and ARM64**. **Upgrade:** applied automatically on the next console update; no action required.
+
+Full notes: [v10.0.2-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.2-alpha).
 
 ### v10.0.1-alpha — 2026-06-21 — infra-TAK runs everywhere: Rocky / RHEL 9 and ARM64, not just Ubuntu
 
