@@ -61192,6 +61192,80 @@ def _startup_ensure_console_gunicorn_threads():
 _startup_ensure_console_gunicorn_threads()
 
 
+def _startup_ensure_broker():
+    """v10.0.5: ensure the privileged broker (takwerx-broker.service) is installed
+    + running on every console start. The T&E flow is `git pull + systemctl
+    restart takwerx-console`, which does NOT re-run start.sh — so the guard must
+    self-install here, otherwise the Cyber-Controls card shows "not installed".
+    Idempotent; writes the unit only when it differs (no restart loop). Console
+    keeps running as root. Uses raw open() on purpose: this is the bootstrap that
+    CREATES the broker, so it cannot route a write through the broker (and the
+    broker denies writes to its own unit anyway)."""
+    try:
+        broker_py = _BROKER_SCRIPT
+        if not os.path.exists(broker_py):
+            return  # broker source not present in this build
+        venv_py = os.path.join(BASE_DIR, '.venv', 'bin', 'python3')
+        if not os.path.exists(venv_py):
+            venv_py = sys.executable or '/usr/bin/python3'
+        try:
+            _ensure_takwerx_system_user()   # socket is group-owned by takwerx
+        except Exception:
+            pass
+        try:
+            os.makedirs('/var/log/takwerx-broker', exist_ok=True)
+            os.chmod('/var/log/takwerx-broker', 0o750)
+        except Exception:
+            pass
+        # SELinux (RHEL): same unconfined_service_t treatment as the console unit,
+        # or init_t can't exec the in-home venv python (203/EXEC under enforcing).
+        selinux_line = ''
+        try:
+            ge = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=5)
+            if ge.returncode == 0 and ge.stdout.strip() != 'Disabled':
+                selinux_line = 'SELinuxContext=system_u:system_r:unconfined_service_t:s0\n'
+        except Exception:
+            pass
+        unit = (
+            '[Unit]\n'
+            'Description=infra-TAK privileged broker (least-privilege console mediation)\n'
+            'After=network-online.target\n'
+            'Wants=network-online.target\n\n'
+            '[Service]\n'
+            'Type=simple\n'
+            f'{selinux_line}'
+            f'ExecStart={venv_py} {broker_py} serve\n'
+            'Restart=always\n'
+            'RestartSec=2\n'
+            'RuntimeMaxSec=24h\n'
+            'Environment=PYTHONUNBUFFERED=1\n\n'
+            '[Install]\n'
+            'WantedBy=multi-user.target\n'
+        )
+        svc = '/etc/systemd/system/takwerx-broker.service'
+        existing = ''
+        if os.path.exists(svc):
+            with open(svc) as f:
+                existing = f.read()
+        changed = (existing != unit)
+        if changed:
+            with open(svc, 'w') as f:
+                f.write(unit)
+            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+            subprocess.run(['systemctl', 'enable', 'takwerx-broker'], capture_output=True, timeout=15)
+        active = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
+                                capture_output=True, text=True, timeout=8).stdout.strip()
+        if changed or active != 'active':
+            subprocess.run(['systemctl', 'restart', 'takwerx-broker'], capture_output=True, timeout=20)
+            print('Startup migration: privileged broker installed/started (takwerx-broker.service)', flush=True)
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print(f'Startup migration: broker ensure warning (non-fatal): {_e}', flush=True)
+
+_startup_ensure_broker()
+
+
 # v0.9.58 (#6): startup migration — re-apply the trusted-upstream ignoreip to every
 # enabled fail2ban jail on boot, so the gateway/VNet whitelist + the mediamtx/recidive
 # baseline activate on a plain restart, not only when an operator next touches a jail
