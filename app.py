@@ -8376,12 +8376,28 @@ def _exposure_listen_map():
             scope = 'loopback'
         else:
             scope = 'scoped'
-        ent = m.setdefault(p, {'scopes': set(), 'procs': set()})
+        ent = m.setdefault(p, {'scopes': set(), 'procs': set(), 'pids': set()})
         ent['scopes'].add(scope)
         mp = re.search(r'"([^"]+)"', ln)
         if mp:
             ent['procs'].add(mp.group(1))
+        for pid in re.findall(r'pid=(\d+)', ln):
+            ent['pids'].add(int(pid))
     return m
+
+
+def _pid_is_takserver(pid):
+    """True if the process owning a listener is the TAK Server JVM — read from
+    /proc/<pid>/cmdline. Lets the exposure audit attribute TAK Server's per-box
+    connector ports (federation, extra HTTPS, operator-defined CoreConfig inputs)
+    as expected rather than flagging them as undeclared. Native installs only;
+    a containerized TAK publishes via docker-proxy (handled as a normal listener)."""
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            cmd = f.read().replace(b'\x00', b' ').decode('utf-8', 'ignore').lower()
+        return ('takserver' in cmd) or ('/opt/tak' in cmd)
+    except Exception:
+        return False
 
 
 def _exposure_bind_of(port, listen_map):
@@ -8519,8 +8535,10 @@ def _exposure_report(force=False):
     fw_enabled = bool(fwstatus.get('enabled'))
     blocked = 0
     undeclared = []
+    tak_connectors = []
     for p in sorted(listen_map):
-        if 'public' not in listen_map[p]['scopes']:
+        ent = listen_map[p]
+        if 'public' not in ent['scopes']:
             continue
         if p in known:
             continue
@@ -8529,7 +8547,13 @@ def _exposure_report(force=False):
         if not reachable:
             blocked += 1
             continue
-        undeclared.append({'port': p, 'procs': sorted(listen_map[p]['procs']) or ['?']})
+        # TAK Server opens a per-box-varying set of connector/input ports
+        # (federation, extra HTTPS, operator CoreConfig inputs). Attribute those
+        # to TAK Server (expected, Tier-1) instead of flagging them for review.
+        if 'takserver' in installed and any(_pid_is_takserver(pid) for pid in ent.get('pids', ())):
+            tak_connectors.append({'port': p, 'procs': sorted(ent['procs']) or ['java']})
+            continue
+        undeclared.append({'port': p, 'procs': sorted(ent['procs']) or ['?']})
     yellow += len(undeclared)
 
     if red:
@@ -8541,6 +8565,7 @@ def _exposure_report(force=False):
     report = {
         'rows': rows,
         'undeclared': undeclared,
+        'tak_connectors': tak_connectors,
         'firewall_blocked': blocked,
         'firewall_supported': bool(fwstatus.get('supported')),
         'firewall_enabled': bool(fwstatus.get('enabled')),
@@ -31576,6 +31601,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       extra='<p style="margin-top:14px;color:var(--yellow);font-size:12px;font-weight:600">'+dot('warn')+'Public listeners not in the standard catalog — review:</p><div class="rules-box" style="max-height:160px">';
       u.forEach(function(x){extra+=esc(x.port)+'/tcp  '+esc((x.procs||[]).join(', '))+'\\n';});
       extra+='</div>';
+    }
+    var tc=d.tak_connectors||[];
+    if(tc.length){
+      extra+='<p style="margin-top:14px;color:var(--text-dim);font-size:12px">'+dot('ok')+'TAK Server connectors (expected): '+tc.map(function(x){return esc(x.port);}).join(', ')+'</p>';
     }
     if(d.firewall_blocked){
       extra+='<p style="margin-top:10px;color:var(--text-dim);font-size:11px">'+dot('ok')+d.firewall_blocked+' listener(s) bound publicly but firewall-blocked — not reachable.</p>';
