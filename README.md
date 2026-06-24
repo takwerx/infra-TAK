@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.3-alpha)**
+**Current release: [v10.0.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.4-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.4-alpha — 2026-06-24 — See exactly what your server exposes — and a server that heals its own address when the cloud changes it
+
+**Headline: a new read-only Service Exposure panel shows, at a glance, whether every part of your stack is reachable the way it should be — and cloud servers now automatically repair themselves when their public IP changes.** Open the **Firewall** page and you get a green / yellow / red board comparing what each service *should* expose against what it's *actually* doing right now: internet-facing services (TAK, the console, streaming) are green by design; admin-only services that should sit behind the reverse proxy are flagged **red** the moment they're actually reachable from the internet — the exact kind of silent misconfiguration that has caused real incidents elsewhere. It's purely informational (it never changes a firewall rule), it understands both Ubuntu's UFW and Rocky/RHEL's firewalld, it correctly treats firewall-blocked and TAK Server's own connector ports as safe, and a small **Exposure** badge on the Console dashboard gives you the one-glance verdict with a click through to the detail. Alongside it, **server-address self-healing**: a cloud server that is stopped and restarted is often handed a brand-new public IP (common on AWS without a static address), which used to leave the console pointing at a dead address — a certificate-name mismatch and firewall rules aimed at the old IP. The console now re-detects its real address on startup and, only when it has genuinely changed, repairs its settings, regenerates the self-signed console certificate, and re-scopes its firewall rules automatically — so the box comes back reachable instead of broken. Works identically on **Ubuntu 22.04, Rocky / RHEL 9, and ARM64**. **Upgrade:** applied automatically on the next console update; no action required.
+
+Full notes: [v10.0.4-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.4-alpha).
 
 ### v10.0.3-alpha — 2026-06-24 — Your server can no longer lose its own domain: hardened config + self-healing startup
 
