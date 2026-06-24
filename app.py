@@ -8341,7 +8341,7 @@ _KNOWN_PUBLIC_PORTS = {
     8554, 8322, 8890, 8892, 8000, 8001,   # MediaMTX streaming (8892 = aux listener)
     18554, 11935, 18890, 18888,           # CloudTAK media streaming
     8448,                                 # Caddy auxiliary vhost listener
-    3100,                                 # TAK Video Restreamer
+    1935, 8555, 3100,                     # TAK Video Restreamer (RTMP 1935, RTSP 8554-8555, web 3100)
     25,                                   # Email Relay (localhost-bound normally)
     8080,                                 # Guard Dog health agent (two-server, source-scoped)
 }
