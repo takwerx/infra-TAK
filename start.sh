@@ -489,7 +489,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ${SELINUX_DIRECTIVE:+$SELINUX_DIRECTIVE
-}ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
+}ExecStartPre=-$USE_DIR/.venv/bin/python3 $USE_DIR/selfheal_ip.py
+ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5

@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.3-alpha"
+VERSION = "10.0.4-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -8299,6 +8299,256 @@ def _firewall_status_local():
         return {'supported': True, 'enabled': enabled, 'rules': rules, 'rules_numbered': rules_numbered, 'raw': out, 'raw_numbered': out_n}
     except Exception as e:
         return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': [], 'rules_numbered': []}
+
+
+# ==========================================================================
+# v10.0.4 — Service-Exposure panel (read-only network-posture audit)
+# ==========================================================================
+# Compares each installed service's DECLARED exposure tier (docs/PORT-EXPOSURE-
+# POLICY.md) against the box's LIVE bind + firewall state, and surfaces any
+# UNDECLARED public listener — the v0.9.11 CloudTAK PGMiner class, where a Tier-4
+# port silently bound to 0.0.0.0 with weak creds got cryptojacked. PURE READER:
+# it reports drift, it never changes a firewall rule (remediation stays with the
+# existing _auto_harden_* overrides + the manual controls below on /firewall).
+# Tiers: 1 Public · 3 Caddy-loopback · 4 Docker-internal · 5 Source-scoped.
+
+# module = detect_modules() key (None = always shown). port=None → resolved live.
+PORT_EXPOSURE_POLICY = [
+    {'module': None,        'label': 'infra-TAK Console',   'port': None, 'tier': 1, 'why': 'Operator web UI (direct-IP backdoor)'},
+    {'module': 'caddy',     'label': 'Caddy HTTP',          'port': 80,   'tier': 1, 'why': 'ACME + redirect to 443'},
+    {'module': 'caddy',     'label': 'Caddy HTTPS',         'port': 443,  'tier': 1, 'why': 'TLS terminator + auth gate'},
+    {'module': 'takserver', 'label': 'TAK Server (mTLS)',   'port': 8089, 'tier': 1, 'why': 'TAK client mutual-TLS'},
+    {'module': 'takserver', 'label': 'TAK Admin WebGUI',    'port': 8443, 'tier': 1, 'why': 'Admin WebGUI (client-cert)'},
+    {'module': 'takserver', 'label': 'TAK Admin (LE cert)', 'port': 8446, 'tier': 1, 'why': 'Admin WebGUI (LE cert)'},
+    {'module': 'authentik', 'label': 'Authentik HTTP',      'port': 9000, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'authentik', 'label': 'Authentik HTTPS',     'port': 9443, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'takportal',  'label': 'TAK Portal',         'port': 3000, 'tier': 3, 'why': 'Reached via Caddy + forward_auth'},
+    {'module': 'nodered',    'label': 'Node-RED',           'port': 1880, 'tier': 3, 'why': 'Reached via Caddy + forward_auth'},
+    {'module': 'cloudtak',   'label': 'CloudTAK API',       'port': 5000, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'cloudtak',   'label': 'CloudTAK Tiles',     'port': 5002, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'mediamtx',   'label': 'MediaMTX RTSP',      'port': 8554, 'tier': 1, 'why': 'Streaming clients (auth+token)'},
+    {'module': 'mediamtx',   'label': 'MediaMTX HLS',       'port': 8888, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'mediamtx',   'label': 'MediaMTX web-editor','port': 5080, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'guarddog',   'label': 'Guard Dog health agent', 'port': 8080, 'tier': 5, 'why': 'Reachable from console only (two-server)'},
+]
+
+# Every host port the stack may LEGITIMATELY open publicly — used only to decide
+# whether a live 0.0.0.0 listener is "undeclared" (worth a look). Streaming uses
+# many ephemeral/media ports; listing them here keeps the undeclared check from
+# crying wolf. SSH + the console port are added live.
+_KNOWN_PUBLIC_PORTS = {
+    80, 443, 8089, 8443, 8446,            # console/caddy/TAK
+    8554, 8322, 8890, 8000, 8001,         # MediaMTX streaming
+    18554, 11935, 18890, 18888,           # CloudTAK media streaming
+    3100,                                 # TAK Video Restreamer
+    25,                                   # Email Relay (localhost-bound normally)
+    8080,                                 # Guard Dog health agent (two-server, source-scoped)
+}
+
+_exposure_cache = {'ts': 0.0, 'data': None}
+_EXPOSURE_TTL = 30  # seconds — cheap enough for the badge, fresh enough to trust
+
+
+def _exposure_listen_map():
+    """port -> {'scopes': set('public'|'loopback'|'scoped'), 'procs': set(names)}
+    from `ss -tlnpH`. Captures native listeners AND docker-published ports (the
+    docker-proxy/userland binding shows here), so one reader covers both."""
+    m = {}
+    try:
+        r = subprocess.run(_sudo_wrap(['ss', '-tlnpH']), capture_output=True, text=True, timeout=8)
+        out = r.stdout or ''
+    except Exception:
+        out = ''
+    for ln in out.splitlines():
+        cols = ln.split()
+        if len(cols) < 4:
+            continue
+        local = cols[3]
+        addr, sep, port = local.rpartition(':')
+        if not sep or not port.isdigit():
+            continue
+        addr = addr.strip('[]')
+        p = int(port)
+        if addr in ('0.0.0.0', '::', '*', ''):
+            scope = 'public'
+        elif addr in ('127.0.0.1', '::1'):
+            scope = 'loopback'
+        else:
+            scope = 'scoped'
+        ent = m.setdefault(p, {'scopes': set(), 'procs': set()})
+        ent['scopes'].add(scope)
+        mp = re.search(r'"([^"]+)"', ln)
+        if mp:
+            ent['procs'].add(mp.group(1))
+    return m
+
+
+def _exposure_bind_of(port, listen_map):
+    ent = listen_map.get(port)
+    if not ent:
+        return 'none'
+    sc = ent['scopes']
+    if 'public' in sc:
+        return 'public'
+    if 'scoped' in sc:
+        return 'scoped'
+    if 'loopback' in sc:
+        return 'loopback'
+    return 'none'
+
+
+def _exposure_fw_states(fwstatus):
+    """port -> {'open':bool,'deny':bool,'scoped':[sources]} parsed from the
+    normalized firewall rules (same line shape for ufw + firewalld)."""
+    states = {}
+    for ln in (fwstatus.get('rules') or []):
+        parts = ln.split()
+        if not parts:
+            continue
+        to = parts[0]
+        mm = re.match(r'^(\d{1,5})(?:/(?:tcp|udp|any))?$', to)
+        if not mm:
+            continue
+        port = int(mm.group(1))
+        upper = ln.upper()
+        st = states.setdefault(port, {'open': False, 'deny': False, 'scoped': []})
+        if 'DENY' in upper:
+            st['deny'] = True
+        elif 'ALLOW' in upper:
+            if 'ANYWHERE' in upper:
+                st['open'] = True
+            else:
+                ipm = re.search(r'(\d{1,3}(?:\.\d{1,3}){3}(?:/\d+)?)', ln)
+                if ipm:
+                    st['scoped'].append(ipm.group(1))
+                else:
+                    st['open'] = True  # unknown source — assume open (conservative)
+    return states
+
+
+def _exposure_verdict(tier, bind, fw):
+    """('ok'|'warn'|'alert'|'na', note). alert = dangerous drift (red)."""
+    fw = fw or {}
+    fw_open = fw.get('open')
+    fw_deny = fw.get('deny')
+    fw_scoped = fw.get('scoped')
+    if bind == 'none':
+        if tier in (4, 5):
+            return ('ok', 'no host listener')
+        return ('na', 'not listening')
+    if tier == 1:
+        if bind == 'public':
+            return ('ok', 'public (by design)')
+        return ('warn', f'{bind}-bound (expected public)')
+    if tier == 3:
+        if bind == 'loopback':
+            return ('ok', 'loopback' + ('' if fw_deny else ' (no belt-and-braces deny)'))
+        if bind == 'public':
+            if fw_open:
+                return ('alert', 'EXPOSED: public + firewall open (should be loopback)')
+            return ('warn', 'public-bound but firewall not open')
+        return ('warn', f'{bind}-bound (expected loopback)')
+    if tier == 4:
+        if bind == 'public':
+            if fw_open:
+                return ('alert', 'EXPOSED: internal port public + firewall open')
+            return ('warn', 'public-bound but firewall not open (expected no host port)')
+        if bind == 'loopback':
+            return ('warn', 'loopback (expected no host port)')
+        return ('ok', 'docker-internal')
+    if tier == 5:
+        if bind == 'public':
+            if fw_open:
+                return ('alert', 'source-scope defeated by an unconditional allow')
+            if fw_scoped:
+                return ('ok', 'source-scoped: ' + ', '.join(fw_scoped))
+            return ('warn', 'public but no firewall scope found')
+        return ('ok', f'{bind}-bound')
+    return ('na', '')
+
+
+def _exposure_report(force=False):
+    """Full read-only exposure audit. Cached (_EXPOSURE_TTL) so the dashboard badge
+    and repeated /firewall loads stay cheap. Never raises."""
+    now = time.time()
+    if not force and _exposure_cache['data'] and (now - _exposure_cache['ts']) < _EXPOSURE_TTL:
+        return _exposure_cache['data']
+    try:
+        settings = load_settings()
+    except Exception:
+        settings = {}
+    try:
+        installed = {k for k, v in detect_modules().items() if v.get('installed')}
+    except Exception:
+        installed = set()
+    try:
+        console_port = int(settings.get('console_port') or 5001)
+    except Exception:
+        console_port = 5001
+    listen_map = _exposure_listen_map()
+    try:
+        fwstatus = _firewall_status_local()
+    except Exception:
+        fwstatus = {'supported': False, 'rules': []}
+    fw_states = _exposure_fw_states(fwstatus)
+
+    rows = []
+    red = yellow = 0
+    for ent in PORT_EXPOSURE_POLICY:
+        mod = ent['module']
+        if mod is not None and mod not in installed:
+            continue
+        port = ent['port'] if ent['port'] is not None else console_port
+        bind = _exposure_bind_of(port, listen_map)
+        sev, note = _exposure_verdict(ent['tier'], bind, fw_states.get(port))
+        if sev == 'alert':
+            red += 1
+        elif sev == 'warn':
+            yellow += 1
+        rows.append({'label': ent['label'], 'port': port, 'proto': 'tcp',
+                     'tier': ent['tier'], 'bind': bind, 'severity': sev,
+                     'note': note, 'why': ent['why']})
+
+    # Undeclared public listeners — the catch-all that would have caught PGMiner.
+    known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22}
+    undeclared = []
+    for p in sorted(listen_map):
+        if 'public' not in listen_map[p]['scopes']:
+            continue
+        if p in known:
+            continue
+        undeclared.append({'port': p, 'procs': sorted(listen_map[p]['procs']) or ['?']})
+    yellow += len(undeclared)
+
+    if red:
+        status = 'issue'
+    elif yellow:
+        status = 'warn'
+    else:
+        status = 'ok'
+    report = {
+        'rows': rows,
+        'undeclared': undeclared,
+        'firewall_supported': bool(fwstatus.get('supported')),
+        'firewall_enabled': bool(fwstatus.get('enabled')),
+        'backend': fwstatus.get('backend') or ('ufw' if fwstatus.get('supported') else None),
+        'summary': {'status': status, 'issue_count': red, 'warn_count': yellow},
+    }
+    _exposure_cache['ts'] = now
+    _exposure_cache['data'] = report
+    return report
+
+
+@app.route('/api/firewall/exposure')
+@login_required
+def firewall_exposure_api():
+    return jsonify(_exposure_report())
+
+
+@app.route('/api/firewall/exposure/summary')
+@login_required
+def firewall_exposure_summary_api():
+    return jsonify(_exposure_report().get('summary', {'status': 'unknown', 'issue_count': 0, 'warn_count': 0}))
 
 
 @app.route('/api/firewall/status')
@@ -31215,6 +31465,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .fw-summary-left{display:flex;align-items:center;gap:8px}
 .fw-summary-chevron{transition:transform .2s ease;color:var(--text-dim)}
 .card[open] .fw-summary-chevron{transform:rotate(180deg)}
+.exp-tbl{width:100%;border-collapse:collapse;font-size:12px}
+.exp-tbl th{text-align:left;color:var(--text-dim);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:6px 8px;border-bottom:1px solid var(--border)}
+.exp-tbl td{padding:6px 8px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;color:var(--text-secondary);vertical-align:top}
+.exp-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.exp-ok{background:var(--green)}.exp-warn{background:var(--yellow)}.exp-alert{background:var(--red)}.exp-na{background:var(--text-dim)}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
@@ -31222,6 +31477,15 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <h1><span class="material-symbols-outlined">shield_locked</span>Firewall</h1>
     <p>Always-on {{ fw_name }} controls. Open/close ports, restrict by source IP/CIDR, and remove rules.</p>
   </div>
+
+  <details class="card" open id="exposure-card">
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">policy</span>Service Exposure</span><span style="display:flex;align-items:center;gap:10px"><span id="exp-badge" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">checking…</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></span></summary>
+    <div class="card-body">
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">Live bind + firewall state vs. the declared exposure policy for every installed service. Read-only — drift is re-hardened automatically on update, or fix it with the controls below.</p>
+      <div id="exp-table">Loading exposure audit…</div>
+      <div id="exp-undeclared"></div>
+    </div>
+  </details>
 
   <details class="card" open>
     <summary><span class="fw-summary-left"><span class="material-symbols-outlined">list</span>Current Rules</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
@@ -31270,6 +31534,46 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </details>
 </div>
+<script>
+(function(){
+  function dot(s){return '<span class="exp-dot exp-'+s+'"></span>';}
+  var TIER={1:'Public',3:'Caddy-loopback',4:'Docker-internal',5:'Source-scoped'};
+  function esc(t){var d=document.createElement('div');d.textContent=(t==null?'':String(t));return d.innerHTML;}
+  fetch('/api/firewall/exposure').then(function(r){return r.json();}).then(function(d){
+    var badge=document.getElementById('exp-badge');
+    var st=(d.summary&&d.summary.status)||'unknown';
+    var red=(d.summary&&d.summary.issue_count)||0, yel=(d.summary&&d.summary.warn_count)||0;
+    if(st==='ok'){badge.innerHTML=dot('ok')+'All clear';badge.style.color='var(--green)';}
+    else if(st==='warn'){badge.innerHTML=dot('warn')+yel+' to review';badge.style.color='var(--yellow)';}
+    else if(st==='issue'){badge.innerHTML=dot('alert')+red+' exposed'+(yel?' · '+yel+' to review':'');badge.style.color='var(--red)';}
+    else{badge.textContent='unavailable';}
+    var rows=d.rows||[];
+    var html='';
+    if(rows.length){
+      html='<table class="exp-tbl"><thead><tr><th>Service</th><th>Port</th><th>Tier</th><th>Bind</th><th>Status</th></tr></thead><tbody>';
+      rows.forEach(function(x){
+        html+='<tr><td style="font-family:\\'DM Sans\\',sans-serif;color:var(--text-primary)">'+esc(x.label)+'</td><td>'+esc(x.port)+'/'+esc(x.proto)+'</td><td>'+esc(TIER[x.tier]||x.tier)+'</td><td>'+esc(x.bind)+'</td><td>'+dot(x.severity)+esc(x.note)+'</td></tr>';
+      });
+      html+='</tbody></table>';
+    } else { html='<p style="color:var(--text-dim);font-size:12px">No installed services to audit.</p>'; }
+    document.getElementById('exp-table').innerHTML=html;
+    var extra='';
+    var u=d.undeclared||[];
+    if(u.length){
+      extra='<p style="margin-top:14px;color:var(--yellow);font-size:12px;font-weight:600">'+dot('warn')+'Public listeners not in the standard catalog — review:</p><div class="rules-box" style="max-height:160px">';
+      u.forEach(function(x){extra+=esc(x.port)+'/tcp  '+esc((x.procs||[]).join(', '))+'\\n';});
+      extra+='</div>';
+    }
+    if(d.firewall_supported===false){
+      extra+='<p style="margin-top:10px;color:var(--text-dim);font-size:11px">No host firewall detected — bind state shown without firewall correlation.</p>';
+    }
+    document.getElementById('exp-undeclared').innerHTML=extra;
+  }).catch(function(){
+    document.getElementById('exp-table').innerHTML='<p style="color:var(--text-dim);font-size:12px">Exposure audit unavailable.</p>';
+    var b=document.getElementById('exp-badge');if(b){b.textContent='unavailable';}
+  });
+})();
+</script>
 <script src="/firewall.js?v={{ version }}"></script>
 </body></html>'''
 
@@ -57568,7 +57872,22 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endfor %}
 </div>
 <div class="section-title">Console</div>
-<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button></div>
+<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button><a href="/firewall" id="exp-badge-console" title="Service exposure — click for detail" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;text-decoration:none;border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8"><span id="exp-badge-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8"></span><span id="exp-badge-text">exposure…</span></a></div>
+<script>
+(function(){
+  var a=document.getElementById('exp-badge-console');if(!a)return;
+  var dot=document.getElementById('exp-badge-dot'),txt=document.getElementById('exp-badge-text');
+  var ctl=new AbortController();var to=setTimeout(function(){try{ctl.abort();}catch(e){}},6000);
+  fetch('/api/firewall/exposure/summary',{signal:ctl.signal}).then(function(r){return r.json();}).then(function(s){
+    clearTimeout(to);
+    var st=s.status||'unknown',red=s.issue_count||0,yel=s.warn_count||0;
+    if(st==='ok'){dot.style.background='#10b981';a.style.color='#10b981';a.style.borderColor='rgba(16,185,129,.4)';txt.textContent='Exposure OK';}
+    else if(st==='warn'){dot.style.background='#eab308';a.style.color='#eab308';a.style.borderColor='rgba(234,179,8,.4)';txt.textContent='Exposure: '+yel+' to review';}
+    else if(st==='issue'){dot.style.background='#ef4444';a.style.color='#ef4444';a.style.borderColor='rgba(239,68,68,.5)';txt.textContent='Exposure: '+red+' exposed';}
+    else{txt.textContent='Exposure: n/a';}
+  }).catch(function(){clearTimeout(to);txt.textContent='Exposure: n/a';});
+})();
+</script>
 <div id="dev-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:320px;max-width:90vw;font-family:'JetBrains Mono',monospace">
     <div style="font-size:13px;font-weight:700;color:var(--yellow);margin-bottom:6px">⚠ Switch to dev channel</div>
@@ -64551,6 +64870,26 @@ try:
     _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
+
+# v10.0.4: server_ip self-heal (belt-and-braces). The primary path is the unit's
+# ExecStartPre=selfheal_ip.py (heals BEFORE gunicorn binds, so a regenerated cert is
+# live this boot). But existing boxes that only `git pull` + restart never re-run
+# start.sh, so their unit lacks that ExecStartPre — here we run the SAME stdlib-only
+# heal once in a daemon thread so settings + firewall are corrected immediately and
+# the cert is right on the next restart. Idempotent (no-op when the IP is unchanged).
+try:
+    import threading as _threading_sh
+
+    def _run_ip_selfheal():
+        try:
+            import selfheal_ip
+            selfheal_ip.main()
+        except Exception as _e2:
+            print(f"[startup] ip self-heal skipped (non-fatal): {_e2}", flush=True)
+
+    _threading_sh.Thread(target=_run_ip_selfheal, daemon=True, name='ip-selfheal').start()
+except Exception as _e:
+    print(f"[startup] failed to start ip self-heal (non-fatal): {_e}", flush=True)
 
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':
