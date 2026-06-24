@@ -114,30 +114,127 @@ _RATE_LOCK = threading.Lock()
 _RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
 
 
+# ---------------------------------------------------------------------------
+# Privileged broker client (v10.0.5 — non-root console migration, Option B)
+# ---------------------------------------------------------------------------
+# All privileged operations are mediated by a small ROOT daemon
+# (broker/takwerx_broker.py) over a unix socket. It enforces an allowlist/
+# rulebook (refuses the Docker/sudoers/shell trap-doors) and is the single
+# audit chokepoint (Compliance C3/C7).
+#
+# Routing rule (`_broker_should_route`):
+#   * Console as root, broker NOT forced  -> helpers behave EXACTLY as before
+#     (direct exec / direct open). Production today is byte-for-byte unchanged.
+#   * TAKWERX_FORCE_BROKER=1               -> route through the broker even while
+#     root. This is how the broker path is PROVEN before the service user is
+#     flipped (this chat's deliverable: "prove the broker path first").
+#   * Console as takwerx (non-root)        -> the broker is the only path.
+import sys as _sys
+import base64 as _b64
+import socket as _socket
+import stat as _stat
+
+BROKER_SOCKET = os.environ.get('TAKWERX_BROKER_SOCKET', '/run/takwerx-broker.sock')
+_BROKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_broker.py')
+
+
+class BrokerError(RuntimeError):
+    pass
+
+
+def _broker_should_route():
+    if os.environ.get('TAKWERX_FORCE_BROKER') == '1':
+        return True
+    return os.getuid() != 0
+
+
+def _broker_available():
+    try:
+        return _stat.S_ISSOCK(os.stat(BROKER_SOCKET).st_mode)
+    except OSError:
+        return False
+
+
+def _broker_request(req, timeout=600):
+    """Send one JSON request to the broker, return the parsed response dict.
+    Raises BrokerError if the socket is unreachable."""
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(BROKER_SOCKET)
+    except OSError as e:
+        raise BrokerError(f'broker unreachable: {e}')
+    try:
+        s.sendall(json.dumps(req).encode())
+        s.shutdown(_socket.SHUT_WR)
+        buf = bytearray()
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return json.loads(bytes(buf).decode())
+    finally:
+        s.close()
+
+
 def _sudo_wrap(cmd):
-    """Prepend 'sudo -n' when the process is not running as root (UID != 0).
-    No-op if sudo is already the first element or if running as root."""
+    """Return a command list to run a privileged command.
+
+    - Console as root, broker not routing: returns cmd unchanged (run directly).
+    - Broker routing active + socket present: returns a brokerctl proxy
+      invocation. The caller still runs the list via subprocess.run(...);
+      brokerctl forwards argv (and the caller's cwd) to the root broker, which
+      enforces the allowlist + audit log.
+    - Legacy fallback (non-root, no broker): 'sudo -n' (pre-broker behavior)."""
     cmd = list(cmd)
-    if os.getuid() != 0 and cmd[0] != 'sudo':
+    if cmd and cmd[0] == 'sudo':
+        return cmd
+    if _broker_should_route() and _broker_available():
+        return [_sys.executable, _BROKER_SCRIPT, 'exec', '--'] + cmd
+    if os.getuid() != 0 and cmd and cmd[0] != 'sudo':
         return ['sudo', '-n'] + cmd
     return cmd
 
 
-def _write_priv(path, content, mode='w'):
-    """Write to a privileged path. Uses 'sudo tee' when not running as root."""
+def _write_priv(path, content, mode='w', perm=None):
+    """Write to a privileged path. Routes through the broker when active;
+    otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
+    given (octal int), the file is chmod'd to it after the write."""
+    if _broker_should_route() and _broker_available():
+        data = content if isinstance(content, (bytes, bytearray)) else str(content).encode()
+        req = {'op': 'write', 'path': path, 'mode': mode,
+               'content_b64': _b64.b64encode(data).decode()}
+        if perm is not None:
+            req['perm'] = int(perm)
+        resp = _broker_request(req)
+        if not resp.get('ok'):
+            raise BrokerError(f"broker write denied ({path}): {resp.get('error')}")
+        return
     if os.getuid() == 0:
         with open(path, mode) as f:
             f.write(content)
+        if perm is not None:
+            os.chmod(path, int(perm))
     else:
         tee_cmd = ['sudo', '-n', 'tee']
         if mode == 'a':
             tee_cmd.append('--append')
         tee_cmd.append(path)
         subprocess.run(tee_cmd, input=content, capture_output=True, text=True, check=True)
+        if perm is not None:
+            subprocess.run(['sudo', '-n', 'chmod', oct(int(perm))[2:], path],
+                           capture_output=True, text=True, check=False)
 
 
 def _read_priv(path):
-    """Read a privileged path. Uses 'sudo cat' when not running as root."""
+    """Read a privileged path. Routes through the broker when active; otherwise
+    direct (root) or 'sudo cat' (legacy non-root). Returns text."""
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'read', 'path': path})
+        if not resp.get('ok'):
+            raise BrokerError(f"broker read denied ({path}): {resp.get('error')}")
+        return _b64.b64decode(resp.get('content_b64') or '').decode(errors='replace')
     if os.getuid() == 0:
         with open(path) as f:
             return f.read()
@@ -376,7 +473,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.4-alpha"
+VERSION = "10.0.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -4995,6 +5092,74 @@ def console_restart_safe():
     return jsonify({'safe': busy is None, 'reason': busy})
 
 
+@app.route('/api/console/broker/selftest')
+@login_required
+def console_broker_selftest():
+    """v10.0.5: prove the privileged-broker path end-to-end THROUGH THE CONSOLE'S
+    OWN HELPERS (_write_priv/_read_priv/_sudo_wrap/_broker_request), not just the
+    standalone client. Used to validate the broker before the console service
+    user is flipped to `takwerx`.
+
+    Set TAKWERX_FORCE_BROKER=1 on the console service to force routing while the
+    console still runs as root, then GET this endpoint: every check should pass
+    AND the broker audit log should show the corresponding ALLOW/DENY records."""
+    checks = []
+
+    def add(name, ok, detail=''):
+        checks.append({'name': name, 'ok': bool(ok), 'detail': str(detail)[:300]})
+
+    info = {
+        'uid': os.getuid(),
+        'broker_socket': BROKER_SOCKET,
+        'routing_active': _broker_should_route(),
+        'broker_available': _broker_available(),
+    }
+    if not _broker_available():
+        return jsonify({'ok': False, 'info': info,
+                        'error': 'broker socket not present — is takwerx-broker.service running?'}), 503
+
+    # 1. ping
+    try:
+        r = _broker_request({'op': 'ping'})
+        add('ping', r.get('ok') and r.get('pong'), r)
+    except Exception as e:
+        add('ping', False, e)
+
+    # 2. write+read round-trip through the console helpers (the broker's own log
+    #    dir is always present, unlike module dirs that may not be deployed)
+    probe = '/var/log/takwerx-broker/.selftest'
+    try:
+        _write_priv(probe, 'broker-ok\n')
+        back = _read_priv(probe)
+        add('write+read via helpers', back.strip() == 'broker-ok', repr(back))
+        try:
+            subprocess.run(_sudo_wrap(['rm', '-f', probe]), capture_output=True, timeout=10)
+        except Exception:
+            pass
+    except Exception as e:
+        add('write+read via helpers', False, e)
+
+    # 3. exec via _sudo_wrap (the brokerctl proxy) returns command output
+    try:
+        p = subprocess.run(_sudo_wrap(['systemctl', '--version']),
+                           capture_output=True, text=True, timeout=15)
+        add('exec via _sudo_wrap', p.returncode == 0 and 'systemd' in p.stdout, p.stdout[:60])
+    except Exception as e:
+        add('exec via _sudo_wrap', False, e)
+
+    # 4. DENY: a write outside the allowlist must be refused by the broker
+    try:
+        _write_priv('/etc/sudoers.d/takwerx-evil', 'takwerx ALL=(ALL) NOPASSWD:ALL\n')
+        add('DENY sudoers write', False, 'write was NOT refused (!)')
+    except BrokerError as e:
+        add('DENY sudoers write', True, e)
+    except Exception as e:
+        add('DENY sudoers write', False, f'unexpected error type: {e}')
+
+    all_ok = all(c['ok'] for c in checks)
+    return jsonify({'ok': all_ok, 'info': info, 'checks': checks})
+
+
 @app.route('/api/console/rollback', methods=['POST'])
 @login_required
 def console_rollback_api():
@@ -8079,8 +8244,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
             'db_host': db_host,
             'db_port': int(db_port),
         }
-        with open(os.path.join(gd_dir, 'guarddog.conf'), 'w') as f:
-            json.dump(gd_conf, f)
+        _write_priv(os.path.join(gd_dir, 'guarddog.conf'), json.dumps(gd_conf))
     except Exception as e:
         return False, f'guarddog.conf: {e}'
 
@@ -8961,8 +9125,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"{ignoreip_line}"
         f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
-    with open(jail_path, 'w') as _f:
-        _f.write(jail_conf)
+    _write_priv(jail_path, jail_conf)
 
 def _f2b_tak_jail_enabled():
     """Return True if the infratak-takserver jail config file exists."""
@@ -9007,8 +9170,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"{ignoreip_line}"
         f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
-    with open(jail_path, 'w') as _f:
-        _f.write(jail_conf)
+    _write_priv(jail_path, jail_conf)
 
 def _f2b_ssh_jail_enabled():
     """Return True if the infratak-sshd jail config file exists."""
@@ -9053,8 +9215,7 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"{ignoreip_line}"
         f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
-    with open(jail_path, 'w') as _f:
-        _f.write(jail_conf)
+    _write_priv(jail_path, jail_conf)
 
 def _f2b_authentik_jail_enabled():
     """Return True if the infratak-authentik jail config file exists."""
@@ -9130,8 +9291,7 @@ def fail2ban_authentik_toggle_api():
                 "WantedBy=multi-user.target\n"
             )
             os.makedirs('/var/log/authentik', exist_ok=True)
-            with open(svc_path, 'w') as _f:
-                _f.write(forwarder_service)
+            _write_priv(svc_path, forwarder_service)
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         # Ensure the fail2ban daemon is running before reloading jails
         _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
@@ -9576,8 +9736,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
         "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
         "ignoreregex =\n"
     )
-    with open(filter_path, 'w') as _f:
-        _f.write(filter_conf)
+    _write_priv(filter_path, filter_conf)
 
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
@@ -9595,8 +9754,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
         f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
-    with open(jail_path, 'w') as _f:
-        _f.write(jail_conf)
+    _write_priv(jail_path, jail_conf)
 
 
 @app.route('/api/fail2ban/mediamtx/status')
@@ -9799,8 +9957,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         "failregex = ^.*\\bip=<HOST>\\b.*\\bresult=(bad_domain|bad_user|captcha_fail)\\b.*$\n"
         "ignoreregex =\n"
     )
-    with open(filter_path, 'w') as _f:
-        _f.write(filter_conf)
+    _write_priv(filter_path, filter_conf)
 
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
@@ -9817,8 +9974,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         f"{ignoreip_line}"
         f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
-    with open('/etc/fail2ban/jail.d/infratak-takportal.conf', 'w') as _f:
-        _f.write(jail_conf)
+    _write_priv('/etc/fail2ban/jail.d/infratak-takportal.conf', jail_conf)
 
 
 @app.route('/api/fail2ban/takportal/status')
@@ -10067,8 +10223,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         f"action   = {_f2b_banaction()}\n"
     )
-    with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
-        _f.write(jail_conf)
+    _write_priv('/etc/fail2ban/jail.d/infratak-recidive.conf', jail_conf)
     # The recidive jail reads fail2ban's own log; pre-create it so the jail loads on
     # the very first start (on RHEL fail2ban never creates it until a clean start —
     # chicken/egg). Harmless no-op where the file already exists (e.g. Debian).
@@ -11363,10 +11518,8 @@ def guarddog_update():
             '[Install]\n'
             'WantedBy=timers.target\n'
         )
-        with open(service_path, 'w') as f:
-            f.write(service_content)
-        with open(timer_path, 'w') as f:
-            f.write(timer_content)
+        _write_priv(service_path, service_content)
+        _write_priv(timer_path, timer_content)
         # Auto-vacuum timer (daily 3am) — install if script exists but timer doesn't
         av_script = '/opt/tak-guarddog/tak-auto-vacuum.sh'
         av_svc_path = '/etc/systemd/system/takautovacuum.service'
@@ -11376,10 +11529,8 @@ def guarddog_update():
             _tak_cfg = _get_tak_deployment_config(_settings)
             _is_two = _tak_cfg.get('mode') == 'two_server'
             _after = 'network-online.target' if _is_two else 'postgresql.service postgresql-15.service'
-            with open(av_svc_path, 'w') as f:
-                f.write(f'[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter={_after}\n\n[Service]\nType=oneshot\nExecStart={av_script}\n')
-            with open(av_tmr_path, 'w') as f:
-                f.write('[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(av_svc_path, f'[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter={_after}\n\n[Service]\nType=oneshot\nExecStart={av_script}\n')
+            _write_priv(av_tmr_path, '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n')
         # CoT DB size timer — install for two-server if missing
         cotdb_svc_path = '/etc/systemd/system/takcotdbguard.service'
         cotdb_tmr_path = '/etc/systemd/system/takcotdbguard.timer'
@@ -11388,10 +11539,8 @@ def guarddog_update():
             _tak_cfg2 = _get_tak_deployment_config(_settings2)
             _is_two2 = _tak_cfg2.get('mode') == 'two_server'
             _after2 = 'network-online.target' if _is_two2 else 'postgresql.service postgresql-15.service'
-            with open(cotdb_svc_path, 'w') as f:
-                f.write(f'[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter={_after2}\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n')
-            with open(cotdb_tmr_path, 'w') as f:
-                f.write('[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(cotdb_svc_path, f'[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter={_after2}\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n')
+            _write_priv(cotdb_tmr_path, '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # DB repack timer (weekly Sunday 4am) — install if script exists but timer doesn't
         rp_script = '/opt/tak-guarddog/tak-db-repack.sh'
         rp_svc_path = '/etc/systemd/system/takdbrepack.service'
@@ -11401,10 +11550,8 @@ def guarddog_update():
             _tak_cfg3 = _get_tak_deployment_config(_settings3)
             _is_two3 = _tak_cfg3.get('mode') == 'two_server'
             _after3 = 'network-online.target' if _is_two3 else 'postgresql.service postgresql-15.service'
-            with open(rp_svc_path, 'w') as f:
-                f.write(f'[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter={_after3}\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart={rp_script}\n')
-            with open(rp_tmr_path, 'w') as f:
-                f.write('[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(rp_svc_path, f'[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter={_after3}\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart={rp_script}\n')
+            _write_priv(rp_tmr_path, '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n')
         # Retention guard timer (every 15min) — install if script exists but timer doesn't
         rg_script = '/opt/tak-guarddog/tak-retention-guard.sh'
         rg_svc_path = '/etc/systemd/system/takretentionguard.service'
@@ -11414,29 +11561,23 @@ def guarddog_update():
             _tak_cfg4 = _get_tak_deployment_config(_settings4)
             _is_two4 = _tak_cfg4.get('mode') == 'two_server'
             _after4 = 'network-online.target' if _is_two4 else 'postgresql.service postgresql-15.service'
-            with open(rg_svc_path, 'w') as f:
-                f.write(f'[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter={_after4}\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart={rg_script}\n')
-            with open(rg_tmr_path, 'w') as f:
-                f.write('[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(rg_svc_path, f'[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter={_after4}\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart={rg_script}\n')
+            _write_priv(rg_tmr_path, '[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # Build-cache reclaim timer (daily 4:30am) — install if script exists but timer doesn't.
         # Cross-platform (docker + df only); no DB/SSH placeholders, no After= DB ordering.
         bc_script = '/opt/tak-guarddog/tak-buildcache-reclaim.sh'
         bc_svc_path = '/etc/systemd/system/takbuildcachereclaim.service'
         bc_tmr_path = '/etc/systemd/system/takbuildcachereclaim.timer'
         if os.path.isfile(bc_script) and not os.path.isfile(bc_tmr_path):
-            with open(bc_svc_path, 'w') as f:
-                f.write(f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={bc_script}\n')
-            with open(bc_tmr_path, 'w') as f:
-                f.write('[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(bc_svc_path, f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={bc_script}\n')
+            _write_priv(bc_tmr_path, '[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
         # TAK Portal timer — install if script exists but timer doesn't
         tp_script = '/opt/tak-guarddog/tak-takportal-watch.sh'
         tp_svc_path = '/etc/systemd/system/taktakportalguard.service'
         tp_tmr_path = '/etc/systemd/system/taktakportalguard.timer'
         if os.path.isfile(tp_script) and not os.path.isfile(tp_tmr_path):
-            with open(tp_svc_path, 'w') as f:
-                f.write(f'[Unit]\nDescription=Guard Dog TAK Portal Monitor\n\n[Service]\nType=oneshot\nExecStart={tp_script}\n')
-            with open(tp_tmr_path, 'w') as f:
-                f.write('[Unit]\nDescription=Run TAK Portal guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taktakportalguard.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(tp_svc_path, f'[Unit]\nDescription=Guard Dog TAK Portal Monitor\n\n[Service]\nType=oneshot\nExecStart={tp_script}\n')
+            _write_priv(tp_tmr_path, '[Unit]\nDescription=Run TAK Portal guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taktakportalguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # Authentik task log purge timer — install if Authentik is present but timer doesn't exist yet
         _ak_tl_svc_path = '/etc/systemd/system/takauthentiktasklogpurge.service'
         _ak_tl_tmr_path = '/etc/systemd/system/takauthentiktasklogpurge.timer'
@@ -11446,13 +11587,9 @@ def guarddog_update():
             # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
-            with open(_ak_tl_script, 'w') as _f:
-                _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
-            os.chmod(_ak_tl_script, 0o755)
-            with open(_ak_tl_svc_path, 'w') as _f:
-                _f.write('[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
-            with open(_ak_tl_tmr_path, 'w') as _f:
-                _f.write('[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(_ak_tl_script, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            _write_priv(_ak_tl_svc_path, '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
+            _write_priv(_ak_tl_tmr_path, '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
         new_timers = ['takupdatesguard.timer']
         if os.path.isfile(av_tmr_path):
@@ -11666,8 +11803,7 @@ def guarddog_notifications_save():
     if os.path.exists('/opt/tak-guarddog'):
         try:
             ident = _guarddog_server_identifier(settings)
-            with open('/opt/tak-guarddog/server_identifier', 'w') as f:
-                f.write(ident)
+            _write_priv('/opt/tak-guarddog/server_identifier', ident)
         except Exception:
             pass
     return jsonify({'success': True, 'message': 'Saved. Alerts will use the server nickname.'})
@@ -12009,13 +12145,11 @@ def run_guarddog_deploy(alert_email):
             gd_conf['db_container'] = TAK_DB_CONTAINER
         # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
         gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
-        with open('/opt/tak-guarddog/guarddog.conf', 'w') as f:
-            json.dump(gd_conf, f)
+        _write_priv('/opt/tak-guarddog/guarddog.conf', json.dumps(gd_conf))
         os.chmod('/opt/tak-guarddog/guarddog.conf', 0o600)
         # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
         server_identifier = _guarddog_server_identifier(settings)
-        with open('/opt/tak-guarddog/server_identifier', 'w') as f:
-            f.write(server_identifier)
+        _write_priv('/opt/tak-guarddog/server_identifier', server_identifier)
         plog("✓ Server identifier written (for alert subject/body)")
         units = [
             ('tak8089guard.service', '[Unit]\nDescription=TAK 8089 Health Guard Dog\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-8089-watch.sh\n'),
@@ -12082,8 +12216,7 @@ def run_guarddog_deploy(alert_email):
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
-            with open(_ak_purge_path, 'w') as _f:
-                _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
+            _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT)
             os.chmod(_ak_purge_path, 0o755)
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
@@ -17222,8 +17355,7 @@ def generate_caddyfile(settings=None):
         except Exception:
             pass
     os.makedirs(os.path.dirname(CADDYFILE_PATH), exist_ok=True)
-    with open(CADDYFILE_PATH, 'w') as f:
-        f.write(caddyfile)
+    _write_priv(CADDYFILE_PATH, caddyfile)
     # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
     # http_port_t (80/443/8443/9000…). A non-standard listener — e.g. the
     # CloudTAK video vhost on :9997 — is denied (name_bind) so the reload fails
@@ -17663,9 +17795,7 @@ chown tak:tak /opt/tak/certs/files/takserver-le.jks
 systemctl restart takserver
 log "TAK keystore refreshed and TAK Server restarted."
 '''
-    with open('/opt/tak/renew-letsencrypt.sh', 'w') as f:
-        f.write(renewal_script)
-    subprocess.run('chmod +x /opt/tak/renew-letsencrypt.sh', shell=True)
+    _write_priv('/opt/tak/renew-letsencrypt.sh', renewal_script, perm=0o755)
     log_fn("  ✓ Renewal script created at /opt/tak/renew-letsencrypt.sh")
 
     # Step E: Create systemd service + timer
@@ -20702,8 +20832,7 @@ paths:
     runOnReady: ffmpeg -i rtsp://localhost:8554/live/$G1 -c copy -f rtsp rtsp://localhost:8554/$G1
     runOnReadyRestart: true
 """
-        with open('/usr/local/etc/mediamtx.yml', 'w') as f:
-            f.write(mediamtx_yml)
+        _write_priv('/usr/local/etc/mediamtx.yml', mediamtx_yml)
         plog("✓ Configuration written to /usr/local/etc/mediamtx.yml")
         plog(f"  HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
 
@@ -26356,9 +26485,7 @@ def _ensure_docker_log_limits(log_fn=None):
         data['log-driver'] = 'json-file'
         data['log-opts'] = {'max-size': '50m', 'max-file': '3'}
         os.makedirs('/etc/docker', exist_ok=True)
-        with open(daemon_json, 'w') as f:
-            json.dump(data, f, indent=2)
-            f.write('\n')
+        _write_priv(daemon_json, json.dumps(data, indent=2) + '\n')
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'docker']), capture_output=True, timeout=90)
         time.sleep(5)
         if log_fn:
@@ -49637,8 +49764,7 @@ def _auto_authentik_tasklog_purge(plog=None):
         try:
             _ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
             os.makedirs('/opt/tak-guarddog', exist_ok=True)
-            with open('/opt/tak-guarddog/authentik_tasklog_purge_last.txt', 'w') as _f:
-                _f.write(_ts + '\n')
+            _write_priv('/opt/tak-guarddog/authentik_tasklog_purge_last.txt', _ts + '\n')
         except Exception:
             pass
     except Exception as _e:
@@ -53918,8 +54044,8 @@ WantedBy=timers.target
     timer_path = '/etc/systemd/system/takserver-snapshot.timer'
 
     try:
-        with open(svc_path,   'w') as _f: _f.write(service_unit)
-        with open(timer_path, 'w') as _f: _f.write(timer_unit)
+        _write_priv(svc_path, service_unit)
+        _write_priv(timer_path, timer_unit)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
 
         if enabled:
@@ -60752,10 +60878,8 @@ def _auto_update_guarddog():
         _bc_script = '/opt/tak-guarddog/tak-buildcache-reclaim.sh'
         _bc_tmr = '/etc/systemd/system/takbuildcachereclaim.timer'
         if os.path.isfile(_bc_script) and not os.path.isfile(_bc_tmr):
-            with open('/etc/systemd/system/takbuildcachereclaim.service', 'w') as _f:
-                _f.write(f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={_bc_script}\n')
-            with open(_bc_tmr, 'w') as _f:
-                _f.write('[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv('/etc/systemd/system/takbuildcachereclaim.service', f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={_bc_script}\n')
+            _write_priv(_bc_tmr, '[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
             subprocess.run('systemctl daemon-reload', shell=True, capture_output=True, timeout=10)
             subprocess.run('systemctl enable --now takbuildcachereclaim.timer', shell=True, capture_output=True, timeout=10)
             print("Guard Dog: installed takbuildcachereclaim.timer on startup.")
@@ -60767,8 +60891,7 @@ def _auto_update_guarddog():
             print("Guard Dog: scripts up to date.")
         # Keep server_identifier in sync (nickname / IP / FQDN)
         ident = _guarddog_server_identifier(settings)
-        with open('/opt/tak-guarddog/server_identifier', 'w') as f:
-            f.write(ident)
+        _write_priv('/opt/tak-guarddog/server_identifier', ident)
         _guarddog_apply_diskio_timer(settings)
         _guarddog_sync_diskio_email_off_file(settings)
     except Exception as e:
@@ -61149,8 +61272,7 @@ def _startup_ensure_metrics_collector():
         if want == have and active:
             return  # current version already applied AND running — no churn on every boot
         # (re)install: script
-        with open('/opt/tak-guarddog/tak-metrics-collector.py', 'w') as f:
-            f.write(new_src)
+        _write_priv('/opt/tak-guarddog/tak-metrics-collector.py', new_src)
         # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Merge — never
         # clobber two_server keys.
         conf_path = '/opt/tak-guarddog/guarddog.conf'
@@ -61161,9 +61283,7 @@ def _startup_ensure_metrics_collector():
         cp = _get_tak_cert_password(load_settings())
         if cp and conf.get('tak_cert_pass') != cp:
             conf['tak_cert_pass'] = cp
-            with open(conf_path, 'w') as f:
-                json.dump(conf, f)
-            os.chmod(conf_path, 0o600)
+            _write_priv(conf_path, json.dumps(conf), perm=0o600)
         # systemd unit
         unit_path = '/etc/systemd/system/tak-metrics-collector.service'
         if (open(unit_path).read() if os.path.exists(unit_path) else None) != _METRICS_COLLECTOR_UNIT:
@@ -61512,8 +61632,7 @@ def _fail2ban_install_and_configure(plog):
         "WantedBy=multi-user.target\n"
     )
     svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
-    with open(svc_path, 'w') as _f:
-        _f.write(forwarder_service)
+    _write_priv(svc_path, forwarder_service)
     plog(f"fail2ban migration: wrote {svc_path}")
 
     # Step 4: Write fail2ban filter (matches Authentik JSON log lines)
@@ -61528,8 +61647,7 @@ def _fail2ban_install_and_configure(plog):
         "ignoreregex =\n"
     )
     filter_path = '/etc/fail2ban/filter.d/authentik.conf'
-    with open(filter_path, 'w') as _f:
-        _f.write(filter_conf)
+    _write_priv(filter_path, filter_conf)
     plog(f"fail2ban migration: wrote {filter_path}")
 
     # Step 5: Write jail config with fleet defaults
@@ -61546,8 +61664,7 @@ def _fail2ban_install_and_configure(plog):
         f"action   = {_f2b_banaction()}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
-    with open(jail_path, 'w') as _f:
-        _f.write(jail_conf)
+    _write_priv(jail_path, jail_conf)
     plog(f"fail2ban migration: wrote {jail_path}")
 
     # Step 6: Reload systemd and enable/start services
@@ -61740,8 +61857,7 @@ if __name__ == '__main__':
     )
     action_path = '/etc/fail2ban/action.d/infratak-guarddog.conf'
     os.makedirs('/etc/fail2ban/action.d', exist_ok=True)
-    with open(action_path, 'w') as _f:
-        _f.write(action_conf)
+    _write_priv(action_path, action_conf)
     plog(f"fail2ban guarddog hook: wrote {action_path}")
 
     # ── Step 3: Rewrite jail config to include both ufw + infratak-guarddog ───
@@ -61805,8 +61921,7 @@ def _fail2ban_takserver_filter(plog):
         "              {^LN-BEG}\n"
     )
     filter_path = '/etc/fail2ban/filter.d/takserver.conf'
-    with open(filter_path, 'w') as _f:
-        _f.write(filter_conf)
+    _write_priv(filter_path, filter_conf)
     plog(f"fail2ban takserver filter: wrote {filter_path}")
 
     # ── Guard Dog action for TAK Server jail ──────────────────────────────────
@@ -61822,8 +61937,7 @@ def _fail2ban_takserver_filter(plog):
         "actionunban =\n"
     )
     tak_action_path = '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf'
-    with open(tak_action_path, 'w') as _f:
-        _f.write(tak_action_conf)
+    _write_priv(tak_action_path, tak_action_conf)
     plog(f"fail2ban takserver filter: wrote {tak_action_path}")
 
     # Reload so the new filter is recognized (jail stays disabled until operator enables it)

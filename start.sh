@@ -424,6 +424,70 @@ generate_self_signed_cert() {
 }
 
 # ==========================================
+# Privileged broker (v10.0.5 — non-root console migration, Option B)
+# ==========================================
+# A small ROOT daemon (broker/takwerx_broker.py) mediates every privileged op
+# the console performs, behind an allowlist/rulebook + single audit log. The
+# console (still root in this release) talks to it over /run/takwerx-broker.sock.
+# Installing + starting it here is ADDITIVE and idempotent — it does NOT change
+# how the console runs (the console keeps working exactly as before). It is the
+# foundation the later non-root flip stands on, and lets the broker path be
+# proven now (TAKWERX_FORCE_BROKER=1 + `takwerx_broker.py selftest`).
+install_broker() {
+    # Ensure the console service account exists so the socket can be group-owned
+    # by it (root:takwerx 0660 — only root + the console user may connect).
+    getent group  takwerx >/dev/null 2>&1 || groupadd --system takwerx >/dev/null 2>&1 || true
+    getent passwd takwerx >/dev/null 2>&1 || \
+        useradd --system -g takwerx -d /nonexistent -s /usr/sbin/nologin takwerx >/dev/null 2>&1 || true
+
+    mkdir -p /var/log/takwerx-broker
+    chmod 750 /var/log/takwerx-broker
+
+    local broker_py="$INSTALL_DIR/broker/takwerx_broker.py"
+    if [ ! -f "$broker_py" ]; then
+        echo -e "${YELLOW}  ⚠ broker source missing ($broker_py) — skipping broker install${NC}"
+        return 0
+    fi
+
+    # SELinux: under enforcing, init_t cannot exec the in-home venv python
+    # without the takwerx_console policy module (installed above) + the
+    # unconfined_service_t context — identical situation to the console unit.
+    local BROKER_SELINUX=""
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
+        BROKER_SELINUX="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+    fi
+
+    cat > /etc/systemd/system/takwerx-broker.service << EOF
+[Unit]
+Description=infra-TAK privileged broker (least-privilege console mediation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+${BROKER_SELINUX:+$BROKER_SELINUX
+}ExecStart=$INSTALL_DIR/.venv/bin/python3 $broker_py serve
+Restart=always
+RestartSec=2
+RuntimeMaxSec=24h
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable takwerx-broker >/dev/null 2>&1 || true
+    systemctl restart takwerx-broker 2>/dev/null || systemctl start takwerx-broker 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet takwerx-broker; then
+        echo -e "  ${GREEN}✓ Privileged broker running (takwerx-broker.service)${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ Privileged broker did not start — check: journalctl -u takwerx-broker${NC}"
+    fi
+}
+
+# ==========================================
 # Create systemd Service
 # ==========================================
 # If the service already exists and points to a directory that has .config/auth.json,
@@ -562,6 +626,12 @@ generate_self_signed_cert
 
 # RHEL/SELinux: install the console policy module before the unit starts
 install_selinux_console_policy
+
+# Privileged broker (v10.0.5): install + start the root mediation daemon BEFORE
+# the console, so the broker socket is live by the time the console comes up.
+# Additive — the console still runs as root; this just makes the broker path
+# available (and provable via TAKWERX_FORCE_BROKER=1).
+install_broker
 
 # Create and start systemd service
 create_service
