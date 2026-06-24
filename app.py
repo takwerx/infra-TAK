@@ -5092,72 +5092,181 @@ def console_restart_safe():
     return jsonify({'safe': busy is None, 'reason': busy})
 
 
+_CONSOLE_UNIT = '/etc/systemd/system/takwerx-console.service'
+
+
+def _broker_force_enabled_in_unit():
+    """True if TAKWERX_FORCE_BROKER=1 is set in the console's systemd unit."""
+    try:
+        with open(_CONSOLE_UNIT) as f:
+            return 'TAKWERX_FORCE_BROKER=1' in f.read()
+    except OSError:
+        return False
+
+
+def _broker_service_active():
+    try:
+        r = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
+                           capture_output=True, text=True, timeout=8)
+        return r.stdout.strip() == 'active'
+    except Exception:
+        return False
+
+
+def _broker_status_dict():
+    return {
+        'installed': os.path.exists(_BROKER_SCRIPT) and os.path.exists('/etc/systemd/system/takwerx-broker.service'),
+        'service_active': _broker_service_active(),
+        'socket_present': _broker_available(),
+        'routing_active': _broker_should_route(),
+        'force_enabled': _broker_force_enabled_in_unit(),
+        'console_uid': os.getuid(),
+        'audit_log': '/var/log/takwerx-broker/audit.log',
+        'socket': BROKER_SOCKET,
+    }
+
+
+@app.route('/api/console/broker/status')
+@login_required
+def console_broker_status():
+    """v10.0.5: status for the 'Least-Privilege Console' Cyber Control card."""
+    return jsonify(_broker_status_dict())
+
+
 @app.route('/api/console/broker/selftest')
 @login_required
 def console_broker_selftest():
-    """v10.0.5: prove the privileged-broker path end-to-end THROUGH THE CONSOLE'S
-    OWN HELPERS (_write_priv/_read_priv/_sudo_wrap/_broker_request), not just the
-    standalone client. Used to validate the broker before the console service
-    user is flipped to `takwerx`.
-
-    Set TAKWERX_FORCE_BROKER=1 on the console service to force routing while the
-    console still runs as root, then GET this endpoint: every check should pass
-    AND the broker audit log should show the corresponding ALLOW/DENY records."""
+    """v10.0.5: prove the privileged broker works end-to-end. Talks to the broker
+    DIRECTLY (via _broker_request), so it is valid whether or not the console is
+    currently routing through it — clicking "Run self-test" needs no restart.
+    When routing IS active, an extra check exercises the console's own helpers."""
     checks = []
 
     def add(name, ok, detail=''):
         checks.append({'name': name, 'ok': bool(ok), 'detail': str(detail)[:300]})
 
-    info = {
-        'uid': os.getuid(),
-        'broker_socket': BROKER_SOCKET,
-        'routing_active': _broker_should_route(),
-        'broker_available': _broker_available(),
-    }
+    info = _broker_status_dict()
     if not _broker_available():
         return jsonify({'ok': False, 'info': info,
                         'error': 'broker socket not present — is takwerx-broker.service running?'}), 503
 
-    # 1. ping
+    # 1. ping — the guard answers
     try:
         r = _broker_request({'op': 'ping'})
-        add('ping', r.get('ok') and r.get('pong'), r)
+        add('Guard responds (ping)', r.get('ok') and r.get('pong'), r)
     except Exception as e:
-        add('ping', False, e)
+        add('Guard responds (ping)', False, e)
 
-    # 2. write+read round-trip through the console helpers (the broker's own log
-    #    dir is always present, unlike module dirs that may not be deployed)
+    # 2. allowed write+read round-trip (broker's own log dir always exists)
     probe = '/var/log/takwerx-broker/.selftest'
     try:
-        _write_priv(probe, 'broker-ok\n')
-        back = _read_priv(probe)
-        add('write+read via helpers', back.strip() == 'broker-ok', repr(back))
+        import base64 as _bb
+        w = _broker_request({'op': 'write', 'path': probe,
+                             'content_b64': _bb.b64encode(b'broker-ok').decode()})
+        rd = _broker_request({'op': 'read', 'path': probe})
+        got = _bb.b64decode(rd.get('content_b64') or '') if rd.get('ok') else b''
+        add('Allowed write + read', w.get('ok') and got == b'broker-ok')
+        _broker_request({'op': 'exec', 'argv': ['rm', '-f', probe]})
+    except Exception as e:
+        add('Allowed write + read', False, e)
+
+    # 3. allowed exec returns output
+    try:
+        r = _broker_request({'op': 'exec', 'argv': ['systemctl', '--version']})
+        out = ''
+        if r.get('ok'):
+            import base64 as _bb
+            out = _bb.b64decode(r.get('stdout_b64') or '').decode(errors='replace')
+        add('Allowed command runs', r.get('ok') and r.get('returncode') == 0 and 'systemd' in out)
+    except Exception as e:
+        add('Allowed command runs', False, e)
+
+    # 4. DENY: write to sudoers must be refused
+    try:
+        r = _broker_request({'op': 'write', 'path': '/etc/sudoers.d/takwerx-evil',
+                             'content_b64': 'eA=='})
+        add('Blocks sudoers write', (not r.get('ok')) and r.get('code') == 'DENIED', r.get('error'))
+    except Exception as e:
+        add('Blocks sudoers write', False, e)
+
+    # 5. DENY: arbitrary shell must be refused
+    try:
+        r = _broker_request({'op': 'exec', 'argv': ['bash', '-c', 'id']})
+        add('Blocks arbitrary shell', (not r.get('ok')) and r.get('code') == 'DENIED', r.get('error'))
+    except Exception as e:
+        add('Blocks arbitrary shell', False, e)
+
+    # 6. when routing is on, prove the console's OWN helpers go through the broker
+    if _broker_should_route():
         try:
-            subprocess.run(_sudo_wrap(['rm', '-f', probe]), capture_output=True, timeout=10)
-        except Exception:
-            pass
-    except Exception as e:
-        add('write+read via helpers', False, e)
-
-    # 3. exec via _sudo_wrap (the brokerctl proxy) returns command output
-    try:
-        p = subprocess.run(_sudo_wrap(['systemctl', '--version']),
-                           capture_output=True, text=True, timeout=15)
-        add('exec via _sudo_wrap', p.returncode == 0 and 'systemd' in p.stdout, p.stdout[:60])
-    except Exception as e:
-        add('exec via _sudo_wrap', False, e)
-
-    # 4. DENY: a write outside the allowlist must be refused by the broker
-    try:
-        _write_priv('/etc/sudoers.d/takwerx-evil', 'takwerx ALL=(ALL) NOPASSWD:ALL\n')
-        add('DENY sudoers write', False, 'write was NOT refused (!)')
-    except BrokerError as e:
-        add('DENY sudoers write', True, e)
-    except Exception as e:
-        add('DENY sudoers write', False, f'unexpected error type: {e}')
+            _write_priv(probe, 'via-helpers\n')
+            back = _read_priv(probe)
+            add('Console routes through guard', back.strip() == 'via-helpers')
+            _broker_request({'op': 'exec', 'argv': ['rm', '-f', probe]})
+        except Exception as e:
+            add('Console routes through guard', False, e)
 
     all_ok = all(c['ok'] for c in checks)
     return jsonify({'ok': all_ok, 'info': info, 'checks': checks})
+
+
+@app.route('/api/console/broker/routing', methods=['POST'])
+@login_required
+def console_broker_routing():
+    """v10.0.5: enable/disable least-privilege routing by toggling
+    TAKWERX_FORCE_BROKER=1 in the console's systemd unit, then restarting the
+    console. SAFE: the console keeps running as root either way — this only
+    decides whether its privileged calls go THROUGH the guard. It does NOT flip
+    the console to a non-root user (that stays gated on the rulebook hardening)."""
+    data = request.get_json(silent=True) or {}
+    enable = bool(data.get('enable'))
+
+    if enable and not _broker_available():
+        return jsonify({'success': False,
+                        'error': 'Broker is not running — cannot enable routing. Check: systemctl status takwerx-broker'}), 400
+
+    try:
+        unit = ''
+        if os.path.exists(_CONSOLE_UNIT):
+            with open(_CONSOLE_UNIT) as f:
+                unit = f.read()
+        lines = [ln for ln in unit.splitlines()
+                 if 'TAKWERX_FORCE_BROKER' not in ln]
+        if enable:
+            # insert under [Service] (after the line that opens it)
+            out = []
+            inserted = False
+            for ln in lines:
+                out.append(ln)
+                if ln.strip() == '[Service]' and not inserted:
+                    out.append('Environment=TAKWERX_FORCE_BROKER=1')
+                    inserted = True
+            if not inserted:   # no [Service] header found — append safely
+                out.append('Environment=TAKWERX_FORCE_BROKER=1')
+            unit = '\n'.join(out) + '\n'
+        else:
+            unit = '\n'.join(lines) + '\n'
+        with open(_CONSOLE_UNIT, 'w') as f:
+            f.write(unit)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        # persist intent so a future start.sh re-run can honor it (P1 wiring)
+        try:
+            _s = load_settings()
+            _s['broker_force_routing'] = enable
+            save_settings(_s)
+        except Exception:
+            pass
+        # detached delayed restart (same pattern as Update Now) so this response returns first
+        subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return jsonify({
+            'success': True,
+            'enabled': enable,
+            'restart_required': True,
+            'restart_message': 'Console is restarting to apply the change. You may see a brief 502 — wait ~15 seconds, then refresh.'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/console/rollback', methods=['POST'])
@@ -29370,6 +29479,19 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   <div class="card">
+    <div class="card-title">Least-Privilege Console — Privileged Broker</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. Enabling routing makes the console's privileged actions go <em>through the guard</em>. <strong>Safe:</strong> the console still runs as root either way — this does not yet hand the console off to a non-root user (that stays gated on rulebook hardening).</p>
+    <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="broker-test-btn" class="btn btn-ghost" onclick="runBrokerSelftest()"><span class="material-symbols-outlined" style="font-size:18px">fact_check</span>Run self-test</button>
+      <button id="broker-toggle-btn" class="btn btn-ghost" onclick="toggleBrokerRouting()"><span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing</button>
+      <span id="broker-msg" style="font-size:12px;margin-left:6px"></span>
+    </div>
+    <div id="broker-selftest" class="ctl-detail" style="margin-top:12px"></div>
+    <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Guard audit log on the box: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
+  </div>
+
+  <div class="card">
     <div class="card-title">Break-glass recovery (W6)</div>
     <p style="font-size:13px;color:var(--text-secondary);line-height:1.6">If SSO/Authentik is ever down, console access is recovered from an <strong>on-box shell</strong> with <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code> — an access-controlled, auditable path, <strong>not</strong> a network backdoor. Hardening can never permanently lock you out.</p>
     <p id="breakglass-status" style="margin-top:10px;font-size:12px;font-family:'JetBrains Mono',monospace"></p>
@@ -29470,7 +29592,46 @@ function postFlip(url,confirmMsg){
 }
 function doApply(){postFlip('/api/hardening/apply','Apply HARDENED posture? This enforces the security controls listed above. You can revert at any time, and on-box break-glass recovery always works.');}
 function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture? This relaxes the hardening controls back to default behavior.');}
-loadStatus();loadAssertions();loadAudit();
+
+function badge(on,label){var c=on?'var(--green)':'var(--text-dim)';var m=on?'&#10003;':'&#8211;';return '<span style="color:'+c+';margin-right:14px">'+m+' '+esc(label)+'</span>';}
+function renderBrokerStatus(d){
+  var el=document.getElementById('broker-status');
+  if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — re-run <code>sudo ./start.sh</code> on the box.</span>';}
+  else{el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'socket ready')+badge(d.routing_active,'routing '+(d.routing_active?'ON':'off'));}
+  var tb=document.getElementById('broker-toggle-btn');
+  if(d.force_enabled){tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Disable routing';}
+  else{tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing';}
+  document.getElementById('broker-test-btn').disabled=!d.socket_present;
+}
+function loadBroker(){
+  fetch('/api/console/broker/status').then(function(r){return r.json();}).then(renderBrokerStatus)
+    .catch(function(){document.getElementById('broker-status').textContent='Failed to load guard status.';});
+}
+function runBrokerSelftest(){
+  var out=document.getElementById('broker-selftest');out.innerHTML='Running self-test…';
+  fetch('/api/console/broker/selftest').then(function(r){return r.json();}).then(function(d){
+    if(d.error){out.innerHTML='<span style="color:var(--red)">'+esc(d.error)+'</span>';return;}
+    var rows=(d.checks||[]).map(function(c){
+      var col=c.ok?'var(--green)':'var(--red)';var m=c.ok?'&#10003;':'&#10007;';
+      return '<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:'+col+'">'+m+' '+esc(c.name)+(c.ok?'':(c.detail?('  — '+esc(c.detail)):''))+'</div>';
+    }).join('');
+    out.innerHTML='<div style="margin-bottom:6px;font-weight:600;color:'+(d.ok?'var(--green)':'var(--red)')+'">'+(d.ok?'SELF-TEST PASSED':'SELF-TEST FAILED')+'</div>'+rows;
+  }).catch(function(){out.innerHTML='<span style="color:var(--red)">Self-test request failed.</span>';});
+}
+function toggleBrokerRouting(){
+  fetch('/api/console/broker/status').then(function(r){return r.json();}).then(function(s){
+    var enable=!s.force_enabled;
+    var msg=enable?'Enable least-privilege routing? The console will RESTART (brief ~15s blip). It keeps running as root — this only routes its privileged actions through the guard.':'Disable routing and restart the console?';
+    if(!confirm(msg))return;
+    var m=document.getElementById('broker-msg');m.textContent='Applying… console will restart.';m.style.color='var(--text-dim)';
+    document.getElementById('broker-toggle-btn').disabled=true;
+    fetch('/api/console/broker/routing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable:enable})}).then(function(r){return r.json();}).then(function(d){
+      if(d.success){m.textContent=d.restart_message||'Restarting…';m.style.color='var(--green)';setTimeout(function(){location.reload();},16000);}
+      else{m.textContent='Error: '+(d.error||'failed');m.style.color='var(--red)';document.getElementById('broker-toggle-btn').disabled=false;}
+    }).catch(function(){m.textContent='Request failed';m.style.color='var(--red)';document.getElementById('broker-toggle-btn').disabled=false;});
+  });
+}
+loadStatus();loadAssertions();loadAudit();loadBroker();
 </script>
 </body></html>
 '''
