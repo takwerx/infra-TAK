@@ -8337,9 +8337,10 @@ PORT_EXPOSURE_POLICY = [
 # many ephemeral/media ports; listing them here keeps the undeclared check from
 # crying wolf. SSH + the console port are added live.
 _KNOWN_PUBLIC_PORTS = {
-    80, 443, 8089, 8443, 8446,            # console/caddy/TAK
-    8554, 8322, 8890, 8000, 8001,         # MediaMTX streaming
+    80, 443, 8089, 8443, 8446, 8444,      # console/caddy/TAK (8444 = TAK aux HTTPS connector)
+    8554, 8322, 8890, 8892, 8000, 8001,   # MediaMTX streaming (8892 = aux listener)
     18554, 11935, 18890, 18888,           # CloudTAK media streaming
+    8448,                                 # Caddy auxiliary vhost listener
     3100,                                 # TAK Video Restreamer
     25,                                   # Email Relay (localhost-bound normally)
     8080,                                 # Guard Dog health agent (two-server, source-scoped)
@@ -8510,12 +8511,23 @@ def _exposure_report(force=False):
                      'note': note, 'why': ent['why']})
 
     # Undeclared public listeners — the catch-all that would have caught PGMiner.
+    # Firewall-aware: a 0.0.0.0 listener that the host firewall actively BLOCKS is
+    # not reachable (e.g. rpcbind :111, which start.sh never opens), so it's not an
+    # exposure — only flag listeners that are firewall-open, or where there's no
+    # enabled host firewall to stop them.
     known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22}
+    fw_enabled = bool(fwstatus.get('enabled'))
+    blocked = 0
     undeclared = []
     for p in sorted(listen_map):
         if 'public' not in listen_map[p]['scopes']:
             continue
         if p in known:
+            continue
+        st = fw_states.get(p)
+        reachable = (not fw_enabled) or bool(st and st.get('open'))
+        if not reachable:
+            blocked += 1
             continue
         undeclared.append({'port': p, 'procs': sorted(listen_map[p]['procs']) or ['?']})
     yellow += len(undeclared)
@@ -8529,6 +8541,7 @@ def _exposure_report(force=False):
     report = {
         'rows': rows,
         'undeclared': undeclared,
+        'firewall_blocked': blocked,
         'firewall_supported': bool(fwstatus.get('supported')),
         'firewall_enabled': bool(fwstatus.get('enabled')),
         'backend': fwstatus.get('backend') or ('ufw' if fwstatus.get('supported') else None),
@@ -31563,6 +31576,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       extra='<p style="margin-top:14px;color:var(--yellow);font-size:12px;font-weight:600">'+dot('warn')+'Public listeners not in the standard catalog — review:</p><div class="rules-box" style="max-height:160px">';
       u.forEach(function(x){extra+=esc(x.port)+'/tcp  '+esc((x.procs||[]).join(', '))+'\\n';});
       extra+='</div>';
+    }
+    if(d.firewall_blocked){
+      extra+='<p style="margin-top:10px;color:var(--text-dim);font-size:11px">'+dot('ok')+d.firewall_blocked+' listener(s) bound publicly but firewall-blocked — not reachable.</p>';
     }
     if(d.firewall_supported===false){
       extra+='<p style="margin-top:10px;color:var(--text-dim);font-size:11px">No host firewall detected — bind state shown without firewall correlation.</p>';
