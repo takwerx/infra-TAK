@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.2-alpha"
+VERSION = "10.0.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -807,15 +807,174 @@ def _load_json_cached(p):
 def load_settings():
     return _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
 
+# v10.0.3 — settings.json is the box's identity (fqdn, ssl_mode, os_type, server_ip…)
+# and is written from 166 call sites across many background threads. The original
+# save_settings did a truncating, unlocked, non-atomic write (open('w')+json.dump):
+# a crash or a concurrent read inside that window left a torn file, _load_json_cached
+# returned {} on the parse error, and the next thread persisted its telemetry on top
+# of that {} — silently wiping the core keys forever (2026-06-23 nebraskatak.net /
+# [[settings-json-tornwrite-race]]). Three shields: (1) atomic write (tmp+fsync+
+# os.replace), (2) a process write-lock, (3) a never-drop-core-keys guard that refills
+# any install-identity key the incoming dict is missing from the last-good on-disk
+# copy. _heal_settings_core_keys() (below) self-heals an ALREADY-corrupted file on boot.
+CORE_SETTINGS_KEYS = ('ssl_mode', 'fqdn', 'server_ip', 'os_type', 'os_name',
+                      'pkg_mgr', 'arch', 'console_port', 'install_dir')
+_settings_write_lock = threading.Lock()
+
 def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     p = os.path.join(CONFIG_DIR, 'settings.json')
-    with open(p, 'w') as f:
-        json.dump(s, f, indent=2)
+    with _settings_write_lock:
+        # (3) Never-drop-core-keys guard. Fast path: when the caller carries every core
+        # key (the overwhelming common case — callers do load→modify→save) we skip the
+        # disk read entirely. A core key is only ever MISSING from the incoming dict on
+        # the torn-read {} bug, never from a legit caller (which sets keys, e.g. fqdn='',
+        # rather than deleting them) — so refilling from the last-good on-disk copy is
+        # always correct and can never resurrect an intentionally-cleared value.
+        if not all(k in s for k in CORE_SETTINGS_KEYS):
+            try:
+                with open(p) as _f:
+                    _disk = json.loads(_f.read())
+            except Exception:
+                _disk = {}
+            if isinstance(_disk, dict):
+                _refilled = [k for k in CORE_SETTINGS_KEYS if k not in s and k in _disk]
+                for k in _refilled:
+                    s[k] = _disk[k]
+                if _refilled:
+                    print(f"[save_settings] GUARD: refilled missing core keys from disk "
+                          f"{_refilled} — caller dropped them (torn-read race?)", flush=True)
+        # (1) Atomic write: write a sibling temp file, fsync, then rename over the target
+        # so a reader always sees the old or new COMPLETE file, never a half-written one.
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.settings-', suffix='.tmp')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(s, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, p)
+        except Exception:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+            raise
+
+def _read_os_release():
+    """(os_type, os_name) from /etc/os-release, mirroring start.sh: '<ID>-<VERSION_ID>'
+    (e.g. ubuntu-22.04, rocky-9) and PRETTY_NAME. ('','') if unreadable."""
     try:
-        os.chmod(p, 0o600)
+        d = {}
+        with open('/etc/os-release') as f:
+            for line in f:
+                if '=' in line:
+                    k, v = line.rstrip('\n').split('=', 1)
+                    d[k] = v.strip().strip('"')
+        idv = (d.get('ID') or '').lower()
+        ver = d.get('VERSION_ID') or ''
+        return (f"{idv}-{ver}" if idv and ver else idv), (d.get('PRETTY_NAME') or '')
+    except Exception:
+        return '', ''
+
+def _detect_console_port():
+    """Console port from the systemd unit's --bind, else 5001."""
+    try:
+        with open('/etc/systemd/system/takwerx-console.service') as f:
+            m = re.search(r'--bind\s+\S*?:(\d+)', f.read())
+            if m:
+                return int(m.group(1))
     except Exception:
         pass
+    return 5001
+
+def _detect_server_ip_safe():
+    """Best-effort public/host IP for self-heal only (never raises, time-boxed)."""
+    try:
+        ip = _detect_cloud_public_ip()
+        if ip:
+            return ip
+    except Exception:
+        pass
+    for cmd in (['curl', '-s', '--connect-timeout', '5', 'https://ifconfig.me'],
+                ['hostname', '-I']):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            ip = (r.stdout or '').strip().split()[0] if (r.stdout or '').strip() else ''
+            if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip or ''):
+                return ip
+        except Exception:
+            pass
+    return ''
+
+def _recover_fqdn():
+    """Recover the base FQDN from on-box evidence — NEVER guesses. Returns None if no
+    evidence. Order: Caddyfile '# Base Domain:' → authentik .env COOKIE_DOMAIN (=.<fqdn>)."""
+    try:
+        with open(CADDYFILE_PATH) as f:
+            m = re.search(r'^#\s*Base Domain:\s*(\S+)', f.read(), re.MULTILINE)
+            if m and '.' in m.group(1):
+                return m.group(1).strip().lower()
+    except Exception:
+        pass
+    try:
+        with open(os.path.expanduser('~/authentik/.env')) as f:
+            m = re.search(r'^AUTHENTIK_COOKIE_DOMAIN=\.?([^\s/]+)', f.read(), re.MULTILINE)
+            if m and '.' in m.group(1):
+                return m.group(1).strip().lower()
+    except Exception:
+        pass
+    return None
+
+def _heal_settings_core_keys():
+    """v10.0.3 load-side self-heal: re-derive any missing install-identity core key and
+    re-persist. Defends against an ALREADY-corrupted settings.json (the torn-write race
+    that predates the save_settings atomic-write shield). Idempotent — a no-op when the
+    file is whole. fqdn is recovered best-effort from on-box evidence, never guessed."""
+    try:
+        s = load_settings()
+    except Exception:
+        return
+    _identity = ('os_type', 'os_name', 'pkg_mgr', 'arch', 'console_port', 'install_dir', 'ssl_mode')
+    # Fast no-op: identity intact AND (fqdn present OR genuinely no domain to recover).
+    if all(s.get(k) for k in _identity) and (s.get('fqdn') or _recover_fqdn() is None):
+        return
+    healed = {}
+    if not s.get('install_dir'):
+        healed['install_dir'] = BASE_DIR
+    if not s.get('arch'):
+        try:
+            healed['arch'] = _host_arch()
+        except Exception:
+            healed['arch'] = 'amd64'
+    if not s.get('pkg_mgr'):
+        healed['pkg_mgr'] = 'dnf' if _distro_family() == 'rhel' else 'apt'
+    if not s.get('os_type') or not s.get('os_name'):
+        _ot, _on = _read_os_release()
+        if not s.get('os_type') and _ot:
+            healed['os_type'] = _ot
+        if not s.get('os_name') and _on:
+            healed['os_name'] = _on
+    if not s.get('console_port'):
+        healed['console_port'] = _detect_console_port()
+    if not s.get('server_ip'):
+        _ip = _detect_server_ip_safe()
+        if _ip:
+            healed['server_ip'] = _ip
+    _fqdn = s.get('fqdn')
+    if not _fqdn:
+        _rec = _recover_fqdn()
+        if _rec:
+            healed['fqdn'] = _rec
+            _fqdn = _rec
+    if not s.get('ssl_mode'):
+        healed['ssl_mode'] = 'fqdn' if _fqdn else 'self-signed'
+    if healed:
+        s.update(healed)
+        save_settings(s)
+        print(f"[heal-settings] restored missing core keys: {list(healed)}", flush=True)
 
 def load_auth():
     """Load auth.json from CONFIG_DIR. Never raises — returns {} on missing file or error."""
@@ -904,13 +1063,30 @@ def _tak_install_method():
     """'native' | 'container' — how TAK Server is (or will be) installed here.
 
     Returns the persisted 'tak_install_method' (set at deploy time) when present.
-    When unset, returns the platform DEFAULT: arm64 → 'container' (no native arm
-    TAK package), everything else → 'native'. Existing amd64 .deb boxes have no
-    key and correctly resolve to 'native'."""
+    When unset, DETECTS from on-disk evidence before falling back to the platform
+    default: the container deploy symlinks /opt/tak → the bundle (`ln -sfn`, deploy
+    step 2/9) while a native .deb leaves /opt/tak a real directory.
+
+    v10.0.3: the old arch-ONLY default ('container' if arm64) mis-classified a NATIVE
+    arm64 install that predates container support (no key, since the container path is
+    the only writer of this key) as 'container' — so its status checks pointed at a
+    non-existent `takserver` container and the console showed TAK Server + PostgreSQL
+    "Stopped" while they ran fine (Oracle Ampere free-tier box after updating to 10.0.2).
+    The /opt/tak symlink probe also makes detection survive a wiped settings.json
+    (a container box that lost the key still reads correctly). Only a truly fresh box
+    (no /opt/tak) falls through to the platform default — arm64 → 'container' for a
+    NEW deploy."""
     s = load_settings()
     m = s.get('tak_install_method')
     if m in ('native', 'container'):
         return m
+    try:
+        if os.path.islink('/opt/tak'):
+            return 'container'
+        if os.path.isdir('/opt/tak'):
+            return 'native'
+    except Exception:
+        pass
     return 'container' if _host_arch() == 'arm64' else 'native'
 
 def _tak_is_container():
@@ -13773,7 +13949,13 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
         except Exception as e:
             _log(f"⚠ Brand update: {str(e)[:120]}")
 
-        # 4. PATCH embedded outpost config.authentik_host → internal URL
+        # 4. PATCH embedded outpost config.authentik_host → PUBLIC base URL.
+        # v10.0.3: this is the BROWSER-FACING proxy outpost — its authentik_host is the
+        # host the forward-auth redirect sends users to for login. It must be the public
+        # base URL (https://tak.<fqdn>), NOT the internal _ldap_internal — the old internal
+        # value made the authorize redirect point at authentik-server-1:9000 (unreachable
+        # from a browser) → the 2026-06-23 SSO break. This now matches the authoritative
+        # _ensure_embedded_outpost_authentik_host() startup migration (was contradicting it).
         try:
             r = _req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers)
             outposts = json.loads(_req.urlopen(r, timeout=10).read().decode()).get('results', [])
@@ -13782,11 +13964,12 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                 op_pk = embedded.get('pk')
                 full = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/', headers=ak_headers), timeout=10).read().decode())
                 cfg = full.get('config') or {}
-                cfg['authentik_host'] = _ldap_internal
-                cfg['authentik_host_insecure'] = True
+                _emb_host = _get_authentik_base_url(settings) or f'https://{ak_host}'
+                cfg['authentik_host'] = _emb_host
+                cfg['authentik_host_insecure'] = False
                 _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
                     data=json.dumps({'config': cfg}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
-                _log(f"✓ Embedded outpost: config.authentik_host → {_ldap_internal}")
+                _log(f"✓ Embedded outpost: config.authentik_host → {_emb_host}")
         except Exception as e:
             _log(f"⚠ Embedded outpost: {str(e)[:120]}")
 
@@ -13803,11 +13986,17 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                     full_prov = json.loads(_req.urlopen(
                         _req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/', headers=ak_headers), timeout=10
                     ).read().decode())
-                    # Build updated external_host — replace old domain in existing URL
+                    # Build updated external_host: keep the service subdomain LABEL and
+                    # swap the base domain to the new fqdn. v10.0.3: the old
+                    # rsplit(".",2)[-2] grabbed the base domain's FIRST label, producing
+                    # <baselabel>.<fqdn> (e.g. nebraskatak.nebraskatak.net) — the
+                    # 2026-06-23 SSO "Not found". First label is correct for every proxy
+                    # provider (all single-label subdomains: infratak/takportal/stream/…)
+                    # and also discards any stray middle label from a polluted old host.
                     ext_host = full_prov.get('external_host') or ''
-                    if ext_host:
-                        import re as _re_prov
-                        ext_host = _re_prov.sub(r'https?://([^/]+)', lambda m: f'https://{m.group(1).rsplit(".", 2)[-2] + "." + fqdn if "." in m.group(1) else m.group(1)}', ext_host)
+                    _ehm = re.match(r'https?://([^/]+)', ext_host) if ext_host else None
+                    if _ehm:
+                        ext_host = f'https://{_ehm.group(1).split(".")[0]}.{fqdn}'
                     # Update redirect_uris — replace old domain in all URL entries
                     uris = full_prov.get('redirect_uris') or []
                     new_uris = []
@@ -39299,6 +39488,35 @@ def _heal_mediamtx_webeditor_writable_paths(plog=None):
         return False
 
 
+def _clear_stale_authentik_migration_lock(plog):
+    """v10.0.3: terminate any orphaned Postgres backend holding Authentik's migration
+    advisory lock before (re)starting authentik-server. Rapid server restarts — or a
+    migration killed mid-flight — can leave an idle / idle-in-tx connection holding
+    pg_advisory_lock(...); the next server boot then waits on it, hits statement_timeout
+    (120s), dies, and crash-loops 'waiting to acquire database lock' forever (2026-06-23
+    nebraskatak.net). Safe: Authentik's startup migrate is a no-op when the schema is
+    current, so the lock releases the instant it's acquired. Targets ONLY idle/idle-in-tx
+    backends with a BLANK application_name that hold an advisory lock — never the live
+    worker (application_name=authentik-worker@…) nor any active query."""
+    try:
+        sql = ("SELECT pg_terminate_backend(a.pid) FROM pg_stat_activity a "
+               "WHERE a.datname='authentik' AND a.state IN ('idle','idle in transaction') "
+               "AND coalesce(a.application_name,'')='' "
+               "AND a.pid IN (SELECT pid FROM pg_locks WHERE locktype='advisory') "
+               "AND a.pid <> pg_backend_pid();")
+        r = subprocess.run(
+            ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+             '-d', 'authentik', '-tA', '-c', sql],
+            capture_output=True, text=True, timeout=20)
+        n = sum(1 for ln in (r.stdout or '').splitlines() if ln.strip() == 't')
+        if n:
+            plog(f"  authentik migration lock: cleared {n} orphaned advisory-lock holder(s)")
+        return n
+    except Exception as e:
+        plog(f"  authentik migration lock: pre-check skipped ({str(e)[:80]})")
+        return 0
+
+
 def _recreate_authentik_server_worker(plog, reason):
     """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
 
@@ -39322,6 +39540,11 @@ def _recreate_authentik_server_worker(plog, reason):
 
     started = time.time()
     plog(f"  authentik recreate: starting (reason={reason}, target=server+worker, ldap=untouched)")
+
+    # v10.0.3: clear any orphaned migration advisory lock first so the recreated server
+    # can acquire the migration lock instead of crash-looping 'waiting to acquire database
+    # lock' (the 2026-06-23 deadlock after rapid restarts).
+    _clear_stale_authentik_migration_lock(plog)
 
     ok = False
     err_text = ''
@@ -42913,6 +43136,10 @@ def _authentik_channels_pool_watchdog_loop():
                 _authentik_max_requests_autotune_record_fire(
                     idle_count=_idle_in_tx_count, threshold=_idle_in_tx_threshold, current_max=_mr_cur
                 )
+                # v10.0.3: clear any orphaned migration advisory lock before the restart so
+                # the server doesn't crash-loop 'waiting to acquire database lock' on boot.
+                _clear_stale_authentik_migration_lock(
+                    lambda m: print(f"[ak-pg-watchdog]{m}", flush=True))
                 _restart_tx = subprocess.run(
                     ['docker', 'restart', 'authentik-server-1'],
                     capture_output=True, text=True, timeout=90
@@ -60022,6 +60249,10 @@ loadSchedule();
 <script src="/takserver.js"></script></body></html>'''
 
 # === Startup Banner (prints for both gunicorn and direct invocation) ===
+# v10.0.3: self-heal a torn/partial settings.json BEFORE we read it for the banner,
+# so a box that lost its core keys (the torn-write race) comes back up on its real
+# domain instead of degrading to "OS: Unknown / self-signed / No Domain" + the banner.
+_heal_settings_core_keys()
 _startup_settings = load_settings()
 _ssl_mode = _startup_settings.get('ssl_mode', 'self-signed')
 _port = _startup_settings.get('console_port', 5001)
@@ -60830,7 +61061,13 @@ def _startup_resync_ldap_service_account():
     except Exception as _e:
         print(f"Startup migration: LDAP service account resync skipped: {_e}")
 
-_startup_resync_ldap_service_account()
+# v10.0.3: run the boot-time LDAP SA bind heal in the BACKGROUND so an unhealthy LDAP
+# outpost can never wedge the worker boot. 2026-06-23: a misconfigured outpost made this
+# synchronous resync spin on ldapsearch and the console never finished starting → /login
+# timed out for minutes. _authentik_ldap_sa_bind_watchdog_loop (every 5 min) is the
+# ongoing safety net, so deferring the one-shot boot heal off the critical path is safe.
+threading.Thread(target=_startup_resync_ldap_service_account, daemon=True,
+                 name='startup-ldap-sa-resync').start()
 
 
 def _fail2ban_install_and_configure(plog):
