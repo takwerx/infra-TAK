@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.2-alpha)**
+**Current release: [v10.0.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.3-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.3-alpha — 2026-06-24 — Your server can no longer lose its own domain: hardened config + self-healing startup
+
+**Headline: a rare race condition could corrupt the console's settings file and make a perfectly healthy server suddenly behave as if it had no domain — showing a "No Domain Configured" banner, dropping to self-signed certificates, and cascading into broken single sign-on if the domain was then re-entered. v10.0.3 makes that class of failure impossible.** The settings file is now written **atomically** (it can never be caught half-written, even under heavy background activity or a restart), it **refuses to drop the server's core identity** (domain, SSL mode, OS, install paths) no matter what writes it, and on every startup the console **self-heals** any missing core setting — re-detecting the OS and recovering the domain from the server's own configuration — so a box comes back up on its real domain instead of a degraded state. Four related hardening fixes ride along: the domain-change flow no longer produces a malformed sign-on hostname (which could break SSO with an "Authentik — Not found"); single sign-on redirects always point at a browser-reachable address; the console **always finishes starting even if Authentik's LDAP component is briefly unhealthy** (it heals in the background instead of hanging); and the identity provider can no longer get stuck in a database-lock restart loop on a slow disk. Finally, servers that installed TAK Server **natively on ARM before container support existed** are now correctly detected as running (they were wrongly shown as "Stopped"). Works identically on **Ubuntu 22.04, Rocky / RHEL 9, and ARM64**. **Upgrade:** applied automatically on the next console update; no action required — and the protection is most valuable on long-running servers.
+
+Full notes: [v10.0.3-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.3-alpha).
 
 ### v10.0.2-alpha — 2026-06-22 — Guard Dog reclaims runaway Docker build cache before it fills your disk
 
