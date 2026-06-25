@@ -110,7 +110,7 @@ allow takwerx_console_t shell_exec_t:file { execute execute_no_trans map };
 allow takwerx_console_t container_runtime_exec_t:file { execute execute_no_trans getattr open read map };
 allow takwerx_console_t systemd_systemctl_exec_t:file { execute execute_no_trans open read map };
 
- rules (audit2allow; still to be minimised) ---
+# --- HARVESTED resource-specific rules (audit2allow; still to be minimised) ---
 allow takwerx_console_t cert_t:dir { getattr open read search };
 allow takwerx_console_t cert_t:file { getattr open read };
 allow takwerx_console_t cert_t:lnk_file read;
