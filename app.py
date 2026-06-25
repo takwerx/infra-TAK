@@ -1555,7 +1555,7 @@ def _selinux_allow_caddy_port(port, log=None):
             return False
         # Which protocols already have this port under http_port_t? (idempotent)
         have = {'tcp': False, 'udp': False}
-        cur = subprocess.run('semanage port -l 2>/dev/null', shell=True, capture_output=True, text=True, timeout=15)
+        cur = subprocess.run(_sudo_wrap(['semanage', 'port', '-l']), capture_output=True, text=True, timeout=15)
         for ln in (cur.stdout or '').splitlines():
             f = ln.split()
             if len(f) >= 3 and f[0] == 'http_port_t' and f[1] in ('tcp', 'udp') \
@@ -1651,8 +1651,7 @@ def _ensure_tak_on_authentik_network():
     if not _tak_is_container():
         return None, None
     try:
-        r = subprocess.run('docker ps --filter name=authentik-ldap --format "{{.Names}}"',
-                           shell=True, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-ldap', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10)
         names = [n for n in (r.stdout or '').splitlines() if n.strip()]
         if not names:
             return None, None
@@ -2386,16 +2385,14 @@ def _get_unattended_upgrades_status():
     """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade job active (not shutdown-waiter)."""
     enabled = False
     try:
-        r = subprocess.run('systemctl is-enabled unattended-upgrades 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'unattended-upgrades']), capture_output=True, text=True, timeout=5)
         enabled = (r.stdout or '').strip() == 'enabled'
     except Exception:
         pass
     running = False
     try:
         # Only "Running" when the timer-started upgrade job is active (apt-daily-upgrade.service)
-        r = subprocess.run('systemctl is-active apt-daily-upgrade.service 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'apt-daily-upgrade.service']), capture_output=True, text=True, timeout=5)
         running = (r.stdout or '').strip() == 'active'
     except Exception:
         pass
@@ -4121,7 +4118,7 @@ def _w1_caddy_regen(log):
                              shell=True, capture_output=True, text=True, timeout=30)
         if val.returncode != 0:
             log('W1: caddy validate FAILED: %s' % (val.stdout or val.stderr or '')[-200:]); return False
-    rl = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
     if rl.returncode != 0:
         log('W1: caddy reload error: %s' % (rl.stdout or rl.stderr or '')[-160:]); return False
     log('W1: Caddy reloaded'); return True
@@ -10568,7 +10565,7 @@ def _guarddog_health_check(service_id):
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return resp.status in (200, 302, 301)
         if service_id == 'takportal':
-            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if service_id == 'mediamtx':
             settings = load_settings()
@@ -10602,7 +10599,7 @@ def _guarddog_health_check(service_id):
                     ok, out = _ssh_probe(rcfg, "docker ps --filter name=cloudtak-api --format '{{.Status}}' 2>/dev/null", timeout=10)
                     return bool(ok and out and 'Up' in out)
                 return False
-            r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if service_id == 'federation_hub':
             settings = load_settings()
@@ -10912,8 +10909,7 @@ def _monitor_health_check(monitor_id):
             if not os.path.isfile(log_path):
                 return None
             tr = subprocess.run(
-                'systemctl show takserver --property=ActiveEnterTimestamp --value 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=3)
+                _sudo_wrap(['systemctl', 'show', 'takserver', '--property=ActiveEnterTimestamp', '--value']), capture_output=True, text=True, timeout=3)
             tak_ts = tr.stdout.strip()  # e.g. "Tue 2026-05-19 14:32:38 UTC"
             tak_prefix = ''
             try:
@@ -11049,7 +11045,7 @@ def _monitor_health_check(monitor_id):
             except Exception:
                 return False
         if monitor_id == 'takportal_ctr':
-            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if monitor_id == 'cloudtak_ctr':
             settings = load_settings()
@@ -11060,7 +11056,7 @@ def _monitor_health_check(monitor_id):
                     return False
                 ok, out = _ssh_probe(rcfg, "docker ps --filter name=cloudtak-api --format '{{.Status}}' 2>/dev/null", timeout=10)
                 return bool(ok and out and 'Up' in out)
-            r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if monitor_id == 'updates_check':
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'takupdatesguard.timer']), capture_output=True, text=True, timeout=3)
@@ -14289,11 +14285,11 @@ def caddy_custom_cert():
         return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
 
     # Reload Caddy (graceful — keeps serving old config if the new one is invalid).
-    reload_r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    reload_r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
     reloaded = reload_r.returncode == 0
     if not reloaded:
         # Fall back to a restart (e.g. Caddy was stopped/paused on this box).
-        restart_r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        restart_r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         reloaded = restart_r.returncode == 0
         if not reloaded:
             return jsonify({'success': False,
@@ -14335,9 +14331,9 @@ def caddy_set_ssl_mode():
         generate_caddyfile(settings)
     except Exception as e:
         return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
-    reload_r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    reload_r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
     if reload_r.returncode != 0:
-        restart_r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        restart_r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         if restart_r.returncode != 0:
             return jsonify({'success': False, 'error': f'Switched setting, but Caddy reload failed: {(reload_r.stdout or reload_r.stderr or "").strip()[:300]}'}), 500
     return jsonify({'success': True, 'message': "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."})
@@ -14723,7 +14719,7 @@ def caddy_update_domain():
     def _restart():
         time.sleep(2)
         try:
-            subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         except Exception:
             pass
     threading.Thread(target=_restart, daemon=True).start()
@@ -14742,7 +14738,7 @@ def _caddy_restart_after_response():
     time.sleep(2)
     try:
         generate_caddyfile(load_settings())
-        subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
     except Exception:
         pass
 
@@ -14756,7 +14752,7 @@ def caddy_control():
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
         return jsonify({'success': True, 'output': 'Caddy restart scheduled; connection may drop briefly.'})
     elif action == 'stop':
-        r = subprocess.run('systemctl stop caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         return jsonify({'success': r.returncode == 0, 'output': (r.stdout or r.stderr or '').strip()})
     elif action == 'start':
         generate_caddyfile(load_settings())
@@ -14784,15 +14780,13 @@ def caddy_update():
                 shell=True, capture_output=True, text=True, timeout=120)
         else:
             r = subprocess.run(
-                'dnf upgrade -y caddy 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120)
+                _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
         # Restart (not reload) — apt replaced the binary; reload only re-reads config and
         # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
-            'systemctl restart caddy 2>&1',
-            shell=True, capture_output=True, text=True, timeout=90)
+            _sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         return jsonify({'success': True, 'output': (r.stdout or '').strip()})
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'error': 'apt-get timed out'})
@@ -14811,7 +14805,7 @@ def caddy_uninstall():
     if pkg_mgr == 'apt':
         subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
     else:
-        subprocess.run('dnf remove -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'caddy']), capture_output=True, timeout=120)
     steps.append('Removed Caddy package')
     for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
         if os.path.exists(path):
@@ -17686,7 +17680,7 @@ log "TAK keystore refreshed and container restarted."
 '''
     try:
         _write_priv('/opt/tak/renew-letsencrypt.sh', renewal)
-        subprocess.run('chmod +x /opt/tak/renew-letsencrypt.sh', shell=True)
+        subprocess.run(_sudo_wrap(['chmod', '+x', '/opt/tak/renew-letsencrypt.sh']))
         svc = ('[Unit]\nDescription=TAK Server LE Cert Renewal (container)\n'
                'After=network.target docker.service\n\n[Service]\nType=oneshot\n'
                'ExecStart=/opt/tak/renew-letsencrypt.sh\n')
@@ -18060,9 +18054,9 @@ def run_caddy_deploy(domain):
                     return
         else:
             plog("  Installing Caddy via dnf...")
-            subprocess.run('dnf install -y "dnf-command(copr)" 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'dnf-command(copr)']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
             subprocess.run('dnf copr enable -y @caddy/caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-            r = subprocess.run('dnf install -y caddy 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+            r = subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
             if r.returncode != 0:
                 plog(f"✗ Caddy install failed")
                 caddy_deploy_status.update({'running': False, 'error': True})
@@ -18128,16 +18122,16 @@ def run_caddy_deploy(domain):
         # Open ports 80, 443, and 5001 (backdoor) so console is reachable before/after Caddy
         r = subprocess.run('which ufw', shell=True, capture_output=True)
         if r.returncode == 0:
-            subprocess.run('ufw allow 80/tcp 2>/dev/null; true', shell=True, capture_output=True)
-            subprocess.run('ufw allow 443/tcp 2>/dev/null; true', shell=True, capture_output=True)
-            subprocess.run('ufw allow 5001/tcp 2>/dev/null; true', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['ufw', 'allow', '80/tcp']), capture_output=True)
+            subprocess.run(_sudo_wrap(['ufw', 'allow', '443/tcp']), capture_output=True)
+            subprocess.run(_sudo_wrap(['ufw', 'allow', '5001/tcp']), capture_output=True)
             plog("  ✓ UFW: ports 80, 443, 5001 (backdoor) opened")
         r = subprocess.run('which firewall-cmd', shell=True, capture_output=True)
         if r.returncode == 0:
-            subprocess.run('firewall-cmd --permanent --add-service=http 2>/dev/null; true', shell=True, capture_output=True)
-            subprocess.run('firewall-cmd --permanent --add-service=https 2>/dev/null; true', shell=True, capture_output=True)
-            subprocess.run('firewall-cmd --permanent --add-port=5001/tcp 2>/dev/null; true', shell=True, capture_output=True)
-            subprocess.run('firewall-cmd --reload 2>/dev/null; true', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', '--add-service=http']), capture_output=True)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', '--add-service=https']), capture_output=True)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', '--add-port=5001/tcp']), capture_output=True)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True)
             plog("  ✓ firewalld: ports 80, 443, 5001 (backdoor) opened")
         plog("✓ Firewall configured")
 
@@ -18165,16 +18159,16 @@ def run_caddy_deploy(domain):
                 plog(f"  ✗ static caddy download did not validate: {((_cv.stderr or _cv.stdout) or 'no output').strip()[:160]}")
             subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True)
-        r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         if r.returncode != 0:
             plog(f"⚠ systemctl restart: {(r.stderr or r.stdout or '').strip()[:300]}")
         time.sleep(3)
-        r = subprocess.run('systemctl is-active caddy', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
         if r.stdout.strip() == 'active':
             plog("✓ Caddy is running")
         else:
             plog("✗ Caddy did not start. Capturing status and logs:")
-            status = subprocess.run('systemctl status caddy --no-pager -l 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+            status = subprocess.run(_sudo_wrap(['systemctl', 'status', 'caddy', '--no-pager', '-l']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
             if status.stdout:
                 for line in (status.stdout or '').strip().split('\n')[:15]:
                     plog(f"  {line}")
@@ -18229,9 +18223,9 @@ def _get_takportal_version_info():
         if rv.returncode == 0 and rv.stdout.strip():
             out['version'] = rv.stdout.strip()
     # If container is running, parse last [update-check] line for update_available
-    r = subprocess.run('docker ps --filter name=tak-portal -q 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '-q']), capture_output=True, text=True, timeout=5)
     if r.returncode == 0 and (r.stdout or '').strip():
-        log_r = subprocess.run('docker logs tak-portal --tail 200 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', '200']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
@@ -18374,7 +18368,7 @@ def _get_authentik_version_info():
             pass
     if not out['version']:
         try:
-            r = subprocess.run('docker images --format "{{.Tag}}" ghcr.io/goauthentik/server 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(_sudo_wrap(['docker', 'images', '--format', '{{.Tag}}', 'ghcr.io/goauthentik/server']), capture_output=True, text=True, timeout=5)
             if r.returncode == 0 and r.stdout.strip():
                 out['version'] = r.stdout.strip().split('\n')[0]
         except Exception:
@@ -18446,11 +18440,11 @@ def _get_authentik_version_info():
 def _get_nodered_version_info():
     """Return {version: str, update_available: bool} for Node-RED from container or image."""
     out = {'version': '', 'update_available': False}
-    r = subprocess.run('docker ps -q -f name=nodered 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+    r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=nodered']), capture_output=True, text=True, timeout=5)
     if not (r.returncode == 0 and (r.stdout or '').strip()):
         return out
     # Try to get version from container (Node-RED package.json)
-    ex = subprocess.run('docker exec nodered node -p "try{require(\'/usr/src/node-red/package.json\').version}catch(e){\'\'}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+    ex = subprocess.run(_sudo_wrap(['docker', 'exec', 'nodered', 'node', '-p', "try{require('/usr/src/node-red/package.json').version}catch(e){''}"]), capture_output=True, text=True, timeout=5)
     if ex.returncode == 0 and ex.stdout.strip():
         out['version'] = ex.stdout.strip().strip('"\'')
     if not out['version']:
@@ -18506,8 +18500,7 @@ def _get_cloudtak_version_info():
     ct_dir = os.path.expanduser('~/CloudTAK')
     # Step 0: prefer the RUNNING container's version (what's actually serving).
     try:
-        rcid = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null',
-                              shell=True, capture_output=True, text=True, timeout=5)
+        rcid = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=cloudtak-api']), capture_output=True, text=True, timeout=5)
         _cid_lines = (rcid.stdout or '').strip().splitlines() if rcid.returncode == 0 else []
         _api_id = _cid_lines[0].strip() if _cid_lines else ''
         if _api_id:
@@ -18547,7 +18540,7 @@ def _get_cloudtak_version_info():
         rv = subprocess.run(f'cd {ct_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
             out['version'] = rv.stdout.strip().lstrip('vV')
-    r = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+    r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=cloudtak-api']), capture_output=True, text=True, timeout=5)
     # Guard: docker ps -q returns empty (rc 0) when no container is running — e.g.
     # the post-update recreate window. `''.splitlines()[0]` was an IndexError → 500
     # on /api/modules/version while CloudTAK was being recreated (caught in v0.9.48 T&E).
@@ -19069,8 +19062,7 @@ def _takportal_get_existing_settings():
     """Read current settings.json from TAK Portal container. Returns dict or {} if container missing or file invalid."""
     try:
         r = subprocess.run(
-            'docker exec tak-portal cat /usr/src/app/data/settings.json 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
         if r.returncode != 0 or not (r.stdout or '').strip():
             return {}
         return json.loads(r.stdout.strip())
@@ -19226,8 +19218,7 @@ def _takportal_setup_ssh(log_fn=None):
 
         # Copy keypair into running container
         subprocess.run(
-            'docker exec tak-portal mkdir -p /usr/src/app/data/ssh',
-            shell=True, capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'mkdir', '-p', '/usr/src/app/data/ssh']), capture_output=True, text=True, timeout=10)
         subprocess.run(
             f'docker cp {shlex.quote(priv_key)} tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519',
             shell=True, capture_output=True, text=True, timeout=10)
@@ -19236,8 +19227,7 @@ def _takportal_setup_ssh(log_fn=None):
             shell=True, capture_output=True, text=True, timeout=10)
         # Ensure correct permissions inside container
         subprocess.run(
-            'docker exec tak-portal chmod 600 /usr/src/app/data/ssh/tak_ssh_ed25519',
-            shell=True, capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'chmod', '600', '/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
         if log_fn:
             log_fn("  ✓ SSH keys copied into TAK Portal container")
 
@@ -19245,8 +19235,7 @@ def _takportal_setup_ssh(log_fn=None):
         try:
             from datetime import datetime as _dt
             r = subprocess.run(
-                'docker exec tak-portal cat /usr/src/app/data/settings.json',
-                shell=True, capture_output=True, text=True, timeout=10)
+                _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
             if r.returncode == 0 and r.stdout.strip():
                 import json as _json
                 portal_cfg = _json.loads(r.stdout)
@@ -19317,7 +19306,7 @@ def takportal_control():
             if cp.returncode != 0:
                 return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
             _takportal_setup_ssh()
-            subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+            subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
         # v0.9.31: run the full Authentik proxy chain heal for all deployed
@@ -19336,7 +19325,7 @@ def takportal_control():
         except Exception:
             pass
         time.sleep(2)
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
         running = 'Up' in (r.stdout or '')
         tp_state = (chain_summary or {}).get('takportal', {})
         ok = (tp_state.get('provider') in ('ok', 'created', 'fixed', 'adopted')
@@ -19400,7 +19389,7 @@ def takportal_control():
                     pass
             if cp.returncode == 0:
                 _takportal_setup_ssh()
-                subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+                subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
                 settings_synced = True
             else:
                 settings_sync_error = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]
@@ -19410,7 +19399,7 @@ def takportal_control():
         time.sleep(3)
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
         running = 'Up' in (r.stdout or '')
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
@@ -19418,7 +19407,7 @@ def takportal_control():
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
-    r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
     running = 'Up' in r.stdout
     return jsonify({'success': True, 'running': running, 'action': action})
 
@@ -19704,7 +19693,7 @@ def run_takportal_deploy():
         # Wait for container to be healthy
         plog("  Waiting for container...")
         time.sleep(5)
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
         if 'Up' in r.stdout:
             plog("\u2713 TAK Portal is running")
         else:
@@ -19768,7 +19757,7 @@ def run_takportal_deploy():
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
         # Restart container to pick up settings
-        subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         time.sleep(3)
         plog("\u2713 TAK Portal restarted with new settings")
 
@@ -20063,7 +20052,7 @@ def mediamtx_control():
     elif action == 'stop':
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'mediamtx', 'mediamtx-webeditor']), capture_output=True)
     elif action == 'restart':
-        subprocess.run('systemctl restart mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx', 'mediamtx-webeditor']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     time.sleep(2)
     r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
     running = r.stdout.strip() == 'active'
@@ -20227,8 +20216,8 @@ def mediamtx_uninstall():
         settings['mediamtx_deployment']['deployed'] = False
         save_settings(settings)
     else:
-        subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
-        subprocess.run('systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'mediamtx', 'mediamtx-webeditor']), capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'mediamtx', 'mediamtx-webeditor']), capture_output=True)
         for f in ['/etc/systemd/system/mediamtx.service', '/etc/systemd/system/mediamtx-webeditor.service',
                   '/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml']:
             if os.path.exists(f):
@@ -21229,10 +21218,10 @@ WantedBy=multi-user.target
             else:
                 plog("  ✓ Web editor Python deps installed")
 
-        subprocess.run('systemctl daemon-reload', shell=True, capture_output=True)
-        subprocess.run('systemctl enable mediamtx', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'mediamtx']), capture_output=True)
         if os.path.exists(editor_file):
-            subprocess.run('systemctl enable mediamtx-webeditor', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', 'mediamtx-webeditor']), capture_output=True)
 
         # v0.9.29 — Pre-create writable dirs + chown for the takwerx-run web editor.
         # The upstream mediamtx_config_editor.py (from mediamtx-installer) hardcodes:
@@ -21251,21 +21240,21 @@ WantedBy=multi-user.target
         if os.path.exists(editor_file):
             try:
                 subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups', shell=True, capture_output=True, timeout=5)
-                subprocess.run('chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups', shell=True, capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
                 # Editor writes theme_config.json, email_config.json, users_file,
                 # share_links, group_metadata, srt_passphrase_backup, pending_reg,
                 # reset_tokens, etc. into /opt/mediamtx-webeditor/. All as takwerx.
                 subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor', shell=True, capture_output=True, timeout=10)
                 # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
                 # the editor's Save-Config UI. takwerx ownership lets both work.
-                subprocess.run('chown takwerx:takwerx /usr/local/etc/mediamtx.yml', shell=True, capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
                 plog("  ✓ Web editor writable paths chowned to takwerx (backups + /opt/mediamtx-webeditor + mediamtx.yml)")
             except Exception as _pe:
                 plog(f"  ⚠ Could not chown web editor paths: {_pe}")
 
-        subprocess.run('systemctl start mediamtx', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'mediamtx']), capture_output=True)
         if os.path.exists(editor_file):
-            subprocess.run('systemctl start mediamtx-webeditor', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['systemctl', 'start', 'mediamtx-webeditor']), capture_output=True)
         plog("✓ Services enabled and started")
 
         # Step 6: Firewall
@@ -21338,12 +21327,12 @@ WantedBy=multi-user.target
                         subprocess.run(f'chmod g+rx "{d}" 2>/dev/null', shell=True, capture_output=True)
                     subprocess.run(f'chmod g+r "{cert_file}" "{key_file}" 2>/dev/null', shell=True, capture_output=True)
                     # daemon-reload so the SupplementaryGroups=caddy in the unit (written in Step 5) takes effect
-                    subprocess.run('systemctl daemon-reload', shell=True, capture_output=True)
+                    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
                     plog("  ✓ Cert read-access granted to MediaMTX (takwerx in caddy group)")
                 except Exception as _e:
                     plog(f"  ⚠ Could not grant cert read-access: {_e}")
 
-                subprocess.run('systemctl restart mediamtx', shell=True, capture_output=True)
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True)
                 time.sleep(2)
                 # Caddy's /hls-proxy reverse_proxy only emits https:// when the stream
                 # cert exists at generate-time (_get_mediamtx_hls_upstream). On a fresh
@@ -22043,7 +22032,7 @@ def cloudtak_control():
         else:
             return jsonify({'error': 'Invalid action'}), 400
         time.sleep(3)
-        r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api', '--format', '{{.Status}}']), capture_output=True, text=True)
         running = 'Up' in r.stdout
     return jsonify({'success': True, 'running': running})
 
@@ -22221,7 +22210,7 @@ def cloudtak_reset_server_config():
             return jsonify({'success': False, 'error': 'psql command timed out'}), 500
         try:
             cloudtak_dir = os.path.expanduser('~/CloudTAK')
-            r2 = subprocess.run('docker compose restart api 2>&1', shell=True, capture_output=True, text=True, timeout=60, cwd=cloudtak_dir)
+            r2 = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'api']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60, cwd=cloudtak_dir)
             if r2.returncode != 0:
                 return jsonify({'success': False, 'error': f'API restart failed: {(r2.stdout + r2.stderr)[:200]}'}), 500
         except subprocess.TimeoutExpired:
@@ -22894,8 +22883,7 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
         media = None
         for _ in range(tries):
             r = subprocess.run(
-                "docker ps --filter name=cloudtak-media --format '{{.Names}}'",
-                shell=True, capture_output=True, text=True, timeout=15)
+                _sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=15)
             names = [n for n in (r.stdout or '').split() if n.strip()]
             if names:
                 media = names[0]
@@ -22938,7 +22926,7 @@ def _compose_cmd(remote_cfg=None):
             return 'docker compose'
         ok, _ = _ssh_probe(remote_cfg, 'docker-compose version >/dev/null 2>&1 && echo OK', timeout=20)
         return 'docker-compose' if ok else None
-    if subprocess.run('docker compose version', shell=True, capture_output=True, timeout=20).returncode == 0:
+    if subprocess.run(_sudo_wrap(['docker', 'compose', 'version']), capture_output=True, timeout=20).returncode == 0:
         return 'docker compose'
     if subprocess.run('docker-compose version', shell=True, capture_output=True, timeout=20).returncode == 0:
         return 'docker-compose'
@@ -23348,7 +23336,7 @@ def run_cloudtak_deploy(cfg=None):
             plog("━━━ Step 6/6: Updating Caddy ━━━")
             if domain:
                 generate_caddyfile(settings)
-                r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=15)
+                r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
                 if r.returncode == 0:
                     plog(f"✓ Caddy updated — map.{domain} routed to remote CloudTAK")
                 else:
@@ -23536,8 +23524,7 @@ def run_cloudtak_deploy(cfg=None):
         plog("━━━ Step 4/7: Building Docker Images ━━━")
         plog("  This may take 5-10 minutes on first run...")
         proc = subprocess.Popen(
-            'docker compose build --no-cache 2>&1',
-            shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
+            _sudo_wrap(['docker', 'compose', 'build', '--no-cache']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
         )
         def _read_build():
             for line in iter(proc.stdout.readline, ''):
@@ -23566,8 +23553,7 @@ def run_cloudtak_deploy(cfg=None):
         plog("  Starting all containers including media (remapped ports)...")
         plog("  Standalone MediaMTX stays on original ports — no conflict")
         r = subprocess.run(
-            'docker compose up -d --force-recreate 2>&1',
-            shell=True, capture_output=True, text=True, timeout=600, cwd=cloudtak_dir
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
         )
         if r.returncode != 0:
             plog(f"✗ docker compose up failed")
@@ -23590,7 +23576,7 @@ def run_cloudtak_deploy(cfg=None):
         if r.returncode == 0:
             for port in ['5000', '5002', '9997']:
                 subprocess.run(f'firewall-cmd --permanent --add-port={port}/tcp 2>/dev/null; true', shell=True, capture_output=True)
-            subprocess.run('firewall-cmd --reload 2>/dev/null; true', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True)
         plog("✓ Firewall: ports 5000 (Web UI), 5002 (tiles), 9997 (Caddy video) opened")
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
@@ -23608,7 +23594,7 @@ def run_cloudtak_deploy(cfg=None):
         if domain:
             try:
                 generate_caddyfile(settings)
-                r_cd = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=15)
+                r_cd = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
                 if r_cd.returncode == 0:
                     plog(f"✓ Caddy updated early — map.{domain} routed (will work as soon as API responds)")
                 else:
@@ -23705,7 +23691,7 @@ def run_cloudtak_deploy(cfg=None):
         try:
             if domain:
                 generate_caddyfile(settings)
-                r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+                r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
                 if r.returncode == 0:
                     plog(f"✓ Caddy confirmed — map.{domain} and tiles.map.{domain} live")
                 else:
@@ -23818,7 +23804,7 @@ def run_cloudtak_redeploy(cfg=None):
             if domain:
                 generate_caddyfile(settings)
                 try:
-                    subprocess.run('systemctl reload caddy 2>/dev/null', shell=True, capture_output=True, timeout=45)
+                    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=45)
                     plog("✓ Caddy reloaded")
                 except subprocess.TimeoutExpired:
                     plog("⚠ Caddy reload timed out — reload manually if needed")
@@ -23888,7 +23874,7 @@ def run_cloudtak_redeploy(cfg=None):
         # Restore /api proxy to 127.0.0.1:5001 (Node in container) if a previous patch sent it to the host
         api_container = None
         for _ in range(15):
-            r = subprocess.run('docker compose ps -q api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5, cwd=cloudtak_dir)
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'ps', '-q', 'api']), capture_output=True, text=True, timeout=5, cwd=cloudtak_dir)
             cid = (r.stdout or '').strip()
             if cid and len(cid) >= 8:
                 api_container = cid
@@ -23916,7 +23902,7 @@ def run_cloudtak_redeploy(cfg=None):
         if domain:
             generate_caddyfile(settings)
             try:
-                subprocess.run('systemctl reload caddy 2>/dev/null', shell=True, capture_output=True, timeout=45)
+                subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=45)
                 plog("✓ Caddy reloaded")
             except subprocess.TimeoutExpired:
                 plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
@@ -24188,8 +24174,7 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
                     status.update({'running': False, 'error': True})
                     return
         else:
-            r = subprocess.run('dnf install -y postfix cyrus-sasl-plain 2>&1',
-                shell=True, capture_output=True, text=True, timeout=300)
+            r = subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'postfix', 'cyrus-sasl-plain']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
             if r.returncode != 0:
                 plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
                 status.update({'running': False, 'error': True})
@@ -24235,7 +24220,7 @@ smtp_generic_maps = hash:/etc/postfix/generic
         sasl_line = f"[{relay_host}]:{relay_port}    {smtp_user}:{smtp_pass}"
         _write_priv('/etc/postfix/sasl_passwd', sasl_line + '\n')
         subprocess.run('postmap /etc/postfix/sasl_passwd', shell=True, capture_output=True)
-        subprocess.run('chmod 600 /etc/postfix/sasl_passwd /etc/postfix/sasl_passwd.db', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
 
         # Generic map for from address rewriting
         hostname = subprocess.run('hostname -f', shell=True, capture_output=True, text=True).stdout.strip()
@@ -24245,8 +24230,8 @@ smtp_generic_maps = hash:/etc/postfix/generic
         plog("✓ Credentials written and hashed")
 
         plog(f"📧 Step 4/5 — Enabling and starting Postfix...")
-        subprocess.run('systemctl enable postfix 2>&1', shell=True, capture_output=True, text=True)
-        r = subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         if r.returncode != 0:
             plog(f"✗ Postfix restart failed: {r.stdout}")
             status.update({'running': False, 'error': True})
@@ -24421,11 +24406,11 @@ def emailrelay_control():
     data = request.get_json()
     action = data.get('action', '')
     if action == 'restart':
-        r = subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
     elif action == 'stop':
-        r = subprocess.run('systemctl stop postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
     elif action == 'start':
-        r = subprocess.run('systemctl start postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
     return jsonify({'success': r.returncode == 0, 'output': r.stdout.strip()})
@@ -24433,14 +24418,14 @@ def emailrelay_control():
 @app.route('/api/emailrelay/uninstall', methods=['POST'])
 @login_required
 def emailrelay_uninstall():
-    subprocess.run('systemctl stop postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
-    subprocess.run('systemctl disable postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'postfix']), capture_output=True, timeout=90)
+    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'postfix']), capture_output=True, timeout=90)
     settings = load_settings()
     pkg_mgr = settings.get('pkg_mgr', 'apt')
     if pkg_mgr == 'apt':
-        subprocess.run('apt-get remove -y postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        subprocess.run(_sudo_wrap(['apt-get', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
     else:
-        subprocess.run('dnf remove -y postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
     settings.pop('email_relay', None)
     save_settings(settings)
     email_deploy_log.clear()
@@ -25644,7 +25629,7 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
     if host:
         subprocess.run(f'ufw allow from {host} to any port 25 proto tcp 2>/dev/null; true',
                        shell=True, capture_output=True)
-        subprocess.run('ufw reload 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['ufw', 'reload']), capture_output=True)
         _log(f'  UFW: allowed {host} → port 25 (console Postfix)')
     # Recreate ONLY server + worker (SMTP env) — recreating the whole stack races
     # the just-recreated LDAP outpost → name conflict (see local variant). --no-deps
@@ -25761,21 +25746,20 @@ services:
         if changed:
             with open(main_cf_path, 'w') as f:
                 f.write(mc)
-            subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
 
     # Allow Docker networks to reach host port 25 (Authentik worker → Postfix)
     r = subprocess.run('which ufw', shell=True, capture_output=True)
     if r.returncode == 0:
-        subprocess.run('ufw allow from 172.16.0.0/12 to any port 25 2>/dev/null; true', shell=True, capture_output=True)
-        subprocess.run('ufw reload 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['ufw', 'allow', 'from', '172.16.0.0/12', 'to', 'any', 'port', '25']), capture_output=True)
+        subprocess.run(_sudo_wrap(['ufw', 'reload']), capture_output=True)
         _log("  UFW: allowed Docker networks → port 25")
     else:
         r = subprocess.run('which firewall-cmd', shell=True, capture_output=True)
         if r.returncode == 0:
             subprocess.run(
-                'firewall-cmd --permanent --add-rich-rule=\'rule family="ipv4" source address="172.16.0.0/12" port port="25" protocol="tcp" accept\' 2>/dev/null; true',
-                shell=True, capture_output=True)
-            subprocess.run('firewall-cmd --reload 2>/dev/null; true', shell=True, capture_output=True)
+                _sudo_wrap(['firewall-cmd', '--permanent', '--add-rich-rule=rule family="ipv4" source address="172.16.0.0/12" port port="25" protocol="tcp" accept']), capture_output=True)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True)
             _log("  firewalld: allowed Docker networks → port 25")
 
     # Recreate ONLY server + worker (they read the SMTP env). Recreating the whole
@@ -26541,7 +26525,7 @@ def _update_boot_stagger_service():
             ('CloudTAK', ['cloudtak-api-1', 'cloudtak-tiles-1', 'cloudtak-events-1', 'cloudtak-store-1', 'cloudtak-media-1'], 0),
         ]
         existing = set()
-        r = subprocess.run('docker ps -a --format "{{.Names}}"', shell=True, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             existing = {name.strip() for name in r.stdout.strip().split('\n') if name.strip()}
         steps = []
@@ -26665,7 +26649,7 @@ def nodered_control():
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(2)
-    r = subprocess.run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=nodered', '--format', '{{.Status}}']), capture_output=True, text=True)
     running = r.stdout and 'Up' in r.stdout
     return jsonify({'success': True, 'running': running})
 
@@ -28293,8 +28277,7 @@ def _reload_embedded_outpost(plog=None):
     changed). NON-ROOT-COMMANDS: docker."""
     _log = plog or (lambda m: None)
     try:
-        names = subprocess.run("docker ps --filter name=authentik-server --format '{{.Names}}'",
-                               shell=True, capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        names = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
         name = names[0].strip() if names else ''
         if not name:
             _log("  ⚠ embedded-outpost reload: authentik-server container not found")
@@ -29027,7 +29010,7 @@ volumes:
     if domain:
         plog("  Updating Caddy...")
         generate_caddyfile(settings)
-        subprocess.run('systemctl reload caddy 2>/dev/null', shell=True, capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
         plog(f"✓ Caddy updated — https://nodered.{domain}")
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
     if domain and ak_token:
@@ -29209,7 +29192,7 @@ volumes:
         plog("━━━ Step 3/3: Updating Caddy ━━━")
         if domain:
             generate_caddyfile(settings)
-            subprocess.run('systemctl reload caddy 2>/dev/null', shell=True, capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             plog(f"✓ Caddy updated — open via https://nodered.{domain}")
         else:
             plog("  No domain configured — access via http://<server>:1880")
@@ -36270,8 +36253,7 @@ def _wait_for_authentik_stack_healthy(plog, timeout=240):
             time.sleep(10)
             continue
         # Server reporting healthy? (or up with no healthcheck defined)
-        hr = subprocess.run('docker inspect --format "{{.State.Health.Status}}" authentik-server-1 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=10)
+        hr = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Health.Status}}', 'authentik-server-1']), capture_output=True, text=True, timeout=10)
         status = (hr.stdout or '').strip()
         if status == 'healthy':
             return True
@@ -36466,7 +36448,7 @@ def authentik_control():
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(5)
-    r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Status}}']), capture_output=True, text=True)
     running = 'Up' in r.stdout
     _authentik_release_cache['tag'] = None
     return jsonify({'success': True, 'running': running, 'action': action})
@@ -36496,7 +36478,7 @@ def _authentik_installed_for_reconfigure():
     if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
         return True
     try:
-        r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Names}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout and 'authentik' in (r.stdout or '').strip().lower():
             return True
     except Exception:
@@ -37720,7 +37702,7 @@ networks:
                 else:
                     plog(f"✓ CoreConfig.xml updated — LDAP pointing to {host}:389")
                     plog("  Restarting TAK Server...")
-                    r = subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
                     if r.returncode == 0:
                         plog("✓ TAK Server restarted")
                     else:
@@ -38356,8 +38338,7 @@ def _detect_authentik_ldap_spiral(plog=None):
         'eof': '": eof"',                                    # normal LDAP client disconnect produces this
     }
     try:
-        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail 1000 2>&1',
-            shell=True, capture_output=True, text=True, timeout=15)
+        _log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--tail', '1000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
         _log_lower = (_log_r.stdout or '').lower()
         spiral_specific_unique = 0
         general_unique = 0
@@ -38591,8 +38572,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             # extra_hosts:<fqdn>:host-gateway so the outpost reaches Caddy without the public-IP
             # hairpin; if host Caddy is up, proceed and let the post-recreate validation + rollback
             # below decide. Only skip if Caddy itself is down (box would genuinely end up worse).
-            _caddy_up = subprocess.run('systemctl is-active caddy 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=10)
+            _caddy_up = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True, timeout=10)
             if (_caddy_up.stdout or '').strip() != 'active':
                 plog(f"  routing repair: FQDN unreachable from container AND host Caddy not active — skipping (box would end up worse)")
                 return
@@ -38630,8 +38610,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             return
 
         _t.sleep(30)
-        _val = subprocess.run('docker logs authentik-ldap-1 --since 30s 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10)
+        _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '30s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         _val_out = (_val.stdout or '').lower()
         connected = 'successfully connected websocket' in _val_out
         has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
@@ -38746,8 +38725,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
             # boxes that DO have a public IP + port forwarding. Don't abort on the hairpin path: if
             # host Caddy is up, migrate anyway and let the post-recreate websocket validation +
             # automatic rollback (below) be the real safety net for boxes where FQDN truly won't work.
-            _caddy_up = subprocess.run('systemctl is-active caddy 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=10)
+            _caddy_up = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True, timeout=10)
             if (_caddy_up.stdout or '').strip() != 'active':
                 plog(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
                 return
@@ -38785,8 +38763,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
             return
 
         _t.sleep(30)
-        _val = subprocess.run('docker logs authentik-ldap-1 --since 30s 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10)
+        _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '30s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         _val_out = (_val.stdout or '').lower()
         connected = 'successfully connected websocket' in _val_out
         has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
@@ -38878,8 +38855,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
 
         _t.sleep(15)
         _v = subprocess.run(
-            'docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10
+            _sudo_wrap(['docker', 'exec', 'authentik-server-1', 'printenv', 'GUNICORN_CMD_ARGS']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10
         )
         if f'--timeout={int(value)}' in (_v.stdout or ''):
             plog(f"  ✓ gunicorn timeout: server container running with --timeout={int(value)} (was upstream default 30s)")
@@ -39001,12 +38977,10 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=10, health_checks=
 
         _t.sleep(15)
         _v_server = subprocess.run(
-            'docker exec authentik-server-1 printenv AUTHENTIK_POSTGRESQL__CONN_MAX_AGE 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10
+            _sudo_wrap(['docker', 'exec', 'authentik-server-1', 'printenv', 'AUTHENTIK_POSTGRESQL__CONN_MAX_AGE']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10
         )
         _v_worker = subprocess.run(
-            'docker exec authentik-worker-1 printenv AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10
+            _sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'printenv', 'AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10
         )
         server_ok = str(int(max_age)) in (_v_server.stdout or '')
         worker_ok = ('true' if health_checks else 'false') in (_v_worker.stdout or '').lower()
@@ -40031,8 +40005,7 @@ def _heal_takwerx_user_missing_for_mediamtx(plog=None):
             if os.path.exists(d):
                 subprocess.run(f'chmod g+rx "{d}" 2>/dev/null; true',
                                shell=True, capture_output=True, timeout=5)
-        subprocess.run('systemctl daemon-reload 2>/dev/null; true',
-                       shell=True, capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx', 'mediamtx-webeditor']),
                        capture_output=True, timeout=20)
         # Verify
@@ -40106,13 +40079,11 @@ def _heal_mediamtx_webeditor_writable_paths(plog=None):
         plog("  mediamtx-webeditor: not active — applying perm-heal (v0.9.29)")
         subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups',
                        shell=True, capture_output=True, timeout=5)
-        subprocess.run('chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups',
-                       shell=True, capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
         subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor',
                        shell=True, capture_output=True, timeout=10)
         if os.path.exists('/usr/local/etc/mediamtx.yml'):
-            subprocess.run('chown takwerx:takwerx /usr/local/etc/mediamtx.yml',
-                           shell=True, capture_output=True, timeout=5)
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                        capture_output=True, timeout=15)
         # Give it a moment and re-check
@@ -40421,10 +40392,7 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
     }
     try:
         ip_r = subprocess.run(
-            "docker inspect "
-            "--format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}' "
-            "authentik-pgbouncer-1 2>/dev/null",
-            shell=True, capture_output=True, text=True, timeout=5
+            _sudo_wrap(['docker', 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}', 'authentik-pgbouncer-1']), capture_output=True, text=True, timeout=5
         )
         ips = [ln.strip() for ln in (ip_r.stdout or '').splitlines() if ln.strip()]
         out['pgbouncer_ip'] = ips[0] if ips else None
@@ -41624,8 +41592,7 @@ def _ensure_authentik_pgbouncer(plog):
     for _ in range(24):
         time.sleep(5)
         h = subprocess.run(
-            "docker inspect --format '{{.State.Health.Status}}' authentik-pgbouncer-1 2>/dev/null",
-            shell=True, capture_output=True, text=True, timeout=5
+            _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Health.Status}}', 'authentik-pgbouncer-1']), capture_output=True, text=True, timeout=5
         )
         status = (h.stdout or '').strip()
         if status == 'healthy':
@@ -41974,8 +41941,7 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     for _ in range(12):
         time.sleep(2)
         h = subprocess.run(
-            "docker inspect --format '{{.State.Health.Status}}' authentik-pgbouncer-1 2>/dev/null",
-            shell=True, capture_output=True, text=True, timeout=5
+            _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Health.Status}}', 'authentik-pgbouncer-1']), capture_output=True, text=True, timeout=5
         )
         if (h.stdout or '').strip() == 'healthy':
             healthy = True
@@ -44042,8 +44008,7 @@ def _takportal_admin_guardrail(plog_fn=None):
         if not os.path.isdir(_portal_dir):
             return
         _ps = subprocess.run(
-            'docker ps --filter name=^tak-portal$ --format "{{.Names}}"',
-            shell=True, capture_output=True, text=True, timeout=10
+            _sudo_wrap(['docker', 'ps', '--filter', 'name=^tak-portal$', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10
         )
         if 'tak-portal' not in (_ps.stdout or ''):
             return
@@ -44077,8 +44042,7 @@ def _takportal_admin_guardrail(plog_fn=None):
             _log(f"takportal admin guardrail: docker cp failed: {((_cp.stderr or _cp.stdout) or '').strip()[:200]}")
             return
         _rs = subprocess.run(
-            'docker restart tak-portal',
-            shell=True, capture_output=True, text=True, timeout=30
+            _sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30
         )
         if _rs.returncode == 0:
             _log("takportal admin guardrail: restarted — akadmin/webadmin hidden + action-locked")
@@ -44713,8 +44677,7 @@ def _authentik_verify_runtime_config(plog):
     cfg = None
     try:
         r = subprocess.run(
-            'docker exec authentik-worker-1 ak dump_config 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=30
+            _sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'ak', 'dump_config']), capture_output=True, text=True, timeout=30
         )
         if r.returncode != 0:
             plog(f"  authentik config verify: ak dump_config failed (rc={r.returncode}); skipping verification")
@@ -44757,8 +44720,7 @@ def _authentik_verify_runtime_config(plog):
         worker_count = 0
         for _attempt in range(6):
             r2 = subprocess.run(
-                'docker top authentik-server-1 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=10
+                _sudo_wrap(['docker', 'top', 'authentik-server-1']), capture_output=True, text=True, timeout=10
             )
             out = r2.stdout or ''
             worker_count = sum(1 for ln in out.splitlines() if 'gunicorn: worker' in ln)
@@ -45417,9 +45379,7 @@ def _authentik_fix_pg_idle_timeout(plog):
     # logs — it caused this whole defensive block to silently fail.
     try:
         _alter = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik "
-            "-c \"ALTER SYSTEM RESET ALL\" -c \"SELECT pg_reload_conf()\"",
-            shell=True, capture_output=True, text=True, timeout=15
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-c', 'ALTER SYSTEM RESET ALL', '-c', 'SELECT pg_reload_conf()']), capture_output=True, text=True, timeout=15
         )
         if _alter.returncode == 0:
             plog("  ✓ pg idle timeout: ALTER SYSTEM RESET ALL applied + config reloaded")
@@ -45451,8 +45411,7 @@ def _authentik_fix_pg_idle_timeout(plog):
         time.sleep(5)
         try:
             _v = subprocess.run(
-                "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c \"SHOW idle_session_timeout\"",
-                shell=True, capture_output=True, text=True, timeout=12
+                _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-tA', '-c', 'SHOW idle_session_timeout']), capture_output=True, text=True, timeout=12
             )
             if _v.returncode == 0:
                 runtime_idle = (_v.stdout or '').strip()
@@ -46310,7 +46269,7 @@ entries:
                         plog("  - Group cache enabled (x509useGroupCacheDefaultActive)")
                         plog("  - Group prefix: tak_")
                         plog("  Restarting TAK Server...")
-                        r = subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
                         if r.returncode == 0:
                             plog("\u2713 TAK Server restarted")
                         else:
@@ -47003,7 +46962,7 @@ entries:
                 plog("  ⚠ Authentik HTTP not ready in time — Caddy may 502 briefly; retry in a minute.")
             plog("  Updating Caddy config...")
             generate_caddyfile(settings)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=90)
             plog(f"  ✓ Caddy config updated for Authentik")
             # Wait for Caddy to provision the TLS cert before restarting LDAP
             # (LDAP outpost uses AUTHENTIK_HOST = https://<ak_host> — needs valid cert on that exact domain)
@@ -47075,8 +47034,7 @@ entries:
         for _lh in range(60):  # 60 × 5s = 300s max
             try:
                 r_lh = subprocess.run(
-                    'docker inspect --format "{{.State.Health.Status}}" authentik-ldap-1 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=5
+                    _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Health.Status}}', 'authentik-ldap-1']), capture_output=True, text=True, timeout=5
                 )
                 _h_status = (r_lh.stdout or '').strip().lower()
                 if _h_status == 'healthy':
@@ -48501,8 +48459,7 @@ def _test_ldap_bind(ldap_pass):
         log = (out or '').lower()
     else:
         r = subprocess.run(
-            'docker logs authentik-ldap-1 --since 25s 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '25s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         log = (r.stdout or '').lower()
     return 'authenticated' in log and ('adm_ldapservice' in log or 'ldapservice' in log)
 
@@ -48585,8 +48542,7 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
                                 'docker logs authentik-ldap-1 --since 90s 2>&1', timeout=15)
                             _slog = (_slog or '').lower()
                         else:
-                            _sr = subprocess.run('docker logs authentik-ldap-1 --since 90s 2>&1',
-                                shell=True, capture_output=True, text=True, timeout=10)
+                            _sr = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '90s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
                             _slog = (_sr.stdout or '').lower()
                         if any(m in _slog for m in spiral_markers):
                             saw_spiral = True
@@ -48607,8 +48563,7 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
             log = (out or '').lower()
         else:
             r = subprocess.run(
-                'docker logs authentik-ldap-1 --since 90s 2>&1',
-                shell=True, capture_output=True, text=True, timeout=10)
+                _sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '90s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
             log = (r.stdout or '').lower()
 
         if any(m in log for m in spiral_markers):
@@ -48675,8 +48630,7 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
         # and _test_ldap_bind_dn_verdict mis-classifies the result as inconclusive.
         try:
             r_fb = subprocess.run(
-                'docker logs authentik-ldap-1 --since 90s 2>&1',
-                shell=True, capture_output=True, text=True, timeout=10)
+                _sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '90s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
             fb_log = (r_fb.stdout or '').lower()
             if 'authenticated from session' in fb_log and 'adm_ldapservice' in fb_log:
                 plog("  \u2713 LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.")
@@ -48712,8 +48666,7 @@ def _wait_ldap_outpost_ready(timeout_secs=180):
                 status = (out or '').strip()
             else:
                 r = subprocess.run(
-                    'docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=8
+                    _sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-ldap', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=8
                 )
                 status = (r.stdout or '').strip()
             last_status = status or last_status
@@ -51410,8 +51363,7 @@ def takserver_connect_ldap():
             ok_ssh2, out2 = _ssh_probe(ak_cfg['remote'], 'docker logs authentik-ldap-1 --since 60s 2>&1 | tail -25', timeout=15)
             outpost_tail = (out2 or '').strip()
         else:
-            r = subprocess.run('docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=10)
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-ldap', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=10)
             ldap_status = (r.stdout or '').strip()
             diag.append(f'LDAP outpost: {ldap_status or "not running"}')
             r = subprocess.run('docker logs authentik-ldap-1 --since 60s 2>&1 | tail -25',
@@ -52318,7 +52270,7 @@ def takserver_revoke_old_ca():
             f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
             shell=True, capture_output=True, text=True, timeout=15)
 
-        subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
 
         # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
         # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
@@ -52639,7 +52591,7 @@ def _run_takserver_update_config():
     subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
     takserver_host = _get_service_domain(settings, 'takserver')
     if fqdn and takserver_host:
-        caddy_active = subprocess.run('systemctl is-active caddy', shell=True, capture_output=True, text=True)
+        caddy_active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
         if caddy_active.stdout.strip() == 'active':
             def _log(msg):
                 print(msg, flush=True)
@@ -52822,8 +52774,7 @@ def takserver_services():
             # means PG is up. Probing only `postgresql` false-reds every Rocky/RHEL
             # native box ("PostgreSQL stopped") even though postgresql-15 is serving
             # cot fine — same EL/Debian split already handled at the deploy probe.
-            pg = subprocess.run("systemctl is-active postgresql postgresql-15 2>/dev/null",
-                shell=True, capture_output=True, text=True, timeout=5)
+            pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql', 'postgresql-15']), capture_output=True, text=True, timeout=5)
             pg_active = 'active' in (pg.stdout or '').split()
             services.append({
                 'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
@@ -54028,8 +53979,7 @@ def _tak_rollback(label, plog=None):
             _shutil.copy2(uaf_src, uaf_dst)
             # Match the ownership convention used elsewhere for /opt/tak files.
             subprocess.run(
-                'chown tak:tak /opt/tak/UserAuthenticationFile.xml 2>/dev/null; true',
-                shell=True, capture_output=True, timeout=10
+                _sudo_wrap(['chown', 'tak:tak', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
             )
             plog("  rollback: UserAuthenticationFile.xml restored")
         except Exception as e:
@@ -54056,8 +54006,7 @@ def _tak_rollback(label, plog=None):
             _shutil.copytree(certs_src, certs_dst)
             # Restore ownership (tak:tak) on certs
             subprocess.run(
-                'chown -R tak:tak /opt/tak/certs/files 2>/dev/null; true',
-                shell=True, capture_output=True, timeout=15
+                _sudo_wrap(['chown', '-R', 'tak:tak', '/opt/tak/certs/files']), capture_output=True, timeout=15
             )
             plog("  rollback: certs/ restored")
         except Exception as e:
@@ -54130,8 +54079,7 @@ def _tak_rollback(label, plog=None):
     # the rollback, causing NPEs in TAK Server's mission API on the next poll.
     try:
         r_nr = subprocess.run(
-            'docker restart nodered 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=30
+            _sudo_wrap(['docker', 'restart', 'nodered']), capture_output=True, text=True, timeout=30
         )
         if r_nr.returncode == 0:
             plog("  rollback: Node-RED restarted (mission state resynced)")
@@ -54673,7 +54621,7 @@ def run_takserver_upgrade(pkg_path):
             except Exception as e:
                 ulog(f"⚠ Could not restore heap settings: {e}")
         ulog("Restarting TAK Server...")
-        subprocess.run('systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=90)
         if _get_authentik_env_content(settings):
             ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
             ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
@@ -54724,7 +54672,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         # Step 1: Update Core (local) — per TAK guide, core first
         ulog("")
         ulog("━━━ Step 1/4: Stopping TAK Server ━━━")
-        subprocess.run('systemctl stop takserver', shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, text=True, timeout=90)
         ulog("✓ TAK Server stopped")
 
         ulog("")
@@ -54859,7 +54807,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                 ulog("\u2713 8446 LE cert restored")
             else:
                 ulog("\u26a0 8446 LE cert not available \u2014 self-signed cert will be used until next Update config")
-        subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True, text=True, timeout=90)
         ulog("Waiting 30 seconds for startup...")
         for remaining in range(20, -1, -10):
             time.sleep(10)
@@ -54964,7 +54912,7 @@ def run_takserver_two_server_db_migrate(
 
         mlog('')
         mlog('━━━ Stopping TAK Server (this host) ━━━')
-        subprocess.run('systemctl stop takserver', shell=True, capture_output=True, text=True, timeout=45)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, text=True, timeout=45)
         stopped_tak = True
         mlog('✓ TAK Server stopped')
 
@@ -55084,7 +55032,7 @@ def run_takserver_two_server_db_migrate(
 
         mlog('')
         mlog('━━━ Starting TAK Server ━━━')
-        subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=45)
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True, text=True, timeout=45)
         stopped_tak = False
         mlog('✓ TAK Server start issued')
 
@@ -55115,7 +55063,7 @@ def run_takserver_two_server_db_migrate(
     finally:
         if stopped_tak:
             mlog('⚠ Restarting TAK Server (migration did not finish cleanly)')
-            subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=45)
+            subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True, text=True, timeout=45)
 
 
 @app.route('/api/deploy/cancel', methods=['POST'])
@@ -55784,7 +55732,7 @@ def run_takserver_deploy(config):
             _pre = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
             if _pre.startswith('takserver') and not os.path.exists('/opt/tak'):
                 log_step("  Detected half-removed takserver (rpm installed, /opt/tak missing) — removing before reinstall...")
-                subprocess.run('dnf remove -y takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+                subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             run_cmd(f'dnf install -y {pkg} 2>&1', "Installing TAK Server rpm (resolving deps from PGDG/EPEL/CRB)...", check=False)
             if not os.path.exists('/opt/tak'):
                 log_step("  /opt/tak missing after install — forcing reinstall...")
@@ -56258,7 +56206,7 @@ def run_takserver_deploy(config):
         # This handles the case where Caddy was deployed before TAK Server.
         fqdn = settings.get('fqdn', '')
         if fqdn:
-            caddy_active = subprocess.run('systemctl is-active caddy', shell=True, capture_output=True, text=True)
+            caddy_active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
             if caddy_active.stdout.strip() == 'active':
                 log_step("")
                 log_step("━━━ Installing LE Cert on Port 8446 ━━━")
@@ -56412,7 +56360,7 @@ def _takportal_sync_certs(plog=None, restart=False):
     if r.returncode != 0:
         return (False, 'TAK Portal container is not running')
     cert_dir = '/opt/tak/certs/files'
-    subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
+    subprocess.run(_sudo_wrap(['docker', 'exec', 'tak-portal', 'mkdir', '-p', '/usr/src/app/data/certs']), capture_output=True, text=True)
     cert_pass = _get_tak_cert_password(load_settings())
     # --- client cert: admin.p12 -> modern PKCS12 -> tak-client.p12 ---
     ok_client = False
@@ -56493,7 +56441,7 @@ def _takportal_sync_certs(plog=None, restart=False):
     else:
         _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
     if restart and (ok_client or ok_ca):
-        subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
     if ok_client and ok_ca:
         return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
     if ok_ca and not ok_client:
@@ -56704,8 +56652,7 @@ def kernel_patch_status_api():
     if (load_settings().get('pkg_mgr', 'apt') or 'apt').lower() == 'dnf':
         try:
             r = subprocess.run(
-                'dnf -q check-update kernel kernel-core 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=30
+                _sudo_wrap(['dnf', '-q', 'check-update', 'kernel', 'kernel-core']), capture_output=True, text=True, timeout=30
             )
             # dnf check-update: 100 = updates available, 0 = up to date, 1 = error.
             # Treat error/timeout as "no banner" (same fail-safe as the apt branch).
@@ -57272,8 +57219,8 @@ def run_full_uninstall():
 
         # 1. MediaMTX
         plog("━━━ MediaMTX ━━━")
-        subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
-        subprocess.run('systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'mediamtx', 'mediamtx-webeditor']), capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'mediamtx', 'mediamtx-webeditor']), capture_output=True)
         for f in ['/etc/systemd/system/mediamtx.service', '/etc/systemd/system/mediamtx-webeditor.service',
                   '/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml']:
             if os.path.exists(f):
@@ -57363,12 +57310,12 @@ def run_full_uninstall():
 
         # 6. Email Relay
         plog("━━━ Email Relay ━━━")
-        subprocess.run('systemctl stop postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
-        subprocess.run('systemctl disable postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'postfix']), capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'postfix']), capture_output=True, timeout=90)
         if pkg_mgr == 'apt':
-            subprocess.run('apt-get remove -y postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+            subprocess.run(_sudo_wrap(['apt-get', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
         else:
-            subprocess.run('dnf remove -y postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+            subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
         settings = load_settings()
         settings.pop('email_relay', None)
         save_settings(settings)
@@ -57388,12 +57335,12 @@ def run_full_uninstall():
 
         # 8. Caddy
         plog("━━━ Caddy ━━━")
-        subprocess.run('systemctl stop caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
-        subprocess.run('systemctl disable caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'caddy']), capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'caddy']), capture_output=True, timeout=90)
         if pkg_mgr == 'apt':
             subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
         else:
-            subprocess.run('dnf remove -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+            subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'caddy']), capture_output=True, timeout=120)
         # Ensure binary and config are gone so console no longer shows Caddy as installed (which uses "which caddy")
         for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
             if os.path.exists(path):
@@ -60966,7 +60913,7 @@ def _auto_harden_guarddog_8080(settings=None, plog=None):
     else:
         _log("Startup migration: guarddog 8080: Settings → Server IP not set — skipping source-scope (set server_ip to harden)")
         return False
-    subprocess.run('ufw deny 8080/tcp >/dev/null 2>&1 || true', shell=True, timeout=5)
+    subprocess.run(_sudo_wrap(['ufw', 'deny', '8080/tcp']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5)
     _log("Startup migration: guarddog 8080: UFW deny 8080/tcp applied")
     return True
 
@@ -61046,12 +60993,12 @@ def _auto_update_guarddog():
         if os.path.isfile(_bc_script) and not os.path.isfile(_bc_tmr):
             _write_priv('/etc/systemd/system/takbuildcachereclaim.service', f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={_bc_script}\n')
             _write_priv(_bc_tmr, '[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
-            subprocess.run('systemctl daemon-reload', shell=True, capture_output=True, timeout=10)
-            subprocess.run('systemctl enable --now takbuildcachereclaim.timer', shell=True, capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takbuildcachereclaim.timer']), capture_output=True, timeout=10)
             print("Guard Dog: installed takbuildcachereclaim.timer on startup.")
         if updated > 0:
-            subprocess.run('systemctl daemon-reload', shell=True, capture_output=True, timeout=10)
-            subprocess.run('systemctl restart takremotedbauthguard.timer 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takremotedbauthguard.timer']), capture_output=True, timeout=10)
             print(f"Guard Dog: {updated} script(s) updated on console startup.")
         else:
             print("Guard Dog: scripts up to date.")
@@ -61361,8 +61308,7 @@ def _startup_harden_tak_portal_ports():
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
-                    "docker inspect tak-portal --format '{{json .HostConfig.PortBindings}}'",
-                    shell=True, capture_output=True, text=True, timeout=5
+                    _sudo_wrap(['docker', 'inspect', 'tak-portal', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                 )
                 _bindings = json.loads(_ins.stdout.strip() or '{}')
                 if not _bindings.get('3000/tcp'):
@@ -61415,8 +61361,7 @@ def _startup_harden_cloudtak_ports():
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
-                    "docker inspect cloudtak-api-1 --format '{{json .HostConfig.PortBindings}}'",
-                    shell=True, capture_output=True, text=True, timeout=5
+                    _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                 )
                 _bindings = json.loads(_ins.stdout.strip() or '{}')
                 if not _bindings.get('5000/tcp'):
@@ -62669,8 +62614,8 @@ def _startup_migrations():
         # Ensure the shared infratak Docker network exists and containers are connected
         # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
         try:
-            portal_up = subprocess.run('docker ps -q --filter name=tak-portal', shell=True, capture_output=True, text=True, timeout=5)
-            ak_up = subprocess.run('docker ps -q --filter name=authentik-server-1', shell=True, capture_output=True, text=True, timeout=5)
+            portal_up = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=tak-portal']), capture_output=True, text=True, timeout=5)
+            ak_up = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=authentik-server-1']), capture_output=True, text=True, timeout=5)
             if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
                 _patch_takportal_compose_network()
                 _patch_authentik_compose_network()
@@ -63641,8 +63586,7 @@ def _post_update_auto_deploy():
                     with open(ak_compose) as _f:
                         _comp = _f.read()
                     if 'AUTHENTIK_HOST:' in _comp and 'http://authentik-server-1:9000' not in _comp:
-                        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail=400 2>&1',
-                            shell=True, capture_output=True, text=True, timeout=15)
+                        _log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--tail=400']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
                         _log = (_log_r.stdout or '').lower()
                         _has_tls_error = ('remote error: tls: internal error' in _log
                                           or 'x509: certificate' in _log
@@ -63870,8 +63814,7 @@ def _post_update_auto_deploy():
                 portal_dir = os.path.expanduser('~/TAK-Portal')
                 if os.path.exists(portal_dir):
                     try:
-                        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"',
-                            shell=True, capture_output=True, text=True, timeout=5)
+                        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
                         if 'Up' in (r.stdout or ''):
                             print("Post-update: auto-reconfiguring TAK Portal")
                             _auto_deploy_active['takportal'] = True
@@ -63892,7 +63835,7 @@ def _post_update_auto_deploy():
                                 _takportal_setup_ssh()
                                 _ensure_infratak_network_for_authentik()
                                 _ensure_infratak_network_for_portal()
-                                subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+                                subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
                                 _sync_authentik_takportal_provider_url(settings)
                                 print("Post-update: TAK Portal config updated and restarted (infratak network connected)")
                             finally:
@@ -64203,8 +64146,7 @@ def _post_update_auto_deploy():
                             _old_pg_pids = set(_old_pg_pids_r.stdout.split()) if _old_pg_pids_r.returncode == 0 else set()
                             # Stop with a longer timeout so postgres can finish its checkpoint cleanly
                             subprocess.run(
-                                'docker stop -t 30 authentik-postgresql-1 2>/dev/null',
-                                shell=True, capture_output=True, text=True, timeout=35
+                                _sudo_wrap(['docker', 'stop', '-t', '30', 'authentik-postgresql-1']), capture_output=True, text=True, timeout=35
                             )
                             subprocess.run(
                                 'cd ~/authentik && docker compose up -d postgresql 2>/dev/null',
@@ -64374,8 +64316,7 @@ def _post_update_auto_deploy():
                         # EACCES when Node-RED restarts (UID 1000 can't read root-owned file).
                         try:
                             ctx_r = subprocess.run(
-                                'docker exec nodered curl -sf --max-time 8 http://localhost:1880/context/global',
-                                shell=True, capture_output=True, text=True, timeout=15
+                                _sudo_wrap(['docker', 'exec', 'nodered', 'curl', '-sf', '--max-time', '8', 'http://localhost:1880/context/global']), capture_output=True, text=True, timeout=15
                             )
                             ctx_data = (ctx_r.stdout or '').strip()
                             if ctx_data and ctx_data not in ('{}', 'null', ''):
@@ -64402,8 +64343,7 @@ def _post_update_auto_deploy():
                                     ctx_normalised = ctx_data
                                 # Pre-create dir as node-red user
                                 subprocess.run(
-                                    'docker exec nodered mkdir -p /data/context/global',
-                                    shell=True, capture_output=True, timeout=10
+                                    _sudo_wrap(['docker', 'exec', 'nodered', 'mkdir', '-p', '/data/context/global']), capture_output=True, timeout=10
                                 )
                                 # Write file as node-red user via docker exec stdin redirect — NOT docker cp
                                 proc = subprocess.run(
@@ -64445,7 +64385,7 @@ def _post_update_auto_deploy():
                     if changed:
                         with open(settings_path, 'w') as f:
                             f.write(content)
-                        subprocess.run('docker restart nodered', shell=True, capture_output=True, timeout=60)
+                        subprocess.run(_sudo_wrap(['docker', 'restart', 'nodered']), capture_output=True, timeout=60)
                         print("Post-update: Node-RED settings.js updated and restarted")
                 except Exception as e:
                     print(f"Post-update: Node-RED settings.js update error: {e}")
@@ -64455,7 +64395,7 @@ def _post_update_auto_deploy():
                 deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
                 if not os.path.exists(deploy_sh):
                     return
-                r = subprocess.run('docker ps -q --filter name=nodered', shell=True,
+                r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=nodered']),
                     capture_output=True, text=True, timeout=5)
                 if not (r.stdout or '').strip():
                     print("Post-update: Node-RED container not running — skipping flow sync")
@@ -64478,7 +64418,7 @@ def _post_update_auto_deploy():
 
             def _nodered_malware_scan():
                 try:
-                    r = subprocess.run('docker ps -q --filter name=nodered', shell=True,
+                    r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=nodered']),
                         capture_output=True, text=True, timeout=5)
                     if not (r.stdout or '').strip():
                         return
@@ -64494,8 +64434,7 @@ def _post_update_auto_deploy():
                         if chk.returncode == 0:
                             found.append(path)
                     susp = subprocess.run(
-                        'docker exec nodered find /usr/src/node-red/.local/share -type f -executable 2>/dev/null',
-                        shell=True, capture_output=True, text=True, timeout=10)
+                        _sudo_wrap(['docker', 'exec', 'nodered', 'find', '/usr/src/node-red/.local/share', '-type', 'f', '-executable']), capture_output=True, text=True, timeout=10)
                     for line in (susp.stdout or '').strip().splitlines():
                         p = line.strip()
                         if p and p not in found:
@@ -64506,7 +64445,7 @@ def _post_update_auto_deploy():
                             subprocess.run(f'docker exec nodered rm -f {shlex.quote(f)}',
                                 shell=True, capture_output=True, timeout=5)
                             print(f"Post-update:   removed {f}")
-                        subprocess.run('docker restart nodered', shell=True, capture_output=True, timeout=60)
+                        subprocess.run(_sudo_wrap(['docker', 'restart', 'nodered']), capture_output=True, timeout=60)
                         print("Post-update: Node-RED restarted after malware cleanup")
                     else:
                         print("Post-update: Node-RED malware scan clean")
@@ -64742,8 +64681,7 @@ def _post_update_auto_deploy():
             ak_dir = os.path.expanduser('~/authentik')
             if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
                 for _i in range(60):
-                    r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null',
-                        shell=True, capture_output=True, text=True, timeout=5)
+                    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
                     if 'healthy' in (r.stdout or '').lower():
                         print("Post-update: Authentik healthy, proceeding with TAK Portal")
                         break
@@ -65047,8 +64985,7 @@ def _post_update_auto_deploy():
                     if not _needs_recreate:
                         try:
                             _ins = subprocess.run(
-                                "docker inspect tak-portal --format '{{json .HostConfig.PortBindings}}'",
-                                shell=True, capture_output=True, text=True, timeout=5
+                                _sudo_wrap(['docker', 'inspect', 'tak-portal', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                             )
                             _bindings = json.loads(_ins.stdout.strip() or '{}')
                             if not _bindings.get('3000/tcp'):
@@ -65159,12 +65096,10 @@ def _post_update_auto_deploy():
                         print(f"  WARNING: MediaMTX UFW rules failed: {_ue}")
 
                     if _yml_changed:
-                        subprocess.run('systemctl restart mediamtx 2>/dev/null; true',
-                            shell=True, capture_output=True, timeout=30)
+                        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=30)
                         print("  MediaMTX restarted")
                     if _webedit_changed:
-                        subprocess.run('systemctl restart mediamtx-webeditor 2>/dev/null; true',
-                            shell=True, capture_output=True, timeout=30)
+                        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']), capture_output=True, timeout=30)
                         print("  MediaMTX webedit restarted")
 
                     print("Post-update: MediaMTX security hardening complete")
@@ -65210,8 +65145,8 @@ def _post_update_auto_deploy():
                 if (_s_caddy.get('fqdn') or '').strip() and os.path.exists(CADDYFILE_PATH):
                     generate_caddyfile(_s_caddy)
                     _r_caddy = subprocess.run(
-                        'systemctl reload caddy 2>&1', shell=True,
-                        capture_output=True, text=True, timeout=20
+                        _sudo_wrap(['systemctl', 'reload', 'caddy']),
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20
                     )
                     if _r_caddy.returncode == 0:
                         print("Post-update: Caddyfile regenerated + reloaded", flush=True)
