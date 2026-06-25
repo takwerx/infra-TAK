@@ -173,6 +173,8 @@ def plan(node, src):
             toks = shlex.split(seg)
         except ValueError as e:
             return None, f'shlex: {e}'
+        while toks and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', toks[0]):
+            toks.pop(0)   # strip leading VAR=value (broker sets apt env itself)
         if not toks or SENT_RE.search(toks[0]):
             return None, 'dynamic/empty head'
         base = os.path.basename(toks[0])

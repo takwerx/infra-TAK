@@ -14790,10 +14790,7 @@ def caddy_update():
         settings = load_settings()
         pkg_mgr = settings.get('pkg_mgr', 'apt')
         if pkg_mgr == 'apt':
-            r = subprocess.run(
-                'DEBIAN_FRONTEND=noninteractive apt-get update -qq && '
-                'apt-get install --only-upgrade -y caddy 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120)
+            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '--only-upgrade', '-y', 'caddy']], 'and', timeout=120)
         else:
             r = subprocess.run(
                 _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
@@ -14819,7 +14816,7 @@ def caddy_uninstall():
     settings = load_settings()
     pkg_mgr = settings.get('pkg_mgr', 'apt')
     if pkg_mgr == 'apt':
-        subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        subprocess.run(_sudo_wrap(['apt-get', 'remove', '--purge', '-y', 'caddy']), capture_output=True, timeout=120)
     else:
         subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'caddy']), capture_output=True, timeout=120)
     steps.append('Removed Caddy package')
@@ -18076,8 +18073,7 @@ def run_caddy_deploy(domain):
         r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
         if r.returncode != 0 and pkg_mgr == 'apt':
             plog("  Binary missing after install; reinstalling package...")
-            subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y caddy 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120, env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
+            subprocess.run(_sudo_wrap(['apt-get', 'install', '--reinstall', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
             r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
         elif r.returncode != 0 and pkg_mgr == 'dnf':
             # v10.0.1 (RHEL): on some EL9 boxes the @caddy/caddy COPR rpm reports a
@@ -24158,8 +24154,7 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
                 'echo "postfix postfix/main_mailer_type string Internet Site" | debconf-set-selections',
                 shell=True, capture_output=True, timeout=30)
             r = subprocess.run(
-                'DEBIAN_FRONTEND=noninteractive apt-get install -y postfix libsasl2-modules 2>&1',
-                shell=True, capture_output=True, text=True, timeout=300)
+                _sudo_wrap(['apt-get', 'install', '-y', 'postfix', 'libsasl2-modules']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
             if r.returncode != 0:
                 # Attempt recovery: set myhostname/mydomain explicitly then retry dpkg --configure
                 plog(f"⚠ Postfix install hit error, attempting recovery (mydomain fix)...")
@@ -57272,7 +57267,7 @@ def run_full_uninstall():
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'caddy']), capture_output=True, timeout=90)
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'caddy']), capture_output=True, timeout=90)
         if pkg_mgr == 'apt':
-            subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+            subprocess.run(_sudo_wrap(['apt-get', 'remove', '--purge', '-y', 'caddy']), capture_output=True, timeout=120)
         else:
             subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'caddy']), capture_output=True, timeout=120)
         # Ensure binary and config are gone so console no longer shows Caddy as installed (which uses "which caddy")

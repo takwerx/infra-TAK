@@ -545,6 +545,13 @@ def _do_exec(req):
         for k, v in extra_env.items():
             if isinstance(k, str) and isinstance(v, str):
                 env[k] = v
+    # apt is always non-interactive through the broker (the CLI proxy can't
+    # forward env, and a bare apt install of e.g. postfix would otherwise block on
+    # a debconf prompt). Safe + correct for every apt op the console runs.
+    if os.path.basename(argv[0]) in ('apt', 'apt-get'):
+        env = dict(env or os.environ)
+        env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
+        env.setdefault('NEEDRESTART_MODE', 'l')
     proc = subprocess.run(argv, input=input_bytes, capture_output=True,
                           timeout=timeout, cwd=cwd, env=env)
     return {

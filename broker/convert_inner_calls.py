@@ -157,6 +157,12 @@ def plan(node, src):
         return None, f'shlex: {e}'
     if not toks:
         return None, 'empty'
+    # strip leading VAR=value env-assignments (e.g. DEBIAN_FRONTEND=noninteractive);
+    # the broker sets apt's non-interactive env itself.
+    while toks and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', toks[0]):
+        toks.pop(0)
+    if not toks:
+        return None, 'empty after env-strip'
     # standalone operator token => genuine host-level compound => skip
     for tk in toks:
         if tk in OPERATORS or tk in (';', '&', '|', '<', '>', '&&', '||', '>>', '2>'):
