@@ -61,14 +61,20 @@ if [ "${TAKWERX_NONROOT:-}" = "1" ]; then
 elif [ "${TAKWERX_NONROOT:-}" = "0" ]; then
     BORN_NONROOT=0                       # explicit opt-out -> stay root
 else
-    # DEFAULT: a FRESH box is born non-root; an EXISTING root install stays root
-    # (until migrated). "Existing" = a console unit whose WorkingDirectory holds a
-    # password (auth.json) — re-running start.sh on a deployed box must not flip it.
+    # DEFAULT: a FRESH box is born non-root; an EXISTING ROOT install stays root
+    # (until migrated). Three cases off the existing unit:
+    #   - already non-root (User=takwerx)        -> keep non-root (don't flip back!)
+    #   - existing root install with a password  -> stay root
+    #   - no console / no auth (fresh)           -> born non-root
     _born_existing="/etc/systemd/system/takwerx-console.service"
-    _born_dir=""
-    [ -f "$_born_existing" ] && _born_dir=$(grep -E '^WorkingDirectory=' "$_born_existing" 2>/dev/null | cut -d= -f2- | tr -d ' ')
-    if [ -z "$_born_dir" ] || [ ! -f "$_born_dir/.config/auth.json" ]; then
+    if [ -f "$_born_existing" ] && grep -qE '^User=takwerx' "$_born_existing" 2>/dev/null; then
         BORN_NONROOT=1
+    else
+        _born_dir=""
+        [ -f "$_born_existing" ] && _born_dir=$(grep -E '^WorkingDirectory=' "$_born_existing" 2>/dev/null | cut -d= -f2- | tr -d ' ')
+        if [ -z "$_born_dir" ] || [ ! -f "$_born_dir/.config/auth.json" ]; then
+            BORN_NONROOT=1
+        fi
     fi
 fi
 
