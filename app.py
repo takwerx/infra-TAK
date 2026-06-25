@@ -61255,17 +61255,38 @@ def _startup_ensure_broker():
         if os.path.exists(svc):
             with open(svc) as f:
                 existing = f.read()
-        changed = (existing != unit)
-        if changed:
+        unit_changed = (existing != unit)
+        if unit_changed:
             with open(svc, 'w') as f:
                 f.write(unit)
             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
             subprocess.run(['systemctl', 'enable', 'takwerx-broker'], capture_output=True, timeout=15)
+        # Restart the broker when its SOURCE changed too — otherwise a `git pull`
+        # that updates takwerx_broker.py leaves the OLD broker process running
+        # stale code (the unit is unchanged, so unit_changed alone misses it).
+        import hashlib
+        try:
+            with open(broker_py, 'rb') as bf:
+                src_hash = hashlib.sha1(bf.read()).hexdigest()
+        except OSError:
+            src_hash = ''
+        stamp = '/var/log/takwerx-broker/.srcstamp'
+        old_hash = ''
+        try:
+            with open(stamp) as sf:
+                old_hash = sf.read().strip()
+        except OSError:
+            pass
         active = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
                                 capture_output=True, text=True, timeout=8).stdout.strip()
-        if changed or active != 'active':
+        if unit_changed or active != 'active' or src_hash != old_hash:
             subprocess.run(['systemctl', 'restart', 'takwerx-broker'], capture_output=True, timeout=20)
-            print('Startup migration: privileged broker installed/started (takwerx-broker.service)', flush=True)
+            try:
+                with open(stamp, 'w') as sf:
+                    sf.write(src_hash)
+            except OSError:
+                pass
+            print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
     except PermissionError:
         pass
     except Exception as _e:
