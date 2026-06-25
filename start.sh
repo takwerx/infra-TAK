@@ -571,6 +571,37 @@ finalize_nonroot_ownership() {
     chown -R "$NONROOT_USER:$NONROOT_GROUP" "$INSTALL_DIR"
 }
 
+# Born-non-root: install Docker Engine UP FRONT, as root. Module deploys all begin
+# with a `docker --version` check (broker-mediated → runs as root); if Docker is
+# present that check passes and the deploy proceeds. The non-root console CANNOT
+# install Docker itself (the install is dnf/systemctl/curl|sh as root), so a fresh
+# born-non-root box must have it provisioned here. Mirrors app.py _docker_install_cmd
+# (multiplatform). takwerx is deliberately NOT added to the docker group — every
+# docker op the console runs is mediated by the root broker.
+ensure_docker_nonroot() {
+    [ "$BORN_NONROOT" = "1" ] || return 0
+    if command -v docker >/dev/null 2>&1; then
+        systemctl enable --now docker >/dev/null 2>&1 || true
+        echo -e "  ${GREEN}✓ Docker already present${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}  Installing Docker Engine (born-non-root: console can't install it later)...${NC}"
+    if [ "$PKG_MGR" = "dnf" ]; then
+        dnf -y install dnf-plugins-core >/dev/null 2>&1
+        rm -f /etc/yum.repos.d/docker-ce.repo
+        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1
+        dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null 2>&1
+    else
+        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
+    fi
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
+        echo -e "  ${GREEN}✓ Docker installed + running${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ Docker install may have failed — module deploys will fail until it's present${NC}"
+    fi
+}
+
 # ==========================================
 # Create systemd Service
 # ==========================================
@@ -739,6 +770,10 @@ install_selinux_console_policy
 # Additive — the console still runs as root; this just makes the broker path
 # available (and provable via TAKWERX_FORCE_BROKER=1).
 install_broker
+
+# Born-non-root: provision Docker as root up front (the non-root console can't
+# install it later); no-op unless TAKWERX_NONROOT=1.
+ensure_docker_nonroot
 
 # Born-non-root: now that venv, .config and cert exist, hand the whole install to
 # takwerx (no-op unless TAKWERX_NONROOT=1).
