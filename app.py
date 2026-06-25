@@ -14760,7 +14760,7 @@ def caddy_control():
         return jsonify({'success': r.returncode == 0, 'output': (r.stdout or r.stderr or '').strip()})
     elif action == 'start':
         generate_caddyfile(load_settings())
-        subprocess.run('systemctl enable caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True, timeout=5)
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
         return jsonify({'success': True, 'output': 'Caddy start scheduled (and enabled for boot); connection may drop briefly.'})
     elif action == 'reload':
@@ -14803,8 +14803,8 @@ def caddy_update():
 @login_required
 def caddy_uninstall():
     steps = []
-    subprocess.run('systemctl stop caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
-    subprocess.run('systemctl disable caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'caddy']), capture_output=True, timeout=90)
+    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'caddy']), capture_output=True, timeout=90)
     steps.append('Stopped and disabled Caddy')
     settings = load_settings()
     pkg_mgr = settings.get('pkg_mgr', 'apt')
@@ -14821,7 +14821,7 @@ def caddy_uninstall():
                 subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
     if os.path.exists('/etc/caddy'):
         subprocess.run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
-    subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
     settings['fqdn'] = ''
     save_settings(settings)
     steps.append('Cleared domain from settings')
@@ -17794,7 +17794,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
     # TAK Server overwrites CoreConfig.xml on restart with its in-memory state,
     # so we must stop it first to prevent our patch from being reverted.
-    subprocess.run('systemctl stop takserver 2>/dev/null; true', shell=True, capture_output=True)
+    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True)
     time.sleep(10)
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
     time.sleep(5)
@@ -17943,7 +17943,7 @@ WantedBy=timers.target
 
     # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
     log_fn("  Starting TAK Server with LE cert on port 8446...")
-    subprocess.run('systemctl start takserver 2>/dev/null; true', shell=True, capture_output=True)
+    subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True)
     log_fn("  ✓ TAK Server started")
     log_fn("✓ Port 8446 now serving Let's Encrypt cert — ready for TAK clients")
     return True
@@ -18164,7 +18164,7 @@ def run_caddy_deploy(domain):
             else:
                 plog(f"  ✗ static caddy download did not validate: {((_cv.stderr or _cv.stdout) or 'no output').strip()[:160]}")
             subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
-        subprocess.run('systemctl enable caddy 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True)
         r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
             plog(f"⚠ systemctl restart: {(r.stderr or r.stdout or '').strip()[:300]}")
@@ -19478,7 +19478,7 @@ def takportal_uninstall():
     try:
         settings = load_settings()
         generate_caddyfile(settings)
-        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
         steps.append('Regenerated Caddyfile + reloaded Caddy')
     except Exception as caddy_err:
         steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
@@ -19964,7 +19964,7 @@ def run_takportal_deploy():
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
             plog(f"  \u2713 Caddy config updated for TAK Portal")
             plog(f"  Open: https://{_get_service_domain(settings, 'takportal')}")
         plog("=" * 50)
@@ -20059,9 +20059,9 @@ def mediamtx_control():
         running = bool(ok2 and out and out.strip() == 'active')
         return jsonify({'success': True, 'running': running})
     if action == 'start':
-        subprocess.run('systemctl start mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'mediamtx', 'mediamtx-webeditor']), capture_output=True)
     elif action == 'stop':
-        subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'mediamtx', 'mediamtx-webeditor']), capture_output=True)
     elif action == 'restart':
         subprocess.run('systemctl restart mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
     time.sleep(2)
@@ -20235,13 +20235,13 @@ def mediamtx_uninstall():
                 os.remove(f)
         if os.path.exists('/opt/mediamtx-webeditor'):
             subprocess.run('rm -rf /opt/mediamtx-webeditor', shell=True, capture_output=True)
-        subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         steps.append('Stopped and disabled mediamtx and mediamtx-webeditor services')
         steps.append('Removed binary, config, and web editor files')
     mediamtx_deploy_log.clear()
     mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
     generate_caddyfile(settings)
-    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
     steps.append('Updated Caddyfile')
     _deregister_authentik_proxy_app(settings, 'stream', 'MediaMTX', plog=lambda m: steps.append(m.strip()))
     return jsonify({'success': True, 'steps': steps})
@@ -20578,7 +20578,7 @@ paths:
     settings['mediamtx_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
     if mtx_domain:
@@ -21288,7 +21288,7 @@ WantedBy=multi-user.target
         if caddy_running and domain:
             # Update Caddyfile first so Caddy issues the cert
             generate_caddyfile(settings)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
             mtx_domain = _get_service_domain(settings, 'mediamtx')
             plog(f"✓ Caddyfile updated — {mtx_domain}")
 
@@ -22148,7 +22148,7 @@ def cloudtak_uninstall():
             cloudtak_deploy_log.clear()
             cloudtak_deploy_status.update({'running': False, 'complete': False, 'error': False})
             generate_caddyfile()
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             _update_boot_stagger_service()
             cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': None})
         except subprocess.TimeoutExpired:
@@ -26732,7 +26732,7 @@ def nodered_uninstall():
         nodered_deploy_status.update({'running': False, 'complete': False, 'error': False})
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             steps.append('Caddyfile updated')
         _deregister_authentik_proxy_app(settings, 'node-red', 'Node-RED Proxy', plog=lambda m: steps.append(m.strip()))
         return jsonify({'success': True, 'steps': steps})
@@ -36921,7 +36921,7 @@ def authentik_uninstall():
         settings['authentik_deployment']['deployed'] = False
         save_settings(settings)
         generate_caddyfile(settings)
-        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
         steps.append('Updated Caddyfile')
     else:
         ak_dir = os.path.expanduser('~/authentik')
@@ -36941,7 +36941,7 @@ def authentik_uninstall():
         try:
             settings_now = load_settings()
             generate_caddyfile(settings_now)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             steps.append('Regenerated Caddyfile + reloaded Caddy')
         except Exception as caddy_err:
             steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
@@ -37742,7 +37742,7 @@ networks:
     settings['authentik_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
     plog("✓ Caddyfile updated")
 
     # v0.9.12 — remote Authentik firewall (security-hardened):
@@ -52625,7 +52625,7 @@ def _sync_webadmin_after_authentik_reconfigure(plog):
         plog("  Syncing WebAdmin (Caddy reload only, no TAK restart)...")
         settings = load_settings()
         generate_caddyfile(settings)
-        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
         plog("  ✓ Caddy reloaded.")
     except Exception as e:
         plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
@@ -52636,7 +52636,7 @@ def _run_takserver_update_config():
     settings = load_settings()
     fqdn = settings.get('fqdn', '').strip()
     generate_caddyfile(settings)
-    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
     takserver_host = _get_service_domain(settings, 'takserver')
     if fqdn and takserver_host:
         caddy_active = subprocess.run('systemctl is-active caddy', shell=True, capture_output=True, text=True)
@@ -53018,7 +53018,7 @@ def takserver_uninstall():
     try:
         settings = load_settings()
         generate_caddyfile(settings)
-        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
         steps.append('Regenerated Caddyfile + reloaded Caddy')
     except Exception as caddy_err:
         steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
@@ -54682,7 +54682,7 @@ def run_takserver_upgrade(pkg_path):
             else:
                 ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
         generate_caddyfile(settings)
-        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
         if not _verify_takserver_dpkg_ok(ulog):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
@@ -54873,7 +54873,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
             else:
                 ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
         generate_caddyfile(settings)
-        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
 
         if not _verify_takserver_dpkg_ok(ulog):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
@@ -55559,7 +55559,7 @@ def _deploy_takserver_container(config):
         if settings.get('fqdn'):
             try:
                 generate_caddyfile(settings)
-                subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+                subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
                 log_step("  ✓ Caddy config updated for TAK Server")
             except Exception as _ce:
                 log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
@@ -56186,7 +56186,7 @@ def run_takserver_deploy(config):
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
             log_step(f"  ✓ Caddy config updated for TAK Server")
 
         # Sync webadmin to Authentik with verification so first 8446 login works without manual fixes.
@@ -57283,7 +57283,7 @@ def run_full_uninstall():
                     pass
         if os.path.exists('/opt/mediamtx-webeditor'):
             subprocess.run('rm -rf /opt/mediamtx-webeditor', shell=True, capture_output=True)
-        subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         mediamtx_deploy_log.clear()
         mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
         plog("✓ MediaMTX removed")
@@ -57403,7 +57403,7 @@ def run_full_uninstall():
                     subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
         if os.path.exists('/etc/caddy'):
             subprocess.run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
-        subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         settings = load_settings()
         settings['fqdn'] = ''
         save_settings(settings)
@@ -62477,7 +62477,7 @@ def _startup_migrations():
         # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
         if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
             generate_caddyfile(s)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
@@ -62517,7 +62517,7 @@ def _startup_migrations():
                 # Drop the now-dead RA vhost from Caddy so its subdomain doesn't 502.
                 if (s.get('fqdn') or '').strip():
                     generate_caddyfile(s)
-                    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+                    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
                 print("Startup migration: legacy cfd-remote-assist removed — reinstall EUD Remote Assist from the console to recreate it", flush=True)
             except Exception as e:
                 print(f"Startup migration: error tearing down legacy cfd-remote-assist: {e}", flush=True)
