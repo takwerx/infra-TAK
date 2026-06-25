@@ -105,6 +105,10 @@ allow takwerx_console_t user_home_t:file entrypoint;
 allow init_t user_home_dir_t:dir search;
 allow init_t user_home_t:file { open read getattr execute execute_no_trans map ioctl };
 allow init_t user_home_t:lnk_file read;
+# broker unix socket at /run/takwerx-broker.sock (var_run_t) — the console's
+# single privilege path: connect to it + write the request.
+allow takwerx_console_t var_run_t:sock_file write;
+allow takwerx_console_t init_t:unix_stream_socket connectto;
 
 # --- HARVESTED (audit2allow, raw — see STATUS note; needs tightening) ---
 allow takwerx_console_t NetworkManager_t:dir { getattr search };
