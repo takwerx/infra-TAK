@@ -38571,10 +38571,11 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
 
         try:
             _probe = subprocess.run(
-                f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
-                shell=True, capture_output=True, text=True, timeout=15
+                _sudo_wrap(['docker', 'exec', 'authentik-ldap-1', 'wget', '--spider',
+                            '--timeout=5', '-q', f'https://{fqdn}/-/health/live/']),
+                capture_output=True, text=True, timeout=15
             )
-            _direct_ok = 'EXIT=0' in (_probe.stdout or '')
+            _direct_ok = (_probe.returncode == 0)
         except subprocess.TimeoutExpired:
             # See _ensure_authentik_ldap_outpost_on_fqdn: a hairpin box hangs `docker exec wget` on
             # its own public IP until the 15s subprocess timeout fires. That's the hairpin signal,
@@ -38713,10 +38714,11 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
 
         try:
             _probe = subprocess.run(
-                f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
-                shell=True, capture_output=True, text=True, timeout=15
+                _sudo_wrap(['docker', 'exec', 'authentik-ldap-1', 'wget', '--spider',
+                            '--timeout=5', '-q', f'https://{fqdn}/-/health/live/']),
+                capture_output=True, text=True, timeout=15
             )
-            _direct_ok = 'EXIT=0' in (_probe.stdout or '')
+            _direct_ok = (_probe.returncode == 0)
         except subprocess.TimeoutExpired:
             # CRITICAL: on a hairpin-broken box `docker exec ... wget` hangs reaching the box's own
             # PUBLIC IP until the 15s subprocess timeout fires (wget's own --timeout=5 never cleanly

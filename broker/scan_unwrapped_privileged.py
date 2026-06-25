@@ -103,7 +103,12 @@ def scan(path):
                 continue  # already mediated
             if shellish or isinstance(cmd_node, (ast.Constant, ast.JoinedStr)):
                 s = _const_str(cmd_node)
-                if s and any(h in s for h in SHELL_PRIV_HINTS):
+                # `which X` / `command -v X` / `command -V X` are read-only binary
+                # PROBES — they run fine as the non-root console (not privileged),
+                # even though a hint substring (e.g. "ufw ") matches. Don't flag.
+                st = (s or '').strip()
+                is_probe = st.startswith(('which ', 'command -v ', 'command -V '))
+                if s and not is_probe and any(h in s for h in SHELL_PRIV_HINTS):
                     findings.append((node.lineno, 'SHELL', s.strip().replace('\n', ' ')[:90]))
                 continue
             binary, elts, dyn = _list_strs(cmd_node)
