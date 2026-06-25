@@ -135,6 +135,26 @@ def scan(path):
                     mode = _const_str(k.value) or mode
             if mode in WRITE_MODES:
                 findings.append((node.lineno, 'OPEN-W', f'{p} ({mode})'))
+
+        # ---- raw os.* / shutil.* mutating a privileged path (bypass the broker) ----
+        # These fail EPERM under a non-root console and are NOT subprocess/open, so
+        # they were a blind spot until a deploy surfaced them. Route through
+        # _makedirs_priv/_chmod_priv or _sudo_wrap(['rm'|'mv'|'cp'|'chown'|...]).
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            modname = node.func.value.id if isinstance(node.func.value, ast.Name) else None
+            attr = node.func.attr
+            os_mut = {'chmod', 'chown', 'makedirs', 'mkdir', 'remove', 'unlink',
+                      'rename', 'replace', 'rmdir', 'symlink', 'link', 'truncate'}
+            sh_mut = {'copy', 'copy2', 'copyfile', 'move', 'rmtree', 'chown', 'copytree'}
+            fn = None
+            if modname == 'os' and attr in os_mut:
+                fn = f'os.{attr}'
+            elif modname == 'shutil' and attr in sh_mut:
+                fn = f'shutil.{attr}'
+            if fn and node.args:
+                p = _const_str(node.args[0])
+                if _priv_path(p):
+                    findings.append((node.lineno, 'OS-RAW', f'{fn} -> {p}'))
     return findings
 
 
@@ -156,7 +176,7 @@ def main(argv):
     print('  OPEN-W = raw write open on a privileged path    -> use _write_priv')
     print('  SHELL  = shell=True / os.system privileged string -> manual convert')
     print()
-    for kind in ('OPEN-W', 'WRAP', 'SHELL'):
+    for kind in ('OPEN-W', 'OS-RAW', 'WRAP', 'SHELL'):
         rows = [r for r in allf if r[2] == kind]
         print(f'--- {kind} ({len(rows)}) ---')
         for fn, ln, _, detail in rows:

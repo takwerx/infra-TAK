@@ -11787,7 +11787,7 @@ def guarddog_uninstall():
             except Exception:
                 pass
     if os.path.exists('/opt/tak-guarddog'):
-        shutil.rmtree('/opt/tak-guarddog', ignore_errors=True)
+        subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/tak-guarddog']), capture_output=True, timeout=30)
     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
     return jsonify({'success': True})
 
