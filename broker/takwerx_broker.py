@@ -120,6 +120,11 @@ PKGMGR_SUBCMDS = {
     'install', 'remove', 'purge', 'reinstall', 'autoremove', 'erase',
     'update', 'upgrade', 'makecache', 'clean', 'list', 'info', 'check-update',
     'module', 'group', 'mark',
+    # `dnf copr enable @caddy/caddy` — enables a COPR repo (RHEL caddy install
+    # path). Repo-metadata management; the eventual package install (which runs
+    # post-install scripts) is already gated by the `install` subcommand. The
+    # `-o/--setopt` hook-command vector is still blocked below regardless.
+    'copr',
 }
 
 # Never executable through the broker — escalation primitives (defence in depth;
@@ -249,11 +254,22 @@ def _check_docker(argv):
     if len(argv) < 2:
         raise Denied('docker: no subcommand')
     sub = argv[1]
+    # Info-only global flags (`docker --version`/`-v`/`--help`) carry no
+    # subcommand and cannot mutate state. Allow them. (We do NOT blanket-allow
+    # all `-*` flags: `-H tcp://host` would retarget the daemon — only this
+    # explicit read-only set.)
+    if sub in ('--version', '-v', '--help', '-h'):
+        return
     allowed_sub = {
         'ps', 'inspect', 'logs', 'cp', 'exec', 'restart', 'start', 'stop',
         'rm', 'kill', 'network', 'compose', 'images', 'image', 'pull', 'version',
         'info', 'stats', 'system', 'volume', 'port', 'top', 'wait', 'update',
         'create', 'run', 'tag', 'load', 'save', 'container', 'builder', 'buildx',
+        # `build` builds an image from a Dockerfile. Same inherent root residual
+        # as `run`/`compose build` (already allowed) — Dockerfile RUN executes in
+        # the build sandbox; it is not a NEW escalation vector over what compose
+        # build already permits. The console uses it for module image builds.
+        'build',
     }
     if sub not in allowed_sub:
         raise Denied(f'docker subcommand not allowed: {sub}')

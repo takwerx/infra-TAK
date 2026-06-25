@@ -18051,7 +18051,7 @@ def run_caddy_deploy(domain):
         else:
             plog("  Installing Caddy via dnf...")
             subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'dnf-command(copr)']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-            subprocess.run('dnf copr enable -y @caddy/caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+            subprocess.run(_sudo_wrap(['dnf', 'copr', 'enable', '-y', '@caddy/caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
             r = subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
             if r.returncode != 0:
                 plog(f"✗ Caddy install failed")
@@ -19512,11 +19512,11 @@ def run_takportal_deploy():
             wait_for_apt_lock(plog, takportal_deploy_log)
         # Step 1: Check Docker
         plog("\u2501\u2501\u2501 Step 1/6: Checking Docker \u2501\u2501\u2501")
-        r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
         if r.returncode != 0:
             plog("Docker not found. Installing...")
             subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
-            r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
+            r2 = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
             if r2.returncode != 0:
                 plog("\u2717 Failed to install Docker")
                 takportal_deploy_status.update({'running': False, 'error': True})
@@ -23096,8 +23096,7 @@ def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
             _log(f"  ✗ media-infra clone failed (media will be unavailable): {(r.stderr or '')[:200]}")
             return False
         r = subprocess.run(
-            f'docker build -t {shlex.quote(image_ref)} {shlex.quote(src_dir)}',
-            shell=True, capture_output=True, text=True, timeout=1800)
+            _sudo_wrap(['docker', 'build', '-t', image_ref, src_dir]), capture_output=True, text=True, timeout=1800)
         if r.returncode != 0:
             _tail = '\n'.join((r.stdout or r.stderr or '').splitlines()[-8:])
             _log(f"  ✗ media-infra arm64 build failed (media will be unavailable):\n{_tail}")
@@ -23344,11 +23343,11 @@ def run_cloudtak_deploy(cfg=None):
 
         # Step 1: Check Docker
         plog("━━━ Step 1/7: Checking Docker ━━━")
-        r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
         if r.returncode != 0:
             plog("  Docker not found — installing...")
             subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
-            r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
+            r2 = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
             if r2.returncode != 0:
                 plog("✗ Failed to install Docker")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -45702,11 +45701,11 @@ def run_authentik_deploy(reconfigure=False):
 
             # Step 1: Check Docker
             plog("\u2501\u2501\u2501 Step 1/10: Checking Docker \u2501\u2501\u2501")
-            r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
+            r = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
             if r.returncode != 0:
                 plog("Docker not found. Installing...")
                 subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
-                r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
+                r2 = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
                 if r2.returncode != 0:
                     plog("\u2717 Failed to install Docker")
                     authentik_deploy_status.update({'running': False, 'error': True})
