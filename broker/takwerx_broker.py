@@ -438,26 +438,17 @@ def _do_exec(req):
 def _do_write(req):
     # Decision made in _dispatch; here only normalize (reject NUL/traversal) so
     # permissive mode can still execute an off-allowlist write (console is root).
+    # NB: we deliberately follow symlinks here. The symlink-escape vector (M2) is
+    # closed elsewhere: a non-root console cannot plant a symlink in the
+    # allowlisted dirs (they are root-owned), and `ln` is path-checked so it
+    # cannot create one pointing outside the allowlist. O_NOFOLLOW would also
+    # break LEGIT symlinked targets (e.g. /etc/os-release -> /usr/lib/os-release).
     path = _abs(req.get('path'))
     content = base64.b64decode(req.get('content_b64') or '')
     mode = req.get('mode', 'w')
     append = mode in ('a', 'ab')
-    # O_NOFOLLOW: refuse to write THROUGH a symlink at the target path (a planted
-    # symlink could otherwise redirect an allowlisted write to e.g. /etc/passwd).
-    # Only the final component is guarded, so a legit symlinked parent (/opt/tak)
-    # still works.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
-    flags |= os.O_APPEND if append else os.O_TRUNC
-    fd = os.open(path, flags, 0o644)
-    try:
-        with os.fdopen(fd, 'ab' if append else 'wb') as f:
-            f.write(content)
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
+    with open(path, 'ab' if append else 'wb') as f:
+        f.write(content)
     perm = req.get('perm')
     if perm is not None:
         os.chmod(path, int(perm))
@@ -466,8 +457,7 @@ def _do_write(req):
 
 def _do_read(req):
     path = _abs(req.get('path'))   # decision in _dispatch; normalize only here
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, 'rb') as f:
+    with open(path, 'rb') as f:
         data = f.read(MAX_MSG)
     return {'ok': True, 'content_b64': base64.b64encode(data).decode()}
 
