@@ -23524,7 +23524,7 @@ def run_cloudtak_deploy(cfg=None):
         plog("━━━ Step 4/7: Building Docker Images ━━━")
         plog("  This may take 5-10 minutes on first run...")
         proc = subprocess.Popen(
-            _sudo_wrap(['docker', 'compose', 'build', '--no-cache']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
+            _sudo_wrap(['docker', 'compose', 'build', '--no-cache']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
         )
         def _read_build():
             for line in iter(proc.stdout.readline, ''):

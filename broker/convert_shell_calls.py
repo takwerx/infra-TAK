@@ -191,9 +191,10 @@ def plan(conv, src):
             cs, ce = node_span(src, cap.value)
             kstart = src.rfind('capture_output', max(0, cs - 40), cs)
             edits.append((kstart, ce, 'stdout=subprocess.PIPE, stderr=subprocess.STDOUT'))
-        else:
-            # insert after the first arg (the _sudo_wrap) — append as kwarg before ')'
-            # simplest: add right after command arg replacement via a marker edit
+        elif kw_span(conv.node, 'stdout', src) is None and kw_span(conv.node, 'stderr', src) is None:
+            # no capture_output AND no existing stdout/stderr — append the merge.
+            # (If the call already pipes stdout/stderr, it already merges; appending
+            # would create a duplicate keyword -> SyntaxError. Skip in that case.)
             edits.append((e, e, ', stdout=subprocess.PIPE, stderr=subprocess.STDOUT'))
     # os.system -> subprocess.run wrapper
     if conv.is_system:
@@ -252,8 +253,8 @@ def main():
         for _, edits, _ in planned:
             all_edits += edits
         new = apply_edits(src, all_edits)
-        # safety: must still parse
-        ast.parse(new)
+        # safety: must COMPILE (ast.parse alone misses 'keyword argument repeated')
+        compile(new, APP, 'exec')
         open(APP, 'w').write(new)
         print(f'\nAPPLIED {len(planned)} conversions, {len(all_edits)} edits.')
 
