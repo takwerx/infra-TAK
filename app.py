@@ -1658,14 +1658,14 @@ def _ensure_tak_on_authentik_network():
             return None, None
         ldap_name = names[0]
         ri = subprocess.run(
-            ['docker', 'inspect', '-f',
-             '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}', ldap_name],
+            _sudo_wrap(['docker', 'inspect', '-f',
+             '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}', ldap_name]),
             capture_output=True, text=True, timeout=10)
         nets = (ri.stdout or '').split()
         if not nets:
             return None, None
         net = nets[0]
-        subprocess.run(['docker', 'network', 'connect', net, TAK_CONTAINER],
+        subprocess.run(_sudo_wrap(['docker', 'network', 'connect', net, TAK_CONTAINER]),
                        capture_output=True, text=True, timeout=15)
         return net, ldap_name
     except Exception:
@@ -1679,7 +1679,7 @@ def _takserver_running_local():
     container box (native systemctl is-active is meaningless there)."""
     if _tak_is_container():
         try:
-            r = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER],
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER]),
                                capture_output=True, text=True, timeout=10)
             return r.returncode == 0 and r.stdout.strip() == 'true'
         except Exception:
@@ -1993,7 +1993,7 @@ def detect_modules():
     if netbird_enabled:
         try:
             _nb_r = subprocess.run(
-                ['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server'],
+                _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server']),
                 capture_output=True, text=True, timeout=3)
             netbird_running = _nb_r.stdout.strip() == 'true'
         except Exception:
@@ -2002,7 +2002,7 @@ def detect_modules():
         # Self-heal: container is running but flag got cleared
         try:
             _nb_r = subprocess.run(
-                ['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server'],
+                _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'netbird-server']),
                 capture_output=True, text=True, timeout=3)
             if _nb_r.stdout.strip() == 'true':
                 _s = load_settings()
@@ -2029,7 +2029,7 @@ def detect_modules():
     if ra_enabled:
         try:
             _ra_r = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
+                _sudo_wrap(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}']),
                 capture_output=True, text=True, timeout=3)
             ra_running = 'Up' in (_ra_r.stdout or '')
         except Exception:
@@ -2037,7 +2037,7 @@ def detect_modules():
     else:
         try:
             _ra_r = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
+                _sudo_wrap(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}']),
                 capture_output=True, text=True, timeout=3)
             if 'Up' in (_ra_r.stdout or ''):
                 _s = load_settings()
@@ -5255,7 +5255,7 @@ def console_broker_routing():
             unit = '\n'.join(lines) + '\n'
         with open(_CONSOLE_UNIT, 'w') as f:
             f.write(unit)
-        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
         # persist intent so a future start.sh re-run can honor it (P1 wiring)
         try:
             _s = load_settings()
@@ -5531,7 +5531,7 @@ def takserver_external_db_provision():
         if r.returncode != 0:
             plog('  psql not found — installing postgresql-client...')
             r2 = subprocess.run(
-                ['apt-get', 'install', '-y', 'postgresql-client'],
+                _sudo_wrap(['apt-get', 'install', '-y', 'postgresql-client']),
                 capture_output=True, text=True, timeout=120
             )
             if r2.returncode != 0:
@@ -9345,7 +9345,7 @@ def fail2ban_status_api():
     if not _f2b_is_available():
         return jsonify({'available': False, 'error': 'fail2ban not installed'})
     try:
-        r = subprocess.run(['fail2ban-client', 'status', 'authentik'],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'authentik']),
                            capture_output=True, text=True, timeout=10)
         status = _f2b_parse_status(r.stdout)
         status['available']      = True
@@ -9377,7 +9377,7 @@ def fail2ban_authentik_toggle_api():
             os.remove(jail_path)
         subprocess.run(_sudo_wrap(['systemctl', 'stop',    'authentik-log-forwarder']), capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'authentik-log-forwarder']), capture_output=True)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     # Enable: write jail config (preserving existing thresholds/ignoreip if present)
     cfg = _f2b_read_jail_config()
@@ -9417,14 +9417,14 @@ def fail2ban_authentik_toggle_api():
                            capture_output=True)
         # Start log forwarder only if Authentik is running
         ak_running = subprocess.run(
-            ['docker', 'ps', '--format', '{{.Names}}'],
+            _sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
             capture_output=True, text=True).stdout
         forwarder_msg = 'log forwarder not started (Authentik not running)'
         if 'authentik' in ak_running:
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
                            capture_output=True)
             forwarder_msg = 'log forwarder started'
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True, 'forwarder': forwarder_msg})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
@@ -9446,7 +9446,7 @@ def fail2ban_config_api():
     ignoreip = str(data.get('ignoreip', '')).strip()
     try:
         _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime, 'ignoreip': ignoreip})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
@@ -9466,7 +9466,7 @@ def fail2ban_unban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'authentik', 'unbanip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'authentik', 'unbanip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -9510,7 +9510,7 @@ def fail2ban_tak_status_api():
     }
     if jail_enabled and _f2b_is_available():
         try:
-            r = subprocess.run(['fail2ban-client', 'status', 'takserver'],
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'takserver']),
                                capture_output=True, text=True, timeout=10)
             status.update(_f2b_parse_status(r.stdout))
         except Exception as e:
@@ -9529,7 +9529,7 @@ def fail2ban_tak_config_api():
         jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
         if os.path.exists(jail_path):
             os.remove(jail_path)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     if not os.path.exists('/etc/fail2ban/filter.d/takserver.conf'):
         return jsonify({'ok': False,
@@ -9549,7 +9549,7 @@ def fail2ban_tak_config_api():
         if _svc.stdout.strip() != 'active':
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
                            capture_output=True)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True,
                         'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime,
                         'ignoreip': ignoreip})
@@ -9567,7 +9567,7 @@ def fail2ban_tak_unban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'takserver', 'unbanip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'takserver', 'unbanip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -9587,7 +9587,7 @@ def fail2ban_tak_ban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'takserver', 'banip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'takserver', 'banip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -9658,7 +9658,7 @@ def fail2ban_tak_watching_api():
 def _f2b_get_version():
     """Return installed fail2ban version string, or None."""
     try:
-        r = subprocess.run(['fail2ban-client', '--version'], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', '--version']), capture_output=True, text=True, timeout=5)
         lines = r.stdout.strip().splitlines()
         return lines[0] if lines else None
     except Exception:
@@ -9683,7 +9683,7 @@ def fail2ban_ssh_status_api():
     if not _f2b_is_available():
         return jsonify({'available': False, 'error': 'fail2ban not installed'})
     try:
-        r = subprocess.run(['fail2ban-client', 'status', 'sshd'],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'sshd']),
                            capture_output=True, text=True, timeout=10)
         status = _f2b_parse_status(r.stdout)
         status['available']      = True
@@ -9709,7 +9709,7 @@ def fail2ban_ssh_config_api():
         jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
         if os.path.exists(jail_path):
             os.remove(jail_path)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
         maxretry = max(1,  min(50,      int(data.get('maxretry', 3))))
@@ -9726,7 +9726,7 @@ def fail2ban_ssh_config_api():
         if _svc.stdout.strip() != 'active':
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
                            capture_output=True)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True,
                         'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
     except Exception as e:
@@ -9744,7 +9744,7 @@ def fail2ban_ssh_unban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'sshd', 'unbanip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'sshd', 'unbanip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -9804,7 +9804,7 @@ def fail2ban_ssh_ban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'sshd', 'banip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'sshd', 'banip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -9880,7 +9880,7 @@ def fail2ban_mediamtx_status_api():
     if not _f2b_is_available():
         return jsonify({'available': False, 'error': 'fail2ban not installed'})
     try:
-        r = subprocess.run(['fail2ban-client', 'status', 'mediamtx-rtsp'],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'mediamtx-rtsp']),
                            capture_output=True, text=True, timeout=10)
         status = _f2b_parse_status(r.stdout)
         status['available']      = True
@@ -9913,7 +9913,7 @@ def fail2ban_mediamtx_config_api():
         jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
         if os.path.exists(jail_path):
             os.remove(jail_path)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
         maxretry = max(1,  min(100,     int(data.get('maxretry', 10))))
@@ -9928,7 +9928,7 @@ def fail2ban_mediamtx_config_api():
         if _svc.stdout.strip() != 'active':
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
                            capture_output=True)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True,
                         'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
     except Exception as e:
@@ -9986,7 +9986,7 @@ def fail2ban_mediamtx_ban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'mediamtx-rtsp', 'banip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'mediamtx-rtsp', 'banip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -10006,7 +10006,7 @@ def fail2ban_mediamtx_unban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'mediamtx-rtsp', 'unbanip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'mediamtx-rtsp', 'unbanip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -10100,7 +10100,7 @@ def fail2ban_takportal_status_api():
     if not _f2b_is_available():
         return jsonify({'available': False, 'error': 'fail2ban not installed'})
     try:
-        r = subprocess.run(['fail2ban-client', 'status', 'takportal'],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'takportal']),
                            capture_output=True, text=True, timeout=10)
         status = _f2b_parse_status(r.stdout)
         status['available']      = True
@@ -10128,7 +10128,7 @@ def fail2ban_takportal_config_api():
         jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
         if os.path.exists(jail_path):
             os.remove(jail_path)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
         maxretry = max(1,  min(100,     int(data.get('maxretry', 5))))
@@ -10144,7 +10144,7 @@ def fail2ban_takportal_config_api():
         if _svc.stdout.strip() != 'active':
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
                            capture_output=True)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True,
                         'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime,
                         'log_present': os.path.exists(TAKPORTAL_F2B_LOG)})
@@ -10203,7 +10203,7 @@ def fail2ban_takportal_ban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'takportal', 'banip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'takportal', 'banip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -10223,7 +10223,7 @@ def fail2ban_takportal_unban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'takportal', 'unbanip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'takportal', 'unbanip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -10302,7 +10302,7 @@ def fail2ban_trusted_cidrs_api():
     save_settings(s)
     rewritten = _f2b_rewrite_all_jails()
     try:
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
     except Exception:
         pass
     return jsonify({'ok': True, 'cidrs': cleaned, 'rewritten': rewritten,
@@ -10379,7 +10379,7 @@ def fail2ban_recidive_status_api():
     }
     if enabled:
         try:
-            r = subprocess.run(['fail2ban-client', 'status', 'recidive'],
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'recidive']),
                                capture_output=True, text=True, timeout=10)
             status.update(_f2b_parse_status(r.stdout))
         except Exception as e:
@@ -10397,7 +10397,7 @@ def fail2ban_recidive_config_api():
         path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
         if os.path.exists(path):
             os.remove(path)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
         maxretry = max(2, min(20,  int(data.get('maxretry', 3))))
@@ -10406,7 +10406,7 @@ def fail2ban_recidive_config_api():
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     try:
         _f2b_write_recidive_config(maxretry, findtime)
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True, 'maxretry': maxretry, 'findtime': findtime})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
@@ -10422,7 +10422,7 @@ def fail2ban_recidive_unban_api():
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
-        r = subprocess.run(['fail2ban-client', 'set', 'recidive', 'unbanip', ip],
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'recidive', 'unbanip', ip]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -10500,7 +10500,7 @@ def fail2ban_uninstall_api():
         if pkg_mgr == 'apt':
             subprocess.run(_sudo_wrap(['apt-get', 'remove', '-y', 'fail2ban']), capture_output=True)
         else:
-            subprocess.run(['yum', 'remove', '-y', 'fail2ban'], capture_output=True)
+            subprocess.run(_sudo_wrap(['yum', 'remove', '-y', 'fail2ban']), capture_output=True)
         _plog("fail2ban package removed")
         # Remove config files
         for path in [
@@ -10580,7 +10580,7 @@ def _guarddog_health_check(service_id):
             return r.returncode == 0
         if service_id == 'tak_video_restreamer':
             r = subprocess.run(
-                ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
+                _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer']),
                 capture_output=True, text=True, timeout=5)
             return r.stdout.strip() == 'true'
         if service_id == 'nodered':
@@ -10884,7 +10884,7 @@ def _monitor_health_check(monitor_id):
             # not a host postgresql.service — check the container's running state
             # there (native is byte-identical: systemctl is-active postgresql).
             if _tak_is_container():
-                r = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER],
+                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER]),
                                    capture_output=True, text=True, timeout=5)
                 return r.returncode == 0 and r.stdout.strip() == 'true'
             # native: Debian/Ubuntu uses the `postgresql` meta-service; RHEL/EL uses
@@ -10899,8 +10899,8 @@ def _monitor_health_check(monitor_id):
             # sudo -u postgres psql. Both query the same cot database size.
             if _tak_is_container():
                 r = subprocess.run(
-                    ['docker', 'exec', '-u', 'postgres', TAK_DB_CONTAINER,
-                     'psql', '-tAc', "SELECT pg_database_size('cot')"],
+                    _sudo_wrap(['docker', 'exec', '-u', 'postgres', TAK_DB_CONTAINER,
+                     'psql', '-tAc', "SELECT pg_database_size('cot')"]),
                     capture_output=True, text=True, timeout=8)
                 return r.returncode == 0 and r.stdout.strip().isdigit()
             r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
@@ -12392,21 +12392,21 @@ def run_guarddog_deploy(alert_email):
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
-            r = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(_sudo_wrap(['swapon', '--show']), capture_output=True, text=True, timeout=5)
             if r.returncode == 0 and '/swapfile' in (r.stdout or ''):
                 plog("✓ Swap already configured, skipping")
             else:
                 if os.path.exists('/swapfile'):
-                    subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
+                    subprocess.run(_sudo_wrap(['swapon', '/swapfile']), capture_output=True, timeout=5)
                     fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
                         _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
                     plog("✓ Swap file enabled")
                 else:
-                    subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
+                    subprocess.run(_sudo_wrap(['fallocate', '-l', '4G', '/swapfile']), check=True, timeout=30)
                     os.chmod('/swapfile', 0o600)
-                    subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
-                    subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
+                    subprocess.run(_sudo_wrap(['mkswap', '/swapfile']), check=True, capture_output=True, timeout=10)
+                    subprocess.run(_sudo_wrap(['swapon', '/swapfile']), check=True, timeout=10)
                     fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
                         _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
@@ -12417,9 +12417,9 @@ def run_guarddog_deploy(alert_email):
         # Default 60 aggressively swaps out processes even with tons of free RAM,
         # causing severe performance issues on VPS with mediocre disk I/O.
         try:
-            cur = subprocess.run(['sysctl', '-n', 'vm.swappiness'], capture_output=True, text=True, timeout=5)
+            cur = subprocess.run(_sudo_wrap(['sysctl', '-n', 'vm.swappiness']), capture_output=True, text=True, timeout=5)
             if cur.returncode == 0 and cur.stdout.strip() != '10':
-                subprocess.run(['sysctl', '-w', 'vm.swappiness=10'], capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['sysctl', '-w', 'vm.swappiness=10']), capture_output=True, timeout=5)
                 sysctl_conf = '/etc/sysctl.conf'
                 with open(sysctl_conf, 'r') as f:
                     content = f.read()
@@ -18881,8 +18881,8 @@ def _netbird_docker_image_version(container_name):
     """Read org.opencontainers.image.version from a running/stopped container."""
     try:
         r = subprocess.run(
-            ['docker', 'inspect', container_name,
-             '--format', '{{index .Config.Labels "org.opencontainers.image.version"}}'],
+            _sudo_wrap(['docker', 'inspect', container_name,
+             '--format', '{{index .Config.Labels "org.opencontainers.image.version"}}']),
             capture_output=True, text=True, timeout=8)
         if r.returncode == 0 and (r.stdout or '').strip():
             return r.stdout.strip().lstrip('vV')
@@ -22075,7 +22075,7 @@ def cloudtak_container_logs():
     if not os.path.exists(compose_yml):
         compose_yml = os.path.join(cloudtak_dir, 'compose.yaml')
     if container:
-        r = subprocess.run(['docker', 'logs', container, '--tail', str(lines)],
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', container, '--tail', str(lines)]),
             capture_output=True, text=True, timeout=15)
     else:
         if os.path.exists(compose_yml):
@@ -22904,12 +22904,12 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
         if not media:
             return False  # CloudTAK media not up — nothing to heal (silent on the no-wait path)
         cur = subprocess.run(
-            ['docker', 'exec', '-i', media, 'sh'],
+            _sudo_wrap(['docker', 'exec', '-i', media, 'sh']),
             input=_CT_MEDIA_CHECK_SH, capture_output=True, text=True, timeout=25)
         if _ct_media_converged(cur.stdout):
             return True  # already converged — no restart
         ap = subprocess.run(
-            ['docker', 'exec', '-i', media, 'sh'],
+            _sudo_wrap(['docker', 'exec', '-i', media, 'sh']),
             input=_CT_MEDIA_APPLY_SH, capture_output=True, text=True, timeout=40)
         if ap.returncode != 0:
             _log(f"  ⚠ cloudtak-media heal apply failed: {(ap.stderr or ap.stdout or '').strip()[:200]}")
@@ -25023,7 +25023,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     save_settings(s)
     generate_caddyfile(s)
     try:
-        subprocess.run(['systemctl', 'reload', 'caddy'], timeout=15, check=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, check=True)
         plog('✓ Caddy reloaded — TLS cert provisioning started')
     except Exception as ce:
         plog(f'  Caddy reload warning: {ce}')
@@ -36610,7 +36610,7 @@ def authentik_container_logs():
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
     if container:
-        r = subprocess.run(['docker', 'logs', container, '--tail', str(lines)], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', container, '--tail', str(lines)]), capture_output=True, text=True, timeout=10)
     else:
         r = subprocess.run('cd ~/authentik && docker compose logs --tail ' + str(lines) + ' 2>&1', shell=True, capture_output=True, text=True, timeout=10)
     entries = r.stdout.strip().split('\n') if r.stdout.strip() else []
@@ -37900,7 +37900,7 @@ def _find_authentik_install_dir():
             return (candidate, env_path, compose_path)
     try:
         r = subprocess.run(
-            ['docker', 'ps', '-q', '-f', 'name=authentik-server'],
+            _sudo_wrap(['docker', 'ps', '-q', '-f', 'name=authentik-server']),
             capture_output=True, text=True, timeout=5
         )
         if not (r.returncode == 0 and r.stdout and r.stdout.strip()):
@@ -37909,7 +37909,7 @@ def _find_authentik_install_dir():
         if not cid:
             return (None, None, None)
         r2 = subprocess.run(
-            ['docker', 'inspect', cid, '--format', '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'],
+            _sudo_wrap(['docker', 'inspect', cid, '--format', '{{index .Config.Labels "com.docker.compose.project.working_dir"}}']),
             capture_output=True, text=True, timeout=5
         )
         if r2.returncode == 0 and r2.stdout and r2.stdout.strip():
@@ -40033,7 +40033,7 @@ def _heal_takwerx_user_missing_for_mediamtx(plog=None):
                                shell=True, capture_output=True, timeout=5)
         subprocess.run('systemctl daemon-reload 2>/dev/null; true',
                        shell=True, capture_output=True, timeout=5)
-        subprocess.run(['systemctl', 'restart', 'mediamtx', 'mediamtx-webeditor'],
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx', 'mediamtx-webeditor']),
                        capture_output=True, timeout=20)
         # Verify
         time.sleep(3)
@@ -40113,7 +40113,7 @@ def _heal_mediamtx_webeditor_writable_paths(plog=None):
         if os.path.exists('/usr/local/etc/mediamtx.yml'):
             subprocess.run('chown takwerx:takwerx /usr/local/etc/mediamtx.yml',
                            shell=True, capture_output=True, timeout=5)
-        subprocess.run(['systemctl', 'restart', 'mediamtx-webeditor'],
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                        capture_output=True, timeout=15)
         # Give it a moment and re-check
         time.sleep(3)
@@ -40150,8 +40150,8 @@ def _clear_stale_authentik_migration_lock(plog):
                "AND a.pid IN (SELECT pid FROM pg_locks WHERE locktype='advisory') "
                "AND a.pid <> pg_backend_pid();")
         r = subprocess.run(
-            ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
-             '-d', 'authentik', '-tA', '-c', sql],
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+             '-d', 'authentik', '-tA', '-c', sql]),
             capture_output=True, text=True, timeout=20)
         n = sum(1 for ln in (r.stdout or '').splitlines() if ln.strip() == 't')
         if n:
@@ -40736,9 +40736,9 @@ def _authentik_pgbouncer_cl_waiting():
     """
     try:
         r = subprocess.run(
-            ['docker', 'exec', 'authentik-pgbouncer-1', 'sh', '-c',
+            _sudo_wrap(['docker', 'exec', 'authentik-pgbouncer-1', 'sh', '-c',
              'PGPASSWORD="$DB_PASSWORD" psql -h 127.0.0.1 -U authentik '
-             '-d pgbouncer -tA -F "|" -c "SHOW POOLS;"'],
+             '-d pgbouncer -tA -F "|" -c "SHOW POOLS;"']),
             capture_output=True, text=True, timeout=8
         )
         if r.returncode != 0:
@@ -40834,13 +40834,13 @@ def _authentik_reap_ghost_channels_conns(plog=None):
     """
     try:
         r = subprocess.run(
-            ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql',
              '-U', 'authentik', '-d', 'authentik', '-tA', '-c',
              "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) "
              "FROM pg_stat_activity "
              "WHERE datname='authentik' AND state='idle' "
              "AND query LIKE '%groupchannel%' "
-             f"AND state_change < NOW() - INTERVAL '{_AUTHENTIK_CHANNELS_GHOST_REAP_AGE_MIN} minutes') t"],
+             f"AND state_change < NOW() - INTERVAL '{_AUTHENTIK_CHANNELS_GHOST_REAP_AGE_MIN} minutes') t"]),
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
@@ -41601,7 +41601,7 @@ def _ensure_authentik_pgbouncer(plog):
     # can show both streams distinctly.
     plog(f"  pgbouncer install: pulling {_AUTHENTIK_PGBOUNCER_IMAGE} (may take ~60s on first run)...")
     _pull_r = subprocess.run(
-        ['docker', 'compose', 'pull', 'pgbouncer'],
+        _sudo_wrap(['docker', 'compose', 'pull', 'pgbouncer']),
         cwd=ak_dir, capture_output=True, text=True, timeout=300
     )
     if _pull_r.returncode != 0:
@@ -41612,7 +41612,7 @@ def _ensure_authentik_pgbouncer(plog):
 
     plog("  pgbouncer install: starting pgbouncer container...")
     r = subprocess.run(
-        ['docker', 'compose', 'up', '-d', '--no-deps', 'pgbouncer'],
+        _sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', 'pgbouncer']),
         cwd=ak_dir, capture_output=True, text=True, timeout=180
     )
     if r.returncode != 0:
@@ -41962,7 +41962,7 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None
     # client-side connections; PgBouncer's transaction-pool semantics + healthcheck
     # cycling re-establish server-side pooling within seconds.
     r = subprocess.run(
-        ['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer'],
+        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer']),
         cwd=ak_dir, capture_output=True, text=True, timeout=120
     )
     if r.returncode != 0:
@@ -42106,7 +42106,7 @@ def _ensure_vm_overcommit_memory(plog):
     runtime_changed = False
     if current != '1':
         r = subprocess.run(
-            ['sysctl', '-w', 'vm.overcommit_memory=1'],
+            _sudo_wrap(['sysctl', '-w', 'vm.overcommit_memory=1']),
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
@@ -43394,12 +43394,12 @@ def _authentik_channels_pool_watchdog_loop():
             # mid-tx storm (Caddy timeout fires before Django commits → abandoned tx →
             # 'idle in transaction' accumulation) was invisible to this watchdog.
             _r = subprocess.run(
-                ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+                _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql',
                  '-U', 'authentik', '-d', 'authentik', '-tA', '-F', '|', '-c',
                  "SELECT "
                  "  COUNT(*) FILTER (WHERE state='idle'), "
                  "  COUNT(*) FILTER (WHERE state='idle in transaction') "
-                 "FROM pg_stat_activity WHERE datname='authentik'"],
+                 "FROM pg_stat_activity WHERE datname='authentik'"]),
                 capture_output=True, text=True, timeout=10
             )
             if _r.returncode != 0:
@@ -43429,7 +43429,7 @@ def _authentik_channels_pool_watchdog_loop():
             def _classify_idle_load():
                 try:
                     _rb = subprocess.run(
-                        ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+                        _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql',
                          '-U', 'authentik', '-d', 'authentik', '-tA', '-F', '|', '-c',
                          "SELECT "
                          "  COUNT(*) FILTER (WHERE query LIKE '%groupchannel%'), "
@@ -43437,7 +43437,7 @@ def _authentik_channels_pool_watchdog_loop():
                          "  COUNT(*) FILTER (WHERE query LIKE '%postgres_cache_cacheentry%'), "
                          "  COUNT(*) FILTER (WHERE query LIKE '%pg_advisory_lock%') "
                          "FROM pg_stat_activity "
-                         "WHERE datname='authentik' AND state='idle'"],
+                         "WHERE datname='authentik' AND state='idle'"]),
                         capture_output=True, text=True, timeout=8
                     )
                     if _rb.returncode == 0:
@@ -43481,8 +43481,8 @@ def _authentik_channels_pool_watchdog_loop():
             # we restart, to avoid restarting on transient single-probe failures.
             try:
                 _r_health = subprocess.run(
-                    ['docker', 'inspect', 'authentik-server-1',
-                     '--format', '{{.State.Health.Status}}'],
+                    _sudo_wrap(['docker', 'inspect', 'authentik-server-1',
+                     '--format', '{{.State.Health.Status}}']),
                     capture_output=True, text=True, timeout=5
                 )
                 _health_str = (_r_health.stdout or '').strip()
@@ -43499,7 +43499,7 @@ def _authentik_channels_pool_watchdog_loop():
                         flush=True,
                     )
                     _restart_h = subprocess.run(
-                        ['docker', 'restart', 'authentik-server-1'],
+                        _sudo_wrap(['docker', 'restart', 'authentik-server-1']),
                         capture_output=True, text=True, timeout=90
                     )
                     if _restart_h.returncode == 0:
@@ -43744,7 +43744,7 @@ def _authentik_channels_pool_watchdog_loop():
                     idle_count=_count, threshold=_threshold, current_max=_mr_cur
                 )
                 _restart = subprocess.run(
-                    ['docker', 'restart', 'authentik-server-1'],
+                    _sudo_wrap(['docker', 'restart', 'authentik-server-1']),
                     capture_output=True, text=True, timeout=90
                 )
                 if _restart.returncode == 0:
@@ -43786,7 +43786,7 @@ def _authentik_channels_pool_watchdog_loop():
                 _clear_stale_authentik_migration_lock(
                     lambda m: print(f"[ak-pg-watchdog]{m}", flush=True))
                 _restart_tx = subprocess.run(
-                    ['docker', 'restart', 'authentik-server-1'],
+                    _sudo_wrap(['docker', 'restart', 'authentik-server-1']),
                     capture_output=True, text=True, timeout=90
                 )
                 if _restart_tx.returncode == 0:
@@ -46192,21 +46192,21 @@ entries:
         plog("\u2501\u2501\u2501 Step 7/10: Pulling Images & Starting Containers \u2501\u2501\u2501")
         # Ensure 4GB swap before stressing the box (reduces OOM/unhealthy on small VPS)
         try:
-            r_sw = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
+            r_sw = subprocess.run(_sudo_wrap(['swapon', '--show']), capture_output=True, text=True, timeout=5)
             if r_sw.returncode == 0 and '/swapfile' in (r_sw.stdout or ''):
                 plog("  Swap already configured")
             else:
                 if os.path.exists('/swapfile'):
-                    subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
+                    subprocess.run(_sudo_wrap(['swapon', '/swapfile']), capture_output=True, timeout=5)
                     fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
                         _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
                     plog("  Swap file enabled")
                 else:
-                    subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
+                    subprocess.run(_sudo_wrap(['fallocate', '-l', '4G', '/swapfile']), check=True, timeout=30)
                     os.chmod('/swapfile', 0o600)
-                    subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
-                    subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
+                    subprocess.run(_sudo_wrap(['mkswap', '/swapfile']), check=True, capture_output=True, timeout=10)
+                    subprocess.run(_sudo_wrap(['swapon', '/swapfile']), check=True, timeout=10)
                     fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
                         _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
@@ -49632,7 +49632,7 @@ def _auto_authentik_channel_purge(plog=None):
               'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
     try:
         _up = subprocess.run(
-            ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+            _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1']),
             capture_output=True, text=True, timeout=10
         )
         if _up.returncode != 0 or _up.stdout.strip() != 'true':
@@ -49734,7 +49734,7 @@ def _auto_authentik_tasklog_purge(plog=None):
 
     try:
         _up = subprocess.run(
-            ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+            _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1']),
             capture_output=True, text=True, timeout=10
         )
         if _up.returncode != 0 or _up.stdout.strip() != 'true':
@@ -49742,9 +49742,9 @@ def _auto_authentik_tasklog_purge(plog=None):
 
         def _size_bytes():
             r = subprocess.run(
-                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
                  '-d', 'authentik', '-t', '-A', '-c',
-                 "SELECT pg_total_relation_size('authentik_tasks_tasklog') + pg_total_relation_size('authentik_tasks_task')"],
+                 "SELECT pg_total_relation_size('authentik_tasks_tasklog') + pg_total_relation_size('authentik_tasks_task')"]),
                 capture_output=True, text=True, timeout=20
             )
             if r.returncode != 0:
@@ -49756,9 +49756,9 @@ def _auto_authentik_tasklog_purge(plog=None):
 
         def _row_counts():
             r = subprocess.run(
-                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
                  '-d', 'authentik', '-t', '-A', '-c',
-                 "SELECT (SELECT count(*) FROM authentik_tasks_task) || '|' || (SELECT count(*) FROM authentik_tasks_tasklog)"],
+                 "SELECT (SELECT count(*) FROM authentik_tasks_task) || '|' || (SELECT count(*) FROM authentik_tasks_tasklog)"]),
                 capture_output=True, text=True, timeout=30
             )
             if r.returncode != 0:
@@ -49795,8 +49795,8 @@ def _auto_authentik_tasklog_purge(plog=None):
                 f"WHERE mtime < NOW() - INTERVAL '{interval}';"
             )
             r = subprocess.run(
-                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
-                 '-d', 'authentik', '-c', sql],
+                _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-c', sql]),
                 capture_output=True, text=True, timeout=600
             )
             if r.returncode != 0:
@@ -49814,9 +49814,9 @@ def _auto_authentik_tasklog_purge(plog=None):
         # VACUUM ANALYZE in its own psql -c so it's NOT inside an implicit transaction.
         # See the v0.9.5 weekly-timer-script bug history in the comment above.
         _vac = subprocess.run(
-            ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
              '-d', 'authentik', '-c',
-             'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;'],
+             'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;']),
             capture_output=True, text=True, timeout=900
         )
         if _vac.returncode != 0:
@@ -49877,8 +49877,8 @@ def _auto_authentik_tasklog_purge(plog=None):
                 _compact_t0 = time.time()
                 for _tbl in ('authentik_tasks_tasklog', 'authentik_tasks_task'):
                     _r_idx = subprocess.run(
-                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
-                         '-d', 'authentik', '-c', f'REINDEX TABLE CONCURRENTLY {_tbl};'],
+                        _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                         '-d', 'authentik', '-c', f'REINDEX TABLE CONCURRENTLY {_tbl};']),
                         capture_output=True, text=True, timeout=1800
                     )
                     if _r_idx.returncode != 0:
@@ -49887,8 +49887,8 @@ def _auto_authentik_tasklog_purge(plog=None):
                             f"(continuing): {(_r_idx.stderr or '')[:200]}"
                         )
                     _r_vf = subprocess.run(
-                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
-                         '-d', 'authentik', '-c', f'VACUUM FULL {_tbl};'],
+                        _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                         '-d', 'authentik', '-c', f'VACUUM FULL {_tbl};']),
                         capture_output=True, text=True, timeout=600
                     )
                     if _r_vf.returncode != 0:
@@ -50004,7 +50004,7 @@ def _heal_takauthentik_tasklog_purge_stale_failed_state(plog=None):
             _log("  tasklog-purge: failed-state present and on-disk script is NOT the v0.9.26 fixed version — leaving alone (script will be re-emitted on next deploy)")
             return False
         subprocess.run(
-            ['systemctl', 'reset-failed', 'takauthentiktasklogpurge.service'],
+            _sudo_wrap(['systemctl', 'reset-failed', 'takauthentiktasklogpurge.service']),
             capture_output=True, timeout=5
         )
         r_verify = subprocess.run(
@@ -52868,9 +52868,9 @@ def takserver_uninstall():
     # uninstall test: native Remove left containers/volume/network/bundle behind.
     if _tak_is_container():
         for c in (TAK_CONTAINER, TAK_DB_CONTAINER):
-            subprocess.run(['docker', 'rm', '-f', c], capture_output=True, timeout=60)
-        subprocess.run(['docker', 'volume', 'rm', TAK_DB_VOLUME], capture_output=True, timeout=30)
-        subprocess.run(['docker', 'network', 'rm', TAK_DOCKER_NET], capture_output=True, timeout=30)
+            subprocess.run(_sudo_wrap(['docker', 'rm', '-f', c]), capture_output=True, timeout=60)
+        subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]), capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['docker', 'network', 'rm', TAK_DOCKER_NET]), capture_output=True, timeout=30)
         subprocess.run(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', shell=True, capture_output=True, timeout=60)
         # Remove the /opt/tak symlink explicitly. After ~/tak-docker is gone it is a
         # DANGLING symlink, which the native `if os.path.exists('/opt/tak')` cleanup
@@ -55292,7 +55292,7 @@ def _tak_container_running(name):
     """True if the named docker container exists and is in the running state."""
     try:
         r = subprocess.run(
-            ['docker', 'inspect', '-f', '{{.State.Running}}', name],
+            _sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', name]),
             capture_output=True, text=True, timeout=10)
         return r.returncode == 0 and r.stdout.strip() == 'true'
     except Exception:
@@ -56066,7 +56066,7 @@ def run_takserver_deploy(config):
                         if db_pass:
                             db_pass_xml = html.escape(db_pass, quote=True)
                             cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass_xml + m.group(2), cc)
-                        subprocess.run(['tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=5)
+                        subprocess.run(_sudo_wrap(['tee', '/opt/tak/CoreConfig.xml']), input=cc, capture_output=True, text=True, timeout=5)
                         log_step(f"✓ JDBC URL and password set for {db_host}:{db_port}")
                     else:
                         log_step(f"✓ JDBC URL already points to {db_host}")
@@ -56860,7 +56860,7 @@ def _kernel_patch_start_job():
     # has LoadState=not-found and reset-failed would be a no-op anyway.
     if load == 'loaded' and active == 'failed':
         try:
-            subprocess.run(['systemctl', 'reset-failed', _KERNEL_PATCH_UNIT],
+            subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _KERNEL_PATCH_UNIT]),
                            capture_output=True, timeout=5)
         except Exception:
             pass
@@ -61108,7 +61108,7 @@ def _startup_pin_console_service_home():
             return
         with open(svc, 'w') as f:
             f.write(new)
-        subprocess.run(['systemctl', 'daemon-reload'],
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
                        capture_output=True, timeout=15)
         print(f'Startup migration: pinned Environment=HOME={home} in takwerx-console.service (v0.9.12)')
     except PermissionError:
@@ -61148,7 +61148,7 @@ def _startup_ensure_console_runtime_max_sec():
             return
         with open(svc, 'w') as f:
             f.write(new)
-        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
         print('Startup migration: added RuntimeMaxSec=24h to takwerx-console.service (v0.9.41 — CLOSE-WAIT scanner fix)')
     except PermissionError:
         pass
@@ -61190,7 +61190,7 @@ def _startup_ensure_console_gunicorn_threads():
         content = content.replace(exec_line, new_exec, 1)
         with open(svc, 'w') as f:
             f.write(content)
-        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
         print('Startup migration: console gunicorn --threads → 8 (v0.9.58 #4; effective next restart)')
     except PermissionError:
         pass
@@ -61259,8 +61259,8 @@ def _startup_ensure_broker():
         if unit_changed:
             with open(svc, 'w') as f:
                 f.write(unit)
-            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
-            subprocess.run(['systemctl', 'enable', 'takwerx-broker'], capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', 'takwerx-broker']), capture_output=True, timeout=15)
         # Restart the broker when its SOURCE changed too — otherwise a `git pull`
         # that updates takwerx_broker.py leaves the OLD broker process running
         # stale code (the unit is unchanged, so unit_changed alone misses it).
@@ -61280,7 +61280,7 @@ def _startup_ensure_broker():
         active = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
                                 capture_output=True, text=True, timeout=8).stdout.strip()
         if unit_changed or active != 'active' or src_hash != old_hash:
-            subprocess.run(['systemctl', 'restart', 'takwerx-broker'], capture_output=True, timeout=20)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']), capture_output=True, timeout=20)
             try:
                 with open(stamp, 'w') as sf:
                     sf.write(src_hash)
@@ -61330,7 +61330,7 @@ def _startup_reapply_f2b_trusted_ignoreip():
         if not need:
             return
         changed = _f2b_rewrite_all_jails()
-        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         print('Startup migration: re-applied fail2ban trusted ignoreip to %s (v0.9.58 #6)' % (changed or []))
     except PermissionError:
         pass
@@ -61868,7 +61868,7 @@ def _fail2ban_install_and_configure(plog):
         result = subprocess.run(_sudo_wrap(['apt-get', 'install', '-y', 'fail2ban']),
                                 capture_output=True, text=True)
     else:
-        result = subprocess.run(['yum', 'install', '-y', 'fail2ban'],
+        result = subprocess.run(_sudo_wrap(['yum', 'install', '-y', 'fail2ban']),
                                 capture_output=True, text=True)
     if result.returncode != 0:
         plog(f"fail2ban migration: FAILED — package install error: {result.stderr[:300]}")
@@ -61938,7 +61938,7 @@ def _fail2ban_install_and_configure(plog):
     # tail a non-existent container. It will be started automatically when the
     # Authentik jail is enabled from the UI after Authentik is deployed.
     ak_running = subprocess.run(
-        ['docker', 'ps', '--format', '{{.Names}}'],
+        _sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
         capture_output=True, text=True).stdout
     if 'authentik' in ak_running:
         subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
@@ -62130,7 +62130,7 @@ if __name__ == '__main__':
     plog("fail2ban guarddog hook: updated jail config with infratak-guarddog action")
 
     # ── Step 4: Reload fail2ban ───────────────────────────────────────────────
-    subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+    subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
     plog("fail2ban guarddog hook: fail2ban reloaded")
 
     # ── Step 5: Record outcome ────────────────────────────────────────────────
@@ -62205,7 +62205,7 @@ def _fail2ban_takserver_filter(plog):
     plog(f"fail2ban takserver filter: wrote {tak_action_path}")
 
     # Reload so the new filter is recognized (jail stays disabled until operator enables it)
-    subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+    subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
     plog("fail2ban takserver filter: fail2ban reloaded — filter ready, jail disabled by default")
 
     # Record outcome
@@ -62500,13 +62500,13 @@ def _startup_migrations():
                 print("Startup migration: tearing down legacy cfd-remote-assist install (renamed to eud)", flush=True)
                 _old_compose = os.path.join(_ra_old_dir, 'docker-compose.yml')
                 if os.path.exists(_old_compose):
-                    subprocess.run(['docker', 'compose', '-f', _old_compose, 'down', '-v', '--remove-orphans'],
+                    subprocess.run(_sudo_wrap(['docker', 'compose', '-f', _old_compose, 'down', '-v', '--remove-orphans']),
                                    capture_output=True, timeout=120)
                 # Belt-and-suspenders: force-remove any container still named cfd-remote-assist-*
-                _ra_old_ids = subprocess.run(['docker', 'ps', '-aq', '--filter', 'name=cfd-remote-assist'],
+                _ra_old_ids = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cfd-remote-assist']),
                                              capture_output=True, text=True, timeout=15).stdout.split()
                 if _ra_old_ids:
-                    subprocess.run(['docker', 'rm', '-f', *_ra_old_ids], capture_output=True, timeout=60)
+                    subprocess.run(_sudo_wrap(['docker', 'rm', '-f', *_ra_old_ids]), capture_output=True, timeout=60)
                 # Deregister the old Authentik application + provider (legacy slug/name).
                 try:
                     _deregister_authentik_oauth2_app(s, 'cfd-remote-assist', 'CFD Remote Assist')
@@ -62535,7 +62535,7 @@ def _startup_migrations():
                     if 'OIDC_ADMIN_GROUP=' not in ra_env_content:
                         with open(ra_env_path, 'a') as f:
                             f.write('\nOIDC_ADMIN_GROUP=authentik Admins\n')
-                        subprocess.run(['docker', 'compose', '-f', os.path.expanduser('~/eud-remote-assist/docker-compose.yml'), 'up', '-d', 'server'], capture_output=True, timeout=30)
+                        subprocess.run(_sudo_wrap(['docker', 'compose', '-f', os.path.expanduser('~/eud-remote-assist/docker-compose.yml'), 'up', '-d', 'server']), capture_output=True, timeout=30)
                         print("Startup migration: Added OIDC_ADMIN_GROUP to remote assist .env and recreated backend container", flush=True)
                 except Exception as e:
                     print(f"Startup migration: error updating remote assist .env: {e}", flush=True)
@@ -62546,12 +62546,12 @@ def _startup_migrations():
         # needing an RA redeploy. Admin port stays closed (loopback/Caddy-only). Ubuntu uses ufw.
         if s.get('remote_assist_enabled') and _distro_family() == 'rhel':
             try:
-                _q = subprocess.run(['firewall-cmd', '--query-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'],
+                _q = subprocess.run(_sudo_wrap(['firewall-cmd', '--query-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp']),
                                     capture_output=True, text=True, timeout=10)
                 if (_q.stdout or '').strip() != 'yes':
-                    subprocess.run(['firewall-cmd', '--permanent', '--add-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'],
+                    subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', '--add-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp']),
                                    capture_output=True, timeout=15)
-                    subprocess.run(['firewall-cmd', '--reload'], capture_output=True, timeout=15)
+                    subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True, timeout=15)
                     print(f"Startup migration: firewalld opened {REMOTE_ASSIST_DEVICE_PORT}/tcp for RHEL Remote Assist device API", flush=True)
             except Exception as e:
                 print(f"Startup migration: error opening RA device port in firewalld: {e}", flush=True)
@@ -63350,7 +63350,7 @@ def _post_update_service_recovery_sweep(plog):
 
     try:
         r = subprocess.run(
-            ['docker', 'ps', '-a', '--format', '{{.Names}}\t{{.State}}'],
+            _sudo_wrap(['docker', 'ps', '-a', '--format', '{{.Names}}\t{{.State}}']),
             capture_output=True, text=True, timeout=15
         )
         if r.returncode == 0:
@@ -63370,7 +63370,7 @@ def _post_update_service_recovery_sweep(plog):
                     continue
                 if state in ('exited', 'created', 'dead'):
                     start_r = subprocess.run(
-                        ['docker', 'start', name], capture_output=True, text=True, timeout=60
+                        _sudo_wrap(['docker', 'start', name]), capture_output=True, text=True, timeout=60
                     )
                     if start_r.returncode == 0:
                         started_containers.append(name)
@@ -63414,7 +63414,7 @@ def _post_update_service_recovery_sweep(plog):
             active_state = (is_active_r.stdout or '').strip()
             if active_state in ('inactive', 'failed'):
                 start_r = subprocess.run(
-                    ['systemctl', 'start', unit],
+                    _sudo_wrap(['systemctl', 'start', unit]),
                     capture_output=True, text=True, timeout=60
                 )
                 if start_r.returncode == 0:
@@ -64161,7 +64161,7 @@ def _post_update_auto_deploy():
                         _shm_needs_pg_recreate = _shm_added
                         if not _shm_needs_pg_recreate:
                             _pg_insp = subprocess.run(
-                                ['docker', 'inspect', '--format', '{{.HostConfig.ShmSize}}', 'authentik-postgresql-1'],
+                                _sudo_wrap(['docker', 'inspect', '--format', '{{.HostConfig.ShmSize}}', 'authentik-postgresql-1']),
                                 capture_output=True, text=True, timeout=10
                             )
                             _pg_shm_val = int(_pg_insp.stdout.strip() or '0')
@@ -64237,7 +64237,7 @@ def _post_update_auto_deploy():
                             for _svc_name in ('authentik-server-1', 'authentik-ldap-1'):
                                 try:
                                     _ins = subprocess.run(
-                                        ['docker', 'inspect', '--format', '{{.HostConfig.CapDrop}}', _svc_name],
+                                        _sudo_wrap(['docker', 'inspect', '--format', '{{.HostConfig.CapDrop}}', _svc_name]),
                                         capture_output=True, text=True, timeout=10
                                     )
                                     _cap = _ins.stdout.strip()
@@ -64257,7 +64257,7 @@ def _post_update_auto_deploy():
                         # restarts CloudTAK on every update.
                         try:
                             _running_r = subprocess.run(
-                                ['docker', 'ps', '-q', '--no-trunc'],
+                                _sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
                                 capture_output=True, text=True, timeout=10
                             )
                             _running_ids = {c[:12] for c in _running_r.stdout.split() if c}
@@ -64671,15 +64671,15 @@ def _post_update_auto_deploy():
                 try:
                     # Only run if Authentik postgres container is up
                     _pg_up = subprocess.run(
-                        ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+                        _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1']),
                         capture_output=True, text=True, timeout=10
                     )
                     if _pg_up.returncode != 0 or _pg_up.stdout.strip() != 'true':
                         return
                     # Check table size — skip if already small
                     _size_r = subprocess.run(
-                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-t', '-A', '-c',
-                         "SELECT pg_total_relation_size('authentik_tasks_tasklog') + pg_total_relation_size('authentik_tasks_task')"],
+                        _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-t', '-A', '-c',
+                         "SELECT pg_total_relation_size('authentik_tasks_tasklog') + pg_total_relation_size('authentik_tasks_task')"]),
                         capture_output=True, text=True, timeout=15
                     )
                     if _size_r.returncode != 0:
@@ -64703,7 +64703,7 @@ def _post_update_auto_deploy():
                         "WHERE mtime < NOW() - INTERVAL '30 days';"
                     )
                     _del_r = subprocess.run(
-                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-c', _del_sql],
+                        _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-c', _del_sql]),
                         capture_output=True, text=True, timeout=300
                     )
                     if _del_r.returncode != 0:
@@ -64711,8 +64711,8 @@ def _post_update_auto_deploy():
                         return
                     print(f"Post-update: Authentik task log DELETE complete — running VACUUM ANALYZE")
                     subprocess.run(
-                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-c',
-                         'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;'],
+                        _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-c',
+                         'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;']),
                         capture_output=True, text=True, timeout=600
                     )
                     print("Post-update: Authentik task log VACUUM ANALYZE complete")
@@ -64729,7 +64729,7 @@ def _post_update_auto_deploy():
                 _mtx_svc = os.path.exists('/etc/systemd/system/mediamtx.service') or os.path.exists('/usr/local/bin/mediamtx')
                 if _mtx_svc and _f2b_is_available() and not _f2b_mediamtx_jail_enabled():
                     _f2b_write_mediamtx_jail(maxretry=10, findtime=30, bantime=3600)
-                    subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+                    subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
                     print("Post-update: MediaMTX RTSP Fail2ban jail installed (10 conns/30s → 1h ban)")
                 elif _mtx_svc and _f2b_mediamtx_jail_enabled():
                     print("Post-update: MediaMTX RTSP Fail2ban jail already present — no change")
@@ -64794,8 +64794,8 @@ def _post_update_auto_deploy():
                     _pg_data_path = None
                     try:
                         _ins = subprocess.run(
-                            ['docker', 'inspect', 'cloudtak-postgis-1', '-f',
-                             '{{ range .Mounts }}{{ if eq .Destination "/var/lib/postgresql/data" }}{{ .Source }}{{ end }}{{ end }}'],
+                            _sudo_wrap(['docker', 'inspect', 'cloudtak-postgis-1', '-f',
+                             '{{ range .Mounts }}{{ if eq .Destination "/var/lib/postgresql/data" }}{{ .Source }}{{ end }}{{ end }}']),
                             capture_output=True, text=True, timeout=10
                         )
                         if _ins.returncode == 0 and _ins.stdout.strip():
@@ -64859,11 +64859,11 @@ def _post_update_auto_deploy():
                     if _compromised:
                         try:
                             subprocess.run(
-                                ['docker', 'stop', '-t', '15',
+                                _sudo_wrap(['docker', 'stop', '-t', '15',
                                  'cloudtak-postgis-1', 'cloudtak-api-1',
                                  'cloudtak-events-1', 'cloudtak-retention-1',
                                  'cloudtak-media-1', 'cloudtak-tiles-1',
-                                 'cloudtak-store-1'],
+                                 'cloudtak-store-1']),
                                 capture_output=True, timeout=60
                             )
                         except Exception:
@@ -65184,7 +65184,7 @@ def _post_update_auto_deploy():
             # cloudtak-postgis-1 processes on every update.
             try:
                 _final_running_r = subprocess.run(
-                    ['docker', 'ps', '-q', '--no-trunc'],
+                    _sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
                     capture_output=True, text=True, timeout=10
                 )
                 _final_running_ids = {c[:12] for c in _final_running_r.stdout.split() if c}

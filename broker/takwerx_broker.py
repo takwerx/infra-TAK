@@ -97,8 +97,9 @@ EXEC_ALLOW = {
     'fail2ban-client',
     # containers (NOTE: docker is effectively root-equivalent; see _check_docker)
     'docker',
-    # storage / kernel knobs (path-checked where they take a file)
-    'swapon', 'swapoff', 'mkswap', 'fallocate', 'sync',
+    # storage / kernel knobs (path-checked where they take a file). sysctl is
+    # gated to safe params only (see _check_sysctl) — VM tuning, not kernel.*
+    'swapon', 'swapoff', 'mkswap', 'fallocate', 'sync', 'sysctl',
     # SELinux: read-only inspection + `semanage port` (gated — see _check_semanage)
     'getenforce', 'getsebool', 'restorecon', 'semanage',
     # read-only inspection (routed for a single audit point)
@@ -130,7 +131,6 @@ EXEC_DENY = {
     'perl', 'python', 'python3', 'ruby', 'awk', 'gawk',    # interpreters
     'sed', 'dd', 'psql', 'openssl',                        # arbitrary write/exec
     'semodule', 'setsebool', 'setcap',                     # confinement / caps
-    'sysctl',                                              # core_pattern = |cmd
     'visudo', 'passwd', 'chpasswd', 'useradd', 'usermod', 'groupadd',
 }
 
@@ -316,6 +316,8 @@ def check_exec(argv, cwd=None):
         _check_semanage(argv)
     elif base == 'install':
         _check_install(argv)
+    elif base == 'sysctl':
+        _check_sysctl(argv)
     elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
@@ -346,6 +348,23 @@ def _check_semanage(argv):
     console labels custom Caddy ports http_port_t); deny fcontext/login/etc."""
     if len(argv) < 2 or argv[1] != 'port':
         raise Denied('semanage: only `semanage port` is allowed')
+
+
+SYSCTL_SAFE_PREFIXES = ('vm.', 'fs.', 'net.', 'dev.')
+
+
+def _check_sysctl(argv):
+    """sysctl can set `kernel.core_pattern=|cmd` (arbitrary root exec on crash),
+    `kernel.modprobe`, `kernel.hotplug`, etc. Allow ONLY safe tuning namespaces
+    (the console uses vm.swappiness / vm.overcommit_memory)."""
+    for a in argv[1:]:
+        if a.startswith('-'):
+            if a in ('-w', '-n', '-q', '-e', '-N', '-a', '-A'):
+                continue
+            raise Denied(f'sysctl flag not allowed: {a}')
+        param = a.split('=', 1)[0].strip()
+        if not param.startswith(SYSCTL_SAFE_PREFIXES):
+            raise Denied(f'sysctl param not in safe namespace (vm./fs./net.): {param}')
 
 
 def _check_install(argv):
