@@ -3684,8 +3684,7 @@ def _ufw_default_incoming_deny():
         except Exception:
             return None
     try:
-        r = subprocess.run('sudo ufw status verbose 2>/dev/null || ufw status verbose 2>/dev/null || true',
-                            shell=True, capture_output=True, text=True, timeout=12)
+        r = subprocess.run(_sudo_wrap(['ufw', 'status', 'verbose']), capture_output=True, text=True, timeout=12)
         for ln in (r.stdout or '').splitlines():
             l = ln.lower().strip()
             if l.startswith('default:'):
@@ -6946,7 +6945,7 @@ def takserver_set_heap():
             if cleaned != r.stdout:
                 subprocess.run(f"sudo tee {setenv} > /dev/null", shell=True, input=cleaned, capture_output=True, text=True, timeout=10)
 
-        rr = subprocess.run('sudo systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=120)
+        rr = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=120)
         if rr.returncode != 0:
             return jsonify({'success': False, 'error': f'Restart failed: {(rr.stderr or rr.stdout or "unknown").strip()[:200]}'}), 500
     except subprocess.TimeoutExpired:
@@ -8563,8 +8562,7 @@ def _firewall_status_local():
         return {'supported': False, 'error': 'No supported firewall (UFW/firewalld) installed on this host', 'enabled': False, 'rules': [], 'rules_numbered': []}
     try:
         r = subprocess.run(
-            'sudo ufw status 2>/dev/null || ufw status 2>/dev/null || true',
-            shell=True, capture_output=True, text=True, timeout=12
+            _sudo_wrap(['ufw', 'status']), capture_output=True, text=True, timeout=12
         )
         out = (r.stdout or '').strip()
         lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
@@ -8579,8 +8577,7 @@ def _firewall_status_local():
                 continue
             rules.append(ln)
         rn = subprocess.run(
-            'sudo ufw status numbered 2>/dev/null || ufw status numbered 2>/dev/null || true',
-            shell=True, capture_output=True, text=True, timeout=12
+            _sudo_wrap(['ufw', 'status', 'numbered']), capture_output=True, text=True, timeout=12
         )
         out_n = (rn.stdout or '').strip()
         lines_n = [ln.rstrip() for ln in out_n.splitlines() if ln.strip()]
@@ -49050,7 +49047,7 @@ def _apply_ldap_to_coreconfig():
     if _tak_is_container():
         r = subprocess.run(_tak_systemctl('restart') + ' 2>&1', shell=True, capture_output=True, text=True, timeout=120)
     else:
-        r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         return False, f'CoreConfig patched but TAK Server restart failed: {r.stderr.strip()[:120]}'
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
@@ -56266,9 +56263,9 @@ def takserver_federation_firewall():
         return jsonify({'success': False, 'error': 'Invalid port'}), 400
     try:
         if action == 'open':
-            subprocess.run(f'sudo ufw allow {port}/tcp', shell=True, capture_output=True, text=True, timeout=10)
+            subprocess.run(_sudo_wrap(['ufw', 'allow', f'{port}/tcp']), capture_output=True, text=True, timeout=10)
         else:
-            subprocess.run(f'sudo ufw delete allow {port}/tcp', shell=True, capture_output=True, text=True, timeout=10)
+            subprocess.run(_sudo_wrap(['ufw', 'delete', 'allow', f'{port}/tcp']), capture_output=True, text=True, timeout=10)
         r = subprocess.run(f'sudo ufw status | grep -w {port}', shell=True,
                            capture_output=True, text=True, timeout=10)
         is_open = 'ALLOW' in (r.stdout or '')
@@ -61670,8 +61667,7 @@ def _startup_resync_ldap_service_account():
             print("Startup migration: LDAP healed — restarting takserver to flush cached state")
             try:
                 r = subprocess.run(
-                    'sudo systemctl restart takserver 2>&1',
-                    shell=True, capture_output=True, text=True, timeout=120)
+                    _sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=120)
                 if r.returncode == 0:
                     print("Startup migration: takserver restart sent")
                 else:
@@ -64801,19 +64797,16 @@ def _post_update_auto_deploy():
                                       '5433/tcp', '9000/tcp', '9002/tcp',
                                       '18888/tcp'):
                             subprocess.run(
-                                f'(sudo ufw deny {_port} || ufw deny {_port}) >/dev/null 2>&1 || true',
-                                shell=True, capture_output=True, timeout=10
+                                _sudo_wrap(['ufw', 'deny', _port]), capture_output=True, timeout=10
                             )
                         # Flip 9997 from deny→allow: delete any legacy deny rule first
                         # (ufw is first-match, so an older `deny 9997` would shadow a
                         # newly-appended allow), then allow inbound to Caddy's listener.
                         subprocess.run(
-                            '(sudo ufw delete deny 9997/tcp || ufw delete deny 9997/tcp) >/dev/null 2>&1 || true',
-                            shell=True, capture_output=True, timeout=10
+                            _sudo_wrap(['ufw', 'delete', 'deny', '9997/tcp']), capture_output=True, timeout=10
                         )
                         subprocess.run(
-                            '(sudo ufw allow 9997/tcp || ufw allow 9997/tcp) >/dev/null 2>&1 || true',
-                            shell=True, capture_output=True, timeout=10
+                            _sudo_wrap(['ufw', 'allow', '9997/tcp']), capture_output=True, timeout=10
                         )
                         print("  CloudTAK UFW rules applied (deny 5000,5002,5003,5433,9000,9002,18888; allow 9997 for Caddy video)")
                     except Exception as _ue:
@@ -64867,8 +64860,7 @@ def _post_update_auto_deploy():
 
                     try:
                         subprocess.run(
-                            '(sudo ufw deny 3000/tcp || ufw deny 3000/tcp) >/dev/null 2>&1 || true',
-                            shell=True, capture_output=True, timeout=10
+                            _sudo_wrap(['ufw', 'deny', '3000/tcp']), capture_output=True, timeout=10
                         )
                     except Exception:
                         pass
@@ -64996,12 +64988,10 @@ def _post_update_auto_deploy():
                         for _port_proto in ('8554/tcp', '8322/tcp', '8890/udp',
                                             '8000/udp', '8001/udp'):
                             subprocess.run(
-                                f'(sudo ufw allow {_port_proto} || ufw allow {_port_proto}) >/dev/null 2>&1 || true',
-                                shell=True, capture_output=True, timeout=10)
+                                _sudo_wrap(['ufw', 'allow', _port_proto]), capture_output=True, timeout=10)
                         for _port_proto in ('8888/tcp', '5080/tcp', '9898/tcp'):
                             subprocess.run(
-                                f'(sudo ufw deny {_port_proto} || ufw deny {_port_proto}) >/dev/null 2>&1 || true',
-                                shell=True, capture_output=True, timeout=10)
+                                _sudo_wrap(['ufw', 'deny', _port_proto]), capture_output=True, timeout=10)
                         print("  MediaMTX UFW: streaming public; webedit/API/HLS denied")
                     except Exception as _ue:
                         print(f"  WARNING: MediaMTX UFW rules failed: {_ue}")
