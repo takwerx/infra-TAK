@@ -197,6 +197,41 @@ def _sudo_wrap(cmd):
     return cmd
 
 
+def _run_priv_chain(cmds, mode='and', timeout=120, **kw):
+    """Run a sequence of privileged argv lists through the broker, replacing a
+    shell `A && B` / `A || B` / `A; B` string (the broker runs argv, not a shell).
+      mode='and': stop at the first FAILURE (A && B && …)
+      mode='or' : stop at the first SUCCESS (A || B || …)
+      mode='seq': run all regardless (A; B; …)
+    Each cmd is an argv list, wrapped in _sudo_wrap (broker-mediated when non-root).
+    Returns the last CompletedProcess. Extra kwargs (e.g. cwd=) pass to subprocess.run."""
+    last = None
+    for c in cmds:
+        last = subprocess.run(_sudo_wrap(list(c)), capture_output=True, text=True,
+                              timeout=timeout, **kw)
+        if mode == 'and' and last.returncode != 0:
+            break
+        if mode == 'or' and last.returncode == 0:
+            break
+    return last
+
+
+def _detached_console_restart(delay=2):
+    """Restart the console itself after a short delay, detached, so the current
+    HTTP response returns before the worker is bounced. Replaces the shell
+    `Popen('sleep 2 && systemctl restart takwerx-console')` (sleep isn't broker-
+    allowed). systemd owns the restart, so it completes even though this thread is
+    killed mid-restart."""
+    def _go():
+        time.sleep(delay)
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-console']),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
@@ -5063,8 +5098,7 @@ def update_apply():
 
         update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
         _ensure_gunicorn_upgrade(console_dir)
-        subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _detached_console_restart()
         return jsonify({
             'success': True,
             'output': f'Updated to {target_label}',
@@ -5284,8 +5318,7 @@ def console_broker_routing():
         except Exception:
             pass
         # detached delayed restart (same pattern as Update Now) so this response returns first
-        subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _detached_console_restart()
         return jsonify({
             'success': True,
             'enabled': enable,
@@ -5333,8 +5366,7 @@ def console_rollback_api():
         # Clear rollback availability (one rollback per update)
         s['console_rollback'] = {'available': False}
         save_settings(s)
-        subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _detached_console_restart()
         return jsonify({
             'ok': True, 'tag': prev_tag,
             'message': f'Rolled back to {prev_tag}. Console is restarting.'
@@ -57347,8 +57379,7 @@ def console_password_reset():
     auth['password_hash'] = generate_password_hash(new_pw)
     auth['created'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     save_auth(auth)
-    subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _detached_console_restart()
     return jsonify({'success': True, 'message': 'Password updated. Console will restart in a few seconds.'})
 
 
