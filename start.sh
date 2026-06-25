@@ -44,12 +44,13 @@ fi
 # root broker (broker/takwerx_broker.py). start.sh itself still runs as root (it
 # does the privileged provisioning); only the CONSOLE drops privilege.
 #
-# Gating (deliberately conservative this release): born-non-root is OPT-IN via
-# TAKWERX_NONROOT=1. Existing AND fresh root installs are byte-identical to
-# before. The ship decision is to flip this to default-for-fresh-installs (add an
-# `|| [ <fresh box> ]` clause); not done yet because the ~110 remaining
-# shell-string privileged calls have not been converted, so a born-non-root box
-# cannot complete every module deploy until that tail lands.
+# Gating: born-non-root is the DEFAULT for FRESH installs; an EXISTING root
+# install stays root (until migrated by scripts/migrate-console-nonroot.sh).
+# Force on with TAKWERX_NONROOT=1, force off with TAKWERX_NONROOT=0. (All
+# privileged shell calls are now broker-mediated — SHELL 0 — and a full deploy is
+# validated non-root under broker-enforce + SELinux-confined, so fresh boxes are
+# safe to default non-root. The broker still defaults PERMISSIVE; enforcing is the
+# operator flip after a fleet soak.)
 NONROOT_USER="takwerx"
 NONROOT_GROUP="takwerx"
 NONROOT_HOME="/home/takwerx"
@@ -57,6 +58,18 @@ NONROOT_INSTALL="/opt/infratak"
 BORN_NONROOT=0
 if [ "${TAKWERX_NONROOT:-}" = "1" ]; then
     BORN_NONROOT=1
+elif [ "${TAKWERX_NONROOT:-}" = "0" ]; then
+    BORN_NONROOT=0                       # explicit opt-out -> stay root
+else
+    # DEFAULT: a FRESH box is born non-root; an EXISTING root install stays root
+    # (until migrated). "Existing" = a console unit whose WorkingDirectory holds a
+    # password (auth.json) — re-running start.sh on a deployed box must not flip it.
+    _born_existing="/etc/systemd/system/takwerx-console.service"
+    _born_dir=""
+    [ -f "$_born_existing" ] && _born_dir=$(grep -E '^WorkingDirectory=' "$_born_existing" 2>/dev/null | cut -d= -f2- | tr -d ' ')
+    if [ -z "$_born_dir" ] || [ ! -f "$_born_dir/.config/auth.json" ]; then
+        BORN_NONROOT=1
+    fi
 fi
 
 # ==========================================
@@ -676,7 +689,15 @@ Group=$NONROOT_GROUP"
     # byte-identical to today's.
     SELINUX_DIRECTIVE=""
     if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
-        SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+        # Born-non-root + confined policy installed -> run in the dedicated,
+        # confined takwerx_console_t domain (permissive; see install_selinux_
+        # console_policy). Otherwise (root install, or confined build failed) use
+        # unconfined_service_t as before.
+        if [ "$BORN_NONROOT" = "1" ] && [ "${CONFINED_POLICY_OK:-0}" = "1" ]; then
+            SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:takwerx_console_t:s0"
+        else
+            SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+        fi
     fi
 
     cat > "$SERVICE_FILE" << EOF
@@ -741,6 +762,32 @@ install_selinux_console_policy() {
         echo -e "${YELLOW}  ⚠ SELinux console policy failed to install — console may not start under enforcing${NC}"
     fi
     rm -rf "$tmp"
+
+    # Born-non-root: also install the CONFINED domain (takwerx_console_t). The
+    # console then runs in its own SELinux domain instead of unconfined_service_t.
+    # Ships PERMISSIVE (logs AVCs, never blocks) for a safe rollout; enforcing is a
+    # deliberate flip (drop the `permissive` line in the .te) after a fleet soak —
+    # already validated to run a full deploy with 0 denials. Sets
+    # CONFINED_POLICY_OK so create_service emits the takwerx_console_t context.
+    CONFINED_POLICY_OK=0
+    [ "$BORN_NONROOT" = "1" ] || return 0
+    local cte="$INSTALL_DIR/selinux/takwerx_console_confined.te"
+    [ -f "$cte" ] || return 0
+    if semodule -l 2>/dev/null | grep -q '^takwerx_console_confined'; then
+        CONFINED_POLICY_OK=1
+        echo "  ✓ SELinux confined console domain already installed"
+        return 0
+    fi
+    local ctmp; ctmp=$(mktemp -d)
+    if checkmodule -M -m -o "$ctmp/c.mod" "$cte" >/dev/null 2>&1 \
+       && semodule_package -o "$ctmp/c.pp" -m "$ctmp/c.mod" >/dev/null 2>&1 \
+       && semodule -i "$ctmp/c.pp" >/dev/null 2>&1; then
+        CONFINED_POLICY_OK=1
+        echo "  ✓ SELinux confined console domain installed (takwerx_console_t, permissive)"
+    else
+        echo -e "${YELLOW}  ⚠ confined domain failed to build — console will use unconfined_service_t${NC}"
+    fi
+    rm -rf "$ctmp"
 }
 
 # ==========================================
