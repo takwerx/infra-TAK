@@ -14433,8 +14433,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                     _f.write(comp)
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST → {_ldap_internal} (internal)")
                 subprocess.run(
-                    f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=60
+                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
                 )
                 _log("✓ LDAP container recreated with internal host")
             else:
@@ -19270,11 +19269,11 @@ def takportal_control():
     if action == 'start':
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
-        subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=120)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=120)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
     elif action == 'stop':
-        subprocess.run(f'cd {portal_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'down']), cwd=portal_dir, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
@@ -19351,7 +19350,7 @@ def takportal_control():
         # (git pull resets the upstream 0.0.0.0 binding on every update).
         _write_takportal_override()
         _patch_takportal_compose_ports(portal_dir)
-        build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
+        build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=180)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
         if build.returncode != 0:
@@ -19388,7 +19387,7 @@ def takportal_control():
                 settings_sync_error = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]
         except Exception as e:
             settings_sync_error = str(e)[:300]
-        subprocess.run(f'cd {portal_dir} && docker image prune -f', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
         time.sleep(3)
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
@@ -19445,7 +19444,7 @@ def takportal_uninstall():
         return jsonify({'error': 'Invalid admin password'}), 403
     portal_dir = os.path.expanduser('~/TAK-Portal')
     steps = []
-    subprocess.run(f'cd {portal_dir} && docker compose down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+    subprocess.run(_sudo_wrap(['docker', 'compose', 'down', '-v', '--rmi', 'local']), cwd=portal_dir, capture_output=True, timeout=120)
     steps.append('Stopped and removed Docker containers/volumes')
     if os.path.exists(portal_dir):
         subprocess.run(f'rm -rf {portal_dir}', shell=True, capture_output=True)
@@ -19640,7 +19639,7 @@ def run_takportal_deploy():
         # install. We seed real settings.json into the created container below, then
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
-        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build --no-start 2>&1', shell=True, capture_output=True, text=True, timeout=900)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
@@ -19680,7 +19679,7 @@ def run_takportal_deploy():
             plog(f"  ⚠ Could not pre-seed settings.json: {str(_seed_e)[:80]} (first boot may log a harmless placeholder error)")
 
         # Start the container now that real settings are in place
-        subprocess.run(f'cd {portal_dir} && docker compose start 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
 
         # Wait for container to be healthy
         plog("  Waiting for container...")
@@ -22014,11 +22013,11 @@ def cloudtak_control():
     else:
         cloudtak_dir = os.path.expanduser('~/CloudTAK')
         if action == 'start':
-            subprocess.run(f'cd {cloudtak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
         elif action == 'stop':
-            subprocess.run(f'cd {cloudtak_dir} && docker compose stop 2>&1', shell=True, capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'stop']), cwd=cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
         elif action == 'restart':
-            subprocess.run(f'cd {cloudtak_dir} && docker compose restart 2>&1', shell=True, capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'restart']), cwd=cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
         elif action == 'update':
             subprocess.run(f'cd {cloudtak_dir} && ./cloudtak.sh update 2>&1', shell=True, capture_output=True, timeout=600)
         else:
@@ -25760,8 +25759,7 @@ services:
     # postgres/redis/ldap untouched. --remove-orphans cleans any prior orphan.
     _log("  Recreating Authentik server + worker for SMTP (ldap/db/redis untouched)...")
     r = subprocess.run(
-        f'cd {ak_dir} && docker compose up -d --force-recreate --no-deps --remove-orphans server worker',
-        shell=True, capture_output=True, text=True, timeout=120)
+        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', '--remove-orphans', 'server', 'worker']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f'Authentik restart failed: {r.stderr or r.stdout}')
 
@@ -36235,8 +36233,7 @@ def _wait_for_authentik_stack_healthy(plog, timeout=240):
                 stopped.append(c)
         if stopped and not healed:
             plog(f"  ⚠ Authentik stack: {', '.join(stopped)} not running — starting the stack (docker compose up -d)…")
-            subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1',
-                shell=True, capture_output=True, text=True, timeout=180)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             healed = True
             time.sleep(10)
             continue
@@ -36415,9 +36412,9 @@ def authentik_control():
     ak_dir = os.path.expanduser('~/authentik')
     _patch_authentik_compose_network()
     if action == 'start':
-        subprocess.run(f'cd {ak_dir} && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
     elif action == 'stop':
-        subprocess.run(f'cd {ak_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'down']), cwd=ak_dir, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
         subprocess.run(f'cd {ak_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
     elif action == 'update':
@@ -36896,7 +36893,7 @@ def authentik_uninstall():
     else:
         ak_dir = os.path.expanduser('~/authentik')
         if os.path.exists(ak_dir):
-            r = subprocess.run(f'cd {ak_dir} && docker compose down -v --rmi all --remove-orphans 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'down', '-v', '--rmi', 'all', '--remove-orphans']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             steps.append('Stopped and removed Docker containers/volumes/images')
             if r.returncode != 0:
                 steps.append(f'(compose reported: {(r.stderr or r.stdout or "").strip()[:200]})')
@@ -38249,8 +38246,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
     compose_changed = _ensure_authentik_compose_patches(compose_path, plog)
     try:
         pg_container = subprocess.run(
-            f'cd {ak_dir} && docker compose ps -q postgresql 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=15
+            _sudo_wrap(['docker', 'compose', 'ps', '-q', 'postgresql']), cwd=ak_dir, capture_output=True, text=True, timeout=15
         ).stdout.strip()
         if not pg_container:
             plog("  PostgreSQL container not found, skipping PG tuning runtime check")
@@ -38264,8 +38260,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
             # Command-line args changed — must recreate the container for them to take effect
             plog("  PostgreSQL tuning args changed — recreating container to apply enterprise settings (max_connections=2000, shared_buffers=12GB, ...)")
             subprocess.run(
-                f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120
+                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120
             )
             plog("  ✓ PostgreSQL recreated with enterprise tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB, statement_timeout=120s, idle_session_timeout=300s)")
         else:
@@ -38585,15 +38580,13 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
 
         plog("  routing repair: recreating LDAP container only (server/worker/db untouched)...")
         _r = subprocess.run(
-            f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap 2>&1',
-            shell=True, capture_output=True, text=True, timeout=90
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
         )
         if _r.returncode != 0:
             plog(f"  ⚠ routing repair: LDAP recreate failed, restoring backup: {(_r.stdout or '')[-300:]}")
             with open(compose_path, 'w') as _f:
                 _f.write(compose_text)
-            subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
-                shell=True, capture_output=True, text=True, timeout=90)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
             _record_spiral_repair_attempt('recreate_failed', evidence)
             return
 
@@ -38612,8 +38605,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
         plog(f"  ⚠ routing repair: validation failed (connected={connected}, tls_err={has_tls_err}, route_err={has_route_err}) — restoring backup")
         with open(compose_path, 'w') as _f:
             _f.write(compose_text)
-        subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
-            shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
         plog("  routing repair: restored LDAP routing to http://authentik-server-1:9000 (validation failed; FQDN path not viable on this box)")
         _record_spiral_repair_attempt('validation_failed', evidence)
     except Exception as e:
@@ -38739,15 +38731,13 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
 
         plog("  proactive routing: recreating LDAP container only (server/worker/db untouched)...")
         _r = subprocess.run(
-            f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap 2>&1',
-            shell=True, capture_output=True, text=True, timeout=90
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
         )
         if _r.returncode != 0:
             plog(f"  ⚠ proactive routing: LDAP recreate failed, restoring backup: {(_r.stdout or '')[-300:]}")
             with open(compose_path, 'w') as _f:
                 _f.write(compose_text)
-            subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
-                shell=True, capture_output=True, text=True, timeout=90)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
             return
 
         _t.sleep(30)
@@ -38774,8 +38764,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
         plog(f"  ⚠ proactive routing: validation failed (connected={connected}, tls_err={has_tls_err}, route_err={has_route_err}) — restoring backup")
         with open(compose_path, 'w') as _f:
             _f.write(compose_text)
-        subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
-            shell=True, capture_output=True, text=True, timeout=90)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
         plog("  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; will retry later)")
     except Exception as e:
         plog(f"  ⚠ proactive routing error (no changes applied): {e}")
@@ -38834,8 +38823,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
 
         plog("  gunicorn timeout: recreating Authentik server container only (worker/db/redis/ldap untouched)...")
         _r = subprocess.run(
-            f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate server 2>&1',
-            shell=True, capture_output=True, text=True, timeout=120
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'server']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120
         )
         if _r.returncode != 0:
             plog(f"  ⚠ gunicorn timeout: server recreate failed — env applied but not yet active: {(_r.stdout or '')[-300:]}")
@@ -41538,8 +41526,7 @@ def _ensure_authentik_pgbouncer(plog):
             with open(env_path, 'w') as f:
                 f.write(env_content)
             subprocess.run(
-                f'cd {ak_dir} && docker compose rm -sf pgbouncer 2>&1',
-                shell=True, capture_output=True, text=True, timeout=60
+                _sudo_wrap(['docker', 'compose', 'rm', '-sf', 'pgbouncer']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60
             )
         except Exception:
             pass
@@ -45307,8 +45294,7 @@ def _authentik_fix_pg_idle_timeout(plog):
     plog("  pg idle timeout: force-recreating Postgres (kills stuck sessions, clears stale advisory locks, applies new timeout)")
     try:
         r = subprocess.run(
-            f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
-            shell=True, capture_output=True, text=True, timeout=180
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180
         )
         if r.returncode != 0:
             plog(f"  ✗ pg idle timeout: Postgres recreate failed: {(r.stdout or r.stderr or '')[:300]}")
@@ -45333,8 +45319,7 @@ def _authentik_fix_pg_idle_timeout(plog):
         time.sleep(5)
         try:
             r = subprocess.run(
-                f'cd {ak_dir} && docker compose exec -T postgresql pg_isready -d authentik -U authentik 2>&1',
-                shell=True, capture_output=True, text=True, timeout=10
+                _sudo_wrap(['docker', 'compose', 'exec', '-T', 'postgresql', 'pg_isready', '-d', 'authentik', '-U', 'authentik']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10
             )
             if r.returncode == 0 and 'accepting connections' in (r.stdout or ''):
                 pg_ready = True
@@ -45555,7 +45540,7 @@ def run_authentik_deploy(reconfigure=False):
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             _patch_authentik_compose_network()
             _ensure_authentik_compose_patches(compose_path, plog)
-            subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
             _ensure_infratak_network_for_authentik()
             _ensure_infratak_network_for_portal()
             plog("  Ensured containers are up")
@@ -45574,7 +45559,7 @@ def run_authentik_deploy(reconfigure=False):
                             f.write(line)
                         f.write(f"# Cookie domain — session shared across subdomains (avoids stream. redirect loop)\nAUTHENTIK_COOKIE_DOMAIN={cookie_domain_val}\n")
                     plog("  Set AUTHENTIK_COOKIE_DOMAIN for subdomain shared session; restarting Authentik...")
-                    subprocess.run(f'cd {ak_dir} && docker compose restart 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'restart']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
             # Apply app access policies so only authentik Admins see infra-TAK/Node-RED
             if fqdn:
                 ak_token = ''
@@ -45666,8 +45651,8 @@ def run_authentik_deploy(reconfigure=False):
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
                                 _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
                                 plog("  Recreating LDAP + restarting Authentik server/worker (no log output for up to ~2 min)...")
-                                subprocess.run(f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-                                subprocess.run(f'cd {ak_dir} && docker compose restart server worker 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+                                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                                subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
                                 plog("  \u2713 Restarted Authentik (LDAP + server/worker to pick up new domain)")
                                 plog("  Waiting for Authentik to come back online...")
                                 _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True)
@@ -46153,17 +46138,17 @@ entries:
         except Exception as e:
             plog(f"  \u26a0 Swap setup skipped: {e}")
         plog("  Pulling images (this may take a few minutes)...")
-        r = subprocess.run(f'cd {ak_dir} && docker compose pull 2>&1', shell=True, capture_output=True, text=True, timeout=600)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'pull']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
         if r.returncode != 0:
             plog(f"  \u26a0 Pull had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
         else:
             plog("  \u2713 Images pulled")
         plog("  Starting PostgreSQL...")
-        r = subprocess.run(f'cd {ak_dir} && docker compose up -d postgresql 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
         if r.returncode != 0:
             plog(f"  \u26a0 Postgres start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
         for attempt in range(24):
-            rp = subprocess.run(f'cd {ak_dir} && docker compose exec -T postgresql pg_isready 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
+            rp = subprocess.run(_sudo_wrap(['docker', 'compose', 'exec', '-T', 'postgresql', 'pg_isready']), cwd=ak_dir, capture_output=True, text=True, timeout=10)
             if rp.returncode == 0:
                 plog("  \u2713 PostgreSQL ready")
                 break
@@ -46171,7 +46156,7 @@ entries:
         else:
             plog("  \u26a0 PostgreSQL not ready in time, starting server anyway")
         plog("  Starting server and worker...")
-        r = subprocess.run(f'cd {ak_dir} && docker compose up -d server worker 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'server', 'worker']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         _ensure_infratak_network_for_authentik()
         if r.returncode != 0:
             plog(f"  \u26a0 Start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
@@ -46202,7 +46187,7 @@ entries:
         # Step 9: Start LDAP outpost (placeholder token — Step 11 will inject real token and recreate)
         plog("")
         plog("\u2501\u2501\u2501 Step 9/12: Starting LDAP Outpost \u2501\u2501\u2501")
-        r = subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         for line in (r.stdout or '').strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 authentik_deploy_log.append(f"  {line.strip()}")
@@ -46634,7 +46619,7 @@ entries:
                                     plog(f"  ✗ No outpost_token_id — cannot inject token")
     
                                 # Ensure LDAP container is started (even if token inject failed)
-                                r = subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                                r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
                                 if r.returncode == 0:
                                     plog(f"  ✓ LDAP container started")
                                 else:
@@ -46643,7 +46628,7 @@ entries:
                     except Exception as e:
                         plog(f"  ✗ LDAP setup error: {str(e)[:200]}")
                         try:
-                            subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, timeout=60)
+                            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
                             plog(f"  ℹ LDAP container started (add token in Authentik → Outposts → LDAP, then restart LDAP)")
                         except Exception:
                             pass
@@ -46660,7 +46645,7 @@ entries:
             if 'ghcr.io/goauthentik/ldap' in compose_text or '\n  ldap:\n' in compose_text:
                 plog("")
                 plog("  Ensuring LDAP container is running...")
-                r = subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+                r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
                 if r.returncode == 0:
                     plog("  ✓ LDAP container is up")
                 else:
@@ -46978,8 +46963,7 @@ entries:
                 plog("  You can run it from Email Relay → 'Configure Authentik to use these settings'.")
         # Final LDAP restart: ensure container has the injected token and internal URL (after SMTP/recreate)
         try:
-            subprocess.run(f'cd {ak_dir} && docker compose restart ldap 2>&1',
-                shell=True, capture_output=True, text=True, timeout=60)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
             plog("  ✓ LDAP container restarted (final)")
         except Exception:
             pass
@@ -57216,7 +57200,7 @@ def run_full_uninstall():
         plog("━━━ TAK Portal ━━━")
         portal_dir = os.path.expanduser('~/TAK-Portal')
         if os.path.exists(portal_dir):
-            subprocess.run(f'cd {portal_dir} && docker compose down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'down', '-v', '--rmi', 'local']), cwd=portal_dir, capture_output=True, timeout=120)
             subprocess.run(f'rm -rf {portal_dir}', shell=True, capture_output=True)
         takportal_deploy_log.clear()
         takportal_deploy_status.update({'running': False, 'complete': False, 'error': False})
@@ -57304,7 +57288,7 @@ def run_full_uninstall():
         plog("━━━ Authentik ━━━")
         ak_dir = os.path.expanduser('~/authentik')
         if os.path.exists(ak_dir):
-            subprocess.run(f'cd {ak_dir} && docker compose down -v --rmi all --remove-orphans 2>/dev/null; true', shell=True, capture_output=True, text=True, timeout=180)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'down', '-v', '--rmi', 'all', '--remove-orphans']), cwd=ak_dir, capture_output=True, text=True, timeout=180)
             subprocess.run(f'rm -rf {ak_dir}', shell=True, capture_output=True)
         authentik_deploy_log.clear()
         authentik_deploy_status.update({'running': False, 'complete': False, 'error': False})
@@ -61294,8 +61278,7 @@ def _startup_harden_tak_portal_ports():
                 pass
         if _needs_recreate:
             r = subprocess.run(
-                f'cd {shlex.quote(_tp_dir)} && docker compose up -d --force-recreate 2>&1',
-                shell=True, capture_output=True, text=True, timeout=180
+                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_tp_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180
             )
             if r.returncode == 0:
                 print("Startup migration: TAK Portal recreated with 127.0.0.1:3000 binding")
@@ -61347,8 +61330,7 @@ def _startup_harden_cloudtak_ports():
                 pass
         if _needs_recreate:
             r = subprocess.run(
-                f'cd {shlex.quote(_ct_dir)} && docker compose up -d --force-recreate 2>&1',
-                shell=True, capture_output=True, text=True, timeout=240
+                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
             )
             if r.returncode == 0:
                 print("Startup migration: CloudTAK recreated with hardened port bindings")
@@ -63852,8 +63834,7 @@ def _post_update_auto_deploy():
                         override_yml = _cloudtak_build_override_yml(settings)
                         with open(override_path, 'w') as f:
                             f.write(override_yml)
-                        subprocess.run(f'cd {shlex.quote(ct_dir)} && docker compose up -d 2>/dev/null',
-                            shell=True, capture_output=True, text=True, timeout=120)
+                        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ct_dir, capture_output=True, text=True, timeout=120)
                         print("Post-update: CloudTAK override refreshed (local)")
                 except Exception as e:
                     print(f"Post-update: CloudTAK override refresh error: {e}")
@@ -63940,8 +63921,7 @@ def _post_update_auto_deploy():
                                     print("Post-update: Node-RED .env file created (empty scaffold)")
                                 except Exception as ee:
                                     print(f"Post-update: Node-RED .env create warning: {ee}")
-                            subprocess.run(f'cd {shlex.quote(nr_dir)} && docker compose up -d 2>/dev/null',
-                                shell=True, capture_output=True, text=True, timeout=120)
+                            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=nr_dir, capture_output=True, text=True, timeout=120)
                             print("Post-update: Node-RED recreated (compose patch)")
                         _nodered_malware_scan()
                         _auto_nodered_settings(nr_dir)
@@ -64470,8 +64450,7 @@ def _post_update_auto_deploy():
                                 needs_recreate = True
                                 print("Post-update: Authentik compose secure but containers still on 0.0.0.0, recreating")
                         if needs_recreate:
-                            subprocess.run(f'cd {shlex.quote(ak_dir)} && docker compose up -d 2>/dev/null',
-                                shell=True, capture_output=True, text=True, timeout=300)
+                            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, capture_output=True, text=True, timeout=300)
                             _ensure_infratak_network_for_authentik()
                             _ensure_infratak_network_for_portal()
                             print("Post-update: Authentik containers recreated with 127.0.0.1 bindings")
@@ -64883,8 +64862,7 @@ def _post_update_auto_deploy():
                     if not _compromised:
                         try:
                             _rec = subprocess.run(
-                                f'cd {shlex.quote(_cloudtak_dir)} && docker compose up -d --force-recreate 2>&1',
-                                shell=True, capture_output=True, text=True, timeout=240
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
                             )
                             if _rec.returncode == 0:
                                 print("  CloudTAK recreated with hardened port bindings")
@@ -64969,8 +64947,7 @@ def _post_update_auto_deploy():
                     if _needs_recreate:
                         try:
                             _r = subprocess.run(
-                                f'cd {shlex.quote(_portal_dir)} && docker compose up -d --force-recreate 2>&1',
-                                shell=True, capture_output=True, text=True, timeout=180
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180
                             )
                             if _r.returncode == 0:
                                 print("  TAK Portal recreated with 127.0.0.1:3000 binding")
