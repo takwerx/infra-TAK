@@ -1,63 +1,229 @@
-module takwerx_console_confined 0.1;
+module takwerx_console_confined 0.2;
 
 ########################################
-# infra-TAK console — CONFINED domain (v10.0.5, SELinux hardening)
+# infra-TAK console — CONFINED SELinux domain (v10.0.5 hardening)
 #
-# Moves the non-root console OFF unconfined_service_t into a dedicated, confined
-# `takwerx_console_t` domain. The console is a thin Flask/gunicorn app: it reads
-# its install (/opt/infratak), reads/writes its config (.config), binds :5001,
-# connects to the root broker's unix socket (/run/takwerx-broker.sock), spawns the
-# brokerctl helper, and makes outbound HTTP. ALL genuinely-privileged work happens
-# in the SEPARATE root broker process — so the console itself needs very little,
-# which is exactly what makes confining it feasible.
+# Moves the non-root console OFF unconfined_service_t into `takwerx_console_t`.
+# The console is a thin Flask/gunicorn app; ALL genuinely-privileged work happens
+# in the SEPARATE root broker process, so the console itself needs comparatively
+# little — which is what makes confining it feasible.
 #
-# RAW module (checkmodule -M -m), so it builds with NO `make`/refpolicy-Makefile
-# dependency — same mechanism start.sh already uses for takwerx_console.te.
-#
-# DEVELOPMENT POSTURE: ships `permissive takwerx_console_t` — the domain is ACTIVE
-# (AVCs are logged against it) but does NOT block, so it can never brick the
-# console. Allow-rules are grown from real AVCs (audit2allow) until a full deploy
-# shows ZERO denials, then `permissive` is removed and the domain enforced.
+# STATUS: PERMISSIVE first cut. The allow-rules below the structural block are the
+# RAW audit2allow harvest from a full deploy + console exercise on Rocky 9.8 — i.e.
+# "make it run", NOT yet security-minimised. Before this domain is ENFORCED it
+# needs TIGHTENING + review (operator/security):
+#   - it still allows exec of shell_exec_t/bin_t/systemd_systemctl_exec_t/
+#     container_runtime_exec_t (sh/python/systemctl/docker, execute_no_trans) —
+#     scope these to only what the console truly needs.
+#   - usr_t relabelfrom/relabelto + write/create/rename — tighten to .config only.
+#   - process getattr on every domain (reads /proc/<pid> for all procs = Guard Dog
+#     health monitoring) — consider a dedicated subdomain or `domain_read_all_*`.
+#   - prefer SELinux booleans/interfaces over broad allows where possible.
+# Until tightened it ships `permissive takwerx_console_t` (logs, never blocks), so
+# it can NEVER brick the console. Built raw (checkmodule -M -m) — no make dep.
 ########################################
 
 require {
-    type init_t;
-    type user_home_t;
-    type user_home_dir_t;
-    type var_run_t;
-    attribute domain;
-    class process { transition dyntransition siginh rlimitinh noatsecure sigchld };
-    class dir search;
-    class file { entrypoint open read getattr execute execute_no_trans map ioctl };
-    class lnk_file read;
-    class sock_file write;
-    class unix_stream_socket connectto;
+	type init_t;
+	type user_home_t;
+	type user_home_dir_t;
+	type NetworkManager_t;
+	type auditd_t;
+	type bin_t;
+	type cert_t;
+	type cgroup_t;
+	type chronyd_t;
+	type commplex_link_port_t;
+	type container_runtime_exec_t;
+	type container_runtime_t;
+	type crond_t;
+	type firewalld_t;
+	type getty_t;
+	type gssproxy_t;
+	type http_port_t;
+	type init_var_run_t;
+	type irqbalance_t;
+	type kernel_t;
+	type net_conf_t;
+	type node_t;
+	type passwd_file_t;
+	type policykit_t;
+	type proc_t;
+	type rngd_t;
+	type rpcbind_t;
+	type setroubleshootd_t;
+	type shell_exec_t;
+	type spc_t;
+	type sshd_t;
+	type sssd_public_t;
+	type sssd_var_lib_t;
+	type sysfs_t;
+	type syslogd_t;
+	type system_dbusd_t;
+	type system_dbusd_var_run_t;
+	type systemd_logind_t;
+	type systemd_systemctl_exec_t;
+	type systemd_unit_file_t;
+	type tmp_t;
+	type udev_t;
+	type unconfined_service_t;
+	type unconfined_t;
+	type usr_t;
+	type var_run_t;
+	type websm_port_t;
+	attribute domain;
+	role system_r;
+	class dbus send_msg;
+	class dir { add_name getattr open read remove_name search write };
+	class file { create entrypoint execute execute_no_trans getattr ioctl map open read relabelfrom relabelto rename setattr unlink write };
+	class lnk_file read;
+	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
+	class process getattr;
+	class sock_file { getattr write };
+	class system status;
+	class tcp_socket { accept bind connect create getattr getopt ioctl listen name_bind name_connect node_bind setopt };
+	class udp_socket { connect create getattr setopt };
+	class unix_stream_socket { connectto getattr ioctl };
+	class process { transition dyntransition siginh rlimitinh noatsecure sigchld };
+	class file entrypoint;
+	class sock_file write;
+	class unix_stream_socket connectto;
 }
 
 type takwerx_console_t;
 typeattribute takwerx_console_t domain;
 role system_r types takwerx_console_t;
 
-# Permissive WHILE WE HARVEST. Remove this single line to enforce (only after a
-# full deploy shows zero AVCs against takwerx_console_t).
+# PERMISSIVE while harvested rules are tightened. Removing this single line (after
+# tightening + a clean enforcing validation) enforces the domain.
 permissive takwerx_console_t;
 
-# systemd (init_t) launches the console with SELinuxContext=...:takwerx_console_t
-# (setexeccon -> transition). Allow the transition + inherited bits.
+# --- structural: systemd launch transition + broker-socket connect ---
 allow init_t takwerx_console_t:process { transition dyntransition siginh rlimitinh noatsecure };
 allow takwerx_console_t init_t:process sigchld;
-
-# Enter the domain via the venv entrypoint (covers the in-home + /opt/infratak
-# install labels); init_t may traverse + read/exec it.
 allow takwerx_console_t user_home_t:file entrypoint;
 allow init_t user_home_dir_t:dir search;
 allow init_t user_home_t:file { open read getattr execute execute_no_trans map ioctl };
 allow init_t user_home_t:lnk_file read;
 
-# Connect to the root broker's unix socket (the console's ONLY privilege path).
-allow takwerx_console_t var_run_t:sock_file write;
-allow takwerx_console_t init_t:unix_stream_socket connectto;
-
-########################################
-# HARVESTED (audit2allow) — appended during development; empty on first cut.
-########################################
+# --- HARVESTED (audit2allow, raw — see STATUS note; needs tightening) ---
+allow takwerx_console_t NetworkManager_t:dir { getattr search };
+allow takwerx_console_t NetworkManager_t:file { open read };
+allow takwerx_console_t NetworkManager_t:process getattr;
+allow takwerx_console_t auditd_t:dir { getattr search };
+allow takwerx_console_t auditd_t:file { open read };
+allow takwerx_console_t auditd_t:process getattr;
+allow takwerx_console_t bin_t:file { entrypoint execute execute_no_trans };
+#!!!! This avc can be allowed using the boolean 'domain_can_mmap_files'
+allow takwerx_console_t bin_t:file map;
+allow takwerx_console_t cert_t:dir { getattr open read search };
+allow takwerx_console_t cert_t:file { getattr open read };
+allow takwerx_console_t cert_t:lnk_file read;
+allow takwerx_console_t cgroup_t:dir search;
+allow takwerx_console_t cgroup_t:file { open read };
+allow takwerx_console_t chronyd_t:dir { getattr search };
+allow takwerx_console_t chronyd_t:file { open read };
+allow takwerx_console_t chronyd_t:process getattr;
+allow takwerx_console_t commplex_link_port_t:tcp_socket name_bind;
+allow takwerx_console_t container_runtime_exec_t:file { execute execute_no_trans getattr open read };
+#!!!! This avc can be allowed using the boolean 'domain_can_mmap_files'
+allow takwerx_console_t container_runtime_exec_t:file map;
+allow takwerx_console_t container_runtime_t:dir { getattr search };
+allow takwerx_console_t container_runtime_t:file { open read };
+allow takwerx_console_t container_runtime_t:process getattr;
+allow takwerx_console_t crond_t:dir { getattr search };
+allow takwerx_console_t crond_t:file { open read };
+allow takwerx_console_t crond_t:process getattr;
+allow takwerx_console_t firewalld_t:dir { getattr search };
+allow takwerx_console_t firewalld_t:file { open read };
+allow takwerx_console_t firewalld_t:process getattr;
+allow takwerx_console_t getty_t:dir { getattr search };
+allow takwerx_console_t getty_t:file { open read };
+allow takwerx_console_t getty_t:process getattr;
+allow takwerx_console_t gssproxy_t:dir { getattr search };
+allow takwerx_console_t gssproxy_t:file { open read };
+allow takwerx_console_t gssproxy_t:process getattr;
+allow takwerx_console_t http_port_t:tcp_socket name_connect;
+allow takwerx_console_t init_t:dbus send_msg;
+allow takwerx_console_t init_t:dir { getattr search };
+allow takwerx_console_t init_t:file { open read };
+allow takwerx_console_t init_t:lnk_file read;
+allow takwerx_console_t init_t:process getattr;
+allow takwerx_console_t init_t:system status;
+allow takwerx_console_t init_t:unix_stream_socket { getattr ioctl };
+allow takwerx_console_t init_var_run_t:dir search;
+allow takwerx_console_t irqbalance_t:dir { getattr search };
+allow takwerx_console_t irqbalance_t:file { open read };
+allow takwerx_console_t irqbalance_t:process getattr;
+allow takwerx_console_t kernel_t:dir { getattr search };
+allow takwerx_console_t kernel_t:file { open read };
+allow takwerx_console_t kernel_t:process getattr;
+allow takwerx_console_t net_conf_t:file { getattr open read };
+allow takwerx_console_t node_t:tcp_socket node_bind;
+allow takwerx_console_t passwd_file_t:file { getattr open read };
+allow takwerx_console_t policykit_t:dir { getattr search };
+allow takwerx_console_t policykit_t:file { open read };
+allow takwerx_console_t policykit_t:process getattr;
+allow takwerx_console_t proc_t:dir read;
+allow takwerx_console_t proc_t:file { getattr open read };
+allow takwerx_console_t rngd_t:dir { getattr search };
+allow takwerx_console_t rngd_t:file { open read };
+allow takwerx_console_t rngd_t:process getattr;
+allow takwerx_console_t rpcbind_t:dir { getattr search };
+allow takwerx_console_t rpcbind_t:file { open read };
+allow takwerx_console_t rpcbind_t:process getattr;
+allow takwerx_console_t self:netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
+allow takwerx_console_t self:process getattr;
+allow takwerx_console_t self:tcp_socket { accept bind connect create getattr getopt ioctl listen setopt };
+allow takwerx_console_t self:udp_socket { connect create getattr setopt };
+allow takwerx_console_t setroubleshootd_t:dir { getattr search };
+allow takwerx_console_t setroubleshootd_t:file { open read };
+allow takwerx_console_t setroubleshootd_t:process getattr;
+allow takwerx_console_t shell_exec_t:file { execute execute_no_trans };
+#!!!! This avc can be allowed using the boolean 'domain_can_mmap_files'
+allow takwerx_console_t shell_exec_t:file map;
+allow takwerx_console_t spc_t:dir { getattr search };
+allow takwerx_console_t spc_t:file { getattr ioctl open read };
+allow takwerx_console_t spc_t:process getattr;
+allow takwerx_console_t sshd_t:dir { getattr search };
+allow takwerx_console_t sshd_t:file { open read };
+allow takwerx_console_t sshd_t:process getattr;
+allow takwerx_console_t sssd_public_t:dir search;
+allow takwerx_console_t sssd_var_lib_t:dir search;
+allow takwerx_console_t sysfs_t:file { open read };
+allow takwerx_console_t syslogd_t:dir { getattr search };
+allow takwerx_console_t syslogd_t:file { open read };
+allow takwerx_console_t syslogd_t:process getattr;
+allow takwerx_console_t system_dbusd_t:dbus send_msg;
+allow takwerx_console_t system_dbusd_t:dir { getattr search };
+allow takwerx_console_t system_dbusd_t:file { open read };
+allow takwerx_console_t system_dbusd_t:process getattr;
+allow takwerx_console_t system_dbusd_t:unix_stream_socket connectto;
+allow takwerx_console_t system_dbusd_var_run_t:dir search;
+allow takwerx_console_t system_dbusd_var_run_t:sock_file write;
+allow takwerx_console_t systemd_logind_t:dir { getattr search };
+allow takwerx_console_t systemd_logind_t:file { open read };
+allow takwerx_console_t systemd_logind_t:process getattr;
+allow takwerx_console_t systemd_systemctl_exec_t:file { execute execute_no_trans open read };
+#!!!! This avc can be allowed using the boolean 'domain_can_mmap_files'
+allow takwerx_console_t systemd_systemctl_exec_t:file map;
+allow takwerx_console_t systemd_unit_file_t:dir search;
+allow takwerx_console_t systemd_unit_file_t:file { getattr ioctl open read };
+allow takwerx_console_t tmp_t:dir { add_name remove_name write };
+allow takwerx_console_t tmp_t:file { create open setattr unlink write };
+allow takwerx_console_t udev_t:dir { getattr search };
+allow takwerx_console_t udev_t:file { open read };
+allow takwerx_console_t udev_t:process getattr;
+allow takwerx_console_t unconfined_service_t:dir { getattr search };
+allow takwerx_console_t unconfined_service_t:file { open read };
+allow takwerx_console_t unconfined_service_t:process getattr;
+allow takwerx_console_t unconfined_service_t:unix_stream_socket connectto;
+allow takwerx_console_t unconfined_t:dir { getattr search };
+allow takwerx_console_t unconfined_t:file { open read };
+allow takwerx_console_t user_home_dir_t:dir search;
+allow takwerx_console_t user_home_t:dir { getattr search };
+allow takwerx_console_t user_home_t:file { getattr ioctl open read };
+allow takwerx_console_t usr_t:dir { add_name remove_name write };
+allow takwerx_console_t usr_t:file { create entrypoint execute relabelfrom relabelto rename setattr unlink write };
+allow takwerx_console_t var_run_t:sock_file getattr;
+allow takwerx_console_t websm_port_t:tcp_socket name_connect;
