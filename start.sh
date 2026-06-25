@@ -742,58 +742,50 @@ EOF
 # policy version. No-op on non-SELinux hosts (Debian/Ubuntu: getenforce absent).
 # Validated on Rocky 9.6 under Enforcing (systemd-run init_t exec+import+read+bind
 # all succeed, zero denials).
-install_selinux_console_policy() {
-    command -v getenforce >/dev/null 2>&1 || return 0
-    [ "$(getenforce 2>/dev/null)" = "Disabled" ] && return 0
-    local te="$INSTALL_DIR/selinux/takwerx_console.te"
-    [ -f "$te" ] || { echo -e "${YELLOW}  ⚠ SELinux policy source missing ($te) — console may not start under enforcing${NC}"; return 0; }
-    # already current? (idempotent re-runs skip the rebuild)
-    if semodule -l 2>/dev/null | grep -q '^takwerx_console'; then
-        echo "  ✓ SELinux console policy already installed"
-        return 0
+# Build+install one raw checkmodule .te. Echoes its own status. Returns 0 on
+# success (module installed or already present), 1 otherwise.
+_install_selinux_module() {
+    local name="$1" te="$2"
+    [ -f "$te" ] || return 1
+    if semodule -l 2>/dev/null | grep -qx "$name"; then
+        return 0   # already installed (idempotent re-run)
     fi
-    if ! command -v checkmodule >/dev/null 2>&1; then
-        dnf install -y checkpolicy >/dev/null 2>&1 || true
-    fi
-    if ! command -v checkmodule >/dev/null 2>&1 || ! command -v semodule_package >/dev/null 2>&1; then
-        echo -e "${YELLOW}  ⚠ SELinux policy tools unavailable — console may not start under enforcing${NC}"
-        return 0
-    fi
-    local tmp; tmp=$(mktemp -d)
-    if checkmodule -M -m -o "$tmp/takwerx_console.mod" "$te" >/dev/null 2>&1 \
-       && semodule_package -o "$tmp/takwerx_console.pp" -m "$tmp/takwerx_console.mod" >/dev/null 2>&1 \
-       && semodule -i "$tmp/takwerx_console.pp" >/dev/null 2>&1; then
-        echo "  ✓ SELinux console policy installed (takwerx_console)"
-    else
-        echo -e "${YELLOW}  ⚠ SELinux console policy failed to install — console may not start under enforcing${NC}"
+    command -v checkmodule >/dev/null 2>&1 || dnf install -y checkpolicy >/dev/null 2>&1 || true
+    command -v checkmodule >/dev/null 2>&1 && command -v semodule_package >/dev/null 2>&1 || return 1
+    local tmp; tmp=$(mktemp -d); local rc=1
+    if checkmodule -M -m -o "$tmp/$name.mod" "$te" >/dev/null 2>&1 \
+       && semodule_package -o "$tmp/$name.pp" -m "$tmp/$name.mod" >/dev/null 2>&1 \
+       && semodule -i "$tmp/$name.pp" >/dev/null 2>&1; then
+        rc=0
     fi
     rm -rf "$tmp"
+    return $rc
+}
 
-    # Born-non-root: also install the CONFINED domain (takwerx_console_t). The
-    # console then runs in its own SELinux domain instead of unconfined_service_t.
-    # Ships PERMISSIVE (logs AVCs, never blocks) for a safe rollout; enforcing is a
-    # deliberate flip (drop the `permissive` line in the .te) after a fleet soak —
-    # already validated to run a full deploy with 0 denials. Sets
-    # CONFINED_POLICY_OK so create_service emits the takwerx_console_t context.
+install_selinux_console_policy() {
     CONFINED_POLICY_OK=0
-    [ "$BORN_NONROOT" = "1" ] || return 0
-    local cte="$INSTALL_DIR/selinux/takwerx_console_confined.te"
-    [ -f "$cte" ] || return 0
-    if semodule -l 2>/dev/null | grep -q '^takwerx_console_confined'; then
-        CONFINED_POLICY_OK=1
-        echo "  ✓ SELinux confined console domain already installed"
-        return 0
+    command -v getenforce >/dev/null 2>&1 || return 0
+    [ "$(getenforce 2>/dev/null)" = "Disabled" ] && return 0
+
+    # 1) The unconfined-helper policy (lets init_t exec the in-home venv +
+    #    transition to unconfined_service_t — used by the ROOT install path).
+    if _install_selinux_module takwerx_console "$INSTALL_DIR/selinux/takwerx_console.te"; then
+        echo "  ✓ SELinux console policy installed (takwerx_console)"
+    else
+        echo -e "${YELLOW}  ⚠ SELinux console policy failed — console may not start under enforcing${NC}"
     fi
-    local ctmp; ctmp=$(mktemp -d)
-    if checkmodule -M -m -o "$ctmp/c.mod" "$cte" >/dev/null 2>&1 \
-       && semodule_package -o "$ctmp/c.pp" -m "$ctmp/c.mod" >/dev/null 2>&1 \
-       && semodule -i "$ctmp/c.pp" >/dev/null 2>&1; then
+
+    # 2) Born-non-root: the CONFINED domain (takwerx_console_t) — the console runs
+    #    in its own SELinux domain instead of unconfined_service_t. Ships
+    #    PERMISSIVE (logs AVCs, never blocks) for a safe rollout; enforcing is a
+    #    deliberate flip (drop the `permissive` line in the .te) after a fleet
+    #    soak — already validated to run a full deploy with 0 denials. Sets
+    #    CONFINED_POLICY_OK so create_service emits the takwerx_console_t context.
+    if [ "$BORN_NONROOT" = "1" ] \
+       && _install_selinux_module takwerx_console_confined "$INSTALL_DIR/selinux/takwerx_console_confined.te"; then
         CONFINED_POLICY_OK=1
         echo "  ✓ SELinux confined console domain installed (takwerx_console_t, permissive)"
-    else
-        echo -e "${YELLOW}  ⚠ confined domain failed to build — console will use unconfined_service_t${NC}"
     fi
-    rm -rf "$ctmp"
 }
 
 # ==========================================
