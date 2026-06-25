@@ -30,10 +30,33 @@ echo -e "${CYAN}${BOLD}  ╚═════════════════�
 echo ""
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}ERROR: This script must be run as root${NC}"
     echo "Please run: sudo $0"
     exit 1
+fi
+
+# ==========================================
+# Born-non-root mode (v10.0.5)
+# ==========================================
+# Provision the console to run as the UNPRIVILEGED `takwerx` user from
+# /opt/infratak, HOME=/home/takwerx, with ALL privileged work mediated by the
+# root broker (broker/takwerx_broker.py). start.sh itself still runs as root (it
+# does the privileged provisioning); only the CONSOLE drops privilege.
+#
+# Gating (deliberately conservative this release): born-non-root is OPT-IN via
+# TAKWERX_NONROOT=1. Existing AND fresh root installs are byte-identical to
+# before. The ship decision is to flip this to default-for-fresh-installs (add an
+# `|| [ <fresh box> ]` clause); not done yet because the ~110 remaining
+# shell-string privileged calls have not been converted, so a born-non-root box
+# cannot complete every module deploy until that tail lands.
+NONROOT_USER="takwerx"
+NONROOT_GROUP="takwerx"
+NONROOT_HOME="/home/takwerx"
+NONROOT_INSTALL="/opt/infratak"
+BORN_NONROOT=0
+if [ "${TAKWERX_NONROOT:-}" = "1" ]; then
+    BORN_NONROOT=1
 fi
 
 # ==========================================
@@ -488,6 +511,61 @@ EOF
 }
 
 # ==========================================
+# Born-non-root provisioning (v10.0.5)
+# ==========================================
+# Make `takwerx` a real, home-owning user; relocate the repo to /opt/infratak
+# owned by takwerx; re-point INSTALL_DIR so every later step (venv build, .config,
+# cert, unit) lands in the non-root install. Idempotent. No-op unless BORN_NONROOT.
+provision_nonroot() {
+    [ "$BORN_NONROOT" = "1" ] || return 0
+    echo -e "${CYAN}  Provisioning non-root console (takwerx @ $NONROOT_INSTALL)...${NC}"
+
+    # 1. takwerx group + user with a REAL home and shell. The broker may have
+    #    already created takwerx as a --system nologin acct (home /nonexistent);
+    #    upgrade it in place to a usable home/shell (modules do `cd ~/authentik`
+    #    and run shell scripts). takwerx gets NO sudo and NO docker group — the
+    #    broker performs every privileged op on its behalf.
+    getent group "$NONROOT_GROUP" >/dev/null 2>&1 || groupadd --system "$NONROOT_GROUP"
+    if getent passwd "$NONROOT_USER" >/dev/null 2>&1; then
+        usermod -d "$NONROOT_HOME" -s /bin/bash "$NONROOT_USER" 2>/dev/null || true
+    else
+        useradd -m -d "$NONROOT_HOME" -s /bin/bash -g "$NONROOT_GROUP" "$NONROOT_USER"
+    fi
+    mkdir -p "$NONROOT_HOME"
+    chown "$NONROOT_USER:$NONROOT_GROUP" "$NONROOT_HOME"
+    chmod 755 "$NONROOT_HOME"
+
+    # 2. Relocate the repo to /opt/infratak (owned by takwerx). The .venv is
+    #    path-specific (shebangs) and is rebuilt at the new path by
+    #    install_dependencies; .config/.git are carried over if present.
+    if [ "$INSTALL_DIR" != "$NONROOT_INSTALL" ]; then
+        mkdir -p "$NONROOT_INSTALL"
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --exclude '.venv' "$INSTALL_DIR/" "$NONROOT_INSTALL/"
+        else
+            cp -a "$INSTALL_DIR/." "$NONROOT_INSTALL/" 2>/dev/null || true
+            rm -rf "$NONROOT_INSTALL/.venv"
+        fi
+    fi
+    chown -R "$NONROOT_USER:$NONROOT_GROUP" "$NONROOT_INSTALL"
+
+    # 3. Re-point every path the rest of the script uses.
+    INSTALL_DIR="$NONROOT_INSTALL"
+    CONFIG_DIR="$INSTALL_DIR/.config"
+    AUTH_FILE="$CONFIG_DIR/auth.json"
+    SETTINGS_FILE="$CONFIG_DIR/settings.json"
+    echo -e "  ${GREEN}✓ takwerx user ready; console will run from $NONROOT_INSTALL${NC}"
+}
+
+# Final ownership pass — after venv build, .config, and cert generation, hand the
+# whole non-root install (and the broker log group) to takwerx. Mode 600 on the
+# password hash is preserved (takwerx, the console user, must read it).
+finalize_nonroot_ownership() {
+    [ "$BORN_NONROOT" = "1" ] || return 0
+    chown -R "$NONROOT_USER:$NONROOT_GROUP" "$INSTALL_DIR"
+}
+
+# ==========================================
 # Create systemd Service
 # ==========================================
 # If the service already exists and points to a directory that has .config/auth.json,
@@ -528,6 +606,19 @@ except Exception:
         SERVICE_HOME="/root"
     fi
 
+    # Born-non-root: the console drops to the unprivileged takwerx user with its
+    # own home, so module deploys (`cd ~/authentik`, etc.) land under
+    # /home/takwerx — NOT /root (which takwerx, mode-700, cannot traverse). All
+    # privileged ops go through the broker, so no User-side sudo/docker group is
+    # needed. The SELinuxContext (unconfined_service_t) is kept: validated to let
+    # the takwerx console exec its venv + bind the port under Enforcing.
+    SERVICE_USER_DIRECTIVE=""
+    if [ "$BORN_NONROOT" = "1" ]; then
+        SERVICE_USER_DIRECTIVE="User=$NONROOT_USER
+Group=$NONROOT_GROUP"
+        SERVICE_HOME="$NONROOT_HOME"
+    fi
+
     # v10.0.1 (RHEL/SELinux): under SELinux enforcing, systemd (init_t) cannot
     # traverse the operator's home (user_home_dir_t) nor exec the gunicorn venv
     # there (user_home_t) — the service crash-loops with 203/EXEC and nothing
@@ -552,7 +643,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-${SELINUX_DIRECTIVE:+$SELINUX_DIRECTIVE
+${SERVICE_USER_DIRECTIVE:+$SERVICE_USER_DIRECTIVE
+}${SELINUX_DIRECTIVE:+$SELINUX_DIRECTIVE
 }ExecStartPre=-$USE_DIR/.venv/bin/python3 $USE_DIR/selfheal_ip.py
 ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
@@ -614,6 +706,11 @@ detect_os
 check_disk_io
 wait_for_upgrades
 
+# Born-non-root: provision takwerx + relocate to /opt/infratak BEFORE the venv is
+# built, so .venv/.config/cert/unit all land in the non-root install. No-op unless
+# TAKWERX_NONROOT=1.
+provision_nonroot
+
 install_dependencies
 
 # First-time setup if no auth file exists
@@ -632,6 +729,10 @@ install_selinux_console_policy
 # Additive — the console still runs as root; this just makes the broker path
 # available (and provable via TAKWERX_FORCE_BROKER=1).
 install_broker
+
+# Born-non-root: now that venv, .config and cert exist, hand the whole install to
+# takwerx (no-op unless TAKWERX_NONROOT=1).
+finalize_nonroot_ownership
 
 # Create and start systemd service
 create_service
