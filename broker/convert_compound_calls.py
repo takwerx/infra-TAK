@@ -52,7 +52,7 @@ PRIV_BINS = {'systemctl', 'ufw', 'firewall-cmd', 'dnf', 'apt', 'apt-get', 'yum',
              'docker', 'docker-compose', 'semanage', 'fail2ban-client', 'swapon',
              'swapoff', 'mkswap', 'fallocate', 'install', 'chown', 'chmod', 'tee',
              'cp', 'mv', 'rm', 'mkdir', 'ln', 'touch', 'sysctl', 'restorecon',
-             'journalctl', 'loginctl'}
+             'journalctl', 'loginctl', 'semodule', 'chcon'}
 REDIR_RE = re.compile(r'\s*(?:\d*>&\d+|&?>{1,2}\s*/dev/null|\d*>\s*/dev/null)')
 TRAIL_TRUE_RE = re.compile(r'\s*(?:;|\|\|)\s*true\s*$')
 SENT = '\x00%d\x00'
@@ -190,13 +190,12 @@ def plan(node, src):
             toks = shlex.split(seg)
         except ValueError as e:
             return None, f'shlex: {e}'
-        while toks and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', toks[0]):
-            toks.pop(0)   # strip leading VAR=value (broker sets apt env itself)
+        while toks and (toks[0] == 'sudo' or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', toks[0])):
+            toks.pop(0)   # strip leading sudo + VAR=value (broker runs as root,
+                          # and sets apt env itself)
         if not toks or SENT_RE.search(toks[0]):
             return None, 'dynamic/empty head'
         base = os.path.basename(toks[0])
-        if base == 'sudo':
-            return None, 'sudo-prefixed segment'
         if base not in PRIV_BINS:
             return None, f'non-privileged segment head: {base}'
         argv_lists.append(tokens_to_argv(toks, exprs))

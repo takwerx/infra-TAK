@@ -46,7 +46,7 @@ SUBPROC_FUNCS = {'run', 'call', 'check_call', 'check_output', 'Popen'}
 PRIV_BINS = {'systemctl', 'ufw', 'firewall-cmd', 'dnf', 'apt', 'apt-get', 'yum',
              'docker', 'docker-compose', 'semanage', 'fail2ban-client', 'swapon',
              'swapoff', 'mkswap', 'fallocate', 'install', 'chown', 'chmod', 'tee',
-             'cp', 'mv', 'rm', 'mkdir', 'ln', 'touch', 'sysctl', 'restorecon'}
+             'cp', 'mv', 'rm', 'mkdir', 'ln', 'touch', 'sysctl', 'restorecon', 'semodule', 'chcon'}
 OPERATORS = {'&&', '||', '|', ';', '>', '>>', '<', '&', '2>'}
 REDIR_RE = re.compile(r'\s*(?:\d*>&\d+|&?>{1,2}\s*/dev/null|\d*>\s*/dev/null)')
 TRAIL_TRUE_RE = re.compile(r'\s*(?:;|\|\|)\s*true\s*$')

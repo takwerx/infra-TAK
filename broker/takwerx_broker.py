@@ -100,8 +100,11 @@ EXEC_ALLOW = {
     # storage / kernel knobs (path-checked where they take a file). sysctl is
     # gated to safe params only (see _check_sysctl) — VM tuning, not kernel.*
     'swapon', 'swapoff', 'mkswap', 'fallocate', 'sync', 'sysctl',
-    # SELinux: read-only inspection + `semanage port` (gated — see _check_semanage)
-    'getenforce', 'getsebool', 'restorecon', 'semanage',
+    # SELinux: read-only inspection + `semanage port`/`fcontext` (gated — see
+    # _check_semanage), `semodule -l/-r <tak modules>` (gated — _check_semodule),
+    # `chcon -t <safe type>` (gated — _check_chcon). Module deploys/uninstalls
+    # need these for TAK's own policy + cesium/caddy file labels.
+    'getenforce', 'getsebool', 'restorecon', 'semanage', 'semodule', 'chcon',
     # read-only inspection (routed for a single audit point)
     'ss', 'ip', 'getent', 'getcap',
     # package managers (gated — see _check_pkgmgr: install/remove only, no -o hooks).
@@ -140,7 +143,9 @@ EXEC_DENY = {
     'env', 'nohup', 'nice', 'timeout', 'xargs', 'find',    # exec wrappers / -exec
     'perl', 'python', 'python3', 'ruby', 'awk', 'gawk',    # interpreters
     'sed', 'dd', 'psql', 'openssl',                        # arbitrary write/exec
-    'semodule', 'setsebool', 'setcap',                     # confinement / caps
+    'setsebool', 'setcap',                                 # confinement / caps
+    # NB: `semodule` is now ALLOWED but tightly gated (_check_semodule: -l, and
+    # -r only for TAK's own policy modules) — it is NOT a blanket allow.
     'visudo', 'passwd', 'chpasswd', 'useradd', 'usermod', 'groupadd',
 }
 
@@ -194,6 +199,12 @@ PATH_ALLOW_EXACT = (
     '/etc/docker/daemon.json',
     '/swapfile',
     '/usr/sbin/ufw',            # ufw->firewalld shim (RHEL); see _check_install
+    # Module binaries installed via `install`/`mv` to a system bin dir. EXACT
+    # paths only (NOT the /usr/bin or /usr/local/bin PREFIX, which stay denied as
+    # root-PATH escalation surfaces). Same inherent power as a package that drops
+    # the same binary — gated to these two known files.
+    '/usr/bin/caddy',                  # official static Caddy (RHEL binary install)
+    '/usr/local/bin/mediamtx',         # MediaMTX (no distro package)
     # Console-owned helper scripts run by systemd units the console ALSO writes
     # (so this grants no privilege beyond the unit it's paired with — same
     # inherent near-root as writing the unit itself). Exact paths only, NOT the
@@ -344,6 +355,10 @@ def check_exec(argv, cwd=None):
         _check_pkgmgr(argv)
     elif base == 'semanage':
         _check_semanage(argv)
+    elif base == 'semodule':
+        _check_semodule(argv)
+    elif base == 'chcon':
+        _check_chcon(argv, cwd)
     elif base == 'install':
         _check_install(argv)
     elif base == 'sysctl':
@@ -358,10 +373,19 @@ def _check_pkgmgr(argv):
     block the `-o`/`--setopt` hook-command vector (e.g.
     `apt-get -o APT::Update::Pre-Invoke::=cmd`). Installing a package still runs
     its root post-install script — that residual is inherent to package mgmt."""
+    # The ONLY --setopt permitted: clean_requirements_on_remove (a benign bool
+    # controlling dependency cleanup on `dnf remove takserver`; cannot run code).
+    # Every other -o/--setopt — especially the Pre-Invoke/hook vectors — is denied.
+    SAFE_SETOPT = 'clean_requirements_on_remove'
     sub = None
     for a in argv[1:]:
         # -o KEY=VAL / --option / --setopt run arbitrary config incl. exec hooks
-        if a in ('-o', '--option', '--setopt') or a.startswith(('-o', '--setopt=', '--option=')):
+        if a.startswith('--setopt='):
+            key = a.split('=', 1)[1].split('=', 1)[0].strip()
+            if key != SAFE_SETOPT:
+                raise Denied(f'{argv[0]}: --setopt {key} not allowed')
+            continue
+        if a in ('-o', '--option', '--setopt') or a.startswith(('-o', '--option=')):
             raise Denied(f'{argv[0]}: -o/--setopt option not allowed')
         if '::' in a and a.startswith('-'):
             raise Denied(f'{argv[0]}: config-override option not allowed: {a}')
@@ -373,11 +397,99 @@ def _check_pkgmgr(argv):
         raise Denied(f'{argv[0]} subcommand not allowed: {sub}')
 
 
+# SELinux file-context types the console may LABEL (semanage fcontext / chcon).
+# Content/exec types for serving files (cesium tiles, the caddy binary) — NOT
+# security-sensitive domains. Relabelling to e.g. shadow_t / unconfined_t stays
+# denied.
+SELINUX_SAFE_TYPES = {'httpd_sys_content_t', 'httpd_exec_t', 'bin_t',
+                      'var_t', 'usr_t', 'cert_t'}
+# SELinux policy MODULES the console may remove (TAK's own, on uninstall). It
+# may NOT remove arbitrary modules (e.g. another service's confinement, or its
+# own future takwerx_console policy).
+SEMODULE_REMOVABLE = {'takserver', 'takserver-policy'}
+
+
 def _check_semanage(argv):
-    """semanage manages SELinux policy bits. Allow ONLY `semanage port` (the
-    console labels custom Caddy ports http_port_t); deny fcontext/login/etc."""
-    if len(argv) < 2 or argv[1] != 'port':
-        raise Denied('semanage: only `semanage port` is allowed')
+    """semanage manages SELinux policy bits. Allow `semanage port` (custom Caddy
+    ports -> http_port_t) and `semanage fcontext -t <safe content/exec type>`
+    (cesium tiles served by httpd). Deny login/user/boolean/etc. and any
+    relabel to a security-sensitive type."""
+    if len(argv) < 2 or argv[1] not in ('port', 'fcontext'):
+        raise Denied('semanage: only `semanage port` / `semanage fcontext` allowed')
+    if argv[1] == 'fcontext':
+        t = None
+        for i, a in enumerate(argv[2:], start=2):
+            if a == '-t' and i + 1 < len(argv):
+                t = argv[i + 1]
+            elif a.startswith('--type='):
+                t = a.split('=', 1)[1]
+        if t is None or t not in SELINUX_SAFE_TYPES:
+            raise Denied(f'semanage fcontext: type not in safe set: {t}')
+
+
+def _check_semodule(argv):
+    """SELinux policy module management. Allow `-l`/`--list-modules` (read-only)
+    and `-r <module>` ONLY for TAK's own policy modules (removed on uninstall).
+    Deny `-i`/`-B`/`-X` and removal of any other module (which could strip
+    another service's — or the console's own — confinement)."""
+    args = [a for a in argv[1:]]
+    if not args:
+        raise Denied('semodule: no operation')
+    # list forms
+    if all(a in ('-l', '--list-modules', '-lfull', '--list', '-a') or a.startswith('--list')
+           for a in args):
+        return
+    # removal: -r NAME [-r NAME ...], no other ops
+    i = 0
+    saw_remove = False
+    while i < len(args):
+        a = args[i]
+        if a in ('-r', '--remove'):
+            if i + 1 >= len(args):
+                raise Denied('semodule -r: missing module name')
+            name = args[i + 1]
+            if name not in SEMODULE_REMOVABLE:
+                raise Denied(f'semodule -r: module not removable: {name}')
+            saw_remove = True
+            i += 2
+            continue
+        if a.startswith('-'):
+            raise Denied(f'semodule: option not allowed: {a}')
+        raise Denied(f'semodule: unexpected arg: {a}')
+    if not saw_remove:
+        raise Denied('semodule: only -l / -r <tak module> allowed')
+
+
+def _check_chcon(argv, cwd=None):
+    """chcon relabels a file's SELinux type. Allow ONLY `-t <safe type>` on an
+    allowlisted path (the console relabels its own binaries/content, e.g.
+    /usr/bin/caddy -> httpd_exec_t). Deny -u/-r (user/role), --reference, and
+    relabelling to a security-sensitive type or an off-allowlist path."""
+    t = None
+    paths = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '-t' and i + 1 < len(argv):
+            t = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith('--type='):
+            t = a.split('=', 1)[1]
+            i += 1
+            continue
+        if a in ('-R', '-v', '-h', '--no-dereference', '-P'):
+            i += 1
+            continue
+        if a.startswith('-'):
+            raise Denied(f'chcon: option not allowed: {a}')
+        paths.append(a)
+        i += 1
+    if t is None or t not in SELINUX_SAFE_TYPES:
+        raise Denied(f'chcon: type not in safe set: {t}')
+    base_cwd = cwd if (cwd and isinstance(cwd, str) and cwd.startswith('/')) else '/'
+    for p in paths:
+        _path_allowed(p if p.startswith('/') else os.path.join(base_cwd, p))
 
 
 SYSCTL_SAFE_PREFIXES = ('vm.', 'fs.', 'net.', 'dev.')

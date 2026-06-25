@@ -6543,10 +6543,7 @@ def takserver_two_server_deploy_server_two():
 
     # Install core .deb
     try:
-        r = subprocess.run(
-            f'cd {shlex.quote(UPLOAD_DIR)} && sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{shlex.quote(core_pkg)}',
-            shell=True, capture_output=True, text=True, timeout=600
-        )
+        r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', f'./{core_pkg}']], 'and', timeout=600, cwd=UPLOAD_DIR)
         log.append(r.stdout or '')
         log.append(r.stderr or '')
         if r.returncode != 0:
@@ -17829,10 +17826,16 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         log_fn(f"  ⚠ JKS conversion failed: {r.stderr.strip()[:200]}")
         return False
 
-    subprocess.run(
-        'mv /tmp/takserver-le.jks /opt/tak/certs/files/ && '
-        'chown tak:tak /opt/tak/certs/files/takserver-le.jks',
-        shell=True)
+    # install(1) reads the /tmp source (broker source-permissive) and writes the
+    # allowlisted /opt/tak dest as tak:tak in one step (replaces mv + chown).
+    subprocess.run(_sudo_wrap([
+        'install', '-o', 'tak', '-g', 'tak', '-m', '644',
+        '/tmp/takserver-le.jks', '/opt/tak/certs/files/takserver-le.jks']),
+        capture_output=True, text=True)
+    try:
+        os.remove('/tmp/takserver-le.jks')  # console-owned /tmp scratch; direct
+    except OSError:
+        pass
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
 
     # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
@@ -18139,11 +18142,10 @@ def run_caddy_deploy(domain):
             # verify the downloaded binary actually executes before trusting it
             _caddy_ver = subprocess.run(f'{_caddy_dl} version', shell=True, capture_output=True, text=True, timeout=20)
             if _caddy_ver.returncode == 0:
-                subprocess.run(f'install -m 0755 {_caddy_dl} /usr/bin/caddy', shell=True, capture_output=True, text=True, timeout=30)
+                subprocess.run(_sudo_wrap(['install', '-m', '0755', _caddy_dl, '/usr/bin/caddy']), capture_output=True, text=True, timeout=30)
                 # label for SELinux (rpm scriptlet already added the httpd_exec_t fcontext rule);
                 # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
-                subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
-                    shell=True, capture_output=True, text=True)
+                _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'], ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
                 subprocess.run(_sudo_wrap(['mkdir', '-p', '/etc/caddy']), capture_output=True, text=True)
                 plog(f"  ✓ official static caddy {(_caddy_ver.stdout or '').split()[0] if _caddy_ver.stdout else ''} installed")
             else:
@@ -18195,12 +18197,14 @@ def run_caddy_deploy(domain):
             subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
             subprocess.run(f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_ca}" -o /tmp/caddy.download',
                            shell=True, capture_output=True, timeout=300)
-            subprocess.run('chmod +x /tmp/caddy.download 2>/dev/null; true', shell=True, capture_output=True)
+            try:
+                os.chmod('/tmp/caddy.download', 0o755)  # console-owned /tmp scratch; direct
+            except OSError:
+                pass
             _cv = subprocess.run('/tmp/caddy.download version', shell=True, capture_output=True, text=True, timeout=20)
             if _cv.returncode == 0:
-                subprocess.run('install -m 0755 /tmp/caddy.download /usr/bin/caddy', shell=True, capture_output=True, timeout=30)
-                subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
-                               shell=True, capture_output=True)
+                subprocess.run(_sudo_wrap(['install', '-m', '0755', '/tmp/caddy.download', '/usr/bin/caddy']), capture_output=True, timeout=30)
+                _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'], ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
                 plog(f"  ✓ official static caddy {(_cv.stdout or '').split()[0] if _cv.stdout else ''} installed")
             else:
                 plog(f"  ✗ static caddy download did not validate: {((_cv.stderr or _cv.stdout) or 'no output').strip()[:160]}")
@@ -20856,14 +20860,15 @@ def run_mediamtx_deploy():
             mediamtx_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(f'tar -xzf {tmp}/mediamtx.tar.gz -C {tmp}', shell=True, capture_output=True)
-        subprocess.run(f'mv -f {tmp}/mediamtx /usr/local/bin/mediamtx && chmod +x /usr/local/bin/mediamtx', shell=True, capture_output=True)
+        # install(1) reads the /tmp source (broker source-permissive), writes the
+        # allowlisted dest, and sets the mode in one step (replaces mv + chmod).
+        subprocess.run(_sudo_wrap(['install', '-m', '0755', f'{tmp}/mediamtx', '/usr/local/bin/mediamtx']), capture_output=True)
         # RHEL/SELinux: the binary was downloaded under /tmp (tmp_t) and `mv` preserves
         # that label, so systemd refuses to exec it → 203/EXEC "Permission denied" and
         # the service crash-loops. restorecon relabels /usr/local/bin/mediamtx to bin_t
         # (chcon fallback). No-op on Debian (restorecon/chcon absent → || true).
         if _distro_family() == 'rhel':
-            subprocess.run('restorecon -v /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null; true',
-                           shell=True, capture_output=True, text=True, timeout=30)
+            _run_priv_chain([['restorecon', '-v', '/usr/local/bin/mediamtx'], ['chcon', '-t', 'bin_t', '/usr/local/bin/mediamtx']], 'or', timeout=30)
         subprocess.run(f'rm -rf {tmp}', shell=True, capture_output=True)
         plog(f"✓ MediaMTX v{version} installed to /usr/local/bin/mediamtx")
 
@@ -24490,10 +24495,7 @@ def _cesium_ensure_dir():
     if _distro_family() == 'rhel':
         try:
             subprocess.run(_sudo_wrap(['chmod', '755', d]), capture_output=True, timeout=10)
-            subprocess.run(
-                f"semanage fcontext -a -t httpd_sys_content_t '{d}(/.*)?' 2>/dev/null; "
-                f"restorecon -RF {shlex.quote(d)} 2>/dev/null; true",
-                shell=True, capture_output=True, text=True, timeout=60)
+            _run_priv_chain([['semanage', 'fcontext', '-a', '-t', 'httpd_sys_content_t', f'{d}(/.*)?'], ['restorecon', '-RF', d]], 'seq', timeout=60)
         except Exception:
             pass
     return d
@@ -52830,7 +52832,7 @@ def takserver_uninstall():
         # later DROP DATABASE cot / DROP USER martiuser actually run.
         _rpm_installed = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
         if _rpm_installed.startswith('takserver'):
-            subprocess.run('dnf remove -y --setopt=clean_requirements_on_remove=False takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+            subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', '--setopt=clean_requirements_on_remove=False', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             _after = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
             if not _after.startswith('takserver') or 'not installed' in _after.lower():
                 steps.append('Removed TAK Server rpm (dnf)')
@@ -52838,7 +52840,7 @@ def takserver_uninstall():
                 subprocess.run('rpm -e --noscripts --nodeps takserver 2>&1', shell=True, capture_output=True, text=True, timeout=120)
                 steps.append('Force-removed TAK Server rpm')
         # remove the takserver SELinux module (named takserver-policy on EL9)
-        subprocess.run('semodule -r takserver-policy 2>/dev/null; semodule -r takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=60)
+        _run_priv_chain([['semodule', '-r', 'takserver-policy'], ['semodule', '-r', 'takserver']], 'seq', timeout=60)
     else:
         pkg_status = subprocess.run(
             "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
@@ -55712,7 +55714,7 @@ def run_takserver_deploy(config):
             if _enf == 'Enforcing':
                 if os.path.exists('/opt/tak/apply-selinux.sh'):
                     run_cmd('cd /opt/tak && ./apply-selinux.sh 2>&1', "Applying TAK Server SELinux policy...", check=False)
-                    _mod = subprocess.run("semodule -l 2>/dev/null | grep -i takserver", shell=True, capture_output=True, text=True).stdout.strip()
+                    _mod = _priv_pipe(['semodule', '-l'], ['grep', '-i', 'takserver']).stdout.strip()
                     if _mod:
                         log_step(f"  ✓ SELinux policy applied ({_mod.splitlines()[0]})")
                     else:

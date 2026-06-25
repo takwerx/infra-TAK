@@ -18,6 +18,7 @@ Usage: python3 broker/scan_unwrapped_privileged.py [files...]   (default app.py)
 """
 import ast
 import os
+import re
 import sys
 
 SUBPROCESS_FUNCS = {'run', 'call', 'check_call', 'check_output', 'Popen'}
@@ -103,11 +104,14 @@ def scan(path):
                 continue  # already mediated
             if shellish or isinstance(cmd_node, (ast.Constant, ast.JoinedStr)):
                 s = _const_str(cmd_node)
-                # `which X` / `command -v X` / `command -V X` are read-only binary
-                # PROBES — they run fine as the non-root console (not privileged),
-                # even though a hint substring (e.g. "ufw ") matches. Don't flag.
+                # READ-ONLY shell commands run fine as the non-root console even
+                # though a hint substring matches: `which/command -v` probes, and
+                # read verbs of systemctl (show/status/is-*/list-*/cat) + apt/dnf
+                # `list`. These are not privileged ops, so don't flag them.
                 st = (s or '').strip()
-                is_probe = st.startswith(('which ', 'command -v ', 'command -V '))
+                is_probe = (st.startswith(('which ', 'command -v ', 'command -V '))
+                            or re.match(r'^systemctl (show|status|is-active|is-enabled|is-failed|list-units|list-timers|list-unit-files|cat)\b', st)
+                            or re.match(r'^(apt|apt-get|dnf|yum) list\b', st))
                 if s and not is_probe and any(h in s for h in SHELL_PRIV_HINTS):
                     findings.append((node.lineno, 'SHELL', s.strip().replace('\n', ' ')[:90]))
                 continue
