@@ -36858,8 +36858,7 @@ def authentik_compose_heal():
 
     try:
         _r_ldap = subprocess.run(
-            'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-            shell=True, capture_output=True, text=True, timeout=90
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
         )
         _out = (_r_ldap.stderr or _r_ldap.stdout or '').strip()
         _result['ldap_recreate'] = {
@@ -40163,8 +40162,8 @@ def _recreate_authentik_server_worker(plog, reason):
     err_text = ''
     try:
         r = subprocess.run(
-            'cd ~/authentik && docker compose up -d --force-recreate --no-deps server worker',
-            shell=True, capture_output=True, text=True, timeout=180
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server', 'worker']),
+            cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=180
         )
         ok = (r.returncode == 0)
         if not ok:
@@ -44128,8 +44127,7 @@ def _check_takserver_ldap49_and_heal(plog=None):
                 )
             else:
                 _flush_r = subprocess.run(
-                    'cd ~/authentik && docker compose up -d --no-deps --force-recreate ldap 2>&1',
-                    shell=True, capture_output=True, text=True, timeout=90
+                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
                 )
                 if _flush_r.returncode != 0:
                     _log(f"  ⚠ LDAP 49 cache flush failed "
@@ -48892,8 +48890,7 @@ def _ensure_ldap_flow_authentication_none():
     if is_remote:
         _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
     else:
-        subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-            shell=True, capture_output=True, timeout=60)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
     time.sleep(5)
     return True, None
 
@@ -48961,8 +48958,7 @@ def _ensure_authentik_ldap_service_account():
         if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
             _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>/dev/null', timeout=90)
         else:
-            subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>/dev/null',
-                shell=True, capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, timeout=60)
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
         _ensure_ldapsearch()
         # 7. Wait for LDAP outpost ready, then VERIFY with authoritative ldapsearch
@@ -50103,8 +50099,7 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
             if not ok_ldap:
                 return False, _format_ldap_restart_err(True, out_ldap)
         elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-            r = subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-                shell=True, capture_output=True, text=True, timeout=90)
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
             # v0.9.25 hotfix #3: retry-after-heal. If the first recreate
             # failed with a YAML parse error (most commonly the duplicate-
             # cap_drop signature observed on tak-10), run the self-heal
@@ -50128,8 +50123,7 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                     except Exception as _rhe:
                         print(f"Sync webadmin: retry heal error (non-fatal): {_rhe}", flush=True)
                     r = subprocess.run(
-                        'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-                        shell=True, capture_output=True, text=True, timeout=90
+                        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
                     )
                 if r.returncode != 0:
                     return False, _format_ldap_restart_err(False, r.stderr or r.stdout)
@@ -50196,8 +50190,7 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
             if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
                 _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
             elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-                subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-                    shell=True, capture_output=True, text=True, timeout=90)
+                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
             ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
             if not ready2:
                 return False, f'webadmin LDAP outpost not ready after recreate. Outpost status: {ready_status2}'
@@ -51271,7 +51264,7 @@ def takserver_connect_ldap():
                     content = content.replace('      password_stage: !KeyOf ldap-authentication-password\n', '')
                     with open(bp_path, 'w') as f:
                         f.write(content)
-                    subprocess.run('cd ~/authentik && docker compose restart worker 2>&1', shell=True, capture_output=True, timeout=90)
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'worker']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
                     time.sleep(50)  # let blueprint reconcile and update identification stage
                     diag.append('LDAP blueprint fixed (removed password_stage); worker restarted')
             except Exception as e:
@@ -62669,8 +62662,7 @@ def _startup_migrations():
                 if 'normalized YAML' in _heal_msg:
                     try:
                         _r_ldap = subprocess.run(
-                            'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-                            shell=True, capture_output=True, text=True, timeout=90
+                            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
                         )
                         if _r_ldap.returncode == 0:
                             print("Startup migration: LDAP outpost recreated after YAML heal — bind cache flushed", flush=True)
@@ -63428,8 +63420,7 @@ def _post_update_auto_deploy():
                     # and logged, never raised.
                     if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
                         _r_ldap = subprocess.run(
-                            'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-                            shell=True, capture_output=True, text=True, timeout=90
+                            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
                         )
                         if _r_ldap.returncode == 0:
                             print("Post-update (same-version): LDAP outpost recreated to flush bind cache after YAML heal", flush=True)
@@ -63579,8 +63570,7 @@ def _post_update_auto_deploy():
                             if _fixed != _comp:
                                 with open(ak_compose, 'w') as _f:
                                     _f.write(_fixed)
-                                subprocess.run('cd ~/authentik && docker compose up -d ldap',
-                                    shell=True, capture_output=True, text=True, timeout=60)
+                                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=60)
                                 print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap (confirmed TLS error)", flush=True)
                         else:
                             print("Post-update: LDAP outpost on FQDN with no TLS errors — leaving routing alone (v0.8.0 migration skipped)", flush=True)
@@ -64127,8 +64117,7 @@ def _post_update_auto_deploy():
                                 _sudo_wrap(['docker', 'stop', '-t', '30', 'authentik-postgresql-1']), capture_output=True, text=True, timeout=35
                             )
                             subprocess.run(
-                                'cd ~/authentik && docker compose up -d postgresql 2>/dev/null',
-                                shell=True, capture_output=True, text=True, timeout=60
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', 'postgresql']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=60
                             )
                             import time as _shm_t
                             _shm_t.sleep(5)
@@ -64145,8 +64134,7 @@ def _post_update_auto_deploy():
                         if _ak != _ak_orig:
                             print("Post-update: Authentik compose hardened — recreating worker/server/ldap")
                             subprocess.run(
-                                'cd ~/authentik && docker compose up -d --force-recreate worker server ldap 2>/dev/null',
-                                shell=True, capture_output=True, text=True, timeout=120
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
                             )
                             # Verify CapDrop was applied to server and ldap (worker is intentionally excluded)
                             import time as _harden_t
@@ -64229,8 +64217,7 @@ def _post_update_auto_deploy():
                         if changed:
                             print("Post-update: TAK Portal override written — recreating container")
                             subprocess.run(
-                                'cd ~/TAK-Portal && docker compose up -d --force-recreate 2>/dev/null',
-                                shell=True, capture_output=True, text=True, timeout=120
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=os.path.expanduser('~/TAK-Portal'), capture_output=True, text=True, timeout=120
                             )
                         else:
                             print("Post-update: TAK Portal override already current — no changes needed")

@@ -115,11 +115,14 @@ def tokens_to_argv(toks, exprs):
 
 
 def plan_one(node, cmd_node, is_system, src):
-    if not isinstance(cmd_node, ast.JoinedStr):
-        return None, 'not f-string'
-    tmpl, exprs = build_template(cmd_node, src)
-    if tmpl is None:
-        return None, exprs
+    if isinstance(cmd_node, ast.Constant) and isinstance(cmd_node.value, str):
+        tmpl, exprs = cmd_node.value, []   # const cd-string (no placeholders)
+    elif isinstance(cmd_node, ast.JoinedStr):
+        tmpl, exprs = build_template(cmd_node, src)
+        if tmpl is None:
+            return None, exprs
+    else:
+        return None, 'not a cd string'
     merge = bool(re.search(r'\d*>&1', tmpl))
     t = TRAIL_TRUE_RE.sub('', tmpl).strip()
     t = REDIR_RE.sub('', t).strip()
