@@ -12632,7 +12632,7 @@ def cloudtak_page():
                         parts = line.split('|||')
                         containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
         else:
-            r = subprocess.run('docker ps --filter "name=cloudtak" --format "{{.Names}}|||{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak', '--format', '{{.Names}}|||{{.Status}}']), capture_output=True, text=True, timeout=5)
             for line in (r.stdout or '').strip().split('\n'):
                 if line.strip():
                     parts = line.split('|||')
@@ -14833,7 +14833,7 @@ def caddy_uninstall():
             except Exception:
                 subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
     if os.path.exists('/etc/caddy'):
-        subprocess.run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
     settings['fqdn'] = ''
     save_settings(settings)
@@ -18110,7 +18110,7 @@ def run_caddy_deploy(domain):
                 # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
                 subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
                     shell=True, capture_output=True, text=True)
-                subprocess.run('mkdir -p /etc/caddy 2>/dev/null; true', shell=True, capture_output=True, text=True)
+                subprocess.run(_sudo_wrap(['mkdir', '-p', '/etc/caddy']), capture_output=True, text=True)
                 plog(f"  ✓ official static caddy {(_caddy_ver.stdout or '').split()[0] if _caddy_ver.stdout else ''} installed")
             else:
                 plog(f"  ✗ static caddy download did not validate: {((_caddy_ver.stderr or _caddy_ver.stdout) or 'no output').strip()[:160]}")
@@ -19028,7 +19028,7 @@ def takportal_page():
     # Get container info if running
     container_info = {}
     if portal.get('running'):
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Names}}|||{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Names}}|||{{.Status}}']), capture_output=True, text=True)
         if r.stdout.strip():
             containers = []
             for line in r.stdout.strip().split('\n'):
@@ -20231,7 +20231,7 @@ def mediamtx_uninstall():
             if os.path.exists(f):
                 os.remove(f)
         if os.path.exists('/opt/mediamtx-webeditor'):
-            subprocess.run('rm -rf /opt/mediamtx-webeditor', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/mediamtx-webeditor']), capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         steps.append('Stopped and disabled mediamtx and mediamtx-webeditor services')
         steps.append('Removed binary, config, and web editor files')
@@ -21245,7 +21245,7 @@ WantedBy=multi-user.target
         # Same problem class as the LE-cert read-access fix earlier in this release.
         if os.path.exists(editor_file):
             try:
-                subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups', shell=True, capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['mkdir', '-p', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
                 subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
                 # Editor writes theme_config.json, email_config.json, users_file,
                 # share_links, group_metadata, srt_passphrase_backup, pending_reg,
@@ -23885,8 +23885,8 @@ def run_cloudtak_redeploy(cfg=None):
             time.sleep(1)
         if api_container:
             for nf in ['/etc/nginx/nginx.conf', '/etc/nginx/conf.d/default.conf']:
-                subprocess.run(f'docker exec {api_container} sed -i "s|proxy_pass http://[^;]*:5001|proxy_pass http://127.0.0.1:5001|g" {nf} 2>/dev/null', shell=True, capture_output=True, timeout=5)
-                subprocess.run(f'docker exec {api_container} sed -i "s/^user nginx;/user root;/" {nf} 2>/dev/null', shell=True, capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['docker', 'exec', api_container, 'sed', '-i', 's|proxy_pass http://[^;]*:5001|proxy_pass http://127.0.0.1:5001|g', nf]), capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['docker', 'exec', api_container, 'sed', '-i', 's/^user nginx;/user root;/', nf]), capture_output=True, timeout=5)
             subprocess.run(_sudo_wrap(['docker', 'exec', api_container, 'nginx', '-s', 'reload']), capture_output=True, timeout=5)
             plog("  Nginx proxy and user directive patched, workers reloaded")
         plog("  Waiting for CloudTAK API to respond...")
@@ -38357,11 +38357,7 @@ def _detect_authentik_ldap_spiral(plog=None):
     # baseline (at request peaks healthy boxes can hit 10-15 briefly).
     try:
         _pg = subprocess.run(
-            'docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c '
-            '"SELECT '
-            '  (SELECT count(*) FROM pg_stat_activity WHERE state=\'idle in transaction\' AND application_name LIKE \'%authentik%\'),'
-            '  (SELECT count(*) FROM pg_stat_activity WHERE datname=\'authentik\');"',
-            shell=True, capture_output=True, text=True, timeout=10
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-tA', '-c', "SELECT   (SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%'),  (SELECT count(*) FROM pg_stat_activity WHERE datname='authentik');"]), capture_output=True, text=True, timeout=10
         )
         _out = (_pg.stdout or '').strip()
         if '|' in _out:
@@ -38384,11 +38380,7 @@ def _detect_authentik_ldap_spiral(plog=None):
     # running and operator action (manual TRUNCATE or worker restart) is warranted.
     try:
         _ch = subprocess.run(
-            'docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c '
-            '"SELECT '
-            '  (SELECT count(*) FROM django_channels_postgres_message),'
-            '  (SELECT pg_total_relation_size(\'django_channels_postgres_message\')/1024/1024);"',
-            shell=True, capture_output=True, text=True, timeout=8
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-tA', '-c', "SELECT   (SELECT count(*) FROM django_channels_postgres_message),  (SELECT pg_total_relation_size('django_channels_postgres_message')/1024/1024);"]), capture_output=True, text=True, timeout=8
         )
         _ch_out = (_ch.stdout or '').strip()
         if '|' in _ch_out:
@@ -40062,8 +40054,7 @@ def _heal_mediamtx_webeditor_writable_paths(plog=None):
         if 'mediamtx-webeditor' not in (r_loaded.stdout or ''):
             return False
         plog("  mediamtx-webeditor: not active — applying perm-heal (v0.9.29)")
-        subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups',
-                       shell=True, capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['mkdir', '-p', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
         if os.path.exists('/usr/local/etc/mediamtx.yml'):
@@ -40385,11 +40376,7 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
 
     try:
         r = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAF, -c "
-            "\"SELECT COALESCE(host(client_addr),''), count(*) FROM pg_stat_activity "
-            "WHERE datname='authentik' AND client_addr IS NOT NULL "
-            "GROUP BY client_addr ORDER BY count(*) DESC;\"",
-            shell=True, capture_output=True, text=True, timeout=timeout_s
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-tAF,', '-c', "SELECT COALESCE(host(client_addr),''), count(*) FROM pg_stat_activity WHERE datname='authentik' AND client_addr IS NOT NULL GROUP BY client_addr ORDER BY count(*) DESC;"]), capture_output=True, text=True, timeout=timeout_s
         )
         if r.returncode != 0:
             err = ((r.stderr or '') + (r.stdout or ''))[:160].strip()
@@ -44717,9 +44704,7 @@ def _authentik_verify_runtime_config(plog):
     # 300s gives slow disks ~10x headroom while still bounding zombie idle-in-tx sessions.
     try:
         r3 = subprocess.run(
-            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
-            "\"SHOW idle_in_transaction_session_timeout;\"",
-            shell=True, capture_output=True, text=True, timeout=10
+            _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik', '-tAc', 'SHOW idle_in_transaction_session_timeout;']), capture_output=True, text=True, timeout=10
         )
         raw = (r3.stdout or '').strip()
         # Postgres SHOW returns values like "300s", "5min", "300000ms" — normalize to ms
@@ -50242,9 +50227,7 @@ def authentik_pgbouncer_api():
     container_state = 'absent'
     try:
         r = subprocess.run(
-            "docker inspect --format '{{.State.Status}}|{{.State.Health.Status}}' "
-            "authentik-pgbouncer-1 2>/dev/null",
-            shell=True, capture_output=True, text=True, timeout=5
+            _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Status}}|{{.State.Health.Status}}', 'authentik-pgbouncer-1']), capture_output=True, text=True, timeout=5
         )
         out = (r.stdout or '').strip()
         if out:
@@ -50260,18 +50243,14 @@ def authentik_pgbouncer_api():
     if 'absent' not in container_state and 'unknown' not in container_state:
         try:
             r = subprocess.run(
-                "docker exec authentik-pgbouncer-1 psql -h 127.0.0.1 -U authentik "
-                "-d pgbouncer -tA -c 'SHOW POOLS;' 2>/dev/null",
-                shell=True, capture_output=True, text=True, timeout=8
+                _sudo_wrap(['docker', 'exec', 'authentik-pgbouncer-1', 'psql', '-h', '127.0.0.1', '-U', 'authentik', '-d', 'pgbouncer', '-tA', '-c', 'SHOW POOLS;']), capture_output=True, text=True, timeout=8
             )
             pools_raw = (r.stdout or '').strip() if r.returncode == 0 else None
         except Exception:
             pools_raw = None
         try:
             r2 = subprocess.run(
-                "docker exec authentik-pgbouncer-1 psql -h 127.0.0.1 -U authentik "
-                "-d pgbouncer -tA -c 'SHOW STATS;' 2>/dev/null",
-                shell=True, capture_output=True, text=True, timeout=8
+                _sudo_wrap(['docker', 'exec', 'authentik-pgbouncer-1', 'psql', '-h', '127.0.0.1', '-U', 'authentik', '-d', 'pgbouncer', '-tA', '-c', 'SHOW STATS;']), capture_output=True, text=True, timeout=8
             )
             stats_raw = (r2.stdout or '').strip() if r2.returncode == 0 else None
         except Exception:
@@ -52791,7 +52770,7 @@ def takserver_uninstall():
         # Remove the /opt/tak symlink explicitly. After ~/tak-docker is gone it is a
         # DANGLING symlink, which the native `if os.path.exists('/opt/tak')` cleanup
         # below skips (exists() follows the link → False), leaving it behind.
-        subprocess.run('rm -f /opt/tak 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
         # Reset the persisted method/credentials so detection falls back to the
         # platform default (arm64 still defaults to container; a redeploy re-sets it).
         try:
@@ -52862,7 +52841,7 @@ def takserver_uninstall():
                 steps.append('⚠ Could not purge takserver package (still registered with dpkg) — manual cleanup required')
     # Clean up /opt/tak
     if os.path.exists('/opt/tak'):
-        subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
+        subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/tak']), capture_output=True)
         steps.append('Removed /opt/tak')
     # Clean up PostgreSQL — local or external depending on deployment mode
     settings = load_settings()
@@ -57187,7 +57166,7 @@ def run_full_uninstall():
                 except Exception:
                     pass
         if os.path.exists('/opt/mediamtx-webeditor'):
-            subprocess.run('rm -rf /opt/mediamtx-webeditor', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/mediamtx-webeditor']), capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         mediamtx_deploy_log.clear()
         mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
@@ -57253,7 +57232,7 @@ def run_full_uninstall():
                 if not _after or 'not-installed' in _after:
                     break
         if os.path.exists('/opt/tak'):
-            subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
+            subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/tak']), capture_output=True)
         subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run('rm -rf /usr/share/debsig/keyrings/* /etc/debsig/policies/* 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
@@ -57307,7 +57286,7 @@ def run_full_uninstall():
                 except Exception:
                     subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
         if os.path.exists('/etc/caddy'):
-            subprocess.run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         settings = load_settings()
         settings['fqdn'] = ''
@@ -64287,8 +64266,7 @@ def _post_update_auto_deploy():
                                 )
                                 # Write file as node-red user via docker exec stdin redirect — NOT docker cp
                                 proc = subprocess.run(
-                                    'docker exec -i nodered sh -c "cat > /data/context/global/global.json"',
-                                    shell=True, input=ctx_normalised.encode('utf-8'),
+                                    _sudo_wrap(['docker', 'exec', '-i', 'nodered', 'sh', '-c', 'cat > /data/context/global/global.json']), input=ctx_normalised.encode('utf-8'),
                                     capture_output=True, timeout=15
                                 )
                                 if proc.returncode != 0:
@@ -64302,8 +64280,7 @@ def _post_update_auto_deploy():
                                     )
                                     os.remove(tmp_ctx)
                                     subprocess.run(
-                                        'docker exec nodered sh -c "chown -R node-red:node-red /data/context 2>/dev/null || chown -R 1000:1000 /data/context 2>/dev/null || true"',
-                                        shell=True, capture_output=True, timeout=10
+                                        _sudo_wrap(['docker', 'exec', 'nodered', 'sh', '-c', 'chown -R node-red:node-red /data/context || chown -R 1000:1000 /data/context || true']), capture_output=True, timeout=10
                                     )
                                 print("Post-update: in-memory context exported (normalised) to filesystem before migration")
                         except Exception as ctx_e:
