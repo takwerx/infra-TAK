@@ -520,6 +520,12 @@ provision_nonroot() {
     [ "$BORN_NONROOT" = "1" ] || return 0
     echo -e "${CYAN}  Provisioning non-root console (takwerx @ $NONROOT_INSTALL)...${NC}"
 
+    # Stop a running console first — if it is ALREADY running as takwerx (a
+    # re-provision), `usermod` on takwerx fails with "user currently used by
+    # process" and the home/shell change is silently lost. start.sh restarts the
+    # console at the end regardless.
+    systemctl stop takwerx-console 2>/dev/null || true
+
     # 1. takwerx group + user with a REAL home and shell. The broker may have
     #    already created takwerx as a --system nologin acct (home /nonexistent);
     #    upgrade it in place to a usable home/shell (modules do `cd ~/authentik`
@@ -574,7 +580,11 @@ finalize_nonroot_ownership() {
 create_service() {
     SERVICE_FILE="/etc/systemd/system/takwerx-console.service"
     USE_DIR="$INSTALL_DIR"
-    if [ -f "$SERVICE_FILE" ]; then
+    # Born-non-root deliberately RELOCATES to /opt/infratak, so do NOT preserve a
+    # prior WorkingDirectory (that would strand the console at the old in-home
+    # path). For the root model, keep the existing-dir preservation so a re-run
+    # from another clone doesn't switch away from the dir that holds the password.
+    if [ "$BORN_NONROOT" != "1" ] && [ -f "$SERVICE_FILE" ]; then
         EXISTING_DIR=$(grep -E '^WorkingDirectory=' "$SERVICE_FILE" 2>/dev/null | cut -d= -f2- | tr -d ' ')
         if [ -n "$EXISTING_DIR" ] && [ -d "$EXISTING_DIR" ] && [ -f "$EXISTING_DIR/.config/auth.json" ]; then
             USE_DIR="$EXISTING_DIR"
