@@ -331,7 +331,10 @@ install_dependencies() {
         exit 1
     fi
 
-    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>"$apt_log"; then
+    # pyyaml: the module compose patchers use it for ROBUST, IDEMPOTENT YAML edits.
+    # Without it they fall back to a legacy text patcher that double-appends keys on
+    # re-deploy (duplicate `healthcheck` -> "mapping key already defined" parse error).
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn pyyaml 2>"$apt_log"; then
         echo -e "${RED}  pip install failed:${NC}"
         tail -20 "$apt_log"
         rm -f "$apt_log"
