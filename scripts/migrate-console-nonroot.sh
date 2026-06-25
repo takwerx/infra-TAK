@@ -65,8 +65,11 @@ fi
 # --- module-dir survey (report only) ---------------------------------------
 step "Module directories that will remain in place (NOT relocated by this tool)"
 FOUND_MODS=0
+_seen_bases=" "
 for base in /root "${CUR_HOME:-/root}" "$(getent passwd "${SUDO_USER:-}" 2>/dev/null | cut -d: -f6)"; do
     [ -z "$base" ] && continue
+    case "$_seen_bases" in *" $base "*) continue;; esac   # dedup bases
+    _seen_bases="$_seen_bases$base "
     for m in authentik CloudTAK TAK-Portal webodm mediamtx-webeditor; do
         if [ -d "$base/$m" ]; then
             say "    $base/$m"
