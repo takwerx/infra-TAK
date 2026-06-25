@@ -53,6 +53,17 @@ DEFAULT_TIMEOUT = 600                         # seconds; broker-side ceiling
 SELF_PATH = os.path.realpath(__file__)
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
 
+# ENFORCE vs PERMISSIVE (v10.0.5).
+#   PERMISSIVE (default this release): a request that fails the rulebook is still
+#   EXECUTED, but logged as WOULD-DENY. The console runs as ROOT today, so routing
+#   through the broker must MEDIATE + AUDIT, never break a legit op (denying a
+#   binary the console needs buys no security while root). Permissive mode lets us
+#   collect the real binary/path needs from WOULD-DENY records and build an
+#   accurate enforce-list BEFORE the non-root flip.
+#   ENFORCE (set TAKWERX_BROKER_ENFORCE=1): deny means deny. This is the posture
+#   the box must be in BEFORE the console is ever flipped to a non-root user.
+ENFORCE = os.environ.get('TAKWERX_BROKER_ENFORCE') == '1'
+
 # ---------------------------------------------------------------------------
 # POLICY / RULEBOOK  — the security core. Tightening these is core .5 work;
 # this is the conservative first cut. Anything not explicitly allowed is denied.
@@ -396,7 +407,11 @@ def _recv_all(conn):
 
 
 def _do_exec(req):
-    argv = check_exec(req.get('argv'))
+    # NB: the allow/deny decision is made in _dispatch (so permissive mode can
+    # execute-and-log). Do NOT re-validate here or permissive mode would block.
+    argv = req.get('argv')
+    if not isinstance(argv, list) or not argv:
+        raise Denied('argv must be a non-empty list')
     inp = req.get('input_b64')
     input_bytes = base64.b64decode(inp) if inp else None
     timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
@@ -421,7 +436,9 @@ def _do_exec(req):
 
 
 def _do_write(req):
-    path = _path_allowed(req.get('path'))
+    # Decision made in _dispatch; here only normalize (reject NUL/traversal) so
+    # permissive mode can still execute an off-allowlist write (console is root).
+    path = _abs(req.get('path'))
     content = base64.b64decode(req.get('content_b64') or '')
     mode = req.get('mode', 'w')
     append = mode in ('a', 'ab')
@@ -448,46 +465,64 @@ def _do_write(req):
 
 
 def _do_read(req):
-    path = _path_allowed(req.get('path'))
+    path = _abs(req.get('path'))   # decision in _dispatch; normalize only here
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as f:
         data = f.read(MAX_MSG)
     return {'ok': True, 'content_b64': base64.b64encode(data).decode()}
 
 
+def _evaluate(req):
+    """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
+    it. Never raises."""
+    op = req.get('op')
+    try:
+        if op == 'exec':
+            check_exec(req.get('argv') or [], req.get('cwd'))
+        elif op in ('write', 'read'):
+            _path_allowed(req.get('path'))
+        else:
+            return ('DENY', f'unknown op: {op}')
+        return ('ALLOW', '')
+    except Denied as d:
+        return ('DENY', str(d))
+
+
+def _summary(req):
+    op = req.get('op')
+    if op == 'exec':
+        return ' '.join(map(str, req.get('argv') or []))[:200]
+    return str(req.get('path'))[:200]
+
+
 def _dispatch(req, peer):
     op = req.get('op')
     if op == 'ping':
         audit(peer, 'ping', '', 'ALLOW')
-        return {'ok': True, 'pong': True}
-    if op == 'exec':
-        try:
-            argv = req.get('argv') or []
-            check_exec(argv, req.get('cwd'))
-        except Denied as d:
-            audit(peer, 'exec', ' '.join(map(str, req.get('argv') or []))[:200], 'DENY', str(d))
-            return {'ok': False, 'code': 'DENIED', 'error': str(d)}
-        res = _do_exec(req)
-        audit(peer, 'exec', ' '.join(req['argv'])[:200], 'ALLOW', f"rc={res['returncode']}")
-        return res
-    if op == 'write':
-        try:
-            _path_allowed(req.get('path'))
-        except Denied as d:
-            audit(peer, 'write', str(req.get('path'))[:200], 'DENY', str(d))
-            return {'ok': False, 'code': 'DENIED', 'error': str(d)}
-        res = _do_write(req)
-        audit(peer, 'write', str(req.get('path'))[:200], 'ALLOW', f"mode={req.get('mode','w')}")
-        return res
-    if op == 'read':
-        try:
-            _path_allowed(req.get('path'))
-        except Denied as d:
-            audit(peer, 'read', str(req.get('path'))[:200], 'DENY', str(d))
-            return {'ok': False, 'code': 'DENIED', 'error': str(d)}
-        res = _do_read(req)
-        audit(peer, 'read', str(req.get('path'))[:200], 'ALLOW')
-        return res
+        return {'ok': True, 'pong': True, 'enforce': ENFORCE}
+    # dry-run: report what the rulebook WOULD do, without executing. Used by the
+    # self-test to verify deny rules even while the broker runs permissive.
+    if op == 'check':
+        inner = req.get('req') or {}
+        verdict, reason = _evaluate(inner)
+        return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
+    if op in ('exec', 'write', 'read'):
+        verdict, reason = _evaluate(req)
+        summary = _summary(req)
+        if verdict == 'DENY':
+            if ENFORCE:
+                audit(peer, op, summary, 'DENY', reason)
+                return {'ok': False, 'code': 'DENIED', 'error': reason}
+            # permissive: record what WOULD be denied, then execute anyway (the
+            # console is root today, so this is mediation+audit, not a new hole).
+            audit(peer, op, summary, 'WOULD-DENY', reason)
+        else:
+            audit(peer, op, summary, 'ALLOW')
+        if op == 'exec':
+            return _do_exec(req)
+        if op == 'write':
+            return _do_write(req)
+        return _do_read(req)
     audit(peer, str(op), '', 'DENY', 'unknown op')
     return {'ok': False, 'code': 'DENIED', 'error': f'unknown op: {op}'}
 
@@ -669,20 +704,19 @@ def cli_selftest():
     except Exception as e:
         check('write+read round-trip', False, str(e))
 
-    # 5. DENY: write to sudoers must be refused
+    # 5. policy DENIES write to sudoers (dry-run — valid in permissive mode too)
     try:
-        r = client_send({'op': 'write', 'path': '/etc/sudoers.d/evil',
-                         'content_b64': base64.b64encode(b'takwerx ALL=(ALL) NOPASSWD:ALL').decode()})
-        check('DENY write(/etc/sudoers.d)', (not r.get('ok')) and r.get('code') == 'DENIED', str(r))
+        r = client_send({'op': 'check', 'req': {'op': 'write', 'path': '/etc/sudoers.d/evil'}})
+        check('Policy blocks sudoers write', r.get('ok') and r.get('verdict') == 'DENY', str(r))
     except Exception as e:
-        check('DENY write(/etc/sudoers.d)', False, str(e))
+        check('Policy blocks sudoers write', False, str(e))
 
-    # 6. DENY: arbitrary shell must be refused
+    # 6. policy DENIES arbitrary shell
     try:
-        r = client_send({'op': 'exec', 'argv': ['bash', '-c', 'id']})
-        check('DENY exec(bash -c)', (not r.get('ok')) and r.get('code') == 'DENIED', str(r))
+        r = client_send({'op': 'check', 'req': {'op': 'exec', 'argv': ['bash', '-c', 'id']}})
+        check('Policy blocks arbitrary shell', r.get('ok') and r.get('verdict') == 'DENY', str(r))
     except Exception as e:
-        check('DENY exec(bash -c)', False, str(e))
+        check('Policy blocks arbitrary shell', False, str(e))
 
     return _print_selftest(results)
 

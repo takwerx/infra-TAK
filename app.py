@@ -5114,12 +5114,20 @@ def _broker_service_active():
 
 
 def _broker_status_dict():
+    enforce = None
+    try:
+        if _broker_available():
+            pong = _broker_request({'op': 'ping'}, timeout=5)
+            enforce = bool(pong.get('enforce'))
+    except Exception:
+        pass
     return {
         'installed': os.path.exists(_BROKER_SCRIPT) and os.path.exists('/etc/systemd/system/takwerx-broker.service'),
         'service_active': _broker_service_active(),
         'socket_present': _broker_available(),
         'routing_active': _broker_should_route(),
         'force_enabled': _broker_force_enabled_in_unit(),
+        'enforce': enforce,   # None=unknown, False=permissive (learning), True=enforcing
         'console_uid': os.getuid(),
         'audit_log': '/var/log/takwerx-broker/audit.log',
         'socket': BROKER_SOCKET,
@@ -5181,20 +5189,19 @@ def console_broker_selftest():
     except Exception as e:
         add('Allowed command runs', False, e)
 
-    # 4. DENY: write to sudoers must be refused
+    # 4. policy DENIES write to sudoers (dry-run — valid in permissive mode too)
     try:
-        r = _broker_request({'op': 'write', 'path': '/etc/sudoers.d/takwerx-evil',
-                             'content_b64': 'eA=='})
-        add('Blocks sudoers write', (not r.get('ok')) and r.get('code') == 'DENIED', r.get('error'))
+        r = _broker_request({'op': 'check', 'req': {'op': 'write', 'path': '/etc/sudoers.d/takwerx-evil'}})
+        add('Policy blocks sudoers write', r.get('ok') and r.get('verdict') == 'DENY', r.get('reason'))
     except Exception as e:
-        add('Blocks sudoers write', False, e)
+        add('Policy blocks sudoers write', False, e)
 
-    # 5. DENY: arbitrary shell must be refused
+    # 5. policy DENIES arbitrary shell
     try:
-        r = _broker_request({'op': 'exec', 'argv': ['bash', '-c', 'id']})
-        add('Blocks arbitrary shell', (not r.get('ok')) and r.get('code') == 'DENIED', r.get('error'))
+        r = _broker_request({'op': 'check', 'req': {'op': 'exec', 'argv': ['bash', '-c', 'id']}})
+        add('Policy blocks arbitrary shell', r.get('ok') and r.get('verdict') == 'DENY', r.get('reason'))
     except Exception as e:
-        add('Blocks arbitrary shell', False, e)
+        add('Policy blocks arbitrary shell', False, e)
 
     # 6. when routing is on, prove the console's OWN helpers go through the broker
     if _broker_should_route():
@@ -29596,8 +29603,9 @@ function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture
 function badge(on,label){var c=on?'var(--green)':'var(--text-dim)';var m=on?'&#10003;':'&#8211;';return '<span style="color:'+c+';margin-right:14px">'+m+' '+esc(label)+'</span>';}
 function renderBrokerStatus(d){
   var el=document.getElementById('broker-status');
-  if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — re-run <code>sudo ./start.sh</code> on the box.</span>';}
-  else{el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'socket ready')+badge(d.routing_active,'routing '+(d.routing_active?'ON':'off'));}
+  if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — restart the console (or re-run <code>sudo ./start.sh</code>).</span>';}
+  else{var mode='';if(d.routing_active){mode=(d.enforce===true)?'<span style="color:var(--yellow);margin-right:14px">&#9888; ENFORCING</span>':'<span style="color:var(--green);margin-right:14px">&#10003; permissive (learning)</span>';}
+    el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'socket ready')+badge(d.routing_active,'routing '+(d.routing_active?'ON':'off'))+mode;}
   var tb=document.getElementById('broker-toggle-btn');
   if(d.force_enabled){tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Disable routing';}
   else{tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing';}
@@ -29621,7 +29629,7 @@ function runBrokerSelftest(){
 function toggleBrokerRouting(){
   fetch('/api/console/broker/status').then(function(r){return r.json();}).then(function(s){
     var enable=!s.force_enabled;
-    var msg=enable?'Enable least-privilege routing? The console will RESTART (brief ~15s blip). It keeps running as root — this only routes its privileged actions through the guard.':'Disable routing and restart the console?';
+    var msg=enable?'Enable least-privilege routing? The console will RESTART (brief ~15s blip). It runs in SAFE learning mode — the guard mediates + logs everything but never blocks a real action yet, so nothing breaks. (The console also stays root.)':'Disable routing and restart the console?';
     if(!confirm(msg))return;
     var m=document.getElementById('broker-msg');m.textContent='Applying… console will restart.';m.style.color='var(--text-dim)';
     document.getElementById('broker-toggle-btn').disabled=true;
