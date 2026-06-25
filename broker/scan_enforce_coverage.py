@@ -25,7 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import takwerx_broker as B  # noqa: E402
 
-HELPERS = {'_sudo_wrap', '_write_priv', '_read_priv'}
+HELPERS = {'_sudo_wrap', '_write_priv', '_read_priv', '_makedirs_priv', '_chmod_priv'}
 # binaries whose *path operand* is a variable we can't resolve statically; these
 # were hand-confirmed to resolve into allowlisted dirs (jail_path -> /etc/fail2ban,
 # svc_path -> /etc/systemd/system, etc.). Flagged DYNAMIC, not GAP.

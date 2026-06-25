@@ -242,6 +242,30 @@ def _read_priv(path):
     return proc.stdout
 
 
+def _makedirs_priv(path, mode=None, exist_ok=True):
+    """Create a directory on a privileged path. Routes through the broker (mkdir
+    -p) when non-root; otherwise native os.makedirs. Raw os.makedirs(/etc/...) by
+    the non-root console fails EPERM — use this for /etc, /opt, /var, /run dirs."""
+    if _broker_should_route() and _broker_available():
+        subprocess.run(_sudo_wrap(['mkdir', '-p', path]), capture_output=True, check=True)
+        if mode is not None:
+            subprocess.run(_sudo_wrap(['chmod', oct(int(mode))[2:], path]), capture_output=True, check=False)
+        return
+    os.makedirs(path, exist_ok=exist_ok)
+    if mode is not None:
+        os.chmod(path, int(mode))
+
+
+def _chmod_priv(path, mode):
+    """chmod a privileged path. Routes through the broker when non-root; otherwise
+    native os.chmod. Raw os.chmod on a root-owned path (e.g. /swapfile) by the
+    non-root console fails EPERM."""
+    if _broker_should_route() and _broker_available():
+        subprocess.run(_sudo_wrap(['chmod', oct(int(mode))[2:], path]), capture_output=True, check=False)
+        return
+    os.chmod(path, int(mode))
+
+
 def _client_ip():
     """Best-effort client IP for rate limiting."""
     if request.remote_addr in ('127.0.0.1', '::1'):
@@ -9222,7 +9246,7 @@ def _f2b_selfheal_rhel_jails(plog=None):
 def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Rewrite the infratak-authentik jail config with new thresholds and ignoreip whitelist."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
-    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
@@ -9267,7 +9291,7 @@ def _f2b_read_tak_jail_config():
 def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Write the infratak-takserver jail config with given thresholds."""
     jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
-    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog-takserver"
@@ -9312,7 +9336,7 @@ def _f2b_read_ssh_jail_config():
 def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Write the infratak-sshd jail config with given thresholds."""
     jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
-    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
@@ -9403,7 +9427,7 @@ def fail2ban_authentik_toggle_api():
                 "[Install]\n"
                 "WantedBy=multi-user.target\n"
             )
-            os.makedirs('/var/log/authentik', exist_ok=True)
+            _makedirs_priv('/var/log/authentik', exist_ok=True)
             _write_priv(svc_path, forwarder_service)
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         # Ensure the fail2ban daemon is running before reloading jails
@@ -9837,8 +9861,8 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
     This jail is the one that banned the Azure App Gateway on CORAZ (its health
     probes look like RTSP opens from the gateway IPs) — so it MUST honour the same
     trusted-ignoreip whitelist as every other jail ([[fail2ban-bans-azure-gateway]])."""
-    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
-    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
     filter_path = '/etc/fail2ban/filter.d/mediamtx-rtsp.conf'
     filter_conf = (
@@ -10048,8 +10072,8 @@ def _f2b_read_portal_jail_config():
 def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
     """Write the takportal filter + infratak-takportal jail. Ensures the log file
     exists so fail2ban can start the jail before the portal ships its log writer."""
-    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
-    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
     # Ensure the logpath exists (empty is fine) — fail2ban refuses a missing logpath.
     try:
@@ -10324,7 +10348,7 @@ def _f2b_read_recidive_config():
 
 def _f2b_write_recidive_config(maxretry, findtime):
     """Write infratak-recidive jail and ensure fail2ban persistence."""
-    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
     jail_conf = (
         "[recidive]\n"
         "enabled  = true\n"
@@ -11840,7 +11864,7 @@ def _guarddog_spiral_correlation_check(cl_waiting):
     # Touch the sentinel BEFORE sending (matches the disk script) so a send failure
     # can't re-spam every tick inside the 6h window.
     try:
-        os.makedirs('/var/lib/takguard', exist_ok=True)
+        _makedirs_priv('/var/lib/takguard', exist_ok=True)
         with open(_GUARDDOG_SPIRAL_CORR_SENTINEL, 'w') as f:
             f.write('')
     except Exception:
@@ -11963,7 +11987,7 @@ def _guarddog_write_sms_send_script(settings):
     sms = settings.get('guarddog_sms', {})
     if not sms or not sms.get('provider'):
         return
-    os.makedirs('/opt/tak-guarddog', exist_ok=True)
+    _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
     py_script = '''#!/usr/bin/env python3
 import urllib.request, json, sys
 if len(sys.argv) < 3:
@@ -12258,7 +12282,7 @@ def run_guarddog_deploy(alert_email):
         # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
         gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
         _write_priv('/opt/tak-guarddog/guarddog.conf', json.dumps(gd_conf))
-        os.chmod('/opt/tak-guarddog/guarddog.conf', 0o600)
+        _chmod_priv('/opt/tak-guarddog/guarddog.conf', 0o600)
         # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
         server_identifier = _guarddog_server_identifier(settings)
         _write_priv('/opt/tak-guarddog/server_identifier', server_identifier)
@@ -12400,7 +12424,7 @@ def run_guarddog_deploy(alert_email):
                     plog("✓ Swap file enabled")
                 else:
                     subprocess.run(_sudo_wrap(['fallocate', '-l', '4G', '/swapfile']), check=True, timeout=30)
-                    os.chmod('/swapfile', 0o600)
+                    _chmod_priv('/swapfile', 0o600)
                     subprocess.run(_sudo_wrap(['mkswap', '/swapfile']), check=True, capture_output=True, timeout=10)
                     subprocess.run(_sudo_wrap(['swapon', '/swapfile']), check=True, timeout=10)
                     fstab = _read_priv('/etc/fstab')
@@ -20637,7 +20661,7 @@ paths:
                     f"'chmod 600 /etc/mediamtx/certs/stream.key && systemctl restart mediamtx' 2>/dev/null\n"
                 )
                 sync_path = '/opt/tak-guarddog/mediamtx-cert-sync.sh'
-                os.makedirs('/opt/tak-guarddog', exist_ok=True)
+                _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
                 with open(sync_path, 'w') as sf:
                     sf.write(sync_script)
                 os.chmod(sync_path, 0o755)
@@ -20821,7 +20845,7 @@ def run_mediamtx_deploy():
         # Step 4: Write config
         plog("")
         plog("━━━ Step 4/7: Writing Configuration ━━━")
-        os.makedirs('/usr/local/etc', exist_ok=True)
+        _makedirs_priv('/usr/local/etc', exist_ok=True)
         import secrets as _sec
         hls_pass = _sec.token_hex(8)
 
@@ -26570,7 +26594,7 @@ def _ensure_docker_log_limits(log_fn=None):
             return False, None
         data['log-driver'] = 'json-file'
         data['log-opts'] = {'max-size': '50m', 'max-file': '3'}
-        os.makedirs('/etc/docker', exist_ok=True)
+        _makedirs_priv('/etc/docker', exist_ok=True)
         _write_priv(daemon_json, json.dumps(data, indent=2) + '\n')
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'docker']), capture_output=True, timeout=90)
         time.sleep(5)
@@ -46127,7 +46151,7 @@ entries:
                     plog("  Swap file enabled")
                 else:
                     subprocess.run(_sudo_wrap(['fallocate', '-l', '4G', '/swapfile']), check=True, timeout=30)
-                    os.chmod('/swapfile', 0o600)
+                    _chmod_priv('/swapfile', 0o600)
                     subprocess.run(_sudo_wrap(['mkswap', '/swapfile']), check=True, capture_output=True, timeout=10)
                     subprocess.run(_sudo_wrap(['swapon', '/swapfile']), check=True, timeout=10)
                     fstab = _read_priv('/etc/fstab')
@@ -48376,20 +48400,20 @@ def _ensure_ldapsearch():
             # unattended-upgrades during the deploy window — the field cause of the
             # "ldapsearch unavailable" verdict on fresh boxes, which then forced the
             # webadmin bind check to inconclusive→FAIL and a false-red "NOT READY".
+            # _pkg_install routes through the broker (works when the console is
+            # non-root, where a raw apt-get fails with EPERM).
             for attempt in range(3):
-                subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get install -y ldap-utils 2>&1',
-                    shell=True, capture_output=True, timeout=120)
+                _pkg_install('ldap-utils', timeout=120)
                 if shutil.which('ldapsearch'):
                     return True
-                subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1',
-                    shell=True, capture_output=True, timeout=120)
+                subprocess.run(_sudo_wrap(['apt-get', 'update', '-qq']),
+                    capture_output=True, timeout=120)
                 if shutil.which('ldapsearch'):
                     return True
                 if attempt < 2:
                     time.sleep(10)  # let a held apt/dpkg lock clear, then retry
         else:
-            subprocess.run('dnf install -y openldap-clients 2>/dev/null || yum install -y openldap-clients 2>/dev/null',
-                shell=True, capture_output=True, timeout=120)
+            _pkg_install('openldap-clients', timeout=120)
     except Exception:
         pass
     return bool(shutil.which('ldapsearch'))
@@ -49848,7 +49872,7 @@ def _auto_authentik_tasklog_purge(plog=None):
         # Update the Guard Dog stamp file so the dashboard's "last run" tile is current.
         try:
             _ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            os.makedirs('/opt/tak-guarddog', exist_ok=True)
+            _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
             _write_priv('/opt/tak-guarddog/authentik_tasklog_purge_last.txt', _ts + '\n')
         except Exception:
             pass
@@ -61124,8 +61148,8 @@ def _startup_ensure_broker():
         except Exception:
             pass
         try:
-            os.makedirs('/var/log/takwerx-broker', exist_ok=True)
-            os.chmod('/var/log/takwerx-broker', 0o750)
+            _makedirs_priv('/var/log/takwerx-broker', exist_ok=True)
+            _chmod_priv('/var/log/takwerx-broker', 0o750)
         except Exception:
             pass
         # SELinux (RHEL): same unconfined_service_t treatment as the console unit,
@@ -61775,7 +61799,7 @@ def _fail2ban_install_and_configure(plog):
     plog("fail2ban migration: fail2ban installed")
 
     # Step 2: Create log directory
-    os.makedirs('/var/log/authentik', exist_ok=True)
+    _makedirs_priv('/var/log/authentik', exist_ok=True)
     plog("fail2ban migration: created /var/log/authentik/")
 
     # Step 3: Write log forwarder systemd service
@@ -61799,7 +61823,7 @@ def _fail2ban_install_and_configure(plog):
     plog(f"fail2ban migration: wrote {svc_path}")
 
     # Step 4: Write fail2ban filter (matches Authentik JSON log lines)
-    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
     filter_conf = (
         "[Definition]\n"
         "# Match Authentik JSON log lines containing login_failed events.\n"
@@ -61814,7 +61838,7 @@ def _fail2ban_install_and_configure(plog):
     plog(f"fail2ban migration: wrote {filter_path}")
 
     # Step 5: Write jail config with fleet defaults
-    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
     jail_conf = (
         "[authentik]\n"
         "enabled  = true\n"
@@ -62008,7 +62032,7 @@ if __name__ == '__main__':
     # ── Step 2: fail2ban action definition ────────────────────────────────────
     # %% in ini = literal % after ConfigParser interpolation → shell %
     # On actionban: write Guard Dog dashboard log line + send email alert
-    os.makedirs('/var/log/takguard', exist_ok=True)
+    _makedirs_priv('/var/log/takguard', exist_ok=True)
     action_conf = (
         "[Definition]\n"
         "actionban  = mkdir -p /var/log/takguard"
@@ -62019,7 +62043,7 @@ if __name__ == '__main__':
         "actionunban =\n"
     )
     action_path = '/etc/fail2ban/action.d/infratak-guarddog.conf'
-    os.makedirs('/etc/fail2ban/action.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/action.d', exist_ok=True)
     _write_priv(action_path, action_conf)
     plog(f"fail2ban guarddog hook: wrote {action_path}")
 
@@ -62071,7 +62095,7 @@ def _fail2ban_takserver_filter(plog):
     # Log format: 2026-05-02-15:58:55.145 [...] ERROR ... NioNettyServerHandler error.
     #             ... Remote address: 1.2.3.4; ... Certificate error: peer not verified;
     # %% in ini = literal % after ConfigParser → shell sees %Y, etc.
-    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
     filter_conf = (
         "[Definition]\n"
         "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
@@ -62088,8 +62112,8 @@ def _fail2ban_takserver_filter(plog):
     plog(f"fail2ban takserver filter: wrote {filter_path}")
 
     # ── Guard Dog action for TAK Server jail ──────────────────────────────────
-    os.makedirs('/var/log/takguard', exist_ok=True)
-    os.makedirs('/etc/fail2ban/action.d', exist_ok=True)
+    _makedirs_priv('/var/log/takguard', exist_ok=True)
+    _makedirs_priv('/etc/fail2ban/action.d', exist_ok=True)
     tak_action_conf = (
         "[Definition]\n"
         "actionban  = mkdir -p /var/log/takguard"

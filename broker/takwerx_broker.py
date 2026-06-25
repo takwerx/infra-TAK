@@ -173,6 +173,7 @@ PATH_ALLOW = (
     '/opt/tak-guarddog/',
     '/usr/local/etc/',
     '/var/lib/cesium-tiles/',   # RHEL cesium tiles dir (chmod 755 by the console)
+    '/var/lib/takguard/',       # Guard Dog state dir (mkdir/chmod by the console)
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
     # NOTE: /usr/local/bin/ and /usr/sbin/ are deliberately NOT prefix-allowed —
     # they are on root's PATH, so a write there is an escalation primitive. The
