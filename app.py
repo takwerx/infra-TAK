@@ -42103,11 +42103,8 @@ def _ensure_vm_overcommit_memory(plog):
             patched.append('vm.overcommit_memory = 1')
             patched.append('')
             new_conf = '\n'.join(patched)
-            # Atomic write via tempfile + rename
-            tmp_path = sysctl_conf + '.infratak-tmp'
-            with open(tmp_path, 'w') as f:
-                f.write(new_conf)
-            os.rename(tmp_path, sysctl_conf)
+            # Route through the broker (the non-root console can't write /etc).
+            _write_priv(sysctl_conf, new_conf)
             sysctl_persisted = True
     except Exception as e:
         plog(f"  vm.overcommit_memory: /etc/sysctl.conf update failed: {e} "
@@ -62001,9 +61998,7 @@ if __name__ == '__main__':
     main()
 '''
     notify_path = '/usr/local/sbin/infratak-f2b-notify'
-    with open(notify_path, 'w') as _f:
-        _f.write(notify_script)
-    os.chmod(notify_path, 0o755)
+    _write_priv(notify_path, notify_script, perm=0o755)
     plog(f"fail2ban guarddog hook: wrote {notify_path}")
 
     # ── Step 2: fail2ban action definition ────────────────────────────────────
@@ -62213,15 +62208,13 @@ def _ensure_console_restart_timer():
             cur = ''
             if os.path.exists(path):
                 try:
-                    with open(path) as _f:
-                        cur = _f.read()
+                    cur = _read_priv(path)
                 except Exception:
                     pass
             if cur != content:
-                with open(path, 'w') as _f:
-                    _f.write(content)
-                if mode is not None:
-                    os.chmod(path, mode)
+                # Route through the broker — the non-root console can't write
+                # /usr/local/sbin or /etc/systemd/system directly.
+                _write_priv(path, content, perm=mode)
                 return True
             return False
 

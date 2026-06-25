@@ -190,9 +190,16 @@ PATH_ALLOW = (
 PATH_ALLOW_EXACT = (
     '/etc/fstab',
     '/etc/os-release',
+    '/etc/sysctl.conf',         # vm.overcommit_memory persistence (Redis BGSAVE fix)
     '/etc/docker/daemon.json',
     '/swapfile',
     '/usr/sbin/ufw',            # ufw->firewalld shim (RHEL); see _check_install
+    # Console-owned helper scripts run by systemd units the console ALSO writes
+    # (so this grants no privilege beyond the unit it's paired with — same
+    # inherent near-root as writing the unit itself). Exact paths only, NOT the
+    # /usr/local/sbin prefix (which stays denied as a root-PATH escalation surface).
+    '/usr/local/sbin/tak-console-restart.sh',   # daily console-restart timer
+    '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
 )
 
 # NEVER, even inside an allowed prefix — the escalation / credential surface and
