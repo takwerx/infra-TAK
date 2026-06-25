@@ -99,13 +99,26 @@ EXEC_ALLOW = {
     'docker',
     # storage / kernel knobs (path-checked where they take a file)
     'swapon', 'swapoff', 'mkswap', 'fallocate', 'sync',
-    # SELinux read-only inspection
-    'getenforce', 'getsebool', 'restorecon',
+    # SELinux: read-only inspection + `semanage port` (gated — see _check_semanage)
+    'getenforce', 'getsebool', 'restorecon', 'semanage',
     # read-only inspection (routed for a single audit point)
     'ss', 'ip', 'getent', 'getcap',
+    # package managers (gated — see _check_pkgmgr: install/remove only, no -o hooks).
+    # NB: installing any package runs its root post-install script — inherently
+    # near-root, same bucket as systemd units / docker. The gate blocks the
+    # GRATUITOUS -o/--setopt hook-command escalation, not package install itself.
+    'apt', 'apt-get', 'dnf', 'yum',
     # privileged file IO via coreutils — TARGET PATHS are validated (see below)
     'tee', 'cat', 'cp', 'mv', 'rm', 'mkdir', 'rmdir', 'chmod', 'chown',
-    'touch', 'ln',
+    'touch', 'ln', 'install',
+}
+
+# Package-manager subcommands the console legitimately uses. Anything else (and
+# the `-o`/`--setopt` hook-command vector) is denied.
+PKGMGR_SUBCMDS = {
+    'install', 'remove', 'purge', 'reinstall', 'autoremove', 'erase',
+    'update', 'upgrade', 'makecache', 'clean', 'list', 'info', 'check-update',
+    'module', 'group', 'mark',
 }
 
 # Never executable through the broker — escalation primitives (defence in depth;
@@ -115,9 +128,8 @@ EXEC_DENY = {
     'su', 'sudo', 'pkexec', 'runuser', 'setpriv',          # privilege pivots
     'env', 'nohup', 'nice', 'timeout', 'xargs', 'find',    # exec wrappers / -exec
     'perl', 'python', 'python3', 'ruby', 'awk', 'gawk',    # interpreters
-    'sed', 'dd', 'install', 'psql', 'openssl',             # arbitrary write/exec
-    'apt', 'apt-get', 'dnf', 'yum',                        # pkg-mgr hook exec
-    'semodule', 'semanage', 'setsebool', 'setcap',         # confinement / caps
+    'sed', 'dd', 'psql', 'openssl',                        # arbitrary write/exec
+    'semodule', 'setsebool', 'setcap',                     # confinement / caps
     'sysctl',                                              # core_pattern = |cmd
     'visudo', 'passwd', 'chpasswd', 'useradd', 'usermod', 'groupadd',
 }
@@ -155,9 +167,11 @@ PATH_ALLOW = (
     '/opt/tak/',
     '/opt/tak-guarddog/',
     '/usr/local/etc/',
-    # NOTE: /usr/local/bin/ deliberately NOT allowed — it is on root's PATH and
-    # executable, so a write there is a root-escalation primitive.
-    '/var/log/takwerx-broker/',
+    '/var/lib/cesium-tiles/',   # RHEL cesium tiles dir (chmod 755 by the console)
+    '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
+    # NOTE: /usr/local/bin/ and /usr/sbin/ are deliberately NOT prefix-allowed —
+    # they are on root's PATH, so a write there is an escalation primitive. The
+    # one legit exception (the ufw->firewalld shim) is the EXACT path below.
 )
 
 # Exact privileged paths that are read/written but aren't directories.
@@ -166,6 +180,7 @@ PATH_ALLOW_EXACT = (
     '/etc/os-release',
     '/etc/docker/daemon.json',
     '/swapfile',
+    '/usr/sbin/ufw',            # ufw->firewalld shim (RHEL); see _check_install
 )
 
 # NEVER, even inside an allowed prefix — the escalation / credential surface and
@@ -219,7 +234,8 @@ def _path_allowed(path):
     if p in PATH_ALLOW_EXACT:
         return p
     for a in PATH_ALLOW:
-        if p.startswith(a):
+        # match a child of the dir, OR the allowlisted dir itself (no trailing /)
+        if p.startswith(a) or p == a.rstrip('/'):
             return p
     raise Denied(f'path not in allow-list: {p}')
 
@@ -292,11 +308,59 @@ def check_exec(argv, cwd=None):
         raise Denied(f'binary not in allow-list: {base}')
     if base == 'systemctl':
         _check_systemctl(argv)
-    if base == 'docker':
+    elif base == 'docker':
         _check_docker(argv)
-    if base in PATH_CHECKED_BINS:
+    elif base in ('apt', 'apt-get', 'dnf', 'yum'):
+        _check_pkgmgr(argv)
+    elif base == 'semanage':
+        _check_semanage(argv)
+    elif base == 'install':
+        _check_install(argv)
+    elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
+
+
+def _check_pkgmgr(argv):
+    """apt/dnf/yum: allow only the package subcommands the console uses, and
+    block the `-o`/`--setopt` hook-command vector (e.g.
+    `apt-get -o APT::Update::Pre-Invoke::=cmd`). Installing a package still runs
+    its root post-install script — that residual is inherent to package mgmt."""
+    sub = None
+    for a in argv[1:]:
+        # -o KEY=VAL / --option / --setopt run arbitrary config incl. exec hooks
+        if a in ('-o', '--option', '--setopt') or a.startswith(('-o', '--setopt=', '--option=')):
+            raise Denied(f'{argv[0]}: -o/--setopt option not allowed')
+        if '::' in a and a.startswith('-'):
+            raise Denied(f'{argv[0]}: config-override option not allowed: {a}')
+        if sub is None and not a.startswith('-'):
+            sub = a
+    if sub is None:
+        raise Denied(f'{argv[0]}: no subcommand')
+    if sub not in PKGMGR_SUBCMDS:
+        raise Denied(f'{argv[0]} subcommand not allowed: {sub}')
+
+
+def _check_semanage(argv):
+    """semanage manages SELinux policy bits. Allow ONLY `semanage port` (the
+    console labels custom Caddy ports http_port_t); deny fcontext/login/etc."""
+    if len(argv) < 2 or argv[1] != 'port':
+        raise Denied('semanage: only `semanage port` is allowed')
+
+
+def _check_install(argv):
+    """install(1): `install -m MODE src dst`. The SOURCE is a read of a
+    console-owned file (anywhere); only the DEST must be allowlisted. Block the
+    `--strip-program=cmd` arbitrary-exec vector."""
+    for a in argv[1:]:
+        if a in ('-S', '--strip') or a.startswith('--strip-program'):
+            raise Denied('install: --strip-program/--strip not allowed')
+    paths = [a for a in argv[1:] if not a.startswith('-')
+             and a not in ('0755', '0644', '0700', '0600', '0750')]
+    # the mode value follows -m; drop a bare numeric mode if present
+    paths = [a for a in paths if not (len(a) <= 4 and a.isdigit())]
+    if paths:
+        _path_allowed(paths[-1])   # dst = last positional path
 
 
 def _check_systemctl(argv):
@@ -319,11 +383,18 @@ def _check_path_args(base, argv, cwd=None):
     daemon honours a caller-supplied cwd (so `tee passwd` with cwd=/etc would
     otherwise hit /etc/passwd)."""
     base_cwd = cwd if (cwd and isinstance(cwd, str) and cwd.startswith('/')) else '/'
+    # chmod/chown take a non-path first positional (the MODE / OWNER:GROUP) which
+    # must NOT be treated as a path operand.
+    skip_first_positional = base in ('chmod', 'chown')
+    seen_positional = False
     for a in argv[1:]:
         if a == '--' or a.startswith('-'):
             continue               # flag — coreutils flags here don't take paths
-                                   # (sed/dd/install with path-taking flags are denied)
-        # Everything else is treated as a path operand and must be allowlisted.
+        if skip_first_positional and not seen_positional:
+            seen_positional = True
+            continue               # the MODE (chmod) / OWNER (chown) arg
+        seen_positional = True
+        # Everything else is a path operand and must be allowlisted.
         target = a if a.startswith('/') else os.path.join(base_cwd, a)
         _path_allowed(target)      # raises Denied if outside allowlist
 
