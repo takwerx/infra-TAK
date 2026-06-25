@@ -160,6 +160,23 @@ def plan(node, src):
         mode, segs = 'seq', t.split(';')
     else:
         return None, 'not compound'
+    # A leading `cd DIR` segment -> extract it as cwd= and chain the rest.
+    cwd_src = None
+    seg0 = REDIR_RE.sub('', segs[0]).strip()
+    if seg0.startswith('cd '):
+        cdtgt = seg0[3:].strip()
+        mall = list(SENT_RE.finditer(cdtgt))
+        if len(mall) == 1 and mall[0].group(0) == cdtgt:
+            cwd_src = exprs[int(mall[0].group(1))]
+        elif not mall and cdtgt.startswith('~'):
+            cwd_src = f'os.path.expanduser({cdtgt!r})'
+        elif not mall and cdtgt.startswith('/'):
+            cwd_src = repr(cdtgt)
+        else:
+            return None, f'unhandled cd target: {cdtgt!r}'
+        segs = segs[1:]
+        if not segs:
+            return None, 'cd with no command'
     argv_lists = []
     for seg in segs:
         seg = REDIR_RE.sub('', seg).strip()
@@ -185,7 +202,7 @@ def plan(node, src):
         argv_lists.append(tokens_to_argv(toks, exprs))
     if _broker_denies(argv_lists):
         return None, 'broker would DENY a segment (gap) — needs rulebook/hand fix'
-    return {'mode': mode, 'argv_lists': argv_lists, 'node': node}, ''
+    return {'mode': mode, 'argv_lists': argv_lists, 'node': node, 'cwd_src': cwd_src}, ''
 
 
 def make_edit(p, src):
@@ -199,6 +216,8 @@ def make_edit(p, src):
     cw = kw(node, 'cwd')
     if cw is not None:
         extra += ', cwd=' + ast.get_source_segment(src, cw.value)
+    elif p.get('cwd_src'):
+        extra += ', cwd=' + p['cwd_src']
     repl = f"_run_priv_chain([{inner}], {p['mode']!r}{extra})"
     return (s, e, repl)
 

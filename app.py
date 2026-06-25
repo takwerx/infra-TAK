@@ -14586,10 +14586,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
     if env_changed:
         _log("Env changed — running docker compose down && up -d to apply (this takes ~30s)…")
         try:
-            subprocess.run(
-                f'cd {ak_dir} && docker compose down --timeout 20 && docker compose up -d 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=120
-            )
+            _run_priv_chain([['docker', 'compose', 'down', '--timeout', '20'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
             _log("✓ Authentik restarted with new env")
         except Exception as e:
             _log(f"⚠ Authentik restart: {e}")
@@ -19287,7 +19284,7 @@ def takportal_control():
     elif action == 'restart':
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
-        subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
+        _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=portal_dir)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
     elif action == 'reconfigure':
@@ -36420,7 +36417,7 @@ def authentik_control():
     elif action == 'stop':
         subprocess.run(_sudo_wrap(['docker', 'compose', 'down']), cwd=ak_dir, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
-        subprocess.run(f'cd {ak_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
+        _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
     elif action == 'update':
         import re as _re
         latest = _get_authentik_target_release(settings)
@@ -36433,7 +36430,7 @@ def authentik_control():
                 with open(cp, 'w') as _f:
                     _f.write(_new)
         _ensure_authentik_compose_patches(cp)
-        subprocess.run(f'cd {ak_dir} && docker compose pull && docker compose down --timeout 30 && docker compose up -d && docker image prune -f', shell=True, capture_output=True, text=True, timeout=360)
+        _run_priv_chain([['docker', 'compose', 'pull'], ['docker', 'compose', 'down', '--timeout', '30'], ['docker', 'compose', 'up', '-d'], ['docker', 'image', 'prune', '-f']], 'and', timeout=360, cwd=ak_dir)
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(5)
@@ -38255,10 +38252,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
             plog("  PostgreSQL container not found, skipping PG tuning runtime check")
             return
         # Clear any ALTER SYSTEM overrides so compose command-line args are authoritative
-        subprocess.run(
-            f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "ALTER SYSTEM RESET ALL;" 2>&1',
-            shell=True, capture_output=True, text=True, timeout=15
-        )
+        _run_priv_chain([['docker', 'compose', 'exec', '-T', 'postgresql', 'psql', '-U', 'authentik', '-d', 'authentik', '-c', 'ALTER SYSTEM RESET ALL;']], 'and', timeout=15, cwd=ak_dir)
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
             plog("  PostgreSQL tuning args changed — recreating container to apply enterprise settings (max_connections=2000, shared_buffers=12GB, ...)")
@@ -38267,10 +38261,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
             )
             plog("  ✓ PostgreSQL recreated with enterprise tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB, statement_timeout=120s, idle_session_timeout=300s)")
         else:
-            subprocess.run(
-                f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
-                shell=True, capture_output=True, text=True, timeout=15
-            )
+            _run_priv_chain([['docker', 'compose', 'exec', '-T', 'postgresql', 'psql', '-U', 'authentik', '-d', 'authentik', '-c', 'SELECT pg_reload_conf();']], 'and', timeout=15, cwd=ak_dir)
             plog("  ✓ PostgreSQL: tuning already current, config reloaded")
     except Exception as e:
         plog(f"  ⚠ PG tuning cleanup skipped: {e}")
@@ -46587,8 +46578,7 @@ entries:
                                                 f.write(compose_text)
                                             plog(f"  ✓ LDAP outpost token injected into docker-compose.yml")
                                             plog(f"  Recreating LDAP container with new token...")
-                                            subprocess.run(f'cd {ak_dir} && docker compose stop ldap && docker compose rm -f ldap && docker compose up -d ldap 2>&1',
-                                                shell=True, capture_output=True, timeout=60)
+                                            _run_priv_chain([['docker', 'compose', 'stop', 'ldap'], ['docker', 'compose', 'rm', '-f', 'ldap'], ['docker', 'compose', 'up', '-d', 'ldap']], 'and', timeout=60, cwd=ak_dir)
                                             plog(f"  ✓ LDAP container recreated with injected token")
                                             time.sleep(10)
                                             plog(f"  ℹ LDAP may take 30–60s to show healthy in Authentik Outposts")
