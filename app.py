@@ -54765,8 +54765,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                     cc = _re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                     if db_password:
                         cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_password + m.group(2), cc)
-                    with open('/opt/tak/CoreConfig.xml', 'w') as f:
-                        f.write(cc)
+                    _write_priv('/opt/tak/CoreConfig.xml', cc)
                     ulog(f"✓ CoreConfig.xml JDBC restored to {db_host}:{db_port}")
                 else:
                     ulog(f"✓ CoreConfig.xml JDBC already points to {db_host}")
@@ -54818,8 +54817,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                     with open('/opt/tak/CoreConfig.xml', 'r') as f:
                         cc = f.read()
                     cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + fresh_pw + m.group(2), cc)
-                    with open('/opt/tak/CoreConfig.xml', 'w') as f:
-                        f.write(cc)
+                    _write_priv('/opt/tak/CoreConfig.xml', cc)
                     db_password = fresh_pw
                     tak_cfg.setdefault('database', {})['password'] = fresh_pw
                     settings = load_settings()
@@ -55901,8 +55899,7 @@ def run_takserver_deploy(config):
                     if _edb_pass_early:
                         _edb_pass_xml = html.escape(_edb_pass_early, quote=True)
                         _cc = _re_early.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + _edb_pass_xml + m.group(2), _cc)
-                    with open('/opt/tak/CoreConfig.xml', 'w') as _f:
-                        _f.write(_cc)
+                    _write_priv('/opt/tak/CoreConfig.xml', _cc)
                     log_step(f"✓ CoreConfig JDBC pre-patched to {_edb_host_early}:{_edb_port_early}")
                 except Exception as _e:
                     log_step(f"⚠ Could not pre-patch CoreConfig JDBC: {_e}")
