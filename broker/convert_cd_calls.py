@@ -66,7 +66,7 @@ def find_calls(tree):
             continue
         f = node.func
         if isinstance(f, ast.Attribute) and f.attr in SUBPROC_FUNCS \
-                and isinstance(f.value, ast.Name) and f.value.id == 'subprocess':
+                and isinstance(f.value, ast.Name) and f.value.id in ('subprocess', '_sp'):
             out.append((node, node.args[0] if node.args else None, False))
         elif isinstance(f, ast.Attribute) and f.attr == 'system' \
                 and isinstance(f.value, ast.Name) and f.value.id == 'os':

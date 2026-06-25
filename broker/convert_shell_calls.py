@@ -77,7 +77,7 @@ def find_calls(tree, src):
             continue
         f = node.func
         if isinstance(f, ast.Attribute) and f.attr in SUBPROC_FUNCS \
-                and isinstance(f.value, ast.Name) and f.value.id == 'subprocess':
+                and isinstance(f.value, ast.Name) and f.value.id in ('subprocess', '_sp'):
             shellish = any(isinstance(k, ast.keyword) and k.arg == 'shell'
                            and isinstance(k.value, ast.Constant) and k.value.value
                            for k in node.keywords)

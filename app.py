@@ -41,7 +41,7 @@ if __name__ == '__main__':
                 _svc_c = _re.sub(r'^ExecStart=.*$', f'ExecStart={_exec_line}', _svc_c, flags=_re.MULTILINE)
                 with open(_svc, 'w') as _f:
                     _f.write(_svc_c)
-                _sp.run(['systemctl', 'daemon-reload'], capture_output=True)
+                _sp.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
 
         _args = [_gunicorn, '--bind', f'0.0.0.0:{_port}',
                  '--workers', '1', '--threads', '8',
@@ -1952,7 +1952,7 @@ def detect_modules():
     else:
         try:
             import subprocess as _sp
-            result = _sp.run(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp'],
+            result = _sp.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp']),
                              capture_output=True, text=True, timeout=3)
             wo_running = result.stdout.strip() == 'true'
             # Self-heal: containers are up but flag got cleared (e.g. interrupted uninstall/deploy)
@@ -7115,7 +7115,7 @@ def netbird_control_api():
     
     import subprocess as _sp
     if action == 'update':
-        pull = _sp.run(['docker', 'compose', 'pull', 'netbird-server', 'dashboard'],
+        pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)
         if pull.returncode != 0:
             err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
@@ -7126,7 +7126,7 @@ def netbird_control_api():
         except Exception as ex:
             return jsonify({'success': False, 'error': str(ex)[:300]}), 500
         time.sleep(2)
-        r_status = _sp.run(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server'],
+        r_status = _sp.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']),
                              capture_output=True, text=True)
         running = r_status.stdout.strip() == 'true'
         vinfo = _get_netbird_version_info()
@@ -7138,14 +7138,14 @@ def netbird_control_api():
             'version': vinfo.get('version') or '',
         })
     if action == 'start':
-        _sp.run(['docker', 'compose', 'start'], capture_output=True, cwd=nb_dir)
+        _sp.run(_sudo_wrap(['docker', 'compose', 'start']), capture_output=True, cwd=nb_dir)
     elif action == 'stop':
-        _sp.run(['docker', 'compose', 'stop'], capture_output=True, cwd=nb_dir)
+        _sp.run(_sudo_wrap(['docker', 'compose', 'stop']), capture_output=True, cwd=nb_dir)
     elif action == 'restart':
-        _sp.run(['docker', 'compose', 'restart'], capture_output=True, cwd=nb_dir)
+        _sp.run(_sudo_wrap(['docker', 'compose', 'restart']), capture_output=True, cwd=nb_dir)
         
     time.sleep(2)
-    r_status = _sp.run(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server'], capture_output=True, text=True)
+    r_status = _sp.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']), capture_output=True, text=True)
     running = r_status.stdout.strip() == 'true'
     return jsonify({'success': True, 'running': running})
 
@@ -7168,7 +7168,7 @@ def netbird_logs_api():
         return jsonify({'lines': ['NetBird is not deployed.']})
     
     import subprocess as _sp
-    r = _sp.run(['docker', 'compose', 'logs', '--tail=100'], capture_output=True, text=True, cwd=nb_dir)
+    r = _sp.run(_sudo_wrap(['docker', 'compose', 'logs', '--tail=100']), capture_output=True, text=True, cwd=nb_dir)
     lines = (r.stdout or r.stderr or '').split('\n')
     return jsonify({'lines': lines})
 
@@ -7197,7 +7197,7 @@ def netbird_uninstall_api():
             nb_dir = NETBIRD_INSTALL_DIR
             # Tear down docker containers
             if os.path.exists(os.path.join(nb_dir, 'docker-compose.yml')):
-                _sp.run(['docker', 'compose', 'down', '-v'], capture_output=True, cwd=nb_dir)
+                _sp.run(_sudo_wrap(['docker', 'compose', 'down', '-v']), capture_output=True, cwd=nb_dir)
             # Remove NetBird directory
             if os.path.exists(nb_dir):
                 _sh.rmtree(nb_dir)
@@ -7212,8 +7212,7 @@ def netbird_uninstall_api():
             save_settings(settings)
             # Regenerate caddyfile and reload
             generate_caddyfile(settings)
-            _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
-                     shell=True, capture_output=True, text=True, timeout=90)
+            _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=90)
             _netbird_uninstall_status.update({'running': False, 'complete': True, 'error': False})
         except Exception:
             _netbird_uninstall_status.update({'running': False, 'complete': True, 'error': True})
@@ -7523,7 +7522,7 @@ def _run_remote_assist_deploy(settings):
             raise RuntimeError('FQDN required — configure Caddy SSL first (Marketplace needs a domain for OIDC).')
 
         plog('━━━ Step 1/6: Checking Docker ━━━')
-        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
+        r = _sp.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
             r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
@@ -7591,13 +7590,12 @@ def _run_remote_assist_deploy(settings):
             # Android device API port is a real inbound listener (host Caddy), so it must be
             # opened in firewalld explicitly: the cloud SG sits IN FRONT of the host firewall,
             # so 'SG handles it' is not enough — firewalld still drops 8448 at the host.
-            _sp.run(f'firewall-cmd --permanent --add-port={REMOTE_ASSIST_DEVICE_PORT}/tcp 2>/dev/null; firewall-cmd --reload 2>/dev/null; true',
-                    shell=True, capture_output=True, timeout=30)
+            _run_priv_chain([['firewall-cmd', '--permanent', f'--add-port={REMOTE_ASSIST_DEVICE_PORT}/tcp'], ['firewall-cmd', '--reload']], 'seq', timeout=30)
             plog(f'  ✓ firewalld allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API); {REMOTE_ASSIST_PORT} Caddy-only (loopback)')
         else:
-            _sp.run(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp'], capture_output=True)
+            _sp.run(_sudo_wrap(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp']), capture_output=True)
             plog(f'  ✓ ufw deny {REMOTE_ASSIST_PORT}/tcp (loopback/Caddy-only)')
-            _sp.run(['ufw', 'allow', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'], capture_output=True)
+            _sp.run(_sudo_wrap(['ufw', 'allow', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp']), capture_output=True)
             plog(f'  ✓ ufw allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API)')
         s = load_settings()
         s['remote_assist_enabled'] = True
@@ -7608,8 +7606,7 @@ def _run_remote_assist_deploy(settings):
             s['remote_assist_version'] = ra_version
         save_settings(s)
         generate_caddyfile(s)
-        _sp.run('systemctl restart caddy 2>&1',
-                shell=True, capture_output=True, text=True, timeout=90)
+        _sp.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         plog('✓ Caddy restarted (8448 listener requires full restart)')
 
         portal_url = f'https://{_get_service_domain(s, "remote_assist")}'
@@ -7967,7 +7964,7 @@ def remote_assist_control_api():
         return jsonify({'success': False, 'error': (r.stderr or r.stdout)[:300]})
     running = False
     try:
-        _st = _sp.run(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
+        _st = _sp.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}']),
                       capture_output=True, text=True, timeout=5)
         running = 'Up' in (_st.stdout or '')
     except Exception:
@@ -8017,8 +8014,7 @@ def remote_assist_uninstall_api():
             settings.pop('remote_assist_version', None)
             save_settings(settings)
             generate_caddyfile(settings)
-            _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
-                    shell=True, capture_output=True, text=True, timeout=90)
+            _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=90)
             _deregister_authentik_oauth2_app(settings, REMOTE_ASSIST_OIDC_SLUG, 'EUD Remote Assist')
             _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': False})
         except Exception:
@@ -17709,8 +17705,7 @@ log "TAK keystore refreshed and container restarted."
                  'Persistent=true\n\n[Install]\nWantedBy=timers.target\n')
         _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
         _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
-        subprocess.run('systemctl daemon-reload && systemctl enable --now takserver-cert-renewal.timer 2>/dev/null; true',
-                       shell=True, capture_output=True)
+        _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'takserver-cert-renewal.timer']], 'and')
         log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
     except Exception as _re:
         log_fn(f"  ⚠ renewal timer setup skipped: {str(_re)[:120]}")
@@ -17950,9 +17945,7 @@ WantedBy=timers.target
 '''
     _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
     _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
-    subprocess.run(
-        'systemctl daemon-reload && systemctl enable --now takserver-cert-renewal.timer 2>/dev/null; true',
-        shell=True, capture_output=True)
+    _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'takserver-cert-renewal.timer']], 'and')
     log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
 
     # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
@@ -18767,8 +18760,8 @@ def _get_webodm_version_info():
     info = {'version': '', 'update_available': False, 'latest': None}
     try:
         r = _sp.run(
-            ['docker', 'exec', 'webapp', 'python3', '-c',
-             'import json; d=json.load(open("/webodm/package.json")); print(d["version"])'],
+            _sudo_wrap(['docker', 'exec', 'webapp', 'python3', '-c',
+             'import json; d=json.load(open("/webodm/package.json")); print(d["version"])']),
             capture_output=True, text=True, timeout=10)
         v = r.stdout.strip()
         if v:
@@ -20669,7 +20662,7 @@ paths:
                 timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
                 _write_priv('/etc/systemd/system/mediamtx-cert-sync.service', svc)
                 _write_priv('/etc/systemd/system/mediamtx-cert-sync.timer', timer)
-                subprocess.run('systemctl daemon-reload && systemctl enable --now mediamtx-cert-sync.timer 2>/dev/null; true', shell=True, capture_output=True)
+                _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'mediamtx-cert-sync.timer']], 'and')
                 plog("✓ Cert renewal sync timer installed (daily)")
             else:
                 plog("⚠ Failed to copy certs to remote — RTSPS not configured")
@@ -20747,8 +20740,7 @@ def run_mediamtx_deploy():
         if _distro_family() == 'rhel':
             subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'epel-release', 'dnf-plugins-core']),
                            capture_output=True, text=True, timeout=300)
-            subprocess.run('dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null; true',
-                           shell=True, capture_output=True, text=True, timeout=120)
+            _run_priv_chain([['dnf', 'config-manager', '--set-enabled', 'crb'], ['dnf', 'config-manager', '--set-enabled', 'powertools']], 'or', timeout=120)
             # Core deps (required). The MediaMTX binary is pure Go and doesn't need
             # ffmpeg, so install core deps strictly, then ffmpeg separately.
             ok, out = _pkg_install(['wget', 'tar', 'curl', 'openssl', 'python3', 'python3-pip'],
@@ -20774,8 +20766,7 @@ def run_mediamtx_deploy():
                  "⚠ ffmpeg unavailable — MediaMTX streaming OK, but recording / MP4 download / test stream need ffmpeg (RPM Fusion repo unreachable?)")
         else:
             wait_for_apt_lock(plog, mediamtx_deploy_log)
-            r = subprocess.run('apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1',
-                shell=True, capture_output=True, text=True, timeout=300)
+            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', 'wget', 'tar', 'curl', 'ffmpeg', 'openssl', 'python3', 'python3-pip']], 'and', timeout=300)
             if r.returncode != 0:
                 plog(f"✗ apt install failed: {r.stdout[-200:]}")
                 mediamtx_deploy_status.update({'running': False, 'error': True})
@@ -21259,7 +21250,7 @@ WantedBy=multi-user.target
                 # Editor writes theme_config.json, email_config.json, users_file,
                 # share_links, group_metadata, srt_passphrase_backup, pending_reg,
                 # reset_tokens, etc. into /opt/mediamtx-webeditor/. All as takwerx.
-                subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor', shell=True, capture_output=True, timeout=10)
+                subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
                 # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
                 # the editor's Save-Config UI. takwerx ownership lets both work.
                 subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
@@ -25080,7 +25071,7 @@ def _run_webodm_deploy(settings):
             f.write(compose_content)
 
         plog('Pulling images (this may take several minutes)…')
-        r = _sp.run(['docker', 'compose', '-f', compose_path, 'pull'],
+        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'pull']),
                     capture_output=True, text=True, timeout=300,
                     cwd=wo_dir)
         if r.returncode != 0:
@@ -25096,10 +25087,10 @@ def _run_webodm_deploy(settings):
             plog('  (RHEL: ufw absent — WebODM ports covered by firewalld default-deny / cloud SG)')
         else:
             for _wo_ufw_port in [wo_port, 3001]:
-                _sp.run(['ufw', 'deny', f'{_wo_ufw_port}/tcp'], capture_output=True)
+                _sp.run(_sudo_wrap(['ufw', 'deny', f'{_wo_ufw_port}/tcp']), capture_output=True)
 
         plog('Starting WebODM containers…')
-        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d']),
                     capture_output=True, text=True, timeout=120, cwd=wo_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
@@ -25125,8 +25116,8 @@ def _run_webodm_deploy(settings):
             # Use manage.py addnode — same approach as WebODM's own start.sh,
             # no auth credentials required, idempotent on duplicate hostname
             _r_node = _sp.run(
-                ['docker', 'exec', 'webapp', 'python', 'manage.py',
-                 'addnode', 'wo_nodeodm', '3000', '--label', 'NodeODX'],
+                _sudo_wrap(['docker', 'exec', 'webapp', 'python', 'manage.py',
+                 'addnode', 'wo_nodeodm', '3000', '--label', 'NodeODX']),
                 capture_output=True, text=True, timeout=30, cwd=wo_dir)
             if _r_node.returncode == 0:
                 plog('NodeODM processing node registered.')
@@ -25226,8 +25217,8 @@ def webodm_admin_accounts():
     import subprocess as _sp
     try:
         r = _sp.run(
-            ['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
-             'from django.contrib.auth.models import User; print(",".join([u.username for u in User.objects.filter(is_superuser=True)]))'],
+            _sudo_wrap(['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
+             'from django.contrib.auth.models import User; print(",".join([u.username for u in User.objects.filter(is_superuser=True)]))']),
             capture_output=True, text=True, timeout=15)
         accounts = [u.strip() for u in r.stdout.strip().split(',') if u.strip()]
         return jsonify({'accounts': accounts})
@@ -25246,8 +25237,8 @@ def webodm_reset_password():
         return jsonify({'success': False, 'error': 'Password must be at least 8 characters'})
     try:
         r = _sp.run(
-            ['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
-             f'from django.contrib.auth.models import User; u=User.objects.get(username={repr(username)}); u.set_password({repr(password)}); u.save(); print("ok")'],
+            _sudo_wrap(['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
+             f'from django.contrib.auth.models import User; u=User.objects.get(username={repr(username)}); u.set_password({repr(password)}); u.save(); print("ok")']),
             capture_output=True, text=True, timeout=15)
         if 'ok' in r.stdout:
             return jsonify({'success': True})
@@ -25269,13 +25260,13 @@ def _run_webodm_update():
         _webodm_update_status['log'] = list(log)
     try:
         plog('Pulling latest WebODM images…')
-        r = _sp.run(['docker', 'compose', '-f', compose_path, 'pull'],
+        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'pull']),
                     capture_output=True, text=True, timeout=300, cwd=wo_dir)
         plog(r.stdout[-500:] if r.stdout else '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose pull failed: {r.stderr[:300]}')
         plog('Restarting containers with new images…')
-        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d']),
                     capture_output=True, text=True, timeout=120, cwd=wo_dir)
         plog(r.stdout[-300:] if r.stdout else '(no output)')
         if r.returncode != 0:
@@ -25322,7 +25313,7 @@ def webodm_ready():
 
     # 1. Container health — 'healthy' state means Django is answering its own healthcheck
     try:
-        r = _sp.run(['docker', 'inspect', '--format={{.State.Health.Status}}', 'webapp'],
+        r = _sp.run(_sudo_wrap(['docker', 'inspect', '--format={{.State.Health.Status}}', 'webapp']),
                     capture_output=True, text=True, timeout=6)
         health = r.stdout.strip()
     except Exception:
@@ -25333,8 +25324,8 @@ def webodm_ready():
 
     # 2. Fallback: probe WebODM's internal API endpoint directly from the container
     try:
-        r2 = _sp.run(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '4',
-                      'http://localhost:8000/api/'],
+        r2 = _sp.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '4',
+                      'http://localhost:8000/api/']),
                      capture_output=True, text=True, timeout=8)
         if r2.returncode == 0:
             return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
@@ -25343,7 +25334,7 @@ def webodm_ready():
 
     # 3. Not ready yet — figure out a useful status message
     try:
-        r3 = _sp.run(['docker', 'inspect', '--format={{.State.Status}}', 'webapp'],
+        r3 = _sp.run(_sudo_wrap(['docker', 'inspect', '--format={{.State.Status}}', 'webapp']),
                      capture_output=True, text=True, timeout=6)
         state = r3.stdout.strip()
     except Exception:
@@ -25381,7 +25372,7 @@ def webodm_uninstall():
         wo_dir = os.path.expanduser('~/webodm')
         compose_path = os.path.join(wo_dir, 'docker-compose.yml')
         if os.path.exists(compose_path):
-            _sp.run(['docker', 'compose', '-f', compose_path, 'down', '--volumes'],
+            _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'down', '--volumes']),
                     capture_output=True, timeout=90, cwd=wo_dir)
         db_dir = os.path.join(wo_dir, 'db')
         if os.path.isdir(db_dir):
@@ -25394,7 +25385,7 @@ def webodm_uninstall():
     s['webodm_deployment'] = _normalize_module_deployment_config(deploy_cfg)
     save_settings(s)
     generate_caddyfile(s)
-    _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
+    _sp.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, capture_output=True)
     return jsonify({'success': True})
 
 
@@ -25479,7 +25470,7 @@ def tvr_control():
 def tvr_logs():
     import subprocess as _sp
     try:
-        r = _sp.run(['docker', 'logs', '--tail', '200', 'tak-video-restreamer'],
+        r = _sp.run(_sudo_wrap(['docker', 'logs', '--tail', '200', 'tak-video-restreamer']),
                     capture_output=True, text=True, timeout=15)
         raw = (r.stdout + r.stderr).splitlines()
         return jsonify({'lines': raw[-200:]})
@@ -25498,13 +25489,13 @@ def tvr_uninstall():
         return jsonify({'error': 'Invalid admin password'}), 403
     compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
     if os.path.exists(compose_path):
-        _sp.run(['docker', 'compose', '-f', compose_path, 'down'],
+        _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'down']),
                 capture_output=True, timeout=60, cwd=TVR_INSTALL_DIR)
     s = load_settings()
     s['tak_video_restreamer_enabled'] = False
     save_settings(s)
     generate_caddyfile(s)
-    _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
+    _sp.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, capture_output=True)
     _deregister_authentik_proxy_app(s, 'tak-video-restreamer', 'TAK Video Restreamer Proxy')
     return jsonify({'success': True})
 
@@ -25530,7 +25521,7 @@ def tvr_set_password():
             content = _re.sub(r'(- ADMIN_PASSWORD=).*', f'- ADMIN_PASSWORD={new_password}', content)
             with open(compose_path, 'w') as f:
                 f.write(content)
-            _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+            _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d']),
                     capture_output=True, timeout=60, cwd=TVR_INSTALL_DIR)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -25562,7 +25553,7 @@ def _run_tvr_update():
         plog('')
         plog('━━━ Step 2/3: Rebuilding Docker image ━━━')
         compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
-        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build'],
+        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build']),
                     capture_output=True, text=True, timeout=600, cwd=TVR_INSTALL_DIR)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
         if r.returncode != 0:
@@ -26310,7 +26301,7 @@ def _run_tvr_deploy(settings):
 
         # Step 1: Ensure Docker is present
         plog('━━━ Step 1/6: Checking Docker ━━━')
-        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
+        r = _sp.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
             r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
@@ -26396,7 +26387,7 @@ def _run_tvr_deploy(settings):
         plog('')
         plog('━━━ Step 4/6: Building & Starting Container ━━━')
         plog('  ⏳ First build downloads + compiles dependencies — allow 5–10 min...')
-        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build'],
+        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build']),
                     capture_output=True, text=True, timeout=900, cwd=tvr_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up --build failed:\n{r.stderr[-500:]}')
@@ -26413,12 +26404,12 @@ def _run_tvr_deploy(settings):
             plog('  (RHEL: ufw absent — stream ports via SG; web UI/HLS Caddy-only via firewalld default-deny/SG)')
         else:
             for port_proto in ['8554/tcp', '8555/tcp', '1935/tcp', '8890/udp']:
-                _sp.run(['ufw', 'allow', port_proto], capture_output=True)
+                _sp.run(_sudo_wrap(['ufw', 'allow', port_proto]), capture_output=True)
                 plog(f'  ✓ ufw allow {port_proto}')
             # Block direct access to web UI and HLS — Caddy is the only entry point
             # TVR web UI is on host port 3100 (not 3000 — that's TAK Portal)
             for port_proto in ['3100/tcp', '8888/tcp']:
-                _sp.run(['ufw', 'deny', port_proto], capture_output=True)
+                _sp.run(_sudo_wrap(['ufw', 'deny', port_proto]), capture_output=True)
                 plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
 
         # Step 6: Save settings + regenerate Caddyfile
@@ -26432,7 +26423,7 @@ def _run_tvr_deploy(settings):
         save_settings(s)
         generate_caddyfile(s)
         try:
-            _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, check=True)
+            _sp.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, check=True)
             plog('✓ Caddy reloaded')
         except Exception as ce:
             plog(f'  Caddy reload warning: {ce}')
@@ -26548,8 +26539,7 @@ def _update_boot_stagger_service():
         if not steps:
             svc = '/etc/systemd/system/docker-stagger.service'
             if os.path.exists(svc):
-                subprocess.run('systemctl disable docker-stagger 2>/dev/null; rm -f /etc/systemd/system/docker-stagger.service; systemctl daemon-reload',
-                               shell=True, capture_output=True, timeout=10)
+                _run_priv_chain([['systemctl', 'disable', 'docker-stagger'], ['rm', '-f', '/etc/systemd/system/docker-stagger.service'], ['systemctl', 'daemon-reload']], 'seq', timeout=10)
             return
         all_containers = []
         for _, containers, _ in BOOT_ORDER:
@@ -26570,8 +26560,7 @@ def _update_boot_stagger_service():
             'WantedBy=multi-user.target\n'
         )
         _write_priv('/etc/systemd/system/docker-stagger.service', unit)
-        subprocess.run('systemctl daemon-reload && systemctl enable docker-stagger 2>/dev/null',
-                       shell=True, capture_output=True, timeout=10)
+        _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', 'docker-stagger']], 'and', timeout=10)
     except Exception:
         pass
 
@@ -28134,7 +28123,7 @@ def _netbird_read_auth_secret(nb_dir):
 def _netbird_recreate_containers(nb_dir, plog):
     """Recreate containers so dashboard picks up env var changes."""
     import subprocess as _sp
-    r = _sp.run(['docker', 'compose', 'up', '-d', '--force-recreate'],
+    r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']),
                 capture_output=True, text=True, cwd=nb_dir, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f'docker compose up --force-recreate failed: {r.stderr[:300]}')
@@ -28149,7 +28138,7 @@ def _run_netbird_deploy(settings):
 
     try:
         plog('━━━ Step 1/6: Checking Docker ━━━')
-        r = _sp.run(['docker', '--version'], capture_output=True, text=True)
+        r = _sp.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
             r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
@@ -28182,8 +28171,8 @@ def _run_netbird_deploy(settings):
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
 
         plog('  Pulling images...')
-        _sp.run(['docker', 'compose', 'pull'], capture_output=True, text=True, cwd=nb_dir)
-        r = _sp.run(['docker', 'compose', 'up', '-d'], capture_output=True, text=True, cwd=nb_dir)
+        _sp.run(_sudo_wrap(['docker', 'compose', 'pull']), capture_output=True, text=True, cwd=nb_dir)
+        r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
         plog('✓ Containers running')
@@ -28228,7 +28217,7 @@ def _run_netbird_deploy(settings):
         settings['netbird_enabled'] = True
         save_settings(settings)
         generate_caddyfile(settings)
-        _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=90)
         plog('✓ Caddy routes active — STUN 3478/udp allowed')
 
         fqdn = settings.get('fqdn', 'localhost')
@@ -40076,8 +40065,7 @@ def _heal_mediamtx_webeditor_writable_paths(plog=None):
         subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups',
                        shell=True, capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
-        subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor',
-                       shell=True, capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
         if os.path.exists('/usr/local/etc/mediamtx.yml'):
             subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
@@ -52509,7 +52497,7 @@ def takserver_create_client_cert():
 
     try:
         _patch_openssl_string_mask()
-        subprocess.run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh', shell=True, capture_output=True)
+        _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'], ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
         r = subprocess.run(
             f'sudo -u tak bash -c "cd /opt/tak/certs && ./makeCert.sh client {cert_name}" 2>&1',
             shell=True, capture_output=True, text=True, timeout=30
@@ -57151,15 +57139,11 @@ def api_toggle_unattended_upgrades():
             else:
                 subprocess.run('pkill -9 -f "/usr/bin/unattended-upgrade" 2>/dev/null; true', shell=True, timeout=5)
                 time.sleep(3)
-            subprocess.run('systemctl stop unattended-upgrades && systemctl disable unattended-upgrades',
-                shell=True, check=True, capture_output=True, text=True, timeout=25)
-            subprocess.run('systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true',
-                shell=True, timeout=10)
+            _run_priv_chain([['systemctl', 'stop', 'unattended-upgrades'], ['systemctl', 'disable', 'unattended-upgrades']], 'and', timeout=25)
+            _run_priv_chain([['systemctl', 'stop', 'apt-daily-upgrade.timer'], ['systemctl', 'disable', 'apt-daily-upgrade.timer']], 'seq', timeout=10)
         else:
-            subprocess.run('systemctl enable unattended-upgrades && systemctl start unattended-upgrades',
-                shell=True, check=True, capture_output=True, text=True, timeout=30)
-            subprocess.run('systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true',
-                shell=True, timeout=10)
+            _run_priv_chain([['systemctl', 'enable', 'unattended-upgrades'], ['systemctl', 'start', 'unattended-upgrades']], 'and', timeout=30)
+            _run_priv_chain([['systemctl', 'enable', 'apt-daily-upgrade.timer'], ['systemctl', 'start', 'apt-daily-upgrade.timer']], 'seq', timeout=10)
         uu = _get_unattended_upgrades_status()
         return jsonify({'success': True, 'target': 'this_host', 'enabled': uu['enabled'], 'running': uu['running']})
     except subprocess.CalledProcessError as e:
@@ -62486,8 +62470,7 @@ def _startup_migrations():
                     _cad = ''
                 if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
                     generate_caddyfile(s)
-                    subprocess.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
-                                   shell=True, capture_output=True, text=True, timeout=60)
+                    _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=60)
                     print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
 
         # Ensure webodm working directories exist when the module is enabled
@@ -62969,8 +62952,7 @@ def _startup_migrations():
                 lambda m: print(f"Startup migration: {m}", flush=True)
             )
             if _ct_labeled:
-                subprocess.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
-                               shell=True, capture_output=True, text=True, timeout=60)
+                _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=60)
                 print(f"Startup migration: relabeled {_ct_labeled} Caddy port(s) for SELinux and reloaded Caddy", flush=True)
         except Exception as caddy_selinux_err:
             print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")

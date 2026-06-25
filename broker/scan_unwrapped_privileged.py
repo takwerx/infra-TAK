@@ -87,7 +87,7 @@ def scan(path):
         if isinstance(node, ast.Call):
             f = node.func
             if isinstance(f, ast.Attribute) and f.attr in SUBPROCESS_FUNCS \
-               and isinstance(f.value, ast.Name) and f.value.id in ('subprocess',):
+               and isinstance(f.value, ast.Name) and f.value.id in ('subprocess', '_sp'):
                 cmd_node = node.args[0] if node.args else None
                 # shell=True ?
                 shellish = any(isinstance(k, ast.keyword) and k.arg == 'shell'

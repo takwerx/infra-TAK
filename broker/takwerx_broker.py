@@ -125,6 +125,11 @@ PKGMGR_SUBCMDS = {
     # post-install scripts) is already gated by the `install` subcommand. The
     # `-o/--setopt` hook-command vector is still blocked below regardless.
     'copr',
+    # `dnf config-manager --set-enabled crb/powertools` — enables the CRB/
+    # PowerTools repo (RHEL deps live there). Repo enable/disable only; same
+    # bucket as copr. The dangerous `--add-repo <url>` still installs a repo def
+    # but cannot run code until an install (gated). -o/--setopt stays blocked.
+    'config-manager',
 }
 
 # Never executable through the broker — escalation primitives (defence in depth;
@@ -174,6 +179,7 @@ PATH_ALLOW = (
     '/usr/local/etc/',
     '/var/lib/cesium-tiles/',   # RHEL cesium tiles dir (chmod 755 by the console)
     '/var/lib/takguard/',       # Guard Dog state dir (mkdir/chmod by the console)
+    '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (chown to takwerx)
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
     # NOTE: /usr/local/bin/ and /usr/sbin/ are deliberately NOT prefix-allowed —
     # they are on root's PATH, so a write there is an escalation primitive. The
