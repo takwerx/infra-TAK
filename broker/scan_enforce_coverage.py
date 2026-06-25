@@ -25,7 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import takwerx_broker as B  # noqa: E402
 
-HELPERS = {'_sudo_wrap', '_write_priv', '_read_priv', '_makedirs_priv', '_chmod_priv', '_run_priv_chain'}
+HELPERS = {'_sudo_wrap', '_write_priv', '_read_priv', '_makedirs_priv', '_chmod_priv', '_run_priv_chain', '_priv_pipe'}
 # binaries whose *path operand* is a variable we can't resolve statically; these
 # were hand-confirmed to resolve into allowlisted dirs (jail_path -> /etc/fail2ban,
 # svc_path -> /etc/systemd/system, etc.). Flagged DYNAMIC, not GAP.
@@ -79,7 +79,8 @@ def scan_file(path):
         if fn not in HELPERS or not node.args:
             continue
         line = node.lineno
-        if fn == '_sudo_wrap':
+        if fn in ('_sudo_wrap', '_priv_pipe'):
+            # _priv_pipe's first arg is the privileged command (the filter is not)
             slots, dyn = _list_slots(node.args[0])
             cmds.append((path, line, slots, dyn))
         elif fn == '_run_priv_chain':

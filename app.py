@@ -216,6 +216,18 @@ def _run_priv_chain(cmds, mode='and', timeout=120, **kw):
     return last
 
 
+def _priv_pipe(argv, filter_argv, timeout=60, **kw):
+    """Replace a shell pipe `PRIV_CMD | FILTER` (the broker runs argv, not a
+    shell). Runs the privileged head via _sudo_wrap (broker-mediated), then feeds
+    its stdout to FILTER (grep/tail/wc/… — NOT privileged, runs as the console
+    user). Returns FILTER's CompletedProcess, so callers that check the pipe's
+    final returncode/stdout (e.g. `grep -q`) keep working unchanged."""
+    r1 = subprocess.run(_sudo_wrap(list(argv)), capture_output=True, text=True,
+                        timeout=timeout, **kw)
+    return subprocess.run(list(filter_argv), input=(r1.stdout or ''),
+                          capture_output=True, text=True, timeout=timeout)
+
+
 def _detached_console_restart(delay=2):
     """Restart the console itself after a short delay, detached, so the current
     HTTP response returns before the worker is bounced. Replaces the shell
@@ -18332,7 +18344,7 @@ def _get_caddy_version_info():
             if m:
                 out['version'] = 'v' + m.group(1).strip()
         if out['version']:
-            apt = subprocess.run('apt list --upgradable 2>/dev/null | grep -i caddy', shell=True, capture_output=True, text=True, timeout=10)
+            apt = _priv_pipe(['apt', 'list', '--upgradable'], ['grep', '-i', 'caddy'], timeout=10)
             if apt.returncode == 0 and (apt.stdout or '').strip():
                 out['update_available'] = True
     except (subprocess.TimeoutExpired, OSError):
@@ -46199,7 +46211,7 @@ entries:
                 authentik_deploy_log.append(f"  {line.strip()}")
         plog("  Waiting for LDAP to start...")
         time.sleep(15)
-        r2 = subprocess.run('docker logs authentik-ldap-1 2>&1 | tail -3', shell=True, capture_output=True, text=True)
+        r2 = _priv_pipe(['docker', 'logs', 'authentik-ldap-1'], ['tail', '-3'])
         if r2.stdout and ('Starting LDAP server' in r2.stdout or 'Starting authentik outpost' in r2.stdout):
             plog("\u2713 LDAP outpost is running on port 389")
         else:
@@ -51324,8 +51336,7 @@ def takserver_connect_ldap():
             r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-ldap', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=10)
             ldap_status = (r.stdout or '').strip()
             diag.append(f'LDAP outpost: {ldap_status or "not running"}')
-            r = subprocess.run('docker logs authentik-ldap-1 --since 60s 2>&1 | tail -25',
-                shell=True, capture_output=True, text=True, timeout=10)
+            r = _priv_pipe(['docker', 'logs', 'authentik-ldap-1', '--since', '60s'], ['tail', '-25'], timeout=10)
             outpost_tail = (r.stdout or '').strip()
         if outpost_tail:
             # Classify the bind OUTCOME up front — the result line was previously cut off by the
@@ -52405,8 +52416,7 @@ def takserver_rotate_rootca():
             log("  TAK Server restarting...")
 
             # Copy new certs to TAK Portal if it's running
-            portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
-                                            shell=True, capture_output=True).returncode == 0
+            portal_running = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode == 0
             if portal_running:
                 log("  Updating TAK Portal certificates...")
                 # v10.0.1: delegate to _takportal_sync_certs — temp-file re-encode
@@ -55552,8 +55562,7 @@ def _deploy_takserver_container(config):
         # cleanly if TAK Portal isn't installed. See memory
         # takportal-stale-client-cert-on-redeploy.
         try:
-            if subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
-                              shell=True, capture_output=True, text=True).returncode == 0:
+            if _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode == 0:
                 log_step(""); log_step("━━━ Refreshing TAK Portal certs (CA changed on redeploy) ━━━")
                 _tp_ok, _tp_msg = _takportal_sync_certs(plog=log_step, restart=True)
                 log_step(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
@@ -56261,8 +56270,7 @@ def takserver_federation_info():
         info['v2_enabled'] = bool(_re.search(r'v2enabled\s*=\s*"true"', cc, _re.IGNORECASE))
     if info['v2_port']:
         try:
-            r = subprocess.run(f'sudo ufw status | grep -w {info["v2_port"]}', shell=True,
-                               capture_output=True, text=True, timeout=10)
+            r = _priv_pipe(['ufw', 'status'], ['grep', '-w', info["v2_port"]], timeout=10)
             info['firewall_open'] = 'ALLOW' in (r.stdout or '')
         except Exception:
             pass
@@ -56283,8 +56291,7 @@ def takserver_federation_firewall():
             subprocess.run(_sudo_wrap(['ufw', 'allow', f'{port}/tcp']), capture_output=True, text=True, timeout=10)
         else:
             subprocess.run(_sudo_wrap(['ufw', 'delete', 'allow', f'{port}/tcp']), capture_output=True, text=True, timeout=10)
-        r = subprocess.run(f'sudo ufw status | grep -w {port}', shell=True,
-                           capture_output=True, text=True, timeout=10)
+        r = _priv_pipe(['ufw', 'status'], ['grep', '-w', port], timeout=10)
         is_open = 'ALLOW' in (r.stdout or '')
         return jsonify({'success': True, 'firewall_open': is_open})
     except Exception as e:
@@ -56311,7 +56318,7 @@ def _takportal_sync_certs(plog=None, restart=False):
     def _log(m):
         if plog:
             plog(m)
-    r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
+    r = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal'])
     if r.returncode != 0:
         return (False, 'TAK Portal container is not running')
     cert_dir = '/opt/tak/certs/files'
@@ -56413,7 +56420,7 @@ def takserver_sync_portal_ca():
     (data/certs/tak-client.p12) and the CA (data/certs/tak-ca.pem), then restart.
     v10.0.1: previously copied ONLY the CA, which left a stale/legacy client cert
     after a CA change → Marti stats 503. Now delegates to _takportal_sync_certs."""
-    r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
+    r = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal'])
     if r.returncode != 0:
         return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
     ok, msg = _takportal_sync_certs(restart=True)
@@ -60845,10 +60852,7 @@ def _auto_harden_guarddog_8080(settings=None, plog=None):
     if subprocess.run('command -v ufw >/dev/null 2>&1', shell=True, timeout=5).returncode != 0:
         return False
     # Idempotency: already denied?
-    chk = subprocess.run(
-        'ufw status 2>/dev/null | grep -E "8080.*DENY" >/dev/null 2>&1',
-        shell=True, timeout=5
-    )
+    chk = _priv_pipe(['ufw', 'status'], ['grep', '-E', '8080.*DENY'], timeout=5)
     if chk.returncode == 0:
         _log("Startup migration: guarddog 8080: UFW deny already set (idempotent — skipping)")
         return False
