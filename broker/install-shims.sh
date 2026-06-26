@@ -23,7 +23,7 @@ mkdir -p "$SHIM_DIR"
 
 ALWAYS=(docker systemctl journalctl loginctl ufw firewall-cmd dnf apt apt-get yum
         semanage semodule restorecon chcon fail2ban-client swapon swapoff mkswap
-        fallocate sysctl)
+        fallocate sysctl gpg)
 PATHAWARE=(mkdir rmdir mv cp chmod chown install tee ln rm touch)
 
 # --- always-route binaries (docker handled specially below) ---

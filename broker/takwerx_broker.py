@@ -107,6 +107,8 @@ EXEC_ALLOW = {
     'getenforce', 'getsebool', 'restorecon', 'semanage', 'semodule', 'chcon',
     # read-only inspection (routed for a single audit point)
     'ss', 'ip', 'getent', 'getcap',
+    # gpg --dearmor of an apt repo signing key (gated — see _check_gpg)
+    'gpg',
     # package managers (gated — see _check_pkgmgr: install/remove only, no -o hooks).
     # NB: installing any package runs its root post-install script — inherently
     # near-root, same bucket as systemd units / docker. The gate blocks the
@@ -179,6 +181,9 @@ PATH_ALLOW = (
     '/etc/security/',
     '/etc/ssh/',
     '/etc/letsencrypt/',
+    '/etc/apt/',                 # apt repo files (sources.list.d) — adding a repo,
+                                 # the apt analogue of the allowed dnf copr/config-manager
+    '/usr/share/keyrings/',      # apt repo signing keys (gpg --dearmor dest)
     '/opt/tak/',
     '/opt/tak-guarddog/',
     '/usr/local/etc/',
@@ -359,6 +364,8 @@ def check_exec(argv, cwd=None):
         _check_semodule(argv)
     elif base == 'chcon':
         _check_chcon(argv, cwd)
+    elif base == 'gpg':
+        _check_gpg(argv)
     elif base == 'install':
         _check_install(argv)
     elif base == 'sysctl':
@@ -458,6 +465,37 @@ def _check_semodule(argv):
         raise Denied(f'semodule: unexpected arg: {a}')
     if not saw_remove:
         raise Denied('semodule: only -l / -r <tak module> allowed')
+
+
+def _check_gpg(argv):
+    """gpg is only allowed to DEARMOR an apt repo signing key to an allowlisted
+    path: `gpg [--batch --yes] --dearmor -o /usr/share/keyrings/<x>.gpg`. The key
+    material arrives on stdin (a downloaded public key). Deny every other gpg
+    operation (sign/encrypt/export-secret/edit-key/keyserver/etc.)."""
+    has_dearmor = '--dearmor' in argv
+    out = None
+    ok_flags = {'--batch', '--yes', '--dearmor', '-o', '--output', '-q', '--quiet'}
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ('-o', '--output'):
+            if i + 1 >= len(argv):
+                raise Denied('gpg: -o without path')
+            out = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith('--output='):
+            out = a.split('=', 1)[1]
+            i += 1
+            continue
+        if a.startswith('-') and a not in ok_flags:
+            raise Denied(f'gpg: option not allowed: {a}')
+        i += 1
+    if not has_dearmor:
+        raise Denied('gpg: only --dearmor is allowed')
+    if out is None:
+        raise Denied('gpg: --dearmor requires -o <allowlisted path>')
+    _path_allowed(out)
 
 
 def _check_chcon(argv, cwd=None):

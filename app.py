@@ -18099,8 +18099,11 @@ def run_caddy_deploy(domain):
                 'apt-get update -qq 2>&1',
             ]
             for cmd in cmds:
+                # shell strings (apt-get / curl|gpg->keyring / curl|tee->sources.list):
+                # the non-root console routes their privileged binaries through the
+                # broker via the shim PATH (env). No-op env as root.
                 r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120,
-                    env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
+                    env=_broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'}))
                 if r.returncode != 0:
                     err = (r.stderr.strip() or r.stdout.strip())[:300]
                     plog(f"✗ Caddy install failed at: {cmd[:60]}")
@@ -18112,14 +18115,14 @@ def run_caddy_deploy(domain):
             wait_for_apt_lock(plog, caddy_deploy_log)
             install_caddy_cmd = 'apt-get install -y caddy 2>&1'
             r = subprocess.run(install_caddy_cmd, shell=True, capture_output=True, text=True, timeout=120,
-                env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
+                env=_broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'}))
             if r.returncode != 0:
                 err = (r.stderr.strip() or r.stdout.strip())[:300]
                 if 'lock' in err.lower() or 'unattended-upgr' in err or 'unable to acquire' in err.lower():
                     plog("  System updates are using the package manager. Waiting 60s then retrying...")
                     time.sleep(60)
                     r = subprocess.run(install_caddy_cmd, shell=True, capture_output=True, text=True, timeout=120,
-                        env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
+                        env=_broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'}))
                 if r.returncode != 0:
                     err = (r.stderr.strip() or r.stdout.strip())[:300]
                     plog(f"✗ Caddy install failed at: apt-get install -y caddy")
