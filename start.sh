@@ -590,6 +590,14 @@ provision_nonroot() {
 # password hash is preserved (takwerx, the console user, must read it).
 finalize_nonroot_ownership() {
     [ "$BORN_NONROOT" = "1" ] || return 0
+    # Broker PATH-shims: let module-deploy shell strings (_module_run) + external
+    # scripts (nodered/deploy.sh, cloudtak.sh) reach docker/systemctl/etc through
+    # the root broker without giving takwerx real privilege. Idempotent.
+    if [ -f "$INSTALL_DIR/broker/install-shims.sh" ]; then
+        bash "$INSTALL_DIR/broker/install-shims.sh" "$INSTALL_DIR/.shims" \
+            "$INSTALL_DIR/broker/takwerx_broker.py" >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓ Broker PATH-shims installed${NC}"
+    fi
     chown -R "$NONROOT_USER:$NONROOT_GROUP" "$INSTALL_DIR"
 }
 

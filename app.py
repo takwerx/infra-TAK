@@ -197,6 +197,23 @@ def _sudo_wrap(cmd):
     return cmd
 
 
+_BROKER_SHIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.shims')
+
+
+def _broker_shim_env(base=None):
+    """Return an env dict with the broker shim dir prepended to PATH, so a shell
+    string run by the non-root console routes its privileged binaries (docker,
+    systemctl, dnf, … and coreutils on privileged paths) through the root broker.
+    Returns None (caller passes env=None -> inherit) as root or when the shims/
+    broker aren't present, so behaviour is unchanged there."""
+    env = dict(base if base is not None else os.environ)
+    if _broker_should_route() and _broker_available() and os.path.isdir(_BROKER_SHIM_DIR):
+        env['PATH'] = _BROKER_SHIM_DIR + os.pathsep + env.get('PATH', '')
+        env.setdefault('TAKWERX_BROKER', _BROKER_SCRIPT)
+        return env
+    return base
+
+
 def _run_priv_chain(cmds, mode='and', timeout=120, **kw):
     """Run a sequence of privileged argv lists through the broker, replacing a
     shell `A && B` / `A || B` / `A; B` string (the broker runs argv, not a shell).
@@ -15131,7 +15148,13 @@ def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
         if log_fn:
             log_fn(f"  [local] {cmd[:80]}...")
         try:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            # v10.0.5 non-root: prepend the broker shim dir to PATH so privileged
+            # binaries in this shell string (docker/systemctl/dnf/… and coreutils
+            # on privileged paths) route through the root broker. No-op as root /
+            # without the broker (shims fall through to the real binary).
+            _env = _broker_shim_env()
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                               timeout=timeout, env=_env)
             return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
         except Exception as e:
             return False, str(e)[:200]
@@ -21012,9 +21035,14 @@ WantedBy=multi-user.target
 
         # Write web editor Python app — flexible: detect LDAP/Authentik and choose regular vs LDAP-enhanced source
         webeditor_dir = '/opt/mediamtx-webeditor'
-        os.makedirs(webeditor_dir, exist_ok=True)
-        os.makedirs(f'{webeditor_dir}/backups', exist_ok=True)
-        os.makedirs(f'{webeditor_dir}/recordings', exist_ok=True)
+        _makedirs_priv(webeditor_dir)
+        _makedirs_priv(f'{webeditor_dir}/backups')
+        _makedirs_priv(f'{webeditor_dir}/recordings')
+        # Hand the dir to the console user NOW (broker creates it root-owned), so
+        # the many open(editor_path,'w') writes below run directly non-root. (A
+        # second chown later re-applies after file shuffling.)
+        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', webeditor_dir]),
+                       capture_output=True, timeout=10)
 
         modules = detect_modules()
         ak = modules.get('authentik', {})
