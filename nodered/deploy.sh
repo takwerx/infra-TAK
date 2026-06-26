@@ -19,12 +19,19 @@ if [ "$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$_TKX_BROKER
     if [ "${1:-}" = "cp" ]; then
       local _a=( "$@" ); local _n=${#_a[@]}
       local _src="${_a[_n-2]}"; local _dst="${_a[_n-1]}"
-      if [[ "$_src" == *:* && "$_dst" != *:* && "$_dst" != /tmp/* ]]; then
-        local _stg="/tmp/.tkxcp.$$.$RANDOM"
-        python3 "$_TKX_BROKER" exec -- docker cp "$_src" "$_stg" || return 1
-        python3 "$_TKX_BROKER" exec -- chmod 644 "$_stg" >/dev/null 2>&1 || true
-        local _rc=0; cp -f "$_stg" "$_dst" || _rc=$?
-        python3 "$_TKX_BROKER" exec -- rm -f "$_stg" >/dev/null 2>&1 || true
+      # `docker cp container:->host`: the broker writes the dest as ROOT. Stage it
+      # in a user-owned, NON-STICKY temp dir, then copy into place + clean up AS
+      # the console user — so the dest ends up user-owned and a later `rm "$_dst"`
+      # by this script works. (We own the temp dir, so we can rm the root file
+      # inside it — which we couldn't do for a bare root file in sticky /tmp.)
+      if [[ "$_src" == *:* && "$_dst" != *:* ]]; then
+        local _sd _rc=0; _sd=$(mktemp -d)
+        if python3 "$_TKX_BROKER" exec -- docker cp "$_src" "$_sd/f"; then
+          cp -f "$_sd/f" "$_dst" || _rc=$?
+        else
+          _rc=1
+        fi
+        rm -rf "$_sd"
         return $_rc
       fi
     fi
