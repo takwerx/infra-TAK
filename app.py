@@ -55905,25 +55905,45 @@ def run_takserver_deploy(config):
         root_ca, int_ca = config['root_ca_name'], config['intermediate_ca_name']
         log_step(f"  Root CA: {root_ca} | Intermediate CA: {int_ca}")
         run_cmd('rm -rf /opt/tak/certs/files')
-        run_cmd('cd /opt/tak/certs && cp cert-metadata.sh cert-metadata.sh.original 2>/dev/null; true')
-        run_cmd('cd /opt/tak/certs && cp cert-metadata.sh.original cert-metadata.sh 2>/dev/null; true')
-        subs = [('COUNTRY', config['cert_country']),
-                ('STATE', config['cert_state']),
-                ('CITY', config['cert_city']),
-                ('ORGANIZATION', config['cert_org']),
-                ('ORGANIZATIONAL_UNIT', config['cert_ou'])]
-        for var, val in subs:
-            if val:
-                run_cmd(f'''sed -i 's/^{var}=.*/{var}="{val}"/' /opt/tak/certs/cert-metadata.sh''', check=False)
-
-        # Patch intermediate CA validity if cert-metadata.sh has a variable for it (e.g. CA_VALIDITY=730)
+        # v10.0.5 non-root: cert-metadata.sh is tak-owned (0600) and `sed` is broker-
+        # denied, so the old `cp`/`sed -i` patching silently failed -> STATE/CITY/OU
+        # never set -> makeRootCa.sh aborted "Please set ... STATE, CITY,
+        # ORGANIZATIONAL_UNIT" -> 0 keystores. Patch it via broker read/modify/write
+        # instead (sources from a .original baseline so re-runs start clean).
         int_validity_days = config.get('intermediate_ca_validity_days', 730)
-        run_cmd(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
-        run_cmd(f'grep -qE "^INTERMEDIATE_VALIDITY" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^INTERMEDIATE_VALIDITY.*/INTERMEDIATE_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
-        log_step(f"  Intermediate CA validity: {int_validity_days} days (issued cert will default to same; change anytime in Certificate signing)")
+        try:
+            cm_path = '/opt/tak/certs/cert-metadata.sh'
+            orig_path = cm_path + '.original'
+            try:
+                base = _read_priv(orig_path)
+            except Exception:
+                base = _read_priv(cm_path)
+                _write_priv(orig_path, base, perm=0o600)
+            repl = [('COUNTRY', config['cert_country']), ('STATE', config['cert_state']),
+                    ('CITY', config['cert_city']), ('ORGANIZATION', config['cert_org']),
+                    ('ORGANIZATIONAL_UNIT', config['cert_ou']),
+                    ('CA_VALIDITY', str(int_validity_days)),
+                    ('INTERMEDIATE_VALIDITY', str(int_validity_days))]
+            if cert_pass and cert_pass != 'atakatak':
+                repl += [('CAPASS', cert_pass), ('PASS', cert_pass)]
+            lines = base.splitlines(keepends=True)
+            for var, val in repl:
+                if not val:
+                    continue
+                for i, line in enumerate(lines):
+                    stripped = line.lstrip()
+                    if stripped.startswith(var + '='):
+                        indent = line[:len(line) - len(stripped)]
+                        safe = str(val).replace('"', '\\"')
+                        lines[i] = f'{indent}{var}="{safe}"\n'
+                        break
+            _write_priv(cm_path, ''.join(lines), perm=0o600)
+            run_cmd('chown tak:tak /opt/tak/certs/cert-metadata.sh /opt/tak/certs/cert-metadata.sh.original', check=False)
+            log_step(f"  Intermediate CA validity: {int_validity_days} days (issued cert defaults to same)")
+        except Exception as _e:
+            log_step(f"  ✗ cert-metadata.sh patch failed: {_e}")
 
         _patch_openssl_string_mask(log_step)
-        _patch_cert_metadata_password(cert_pass)
 
         run_cmd('chown -R tak:tak /opt/tak/certs/')
         # v10.0.5 non-root: cert gen runs AS the `tak` service user. Pre-non-root
