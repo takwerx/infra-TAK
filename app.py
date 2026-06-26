@@ -55926,19 +55926,39 @@ def run_takserver_deploy(config):
         _patch_cert_metadata_password(cert_pass)
 
         run_cmd('chown -R tak:tak /opt/tak/certs/')
-        log_step(f"Creating Root CA: {root_ca}...")
-        run_cmd(f'cd /opt/tak/certs && echo "{root_ca}" | sudo -u tak ./makeRootCa.sh 2>&1', quiet=True)
-        log_step(f"Creating Intermediate CA: {int_ca}...")
-        run_cmd(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh ca "{int_ca}" 2>&1', quiet=True)
-        log_step("Creating server certificate...")
-        run_cmd('cd /opt/tak/certs && sudo -u tak ./makeCert.sh server takserver 2>&1', quiet=True)
-        log_step("Creating admin certificate...")
-        run_cmd('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client admin 2>&1', quiet=True)
-        log_step("Creating user certificate...")
-        run_cmd('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client user 2>&1', quiet=True)
+        # v10.0.5 non-root: cert gen runs AS the `tak` service user. Pre-non-root
+        # this was `sudo -u tak ./makeCert.sh` (a shell pipe). The non-root console
+        # has no sudo, so route `runuser -u tak -- <script>` through the broker
+        # (which is tightly gated to TAK's cert scripts + keytool). As root this
+        # runuser runs directly. stdin (CA name / "y") + cwd are forwarded by the
+        # broker. The scripts are tak-owned (0500) so they run/read correctly.
+        def _tak_cert(args, inp=None, desc=None):
+            if desc: log_step(desc)
+            try:
+                r = subprocess.run(
+                    _sudo_wrap(['runuser', '-u', 'tak', '--'] + args),
+                    input=(inp.encode() if inp else None),
+                    capture_output=True, cwd='/opt/tak/certs', timeout=300)
+                out = (r.stdout or b'').decode(errors='replace') + (r.stderr or b'').decode(errors='replace')
+                for line in out.splitlines():
+                    if line.strip() and 'error' in line.lower():
+                        deploy_log.append(f"  {line[:200]}")
+                if r.returncode != 0:
+                    log_step(f"  ✗ cert step exit {r.returncode}")
+                return r.returncode == 0
+            except Exception as e:
+                log_step(f"  ✗ {e}")
+                return False
+        _tak_cert(['/opt/tak/certs/makeRootCa.sh'], inp=f'{root_ca}\n', desc=f"Creating Root CA: {root_ca}...")
+        _tak_cert(['/opt/tak/certs/makeCert.sh', 'ca', int_ca], inp='y\n', desc=f"Creating Intermediate CA: {int_ca}...")
+        _tak_cert(['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], desc="Creating server certificate...")
+        _tak_cert(['/opt/tak/certs/makeCert.sh', 'client', 'admin'], desc="Creating admin certificate...")
+        _tak_cert(['/opt/tak/certs/makeCert.sh', 'client', 'user'], desc="Creating user certificate...")
         log_step("✓ All certificates created")
         log_step("Importing root CA into TAK clients truststore...")
-        run_cmd(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
+        _tak_cert(['keytool', '-import', '-alias', 'root-ca', '-file', '/opt/tak/certs/files/root-ca.pem',
+                   '-keystore', f'/opt/tak/certs/files/truststore-{int_ca}.jks',
+                   '-storepass', cert_pass, '-noprompt'])
         log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
         log_step("Restarting TAK Server...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()

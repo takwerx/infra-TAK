@@ -348,6 +348,13 @@ def check_exec(argv, cwd=None):
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
         raise Denied('argv must be a non-empty list of strings')
     base = os.path.basename(argv[0])
+    # `runuser` is a privilege pivot (in EXEC_DENY) — but TAK Server generates its
+    # certs as the unprivileged `tak` service user (the scripts are tak-owned, mode
+    # 0500; the non-root console has no su/sudo). Carve a TIGHT exception BEFORE the
+    # deny check: only `runuser -u tak -- <TAK cert script | keytool>`.
+    if base == 'runuser':
+        _check_runuser(argv)
+        return argv
     if base in EXEC_DENY:
         raise Denied(f'binary is denied: {base}')
     if base not in EXEC_ALLOW:
@@ -465,6 +472,26 @@ def _check_semodule(argv):
         raise Denied(f'semodule: unexpected arg: {a}')
     if not saw_remove:
         raise Denied('semodule: only -l / -r <tak module> allowed')
+
+
+# TAK Server's cert scripts (tak-owned, mode 0500) and its truststore import must
+# run AS the unprivileged `tak` service user — that's how TAK is designed to make
+# its CA/keystores, and the non-root console has no su/sudo. Allow ONLY
+# `runuser -u tak -- <X>` where X is a TAK cert script under /opt/tak/certs/ or
+# `keytool`. Any other target user (esp. root) or command stays denied.
+_TAK_CERT_SCRIPTS = ('/opt/tak/certs/makeRootCa.sh', '/opt/tak/certs/makeCert.sh')
+
+
+def _check_runuser(argv):
+    # form: runuser -u tak -- CMD [args...]
+    if len(argv) < 5 or argv[1] != '-u' or argv[2] != 'tak' or argv[3] != '--':
+        raise Denied('runuser: only `runuser -u tak -- <tak cert cmd>` allowed')
+    cmd = argv[4]
+    if cmd in _TAK_CERT_SCRIPTS:
+        return
+    if os.path.basename(cmd) == 'keytool':
+        return
+    raise Denied(f'runuser: command not allowed as tak: {cmd}')
 
 
 def _check_gpg(argv):
