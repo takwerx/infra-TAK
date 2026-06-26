@@ -37,6 +37,11 @@ if [ "$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$_TKX_BROKER
     fi
     python3 "$_TKX_BROKER" exec -- docker "$@"
   }
+  # Run a privileged HOST command (mkdir/install to /opt/tak, etc.) through the
+  # broker when unprivileged. No-op wrapper as root / without the broker.
+  _priv() { python3 "$_TKX_BROKER" exec -- "$@"; }
+else
+  _priv() { "$@"; }
 fi
 
 cd "$REPO_DIR"
@@ -95,7 +100,7 @@ NR_CTX_GLOBAL="/tmp/nr_ctx_global.json"
 NR_CTX_FLOW_CFG="/tmp/nr_ctx_flow_arcgis_cfg.json"
 PERSISTENT_CTX_BACKUP="/opt/tak/nodered-ctx-backup.json"
 rm -f "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
-mkdir -p /opt/tak
+_priv mkdir -p /opt/tak
 
 # Try Node-RED REST API first (live in-memory context — works for both memory and filesystem storage)
 NR_API_CTX=$(docker exec "$CONTAINER" curl -sf --max-time 8 http://localhost:1880/context/global 2>/dev/null || echo "")
@@ -358,7 +363,7 @@ rm -f /tmp/_nr_latest.json
 echo "    Context keys (live):  $(_ctx_summary "$NR_CTX_GLOBAL")"
 if _ctx_is_valid "$NR_CTX_GLOBAL"; then
   # Good live backup — also update the persistent snapshot for next time
-  cp "$NR_CTX_GLOBAL" "$PERSISTENT_CTX_BACKUP"
+  _priv install -m 644 "$NR_CTX_GLOBAL" "$PERSISTENT_CTX_BACKUP"
   echo "    Persistent snapshot updated: $PERSISTENT_CTX_BACKUP"
 elif _ctx_is_valid "$PERSISTENT_CTX_BACKUP"; then
   echo "    WARNING: live context has no saved configs — falling back to persistent snapshot"
