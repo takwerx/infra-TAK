@@ -6,6 +6,32 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 CONTAINER="nodered"
 NEW_FLOWS="$SCRIPT_DIR/flows.json"
 
+# v10.0.5 non-root: the console runs as the unprivileged `takwerx` user, which has
+# NO docker access (docker is mediated by the root broker). When run unprivileged
+# with the broker socket present, route every `docker` call through the broker's
+# CLI proxy. Byte-identical as root / on boxes without the broker.
+# `docker cp` OUT writes host files as root; for a destination OUTSIDE /tmp (e.g.
+# the in-tree flows.json) we stage via /tmp and copy it into place AS the console
+# user, so the tree file stays user-owned (git pull / Update Now keep working).
+_TKX_BROKER="${TAKWERX_BROKER:-$REPO_DIR/broker/takwerx_broker.py}"
+if [ "$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$_TKX_BROKER" ]; then
+  docker() {
+    if [ "${1:-}" = "cp" ]; then
+      local _a=( "$@" ); local _n=${#_a[@]}
+      local _src="${_a[_n-2]}"; local _dst="${_a[_n-1]}"
+      if [[ "$_src" == *:* && "$_dst" != *:* && "$_dst" != /tmp/* ]]; then
+        local _stg="/tmp/.tkxcp.$$.$RANDOM"
+        python3 "$_TKX_BROKER" exec -- docker cp "$_src" "$_stg" || return 1
+        python3 "$_TKX_BROKER" exec -- chmod 644 "$_stg" >/dev/null 2>&1 || true
+        local _rc=0; cp -f "$_stg" "$_dst" || _rc=$?
+        python3 "$_TKX_BROKER" exec -- rm -f "$_stg" >/dev/null 2>&1 || true
+        return $_rc
+      fi
+    fi
+    python3 "$_TKX_BROKER" exec -- docker "$@"
+  }
+fi
+
 cd "$REPO_DIR"
 
 # Pull latest code (skip if called with --no-pull, e.g. from post-update auto-deploy)
