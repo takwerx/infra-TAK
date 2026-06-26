@@ -1813,6 +1813,13 @@ def detect_modules():
         node-red timed out at 5s under load). Default timeout, swallow all errors."""
         kw.setdefault("timeout", 8)
         kw.setdefault("capture_output", True)
+        # v10.0.5 non-root: the status probes here run bare shell strings like
+        # `docker ps --filter ... --format ...` (and `docker inspect`, systemctl).
+        # As the non-root console, takwerx can't reach the docker socket directly,
+        # so without the broker shim PATH every probe returns empty -> every
+        # docker-backed module is misreported "Stopped" (containers are actually
+        # Up). Route through the shims. No-op as root / when shims absent.
+        kw["env"] = _broker_shim_env(kw.get("env"))
         try:
             return subprocess.run(*a, **kw)
         except Exception:
@@ -18249,7 +18256,7 @@ def run_caddy_deploy(domain):
             if status.stdout:
                 for line in (status.stdout or '').strip().split('\n')[:15]:
                     plog(f"  {line}")
-            journal = subprocess.run('journalctl -u caddy -n 25 --no-pager 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+            journal = subprocess.run('journalctl -u caddy -n 25 --no-pager 2>&1', shell=True, capture_output=True, text=True, timeout=10, env=_broker_shim_env())
             if journal.stdout:
                 plog("  --- journalctl -u caddy (last 25 lines) ---")
                 for line in (journal.stdout or '').strip().split('\n'):
