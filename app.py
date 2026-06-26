@@ -22101,7 +22101,10 @@ def cloudtak_control():
         elif action == 'restart':
             subprocess.run(_sudo_wrap(['docker', 'compose', 'restart']), cwd=cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
         elif action == 'update':
-            subprocess.run(f'cd {cloudtak_dir} && ./cloudtak.sh update 2>&1', shell=True, capture_output=True, timeout=600)
+            # cloudtak.sh runs docker internally; the non-root console reaches it
+            # through the broker via the shim PATH (env). No-op env as root.
+            subprocess.run(f'cd {cloudtak_dir} && ./cloudtak.sh update 2>&1', shell=True,
+                           capture_output=True, timeout=600, env=_broker_shim_env())
         else:
             return jsonify({'error': 'Invalid action'}), 400
         time.sleep(3)
