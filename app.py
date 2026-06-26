@@ -55222,7 +55222,13 @@ def log_step(msg):
 def run_cmd(cmd, desc=None, check=True, quiet=False):
     if desc: log_step(desc)
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600)
+        # v10.0.5 non-root: this helper drives the ENTIRE TAK Server deploy (native
+        # + container) as bare shell strings. As the non-root console it must route
+        # its privileged binaries (dnf/rpm/docker/systemctl/firewall + coreutils on
+        # /opt/tak) through the broker shims, else every step fails "must be run with
+        # superuser privileges". No-op as root / when shims absent.
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600,
+                           env=_broker_shim_env())
         if not quiet and r.stdout.strip():
             for line in r.stdout.strip().split('\n'):
                 if 'NEEDRESTART' not in line:
