@@ -50532,11 +50532,7 @@ def _takserver_connection_state(timeout_s=10, sample_size=10):
     )
 
     try:
-        r = subprocess.run(
-            _sudo_wrap(['sudo', '-u', 'postgres', 'psql', 'cot',
-                        '-tAF', '\t', '-c', sql_stats]),
-            capture_output=True, text=True, timeout=timeout_s
-        )
+        r = _pg_exec(['psql', 'cot', '-tAF', '\t', '-c', sql_stats], timeout=timeout_s)
     except subprocess.TimeoutExpired:
         out['error'] = 'cot DB query timed out — postgresql.service may be unresponsive'
         return out
@@ -50596,11 +50592,7 @@ def _takserver_connection_state(timeout_s=10, sample_size=10):
             f"LIMIT {int(sample_size)}"
         )
         try:
-            sr = subprocess.run(
-                _sudo_wrap(['sudo', '-u', 'postgres', 'psql', 'cot',
-                            '-tAF', '\t', '-c', sql_sample]),
-                capture_output=True, text=True, timeout=timeout_s
-            )
+            sr = _pg_exec(['psql', 'cot', '-tAF', '\t', '-c', sql_sample], timeout=timeout_s)
             if sr.returncode == 0:
                 for ln in (sr.stdout or '').strip().splitlines():
                     sp = ln.split('\t')
