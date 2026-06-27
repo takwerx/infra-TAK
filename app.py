@@ -17541,7 +17541,10 @@ def generate_caddyfile(settings=None):
                     caddyfile = caddyfile.rstrip() + '\n\n' + user_blocks
         except Exception:
             pass
-    os.makedirs(os.path.dirname(CADDYFILE_PATH), exist_ok=True)
+    # v10.0.5 non-root: /etc/caddy may not exist yet (RHEL copr caddy doesn't
+    # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
+    # '/etc/caddy'), failing the deploy before the broker-routed write below.
+    _makedirs_priv(os.path.dirname(CADDYFILE_PATH))
     _write_priv(CADDYFILE_PATH, caddyfile)
     # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
     # http_port_t (80/443/8443/9000…). A non-standard listener — e.g. the
