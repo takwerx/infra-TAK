@@ -55118,8 +55118,18 @@ def deploy_takserver():
     # ── v10.0.1: container path (arm64 forced, or operator-selected on amd64) ──
     # Uses the official takserver-docker-*.zip instead of a .deb/.rpm. Branches
     # here and returns BEFORE the byte-identical .deb selection logic below.
-    _method = (data.get('install_method') if data.get('install_method') in ('native', 'container')
-               else _tak_install_method())
+    _explicit_method = data.get('install_method') if data.get('install_method') in ('native', 'container') else None
+    _method = _explicit_method or _tak_install_method()
+    # Auto-correct an un-pinned method to match the uploaded artifact: if we'd take
+    # the native path but only a takserver-docker .zip is uploaded (no .deb/.rpm),
+    # use the container path. Avoids a confusing "No package file found." when the
+    # operator uploaded the container bundle (common on arm64).
+    if _method == 'native' and not _explicit_method:
+        _ups = os.listdir(UPLOAD_DIR)
+        _has_native = any(f.endswith('.deb') or f.endswith('.rpm') for f in _ups)
+        _has_zip = any(f.lower().endswith('.zip') and 'docker' in f.lower() for f in _ups)
+        if not _has_native and _has_zip:
+            _method = 'container'
     if _method == 'container':
         zips = [f for f in os.listdir(UPLOAD_DIR) if f.lower().endswith('.zip') and 'docker' in f.lower()]
         if not zips:

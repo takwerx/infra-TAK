@@ -187,6 +187,8 @@ PATH_ALLOW = (
     '/etc/apt/',                 # apt repo files (sources.list.d) — adding a repo,
                                  # the apt analogue of the allowed dnf copr/config-manager
     '/usr/share/keyrings/',      # apt repo signing keys (gpg --dearmor dest)
+    '/etc/debsig/',              # debsig policy dir — TAK .deb signature verification
+    '/usr/share/debsig/',        # debsig keyring dir (same)
     '/opt/tak/',
     '/opt/tak-guarddog/',
     '/usr/local/etc/',
