@@ -53,6 +53,20 @@ DEFAULT_TIMEOUT = 600                         # seconds; broker-side ceiling
 SELF_PATH = os.path.realpath(__file__)
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
 
+# The console-owned TAK Server docker bundle is unzipped here (app.py
+# TAK_DOCKER_ROOT = ~/tak-docker) and bind-mounted into the TAK containers at
+# /opt/tak. The non-root console writes it DIRECTLY (it owns the dir), so it
+# lives under takwerx's HOME rather than a root /opt path. The container deploy
+# legitimately `ln -sfn <bundle>/tak /opt/tak` and `docker run -v <bundle>/tak:
+# /opt/tak` FROM here — both were denied because /home is forbidden, which is
+# the v10.0.5 container-deploy exit-126 regression. Allow this ONE subtree (NOT
+# /home at large): it is takwerx-owned and is the intended /opt/tak source.
+try:
+    _NONROOT_HOME = pwd.getpwnam(BROKER_USER).pw_dir or '/home/takwerx'
+except KeyError:
+    _NONROOT_HOME = '/home/takwerx'
+TAK_BUNDLE_DIR = os.path.join(_NONROOT_HOME, 'tak-docker')
+
 # ENFORCE vs PERMISSIVE (v10.0.5).
 #   PERMISSIVE (default this release): a request that fails the rulebook is still
 #   EXECUTED, but logged as WOULD-DENY. The console runs as ROOT today, so routing
@@ -191,6 +205,7 @@ PATH_ALLOW = (
     '/usr/share/debsig/',        # debsig keyring dir (same)
     '/opt/tak/',
     '/opt/tak-guarddog/',
+    TAK_BUNDLE_DIR + '/',        # console-owned TAK docker bundle (ln source for /opt/tak)
     '/usr/local/etc/',
     '/var/lib/cesium-tiles/',   # RHEL cesium tiles dir (chmod 755 by the console)
     '/var/lib/takguard/',       # Guard Dog state dir (mkdir/chmod by the console)
@@ -262,6 +277,24 @@ def _abs(path):
     return p
 
 
+def _within_realpath(path, root):
+    """True if `path` RESOLVES (symlinks followed) to within `root`. Used to
+    harden the one console-WRITABLE allowlist prefix (TAK_BUNDLE_DIR): every other
+    allowlisted dir is root-owned, so `_abs`'s lexical match is safe (the console
+    can't plant an escaping symlink in a root-owned dir). The bundle dir is
+    takwerx-owned, so a lexical match alone would let the console `ln -s /etc
+    bundle/x` then write/mount `bundle/x` to escape. realpath-containment closes
+    that. (Resolving realpath here is safe BECAUSE the bundle is console-owned —
+    the reason `_abs` avoids realpath, root-owned legit symlinks like /opt/tak,
+    does not apply to this prefix.)"""
+    try:
+        rr = os.path.realpath(root)
+        rp = os.path.realpath(path)
+    except OSError:
+        return False
+    return rp == rr or rp.startswith(rr + '/')
+
+
 def _path_allowed(path):
     """True if `path` is within the privileged read/write allowlist and not in
     the deny set. Raises Denied with a reason otherwise."""
@@ -276,6 +309,11 @@ def _path_allowed(path):
     for a in PATH_ALLOW:
         # match a child of the dir, OR the allowlisted dir itself (no trailing /)
         if p.startswith(a) or p == a.rstrip('/'):
+            # The bundle dir is the lone console-WRITABLE prefix — require realpath
+            # containment so a planted symlink under it can't escape (the other
+            # prefixes are root-owned, so they keep the cheaper lexical match).
+            if a == TAK_BUNDLE_DIR + '/' and not _within_realpath(p, TAK_BUNDLE_DIR):
+                raise Denied(f'symlink escape from bundle dir: {p}')
             return p
     raise Denied(f'path not in allow-list: {p}')
 
@@ -338,9 +376,19 @@ def _check_docker_mount(spec):
         src = spec.split(':', 1)[0]
     if not src.startswith('/'):
         return                     # named volume, not a host bind
+    real = os.path.normpath(src)
+    # The console's own TAK bundle dir is the LEGIT /opt/tak source mount — it is
+    # under takwerx's HOME (not a root /opt path) only because the non-root
+    # console unzips it there. Allow this one subtree before the /home denial, but
+    # require realpath containment: the dir is console-WRITABLE, so a lexical match
+    # alone would let a planted symlink (bundle/x -> /etc) root-mount any host path
+    # into a root-running container. realpath follows the symlink and re-checks.
+    if real == TAK_BUNDLE_DIR or real.startswith(TAK_BUNDLE_DIR + '/'):
+        if _within_realpath(src, TAK_BUNDLE_DIR):
+            return
+        raise Denied(f'docker bind mount escapes bundle dir via symlink: {src}')
     bad = ('/', '/etc', '/root', '/home', '/boot', '/usr', '/bin', '/sbin',
            '/lib', '/var/run', '/run', '/proc', '/sys', '/dev')
-    real = os.path.normpath(src)
     if real in bad or any(real.startswith(b + '/') for b in ('/etc', '/root', '/home', '/boot', '/proc', '/sys')):
         raise Denied(f'docker bind mount of sensitive host path denied: {src}')
 
@@ -811,6 +859,20 @@ def _summary(req):
     return str(req.get('path'))[:200]
 
 
+def _summary_safe(req, field=None):
+    """Best-effort summary/op for audit on the exception paths, where `req` may be
+    empty or unparsed. `field='op'` returns the op name; otherwise the summary.
+    Never raises — these run inside `except` handlers."""
+    try:
+        if not isinstance(req, dict):
+            return 'unknown' if field == 'op' else ''
+        if field == 'op':
+            return str(req.get('op') or 'unknown')
+        return _summary(req)
+    except Exception:
+        return 'unknown' if field == 'op' else ''
+
+
 def _dispatch(req, peer):
     op = req.get('op')
     if op == 'ping':
@@ -855,19 +917,29 @@ class _Handler(socketserver.BaseRequestHandler):
             except OSError:
                 pass
             return
+        req = {}
         try:
             raw = _recv_all(conn)
             req = json.loads(raw.decode())
             resp = _dispatch(req, peer)
         except Denied as d:
+            # A Denied raised OUTSIDE _evaluate (so _dispatch never audited it) —
+            # log it here so EVERY refusal hits the audit chokepoint, not just
+            # rulebook denials. Without this a refusal surfaces to the client as a
+            # bare exit-126 with nothing in the audit log (the v10.0.5 anomaly).
             resp = {'ok': False, 'code': 'DENIED', 'error': str(d)}
+            audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'DENY', str(d))
         except subprocess.TimeoutExpired:
             resp = {'ok': False, 'code': 'TIMEOUT', 'error': 'command timed out'}
+            audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR', 'command timed out')
         except Exception as e:  # noqa: BLE001 — broker must never crash a worker thread
             resp = {'ok': False, 'code': 'ERROR', 'error': f'{type(e).__name__}: {e}'}
+            audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR', f'{type(e).__name__}: {e}')
         try:
             data = json.dumps(resp).encode()
             if len(data) > MAX_MSG:
+                audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR',
+                      'response exceeds MAX_MSG')
                 data = json.dumps({'ok': False, 'code': 'ERROR',
                                    'error': 'response exceeds MAX_MSG'}).encode()
             conn.sendall(data)

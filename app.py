@@ -55248,12 +55248,22 @@ def run_cmd(cmd, desc=None, check=True, quiet=False):
             for line in r.stdout.strip().split('\n'):
                 if 'NEEDRESTART' not in line:
                     deploy_log.append(f"  {line}")
-        if not quiet and r.stderr.strip():
+        if not quiet and r.returncode == 0 and r.stderr.strip():
             for line in r.stderr.strip().split('\n'):
                 if 'NEEDRESTART' not in line and 'error' in line.lower():
                     deploy_log.append(f"  ✗ {line}")
         if check and r.returncode != 0:
             log_step(f"✗ Command failed (exit {r.returncode})")
+            # v10.0.5 non-root: surface the FULL stderr on failure. The broker
+            # PATH-shim writes its reason to stderr as `takwerx_broker: DENIED: …`
+            # / `ERROR: …` and returns 126; the 'error'-substring filter above
+            # silently drops "DENIED" (no 'error' in it), which is exactly why the
+            # container-deploy 126s looked causeless. Failure-path only, ignores
+            # `quiet` so cert-gen failures are visible too.
+            err = (r.stderr or '').strip()
+            for line in err.split('\n')[-15:]:
+                if line.strip() and 'NEEDRESTART' not in line:
+                    deploy_log.append(f"  ✗ {line}")
             return False
         return True
     except Exception as e:
