@@ -10184,13 +10184,11 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
     # Ensure the logpath exists (empty is fine) — fail2ban refuses a missing logpath.
+    # v10.0.5 non-root: /var/log/tak-portal is root-owned — create + touch via broker.
     try:
-        os.makedirs(os.path.dirname(TAKPORTAL_F2B_LOG), exist_ok=True)
-        if not os.path.exists(TAKPORTAL_F2B_LOG):
-            with open(TAKPORTAL_F2B_LOG, 'a'):
-                pass
-            try: os.chmod(TAKPORTAL_F2B_LOG, 0o664)
-            except Exception: pass
+        _makedirs_priv(os.path.dirname(TAKPORTAL_F2B_LOG))
+        subprocess.run(_sudo_wrap(['touch', TAKPORTAL_F2B_LOG]), capture_output=True)
+        _chmod_priv(TAKPORTAL_F2B_LOG, 0o664)
     except Exception:
         pass
 
@@ -12279,18 +12277,14 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         for d in ['/opt/tak-guarddog', '/var/lib/takguard', '/var/log/takguard']:
-            os.makedirs(d, exist_ok=True)
+            _makedirs_priv(d)
         # v0.9.29 CRIT-08 fix: provision pinned SSH known_hosts for watchdog
         # scripts (used when StrictHostKeyChecking=accept-new is in effect).
         try:
             _kh = '/opt/tak-guarddog/known_hosts'
-            if not os.path.exists(_kh):
-                open(_kh, 'a').close()
-            os.chmod(_kh, 0o600)
-            try:
-                os.chown(_kh, 0, 0)
-            except PermissionError:
-                pass
+            subprocess.run(_sudo_wrap(['touch', _kh]), capture_output=True)
+            _chmod_priv(_kh, 0o600)
+            subprocess.run(_sudo_wrap(['chown', 'root:root', _kh]), capture_output=True)
         except Exception:
             pass
         plog("✓ Directories created")
@@ -12372,10 +12366,7 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('SSH_KEY_PLACEHOLDER', fh_ssh_key)
                 content = content.replace('SSH_USER_PLACEHOLDER', fh_ssh_user)
             dest = os.path.join('/opt/tak-guarddog', name)
-            with open(dest, 'w') as f:
-                f.write(content)
-            if name.endswith('.sh'):
-                os.chmod(dest, 0o755)
+            _write_priv(dest, content, perm=(0o755 if name.endswith('.sh') else None))
         plog("✓ Scripts installed")
         # Write config file for health endpoint (two-server DB host info)
         gd_conf = {}
@@ -12460,8 +12451,7 @@ def run_guarddog_deploy(alert_email):
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
-            _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT)
-            os.chmod(_ak_purge_path, 0o755)
+            _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
                 ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
@@ -12498,8 +12488,7 @@ def run_guarddog_deploy(alert_email):
         ])
         for name, content in units:
             path = os.path.join('/etc/systemd/system', name)
-            with open(path, 'w') as f:
-                f.write(content)
+            _write_priv(path, content)
         plog("✓ Systemd units installed")
         # TAK Server soft start: start after network and PostgreSQL to avoid boot race / restart loops.
         # v10.0.1: skip on container TAK — there is no host takserver.service to
@@ -12509,14 +12498,13 @@ def run_guarddog_deploy(alert_email):
             plog("✓ Container TAK — skipping native soft-start drop-in (container uses --restart=always)")
         else:
             tak_dropin_dir = '/etc/systemd/system/takserver.service.d'
-            os.makedirs(tak_dropin_dir, exist_ok=True)
+            _makedirs_priv(tak_dropin_dir)
             tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
-            with open(tak_dropin, 'w') as f:
-                # TimeoutStartSec must exceed the boot sequencer's MAX_WAIT (120s):
-                # systemd's 90s default would otherwise kill start-pre mid-wait and
-                # mark the unit failed(timeout) before the sequencer's "proceed anyway"
-                # fallback can fire. Universal hardening — applies to every distro.
-                f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+            # TimeoutStartSec must exceed the boot sequencer's MAX_WAIT (120s):
+            # systemd's 90s default would otherwise kill start-pre mid-wait and
+            # mark the unit failed(timeout) before the sequencer's "proceed anyway"
+            # fallback can fire. Universal hardening — applies to every distro.
+            _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
@@ -12549,16 +12537,13 @@ def run_guarddog_deploy(alert_email):
             if cur.returncode == 0 and cur.stdout.strip() != '10':
                 subprocess.run(_sudo_wrap(['sysctl', '-w', 'vm.swappiness=10']), capture_output=True, timeout=5)
                 sysctl_conf = '/etc/sysctl.conf'
-                with open(sysctl_conf, 'r') as f:
-                    content = f.read()
+                content = _read_priv(sysctl_conf)
                 if 'vm.swappiness' in content:
                     lines = content.split('\n')
                     lines = [('vm.swappiness=10' if l.strip().startswith('vm.swappiness') else l) for l in lines]
-                    with open(sysctl_conf, 'w') as f:
-                        f.write('\n'.join(lines))
+                    _write_priv(sysctl_conf, '\n'.join(lines))
                 else:
-                    with open(sysctl_conf, 'a') as f:
-                        f.write('\nvm.swappiness=10\n')
+                    _write_priv(sysctl_conf, content + '\nvm.swappiness=10\n')
                 plog("✓ vm.swappiness set to 10 (swap only when RAM exhausted)")
             else:
                 plog("✓ vm.swappiness already 10")
@@ -12623,8 +12608,7 @@ def run_guarddog_deploy(alert_email):
         plog("✓ Boot orchestrator enabled (staggered start: TAK → Authentik → TAK Portal → CloudTAK)")
         for f in ['process_alert_sent', 'disk_alert_sent', 'db_alert_sent', 'cotdb_alert_sent', 'network_alert_sent', 'cert_alert_sent']:
             p = os.path.join('/var/lib/takguard', f)
-            if not os.path.exists(p):
-                open(p, 'a').close()
+            subprocess.run(_sudo_wrap(['touch', p]), capture_output=True)
         if not _guarddog_is_enabled():
             plog("✗ Timers did not end up enabled; run Enable on the Guard Dog page or retry deploy.")
             guarddog_deploy_status.update({'running': False, 'error': True})
