@@ -114,6 +114,10 @@ EXEC_ALLOW = {
     # Debian postgres cluster init + dpkg reconfigure (TAK native .deb deploy). dpkg
     # is no broader than the already-allowed apt/dnf the console drives.
     'pg_createcluster', 'dpkg',
+    # Email Relay (postfix) admin tools: postconf edits main.cf, postmap builds the
+    # sasl_passwd/generic .db maps (root-owned /etc/postfix), debconf-set-selections
+    # pre-seeds the postfix install. No broader than the apt install they accompany.
+    'postconf', 'postmap', 'debconf-set-selections', 'newaliases',
     # storage / kernel knobs (path-checked where they take a file). sysctl is
     # gated to safe params only (see _check_sysctl) — VM tuning, not kernel.*
     'swapon', 'swapoff', 'mkswap', 'fallocate', 'sync', 'sysctl',
