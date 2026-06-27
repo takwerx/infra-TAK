@@ -15964,8 +15964,8 @@ def _patch_coreconfig_passwords(cert_pass, log_fn=None):
         return
     try:
         import re
-        with open(cc_path, 'r') as f:
-            content = f.read()
+        # v10.0.5 non-root: CoreConfig is tak-owned 0640; read/write via the broker.
+        content = _read_priv(cc_path)
         updated = content
         for attr in ('keystorePass', 'truststorePass'):
             for m in re.finditer(rf'{attr}="([^"]*)"', content):
@@ -15973,8 +15973,7 @@ def _patch_coreconfig_passwords(cert_pass, log_fn=None):
                 if old_val != cert_pass:
                     updated = updated.replace(f'{attr}="{old_val}"', f'{attr}="{cert_pass}"')
         if updated != content:
-            with open(cc_path, 'w') as f:
-                f.write(updated)
+            _write_priv(cc_path, updated)
             if log_fn:
                 log_fn("✓ CoreConfig.xml keystore/truststore passwords updated")
     except Exception:
@@ -37759,8 +37758,8 @@ networks:
         if ldap_svc_pass:
             backup_path = coreconfig_path + '.pre-ldap.bak'
             if not os.path.exists(backup_path):
-                import shutil
-                shutil.copy2(coreconfig_path, backup_path)
+                # v10.0.5 non-root: /opt/tak is tak-owned — copy via the broker.
+                subprocess.run(_sudo_wrap(['cp', coreconfig_path, backup_path]), capture_output=True, timeout=10)
                 plog("  Backed up CoreConfig.xml")
 
             with open(coreconfig_path, 'r') as f:
@@ -46279,8 +46278,8 @@ entries:
                 # Backup
                 backup_path = coreconfig_path + '.pre-ldap.bak'
                 if not os.path.exists(backup_path):
-                    import shutil
-                    shutil.copy2(coreconfig_path, backup_path)
+                    # v10.0.5 non-root: /opt/tak is tak-owned — copy via the broker.
+                    subprocess.run(_sudo_wrap(['cp', coreconfig_path, backup_path]), capture_output=True, timeout=10)
                     plog(f"  Backed up CoreConfig.xml")
 
                 # Read current config
@@ -48233,9 +48232,12 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     for k, v in _ldap_attrs.items():
         ldap.set(k, v)
 
-    # Write back (to a temp file then sudo-copy to /opt/tak)
+    # v10.0.5 non-root: write to a takwerx-writable temp file (NOT into /opt/tak,
+    # which is tak-owned — the old direct write got Errno 13), verify, then push to
+    # /opt/tak via the broker (the old `sudo cp` fails: takwerx is not in sudoers).
     import tempfile
-    _patch_path = coreconfig_path + '.ldap-patch.xml'
+    _tmpfd, _patch_path = tempfile.mkstemp(suffix='.ldap-patch.xml')
+    os.close(_tmpfd)
     try:
         tree.write(_patch_path, xml_declaration=True, encoding='UTF-8', short_empty_elements=True)
         # Re-read and verify the patch has adm_ldapservice (sanity check)
@@ -48251,18 +48253,15 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
         if '<ns0:' in _check or 'xmlns:ns0=' in _check:
             return False, ('BUG: ElementTree emitted ns0: prefixes (TAK Server LDAP auth would break). '
                            'Falling back to text-based patcher.')
-        r = subprocess.run(
-            ['sudo', 'cp', os.path.abspath(_patch_path), coreconfig_path],
-            capture_output=True, text=True, timeout=10
-        )
-        if r.returncode != 0:
-            return False, f'sudo cp failed: {r.stderr.strip()[:200]}'
-        # v0.9.29 — final post-cp verification: read /opt/tak/CoreConfig.xml back
-        # and confirm it has no ns0: prefixes. If it does (e.g. cp got partial write),
-        # log a loud warning so the operator can investigate.
         try:
-            r2 = subprocess.run(['sudo', 'cat', coreconfig_path], capture_output=True, text=True, timeout=5)
-            if r2.returncode == 0 and ('<ns0:' in r2.stdout or 'xmlns:ns0=' in r2.stdout):
+            _write_priv(coreconfig_path, _check)
+        except Exception as _we:
+            return False, f'CoreConfig.xml broker write failed: {_we}'
+        # v0.9.29 — final post-write verification: read /opt/tak/CoreConfig.xml back
+        # (via the broker) and confirm it has no ns0: prefixes.
+        try:
+            _back = _read_priv(coreconfig_path)
+            if '<ns0:' in _back or 'xmlns:ns0=' in _back:
                 if plog:
                     plog("  ⚠ /opt/tak/CoreConfig.xml STILL has ns0: prefixes after write — investigate")
                 return False, 'CoreConfig.xml has ns0: prefixes after write — TAK Server LDAP will fail'
@@ -48271,6 +48270,11 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
         return True, f'CoreConfig.xml updated with LDAP auth (ldap://{ldap_host}:389)'
     except Exception as e:
         return False, f'CoreConfig.xml write error: {e}'
+    finally:
+        try:
+            os.remove(_patch_path)
+        except OSError:
+            pass
 
 
 def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog=None):
@@ -49091,7 +49095,8 @@ def _apply_ldap_to_coreconfig():
     # Backup (create once before any writes)
     backup_path = coreconfig_path + '.pre-ldap.bak'
     if not os.path.exists(backup_path):
-        subprocess.run(['sudo', 'cp', coreconfig_path, backup_path], capture_output=True, timeout=10)
+        # v10.0.5 non-root: /opt/tak is tak-owned; takwerx has no sudo — copy via broker.
+        subprocess.run(_sudo_wrap(['cp', coreconfig_path, backup_path]), capture_output=True, timeout=10)
     # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
     # Use remote LDAP host if Authentik deployed remotely
     ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
@@ -56035,24 +56040,39 @@ def run_takserver_deploy(config):
             deploy_log.append(f"  \u23f3 {remaining//60:02d}:{remaining%60:02d} remaining")
 
         log_step(""); log_step("━━━ Step 8/9: Configuring CoreConfig.xml ━━━")
-        run_cmd('sed -i \'s|<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>|<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>|g\' /opt/tak/CoreConfig.xml', "Enabling X.509 auth on 8089...")
-        run_cmd(f'sed -i "s|truststoreFile=\\"certs/files/truststore-root.jks|truststoreFile=\\"certs/files/truststore-{int_ca}.jks|g" /opt/tak/CoreConfig.xml', "Setting intermediate CA truststore...")
-        _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
+        # v10.0.5 non-root: these were `sed -i /opt/tak/CoreConfig.xml` — but sed is
+        # broker-denied AND CoreConfig is tak-owned (0640), so every edit failed
+        # exit 4 and X.509 auth / truststore / cert-enrollment / WebTAK were never
+        # applied (TAK installs but is misconfigured). Do ONE broker read-modify-write.
         issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
-        cert_block = (f'<certificateSigning CA="TAKServer"><certificateConfig>\\n'
-            f'<nameEntries>\\n<nameEntry name="O" value="{config["cert_org"]}"/>\\n'
-            f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\\n</nameEntries>\\n'
-            f'</certificateConfig>\\n<TAKServerCAConfig keystore="JKS" '
+        cert_block = ('<certificateSigning CA="TAKServer"><certificateConfig>\n'
+            f'<nameEntries>\n<nameEntry name="O" value="{config["cert_org"]}"/>\n'
+            f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\n</nameEntries>\n'
+            '</certificateConfig>\n<TAKServerCAConfig keystore="JKS" '
             f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
-            f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />\\n'
-            f'</certificateSigning>\\n<vbm enabled="false"/>')
-        run_cmd(f'sed -i \'s|<vbm enabled="false"/>|{cert_block}|g\' /opt/tak/CoreConfig.xml', "Enabling certificate enrollment...")
-        run_cmd('sed -i \'s|<auth>|<auth x509useGroupCache="true">|g\' /opt/tak/CoreConfig.xml')
-        admin_ui = str(config.get('enable_admin_ui', False)).lower()
-        webtak = str(config.get('enable_webtak', False)).lower()
-        if config.get('enable_admin_ui') or config.get('enable_webtak'):
-            log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
-            run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/|g\' /opt/tak/CoreConfig.xml')
+            f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />\n'
+            '</certificateSigning>\n<vbm enabled="false"/>')
+        try:
+            _cc = _read_priv('/opt/tak/CoreConfig.xml')
+            log_step("Enabling X.509 auth on 8089...")
+            _cc = _cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
+                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
+            log_step("Setting intermediate CA truststore...")
+            _cc = _cc.replace('truststoreFile="certs/files/truststore-root.jks',
+                              f'truststoreFile="certs/files/truststore-{int_ca}.jks')
+            log_step("Enabling certificate enrollment...")
+            _cc = _cc.replace('<vbm enabled="false"/>', cert_block)
+            _cc = _cc.replace('<auth>', '<auth x509useGroupCache="true">')
+            if config.get('enable_admin_ui') or config.get('enable_webtak'):
+                admin_ui = str(config.get('enable_admin_ui', False)).lower()
+                webtak = str(config.get('enable_webtak', False)).lower()
+                log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
+                _cc = _cc.replace('"cert_https"/',
+                                  f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
+            _write_priv('/opt/tak/CoreConfig.xml', _cc)
+        except Exception as _cce:
+            log_step(f"  ✗ CoreConfig patch failed: {_cce}")
+        _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
         # For two-server and external_db: ensure JDBC URL and password point to the remote DB host
         import re
         _needs_jdbc_patch = (config.get('two_server') or config.get('external_db')) and config.get('tak_deploy_cfg')
