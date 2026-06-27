@@ -56590,25 +56590,40 @@ def takserver_purge_failed_install():
     if deploy_status.get('running'):
         return jsonify({'error': 'Deployment is running — wait for it to complete first.'}), 400
     log = []
-    for cmd in [
-        'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver 2>&1',
-        'rm -rf /opt/tak',
-        'apt-get autoremove -y 2>/dev/null; true',
-    ]:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-        log.append(r.stdout.strip() or r.stderr.strip() or '(ok)')
-    # Delete any .deb uploads that fail dpkg-deb --info (corrupted files)
+    # v10.0.5 non-root + multiplatform: package removal is family-specific and must
+    # route through the broker. The old handler ran `dpkg --purge` (Debian-only — it's
+    # "command not found" on RHEL) and a raw `rm -rf /opt/tak` (fails as the non-root
+    # console — /opt/tak is root/tak-owned).
+    if _distro_family() == 'rhel':
+        purge_cmds = [['dnf', 'remove', '-y', 'takserver']]
+    else:
+        purge_cmds = [['dpkg', '--purge', '--force-all', 'takserver'],
+                      ['apt-get', 'autoremove', '-y']]
+    purge_cmds.append(['rm', '-rf', '/opt/tak'])
+    for argv in purge_cmds:
+        try:
+            r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=180)
+            log.append((r.stdout.strip() or r.stderr.strip() or '(ok)')[:300])
+        except Exception as e:
+            log.append(f'{argv[0]}: {e}')
+    # Delete any corrupted takserver package uploads (.deb via dpkg-deb, .rpm via rpm -qp).
     cleaned_debs = []
     for fn in os.listdir(UPLOAD_DIR):
-        if 'takserver' in fn.lower() and fn.endswith('.deb'):
-            fp = os.path.join(UPLOAD_DIR, fn)
-            r = subprocess.run(f'dpkg-deb --info {fp} > /dev/null 2>&1', shell=True, capture_output=True, timeout=15)
-            if r.returncode != 0:
-                try:
-                    os.remove(fp)
-                    cleaned_debs.append(fn)
-                except OSError:
-                    pass
+        low = fn.lower()
+        if 'takserver' not in low or not (low.endswith('.deb') or low.endswith('.rpm')):
+            continue
+        fp = os.path.join(UPLOAD_DIR, fn)
+        verify = ['dpkg-deb', '--info', fp] if low.endswith('.deb') else ['rpm', '-qp', fp]
+        try:
+            ok = subprocess.run(verify, capture_output=True, timeout=15).returncode == 0
+        except Exception:
+            ok = True  # verifier missing for this family — don't delete a good upload
+        if not ok:
+            try:
+                os.remove(fp)
+                cleaned_debs.append(fn)
+            except OSError:
+                pass
     deploy_status.update({'running': False, 'complete': False, 'error': False, 'cancelled': False})
     deploy_log.clear()
     return jsonify({'success': True, 'cleaned_debs': cleaned_debs, 'log': log})
