@@ -56946,7 +56946,7 @@ def _kernel_patch_start_job():
         except Exception:
             pass
     try:
-        os.makedirs(os.path.dirname(_KERNEL_PATCH_LOGFILE), exist_ok=True)
+        _makedirs_priv(os.path.dirname(_KERNEL_PATCH_LOGFILE))
     except Exception:
         pass
     # v10.0.1: which OS-upgrade command this job runs is package-manager
@@ -57008,9 +57008,10 @@ def _kernel_patch_start_job():
         )
     _script_path = '/var/lib/infratak-kernel-patch.sh'
     try:
-        with open(_script_path, 'w') as _sf:
-            _sf.write(script)
-        os.chmod(_script_path, 0o755)
+        # v10.0.5 non-root: /var/lib is root-owned — write via the broker. A raw
+        # open() here EPERM'd as the takwerx console, silently failing the whole
+        # job so the transient unit never started and the UI hung on "pid ?".
+        _write_priv(_script_path, script, perm=0o755)
     except Exception as _we:
         return (False, f"could not write script to {_script_path}: {_we}", None)
     cmd = [
@@ -57026,7 +57027,11 @@ def _kernel_patch_start_job():
         '/bin/bash', _script_path,
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        # v10.0.5 non-root: systemd-run creates a SYSTEM transient unit (needs
+        # root) — route through the broker, which gates it to exactly this unit +
+        # the fixed script (see _check_systemd_run). A bare subprocess failed as
+        # the non-root console (system bus auth), which is the "pid ?" regression.
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=15)
     except Exception as _se:
         return (False, f"systemd-run spawn failed: {_se}", None)
     if r.returncode != 0:
@@ -57106,16 +57111,16 @@ def _kernel_patch_job_state():
     running = (active in ('active', 'activating'))
     log_tail = ''
     log_present = False
-    if os.path.exists(_KERNEL_PATCH_LOGFILE):
+    # v10.0.5 non-root: the log is written by the root transient unit; read it via
+    # the broker so the takwerx console can stream it regardless of dir perms.
+    # (As root, _read_priv reads directly.) Raises if absent → log not present yet.
+    try:
+        _full = _read_priv(_KERNEL_PATCH_LOGFILE)
         log_present = True
-        try:
-            r = subprocess.run(
-                ['tail', '-c', '4096', _KERNEL_PATCH_LOGFILE],
-                capture_output=True, text=True, timeout=5
-            )
-            log_tail = (r.stdout or '')[-4000:]
-        except Exception:
-            log_tail = ''
+        log_tail = _full[-4000:]
+    except Exception:
+        log_present = False
+        log_tail = ''
 
     # v0.9.44: a pending reboot (new kernel staged) is the authoritative "you
     # should reboot" signal — and the kernel auto-clears /var/run/reboot-required
@@ -57202,7 +57207,7 @@ def kernel_patch_reboot_api():
     login_required; the UI confirm dialog is the only gate."""
     try:
         subprocess.Popen(
-            ['systemctl', 'reboot'],
+            _sudo_wrap(['systemctl', 'reboot']),
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, close_fds=True
         )

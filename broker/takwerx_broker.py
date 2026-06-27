@@ -134,6 +134,10 @@ EXEC_ALLOW = {
     # privileged file IO via coreutils — TARGET PATHS are validated (see below)
     'tee', 'cat', 'cp', 'mv', 'rm', 'mkdir', 'rmdir', 'chmod', 'chown',
     'touch', 'ln', 'install',
+    # transient-unit launcher — a DIRECT root-exec primitive, so gated to the ONE
+    # fixed kernel-patch shape (see _check_systemd_run). No broader than the
+    # already-allowed `systemctl start <console-written-unit>`.
+    'systemd-run',
 }
 
 # Package-manager subcommands the console legitimately uses. Anything else (and
@@ -176,6 +180,7 @@ SYSTEMCTL_VERBS = {
     'enable', 'disable', 'mask', 'unmask', 'is-active', 'is-enabled',
     'is-failed', 'status', 'show', 'cat', 'daemon-reload', 'reset-failed',
     'list-units', 'list-timers', 'list-unit-files', 'kill',
+    'reboot',                  # operator-gated reboot after a kernel patch
 }
 
 # Coreutils whose path arguments MUST live inside PATH_ALLOW (and not PATH_DENY).
@@ -236,6 +241,8 @@ PATH_ALLOW_EXACT = (
     # /usr/local/sbin prefix (which stays denied as a root-PATH escalation surface).
     '/usr/local/sbin/tak-console-restart.sh',   # daily console-restart timer
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
+    '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
+                                                 # the console, run by the gated systemd-run)
 )
 
 # NEVER, even inside an allowed prefix — the escalation / credential surface and
@@ -420,6 +427,8 @@ def check_exec(argv, cwd=None):
         raise Denied(f'binary not in allow-list: {base}')
     if base == 'systemctl':
         _check_systemctl(argv)
+    elif base == 'systemd-run':
+        _check_systemd_run(argv)
     elif base == 'docker':
         _check_docker(argv)
     elif base in ('apt', 'apt-get', 'dnf', 'yum'):
@@ -657,6 +666,63 @@ def _check_install(argv):
     paths = [a for a in paths if not (len(a) <= 4 and a.isdigit())]
     if paths:
         _path_allowed(paths[-1])   # dst = last positional path
+
+
+# systemd-run is a DIRECT root-exec primitive (it can launch any command as root,
+# and via --property=ExecStartPre=/--scope/--pty etc. inject more). It is allowed
+# ONLY in the exact shape the kernel-patch job uses: the fixed transient unit name
+# running the fixed, broker-written /var/lib/infratak-kernel-patch.sh, with only
+# the StandardOutput/StandardError append-to-the-known-log properties and the
+# exact --setenv strings the job uses. This is no broader than `systemctl start`
+# of a console-written unit (already allowed); anything else is denied.
+_KPATCH_UNIT_NAME = 'infratak-kernel-patch'
+_KPATCH_SCRIPT = '/var/lib/infratak-kernel-patch.sh'
+_KPATCH_LOG = '/var/log/takguard/kernel-patch.log'
+_SYSTEMD_RUN_ALLOWED_PROPERTIES = {
+    'StandardOutput=append:' + _KPATCH_LOG,
+    'StandardError=append:' + _KPATCH_LOG,
+}
+# env vars are not exec, BUT they can turn the fixed `/bin/bash <script>` into
+# arbitrary root exec: BASH_ENV/ENV source a file in a non-interactive shell,
+# LD_PRELOAD/LD_LIBRARY_PATH hijack the loader, and even PATH=<attacker dir>
+# redirects the script's bare `apt-get`/`dnf`. The whole invocation is a fixed
+# shape, so pin the EXACT --setenv strings (key AND value), not just keys.
+_SYSTEMD_RUN_ALLOWED_SETENV = {
+    'DEBIAN_FRONTEND=noninteractive',
+    'NEEDRESTART_MODE=a',
+    'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+}
+
+
+def _check_systemd_run(argv):
+    """Allow ONLY the fixed kernel-patch transient-unit invocation."""
+    saw_unit = False
+    positionals = []
+    for a in argv[1:]:
+        if a in ('--no-block', '--collect'):
+            continue
+        if a.startswith('--unit='):
+            if a.split('=', 1)[1] != _KPATCH_UNIT_NAME:
+                raise Denied(f'systemd-run: only unit {_KPATCH_UNIT_NAME} allowed')
+            saw_unit = True
+            continue
+        if a.startswith('--description='):
+            continue
+        if a.startswith('--property='):
+            if a.split('=', 1)[1] not in _SYSTEMD_RUN_ALLOWED_PROPERTIES:
+                raise Denied(f'systemd-run: property not allowed: {a}')
+            continue
+        if a.startswith('--setenv='):
+            if a.split('=', 1)[1] not in _SYSTEMD_RUN_ALLOWED_SETENV:
+                raise Denied(f'systemd-run: setenv not allowed: {a}')
+            continue
+        if a.startswith('-'):
+            raise Denied(f'systemd-run: flag not allowed: {a}')
+        positionals.append(a)
+    if not saw_unit:
+        raise Denied(f'systemd-run: missing required --unit={_KPATCH_UNIT_NAME}')
+    if positionals != ['/bin/bash', _KPATCH_SCRIPT]:
+        raise Denied(f'systemd-run: only `/bin/bash {_KPATCH_SCRIPT}` allowed')
 
 
 def _check_systemctl(argv):

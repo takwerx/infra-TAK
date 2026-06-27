@@ -21,7 +21,7 @@ SHIM_DIR="${1:-/opt/infratak/.shims}"
 BROKER="${2:-/opt/infratak/broker/takwerx_broker.py}"
 mkdir -p "$SHIM_DIR"
 
-ALWAYS=(docker systemctl journalctl loginctl ufw firewall-cmd dnf apt apt-get yum
+ALWAYS=(docker systemctl systemd-run journalctl loginctl ufw firewall-cmd dnf apt apt-get yum
         semanage semodule restorecon chcon fail2ban-client swapon swapoff mkswap
         fallocate sysctl gpg)
 PATHAWARE=(mkdir rmdir mv cp chmod chown install tee ln rm touch)
