@@ -97,6 +97,9 @@ EXEC_ALLOW = {
     'fail2ban-client',
     # containers (NOTE: docker is effectively root-equivalent; see _check_docker)
     'docker',
+    # Debian postgres cluster init + dpkg reconfigure (TAK native .deb deploy). dpkg
+    # is no broader than the already-allowed apt/dnf the console drives.
+    'pg_createcluster', 'dpkg',
     # storage / kernel knobs (path-checked where they take a file). sysctl is
     # gated to safe params only (see _check_sysctl) — VM tuning, not kernel.*
     'swapon', 'swapoff', 'mkswap', 'fallocate', 'sync', 'sysctl',
@@ -355,6 +358,12 @@ def check_exec(argv, cwd=None):
     if base == 'runuser':
         _check_runuser(argv)
         return argv
+    # `bash` is denied (arbitrary shell) — but TAK ships ONE fixed root setup
+    # script, apply-selinux.sh (compiles + `semodule -i` of TAK's own policy). It
+    # uses sudo internally so it must run as root. Allow ONLY that exact script.
+    if base == 'bash':
+        _check_bash(argv)
+        return argv
     if base in EXEC_DENY:
         raise Denied(f'binary is denied: {base}')
     if base not in EXEC_ALLOW:
@@ -492,6 +501,17 @@ def _check_runuser(argv):
     if os.path.basename(cmd) == 'keytool':
         return
     raise Denied(f'runuser: command not allowed as tak: {cmd}')
+
+
+# TAK's rpm/deb ships apply-selinux.sh which compiles + installs TAK's own SELinux
+# policy module (and uses sudo internally), so it must run as root. Allow ONLY this
+# one exact, TAK-provided script — never `bash -c`, never any other path.
+_TAK_BASH_SCRIPTS = ('/opt/tak/apply-selinux.sh',)
+
+
+def _check_bash(argv):
+    if len(argv) != 2 or argv[1] not in _TAK_BASH_SCRIPTS:
+        raise Denied('bash: only the TAK apply-selinux.sh script is allowed')
 
 
 def _check_gpg(argv):

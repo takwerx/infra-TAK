@@ -55676,7 +55676,15 @@ def run_takserver_deploy(config):
         if deploy_status.get('cancelled'): return
 
         log_step(""); log_step("━━━ Step 1/9: System Limits ━━━")
-        run_cmd('grep -q "soft nofile 32768" /etc/security/limits.conf || echo -e "* soft nofile 32768\\n* hard nofile 32768" >> /etc/security/limits.conf', "Increasing JVM thread limits...")
+        log_step("Increasing JVM thread limits...")
+        # v10.0.5 non-root: shell `>> /etc/security/limits.conf` is a shell redirect
+        # (not a routed binary) — fails as takwerx. Append via the broker instead.
+        try:
+            _lc = _read_priv('/etc/security/limits.conf')
+        except Exception:
+            _lc = ''
+        if 'soft nofile 32768' not in _lc:
+            _write_priv('/etc/security/limits.conf', '* soft nofile 32768\n* hard nofile 32768\n', mode='a')
         log_step("✓ System limits configured")
 
         log_step(""); log_step("━━━ Step 2/9: PostgreSQL Repository ━━━")
@@ -55696,11 +55704,22 @@ def run_takserver_deploy(config):
             log_step("✓ EPEL + PostgreSQL (PGDG) repo + Java 17 + CRB configured")
         else:
             run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y lsb-release > /dev/null 2>&1', "Installing prerequisites...", check=False)
-            run_cmd('install -d /usr/share/postgresql-common/pgdg', check=False)
-            run_cmd('curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc 2>/dev/null', "Adding PostgreSQL GPG key...")
-            run_cmd('echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list')
-            run_cmd('apt-get update -qq > /dev/null 2>&1', "Updating package lists...")
-            log_step("✓ PostgreSQL repository configured")
+            # v10.0.5 non-root: the PGDG key (curl -o /usr/share/...) and the repo
+            # list (echo > /etc/apt/...) wrote to root paths as the non-root console
+            # and failed. Fetch the key as takwerx, then write key + list through the
+            # broker into already-allowlisted dirs (/usr/share/keyrings, /etc/apt).
+            log_step("Adding PostgreSQL GPG key...")
+            try:
+                _cn = subprocess.run(['lsb_release', '-cs'], capture_output=True, text=True, timeout=10).stdout.strip() or 'jammy'
+                _pgkey = subprocess.run(['curl', '-fsSL', 'https://www.postgresql.org/media/keys/ACCC4CF8.asc'],
+                                        capture_output=True, timeout=30).stdout
+                _write_priv('/usr/share/keyrings/pgdg.asc', _pgkey, perm=0o644)
+                _write_priv('/etc/apt/sources.list.d/pgdg.list',
+                            f'deb [signed-by=/usr/share/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt {_cn}-pgdg main\n')
+                run_cmd('apt-get update -qq > /dev/null 2>&1', "Updating package lists...")
+                log_step("✓ PostgreSQL repository configured")
+            except Exception as _e:
+                log_step(f"✗ PostgreSQL repo setup failed: {_e}")
 
         log_step(""); log_step("━━━ Step 3/9: Package Verification ━━━")
         if _distro_family() == 'rhel':
@@ -55760,7 +55779,13 @@ def run_takserver_deploy(config):
             _enf = subprocess.run('getenforce 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
             if _enf == 'Enforcing':
                 if os.path.exists('/opt/tak/apply-selinux.sh'):
-                    run_cmd('cd /opt/tak && ./apply-selinux.sh 2>&1', "Applying TAK Server SELinux policy...", check=False)
+                    # v10.0.5 non-root: the script compiles + `semodule -i`s TAK's own
+                    # SELinux policy and uses sudo internally -> must run as root. The
+                    # non-root console routes it through the broker (gated to this exact
+                    # TAK script). cwd=/opt/tak so it finds takserver-policy.te.
+                    log_step("Applying TAK Server SELinux policy...")
+                    subprocess.run(_sudo_wrap(['bash', '/opt/tak/apply-selinux.sh']),
+                                   cwd='/opt/tak', capture_output=True, text=True, timeout=120)
                     _mod = _priv_pipe(['semodule', '-l'], ['grep', '-i', 'takserver']).stdout.strip()
                     if _mod:
                         log_step(f"  ✓ SELinux policy applied ({_mod.splitlines()[0]})")
@@ -55828,8 +55853,12 @@ def run_takserver_deploy(config):
             pg_check = subprocess.run('pg_lsclusters 2>/dev/null | grep -q "15"', shell=True, capture_output=True)
             if pg_check.returncode != 0:
                 log_step("  Creating PostgreSQL 15 cluster...")
-                run_cmd('pg_createcluster 15 main --start 2>&1', check=False)
-            run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
+                # v10.0.5 non-root: pg_createcluster/dpkg aren't shimmed coreutils —
+                # route the argv through the broker so they run as root.
+                subprocess.run(_sudo_wrap(['pg_createcluster', '15', 'main', '--start']),
+                               capture_output=True, text=True, timeout=180)
+            subprocess.run(_sudo_wrap(['dpkg', '--configure', '-a']),
+                           capture_output=True, text=True, timeout=180)
             # Last-resort self-heal: if /opt/tak is still missing (e.g. apt
             # decided the package was already installed and skipped extraction
             # despite our pre-flight purge), force a reinstall from the .deb.
