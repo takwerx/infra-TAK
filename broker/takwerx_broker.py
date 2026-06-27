@@ -247,6 +247,7 @@ PATH_ALLOW_EXACT = (
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
     '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
                                                  # the console, run by the gated systemd-run)
+    '/etc/default/takserver',                    # TAK Server JVM heap (snapshot/restore + deploy)
 )
 
 # NEVER, even inside an allowed prefix — the escalation / credential surface and
@@ -552,18 +553,31 @@ def _check_semodule(argv):
 # `runuser -u tak -- <X>` where X is a TAK cert script under /opt/tak/certs/ or
 # `keytool`. Any other target user (esp. root) or command stays denied.
 _TAK_CERT_SCRIPTS = ('/opt/tak/certs/makeRootCa.sh', '/opt/tak/certs/makeCert.sh')
+# Postgres admin tooling run AS the postgres OS user (peer-auth) — the non-root
+# console has no `sudo -u postgres`, so TAK Server DB ops (health probes, vacuum/
+# reindex, db size/stats, snapshot pg_dump, rollback pg_restore, purge drop) route
+# `runuser -u postgres -- <pg tool>` through the broker. This grants the postgres
+# privilege level (DB admin) the ops already need — NOT root: the postgres user is
+# unprivileged at the OS layer, so even psql `COPY … TO PROGRAM` runs as postgres,
+# not root. Whitelist the pg binaries so `runuser -u postgres -- bash` stays denied.
+_PG_AS_POSTGRES = {'psql', 'pg_dump', 'pg_dumpall', 'pg_restore', 'pg_isready',
+                   'vacuumdb', 'reindexdb', 'createdb', 'dropdb', 'pg_basebackup'}
 
 
 def _check_runuser(argv):
-    # form: runuser -u tak -- CMD [args...]
-    if len(argv) < 5 or argv[1] != '-u' or argv[2] != 'tak' or argv[3] != '--':
-        raise Denied('runuser: only `runuser -u tak -- <tak cert cmd>` allowed')
-    cmd = argv[4]
-    if cmd in _TAK_CERT_SCRIPTS:
-        return
-    if os.path.basename(cmd) == 'keytool':
-        return
-    raise Denied(f'runuser: command not allowed as tak: {cmd}')
+    # form: runuser -u <tak|postgres> -- CMD [args...]
+    if len(argv) < 5 or argv[1] != '-u' or argv[3] != '--':
+        raise Denied('runuser: only `runuser -u <tak|postgres> -- <cmd>` allowed')
+    target, cmd = argv[2], argv[4]
+    if target == 'tak':
+        if cmd in _TAK_CERT_SCRIPTS or os.path.basename(cmd) == 'keytool':
+            return
+        raise Denied(f'runuser: command not allowed as tak: {cmd}')
+    if target == 'postgres':
+        if os.path.basename(cmd) in _PG_AS_POSTGRES:
+            return
+        raise Denied(f'runuser: command not allowed as postgres: {cmd}')
+    raise Denied(f'runuser: target user not allowed: {target}')
 
 
 # TAK's rpm/deb ships apply-selinux.sh which compiles + installs TAK's own SELinux

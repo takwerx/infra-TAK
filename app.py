@@ -358,6 +358,28 @@ def _chmod_priv(path, mode):
     os.chmod(path, int(mode))
 
 
+def _pg_exec(args, timeout=30, input_text=None, input_bytes=None, capture_binary=False):
+    """Run a PostgreSQL admin tool AS the postgres OS user (peer-auth), replacing
+    LOCAL `sudo -u postgres <tool> …`. The non-root console has no sudo, so route
+    `runuser -u postgres -- <tool> …` through the broker (gated to the pg tools —
+    see _check_runuser). `args` is the argv STARTING WITH the tool, e.g.
+    ['psql','-tA','-d','cot','-c', sql] or ['pg_dump','-Fc','cot']. As root (or
+    force-broker on root) _sudo_wrap returns the argv unchanged, so runuser runs
+    directly — same result as the old sudo, no regression on root boxes. Returns
+    the CompletedProcess (text unless capture_binary). NB: only for LOCAL pg; the
+    two-server SSH path still runs `sudo -u postgres` on the REMOTE box as root."""
+    argv = _sudo_wrap(['runuser', '-u', 'postgres', '--'] + list(args))
+    kw = {'capture_output': True, 'timeout': timeout}
+    if capture_binary:
+        if input_bytes is not None:
+            kw['input'] = input_bytes
+    else:
+        kw['text'] = True
+        if input_text is not None:
+            kw['input'] = input_text
+    return subprocess.run(argv, **kw)
+
+
 def _client_ip():
     """Best-effort client IP for rate limiting."""
     if request.remote_addr in ('127.0.0.1', '::1'):
@@ -11010,7 +11032,7 @@ def _monitor_health_check(monitor_id):
                      'psql', '-tAc', "SELECT pg_database_size('cot')"]),
                     capture_output=True, text=True, timeout=8)
                 return r.returncode == 0 and r.stdout.strip().isdigit()
-            r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            r = _pg_exec(['psql', '-tAc', "SELECT pg_database_size('cot')"], timeout=5)
             return r.returncode == 0 and r.stdout.strip().isdigit()
         if monitor_id == 'oom':
             # Only count OOM entries logged after TAK's last start so a pre-restart OOM
@@ -51562,8 +51584,7 @@ def _run_vacuum_background(use_full, tak_cfg):
                 return
             _vacuum_status.update({'running': False, 'result': (out or '').strip()})
         else:
-            cmd = f"sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_sec, cwd='/')
+            r = _pg_exec(['psql', '-d', 'cot', '-c', vacuum_sql], timeout=timeout_sec)
             out = (r.stdout or '') + (r.stderr or '')
             if r.returncode != 0:
                 _vacuum_status.update({'running': False, 'error': out.strip() or f'Exit code {r.returncode}'})
@@ -51611,7 +51632,7 @@ def takserver_vacuum_status():
                     ok, out = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{check_sql}" 2>/dev/null', timeout=10)
                     raw = (out or '').strip()
             else:
-                r = subprocess.run(f'sudo -u postgres psql -t -A -d cot -c "{check_sql}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
+                r = _pg_exec(['psql', '-t', '-A', '-d', 'cot', '-c', check_sql], timeout=10)
                 raw = (r.stdout or '').strip()
             if raw and 'VACUUM' in raw.upper():
                 running = True
@@ -51657,9 +51678,8 @@ def takserver_reindex():
             return jsonify({'success': False, 'error': (out or 'SSH command failed')[:500]}), 400
         return jsonify({'success': True, 'output': (out or '').strip(), 'remote': True})
 
-    cmd = f"sudo -u postgres psql -d cot -c '{reindex_sql}' 2>&1"
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_sec, cwd='/')
+        r = _pg_exec(['psql', '-d', 'cot', '-c', reindex_sql], timeout=timeout_sec)
         out = (r.stdout or '') + (r.stderr or '')
         if r.returncode != 0:
             return jsonify({'success': False, 'error': out.strip() or f'Exit code {r.returncode}'}), 400
@@ -51687,7 +51707,7 @@ def takserver_cot_db_size():
             ok, out = _ssh_probe(s1, size_cmd, timeout=15)
             raw = (out or '0').strip()
         else:
-            r = subprocess.run(size_cmd, shell=True, capture_output=True, text=True, timeout=10)
+            r = _pg_exec(['psql', '-t', '-A', '-c', "SELECT COALESCE(pg_database_size('cot'), 0);"], timeout=10)
             raw = (r.stdout or '0').strip()
         size = int(raw or 0)
         if size >= 1024 ** 3:
@@ -51707,7 +51727,7 @@ def takserver_cot_db_size():
                 ok2, out2 = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{stats_sql}" 2>/dev/null', timeout=15)
                 parts = (out2 or '0|0').strip().split('|')
             else:
-                r2 = subprocess.run(f'sudo -u postgres psql -t -A -d cot -c "{stats_sql}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
+                r2 = _pg_exec(['psql', '-t', '-A', '-d', 'cot', '-c', stats_sql], timeout=10)
                 parts = (r2.stdout or '0|0').strip().split('|')
             msg_count = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 0
             dead_tuples = int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 0
@@ -52981,13 +53001,13 @@ def takserver_uninstall():
             steps.append('External DB cleanup skipped — no credentials stored (run Provision Database on next deploy)')
         # The .deb installer always creates a local martiuser + cot DB regardless of deployment
         # mode. Clean them up so re-deploys don't hit stale-password noise in the postinstall.
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
-        subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("runuser -u postgres -- psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || runuser -u postgres -- psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("runuser -u postgres -- psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         steps.append('Cleaned up local PostgreSQL side-effect (cot database, martiuser)')
     else:
         # Local PostgreSQL (single-server or two-server mode)
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
-        subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("runuser -u postgres -- psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || runuser -u postgres -- psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("runuser -u postgres -- psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         steps.append('Cleaned up local PostgreSQL (cot database, martiuser)')
     # Clean up GPG verification artifacts
     subprocess.run('rm -rf /usr/share/debsig/keyrings/* /etc/debsig/policies/* 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
@@ -57466,8 +57486,8 @@ def run_full_uninstall():
                     break
         if os.path.exists('/opt/tak'):
             subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/tak']), capture_output=True)
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
-        subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("runuser -u postgres -- psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || runuser -u postgres -- psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("runuser -u postgres -- psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run('rm -rf /usr/share/debsig/keyrings/* /etc/debsig/policies/* 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
         for f in os.listdir(UPLOAD_DIR):
             try:
