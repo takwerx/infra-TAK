@@ -214,6 +214,34 @@ def _broker_shim_env(base=None):
     return base
 
 
+def _install_global_shim_path():
+    """v10.0.5 non-root: prepend the broker shim dir to THIS PROCESS's own PATH at
+    startup, so EVERY subprocess the console runs routes docker/systemctl/dnf/… (and
+    coreutils on privileged paths) through the root broker — including the many
+    `subprocess.run(..., shell=True)` sites that never opted into env=_broker_shim_env()
+    (per-module logs/stats panels: `docker ps`/`docker stats`/`docker compose logs`,
+    compose restarts, …). Without it those hit /usr/bin/docker directly as takwerx
+    (not in the docker group) → "permission denied ... /var/run/docker.sock".
+
+    The console unit sets no Environment=PATH, so it inherits systemd's default
+    (no .shims) — this is the code-only equivalent of putting .shims first on PATH.
+    No-op as root / on the force-broker proving path with no shims. Socket presence
+    is NOT required here: the shims self-gate at runtime (they fall through to the
+    real binary when the broker socket is absent), so this is safe even if the
+    broker isn't up yet at import time."""
+    try:
+        if _broker_should_route() and os.path.isdir(_BROKER_SHIM_DIR):
+            parts = os.environ.get('PATH', '').split(os.pathsep)
+            if _BROKER_SHIM_DIR not in parts:
+                os.environ['PATH'] = _BROKER_SHIM_DIR + os.pathsep + os.environ.get('PATH', '')
+            os.environ.setdefault('TAKWERX_BROKER', _BROKER_SCRIPT)
+    except Exception:
+        pass
+
+
+_install_global_shim_path()
+
+
 def _run_priv_chain(cmds, mode='and', timeout=120, **kw):
     """Run a sequence of privileged argv lists through the broker, replacing a
     shell `A && B` / `A || B` / `A; B` string (the broker runs argv, not a shell).
