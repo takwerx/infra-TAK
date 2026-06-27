@@ -7049,16 +7049,22 @@ def takserver_set_heap():
     )
     defaults_file = '/etc/default/takserver'
     try:
-        w = subprocess.run(f"sudo tee {defaults_file} > /dev/null", shell=True, input=defaults_content, capture_output=True, text=True, timeout=10)
-        if w.returncode != 0:
-            return jsonify({'success': False, 'error': f'Failed to write {defaults_file}: {(w.stderr or "").strip()[:200]}'}), 500
+        # v10.0.5 non-root: /etc/default/takserver + /opt/tak/setenv.sh are root-owned;
+        # was bare `sudo tee`/`sudo cat` (bypass broker → EPERM non-root). Route via broker.
+        try:
+            _write_priv(defaults_file, defaults_content)
+        except Exception as _we:
+            return jsonify({'success': False, 'error': f'Failed to write {defaults_file}: {str(_we)[:200]}'}), 500
 
         setenv = '/opt/tak/setenv.sh'
-        r = subprocess.run(f'sudo cat {setenv}', shell=True, capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and r.stdout:
-            cleaned = _re.sub(r'\n*export JAVA_OPTS="\$JAVA_OPTS\s+-Xms\d+[gGmM]\s+-Xmx\d+[gGmM]"\n*', '\n', r.stdout)
-            if cleaned != r.stdout:
-                subprocess.run(f"sudo tee {setenv} > /dev/null", shell=True, input=cleaned, capture_output=True, text=True, timeout=10)
+        try:
+            _setenv_cur = _read_priv(setenv)
+        except Exception:
+            _setenv_cur = ''
+        if _setenv_cur:
+            cleaned = _re.sub(r'\n*export JAVA_OPTS="\$JAVA_OPTS\s+-Xms\d+[gGmM]\s+-Xmx\d+[gGmM]"\n*', '\n', _setenv_cur)
+            if cleaned != _setenv_cur:
+                _write_priv(setenv, cleaned)
 
         rr = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=120)
         if rr.returncode != 0:
@@ -52171,13 +52177,13 @@ def takserver_rotate_intca():
             run(f'grep -qE "^INTERMEDIATE_VALIDITY" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^INTERMEDIATE_VALIDITY.*/INTERMEDIATE_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
             log(f"  New intermediate validity: {int_validity_days} days (capped by root if needed)")
             _patch_cert_metadata_password(cert_pass)
-            if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh ca "{new_ca_name}" 2>&1'):
+            if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_ca_name}" 2>&1'):
                 raise Exception('Failed to create new intermediate CA')
             log(f"✓ Intermediate CA {new_ca_name} created")
 
             log("")
             log("Step 3/7: Creating new server certificate (signed by new CA)...")
-            if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
+            if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
                 raise Exception('Failed to create new server certificate')
             log("✓ Server certificate regenerated (signed by new CA)")
 
@@ -52193,7 +52199,7 @@ def takserver_rotate_intca():
                 if name.lower() in skip or name.startswith('truststore-'):
                     continue
                 log(f"  Regenerating: {name}")
-                run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh client {name} 2>&1')
+                run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh client {name} 2>&1')
                 regen_count += 1
             log(f"✓ {regen_count} client certificate(s) regenerated (signed by new CA)")
 
@@ -52289,7 +52295,7 @@ def takserver_revoke_old_ca():
         le_jks = os.path.join(cert_dir, 'takserver-le.jks')
         if not os.path.isfile(le_jks):
             r = subprocess.run(
-                'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1',
+                'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 return jsonify({'error': f'Creating new server cert failed: {(r.stderr or r.stdout or "")[:200]}'}), 500
@@ -52433,19 +52439,19 @@ def takserver_rotate_rootca():
             log(f"Step 2/8: Creating new Root CA: {new_root_name}...")
             run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
             _patch_cert_metadata_password(cert_pass)
-            if not run(f'cd /opt/tak/certs && echo "{new_root_name}" | sudo -u tak ./makeRootCa.sh 2>&1'):
+            if not run(f'cd /opt/tak/certs && echo "{new_root_name}" | runuser -u tak -- /opt/tak/certs/makeRootCa.sh 2>&1'):
                 raise Exception('Failed to create new Root CA')
             log(f"✓ Root CA {new_root_name} created")
 
             log("")
             log(f"Step 3/8: Creating new Intermediate CA: {new_int_name}...")
-            if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh ca "{new_int_name}" 2>&1'):
+            if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_int_name}" 2>&1'):
                 raise Exception('Failed to create new Intermediate CA')
             log(f"✓ Intermediate CA {new_int_name} created")
 
             log("")
             log("Step 4/8: Creating new server certificate...")
-            if not run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
+            if not run('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
                 raise Exception('Failed to create server certificate')
             log("✓ Server certificate created")
 
@@ -52454,9 +52460,9 @@ def takserver_rotate_rootca():
             skip = {'takserver', 'root-ca', 'ca', new_root_name.lower(), new_int_name.lower(),
                     old_root_name.lower(), old_int_name.lower()}
             # We need to create admin and user first since old files were cleared
-            run('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client admin 2>&1')
+            run('cd /opt/tak/certs && runuser -u tak -- /opt/tak/certs/makeCert.sh client admin 2>&1')
             log("  Regenerated: admin")
-            run('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client user 2>&1')
+            run('cd /opt/tak/certs && runuser -u tak -- /opt/tak/certs/makeCert.sh client user 2>&1')
             log("  Regenerated: user")
             # Check settings or old backup for any other client cert names to recreate
             regen_count = 2
@@ -52577,7 +52583,7 @@ def takserver_create_client_cert():
         _patch_openssl_string_mask()
         _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'], ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
         r = subprocess.run(
-            f'sudo -u tak bash -c "cd /opt/tak/certs && ./makeCert.sh client {cert_name}" 2>&1',
+            f'cd /opt/tak/certs && runuser -u tak -- /opt/tak/certs/makeCert.sh client {cert_name} 2>&1',
             shell=True, capture_output=True, text=True, timeout=30
         )
         if r.returncode != 0:
@@ -53817,7 +53823,7 @@ def _tak_snapshot(label, plog=None):
     plog(f"  snapshot [{label}]: creating at {snap_path}")
 
     try:
-        os.makedirs(snap_path, exist_ok=True)
+        _makedirs_priv(snap_path)  # /opt/tak/snapshots root-owned — broker mkdir
     except Exception as e:
         return False, f"Could not create snapshot dir: {e}"
 
@@ -53854,7 +53860,7 @@ def _tak_snapshot(label, plog=None):
     cc_src = '/opt/tak/CoreConfig.xml'
     if os.path.exists(cc_src):
         try:
-            _shutil.copy2(cc_src, os.path.join(snap_path, 'CoreConfig.xml'))
+            subprocess.run(_sudo_wrap(['cp','-p',cc_src, os.path.join(snap_path,'CoreConfig.xml')]), capture_output=True, check=True)
             plog("  snapshot: CoreConfig.xml copied")
         except Exception as e:
             plog(f"  snapshot: CoreConfig copy failed: {e}")
@@ -53867,7 +53873,7 @@ def _tak_snapshot(label, plog=None):
     uaf_src = '/opt/tak/UserAuthenticationFile.xml'
     if os.path.exists(uaf_src):
         try:
-            _shutil.copy2(uaf_src, os.path.join(snap_path, 'UserAuthenticationFile.xml'))
+            subprocess.run(_sudo_wrap(['cp','-p',uaf_src, os.path.join(snap_path,'UserAuthenticationFile.xml')]), capture_output=True, check=True)
             plog("  snapshot: UserAuthenticationFile.xml copied")
         except Exception as e:
             plog(f"  snapshot: UserAuthenticationFile.xml copy failed: {e}")
@@ -53878,7 +53884,7 @@ def _tak_snapshot(label, plog=None):
     heap_src = '/etc/default/takserver'
     if os.path.exists(heap_src):
         try:
-            _shutil.copy2(heap_src, os.path.join(snap_path, 'takserver.default'))
+            subprocess.run(_sudo_wrap(['cp','-p',heap_src, os.path.join(snap_path,'takserver.default')]), capture_output=True, check=True)
             plog("  snapshot: takserver.default copied")
         except Exception as e:
             plog(f"  snapshot: takserver.default copy failed: {e}")
@@ -53935,9 +53941,8 @@ def _tak_snapshot(label, plog=None):
     certs_dst = os.path.join(snap_path, 'certs')
     if os.path.isdir(certs_src):
         try:
-            if os.path.exists(certs_dst):
-                _shutil.rmtree(certs_dst)
-            _shutil.copytree(certs_src, certs_dst)
+            subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
+            subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             plog("  snapshot: certs/ copied")
         except Exception as e:
             plog(f"  snapshot: certs copy failed: {e}")
@@ -54012,7 +54017,7 @@ def _tak_rollback(label, plog=None):
     cc_src = os.path.join(snap_path, 'CoreConfig.xml')
     if os.path.exists(cc_src):
         try:
-            _shutil.copy2(cc_src, '/opt/tak/CoreConfig.xml')
+            subprocess.run(_sudo_wrap(['cp','-p',cc_src,'/opt/tak/CoreConfig.xml']), capture_output=True, check=True)
             plog("  rollback: CoreConfig.xml restored")
         except Exception as e:
             plog(f"  rollback: CoreConfig restore failed: {e}")
@@ -54022,7 +54027,7 @@ def _tak_rollback(label, plog=None):
     uaf_dst = '/opt/tak/UserAuthenticationFile.xml'
     if os.path.exists(uaf_src):
         try:
-            _shutil.copy2(uaf_src, uaf_dst)
+            subprocess.run(_sudo_wrap(['cp','-p',uaf_src,uaf_dst]), capture_output=True, check=True)
             # Match the ownership convention used elsewhere for /opt/tak files.
             subprocess.run(
                 _sudo_wrap(['chown', 'tak:tak', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
@@ -54037,7 +54042,7 @@ def _tak_rollback(label, plog=None):
     heap_src = os.path.join(snap_path, 'takserver.default')
     if os.path.exists(heap_src):
         try:
-            _shutil.copy2(heap_src, '/etc/default/takserver')
+            subprocess.run(_sudo_wrap(['cp','-p',heap_src,'/etc/default/takserver']), capture_output=True, check=True)
             plog("  rollback: takserver.default restored")
         except Exception as e:
             plog(f"  rollback: takserver.default restore failed: {e}")
@@ -54047,9 +54052,8 @@ def _tak_rollback(label, plog=None):
     certs_dst = '/opt/tak/certs/files'
     if os.path.isdir(certs_src):
         try:
-            if os.path.exists(certs_dst):
-                _shutil.rmtree(certs_dst)
-            _shutil.copytree(certs_src, certs_dst)
+            subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
+            subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             # Restore ownership (tak:tak) on certs
             subprocess.run(
                 _sudo_wrap(['chown', '-R', 'tak:tak', '/opt/tak/certs/files']), capture_output=True, timeout=15
@@ -54593,8 +54597,7 @@ def run_takserver_upgrade(pkg_path):
         heap_file = '/etc/default/takserver'
         if os.path.isfile(heap_file):
             try:
-                with open(heap_file, 'r') as f:
-                    heap_backup = f.read()
+                heap_backup = _read_priv(heap_file)
                 if heap_backup.strip():
                     ulog("✓ JVM heap settings backed up")
             except Exception:
@@ -54659,8 +54662,7 @@ def run_takserver_upgrade(pkg_path):
                 ulog("\u26a0 8446 LE cert not available \u2014 self-signed cert will be used until next Update config")
         if heap_backup and heap_backup.strip():
             try:
-                with open(heap_file, 'w') as f:
-                    f.write(heap_backup)
+                _write_priv(heap_file, heap_backup)
                 ulog("✓ JVM heap settings restored")
             except Exception as e:
                 ulog(f"⚠ Could not restore heap settings: {e}")
@@ -54705,8 +54707,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         heap_file = '/etc/default/takserver'
         if os.path.isfile(heap_file):
             try:
-                with open(heap_file, 'r') as f:
-                    heap_backup = f.read()
+                heap_backup = _read_priv(heap_file)
                 if heap_backup.strip():
                     ulog("✓ JVM heap settings backed up")
             except Exception:
@@ -54832,8 +54833,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("━━━ Step 4/4: Starting TAK Server ━━━")
         if heap_backup and heap_backup.strip():
             try:
-                with open(heap_file, 'w') as f:
-                    f.write(heap_backup)
+                _write_priv(heap_file, heap_backup)
                 ulog("✓ JVM heap settings restored")
             except Exception as e:
                 ulog(f"⚠ Could not restore heap settings: {e}")
