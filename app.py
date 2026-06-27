@@ -24309,11 +24309,15 @@ smtp_use_tls = yes
 header_size_limit = 4096000
 smtp_generic_maps = hash:/etc/postfix/generic
 """
-        # Read existing main.cf and strip any previous TAKWERX block
+        # Read existing main.cf and strip any previous TAKWERX block. v10.0.5
+        # non-root: /etc/postfix is root-owned — read+write via the broker (raw
+        # open(...,'w') EPERM'd as the takwerx console: [Errno 13] /etc/postfix/main.cf).
         main_cf_path = '/etc/postfix/main.cf'
-        if os.path.exists(main_cf_path):
-            with open(main_cf_path) as f:
-                existing = f.read()
+        try:
+            existing = _read_priv(main_cf_path)
+        except Exception:
+            existing = ''
+        if existing:
             # Remove previous TAKWERX block if present
             import re
             existing = re.sub(r'\n# TAKWERX Email Relay.*', '', existing, flags=re.DOTALL)
@@ -24322,10 +24326,7 @@ smtp_generic_maps = hash:/etc/postfix/generic
             # Remove any existing mynetworks (we set it in our block for Docker relay)
             existing = re.sub(r'^\s*mynetworks\s*=.*$', '', existing, flags=re.MULTILINE)
             existing = existing.rstrip()
-        else:
-            existing = ''
-        with open(main_cf_path, 'w') as f:
-            f.write(existing + '\n' + main_cf_additions)
+        _write_priv(main_cf_path, existing + '\n' + main_cf_additions)
         plog("✓ main.cf configured")
 
         plog(f"📧 Step 3/5 — Writing credentials...")
