@@ -9346,8 +9346,7 @@ def _f2b_selfheal_rhel_jails(plog=None):
             new = re.sub(r'(?m)^(\s*action\s*=\s*)ufw\b', r'\g<1>' + banaction, txt)
             new = new.replace('/var/log/auth.log', '/var/log/secure')
             if new != txt:
-                with open(path, 'w') as f:
-                    f.write(new)
+                _write_priv(path, new)   # v10.0.5 non-root: /etc/fail2ban is root-owned
                 changed = True
                 _log(f"  fail2ban self-heal: patched {os.path.basename(path)} (ufw→{banaction}, auth.log→secure)")
         # The recidive jail reads fail2ban's OWN log (/var/log/fail2ban.log). On a box
@@ -9527,7 +9526,7 @@ def fail2ban_authentik_toggle_api():
     if not enabled:
         jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
         if os.path.exists(jail_path):
-            os.remove(jail_path)
+            subprocess.run(_sudo_wrap(['rm', '-f', jail_path]), capture_output=True)  # v10.0.5 non-root: /etc/fail2ban is root-owned
         subprocess.run(_sudo_wrap(['systemctl', 'stop',    'authentik-log-forwarder']), capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'authentik-log-forwarder']), capture_output=True)
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
@@ -9681,7 +9680,7 @@ def fail2ban_tak_config_api():
     if not enabled:
         jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
         if os.path.exists(jail_path):
-            os.remove(jail_path)
+            subprocess.run(_sudo_wrap(['rm', '-f', jail_path]), capture_output=True)  # v10.0.5 non-root: /etc/fail2ban is root-owned
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     if not os.path.exists('/etc/fail2ban/filter.d/takserver.conf'):
@@ -9861,7 +9860,7 @@ def fail2ban_ssh_config_api():
     if not enabled:
         jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
         if os.path.exists(jail_path):
-            os.remove(jail_path)
+            subprocess.run(_sudo_wrap(['rm', '-f', jail_path]), capture_output=True)  # v10.0.5 non-root: /etc/fail2ban is root-owned
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
@@ -10065,7 +10064,7 @@ def fail2ban_mediamtx_config_api():
     if not enabled:
         jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
         if os.path.exists(jail_path):
-            os.remove(jail_path)
+            subprocess.run(_sudo_wrap(['rm', '-f', jail_path]), capture_output=True)  # v10.0.5 non-root: /etc/fail2ban is root-owned
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
@@ -10278,7 +10277,7 @@ def fail2ban_takportal_config_api():
     if not enabled:
         jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
         if os.path.exists(jail_path):
-            os.remove(jail_path)
+            subprocess.run(_sudo_wrap(['rm', '-f', jail_path]), capture_output=True)  # v10.0.5 non-root: /etc/fail2ban is root-owned
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
@@ -10505,13 +10504,14 @@ def _f2b_write_recidive_config(maxretry, findtime):
     db_line = 'dbfile = /var/lib/fail2ban/fail2ban.sqlite3\n'
     purge_line = 'dbpurgeage = 0\n'
     try:
-        existing = open(local_path).read() if os.path.exists(local_path) else ''
+        # v10.0.5 non-root: /etc/fail2ban/fail2ban.local is root-owned — read+append via broker.
+        try:
+            existing = _read_priv(local_path)
+        except Exception:
+            existing = ''
         if 'dbfile' not in existing:
-            with open(local_path, 'a') as _f:
-                if not existing.strip():
-                    _f.write('[Definition]\n')
-                _f.write(db_line)
-                _f.write(purge_line)
+            addition = ('' if existing.strip() else '[Definition]\n') + db_line + purge_line
+            _write_priv(local_path, existing + addition)
     except Exception:
         pass
 
@@ -10546,8 +10546,7 @@ def fail2ban_recidive_config_api():
     data = request.get_json(force=True) or {}
     if not bool(data.get('enabled', False)):
         path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
-        if os.path.exists(path):
-            os.remove(path)
+        subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)  # v10.0.5 non-root
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     try:
@@ -10664,8 +10663,7 @@ def fail2ban_uninstall_api():
             '/etc/systemd/system/authentik-log-forwarder.service',
             '/usr/local/sbin/infratak-f2b-notify',
         ]:
-            if os.path.exists(path):
-                os.remove(path)
+            subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)  # v10.0.5 non-root
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         _plog("Config files and systemd unit removed")
         # Clear settings
@@ -11651,15 +11649,11 @@ def _guarddog_sync_diskio_email_off_file(settings=None):
     path = '/opt/tak-guarddog/diskio_email_off'
     if not _guarddog_diskio_email_enabled(settings):
         try:
-            with open(path, 'w') as f:
-                f.write('')
-        except OSError:
+            _write_priv(path, '')   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
+        except Exception:
             pass
     else:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)
 
 
 def _guarddog_apply_diskio_timer(settings=None):
@@ -11910,12 +11904,8 @@ def guarddog_uninstall():
                       'takintcaguard.service',
                       'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takcloudtakguard.service', 'taktakportalguard.service', 'tak-health.service']
     for name in timers + services_extra:
-        path = os.path.join('/etc/systemd/system', name)
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+        # v10.0.5 non-root: /etc/systemd/system is root-owned — remove via broker.
+        subprocess.run(_sudo_wrap(['rm', '-f', os.path.join('/etc/systemd/system', name)]), capture_output=True)
     if os.path.exists('/opt/tak-guarddog'):
         subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/tak-guarddog']), capture_output=True, timeout=30)
     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
@@ -11995,8 +11985,7 @@ def _guarddog_spiral_correlation_check(cl_waiting):
     # can't re-spam every tick inside the 6h window.
     try:
         _makedirs_priv('/var/lib/takguard', exist_ok=True)
-        with open(_GUARDDOG_SPIRAL_CORR_SENTINEL, 'w') as f:
-            f.write('')
+        _write_priv(_GUARDDOG_SPIRAL_CORR_SENTINEL, '')   # v10.0.5 non-root: /var/lib/takguard root-owned
     except Exception:
         pass
     if alert_email:
@@ -12142,9 +12131,7 @@ BODY_FILE="$2"
 '''
     for name, content in [('sms_send.py', py_script), ('sms_send.sh', sh_script)]:
         p = os.path.join('/opt/tak-guarddog', name)
-        with open(p, 'w') as f:
-            f.write(content)
-        os.chmod(p, 0o755)
+        _write_priv(p, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
 
 def _guarddog_send_sms_now(sms, text):
     """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging."""
@@ -25919,23 +25906,22 @@ services:
             mc += 'mynetworks = 127.0.0.0/8 [::1]/128 172.16.0.0/12\n'
             changed = True
         if changed:
-            with open(main_cf_path, 'w') as f:
-                f.write(mc)
+            _write_priv(main_cf_path, mc)   # v10.0.5 non-root: /etc/postfix/main.cf is root-owned
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
 
-    # Allow Docker networks to reach host port 25 (Authentik worker → Postfix)
-    r = subprocess.run('which ufw', shell=True, capture_output=True)
-    if r.returncode == 0:
+    # Allow Docker networks to reach host port 25 (Authentik worker → Postfix).
+    # v10.0.5: pick the backend via _fw_backend() — the broker shims BOTH ufw and
+    # firewall-cmd onto PATH, so `which` is poisoned and mis-detects on RHEL.
+    _be25 = _fw_backend()
+    if _be25 == 'ufw':
         subprocess.run(_sudo_wrap(['ufw', 'allow', 'from', '172.16.0.0/12', 'to', 'any', 'port', '25']), capture_output=True)
         subprocess.run(_sudo_wrap(['ufw', 'reload']), capture_output=True)
         _log("  UFW: allowed Docker networks → port 25")
-    else:
-        r = subprocess.run('which firewall-cmd', shell=True, capture_output=True)
-        if r.returncode == 0:
-            subprocess.run(
-                _sudo_wrap(['firewall-cmd', '--permanent', '--add-rich-rule=rule family="ipv4" source address="172.16.0.0/12" port port="25" protocol="tcp" accept']), capture_output=True)
-            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True)
-            _log("  firewalld: allowed Docker networks → port 25")
+    elif _be25 == 'firewalld':
+        subprocess.run(
+            _sudo_wrap(['firewall-cmd', '--permanent', '--add-rich-rule=rule family="ipv4" source address="172.16.0.0/12" port port="25" protocol="tcp" accept']), capture_output=True)
+        subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True)
+        _log("  firewalld: allowed Docker networks → port 25")
 
     # Recreate ONLY server + worker (they read the SMTP env). Recreating the whole
     # stack with --force-recreate races the LDAP outpost — which was just recreated
@@ -49672,9 +49658,7 @@ def _ensure_authentik_tasklog_purge_script(plog=None):
                 _current = _f.read()
         if _current == _AUTHENTIK_TASKLOG_PURGE_SCRIPT:
             return  # Already canonical
-        with open(_path, 'w') as _f:
-            _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
-        os.chmod(_path, 0o755)
+        _write_priv(_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
         _log("Authentik tasklog purge script updated to v0.9.26 canonical version (fixes VACUUM-in-transaction bug)")
     except Exception as _e:
         _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
@@ -61222,15 +61206,11 @@ def _auto_update_guarddog():
                 content = content.replace('SSH_USER_PLACEHOLDER', (_fh_remote.get('username') or 'root').strip())
             dest = os.path.join('/opt/tak-guarddog', name)
             try:
-                with open(dest) as f:
-                    existing = f.read()
-                if existing == content:
+                if _read_priv(dest) == content:   # v10.0.5 non-root: /opt/tak-guarddog root-owned
                     continue
             except Exception:
                 pass
-            with open(dest, 'w') as f:
-                f.write(content)
-            os.chmod(dest, 0o755)
+            _write_priv(dest, content, perm=0o755)
             updated += 1
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
