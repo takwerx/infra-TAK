@@ -18164,33 +18164,52 @@ def _selfheal_takserver_le_cert(plog=None):
         if not host:
             return
         # v0.9.51 — source cert is the uploaded PEM in custom mode, else Caddy's ACME store.
+        # v10.0.5 non-root: the takwerx console can't stat/read Caddy's 0750 store, so stage a
+        # readable copy via the broker (cat as root) before os.path.exists/openssl — otherwise
+        # this self-heal silently early-returns and the 8446 keystore drifts (CERT_HAS_EXPIRED).
+        _heal_tmp = None
         if (settings.get('ssl_mode') or '') == 'custom':
             cert_crt, _ = _custom_cert_paths()
+            if not os.path.exists(cert_crt):
+                return
         else:
-            cert_crt = (f'/var/lib/caddy/.local/share/caddy/certificates/'
-                        f'acme-v02.api.letsencrypt.org-directory/{host}/{host}.crt')
-        if not os.path.exists(cert_crt):
-            return  # no active cert for this host — nothing to sync from
-        jks = '/opt/tak/certs/files/takserver-le.jks'
-        cert_pass = _get_tak_cert_password(settings)
-        caddy_fp = subprocess.run(
-            f'openssl x509 -in {shlex.quote(cert_crt)} -noout -fingerprint -sha256 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=15).stdout.strip()
-        tak_fp = ''
-        tak_expired = True
-        if os.path.exists(jks):
-            kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
-            tak_fp = subprocess.run(
-                f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
-            tak_expired = subprocess.run(
-                f'{kt} | openssl x509 -checkend 0 -noout',
-                shell=True, capture_output=True, timeout=20).returncode != 0
-        if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
-            return  # keystore already matches Caddy and is valid — nothing to do
-        _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
-             '— re-syncing and restarting TAK Server...')
-        install_le_cert_on_8446(host, _log, wait_for_cert=False)
+            _src = (f'/var/lib/caddy/.local/share/caddy/certificates/'
+                    f'acme-v02.api.letsencrypt.org-directory/{host}/{host}.crt')
+            _cc = subprocess.run(_sudo_wrap(['cat', _src]), capture_output=True, timeout=15)
+            if _cc.returncode != 0 or not _cc.stdout:
+                return  # no active cert for this host — nothing to sync from
+            import tempfile as _tf
+            _fd, _heal_tmp = _tf.mkstemp(suffix='.crt', prefix='le8446-heal-')
+            with os.fdopen(_fd, 'wb') as _f:
+                _f.write(_cc.stdout)
+            cert_crt = _heal_tmp
+        try:
+            jks = '/opt/tak/certs/files/takserver-le.jks'
+            cert_pass = _get_tak_cert_password(settings)
+            caddy_fp = subprocess.run(
+                f'openssl x509 -in {shlex.quote(cert_crt)} -noout -fingerprint -sha256 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=15).stdout.strip()
+            tak_fp = ''
+            tak_expired = True
+            if os.path.exists(jks):
+                kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
+                tak_fp = subprocess.run(
+                    f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
+                tak_expired = subprocess.run(
+                    f'{kt} | openssl x509 -checkend 0 -noout',
+                    shell=True, capture_output=True, timeout=20).returncode != 0
+            if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
+                return  # keystore already matches Caddy and is valid — nothing to do
+            _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
+                 '— re-syncing and restarting TAK Server...')
+            install_le_cert_on_8446(host, _log, wait_for_cert=False)
+        finally:
+            if _heal_tmp:
+                try:
+                    os.remove(_heal_tmp)
+                except Exception:
+                    pass
     except Exception as e:
         _log(f'takserver LE-cert self-heal error (non-fatal): {e}')
 
@@ -51915,12 +51934,30 @@ def takserver_groups():
         # rejects (exit 58). Extract PEM cert+key with -legacy flag for curl.
         admin_pem = '/tmp/tak-admin-curl.pem'
         admin_key = '/tmp/tak-admin-curl.key'
+        # v10.0.5 non-root: admin.p12 is 0600 tak:tak — cat it via the broker into a temp so
+        # openssl can read it (raw openssl as takwerx -> empty PEM -> "Failed to extract").
+        import tempfile as _tf
+        _src_p12, _tmp_src = admin_p12, None
+        try:
+            _cat = subprocess.run(_sudo_wrap(['cat', admin_p12]), capture_output=True, timeout=10)
+            if _cat.returncode == 0 and _cat.stdout:
+                _fd, _tmp_src = _tf.mkstemp(suffix='.p12')
+                with os.fdopen(_fd, 'wb') as _f:
+                    _f.write(_cat.stdout)
+                _src_p12 = _tmp_src
+        except Exception:
+            pass
         subprocess.run(
-            f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
+            f'openssl pkcs12 -in {_src_p12} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
             shell=True, capture_output=True, text=True, timeout=10)
         subprocess.run(
-            f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
+            f'openssl pkcs12 -in {_src_p12} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
             shell=True, capture_output=True, text=True, timeout=10)
+        if _tmp_src:
+            try:
+                os.remove(_tmp_src)
+            except Exception:
+                pass
         if not os.path.exists(admin_pem) or os.path.getsize(admin_pem) == 0:
             return jsonify({'error': 'Failed to extract PEM from admin.p12 (legacy conversion)', 'groups': []})
         import json as _json
@@ -56623,6 +56660,21 @@ def _takportal_sync_certs(plog=None, restart=False):
                 admin_p12 = p
                 break
     if os.path.exists(admin_p12):
+        # v10.0.5 non-root: admin.p12 is 0600 tak:tak — cat it via the broker (root) into a
+        # console-readable temp so the openssl -legacy READ stage below works. Raw openssl as
+        # takwerx produced an empty PEM → the code fell back to copying the unreadable LEGACY
+        # p12 → portal can't read its client cert → Marti stats 503.
+        _fd_a, _local_admin_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-src-')
+        try:
+            _cat_a = subprocess.run(_sudo_wrap(['cat', admin_p12]), capture_output=True, timeout=15)
+            with os.fdopen(_fd_a, 'wb') as _f:
+                _f.write(_cat_a.stdout or b'')
+        except Exception:
+            try:
+                os.close(_fd_a)
+            except Exception:
+                pass
+            _local_admin_p12 = admin_p12
         fd_p12, modern_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-admin-')
         os.close(fd_p12)
         fd_pem, tmp_pem = tempfile.mkstemp(suffix='.pem', prefix='tak-portal-pem-')
@@ -56636,7 +56688,7 @@ def _takportal_sync_certs(plog=None, restart=False):
         # -legacy is required to READ TAK's RC2-40-CBC admin.p12; the export stage
         # defaults to modern AES, which the portal's Node 22 / OpenSSL 3 can read.
         subprocess.run(
-            f'openssl pkcs12 -in {shlex.quote(admin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy -out {shlex.quote(tmp_pem)} 2>/dev/null',
+            f'openssl pkcs12 -in {shlex.quote(_local_admin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy -out {shlex.quote(tmp_pem)} 2>/dev/null',
             shell=True, capture_output=True, text=True, timeout=30)
         if os.path.exists(tmp_pem) and os.path.getsize(tmp_pem) > 0:
             subprocess.run(
@@ -56658,6 +56710,11 @@ def _takportal_sync_certs(plog=None, restart=False):
             os.remove(modern_p12)
         except OSError:
             pass
+        if _local_admin_p12 != admin_p12:
+            try:
+                os.remove(_local_admin_p12)
+            except OSError:
+                pass
     else:
         _log("  ⚠ admin.p12 not found in /opt/tak/certs/files/ — client cert not refreshed")
     # --- CA chain: takserver.pem (full chain) or ca.pem+root-ca.pem -> tak-ca.pem ---
@@ -56671,8 +56728,10 @@ def _takportal_sync_certs(plog=None, restart=False):
         bundle_parts = []
         for ca_file in [os.path.join(cert_dir, 'ca.pem'), os.path.join(cert_dir, 'root-ca.pem')]:
             if os.path.isfile(ca_file):
-                with open(ca_file, 'r') as f:
-                    content = f.read().strip()
+                try:
+                    content = _read_priv(ca_file).strip()   # v10.0.5 non-root: read via broker
+                except Exception:
+                    content = ''
                 if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
                     bundle_parts.append(content)
         if bundle_parts:
