@@ -5400,8 +5400,10 @@ def console_broker_routing():
     try:
         unit = ''
         if os.path.exists(_CONSOLE_UNIT):
-            with open(_CONSOLE_UNIT) as f:
-                unit = f.read()
+            try:
+                unit = _read_priv(_CONSOLE_UNIT)   # v10.0.5 non-root: read via broker
+            except Exception:
+                unit = ''
         lines = [ln for ln in unit.splitlines()
                  if 'TAKWERX_FORCE_BROKER' not in ln]
         if enable:
@@ -5418,8 +5420,7 @@ def console_broker_routing():
             unit = '\n'.join(out) + '\n'
         else:
             unit = '\n'.join(lines) + '\n'
-        with open(_CONSOLE_UNIT, 'w') as f:
-            f.write(unit)
+        _write_priv(_CONSOLE_UNIT, unit)   # v10.0.5 non-root: /etc/systemd/system root-owned
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
         # persist intent so a future start.sh re-run can honor it (P1 wiring)
         try:
@@ -9111,11 +9112,10 @@ def firewall_restrict_source_api():
             subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
                            capture_output=True, text=True, timeout=15)
         else:
-            cmd = (
-                f'sudo ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || '
-                f'ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || true'
-            )
-            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+            # v10.0.5 non-root: literal `sudo ufw` fails (takwerx not in sudoers) and `|| true`
+            # masked it as success — route through the broker shim.
+            subprocess.run(_sudo_wrap(['ufw', action, 'from', source, 'to', 'any', 'port', str(port), 'proto', proto]),
+                           capture_output=True, text=True, timeout=12)
         st2 = _firewall_status_local()
         return jsonify({'success': True, 'message': f'{action.upper()} from {source} to {port}/{proto}', 'status': st2})
     except Exception as e:
@@ -9153,8 +9153,8 @@ def firewall_delete_rule_api():
             subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
                            capture_output=True, text=True, timeout=15)
         else:
-            cmd = f'sudo ufw --force delete {number} >/dev/null 2>&1 || ufw --force delete {number} >/dev/null 2>&1 || true'
-            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+            # v10.0.5 non-root: literal `sudo ufw` failed (not in sudoers) — route via broker shim.
+            subprocess.run(_sudo_wrap(['ufw', '--force', 'delete', str(number)]), capture_output=True, text=True, timeout=12)
         st2 = _firewall_status_local()
         return jsonify({'success': True, 'message': f'Deleted rule #{number}', 'status': st2})
     except Exception as e:
@@ -15874,21 +15874,44 @@ def _get_tak_cert_password(settings):
         return _TAK_CERT_PW_CACHE[key]
     result = None
     seen = set()
-    for cand in (configured, 'atakatak'):
-        if not cand or cand in seen:
-            continue
-        seen.add(cand)
-        for extra in (['-legacy'], []):
-            try:
-                r = subprocess.run(['openssl', 'pkcs12', '-in', p12, '-passin', 'pass:' + cand,
-                                    '-noout'] + extra, capture_output=True, timeout=10)
-                if r.returncode == 0:
-                    result = cand
-                    break
-            except Exception:
+    # v10.0.5 non-root: admin.p12 is 0600 tak:tak — the takwerx console can't openssl it
+    # directly (it would silently fall back to the configured/default password, which is
+    # WRONG on boxes where the cert pass diverged → Portal gets the wrong P12 passphrase →
+    # Marti stats 503). Pull the ~4KB p12 via the broker (cat as root) into a console-owned
+    # temp and probe that. (runuser -u tak only allows keytool/cert-scripts, not openssl.)
+    _p12_probe, _tmp_p12 = p12, None
+    try:
+        _cat = subprocess.run(_sudo_wrap(['cat', p12]), capture_output=True, timeout=10)
+        if _cat.returncode == 0 and _cat.stdout:
+            import tempfile as _tf
+            _fd, _tmp_p12 = _tf.mkstemp(suffix='.p12')
+            with os.fdopen(_fd, 'wb') as _f:
+                _f.write(_cat.stdout)
+            _p12_probe = _tmp_p12
+    except Exception:
+        pass
+    try:
+        for cand in (configured, 'atakatak'):
+            if not cand or cand in seen:
                 continue
-        if result:
-            break
+            seen.add(cand)
+            for extra in (['-legacy'], []):
+                try:
+                    r = subprocess.run(['openssl', 'pkcs12', '-in', _p12_probe, '-passin', 'pass:' + cand,
+                                        '-noout'] + extra, capture_output=True, timeout=10)
+                    if r.returncode == 0:
+                        result = cand
+                        break
+                except Exception:
+                    continue
+            if result:
+                break
+    finally:
+        if _tmp_p12:
+            try:
+                os.remove(_tmp_p12)
+            except Exception:
+                pass
     if result is None:
         result = configured or 'atakatak'    # cert opens with neither candidate → don't guess
     _TAK_CERT_PW_CACHE[key] = result
@@ -57716,9 +57739,8 @@ def api_hardening_ssh_port_post():
 
     config_path = '/etc/ssh/sshd_config'
     try:
-        with open(config_path, 'r') as f:
-            lines = f.readlines()
-    except OSError as e:
+        lines = _read_priv(config_path).splitlines(keepends=True)   # v10.0.5 non-root: sshd_config may be 0600
+    except Exception as e:
         return jsonify({'success': False, 'error': f'Cannot read sshd_config: {e}'}), 500
 
     # Replace or add Port line; drop any existing Port / #Port
@@ -57743,16 +57765,14 @@ def api_hardening_ssh_port_post():
         new_lines.append(f'\n# infra-TAK hardening\nPort {port}\n')
 
     try:
-        with open(config_path, 'w') as f:
-            f.writelines(new_lines)
-    except OSError as e:
+        _write_priv(config_path, ''.join(new_lines))   # v10.0.5 non-root: /etc/ssh/sshd_config root-owned
+    except Exception as e:
         return jsonify({'success': False, 'error': f'Cannot write sshd_config: {e}'}), 500
 
-    # Allow new port in firewall (ufw)
-    r = subprocess.run(['which', 'ufw'], capture_output=True)
-    if r.returncode == 0:
-        subprocess.run(_sudo_wrap(['ufw', 'allow', f'{port}/tcp']), capture_output=True, timeout=10)
-        subprocess.run(_sudo_wrap(['ufw', 'reload']), capture_output=True, timeout=10)
+    # Allow the new SSH port in the host firewall. v10.0.5: _fw_allow picks the
+    # family-gated backend — bare `which ufw` is shim-poisoned and would skip firewalld
+    # on RHEL, never opening the port → lockout after sshd restart.
+    _fw_allow(int(port), 'tcp')
 
     # Restart SSH (ssh.service on Debian/Ubuntu, sshd on some others)
     for svc in ('ssh', 'sshd'):
