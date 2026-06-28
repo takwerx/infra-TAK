@@ -6654,8 +6654,9 @@ def takserver_two_server_deploy_server_two():
     core_config = '/opt/tak/CoreConfig.xml'
     if os.path.exists(core_config):
         try:
-            r = subprocess.run(['sudo', 'cat', core_config], capture_output=True, text=True, timeout=5)
-            content = r.stdout or ''
+            # v10.0.5 non-root: read/write CoreConfig via the broker (literal `sudo
+            # cat`/`sudo tee` fail — takwerx isn't in sudoers — and /opt/tak is tak:tak).
+            content = _read_priv(core_config)
             if not content:
                 return jsonify({'success': False, 'error': 'Could not read CoreConfig.xml', 'log': log}), 400
 
@@ -6669,14 +6670,11 @@ def takserver_two_server_deploy_server_two():
                     content
                 )
 
-            proc = subprocess.run(['sudo', 'tee', core_config], input=content,
-                                  capture_output=True, text=True, timeout=5)
-            if proc.returncode != 0:
-                return jsonify({'success': False, 'error': 'Failed to write CoreConfig.xml', 'log': log}), 400
+            _write_priv(core_config, content)
 
-            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, timeout=90)
-            subprocess.run(['sudo', 'systemctl', 'enable', 'takserver'], capture_output=True, timeout=90)
-            subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=90)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=90)
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', 'takserver']), capture_output=True, timeout=90)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, timeout=90)
             log.append(f'CoreConfig updated: DB→{db_host}:{db_port}, takserver restarted.')
         except Exception as e:
             return jsonify({'success': False, 'error': f'CoreConfig update failed: {e}', 'log': log}), 400
@@ -6723,18 +6721,17 @@ def takserver_two_server_sync_db_password():
             }), 400
 
     try:
-        r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
-        content = r.stdout or ''
+        # v10.0.5 non-root: read/write CoreConfig via the broker (literal `sudo cat`/
+        # `sudo tee` fail as takwerx; /opt/tak is tak:tak).
+        content = _read_priv('/opt/tak/CoreConfig.xml')
         if not content:
             return jsonify({'success': False, 'error': 'Could not read CoreConfig.xml'}), 400
         content = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass + m.group(2), content)
-        proc = subprocess.run(['sudo', 'tee', '/opt/tak/CoreConfig.xml'], input=content, capture_output=True, text=True, timeout=5)
-        if proc.returncode != 0:
-            return jsonify({'success': False, 'error': 'Failed to write CoreConfig.xml'}), 500
+        _write_priv('/opt/tak/CoreConfig.xml', content)
         cfg.setdefault('database', {})['password'] = db_pass
         settings['tak_deployment'] = cfg
         save_settings(settings)
-        subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, text=True, timeout=60)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=60)
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
@@ -8533,14 +8530,12 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
     # successful connect. Operators rotating the DB host key can clear this
     # with `: > /opt/tak-guarddog/known_hosts`.
     try:
+        # v10.0.5 non-root: provision known_hosts via the broker — /opt/tak-guarddog is
+        # root-owned, so raw open()/chmod/chown by takwerx hit [Errno 13]. `touch` never
+        # truncates, so accumulated host keys survive a re-sync.
         kh_path = os.path.join(gd_dir, 'known_hosts')
-        if not os.path.exists(kh_path):
-            open(kh_path, 'a').close()
-        os.chmod(kh_path, 0o600)
-        try:
-            os.chown(kh_path, 0, 0)
-        except PermissionError:
-            pass
+        subprocess.run(_sudo_wrap(['touch', kh_path]), capture_output=True)
+        subprocess.run(_sudo_wrap(['chmod', '600', kh_path]), capture_output=True)
     except Exception as e:
         return False, f'known_hosts: {e}'
 
@@ -8568,14 +8563,12 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
                 .replace('DB_PORT_PLACEHOLDER', db_port)
                 .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 .replace('SSH_USER_PLACEHOLDER', s1_user))
-            with open(dest, 'w', encoding='utf-8') as f:
-                f.write(content)
-            os.chmod(dest, 0o755)
+            _write_priv(dest, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
         except Exception as e:
             return False, f'{name}: {e}'
     try:
         subprocess.run(
-            ['sudo', 'systemctl', 'try-restart', 'tak-health.service'],
+            _sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
             capture_output=True, text=True, timeout=20,
         )
     except Exception:
@@ -52267,12 +52260,14 @@ def takserver_rotate_intca():
             log("")
             log("Step 5/7: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_ca_name}.jks')
-            run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
+            # v10.0.5 non-root: bare keytool writes JKS into tak-owned /opt/tak/certs/files
+            # and fails as takwerx — route via the broker-allowed `runuser -u tak -- keytool`.
+            run(f'runuser -u tak -- keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
                 f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
             log("  Root CA imported into new truststore")
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
             if os.path.exists(old_pem):
-                run(f'keytool -import -trustcacerts -file {old_pem} '
+                run(f'runuser -u tak -- keytool -import -trustcacerts -file {old_pem} '
                     f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
                     check=False)
                 log(f"  Old CA ({old_ca_name}) imported into new truststore (transition period)")
@@ -52282,8 +52277,15 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 6/7: Updating CoreConfig.xml...")
-            run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.xml')
-            run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            # v10.0.5 non-root: sed isn't broker-routed + /opt/tak is tak:tak — rewrite
+            # CoreConfig via broker read-modify-write.
+            for _cc in ('/opt/tak/CoreConfig.xml', '/opt/tak/CoreConfig.example.xml'):
+                try:
+                    _t = _read_priv(_cc)
+                    if old_ca_name in _t:
+                        _write_priv(_cc, _t.replace(old_ca_name, new_ca_name))
+                except Exception:
+                    pass
             _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
@@ -52365,13 +52367,13 @@ def takserver_revoke_old_ca():
             jks = os.path.join(cert_dir, 'takserver.jks')
             if os.path.isfile(p12):
                 subprocess.run(
-                    f'keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass {shlex.quote(cert_pass)} '
+                    f'runuser -u tak -- keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass {shlex.quote(cert_pass)} '
                     f'-deststoretype JKS -destkeystore {jks} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
                     shell=True, capture_output=True, text=True, timeout=30)
 
         # 2) Remove old CA from truststore
         r = subprocess.run(
-            ['keytool', '-delete', '-alias', old_ca_alias,
+            ['runuser', '-u', 'tak', '--', 'keytool', '-delete', '-alias', old_ca_alias,
              '-keystore', ts_path, '-storepass', cert_pass],
             capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
@@ -52380,7 +52382,7 @@ def takserver_revoke_old_ca():
         # 3) Regenerate .p12 truststore
         ts_p12 = ts_path.replace('.jks', '.p12')
         subprocess.run(
-            f'keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
+            f'runuser -u tak -- keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
             f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
             shell=True, capture_output=True, text=True, timeout=15)
 
@@ -52533,19 +52535,30 @@ def takserver_rotate_rootca():
             log("")
             log("Step 6/8: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_int_name}.jks')
-            run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
+            # v10.0.5 non-root: route keytool via broker-allowed `runuser -u tak -- keytool`.
+            run(f'runuser -u tak -- keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
                 f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
             log("  Root CA imported into truststore")
             log("✓ Truststore updated")
 
             log("")
             log("Step 7/8: Updating CoreConfig.xml...")
+            # v10.0.5 non-root: sed isn't broker-routed + /opt/tak is tak:tak — rewrite
+            # CoreConfig via broker read-modify-write.
+            _repl = []
             if old_int_name:
-                run(f'sed -i "s/{old_int_name}/{new_int_name}/g" /opt/tak/CoreConfig.xml')
-                run(f'sed -i "s/{old_int_name}/{new_int_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+                _repl.append((old_int_name, new_int_name))
             if old_root_name and old_root_name != new_root_name:
-                run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.xml', check=False)
-                run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+                _repl.append((old_root_name, new_root_name))
+            for _cc in ('/opt/tak/CoreConfig.xml', '/opt/tak/CoreConfig.example.xml'):
+                try:
+                    _t = _read_priv(_cc); _orig = _t
+                    for _o, _n in _repl:
+                        _t = _t.replace(_o, _n)
+                    if _t != _orig:
+                        _write_priv(_cc, _t)
+                except Exception:
+                    pass
             _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
@@ -53553,9 +53566,12 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     appends lines to upgrade_log so operators see where apt stalled if a timeout fires.
     """
     qn = shlex.quote(pkg_name)
-    cmd = f'stdbuf -oL -eL env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y ./{qn} 2>&1'
+    # v10.0.5 non-root: pass env via Popen instead of a literal `env` wrapper, so
+    # `apt-get` is the direct command and resolves to the broker shim on PATH (root).
+    _aenv = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
+    cmd = f'stdbuf -oL -eL apt-get install -y ./{qn} 2>&1'
     proc = subprocess.Popen(
-        cmd, shell=True, cwd=cwd,
+        cmd, shell=True, cwd=cwd, env=_aenv,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     if proc.stdout is None:
         return 1
@@ -53648,9 +53664,15 @@ def _tak_postinst_resolved_mitigation_paths():
 
 
 def _sudo_test(path, flag):
-    """True if `sudo test <flag> path` succeeds (e.g. flag '-d', '-f', '-e')."""
-    r = subprocess.run(['sudo', 'test', flag, path], capture_output=True, text=True, timeout=15)
-    return r.returncode == 0
+    """True if a test on `path` succeeds (flag '-d','-f','-e'). v10.0.5 non-root:
+    /opt/tak is world-traversable and its files are world-readable, so a plain
+    os.path check works — the old `sudo test` failed (takwerx isn't in sudoers)
+    and returned False for everything."""
+    if flag == '-d':
+        return os.path.isdir(path)
+    if flag == '-f':
+        return os.path.isfile(path)
+    return os.path.exists(path)
 
 
 def _tak_upgrade_remove_blocking_empty_takserver_config(ulog):
@@ -53661,15 +53683,13 @@ def _tak_upgrade_remove_blocking_empty_takserver_config(ulog):
     Real install unpacks/copies into that path — it must not exist as an empty infra-TAK placeholder.
     """
     p = '/opt/tak/config/takserver-config'
-    script = (
-        'if [ -d ' + shlex.quote(p) + ' ] && [ -z "$(ls -A ' + shlex.quote(p) + ' 2>/dev/null)" ]; then '
-        'rmdir ' + shlex.quote(p) + ' && echo REMOVED; fi'
-    )
     try:
-        r = subprocess.run(['sudo', 'bash', '-c', script], capture_output=True, text=True, timeout=15)
-        out = (r.stdout or '').strip()
-        if 'REMOVED' in out:
-            ulog(f"  ✓ removed empty {p} (so postinst can populate — not a mkdir placeholder)")
+        # v10.0.5 non-root: check emptiness in Python (world-readable) + remove via the
+        # broker-routed `rmdir` shim (the old literal `sudo bash -c` failed as takwerx).
+        if os.path.isdir(p) and not os.listdir(p):
+            r = subprocess.run(_sudo_wrap(['rmdir', p]), capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                ulog(f"  ✓ removed empty {p} (so postinst can populate — not a mkdir placeholder)")
     except Exception as e:
         ulog(f"  ⚠ could not clear empty {p}: {e}")
 
@@ -53690,39 +53710,38 @@ def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
         '# infra-TAK: placeholder until package files are restored — run: apt reinstall takserver .deb\n'
         'exit 0\n'
     )
+    # v10.0.5 non-root: literal `sudo mkdir/tee/chmod/bash` all fail (takwerx not in
+    # sudoers). Route mkdir via the shim (_sudo_wrap), writes via _write_priv (perm sets
+    # the +x), and do emptiness/glob checks in Python (world-readable).
+    import glob as _glob
     try:
         for d in sorted(dir_paths):
-            r = subprocess.run(['sudo', 'mkdir', '-p', d], capture_output=True, text=True, timeout=30)
+            r = subprocess.run(_sudo_wrap(['mkdir', '-p', d]), capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 ulog(f"✗ mkdir -p {d} failed: {(r.stderr or r.stdout or '').strip()[:400]}")
             else:
                 ulog(f"  ✓ mkdir -p {d}")
         for fpath in sorted(sh_paths):
             parent = os.path.dirname(fpath)
-            subprocess.run(['sudo', 'mkdir', '-p', parent], capture_output=True, text=True, timeout=30)
+            subprocess.run(_sudo_wrap(['mkdir', '-p', parent]), capture_output=True, text=True, timeout=30)
             if _sudo_test(fpath, '-f'):
                 continue
-            w = subprocess.run(
-                ['sudo', 'tee', fpath], input=placeholder, capture_output=True, text=True, timeout=30)
-            if w.returncode != 0:
-                ulog(f"✗ could not write {fpath}: {(w.stderr or '')[:200]}")
+            try:
+                _write_priv(fpath, placeholder, perm=0o755)
+            except Exception as _we:
+                ulog(f"✗ could not write {fpath}: {str(_we)[:200]}")
                 continue
-            subprocess.run(['sudo', 'chmod', '+x', fpath], capture_output=True, text=True, timeout=15)
             ulog(f"  ✓ placeholder {os.path.basename(fpath)}")
         for d in _TAK_POSTINST_SH_GLOB_DIRS:
-            subprocess.run(['sudo', 'mkdir', '-p', d], capture_output=True, text=True, timeout=30)
-            d_q = shlex.quote(d)
-            bash_glob = 'shopt -s nullglob; a=(' + d_q + '/*.sh); [[ ${#a[@]} -eq 0 ]]'
-            chk = subprocess.run(
-                ['sudo', 'bash', '-c', bash_glob], capture_output=True, text=True, timeout=15)
-            if chk.returncode != 0:
+            subprocess.run(_sudo_wrap(['mkdir', '-p', d]), capture_output=True, text=True, timeout=30)
+            if _glob.glob(os.path.join(d, '*.sh')):
                 continue
             stub = os.path.join(d, '_infra_tak_placeholder_for_postinst.sh')
-            w = subprocess.run(
-                ['sudo', 'tee', stub], input=placeholder, capture_output=True, text=True, timeout=30)
-            if w.returncode == 0:
-                subprocess.run(['sudo', 'chmod', '+x', stub], capture_output=True, text=True, timeout=15)
+            try:
+                _write_priv(stub, placeholder, perm=0o755)
                 ulog(f"  ✓ {d}/*.sh glob placeholder")
+            except Exception:
+                pass
     except Exception as e:
         ulog(f"✗ Tak path preparation error: {e}")
 
@@ -53730,7 +53749,9 @@ def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
 def _run_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
     """Run dpkg --configure -a, streaming output. Returns exit code (0 = success)."""
     ulog("Running dpkg --configure -a...")
-    cmd = 'sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg --configure -a 2>&1'
+    # v10.0.5 non-root: drop literal `sudo` — `dpkg` is an ALWAYS-shim binary, so the
+    # bare invocation routes through the broker (running as root). `sudo dpkg` failed.
+    cmd = 'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg --configure -a 2>&1'
     proc = subprocess.Popen(
         cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     if proc.stdout is None:
@@ -53782,7 +53803,7 @@ def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=None):
     ulog(f"  dpkg --unpack {os.path.basename(pkg_path)}")
     try:
         rc2 = _tak_upgrade_apt_install_streamed(
-            'sudo dpkg --unpack ' + shlex.quote(pkg_path) + ' 2>&1',
+            'dpkg --unpack ' + shlex.quote(pkg_path) + ' 2>&1',
             os.path.dirname(pkg_path), upgrade_log, timeout_sec=300)
     except subprocess.TimeoutExpired:
         ulog("✗ dpkg --unpack timed out.")
@@ -53982,6 +54003,13 @@ def _tak_snapshot(label, plog=None):
                 plog(f"  snapshot: remote pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
                 try: os.remove(pg_dump_path)
                 except Exception: pass
+        elif _broker_should_route() and _broker_available():
+            # v10.0.5 non-root (DEFERRED — see HANDOFF/PUNCHLIST): a local pg_dump needs
+            # postgres + a write into the root-owned snapshot dir, and streaming it
+            # through the broker hits the 32MB socket cap. Skip the DB dump GRACEFULLY
+            # (config + certs ARE captured) rather than failing the snapshot or leaving
+            # a doomed [Errno 13]. Rollback already refuses a DB-restore without a dump.
+            plog("  snapshot: cot pg_dump SKIPPED on non-root console (config+certs captured; DB dump deferred)")
         else:
             with open(pg_dump_path, 'wb') as _f:
                 r2 = subprocess.run(
