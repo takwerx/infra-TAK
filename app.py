@@ -16197,15 +16197,15 @@ def _patch_openssl_string_mask(log_fn=None):
     if 'string_mask = utf8only' not in content:
         return
     patched = content.replace('string_mask = utf8only', 'string_mask = nombstr')
+    # v10.0.5 non-root: write /etc/ssl/openssl.cnf via the broker. The old raw
+    # open()→`sudo cp` fallback FAILS on the non-root console (takwerx isn't in
+    # sudoers — `sudo` prompts and exits) AND then falsely logged "✓ Patched".
     try:
-        with open(cnf, 'w') as f:
-            f.write(patched)
-    except PermissionError:
-        fd_ssl, tmp = tempfile.mkstemp(suffix='.txt', prefix='openssl_cnf_')
-        with os.fdopen(fd_ssl, 'w') as f:
-            f.write(patched)
-        subprocess.run(['sudo', 'cp', tmp, cnf], capture_output=True, timeout=10)
-        os.remove(tmp)
+        _write_priv(cnf, patched)
+    except Exception as _e:
+        if log_fn:
+            log_fn(f"  ⚠ Could not patch OpenSSL string_mask ({str(_e)[:80]}) — non-fatal (PrintableString compat skipped)")
+        return
     if log_fn:
         log_fn("✓ Patched OpenSSL config: string_mask = nombstr (PrintableString for TAK client compatibility)")
 
@@ -17824,9 +17824,12 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # Step C: patch CoreConfig 8446 connector → LetsEncrypt keystore (host-side via symlink).
     # TAK-in-container preserves CoreConfig across docker restart (verified), so no stop-first.
     try:
-        with open(core_config) as f:
-            content = f.read()
-        shutil.copy(core_config, core_config + '.bak-le')
+        # v10.0.5 non-root: read/back-up/patch CoreConfig via the broker — /opt/tak is
+        # tak:tak 0755 + CoreConfig.xml 0640, so raw open('w')/shutil.copy by the
+        # non-root console hit [Errno 13] and the 8446 connector was never patched →
+        # 8446 served the wrong keystore → WebGUI 403.
+        content = _read_priv(core_config)
+        _write_priv(core_config + '.bak-le', content)
         new_connector = (
             '<connector port="8446" clientAuth="false" _name="LetsEncrypt" '
             'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
@@ -17835,8 +17838,7 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
         patched = re.sub(r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
                          new_connector, content, count=1)
         if patched != content and '_name="LetsEncrypt"' in patched and 'takserver-le.jks' in patched:
-            with open(core_config, 'w') as f:
-                f.write(patched)
+            _write_priv(core_config, patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to LE cert")
         else:
             log_fn("  ⚠ 8446 connector not matched — check CoreConfig.xml manually"); return False
@@ -17980,9 +17982,12 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
     time.sleep(5)
     try:
-        with open(core_config, 'r') as f:
-            content = f.read()
-        shutil.copy(core_config, core_config + '.bak-le')
+        # v10.0.5 non-root: read/back-up/patch CoreConfig via the broker — /opt/tak is
+        # tak:tak 0755 + CoreConfig.xml 0640, so raw open('w')/shutil.copy by the
+        # non-root console hit [Errno 13] ('/opt/tak/CoreConfig.xml.bak-le') and the
+        # 8446 connector was never patched → 8446 served the wrong keystore → WebGUI 403.
+        content = _read_priv(core_config)
+        _write_priv(core_config + '.bak-le', content)
         # v0.9.29 — defense-in-depth: if CoreConfig has ns0: prefixes (leftover from a
         # prior buggy _apply_coreconfig_ldap_auth_et run on an older release), strip
         # them BEFORE patching the connector. The original regex below only matched
@@ -18015,8 +18020,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
             new_connector, content, count=1
         )
         if patched != content:
-            with open(core_config, 'w') as f:
-                f.write(patched)
+            _write_priv(core_config, patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to use LE cert")
             # v0.9.29 — verify the patch actually landed by reading back. Critical
             # because subtle whitespace differences or a stale file lock could leave
@@ -18024,12 +18028,11 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
             # cert_https default keystore instead of LE — making mobile/ATAK clients
             # show cert warnings on enrollment.
             try:
-                with open(core_config, 'r') as f:
-                    _verify = f.read()
+                _verify = _read_priv(core_config)
                 if '_name="LetsEncrypt"' not in _verify or 'takserver-le.jks' not in _verify:
                     log_fn("  ⚠ Post-patch verify FAILED — 8446 connector did not pick up LE attrs")
                     log_fn("  ⚠ Restoring from .bak-le and aborting LE wire-up")
-                    shutil.copy(core_config + '.bak-le', core_config)
+                    _write_priv(core_config, content)
                     return False
             except Exception as _ve:
                 log_fn(f"  ⚠ Post-patch verify error: {_ve} (continuing — may need manual check)")
