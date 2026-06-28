@@ -55624,17 +55624,38 @@ def _deploy_takserver_container(config):
         # Container TAK user is uid 1000 — chown so makeCert (run as that user
         # inside the container) can write the cert files on the shared mount.
         run_cmd('chown -R 1000:1000 /opt/tak/certs 2>/dev/null; true', check=False)
+        # v10.0.1/v10.0.5 (ARM container): generate certs in a ONE-SHOT `docker run` container
+        # that mounts the shared bundle — NOT `docker exec` into the init-pass service container.
+        # The init container crash-loops until certs exist (TAK's entrypoint exits with no
+        # keystore -> --restart=always backoff), so `docker exec` hit a STOPPED container and
+        # returned exit 255 -> ZERO certs while the deploy falsely logged "✓ created". A fresh
+        # `docker run --entrypoint bash <image>` uses the image's default user (uid 1000/tak,
+        # same as docker exec) + ENV (Java on PATH), sees the configured certs/ dir on the
+        # mount, and does NOT depend on the service container being up. FATAL on failure.
+        def _certrun(inner, label):
+            cmd = (f"docker run --rm -v {shlex.quote(tak_dir)}:/opt/tak:z "
+                   f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(inner)} 2>&1")
+            if not run_cmd(cmd, label, quiet=True):
+                log_step(f"✗ Certificate generation FAILED at: {label} — aborting (TAK is unusable without certs)")
+                deploy_status.update({'running': False, 'error': True})
+                return False
+            return True
         log_step(f"Creating Root CA: {root_ca}...")
-        run_cmd(_tak_exec(f'cd /opt/tak/certs && echo "{root_ca}" | ./makeRootCa.sh') + ' 2>&1', quiet=True)
+        if not _certrun(f'cd /opt/tak/certs && echo "{root_ca}" | ./makeRootCa.sh', f"Root CA {root_ca}"):
+            return
         log_step(f"Creating Intermediate CA: {int_ca}...")
-        run_cmd(_tak_exec(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"') + ' 2>&1', quiet=True)
+        if not _certrun(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"', f"Intermediate CA {int_ca}"):
+            return
         log_step("Creating server certificate...")
-        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh server takserver') + ' 2>&1', quiet=True)
+        if not _certrun('cd /opt/tak/certs && ./makeCert.sh server takserver', "server cert"):
+            return
         log_step("Creating admin certificate...")
-        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh client admin') + ' 2>&1', quiet=True)
+        if not _certrun('cd /opt/tak/certs && ./makeCert.sh client admin', "admin cert"):
+            return
         log_step("Creating user certificate...")
-        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh client user') + ' 2>&1', quiet=True)
-        run_cmd(_tak_exec(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt') + ' 2>&1', check=False)
+        if not _certrun('cd /opt/tak/certs && ./makeCert.sh client user', "user cert"):
+            return
+        _certrun(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt', "truststore")
         log_step("✓ Certificates created and truststore built")
 
         # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
