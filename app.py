@@ -55325,9 +55325,15 @@ def deploy_takserver():
         c_config = {
             'install_method': 'container',
             'package_path': os.path.join(UPLOAD_DIR, selected_zip),
-            'cert_country': data.get('cert_country', 'US'), 'cert_state': data.get('cert_state', 'CA'),
-            'cert_city': data.get('cert_city', ''), 'cert_org': data.get('cert_org', ''),
-            'cert_ou': data.get('cert_ou', ''), 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
+            # v10.0.5: default cert-metadata to NON-EMPTY — TAK's makeRootCa.sh refuses to run
+            # (exit 255) if STATE/CITY/ORGANIZATIONAL_UNIT are blank, and the TAK deploy form
+            # doesn't collect them, so an empty value here aborted cert-gen. Use the operator's
+            # value when present, else a sensible default.
+            'cert_country': (data.get('cert_country') or '').strip() or 'US',
+            'cert_state': (data.get('cert_state') or '').strip() or 'State',
+            'cert_city': (data.get('cert_city') or '').strip() or 'City',
+            'cert_org': (data.get('cert_org') or '').strip() or 'TAK',
+            'cert_ou': (data.get('cert_ou') or '').strip() or 'TAK', 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
             'intermediate_ca_name': data.get('intermediate_ca_name', 'INTERMEDIATE-CA-01'),
             'intermediate_ca_validity_days': _int_days, 'issued_cert_validity_days': _iss_days,
             'enable_admin_ui': data.get('enable_admin_ui', False),
@@ -55377,9 +55383,13 @@ def deploy_takserver():
         'two_server': is_two_server,
         'external_db': is_external_db,
         'tak_deploy_cfg': tak_deploy_cfg if (is_two_server or is_external_db) else None,
-        'cert_country': data.get('cert_country', 'US'), 'cert_state': data.get('cert_state', 'CA'),
-        'cert_city': data.get('cert_city', ''), 'cert_org': data.get('cert_org', ''),
-        'cert_ou': data.get('cert_ou', ''), 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
+        # v10.0.5: default cert-metadata to NON-EMPTY (makeRootCa.sh exits 255 on blank
+        # STATE/CITY/ORGANIZATIONAL_UNIT). Operator value when present, else a default.
+        'cert_country': (data.get('cert_country') or '').strip() or 'US',
+        'cert_state': (data.get('cert_state') or '').strip() or 'State',
+        'cert_city': (data.get('cert_city') or '').strip() or 'City',
+        'cert_org': (data.get('cert_org') or '').strip() or 'TAK',
+        'cert_ou': (data.get('cert_ou') or '').strip() or 'TAK', 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
         'intermediate_ca_name': data.get('intermediate_ca_name', 'INTERMEDIATE-CA-01'),
         'intermediate_ca_validity_days': intermediate_days,
         'issued_cert_validity_days': issued_days,
