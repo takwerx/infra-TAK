@@ -915,8 +915,17 @@ def _do_write(req):
 
 def _do_read(req):
     path = _abs(req.get('path'))   # decision in _dispatch; normalize only here
-    with open(path, 'rb') as f:
-        data = f.read(MAX_MSG)
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(MAX_MSG)
+    except FileNotFoundError:
+        # An allowlisted path that simply doesn't exist is a MISS, not a broker
+        # ERROR — poll-before-exists reads (e.g. the kernel-patch log before any
+        # patch has run) must not pollute the audit ERROR stream. The access
+        # decision was already audited ALLOW in _dispatch; surface a benign
+        # not-found so the caller's _read_priv raises (absent), as before, but
+        # the handler's generic except never logs ERROR for it.
+        return {'ok': False, 'code': 'ENOENT', 'error': 'not found'}
     return {'ok': True, 'content_b64': base64.b64encode(data).decode()}
 
 

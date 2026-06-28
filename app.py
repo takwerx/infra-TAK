@@ -18244,19 +18244,16 @@ def run_caddy_deploy(domain):
         plog("")
         plog("━━━ Step 3/4: Configuring Firewall ━━━")
         # Open ports 80, 443, and 5001 (backdoor) so console is reachable before/after Caddy
-        r = subprocess.run('which ufw', shell=True, capture_output=True)
-        if r.returncode == 0:
-            subprocess.run(_sudo_wrap(['ufw', 'allow', '80/tcp']), capture_output=True)
-            subprocess.run(_sudo_wrap(['ufw', 'allow', '443/tcp']), capture_output=True)
-            subprocess.run(_sudo_wrap(['ufw', 'allow', '5001/tcp']), capture_output=True)
-            plog("  ✓ UFW: ports 80, 443, 5001 (backdoor) opened")
-        r = subprocess.run('which firewall-cmd', shell=True, capture_output=True)
-        if r.returncode == 0:
-            subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', '--add-service=http']), capture_output=True)
-            subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', '--add-service=https']), capture_output=True)
-            subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', '--add-port=5001/tcp']), capture_output=True)
-            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True)
-            plog("  ✓ firewalld: ports 80, 443, 5001 (backdoor) opened")
+        # Open 80/443 (Caddy) + 5001 (console backdoor) via the family-gated backend.
+        # Do NOT detect with `which ufw`/`which firewall-cmd`: the broker shims put BOTH
+        # tools on the console PATH on EVERY platform, so `which` always matches and a
+        # Debian box would wrongly drive firewalld (and a RHEL box ufw) → FileNotFound
+        # ERROR in the broker audit. _fw_allow()/_fw_backend() gate on _distro_family().
+        be = _fw_backend()
+        for _p in (80, 443, 5001):
+            _fw_allow(_p, 'tcp')
+        if be:
+            plog(f"  ✓ {be}: ports 80, 443, 5001 (backdoor) opened")
         plog("✓ Firewall configured")
 
         plog("")
@@ -23695,13 +23692,12 @@ def run_cloudtak_deploy(cfg=None):
         # that port for every media URL); allow it now so a fresh install works without
         # waiting for the next console-update _auto_harden_cloudtak() pass. The media
         # container still publishes 9997 on 127.0.0.1 only, so this exposes Caddy, not it.
-        for port in ['5000/tcp', '5002/tcp', '9997/tcp']:
-            subprocess.run(_sudo_wrap(['ufw', 'allow', port]), capture_output=True)
-        r = subprocess.run('which firewall-cmd', shell=True, capture_output=True)
-        if r.returncode == 0:
-            for port in ['5000', '5002', '9997']:
-                subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--add-port={port}/tcp']), capture_output=True)
-            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True)
+        # Family-gated backend (see _fw_backend): the broker shims both ufw and
+        # firewall-cmd onto the console PATH on every platform, so `which firewall-cmd`
+        # mis-detects on Debian (and bare `ufw` errors on RHEL). Drive the firewall
+        # through _fw_allow() instead of raw ufw + `which firewall-cmd`.
+        for _p in (5000, 5002, 9997):
+            _fw_allow(_p, 'tcp')
         plog("✓ Firewall: ports 5000 (Web UI), 5002 (tiles), 9997 (Caddy video) opened")
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
