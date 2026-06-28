@@ -14224,14 +14224,16 @@ def _sync_custom_cert_for_caddy():
     dst_cert = os.path.join(base, 'infratak-custom-fullchain.pem')
     dst_key = os.path.join(base, 'infratak-custom-key.pem')
     try:
-        os.makedirs(base, exist_ok=True)
-        shutil.copyfile(src_cert, dst_cert)
-        shutil.copyfile(src_key, dst_key)
+        # v10.0.5 non-root: /var/lib/caddy is caddy:caddy 0750 — the takwerx console can't
+        # makedirs/copy/chown/chmod there. Route the copy through the broker (root): read the
+        # console-owned source via _read_priv, write the caddy-readable copy via _write_priv,
+        # then chown to the caddy user via the broker. Without this, custom (BYO) cert mode
+        # silently returns (None,None) and the Caddyfile never gets the `tls` directive.
+        _makedirs_priv(base)
+        _write_priv(dst_cert, _read_priv(src_cert), perm=0o644)
+        _write_priv(dst_key, _read_priv(src_key), perm=0o600)
         if caddy_pw:
-            os.chown(dst_cert, caddy_pw.pw_uid, caddy_pw.pw_gid)
-            os.chown(dst_key, caddy_pw.pw_uid, caddy_pw.pw_gid)
-        os.chmod(dst_cert, 0o644)
-        os.chmod(dst_key, 0o600)
+            subprocess.run(_sudo_wrap(['chown', f'{caddy_pw.pw_uid}:{caddy_pw.pw_gid}', dst_cert, dst_key]), capture_output=True)
         return dst_cert, dst_key
     except Exception as e:
         print(f"[custom-cert] failed to deploy Caddy-readable cert copy: {e}", flush=True)
@@ -20383,8 +20385,7 @@ def mediamtx_uninstall():
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'mediamtx', 'mediamtx-webeditor']), capture_output=True)
         for f in ['/etc/systemd/system/mediamtx.service', '/etc/systemd/system/mediamtx-webeditor.service',
                   '/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml']:
-            if os.path.exists(f):
-                os.remove(f)
+            subprocess.run(_sudo_wrap(['rm', '-f', f]), capture_output=True)  # v10.0.5 non-root: root-owned
         if os.path.exists('/opt/mediamtx-webeditor'):
             subprocess.run(_sudo_wrap(['rm', '-rf', '/opt/mediamtx-webeditor']), capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -20810,9 +20811,7 @@ paths:
                 )
                 sync_path = '/opt/tak-guarddog/mediamtx-cert-sync.sh'
                 _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
-                with open(sync_path, 'w') as sf:
-                    sf.write(sync_script)
-                os.chmod(sync_path, 0o755)
+                _write_priv(sync_path, sync_script, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
                 svc = "[Unit]\nDescription=Sync MediaMTX SSL certs to remote host\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/mediamtx-cert-sync.sh\n"
                 timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
                 _write_priv('/etc/systemd/system/mediamtx-cert-sync.service', svc)
@@ -24616,13 +24615,19 @@ def _cesium_ensure_dir():
     world-traversable perms (755) + httpd_sys_content_t label, then relabel so any
     just-uploaded tiles inherit it. No-op extras on Debian. Returns the dir path."""
     d = _cesium_dir()
-    os.makedirs(d, exist_ok=True)
     if _distro_family() == 'rhel':
+        # v10.0.5 non-root: on RHEL the dir is /var/lib/cesium-tiles (under root-owned
+        # /var/lib). Create it via the broker and chown to takwerx so the downstream
+        # raw upload/extract/delete writes (home-style) succeed; then label for Caddy.
+        _makedirs_priv(d, exist_ok=True)
         try:
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', d]), capture_output=True, timeout=15)
             subprocess.run(_sudo_wrap(['chmod', '755', d]), capture_output=True, timeout=10)
             _run_priv_chain([['semanage', 'fcontext', '-a', '-t', 'httpd_sys_content_t', f'{d}(/.*)?'], ['restorecon', '-RF', d]], 'seq', timeout=60)
         except Exception:
             pass
+    else:
+        os.makedirs(d, exist_ok=True)
     return d
 
 
