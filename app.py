@@ -17731,6 +17731,47 @@ def wait_for_unattended_upgrade_worker(log_fn, log_list, cancelled_check=None):
         log_list.append(f"  ⏳ {m:02d}:{s:02d}")
 
 
+def _stage_le_cert_local(cert_crt, cert_key, wait_for_cert, log_fn, label='LE'):
+    """v10.0.5 non-root: Caddy's cert dir is 0750 caddy:caddy, so the takwerx console
+    CANNOT stat or read it — raw os.path.exists() returns False (and openssl -in
+    <caddy cert> EPERM-fails) even though the cert exists, silently skipping the 8446
+    wire-up. (Pre-v10 the ROOT console read it directly.) This silent EPERM never
+    reaches the broker, so it does not show up as a DENY.
+
+    Read the cert+key THROUGH THE BROKER (root) and stage console-owned copies for the
+    deploy-time openssl/keytool. Returns (local_crt, local_key) or (None, None). On a
+    root console _read_priv reads directly, so behavior is unchanged there.
+
+    NOTE: callers keep the ORIGINAL Caddy paths for the renewal script (that runs as a
+    root systemd unit and CAN read them) — only the deploy-time openssl uses these
+    staged copies."""
+    import tempfile
+    waited = 0
+    crt = key = None
+    while True:
+        try:
+            crt = _read_priv(cert_crt)
+            key = _read_priv(cert_key)
+        except Exception:
+            crt = key = None
+        if (crt and key) or not wait_for_cert or waited >= 120:
+            break
+        log_fn(f"  Waiting for {label} cert files... ({waited}s)")
+        time.sleep(10)
+        waited += 10
+    if not (crt and key):
+        return None, None
+    d = tempfile.mkdtemp(prefix='le8446-')
+    local_crt = os.path.join(d, 'le.crt')
+    local_key = os.path.join(d, 'le.key')
+    with open(local_crt, 'w') as f:
+        f.write(crt)
+    with open(local_key, 'w') as f:
+        f.write(key)
+    os.chmod(local_key, 0o600)
+    return local_crt, local_key
+
+
 def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=True):
     """v10.0.1 — container variant of install_le_cert_on_8446. Same outcome (wire
     the Caddy LE / custom cert onto TAK's 8446 enrollment connector so clients
@@ -17752,19 +17793,19 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
         cert_key = f"{cert_dir}/{takserver_host}.key"
         cert_label = 'LE'
     core_config = '/opt/tak/CoreConfig.xml'
-    if wait_for_cert and not custom_mode:
-        waited = 0
-        while not (os.path.exists(cert_crt) and os.path.exists(cert_key)) and waited < 120:
-            log_fn(f"  Waiting for {cert_label} cert files... ({waited}s)"); _t.sleep(10); waited += 10
-    if not (os.path.exists(cert_crt) and os.path.exists(cert_key)):
-        log_fn(f"  ⚠ {cert_label} cert not found at {cert_dir} — skipping 8446 cert wire-up")
+    # v10.0.5 non-root: read Caddy's caddy:caddy-owned cert via the broker into
+    # console-readable copies for openssl (raw os.path.exists/openssl EPERM-fail
+    # SILENTLY as takwerx — the cert exists but the deploy skipped the 8446 wire-up).
+    local_crt, local_key = _stage_le_cert_local(cert_crt, cert_key, wait_for_cert and not custom_mode, log_fn, cert_label)
+    if not local_crt:
+        log_fn(f"  ⚠ {cert_label} cert not readable at {cert_dir} — skipping 8446 cert wire-up")
         return False
     log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
     p12 = '/opt/tak/certs/files/takserver-le.p12'
     jks = '/opt/tak/certs/files/takserver-le.jks'
     # Step A: cert → PKCS12 on the shared mount (host openssl; the container reads it there)
     r = subprocess.run(
-        f'openssl pkcs12 -export -in {shlex.quote(cert_crt)} -inkey {shlex.quote(cert_key)} '
+        f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
         f'-out {p12} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
@@ -17885,27 +17926,23 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # Optionally wait for Caddy to finish obtaining the cert (ACME only — a custom cert
     # is already on disk, so there is nothing to wait for).
-    if wait_for_cert and not custom_mode:
-        waited = 0
-        while not (os.path.exists(cert_crt) and os.path.exists(cert_key)) and waited < 120:
-            log_fn(f"  Waiting for LE cert files... ({waited}s)")
-            time.sleep(10)
-            waited += 10
-
-    if not (os.path.exists(cert_crt) and os.path.exists(cert_key)):
-        log_fn(f"  ⚠ {cert_label} cert not found at {cert_dir}")
+    # v10.0.5 non-root: read Caddy's caddy:caddy-owned cert via the broker into
+    # console-readable copies for openssl (raw os.path.exists/openssl EPERM-fail
+    # SILENTLY as takwerx — the cert exists but the deploy skipped the 8446 wire-up).
+    local_crt, local_key = _stage_le_cert_local(cert_crt, cert_key, wait_for_cert and not custom_mode, log_fn, cert_label)
+    if not local_crt:
+        log_fn(f"  ⚠ {cert_label} cert not readable at {cert_dir}")
         if custom_mode:
             log_fn("  Skipping 8446 cert install — upload a custom certificate first")
         else:
-            log_fn("  Skipping 8446 cert install — DNS may not be propagated yet")
-            log_fn("  Re-run Caddy deploy once the cert is available")
+            log_fn("  Skipping 8446 cert install — cert not yet issued by Caddy")
         return False
 
     log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
 
     # Step A: LE cert → PKCS12
     r = subprocess.run(
-        f'openssl pkcs12 -export -in {shlex.quote(cert_crt)} -inkey {shlex.quote(cert_key)} '
+        f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
         f'-out /tmp/takserver-le.p12 -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
