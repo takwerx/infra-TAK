@@ -11144,8 +11144,10 @@ def _monitor_health_check(monitor_id):
             # Read password from LOCAL CoreConfig.xml (what TAK Server actually uses)
             local_pw = ''
             try:
-                r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
-                cc = r.stdout or ''
+                try:
+                    cc = _read_priv('/opt/tak/CoreConfig.xml')   # v10.0.5 non-root: read via broker
+                except Exception:
+                    cc = ''
                 for pat in (
                     r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
                     r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
@@ -16152,13 +16154,12 @@ def _patch_coreconfig_cert_enrollment(coreconfig_path, int_ca, cert_pass, config
                     changed.append('8089 x509')
                 break
 
-    try:
-        tree.write(coreconfig_path, encoding='UTF-8', xml_declaration=True)
-    except PermissionError:
-        tmp = coreconfig_path + '.cert-enroll.xml'
-        tree.write(tmp, encoding='UTF-8', xml_declaration=True)
-        subprocess.run(['sudo', 'cp', os.path.abspath(tmp), coreconfig_path],
-                       capture_output=True, text=True, timeout=10)
+    # v10.0.5 non-root: write CoreConfig via the broker (literal `sudo cp` fallback failed
+    # as takwerx; /opt/tak is tak-owned on native, a home-symlink on container — broker handles both).
+    import io as _io_ce
+    _buf_ce = _io_ce.BytesIO()
+    tree.write(_buf_ce, encoding='UTF-8', xml_declaration=True)
+    _write_priv(coreconfig_path, _buf_ce.getvalue())
     if log_fn:
         log_fn(f"  ✓ CoreConfig cert-enrollment patched ({', '.join(changed) if changed else 'already ok'})")
     return True, ', '.join(changed)
@@ -16249,15 +16250,7 @@ def _sanitize_coreconfig_name_entries():
     )
     if not changed:
         return False, 'name_entries_ok'
-    try:
-        with open(coreconfig, 'w') as f:
-            f.write(patched)
-    except PermissionError:
-        tmp = os.path.join(BASE_DIR, 'CoreConfig.nameentry-fix.xml')
-        with open(tmp, 'w') as f:
-            f.write(patched)
-        subprocess.run(['sudo', 'cp', tmp, coreconfig],
-                       capture_output=True, text=True, timeout=10)
+    _write_priv(coreconfig, patched)   # v10.0.5 non-root: broker write to tak-owned /opt/tak
     return True, 'Fixed invalid characters in CoreConfig.xml nameEntry values (replaced underscores with spaces)'
 
 
@@ -17808,13 +17801,22 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
     p12 = '/opt/tak/certs/files/takserver-le.p12'
     jks = '/opt/tak/certs/files/takserver-le.jks'
-    # Step A: cert → PKCS12 on the shared mount (host openssl; the container reads it there)
+    # Step A: cert → PKCS12. v10.0.5 non-root: takwerx can't write into tak-owned
+    # /opt/tak/certs/files, so write the p12 to a host-writable /tmp path, then broker-cp it
+    # onto the shared mount where the container's keytool (Step B) reads it. (Raw -out into
+    # /opt/tak EPERM'd with an empty error -> "PKCS12 conversion failed" -> no 8446 LE cert.)
+    _tmp_p12 = '/tmp/takserver-le.p12'
     r = subprocess.run(
         f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
-        f'-out {p12} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
+        f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ PKCS12 conversion failed: {r.stderr.strip()[:200]}"); return False
+        log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}"); return False
+    subprocess.run(_sudo_wrap(['cp', _tmp_p12, p12]), capture_output=True)
+    try:
+        os.remove(_tmp_p12)
+    except Exception:
+        pass
     # Step B: PKCS12 → JKS via docker exec (the container has Java/keytool; host arm64 does not)
     r = subprocess.run(
         _tak_exec('cd /opt/tak/certs/files && rm -f takserver-le.jks && '
@@ -49186,8 +49188,12 @@ def _remove_webadmin_from_userauth():
     if not os.path.exists(uaf):
         return
     try:
-        r = subprocess.run(['sudo', 'cat', uaf], capture_output=True, text=True, timeout=10)
-        content = r.stdout if r.returncode == 0 else ''
+        # v10.0.5 non-root: UserAuthenticationFile.xml is under tak-owned /opt/tak — read and
+        # write via the broker (literal `sudo cat`/`sudo cp` fail; takwerx isn't in sudoers).
+        try:
+            content = _read_priv(uaf)
+        except Exception:
+            content = ''
         if not content or 'identifier="webadmin"' not in content:
             return
         import xml.etree.ElementTree as ET
@@ -49202,10 +49208,10 @@ def _remove_webadmin_from_userauth():
                     removed = True
         if not removed:
             return
-        patch_path = os.path.join(BASE_DIR, 'UserAuthenticationFile.patched.xml')
-        tree.write(patch_path, xml_declaration=True, encoding='unicode')
-        subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), uaf],
-            capture_output=True, text=True, timeout=10)
+        import io as _io
+        _buf = _io.StringIO()
+        tree.write(_buf, xml_declaration=True, encoding='unicode')
+        _write_priv(uaf, _buf.getvalue())
     except Exception:
         pass
 
