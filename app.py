@@ -80,6 +80,31 @@ if not os.environ.get('HOME'):
         os.environ['HOME'] = '/root'
 
 app = Flask(__name__)
+
+
+class _SurrogateSafeResponse(app.response_class):
+    """Issue #12: a lone UTF-8 surrogate (U+D800–U+DFFF) in operator-influenced
+    data otherwise hard-500s the page at response build time — Werkzeug encodes
+    the body str to bytes inside make_response (BEFORE after_request hooks run),
+    so the page can LOCK THE OPERATOR OUT entirely. These leak in via
+    surrogateescape-decoded filenames/paths — e.g. a partial/failed container
+    deploy left in uploads/ or ~/tak-docker — so a botched mid-install must never
+    brick /takserver (or any page).
+
+    Scrub lone surrogates at the encode boundary so the body always encodes. The
+    encode probe gates the work: clean bodies (the overwhelming majority) pay only
+    a cheap encode attempt and are left byte-for-byte untouched; only a body that
+    would otherwise raise is scrubbed. bytes bodies pass straight through."""
+    def set_data(self, value):
+        if isinstance(value, str):
+            try:
+                value.encode('utf-8')
+            except UnicodeEncodeError:
+                value = ''.join(c for c in value if not (0xD800 <= ord(c) <= 0xDFFF))
+        return super().set_data(value)
+
+
+app.response_class = _SurrogateSafeResponse
 # Persist the secret key so session cookies survive console restarts.
 _SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'secret_key')
 try:
