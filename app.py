@@ -55291,6 +55291,16 @@ def deploy_takserver():
             _sanitize_cert_field(data.get(key, ''), field)
     except ValueError as e:
         return jsonify({'error': str(e)[:200]}), 400
+    # v10.0.5: TAK's makeRootCa.sh REFUSES to run (cert-gen exit 255) unless these are set,
+    # and they're NOT persisted — so they reset to blank on a redeploy after Remove. Refuse
+    # up front with a clear message instead of failing mid-cert-gen.
+    _cert_required_missing = [f for f, k in [('Country', 'cert_country'), ('State', 'cert_state'),
+                                             ('City', 'cert_city'), ('Organization', 'cert_org'),
+                                             ('Organizational Unit', 'cert_ou')]
+                              if not (data.get(k, '') or '').strip()]
+    if _cert_required_missing:
+        return jsonify({'error': 'Certificate Information is required: ' + ', '.join(_cert_required_missing) +
+                        '. Fill these in (they reset after a Remove) and deploy again.'}), 400
 
     # ── v10.0.1: container path (arm64 forced, or operator-selected on amd64) ──
     # Uses the official takserver-docker-*.zip instead of a .deb/.rpm. Branches
