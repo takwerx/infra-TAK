@@ -23455,6 +23455,42 @@ def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', total_timeout=180,
     return False
 
 
+def _cloudtak_git_prep(cloudtak_dir, plog):
+    """Make a CloudTAK checkout safe to git-reset under the non-root console.
+
+    Two non-root hazards live in ~/CloudTAK and bite the deploy/update git ops:
+      * A killed `git checkout` leaves a stale .git/index.lock that wedges every
+        later git op ("Unable to create '.git/index.lock': File exists"). CloudTAK
+        is ~18k tracked files, so on slower/SELinux boxes (RHEL) the index refresh
+        can run long and get timeout-killed where a faster box (Ubuntu) finishes —
+        a non-fleet-uniform failure. The .git tree is takwerx-owned, so we just
+        unlink the stale lock.
+      * `.docker-store/` is an UPSTREAM compose bind-mount (`- .docker-store:/data`,
+        MinIO's live S3 data), which is ROOT-owned and NOT gitignored. Add it to
+        .git/info/exclude so git status/checkout never tries to walk or touch a
+        tree the non-root console can neither read into nor modify.
+    Both writes land in the takwerx-owned .git, so plain file IO works non-root."""
+    try:
+        _lock = os.path.join(cloudtak_dir, '.git', 'index.lock')
+        if os.path.exists(_lock):
+            os.remove(_lock)
+            plog("  cleared stale .git/index.lock")
+    except Exception as e:
+        plog(f"  ⚠ could not clear .git/index.lock: {e}")
+    try:
+        _excl = os.path.join(cloudtak_dir, '.git', 'info', 'exclude')
+        _cur = ''
+        if os.path.exists(_excl):
+            with open(_excl) as _f:
+                _cur = _f.read()
+        if '.docker-store' not in _cur:
+            os.makedirs(os.path.dirname(_excl), exist_ok=True)
+            with open(_excl, 'a') as _f:
+                _f.write('\n# TAKWERX: never track the root-owned MinIO bind-mount\n.docker-store/\n')
+    except Exception:
+        pass
+
+
 def run_cloudtak_deploy(cfg=None):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -23659,22 +23695,55 @@ def run_cloudtak_deploy(cfg=None):
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
         release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
         if os.path.exists(cloudtak_dir):
-            if release_tag:
-                plog(f"  ~/CloudTAK exists — re-cloning {release_tag} so version is correct...")
-                subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
-                clone_cmd = f'git clone --depth 1 --branch {release_tag} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}'
-                r = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True, timeout=600)
+            has_git  = os.path.isdir(os.path.join(cloudtak_dir, '.git'))
+            has_data = os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
+            if has_git:
+                # In-place update — NEVER rm -rf a CloudTAK tree: it holds
+                # .docker-store/ (the upstream `- .docker-store:/data` MinIO
+                # bind-mount), which is LIVE data, root-owned, and undeletable by the
+                # non-root console — that exact rm -rf failure ("destination path
+                # already exists and is not an empty directory") is what broke arm
+                # deploy. Reset to the target tag IN PLACE, preserving
+                # .docker-store / .env / docker-compose.override.yml (all untracked).
+                plog(f"  ~/CloudTAK exists — updating in place to {release_tag or 'latest'} (preserving data)...")
+                _cloudtak_git_prep(cloudtak_dir, plog)
+                if release_tag:
+                    r = subprocess.run(
+                        f'cd {cloudtak_dir} && '
+                        f'git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && '
+                        f'git -c safe.directory={cloudtak_dir} checkout -f {release_tag}',
+                        shell=True, capture_output=True, text=True, timeout=300)
+                else:
+                    r = subprocess.run(
+                        f'cd {cloudtak_dir} && '
+                        f'git -c safe.directory={cloudtak_dir} reset --hard && '
+                        f'git -c safe.directory={cloudtak_dir} pull',
+                        shell=True, capture_output=True, text=True, timeout=300)
                 if r.returncode != 0:
-                    plog(f"✗ Re-clone failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+                    plog(f"✗ In-place update failed: {(r.stderr or r.stdout or '').strip()[:200]}")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+            elif has_data:
+                # No usable .git but live MinIO data present — a fresh clone would have
+                # to relocate the root-owned .docker-store, which the non-root console
+                # cannot do. Fail with an actionable message instead of the cryptic
+                # "destination path already exists and is not an empty directory".
+                plog("✗ ~/CloudTAK holds live data (.docker-store) but has no usable git checkout.")
+                plog(f"  A root operator must move or remove {cloudtak_dir}/.docker-store, then redeploy.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             else:
-                plog("  ~/CloudTAK exists — pulling latest (could not fetch release tag)...")
+                # Empty/foreign dir — no .git, no live data — safe to clear and clone fresh.
+                plog(f"  ~/CloudTAK exists (no git, no data) — cloning {release_tag or 'latest'} fresh...")
+                subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=60)
+                _branch_flag = f' --branch {release_tag}' if release_tag else ''
                 r = subprocess.run(
-                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull --rebase --autostash',
-                    shell=True, capture_output=True, text=True, timeout=120)
+                    f'git clone --depth 1{_branch_flag} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}',
+                    shell=True, capture_output=True, text=True, timeout=600)
                 if r.returncode != 0:
-                    plog(f"  ⚠ git pull warning: {r.stderr.strip()[:100]}")
+                    plog(f"✗ Clone failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
         else:
             release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
             tag_label = release_tag or 'main (latest release tag unavailable)'
@@ -24273,20 +24342,27 @@ def run_cloudtak_update():
                 if os.path.isdir(os.path.join(plugins_base, p['install_dir']))
                    or os.path.islink(os.path.join(plugins_base, p['install_dir']))
             }
-            # Reset local modifications before checkout — patches (nginx, port
-            # bindings) live in docker-compose.override.yml which is untracked, so
-            # discarding tracked-file dirt is safe and mirrors the TAK Portal update path.
-            subprocess.run(
-                f'git -c safe.directory={cloudtak_dir} -C {cloudtak_dir} checkout -- .',
-                shell=True, capture_output=True, text=True, timeout=15)
+            # Clear any stale .git/index.lock (a prior checkout that ran long enough
+            # to be timeout-killed on a slower/SELinux box leaves one and wedges the
+            # repo) and exclude the root-owned .docker-store MinIO bind-mount from git.
+            # Then do ONE force-checkout to the tag: -f discards the tracked
+            # docker-compose.yml port patch (re-applied below) and the override/.env/
+            # .docker-store are untracked, so they survive. Patches (nginx, port
+            # bindings) live in docker-compose.override.yml which is untracked.
+            # Generous timeout so no family crosses it (CloudTAK is ~18k tracked files).
+            _cloudtak_git_prep(cloudtak_dir, plog)
             if release_tag:
                 r = subprocess.run(
-                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
-                    shell=True, capture_output=True, text=True, timeout=120)
+                    f'cd {cloudtak_dir} && '
+                    f'git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && '
+                    f'git -c safe.directory={cloudtak_dir} checkout -f {release_tag}',
+                    shell=True, capture_output=True, text=True, timeout=300)
             else:
                 r = subprocess.run(
-                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull',
-                    shell=True, capture_output=True, text=True, timeout=120)
+                    f'cd {cloudtak_dir} && '
+                    f'git -c safe.directory={cloudtak_dir} reset --hard && '
+                    f'git -c safe.directory={cloudtak_dir} pull',
+                    shell=True, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
