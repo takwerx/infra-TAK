@@ -1416,6 +1416,15 @@ def _rotate_tak_cert_cmd(cmd):
         keep = [p.strip() for p in cmd.split('&&')
                 if 'chown tak:tak' not in p and not ('chmod' in p and 'cert-metadata.sh' in p)]
         return ' && '.join(keep) if keep else 'true'
+    # Any remaining host coreutils op on the bundle cert dir (cp/sed/grep/mv/rm of ca.pem,
+    # root-ca.pem, cert-metadata.sh, …): on container those files are ROOT-owned, so a host op
+    # by the console user (takwerx) SILENTLY fails — e.g. the rotation's "restore root as the
+    # working CA" cp's and the CA_VALIDITY sed. Run the whole command inside the container
+    # (root there) against the mounted /opt/tak. Skip anything already wrapped in docker.
+    if '/opt/tak/certs' in cmd and not cmd.lstrip().startswith('docker '):
+        tak_real = os.path.realpath('/opt/tak')
+        return (f"docker run --rm -v {shlex.quote(tak_real)}:/opt/tak:z "
+                f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(cmd)} 2>&1")
     return cmd
 
 def _tak_systemctl(action):
@@ -16049,8 +16058,13 @@ def _patch_cert_metadata_password(cert_pass):
     if not cert_pass or cert_pass == 'atakatak':
         return
     try:
-        with open(path, 'r') as f:
-            lines = f.readlines()
+        # v10.0.5/v10.0.1 non-root + container: cert-metadata.sh is tak-owned (native, 0640)
+        # or ROOT-owned in the bundle (container) — the takwerx console can't raw read/write it,
+        # and there's no host `tak` user to chown to on a container box. Route through the broker.
+        content = _read_priv(path)
+        if not content:
+            return
+        lines = content.splitlines(keepends=True)
         changed = False
         for var in ('CAPASS', 'PASS', 'CERT_PASS', 'PASSWORD', 'KEYSTORE_PASS', 'CA_PASS', 'JKS_PASS'):
             for i, line in enumerate(lines):
@@ -16059,10 +16073,7 @@ def _patch_cert_metadata_password(cert_pass):
                     changed = True
                     break
         if changed:
-            with open(path, 'w') as f:
-                f.writelines(lines)
-            import shutil
-            shutil.chown(path, user='tak', group='tak')
+            _write_priv(path, ''.join(lines))
     except Exception:
         pass
 
