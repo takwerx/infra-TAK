@@ -55003,12 +55003,20 @@ def run_takserver_upgrade_rhel(rpm_path):
             save_settings(_s)
         except Exception: pass
 
-        # dnf install the new rpm — upgrades in place, keeps the DB. --allowerasing handles dep churn.
+        # Ensure the build repo + postgres module state the guide requires (idempotent on an
+        # already-installed box; powertools/CRB on Rocky, codeready-builder on RHEL).
+        rc('dnf config-manager --set-enabled powertools 2>/dev/null; dnf config-manager --set-enabled crb 2>/dev/null; '
+           'subscription-manager repos --enable codeready-builder-for-rhel-8-x86_64-rpms 2>/dev/null; '
+           'dnf -qy module disable postgresql 2>/dev/null; true')
+        # dnf install the new rpm — the guide's EXACT upgrade command (§5.2.1/5.2.2). The flag
+        # --setopt=clean_requirements_on_remove=false is what PRESERVES the existing postgres DB +
+        # deps when swapping the takserver rpm. NEVER use --allowerasing here (it would let dnf
+        # erase the DB to resolve a conflict).
         ulog(""); ulog("Installing upgrade package: " + pkg_name)
-        rc(f'DEBIAN_FRONTEND=noninteractive dnf install -y --allowerasing {shlex.quote(rpm_path)} 2>&1', "Upgrading via dnf...")
+        rc(f'dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1', "Upgrading via dnf (guide §5.2.1)...")
         if not os.path.exists('/opt/tak'):
             ulog("  /opt/tak missing after dnf install — forcing reinstall...")
-            rc(f'dnf reinstall -y {shlex.quote(rpm_path)} 2>&1 || dnf install -y {shlex.quote(rpm_path)} 2>&1')
+            rc(f'dnf reinstall -y {shlex.quote(rpm_path)} 2>&1 || dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1')
         if not os.path.exists('/opt/tak'):
             ulog("✗ FATAL: /opt/tak not found after rpm upgrade — check `rpm -q takserver` / `dnf history`.")
             upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
