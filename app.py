@@ -53680,6 +53680,17 @@ def takserver_update():
     if not os.path.exists('/opt/tak'):
         return jsonify({'error': 'TAK Server not installed. Deploy TAK Server first.'}), 400
     settings = load_settings()
+    # v10.0.1: a container box must NEVER take the .deb/dpkg/apt upgrade path — it does not
+    # upgrade the image and litters the host. The data-preserving container upgrade (rebuild
+    # the image from the new takserver-docker-*.zip while keeping the DB volume + certs) is
+    # built separately; until it ships, gate here so Update can't run the destructive native
+    # path on a container box.
+    if _tak_is_container():
+        return jsonify({'error': 'Container (docker) upgrade is not enabled yet. On a container box, '
+                        'upgrading rebuilds the image from the new takserver-docker-*.zip while PRESERVING '
+                        'your database and certificates — that path is in active development and intentionally '
+                        'will NOT fall back to the .deb/apt upgrade (which would not touch the running image). '
+                        'Hold off on Update here; the data-preserving container upgrade ships next.'}), 400
     if settings.get('pkg_mgr', 'apt') != 'apt':
         return jsonify({'error': 'TAK Server update is supported on Ubuntu only for now. Rocky/RHEL coming later.'}), 400
     if upgrade_status['running']:
