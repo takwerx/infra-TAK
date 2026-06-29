@@ -54365,6 +54365,21 @@ def _tak_rollback(label, plog=None):
     # 6. pg_restore
     # In two-server mode stream the dump to Server One and restore there.
     # In single-server mode restore into the local takserver-db container.
+    #
+    # v10.0.5 non-root: cot.pgdump lives in the root-owned snapshot dir (0600 from
+    # pg_dump), so the non-root console can't open() it to feed pg_restore's stdin.
+    # Stage a console-readable copy via the broker (cp + chown to the console uid,
+    # inside /opt/tak/snapshots/), open THAT, and remove it afterwards. On root the
+    # broker doesn't route, so _staged_dump stays the original path (opened directly).
+    _staged_dump = pg_dump_path
+    if _broker_should_route() and _broker_available():
+        _staged_dump = os.path.join(snap_path, '.cot.pgdump.staged')
+        try:
+            subprocess.run(_sudo_wrap(['cp', pg_dump_path, _staged_dump]), capture_output=True, check=True, timeout=120)
+            subprocess.run(_sudo_wrap(['chown', f'{os.getuid()}:{os.getgid()}', _staged_dump]), capture_output=True, check=True, timeout=30)
+        except Exception as _e_stage:
+            plog(f"  rollback: could not stage cot.pgdump for restore: {_e_stage}")
+            _staged_dump = pg_dump_path  # fall back; open() may still work as root
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
         _rb_settings = load_settings()
@@ -54383,7 +54398,7 @@ def _tak_rollback(label, plog=None):
                 _rb_ssh += ['-i', _rb_key]
             _rb_remote_cmd = 'sudo -u postgres pg_restore --clean -d cot'
             _rb_ssh += [f'{_rb_user}@{_rb_host}', _rb_remote_cmd]
-            with open(pg_dump_path, 'rb') as _f:
+            with open(_staged_dump, 'rb') as _f:
                 r2 = subprocess.run(_rb_ssh, stdin=_f, capture_output=True, timeout=300)
             if r2.returncode in (0, 1):
                 stderr = (r2.stderr or b'').decode()[:200]
@@ -54401,7 +54416,7 @@ def _tak_rollback(label, plog=None):
             if (r.stdout or '').strip():
                 r2 = subprocess.run(
                     _sudo_wrap(['docker', 'exec', '-i', pg_container, 'pg_restore', '-U', 'postgres', '--clean', '-d', 'cot']),
-                    stdin=open(pg_dump_path, 'rb'),
+                    stdin=open(_staged_dump, 'rb'),
                     capture_output=True,
                     timeout=300
                 )
@@ -54417,6 +54432,11 @@ def _tak_rollback(label, plog=None):
                 plog(f"  rollback: {pg_container} not running — skipping pg_restore")
     except Exception as e:
         plog(f"  rollback: pg_restore exception: {e}")
+    finally:
+        # Remove the staged dump copy (broker-owned by the console uid now).
+        if _staged_dump != pg_dump_path:
+            try: subprocess.run(_sudo_wrap(['rm', '-f', _staged_dump]), capture_output=True, timeout=30)
+            except Exception: pass
 
     # 7. Start TAK Server
     plog("  rollback: starting takserver…")
@@ -54635,10 +54655,33 @@ def takserver_snapshot_download_api(label):
     if not os.path.isdir(snap_path):
         return jsonify({'error': 'Snapshot not found'}), 404
 
+    # v10.0.5 non-root: the snapshot tree under /opt/tak/snapshots is root-owned
+    # (config/keystores often 0600). tar run as takwerx would SILENTLY skip the
+    # unreadable files and hand back a partial archive. Stage a console-readable
+    # copy via the broker (cp -rp + chown to the console uid, all under /opt/tak/),
+    # tar from there, and clean it up when the stream finishes. On root the broker
+    # doesn't route, so we tar SNAPSHOT_DIR directly — unchanged behaviour.
+    staging = None
+    src_dir = SNAPSHOT_DIR
+    if _broker_should_route() and _broker_available():
+        staging = os.path.join(SNAPSHOT_DIR, '.dl-' + safe_label)
+        try:
+            subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+            subprocess.run(_sudo_wrap(['cp', '-rp', snap_path, os.path.join(staging, safe_label)]),
+                           capture_output=True, check=True, timeout=300)
+            subprocess.run(_sudo_wrap(['chown', '-R', f'{os.getuid()}:{os.getgid()}', staging]),
+                           capture_output=True, check=True, timeout=120)
+            src_dir = staging
+        except Exception as e:
+            try: subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
+            except Exception: pass
+            return jsonify({'error': f'Could not stage snapshot for download: {str(e)[:200]}'}), 500
+
     def _stream():
         # Stream tar directly from disk — no in-memory buffering
         proc = subprocess.Popen(
-            ['tar', '-czf', '-', '-C', SNAPSHOT_DIR, safe_label],
+            ['tar', '-czf', '-', '-C', src_dir, safe_label],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
@@ -54651,6 +54694,9 @@ def takserver_snapshot_download_api(label):
         finally:
             proc.stdout.close()
             proc.wait()
+            if staging:
+                try: subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
+                except Exception: pass
 
     from flask import Response
     return Response(
@@ -54676,6 +54722,19 @@ def takserver_snapshot_upload_api():
     filename = uploaded.filename
     if not filename.endswith('.tar.gz'):
         return jsonify({'ok': False, 'error': 'File must be a .tar.gz archive'}), 400
+
+    # v10.0.5 non-root: snapshot UPLOAD is PARKED (non-blocking). Doing it safely
+    # under the non-root console means extracting an operator-supplied archive on
+    # the console side, which needs a traversal-hardened extractor (new attack
+    # surface). Until that lands, refuse cleanly instead of throwing an EPERM 500
+    # when writing into the root-owned /opt/tak/snapshots. On-box snapshots (the
+    # rollback safety net) and download are unaffected; restore an uploaded archive
+    # on a root console, or use download→rollback on the same box.
+    if _broker_should_route() and _broker_available():
+        return jsonify({'ok': False, 'error':
+            'Snapshot upload is not yet supported on the non-root (least-privilege) '
+            'console. On-box snapshots and download still work — use those, or import '
+            'the archive on a root console.'}), 501
 
     # Derive label from filename (strip .tar.gz)
     raw_label = filename[:-7]
@@ -54784,14 +54843,19 @@ def takserver_snapshot_upload_api():
 @login_required
 def takserver_snapshot_delete_api(label):
     """Delete a snapshot directory and its settings entry."""
-    import shutil as _shutil
     ok, safe_label = _validate_snapshot_label(label)
     if not ok:
         return jsonify({'ok': False, 'error': safe_label}), 400
     snap_path = os.path.join(SNAPSHOT_DIR, safe_label)
     if os.path.isdir(snap_path):
+        # /opt/tak/snapshots is root-owned — the non-root console can't rmtree it.
+        # Route through the broker (rm is path-checked to /opt/tak/); on root this
+        # runs `rm -rf` directly. label is already traversal-validated above.
         try:
-            _shutil.rmtree(snap_path)
+            r = subprocess.run(_sudo_wrap(['rm', '-rf', snap_path]),
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                return jsonify({'ok': False, 'error': (r.stderr or 'delete failed').strip()[:200]}), 500
         except Exception as e:
             return jsonify({'ok': False, 'error': str(e)[:200]}), 500
     try:
