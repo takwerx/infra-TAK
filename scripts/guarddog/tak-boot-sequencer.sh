@@ -21,6 +21,10 @@ _log() {
   logger -t takguard-boot "$1" 2>/dev/null
 }
 
+# Portable TCP probe — RHEL ships no `nc`, so `nc -z host port` exits 127 there.
+# bash /dev/tcp is a builtin, identical on Ubuntu / RHEL / ARM.
+_tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
 # ── 1. Stop Docker containers so TAK gets full CPU (boot only) ──
 # On a real boot, uptime is under a few minutes — stop everything so TAK
 # gets full CPU during its heavy 5-7 minute initialization.
@@ -95,7 +99,7 @@ else
     _log "Waiting for remote PostgreSQL ($_REMOTE_DB:5432)..."
     _t=0
     while [ $_t -lt $MAX_WAIT ]; do
-      if nc -z "$_REMOTE_DB" 5432 2>/dev/null; then
+      if _tcp_up "$_REMOTE_DB" 5432; then
         _log "Remote PostgreSQL ($_REMOTE_DB) ready (${_t}s)"
         break
       fi

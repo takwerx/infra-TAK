@@ -104,7 +104,7 @@ if [ -n "$AK_DIR" ]; then
   _t=0
   _MAX_LDAP=120
   while [ $_t -lt $_MAX_LDAP ]; do
-    if nc -z 127.0.0.1 389 2>/dev/null; then
+    if gd_tcp_up 127.0.0.1 389; then
       _log "LDAP outpost ready (${_t}s)"
       break
     fi
@@ -115,7 +115,7 @@ if [ -n "$AK_DIR" ]; then
     _log "LDAP not responding after ${_MAX_LDAP}s — force-recreating LDAP container"
     cd "$AK_DIR" && docker compose up -d --force-recreate ldap 2>/dev/null
     sleep 30
-    if nc -z 127.0.0.1 389 2>/dev/null; then
+    if gd_tcp_up 127.0.0.1 389; then
       _log "LDAP outpost recovered after recreate"
     else
       _log "LDAP still not responding — Guard Dog will monitor"

@@ -51,6 +51,13 @@ _cooldown_ok() {
   [ $(( now - last )) -ge $COOLDOWN_SECS ]
 }
 
+# Portable TCP liveness probe. RHEL ships NO `nc` by default, so the old
+# `nc -z 127.0.0.1 389` exited 127 every check on Rocky — a false "LDAP down" that
+# drove an endless 15-min LDAP-recreate loop while the outpost was perfectly healthy
+# (and each recreate flapped TAK's LDAP bind). bash /dev/tcp is a builtin, identical
+# on Ubuntu / RHEL / ARM. Usage: _tcp_up 127.0.0.1 389
+_tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
 # ── HTTP health check (Authentik server) ──
 ak_http_ok() {
   local url code
@@ -105,11 +112,11 @@ fi
 if [ "$HTTP_OK" -eq 1 ]; then
   LDAP_OK=0
 
-  if nc -z 127.0.0.1 389 2>/dev/null; then
+  if _tcp_up 127.0.0.1 389; then
     LDAP_OK=1
   else
     sleep 3
-    nc -z 127.0.0.1 389 2>/dev/null && LDAP_OK=1
+    _tcp_up 127.0.0.1 389 && LDAP_OK=1
   fi
 
   if [ "$LDAP_OK" -eq 1 ]; then

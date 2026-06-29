@@ -57,6 +57,12 @@ fi
 # True (0) when TAK runs as a container on this box.
 gd_is_container() { [ "$GD_TAK_MODE" = "container" ]; }
 
+# Portable TCP liveness probe. RHEL ships NO `nc` by default, so the old
+# `nc -z host port` exited 127 on every call there — a false "port down" that drove
+# an endless LDAP-recreate loop on Rocky. bash /dev/tcp is a builtin, identical on
+# Ubuntu / RHEL / ARM. Usage: gd_tcp_up 127.0.0.1 389  -> rc 0 if accepting connects.
+gd_tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
 # --- PostgreSQL access (local single-server only; two-server scripts keep their
 # own SSH path and never call these) -----------------------------------------
 # gd_psql_scalar "<sql>" [db]   -> -t -A scalar, stdout, rc passthrough
