@@ -1383,6 +1383,41 @@ def _tak_exec(inner_cmd):
         return f"docker exec {TAK_CONTAINER} bash -c {shlex.quote(inner_cmd)}"
     return f"sudo -u tak bash -c {shlex.quote(inner_cmd)}"
 
+def _rotate_tak_cert_cmd(cmd):
+    """v10.0.1 container path: the TAK cert/CA ops (CA rotation, revoke-old-CA,
+    create-client-cert) were written for NATIVE TAK, where the .deb/.rpm creates a host
+    `tak` user. On the CONTAINER path TAK's `tak` user lives INSIDE the container, so the
+    host-side `runuser -u tak -- <tool>`, `chown tak:tak`, and `systemctl restart takserver`
+    all fail ("user tak does not exist" / "invalid user: 'tak:tak'") — which is what broke
+    CA rotation on arm64. Translate those native idioms to the container equivalents:
+      - `runuser -u tak -- <tool ...>`  → run the op inside the image, exactly like the
+        container deploy's _certrun (docker run --rm --entrypoint bash {TAK_CONTAINER},
+        with /opt/tak bind-mounted so files land in the symlinked bundle dir).
+      - `chown tak:tak X && ...`         → drop the chown (no host tak user; the bundle is
+        owned by the console user / container uid), keep the rest of the && chain.
+      - `systemctl restart takserver`    → `docker restart takserver`.
+    NO-OP on native (.deb/.rpm) — that path keeps its byte-identical runuser/systemctl
+    commands. Pass a single shell-string command; returns the translated shell string."""
+    if not _tak_is_container():
+        return cmd
+    if 'systemctl restart takserver' in cmd:
+        return 'docker restart takserver 2>&1'
+    if 'runuser -u tak -- ' in cmd:
+        inner = cmd.replace('runuser -u tak -- ', '')
+        tak_real = os.path.realpath('/opt/tak')
+        return (f"docker run --rm -v {shlex.quote(tak_real)}:/opt/tak:z "
+                f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(inner)} 2>&1")
+    if 'chown tak:tak' in cmd:
+        # These are native cert-metadata.sh perm-hardening lines (chown tak:tak && chmod 500).
+        # On the container path there's no host tak user, the bundle file may be owned by the
+        # container uid (so a host chmod would EPERM too), and it's irrelevant to in-container
+        # cert-gen (makeCert reads cert-metadata.sh through the /opt/tak mount). Keep any
+        # non-chown/chmod-cert-metadata parts; otherwise no-op.
+        keep = [p.strip() for p in cmd.split('&&')
+                if 'chown tak:tak' not in p and not ('chmod' in p and 'cert-metadata.sh' in p)]
+        return ' && '.join(keep) if keep else 'true'
+    return cmd
+
 def _tak_systemctl(action):
     """Return a shell string for a TAK Server lifecycle action.
       native    → `systemctl <action> takserver`
@@ -52272,6 +52307,7 @@ def takserver_rotate_intca():
         def run(cmd, desc=None, check=True):
             if desc:
                 log(desc)
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
             try:
                 r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
                 if check and r.returncode != 0:
@@ -52437,7 +52473,7 @@ def takserver_revoke_old_ca():
         le_jks = os.path.join(cert_dir, 'takserver-le.jks')
         if not os.path.isfile(le_jks):
             r = subprocess.run(
-                'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1',
+                _rotate_tak_cert_cmd('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'),
                 shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 return jsonify({'error': f'Creating new server cert failed: {(r.stderr or r.stdout or "")[:200]}'}), 500
@@ -52446,26 +52482,32 @@ def takserver_revoke_old_ca():
             jks = os.path.join(cert_dir, 'takserver.jks')
             if os.path.isfile(p12):
                 subprocess.run(
-                    f'runuser -u tak -- keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass {shlex.quote(cert_pass)} '
-                    f'-deststoretype JKS -destkeystore {jks} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
+                    _rotate_tak_cert_cmd(
+                        f'runuser -u tak -- keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass {shlex.quote(cert_pass)} '
+                        f'-deststoretype JKS -destkeystore {jks} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'),
                     shell=True, capture_output=True, text=True, timeout=30)
 
         # 2) Remove old CA from truststore
         r = subprocess.run(
-            ['runuser', '-u', 'tak', '--', 'keytool', '-delete', '-alias', old_ca_alias,
-             '-keystore', ts_path, '-storepass', cert_pass],
-            capture_output=True, text=True, timeout=10)
+            _rotate_tak_cert_cmd(
+                f'runuser -u tak -- keytool -delete -alias {shlex.quote(old_ca_alias)} '
+                f'-keystore {shlex.quote(ts_path)} -storepass {shlex.quote(cert_pass)} 2>&1'),
+            shell=True, capture_output=True, text=True, timeout=15)
         if r.returncode != 0:
             return jsonify({'error': f'keytool failed: {r.stderr or r.stdout}'}), 500
 
         # 3) Regenerate .p12 truststore
         ts_p12 = ts_path.replace('.jks', '.p12')
         subprocess.run(
-            f'runuser -u tak -- keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
-            f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
+            _rotate_tak_cert_cmd(
+                f'runuser -u tak -- keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
+                f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'),
             shell=True, capture_output=True, text=True, timeout=15)
 
-        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+        if _tak_is_container():
+            subprocess.run(_sudo_wrap(['docker', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+        else:
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
 
         # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
         # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
@@ -52550,6 +52592,7 @@ def takserver_rotate_rootca():
         def run(cmd, desc=None, check=True):
             if desc:
                 log(desc)
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
             try:
                 r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
                 if check and r.returncode != 0:
@@ -52734,9 +52777,13 @@ def takserver_create_client_cert():
 
     try:
         _patch_openssl_string_mask()
-        _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'], ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+        if _tak_is_container():
+            # container: no host `tak` user — chown tak:tak is invalid; just fix the mode (broker root)
+            _run_priv_chain([['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+        else:
+            _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'], ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
         r = subprocess.run(
-            f'cd /opt/tak/certs && runuser -u tak -- /opt/tak/certs/makeCert.sh client {cert_name} 2>&1',
+            _rotate_tak_cert_cmd(f'cd /opt/tak/certs && runuser -u tak -- /opt/tak/certs/makeCert.sh client {cert_name} 2>&1'),
             shell=True, capture_output=True, text=True, timeout=30
         )
         if r.returncode != 0:
