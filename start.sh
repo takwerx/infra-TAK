@@ -21,7 +21,11 @@ CONFIG_DIR="$INSTALL_DIR/.config"
 AUTH_FILE="$CONFIG_DIR/auth.json"
 SETTINGS_FILE="$CONFIG_DIR/settings.json"
 
-clear
+# Only clear an interactive screen. Headless callers (e.g. the in-console
+# "Switch to non-root" button, which runs start.sh detached via systemd-run with
+# no TTY) have no terminal — a bare `clear` prints "TERM environment variable not
+# set" and exits non-zero, which under `set -e` aborts the whole install at line 1.
+[ -t 1 ] && clear
 echo ""
 echo -e "${CYAN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}${BOLD}  ║  infra-TAK                                           ║${NC}"

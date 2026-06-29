@@ -147,7 +147,10 @@ echo "$CUR_DIR" > /etc/takwerx-console.prenonroot-dir
 say "  ✓ ${UNIT}.pre-nonroot.bak  (rollback: restore it + systemctl daemon-reload + restart)"
 
 step "Running born-non-root flip (start.sh TAKWERX_NONROOT=1)"
-if ! TAKWERX_NONROOT=1 bash "$SCRIPT_DIR/start.sh"; then
+# TERM=dumb + </dev/null: this runs headless (systemd-run, no TTY). start.sh now
+# guards its `clear` on [ -t 1 ], but keep these as defense-in-depth so any other
+# terminal/stdin-dependent step degrades instead of hanging or aborting.
+if ! TERM=dumb TAKWERX_NONROOT=1 bash "$SCRIPT_DIR/start.sh" </dev/null; then
     say "${RED}✗ start.sh non-root flip failed. The backup unit is at ${UNIT}.pre-nonroot.bak.${NC}"
     if [ "$AUTO_ROLLBACK" = "1" ]; then
         if _rollback; then _status "failed:start.sh flip failed — rolled back to the root console";
