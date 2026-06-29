@@ -23732,6 +23732,27 @@ def run_cloudtak_deploy(cfg=None):
         if media_url:
             plog(f"  Media URL: {media_url} (CloudTAK media container — port 9997 hardcoded in source)")
 
+        # v10.0.1 arm64: CloudTAK's tiles task (tasks/pmtiles) builds FROM node:*-alpine
+        # (musl libc), but its native dep @mapbox/vtquery has NO musl-arm64 prebuilt — the
+        # glibc prebuilt it pulls fails to load at runtime ("__libc_single_threaded: symbol
+        # not found"), crashing cloudtak-tiles on arm64. Swap the tiles base to a glibc
+        # (Debian bookworm) Node image on arm64 so the prebuilt resolves. x86 stays on Alpine
+        # (works there). Re-applied on every deploy so it survives a CloudTAK source refresh.
+        try:
+            if (os.uname().machine or '').lower() in ('aarch64', 'arm64'):
+                _tiles_df = os.path.join(cloudtak_dir, 'tasks', 'pmtiles', 'Dockerfile.compose')
+                if os.path.isfile(_tiles_df):
+                    with open(_tiles_df) as _f:
+                        _dfc = _f.read()
+                    _newdf = re.sub(r'(?m)^FROM\s+node:([\w.\-]+)-alpine[\w.\-]*',
+                                    r'FROM node:\1-bookworm-slim', _dfc, count=1)
+                    if _newdf != _dfc:
+                        with open(_tiles_df, 'w') as _f:
+                            _f.write(_newdf)
+                        plog("  arm64: patched tiles Dockerfile base alpine→bookworm-slim (glibc — fixes @mapbox/vtquery)")
+        except Exception as _te:
+            plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
+
         # Step 4: Build Docker images (stream output, 45 min timeout)
         plog("")
         plog("━━━ Step 4/7: Building Docker Images ━━━")
