@@ -55047,6 +55047,13 @@ def run_takserver_upgrade_container(zip_path):
         rc(f'docker run -v {shlex.quote(new_tak)}:/opt/tak:z --restart=always '
            f'-p 8089:8089 -p 8443:8443 -p 8446:8446 --network {TAK_DOCKER_NET} '
            f'--name {TAK_CONTAINER} -d {TAK_CONTAINER}', timeout=120)
+        # Re-join the Authentik LDAP network — a fresh `docker run` only has the takserver net,
+        # but webadmin/EUD LDAP auth needs to reach the authentik-ldap outpost by container name
+        # (CoreConfig points at ldap://authentik-ldap-1:3389). The deploy joins it; the upgrade
+        # must too, or webadmin login fails with "bad password". Idempotent.
+        _aknet, _aklname = _ensure_tak_on_authentik_network()
+        if _aknet:
+            ulog(f"✓ Re-joined Authentik network ({_aknet}) — LDAP/webadmin reachable")
 
         # 6) Wait for messaging (TAK runs its schema migrations here against the preserved DB).
         ulog("Step 6/6: Waiting for messaging microservice (schema migration; up to 10 min)...")
