@@ -2768,23 +2768,41 @@ def _get_vcpu_count_remote(remote_cfg):
 _GUARDDOG_DISKIO_CSV = '/var/lib/takguard/diskio_history.csv'
 
 
+def _read_guarddog_csv_text(path):
+    """Return the text of a root-owned Guard Dog state file (CSV) under
+    /var/lib/takguard/, or None if absent/unreadable.
+
+    v10.0.5 non-root: the disk-I/O CSVs are 0600 root:root (the probe runs as root
+    under a systemd timer), so the non-root (takwerx) console must read them through
+    the broker — the dir is broker allow-listed. A plain open() EPERMs, which is what
+    made the Disk-I/O panel return "API error (500)" with all tiles blank while the
+    rest of Guard Dog (0644 state) worked. As root, _read_priv falls back to a direct
+    read, so behaviour is unchanged there."""
+    try:
+        if not os.path.exists(path):
+            return None
+        return _read_priv(path)
+    except Exception:
+        return None
+
+
 def _read_guarddog_latest_write_mbs():
     """Return the most recent sync write speed (MB/s) from Guard Dog's diskio_history.csv, or None."""
     try:
-        if not os.path.exists(_GUARDDOG_DISKIO_CSV):
+        text = _read_guarddog_csv_text(_GUARDDOG_DISKIO_CSV)
+        if text is None:
             return None
         last_val = None
-        with open(_GUARDDOG_DISKIO_CSV) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    try:
-                        last_val = float(parts[1])
-                    except ValueError:
-                        pass
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split(',')
+            if len(parts) >= 2:
+                try:
+                    last_val = float(parts[1])
+                except ValueError:
+                    pass
         return last_val
     except Exception:
         return None
@@ -2801,23 +2819,23 @@ def _guarddog_diskio_latency_1h_avg():
     diskio_latency.csv, or None if the series is absent/empty. Mirrors the 1h
     window the bash latency gate uses (v0.9.54 §4c)."""
     try:
-        if not os.path.exists(_GUARDDOG_DISKIO_LATENCY_CSV):
+        text = _read_guarddog_csv_text(_GUARDDOG_DISKIO_LATENCY_CSV)
+        if text is None:
             return None
         cutoff = datetime.utcnow() - timedelta(hours=1)
         vals = []
-        with open(_GUARDDOG_DISKIO_LATENCY_CSV) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('timestamp') or line.startswith('#'):
-                    continue
-                parts = line.split(',')
-                if len(parts) >= 3:
-                    try:
-                        ts = datetime.strptime(parts[0], '%Y-%m-%dT%H:%M:%SZ')
-                        if ts >= cutoff:
-                            vals.append(float(parts[2]))
-                    except ValueError:
-                        pass
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('timestamp') or line.startswith('#'):
+                continue
+            parts = line.split(',')
+            if len(parts) >= 3:
+                try:
+                    ts = datetime.strptime(parts[0], '%Y-%m-%dT%H:%M:%SZ')
+                    if ts >= cutoff:
+                        vals.append(float(parts[2]))
+                except ValueError:
+                    pass
         return (sum(vals) / len(vals)) if vals else None
     except Exception:
         return None
@@ -11387,20 +11405,23 @@ def guarddog_diskio_history():
     try:
         hours = int(request.args.get('hours', 24))
         csv_path = '/var/lib/takguard/diskio_history.csv'
-        if not os.path.exists(csv_path):
+        # v10.0.5 non-root: 0600 root:root — read via the broker (a plain open()
+        # EPERMs and 500s the whole panel). None -> treat as "no data yet".
+        import io as _io
+        hist_text = _read_guarddog_csv_text(csv_path)
+        if hist_text is None:
             return jsonify({'entries': [], 'avg_1h': None, 'avg_24h': None})
         import csv as csv_mod
         cutoff = datetime.utcnow() - timedelta(hours=hours)
         entries = []
-        with open(csv_path, 'r') as f:
-            reader = csv_mod.DictReader(f)
-            for row in reader:
-                try:
-                    ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
-                    if ts >= cutoff:
-                        entries.append({'t': row['timestamp'], 'v': float(row['mb_per_sec'])})
-                except (ValueError, KeyError):
-                    continue
+        reader = csv_mod.DictReader(_io.StringIO(hist_text))
+        for row in reader:
+            try:
+                ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                if ts >= cutoff:
+                    entries.append({'t': row['timestamp'], 'v': float(row['mb_per_sec'])})
+            except (ValueError, KeyError):
+                continue
         now = datetime.utcnow()
         vals_1h = [e['v'] for e in entries if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
         vals_all = [e['v'] for e in entries]
@@ -11413,17 +11434,17 @@ def guarddog_diskio_history():
         # have not yet run the new probe (lat_* come back null, entries[] is [] → no break).
         lat_entries = []
         lat_path = '/var/lib/takguard/diskio_latency.csv'
-        if os.path.exists(lat_path):
-            with open(lat_path, 'r') as f:
-                for row in csv_mod.DictReader(f):
-                    try:
-                        ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
-                        if ts >= cutoff:
-                            lat_entries.append({'t': row['timestamp'],
-                                                'ms': float(row['ms_per_commit']),
-                                                'kbps': float(row['kb_per_sec'])})
-                    except (ValueError, KeyError):
-                        continue
+        lat_text = _read_guarddog_csv_text(lat_path)
+        if lat_text is not None:
+            for row in csv_mod.DictReader(_io.StringIO(lat_text)):
+                try:
+                    ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                    if ts >= cutoff:
+                        lat_entries.append({'t': row['timestamp'],
+                                            'ms': float(row['ms_per_commit']),
+                                            'kbps': float(row['kb_per_sec'])})
+                except (ValueError, KeyError):
+                    continue
         lat_1h = [e['ms'] for e in lat_entries if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
         lat_all = [e['ms'] for e in lat_entries]
         lat_avg_1h = round(sum(lat_1h) / len(lat_1h), 2) if lat_1h else None
@@ -11593,23 +11614,21 @@ def guarddog_diskio_report():
 def _guarddog_diskio_report_inner():
     hours = int(request.args.get('hours', 72))
     csv_path = '/var/lib/takguard/diskio_history.csv'
-    if not os.path.exists(csv_path):
+    import io as _io
+    # v10.0.5 non-root: 0600 root:root — read via the broker, not a plain open().
+    hist_text = _read_guarddog_csv_text(csv_path)
+    if hist_text is None:
         return 'No disk I/O data available yet.\n', 404, {'Content-Type': 'text/plain'}
     import csv as csv_mod
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     entries = []
-    try:
-        with open(csv_path, 'r') as f:
-            reader = csv_mod.DictReader(f)
-            for row in reader:
-                try:
-                    ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
-                    if ts >= cutoff:
-                        entries.append((row['timestamp'], float(row['mb_per_sec'])))
-                except (ValueError, KeyError):
-                    continue
-    except (OSError, PermissionError):
-        return 'Could not read history file.\n', 500, {'Content-Type': 'text/plain'}
+    for row in csv_mod.DictReader(_io.StringIO(hist_text)):
+        try:
+            ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+            if ts >= cutoff:
+                entries.append((row['timestamp'], float(row['mb_per_sec'])))
+        except (ValueError, KeyError):
+            continue
     if not entries:
         return 'No data in the requested time range.\n', 404, {'Content-Type': 'text/plain'}
     vals = [e[1] for e in entries]
@@ -11637,19 +11656,16 @@ def _guarddog_diskio_report_inner():
     # 4 KB numbers and Postgres commits (a throttled disk reads 80 MB/s sequentially while
     # a 4 KB fsync takes 16 ms). Header-only; data rows below stay the throughput series.
     lat_path = '/var/lib/takguard/diskio_latency.csv'
-    if os.path.exists(lat_path):
+    lat_text = _read_guarddog_csv_text(lat_path)
+    if lat_text is not None:
         lat_vals = []
-        try:
-            with open(lat_path, 'r') as lf:
-                for row in csv_mod.DictReader(lf):
-                    try:
-                        ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
-                        if ts >= cutoff:
-                            lat_vals.append(float(row['ms_per_commit']))
-                    except (ValueError, KeyError):
-                        continue
-        except (OSError, PermissionError):
-            lat_vals = []
+        for row in csv_mod.DictReader(_io.StringIO(lat_text)):
+            try:
+                ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                if ts >= cutoff:
+                    lat_vals.append(float(row['ms_per_commit']))
+            except (ValueError, KeyError):
+                continue
         if lat_vals:
             output.write(f'# Commit latency (4 KB sync): {hours}h average {round(sum(lat_vals)/len(lat_vals), 2)} ms/commit '
                          f'| Min {round(min(lat_vals), 2)} | Max {round(max(lat_vals), 2)} ms (ceiling 10 ms)\n')
