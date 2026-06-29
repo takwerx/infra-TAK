@@ -19700,7 +19700,7 @@ def takportal_deploy_log_api():
 def takportal_container_logs():
     """Get recent container logs"""
     lines = request.args.get('lines', 50, type=int)
-    r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', lines]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+    r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
     entries = []
     skip_lines = {'npm error', 'npm ERR', 'signal SIGTERM', 'command failed', 'A complete log of this run'}
     for line in (r.stdout.strip().split('\n') if r.stdout.strip() else []):
@@ -55044,16 +55044,18 @@ def run_takserver_upgrade_container(zip_path):
            f'-v {shlex.quote(new_tak)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
            f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db', timeout=120)
         time.sleep(8)
-        rc(f'docker run -v {shlex.quote(new_tak)}:/opt/tak:z --restart=always '
+        # CREATE (not run -d) so the Authentik LDAP network is attached BEFORE the JVM starts.
+        # If TAK boots without the LDAP net reachable, it loads its group cache EMPTY -> every user
+        # resolves to "not a member of any group" -> "no channels", needing a manual restart+resync.
+        # create -> connect the LDAP net -> start guarantees LDAP (ldap://authentik-ldap-1:3389) is
+        # resolvable from the first boot, so groups load and webadmin/EUD channels work hands-off.
+        rc(f'docker create -v {shlex.quote(new_tak)}:/opt/tak:z --restart=always '
            f'-p 8089:8089 -p 8443:8443 -p 8446:8446 --network {TAK_DOCKER_NET} '
-           f'--name {TAK_CONTAINER} -d {TAK_CONTAINER}', timeout=120)
-        # Re-join the Authentik LDAP network — a fresh `docker run` only has the takserver net,
-        # but webadmin/EUD LDAP auth needs to reach the authentik-ldap outpost by container name
-        # (CoreConfig points at ldap://authentik-ldap-1:3389). The deploy joins it; the upgrade
-        # must too, or webadmin login fails with "bad password". Idempotent.
-        _aknet, _aklname = _ensure_tak_on_authentik_network()
+           f'--name {TAK_CONTAINER} {TAK_CONTAINER}', timeout=60)
+        _aknet, _aklname = _ensure_tak_on_authentik_network()  # connect LDAP net to the created (not-yet-started) container
         if _aknet:
-            ulog(f"✓ Re-joined Authentik network ({_aknet}) — LDAP/webadmin reachable")
+            ulog(f"✓ Joined Authentik network ({_aknet}) before start — LDAP/groups reachable from boot")
+        rc(f'docker start {TAK_CONTAINER}', timeout=90)
 
         # 6) Wait for messaging (TAK runs its schema migrations here against the preserved DB).
         ulog("Step 6/6: Waiting for messaging microservice (schema migration; up to 10 min)...")
