@@ -29759,19 +29759,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div id="posture-banner" class="status-banner stopped"><div class="dot"></div><span id="posture-text">Loading…</span></div>
 
   <div class="card">
-    <div class="card-title">Posture controls</div>
-    <div id="controls">Loading…</div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Boundary assertions (W4) — read-only</div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Host firewall, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
-    <div id="assertions">Loading…</div>
-  </div>
-
-  <div class="card">
     <div class="card-title">Console Security Guard</div>
-    <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">This box has a built-in security <strong>guard</strong>. The web console can't make powerful changes on its own &mdash; installs, restarts, and config edits all go <strong>through the guard</strong>, which only allows pre-approved actions and writes down every one. So even if the console were ever hacked, it can't do anything off the approved list. Press <strong>Run self-test</strong> to confirm the guard is working.</p>
+    <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A built-in security <strong>guard</strong> sits between the web console and the system &mdash; the console can't make powerful changes (installs, restarts, config edits) except through the guard, and every action is recorded. Press <strong>Run self-test</strong> to check it's working.</p>
     <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button id="broker-test-btn" class="btn btn-ghost" onclick="runBrokerSelftest()"><span class="material-symbols-outlined" style="font-size:18px">fact_check</span>Run self-test</button>
@@ -29780,6 +29769,17 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <div id="broker-selftest" class="ctl-detail" style="margin-top:12px"></div>
     <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Everything the guard does is recorded here: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Posture controls</div>
+    <div id="controls">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Boundary assertions (W4) — read-only</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Host firewall, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
+    <div id="assertions">Loading…</div>
   </div>
 
   <div class="card">
@@ -29889,8 +29889,8 @@ function renderBrokerStatus(d){
   var el=document.getElementById('broker-status');
   var nonRoot=(d.console_uid!==undefined && d.console_uid!==0);
   if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — restart the console (or re-run <code>sudo ./start.sh</code>).</span>';}
-  else{var mode='';if(d.routing_active){mode=(d.enforce===true)?'<span style="color:var(--yellow);margin-right:14px">&#9888; blocking mode &mdash; stops anything not approved</span>':'<span style="color:var(--green);margin-right:14px">&#10003; watch mode &mdash; records everything, blocks nothing</span>';}
-    el.innerHTML=badge(d.service_active&&d.socket_present,'guard is on')+badge(d.routing_active,'all admin actions go through the guard')+mode;}
+  else{var on=(d.service_active&&d.socket_present&&d.routing_active);
+    el.innerHTML=on?'<span style="color:var(--green);font-weight:600;font-size:14px">&#10003; Guard is ON</span>':'<span style="color:var(--yellow);font-weight:600;font-size:14px">&#9888; Guard is OFF</span>';}
   var tb=document.getElementById('broker-toggle-btn');
   // On a NON-ROOT console the broker is the only path to privilege, so routing is mandatory and
   // can't be toggled (Disable would do nothing). Hide the misleading button; show it only on a
@@ -29898,10 +29898,6 @@ function renderBrokerStatus(d){
   if(nonRoot){tb.style.display='none';}
   else if(d.force_enabled){tb.style.display='';tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Turn off guard';}
   else{tb.style.display='';tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Turn on guard';}
-  // The static description is the non-root (fresh-box) copy — no "Enable routing" language. Only a
-  // ROOT console swaps in the copy that explains the toggle, so a fresh deploy never sees it.
-  var desc=document.getElementById('broker-desc');
-  if(desc&&!nonRoot){desc.innerHTML='This box has a built-in security <strong>guard</strong>, but right now the web console still makes powerful changes <strong>directly</strong> (not through the guard). Press <strong>Turn on guard</strong> so its installs, restarts, and config edits go through the guard instead &mdash; at first it just <strong>watches and records</strong> without blocking anything, so you can confirm everything still works before locking it down. Press <strong>Run self-test</strong> to confirm the guard is working.';}
   document.getElementById('broker-test-btn').disabled=!d.socket_present;
 }
 function loadBroker(){
