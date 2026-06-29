@@ -7048,9 +7048,7 @@ def _get_current_takserver_heap_gb():
                 content = f.read()
         except (OSError, IOError):
             try:
-                r = subprocess.run(f'sudo cat {path} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-                if r.returncode == 0 and r.stdout:
-                    content = r.stdout
+                content = _read_priv(path) or content  # v10.0.5 non-root: broker read (literal `sudo cat` bypassed the broker)
             except Exception:
                 pass
         if content:
@@ -7064,9 +7062,7 @@ def _get_current_takserver_heap_gb():
             content = f.read()
     except (OSError, IOError):
         try:
-            r = subprocess.run(f'sudo cat {setenv} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 and r.stdout:
-                content = r.stdout
+            content = _read_priv(setenv) or content  # v10.0.5 non-root: broker read (literal `sudo cat` bypassed the broker)
         except Exception:
             pass
     if content:
@@ -53437,13 +53433,13 @@ def takserver_plugins_list():
     """List installed plugins: union of JARs in /opt/tak/lib/ and YAMLs in /opt/tak/conf/plugins/."""
     plugins = {}
     if os.path.isdir(TAK_LIB_DIR):
-        r = subprocess.run(['sudo', 'ls', TAK_LIB_DIR], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['ls', TAK_LIB_DIR]), capture_output=True, text=True, timeout=5)
         for fn in (r.stdout.splitlines() if r.returncode == 0 else []):
             if fn.endswith('.jar'):
                 stem = fn[:-4]
                 plugins[stem] = {'jar': fn, 'classname': None, 'has_config': False}
     if os.path.isdir(TAK_PLUGINS_CONF_DIR):
-        r2 = subprocess.run(['sudo', 'ls', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=5)
+        r2 = subprocess.run(_sudo_wrap(['ls', TAK_PLUGINS_CONF_DIR]), capture_output=True, text=True, timeout=5)
         for fn in (r2.stdout.splitlines() if r2.returncode == 0 else []):
             if fn.endswith('.yaml'):
                 classname = fn[:-5]
@@ -53499,13 +53495,13 @@ def takserver_plugin_install_jar():
     def _do_install(src=src, dest=dest, fn=fn):
         try:
             plugin_install_log.append(f'Copying {fn} to {TAK_LIB_DIR}...')
-            r = subprocess.run(['sudo', 'mkdir', '-p', TAK_LIB_DIR], capture_output=True, text=True, timeout=10)
-            r2 = subprocess.run(['sudo', 'cp', src, dest], capture_output=True, text=True, timeout=30)
+            r = subprocess.run(_sudo_wrap(['mkdir', '-p', TAK_LIB_DIR]), capture_output=True, text=True, timeout=10)
+            r2 = subprocess.run(_sudo_wrap(['cp', src, dest]), capture_output=True, text=True, timeout=30)
             if r2.returncode != 0:
                 plugin_install_log.append(f'Error: {r2.stderr.strip() or "copy failed"}')
                 plugin_install_status.update({'running': False, 'error': True})
                 return
-            subprocess.run(['sudo', 'chmod', '644', dest], capture_output=True, text=True, timeout=10)
+            subprocess.run(_sudo_wrap(['chmod', '644', dest]), capture_output=True, text=True, timeout=10)
             plugin_install_log.append(f'\u2713 {fn} installed to {TAK_LIB_DIR}')
             plugin_install_log.append('Restart TAK Server to load the plugin.')
             plugin_install_status.update({'running': False, 'complete': True})
@@ -53532,11 +53528,11 @@ def takserver_plugin_install_yaml():
         return jsonify({'error': f'File not found in uploads: {fn}'}), 404
     dest = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
     try:
-        subprocess.run(['sudo', 'mkdir', '-p', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=10)
-        r = subprocess.run(['sudo', 'cp', src, dest], capture_output=True, text=True, timeout=30)
+        subprocess.run(_sudo_wrap(['mkdir', '-p', TAK_PLUGINS_CONF_DIR]), capture_output=True, text=True, timeout=10)
+        r = subprocess.run(_sudo_wrap(['cp', src, dest]), capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             return jsonify({'error': r.stderr.strip() or 'Copy failed'}), 500
-        subprocess.run(['sudo', 'chmod', '644', dest], capture_output=True, text=True, timeout=10)
+        subprocess.run(_sudo_wrap(['chmod', '644', dest]), capture_output=True, text=True, timeout=10)
         return jsonify({'success': True, 'filename': fn})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -53569,10 +53565,8 @@ def takserver_plugin_config_save(classname):
     fn = classname if classname.endswith('.yaml') else classname + '.yaml'
     path = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
     try:
-        subprocess.run(['sudo', 'mkdir', '-p', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=10)
-        proc = subprocess.run(['sudo', 'tee', path], input=content, capture_output=True, text=True, timeout=10)
-        if proc.returncode != 0:
-            return jsonify({'error': proc.stderr.strip() or 'Write failed'}), 500
+        subprocess.run(_sudo_wrap(['mkdir', '-p', TAK_PLUGINS_CONF_DIR]), capture_output=True, text=True, timeout=10)
+        _write_priv(path, content)  # v10.0.5 non-root: broker write (literal `sudo tee` bypassed the broker → EPERM as takwerx)
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -53586,18 +53580,18 @@ def takserver_plugin_remove(jarname):
     if not _re.match(r'^[a-zA-Z0-9._-]+\.jar$', jarname):
         return jsonify({'error': 'Invalid jar filename'}), 400
     jar_path = os.path.join(TAK_LIB_DIR, jarname)
-    r = subprocess.run(['sudo', 'test', '-f', jar_path], capture_output=True, timeout=5)
+    r = subprocess.run(_sudo_wrap(['test', '-f', jar_path]), capture_output=True, timeout=5)
     if r.returncode != 0:
         return jsonify({'error': f'{jarname} not found in {TAK_LIB_DIR}'}), 404
     try:
-        subprocess.run(['sudo', 'rm', jar_path], capture_output=True, text=True, timeout=10)
+        subprocess.run(_sudo_wrap(['rm', jar_path]), capture_output=True, text=True, timeout=10)
         removed_yaml = []
         if os.path.isdir(TAK_PLUGINS_CONF_DIR):
-            r2 = subprocess.run(['sudo', 'ls', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=5)
+            r2 = subprocess.run(_sudo_wrap(['ls', TAK_PLUGINS_CONF_DIR]), capture_output=True, text=True, timeout=5)
             stem = jarname[:-4].lower().replace('-', '').replace('_', '')
             for fn in (r2.stdout.splitlines() if r2.returncode == 0 else []):
                 if fn.endswith('.yaml') and stem in fn.lower().replace('.', '').replace('-', '').replace('_', ''):
-                    subprocess.run(['sudo', 'rm', os.path.join(TAK_PLUGINS_CONF_DIR, fn)],
+                    subprocess.run(_sudo_wrap(['rm', os.path.join(TAK_PLUGINS_CONF_DIR, fn)]),
                                    capture_output=True, text=True, timeout=10)
                     removed_yaml.append(fn)
         return jsonify({'success': True, 'jar_removed': jarname, 'yaml_removed': removed_yaml})
@@ -53669,9 +53663,7 @@ def takserver_security_config_post():
     if new_content == content:
         return jsonify({'error': 'No change applied'}), 400
     try:
-        proc = subprocess.run(['sudo', 'tee', coreconfig_path], input=new_content, capture_output=True, text=True, timeout=5)
-        if proc.returncode != 0:
-            return jsonify({'error': 'Failed to write CoreConfig.xml'}), 500
+        _write_priv(coreconfig_path, new_content)  # v10.0.5 non-root: broker write (literal `sudo tee` bypassed the broker)
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=90)  # v10.0.1: container-aware
