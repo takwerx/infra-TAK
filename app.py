@@ -17938,6 +17938,14 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
         if patched != content and '_name="LetsEncrypt"' in patched and 'takserver-le.jks' in patched:
             _write_priv(core_config, patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to LE cert")
+        elif '_name="LetsEncrypt"' in content and 'takserver-le.jks' in content:
+            # Already wired to the LE keystore — re.sub was a no-op (patched==content).
+            # This is the IDEMPOTENT re-run path (e.g. the LE-cert self-heal re-establishing
+            # the renewal script after a container redeploy re-extracted /opt/tak and wiped
+            # only the script — CoreConfig is preserved across redeploy). NOT a failure:
+            # fall through to Step D so the renewal script + timer get rewritten. Returning
+            # False here is exactly what left arm's cert-renewal unit stuck in 203/EXEC.
+            log_fn("  ✓ CoreConfig.xml 8446 connector already on LE cert")
         else:
             log_fn("  ⚠ 8446 connector not matched — check CoreConfig.xml manually"); return False
     except Exception as ce:
