@@ -53694,8 +53694,19 @@ def takserver_update():
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=run_takserver_upgrade_container, args=(_zip,), daemon=True).start()
         return jsonify({'success': True})
-    if settings.get('pkg_mgr', 'apt') != 'apt':
-        return jsonify({'error': 'TAK Server update is supported on Ubuntu only for now. Rocky/RHEL coming later.'}), 400
+    # RHEL/Rocky native: upgrade from the new takserver-*.noarch.rpm via dnf (single-server).
+    if _distro_family() == 'rhel' or settings.get('pkg_mgr') == 'dnf':
+        if upgrade_status['running']:
+            return jsonify({'error': 'Update already in progress'}), 409
+        _rpms = sorted([f for f in os.listdir(UPLOAD_DIR)
+                        if f.endswith('.rpm') and '-database' not in f.lower() and '-core' not in f.lower()],
+                       key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)), reverse=True)
+        if not _rpms:
+            return jsonify({'error': 'No takserver .rpm found. Upload the new takserver-*.noarch.rpm from tak.gov first (the single-server package, not core/database).'}), 400
+        upgrade_log.clear()
+        upgrade_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_upgrade_rhel, args=(os.path.join(UPLOAD_DIR, _rpms[0]),), daemon=True).start()
+        return jsonify({'success': True})
     if upgrade_status['running']:
         return jsonify({'error': 'Update already in progress'}), 409
     tak_cfg = _get_tak_deployment_config(settings)
@@ -54951,6 +54962,87 @@ def run_takserver_upgrade(pkg_path):
     except Exception as e:
         ulog("Error: " + str(e))
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
+def run_takserver_upgrade_rhel(rpm_path):
+    """v10.0.1 — RHEL/Rocky native .rpm TAK Server upgrade via dnf. `dnf install` of the new .rpm
+    upgrades in place and PRESERVES the existing cot database (TAK config guide §5.2.1 — dnf keeps
+    the postgres data dir + a delete_old_cluster.sh). Mirrors the .deb path (run_takserver_upgrade):
+    pre-upgrade snapshot (abort on fail) → dnf install → SELinux re-apply → CoreConfig sanitize +
+    LDAP resync → 8446 LE cert → restart → webadmin sync. Logs to upgrade_log/upgrade_status."""
+    def ulog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        upgrade_log.append(entry); print(entry, flush=True)
+    def rc(cmd, label=None, timeout=3600):
+        if label: ulog(label)
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            for ln in ((r.stdout or '') + (r.stderr or '')).strip().split('\n')[-12:]:
+                if ln.strip(): upgrade_log.append("  " + ln)
+            return r.returncode == 0
+        except Exception as e:
+            ulog(f"  ! {str(e)[:160]}"); return False
+    try:
+        pkg_name = os.path.basename(rpm_path)
+        ulog("=" * 50); ulog("TAK Server update (upgrade) — RHEL/Rocky .rpm"); ulog("=" * 50)
+        if subprocess.run(f'rpm -qp {shlex.quote(rpm_path)} > /dev/null 2>&1', shell=True, capture_output=True, timeout=30).returncode != 0:
+            ulog("✗ FATAL: the uploaded .rpm is corrupted or incomplete (rpm -qp failed). Re-upload a fresh takserver-*.noarch.rpm.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+
+        # Pre-upgrade snapshot — abort if it fails (protect current data), same as the .deb path.
+        snap_label = f"pre-upgrade-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        ulog(f"Taking pre-upgrade snapshot [{snap_label}]…")
+        snap_ok, snap_result = _tak_snapshot(snap_label, ulog)
+        if not snap_ok:
+            ulog(f"✗ Pre-upgrade snapshot failed — aborting upgrade to protect current data ({snap_result})")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        ulog("✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery")
+        try:
+            _s = load_settings()
+            for sn in (_s.get('tak_snapshots') or []):
+                if sn.get('label') == snap_label: sn['source'] = 'pre-upgrade'
+            save_settings(_s)
+        except Exception: pass
+
+        # dnf install the new rpm — upgrades in place, keeps the DB. --allowerasing handles dep churn.
+        ulog(""); ulog("Installing upgrade package: " + pkg_name)
+        rc(f'DEBIAN_FRONTEND=noninteractive dnf install -y --allowerasing {shlex.quote(rpm_path)} 2>&1', "Upgrading via dnf...")
+        if not os.path.exists('/opt/tak'):
+            ulog("  /opt/tak missing after dnf install — forcing reinstall...")
+            rc(f'dnf reinstall -y {shlex.quote(rpm_path)} 2>&1 || dnf install -y {shlex.quote(rpm_path)} 2>&1')
+        if not os.path.exists('/opt/tak'):
+            ulog("✗ FATAL: /opt/tak not found after rpm upgrade — check `rpm -q takserver` / `dnf history`.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+
+        # SELinux: the rpm ships apply-selinux.sh — re-apply under enforcing (postinst may reset it).
+        _enf = subprocess.run('getenforce 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+        if _enf == 'Enforcing' and os.path.exists('/opt/tak/apply-selinux.sh'):
+            ulog("Re-applying TAK Server SELinux policy...")
+            subprocess.run(_sudo_wrap(['bash', '/opt/tak/apply-selinux.sh']), cwd='/opt/tak', capture_output=True, text=True, timeout=120)
+
+        ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
+        if ne_changed: ulog(f"NameEntry fix: {ne_msg}")
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed: ulog(f"LDAP resync: {resync_msg}")
+        settings = load_settings()
+        takserver_host = _get_service_domain(settings, 'takserver')
+        if takserver_host:
+            ulog("Re-installing LE cert on 8446 (postinst may have reset connector)...")
+            install_le_cert_on_8446(takserver_host, ulog, wait_for_cert=False)
+        ulog("Restarting TAK Server...")
+        subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)
+        if _get_authentik_env_content(settings):
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
+        generate_caddyfile(settings)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _rq = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+        ulog(f"✓ Installed: {_rq}" if _rq.startswith('takserver') else "⚠ rpm -q takserver did not report installed — verify manually")
+        ulog("TAK Server update complete.")
+        upgrade_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        ulog("Error: " + str(e))
+        upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
 
 def run_takserver_upgrade_container(zip_path):
     """v10.0.1 — DATA-PRESERVING container upgrade. Rebuilds the TAK Server image from the new
@@ -60748,7 +60840,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block;flex-shrink:0}
 .dot-pulse{animation:tak-badge-pulse 2s infinite}
 @keyframes tak-badge-pulse{0%,100%{opacity:1}50%{opacity:.4}}
-</style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}" data-tak-container="{{ 'true' if tak_is_container else 'false' }}">
+</style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}" data-tak-container="{{ 'true' if tak_is_container else 'false' }}" data-tak-native-ext="{{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm' }}">
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header"><h1><img src="{{ tak_logo_url }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px;object-fit:contain"> TAK Server</h1><p>Team Awareness Kit Server</p></div>
@@ -60932,7 +61024,7 @@ function takPurgeFailed(){
 </div>
 </div>
 {% endif %}
-{% if tak.installed and 'ubuntu' in settings.get('os_type', '') %}
+{% if tak.installed %}
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="takToggleUpdate()" id="tak-update-header">
 <span class="section-title" style="margin-bottom:0">Update TAK Server</span>
@@ -60941,11 +61033,12 @@ function takPurgeFailed(){
 <div id="tak-update-body" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 {% if two_server_mode %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px"><span style="color:var(--cyan);font-weight:600">Two-server mode detected.</span> Upload <strong>both</strong> the <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb packages from tak.gov. The update will upgrade the core on this host first, then the database on Server One ({{ s1_host }}) via SSH.</p>
 {% elif tak_is_container %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-docker-X.X-RELEASE-XX.zip</span> from tak.gov, upload it below, then click Update. This rebuilds the TAK Server container image from the new bundle and restarts it &mdash; your <strong>database and certificates are preserved</strong>.</p>
-{% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
+{% elif 'ubuntu' in settings.get('os_type', '') %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
+{% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-X.X-RELEASE-XX.noarch.rpm</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">dnf install ./package.rpm</span> and restarts TAK Server &mdash; your <strong>database is preserved</strong>.</p>
 {% endif %}
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
-<input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else '.deb' }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
-<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else '.deb' }}){% endif %}</div>
+<input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
+<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>
 <div id="upgrade-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
 </div>
 <div id="upgrade-progress-area" style="margin-bottom:16px"></div>

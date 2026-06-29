@@ -1739,8 +1739,9 @@ async function removeUpgradeFile(filename){
 
 function uploadUpgradeDeb(file){
   var _isCtr=document.body&&document.body.getAttribute('data-tak-container')==='true';
-  var _ext=_isCtr?'.zip':'.deb';
-  if(!file||!file.name.toLowerCase().endsWith(_ext)){var m=document.getElementById('tak-update-msg');if(m){m.textContent=_isCtr?'Select the takserver-docker-*.zip bundle.':'Select a .deb file.';m.style.color='var(--red)';}return;}
+  var _nativeExt=(document.body&&document.body.getAttribute('data-tak-native-ext'))||'.deb';
+  var _ext=_isCtr?'.zip':_nativeExt;
+  if(!file||!file.name.toLowerCase().endsWith(_ext)){var m=document.getElementById('tak-update-msg');if(m){m.textContent=_isCtr?'Select the takserver-docker-*.zip bundle.':('Select a '+_ext+' file.');m.style.color='var(--red)';}return;}
   var n=file.name.toLowerCase();
   if(_isCtr){
     if(n.indexOf('docker')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Upload the official takserver-docker-*.zip bundle (container upgrade).';m.style.color='var(--red)';}return;}
