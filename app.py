@@ -7124,7 +7124,7 @@ def takserver_set_heap():
             if cleaned != _setenv_cur:
                 _write_priv(setenv, cleaned)
 
-        rr = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=120)
+        rr = subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=120)  # v10.0.1: container-aware
         if rr.returncode != 0:
             return jsonify({'success': False, 'error': f'Restart failed: {(rr.stderr or rr.stdout or "unknown").strip()[:200]}'}), 500
     except subprocess.TimeoutExpired:
@@ -37965,7 +37965,7 @@ networks:
                 else:
                     plog(f"✓ CoreConfig.xml updated — LDAP pointing to {host}:389")
                     plog("  Restarting TAK Server...")
-                    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                    r = subprocess.run(_tak_systemctl('restart'), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
                     if r.returncode == 0:
                         plog("✓ TAK Server restarted")
                     else:
@@ -46488,7 +46488,7 @@ entries:
                         plog("  - Group cache enabled (x509useGroupCacheDefaultActive)")
                         plog("  - Group prefix: tak_")
                         plog("  Restarting TAK Server...")
-                        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                        r = subprocess.run(_tak_systemctl('restart'), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
                         if r.returncode == 0:
                             plog("\u2713 TAK Server restarted")
                         else:
@@ -52848,7 +52848,7 @@ def _run_takserver_update_config():
             def _log(msg):
                 print(msg, flush=True)
             install_le_cert_on_8446(takserver_host, _log, wait_for_cert=False)
-    subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=60)
+    subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=60)  # v10.0.1: container-aware
     takserver_update_config_status.update({'running': False, 'complete': True, 'error': False})
 
 takserver_update_config_status = {'running': False, 'complete': False, 'error': False}
@@ -53632,7 +53632,7 @@ def takserver_security_config_post():
             return jsonify({'error': 'Failed to write CoreConfig.xml'}), 500
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
-    subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=90)
+    subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=90)  # v10.0.1: container-aware
     return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
 
 
@@ -54226,7 +54226,7 @@ def _tak_rollback(label, plog=None):
 
     # 2. Stop TAK Server
     plog("  rollback: stopping takserver…")
-    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=60)
+    subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=60)  # v10.0.1: container-aware
 
     # 3. Restore CoreConfig.xml
     cc_src = os.path.join(snap_path, 'CoreConfig.xml')
@@ -54245,7 +54245,7 @@ def _tak_rollback(label, plog=None):
             subprocess.run(_sudo_wrap(['cp','-p',uaf_src,uaf_dst]), capture_output=True, check=True)
             # Match the ownership convention used elsewhere for /opt/tak files.
             subprocess.run(
-                _sudo_wrap(['chown', 'tak:tak', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
+                _sudo_wrap(['chown', ('1000:1000' if _tak_is_container() else 'tak:tak'), '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
             )
             plog("  rollback: UserAuthenticationFile.xml restored")
         except Exception as e:
@@ -54271,7 +54271,7 @@ def _tak_rollback(label, plog=None):
             subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             # Restore ownership (tak:tak) on certs
             subprocess.run(
-                _sudo_wrap(['chown', '-R', 'tak:tak', '/opt/tak/certs/files']), capture_output=True, timeout=15
+                _sudo_wrap(['chown', '-R', ('1000:1000' if _tak_is_container() else 'tak:tak'), '/opt/tak/certs/files']), capture_output=True, timeout=15
             )
             plog("  rollback: certs/ restored")
         except Exception as e:
@@ -54335,7 +54335,7 @@ def _tak_rollback(label, plog=None):
 
     # 7. Start TAK Server
     plog("  rollback: starting takserver…")
-    subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True, timeout=90)
+    subprocess.run(_tak_systemctl('start'), shell=True, capture_output=True, timeout=90)  # v10.0.1: container-aware
 
     # 8. Restart Node-RED so it resyncs mission state from the restored DB.
     # Without this, Node-RED keeps trying to manage missions that were wiped by
@@ -54882,7 +54882,7 @@ def run_takserver_upgrade(pkg_path):
             except Exception as e:
                 ulog(f"⚠ Could not restore heap settings: {e}")
         ulog("Restarting TAK Server...")
-        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=90)
+        subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)  # v10.0.1: container-aware
         if _get_authentik_env_content(settings):
             ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
             ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
@@ -57743,6 +57743,17 @@ def run_full_uninstall():
 
         # 5. TAK Server
         plog("━━━ TAK Server ━━━")
+        # v10.0.1: container TAK teardown FIRST — systemctl/pkill don't touch Docker and
+        # --restart=always respawns the containers; mirror takserver_uninstall()'s teardown
+        # so a factory-reset on an arm64/container box doesn't orphan the containers/volume.
+        if _tak_is_container():
+            for c in (TAK_CONTAINER, TAK_DB_CONTAINER):
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f', c]), capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]), capture_output=True, timeout=30)
+            subprocess.run(_sudo_wrap(['docker', 'network', 'rm', TAK_DOCKER_NET]), capture_output=True, timeout=30)
+            subprocess.run(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', shell=True, capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
+            plog("  container TAK removed (containers, volume, network, ~/tak-docker)")
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
         subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
@@ -62193,7 +62204,7 @@ def _startup_resync_ldap_service_account():
             print("Startup migration: LDAP healed — restarting takserver to flush cached state")
             try:
                 r = subprocess.run(
-                    _sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=120)
+                    _tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=120)  # v10.0.1: container-aware
                 if r.returncode == 0:
                     print("Startup migration: takserver restart sent")
                 else:
