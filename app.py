@@ -29770,16 +29770,16 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   <div class="card">
-    <div class="card-title">Least-Privilege Console — Privileged Broker</div>
-    <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. <strong>This console runs as a non-root user, so the guard is mandatory — routing is always on and there's nothing to toggle.</strong> Click <strong>Run self-test</strong> anytime (no restart) to prove it works: allowed actions succeed and dangerous ones (writing sudoers, arbitrary shells) are blocked.</p>
+    <div class="card-title">Console Security Guard</div>
+    <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">This box has a built-in security <strong>guard</strong>. The web console can't make powerful changes on its own &mdash; installs, restarts, and config edits all go <strong>through the guard</strong>, which only allows pre-approved actions and writes down every one. So even if the console were ever hacked, it can't do anything off the approved list. Press <strong>Run self-test</strong> to confirm the guard is working.</p>
     <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button id="broker-test-btn" class="btn btn-ghost" onclick="runBrokerSelftest()"><span class="material-symbols-outlined" style="font-size:18px">fact_check</span>Run self-test</button>
-      <button id="broker-toggle-btn" class="btn btn-ghost" onclick="toggleBrokerRouting()"><span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing</button>
+      <button id="broker-toggle-btn" class="btn btn-ghost" onclick="toggleBrokerRouting()"><span class="material-symbols-outlined" style="font-size:18px">shield</span>Turn on guard</button>
       <span id="broker-msg" style="font-size:12px;margin-left:6px"></span>
     </div>
     <div id="broker-selftest" class="ctl-detail" style="margin-top:12px"></div>
-    <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Guard audit log on the box: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
+    <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Everything the guard does is recorded here: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
   </div>
 
   <div class="card">
@@ -29889,19 +29889,19 @@ function renderBrokerStatus(d){
   var el=document.getElementById('broker-status');
   var nonRoot=(d.console_uid!==undefined && d.console_uid!==0);
   if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — restart the console (or re-run <code>sudo ./start.sh</code>).</span>';}
-  else{var mode='';if(d.routing_active){mode=(d.enforce===true)?'<span style="color:var(--yellow);margin-right:14px">&#9888; enforcing &mdash; blocks anything not allowed</span>':'<span style="color:var(--green);margin-right:14px">&#10003; monitor mode &mdash; logging, not blocking yet</span>';}
-    el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'guard connected')+badge(d.routing_active,(d.routing_active?'protecting all admin actions':'not protecting')+(nonRoot?' (non-root console)':''))+mode;}
+  else{var mode='';if(d.routing_active){mode=(d.enforce===true)?'<span style="color:var(--yellow);margin-right:14px">&#9888; blocking mode &mdash; stops anything not approved</span>':'<span style="color:var(--green);margin-right:14px">&#10003; watch mode &mdash; records everything, blocks nothing</span>';}
+    el.innerHTML=badge(d.service_active&&d.socket_present,'guard is on')+badge(d.routing_active,'all admin actions go through the guard')+mode;}
   var tb=document.getElementById('broker-toggle-btn');
   // On a NON-ROOT console the broker is the only path to privilege, so routing is mandatory and
   // can't be toggled (Disable would do nothing). Hide the misleading button; show it only on a
   // root console, where Enable routing force-routes through the guard to dry-run before going non-root.
   if(nonRoot){tb.style.display='none';}
-  else if(d.force_enabled){tb.style.display='';tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Disable routing';}
-  else{tb.style.display='';tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing';}
+  else if(d.force_enabled){tb.style.display='';tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Turn off guard';}
+  else{tb.style.display='';tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Turn on guard';}
   // The static description is the non-root (fresh-box) copy — no "Enable routing" language. Only a
   // ROOT console swaps in the copy that explains the toggle, so a fresh deploy never sees it.
   var desc=document.getElementById('broker-desc');
-  if(desc&&!nonRoot){desc.innerHTML='A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. <strong>Run self-test</strong> proves it works (no restart). This console still runs as <strong>root</strong>, so privilege is not mediated yet — click <strong>Enable routing</strong> to force every privileged action through the guard in <em>learning mode</em> (it logs everything but blocks nothing), then watch the audit log to confirm the allowlist is complete before switching the console to a non-root user.';}
+  if(desc&&!nonRoot){desc.innerHTML='This box has a built-in security <strong>guard</strong>, but right now the web console still makes powerful changes <strong>directly</strong> (not through the guard). Press <strong>Turn on guard</strong> so its installs, restarts, and config edits go through the guard instead &mdash; at first it just <strong>watches and records</strong> without blocking anything, so you can confirm everything still works before locking it down. Press <strong>Run self-test</strong> to confirm the guard is working.';}
   document.getElementById('broker-test-btn').disabled=!d.socket_present;
 }
 function loadBroker(){
@@ -29922,7 +29922,7 @@ function runBrokerSelftest(){
 function toggleBrokerRouting(){
   fetch('/api/console/broker/status').then(function(r){return r.json();}).then(function(s){
     var enable=!s.force_enabled;
-    var msg=enable?'Enable least-privilege routing? The console will RESTART (brief ~15s blip). It runs in SAFE learning mode — the guard mediates + logs everything but never blocks a real action yet, so nothing breaks. (The console also stays root.)':'Disable routing and restart the console?';
+    var msg=enable?'Turn on the guard? The console will restart (about 15 seconds). It starts in watch mode — the guard records everything but blocks nothing yet, so nothing breaks.':'Turn off the guard and restart the console?';
     if(!confirm(msg))return;
     var m=document.getElementById('broker-msg');m.textContent='Applying… console will restart.';m.style.color='var(--text-dim)';
     document.getElementById('broker-toggle-btn').disabled=true;
