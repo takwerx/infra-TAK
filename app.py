@@ -53094,7 +53094,7 @@ def takserver_uninstall():
             subprocess.run(_sudo_wrap(['docker', 'rm', '-f', c]), capture_output=True, timeout=60)
         subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]), capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['docker', 'network', 'rm', TAK_DOCKER_NET]), capture_output=True, timeout=30)
-        subprocess.run(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', shell=True, capture_output=True, timeout=60)
+        subprocess.run(_sudo_wrap(['rm', '-rf', TAK_DOCKER_ROOT]), capture_output=True, timeout=60)  # v10.0.1: broker rm — the host console user can't delete the root-owned in-container cert files
         # Remove the /opt/tak symlink explicitly. After ~/tak-docker is gone it is a
         # DANGLING symlink, which the native `if os.path.exists('/opt/tak')` cleanup
         # below skips (exists() follows the link → False), leaving it behind.
@@ -55604,7 +55604,11 @@ def _deploy_takserver_container(config):
 
         # ── Step 2/9: Unpack bundle + symlink /opt/tak ──────────────────────
         log_step(""); log_step("━━━ Step 2/9: Unpacking TAK docker bundle ━━━")
-        run_cmd(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', check=False)
+        # v10.0.1: broker rm — a prior deploy's in-container cert-gen leaves root-owned files
+        # under ~/tak-docker that the host console user (takwerx) cannot delete; a host `rm -rf`
+        # silently fails and the STALE bundle dir survives, so the next deploy picks the wrong
+        # build context ("Dockerfile.takserver not found under .../<old-version>/docker").
+        subprocess.run(_sudo_wrap(['rm', '-rf', TAK_DOCKER_ROOT]), capture_output=True, timeout=60)
         run_cmd(f'mkdir -p {shlex.quote(TAK_DOCKER_ROOT)}')
         # Extract with Python's zipfile rather than shelling to `unzip` — minimal
         # cloud images (incl. this arm64 AMI) ship without unzip (exit 127), and
@@ -55628,8 +55632,13 @@ def _deploy_takserver_container(config):
             deploy_status.update({'error': True, 'running': False}); return
         # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
         try:
+            # Only consider dirs that are an actual bundle (have docker/Dockerfile.takserver),
+            # and pick the NEWEST (the one just extracted) so a leftover dir from a prior
+            # version can never shadow the upload even if cleanup somehow left one behind.
             entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
-                       if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()]
+                       if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
+                       and os.path.isfile(os.path.join(TAK_DOCKER_ROOT, d, 'docker', 'Dockerfile.takserver'))]
+            entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
             build_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0]) if entries else TAK_DOCKER_ROOT
         except Exception:
             build_ctx = TAK_DOCKER_ROOT
@@ -57771,7 +57780,7 @@ def run_full_uninstall():
                 subprocess.run(_sudo_wrap(['docker', 'rm', '-f', c]), capture_output=True, timeout=60)
             subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]), capture_output=True, timeout=30)
             subprocess.run(_sudo_wrap(['docker', 'network', 'rm', TAK_DOCKER_NET]), capture_output=True, timeout=30)
-            subprocess.run(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', shell=True, capture_output=True, timeout=60)
+            subprocess.run(_sudo_wrap(['rm', '-rf', TAK_DOCKER_ROOT]), capture_output=True, timeout=60)  # v10.0.1: broker rm — the host console user can't delete the root-owned in-container cert files
             subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
             plog("  container TAK removed (containers, volume, network, ~/tak-docker)")
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
