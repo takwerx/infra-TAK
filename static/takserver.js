@@ -1124,7 +1124,7 @@ function initTakDeployModeUI(rootEl){
       '<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px">',
       '<div style="font-size:12px;color:var(--cyan);font-weight:600;margin-bottom:8px">Server One: Database Server</div>',
       '<div class="form-field"><label>Host / IP</label><input type="text" id="ts_server_one_host" placeholder="10.0.0.21"></div>',
-      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_one_user" placeholder="root"></div>',
+      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_one_user" placeholder="root"><div style="font-size:10px;color:var(--text-dim);margin-top:3px">Cloud boxes use the AMI/admin user (AWS: <code>rocky</code>/<code>ubuntu</code>/<code>ec2-user</code>; Azure: your VM admin), <b>not</b> <code>root</code>. VPS / SSD&nbsp;Nodes use <code>root</code>.</div></div>',
       '<div class="form-field"><label>SSH Port</label><input type="number" id="ts_server_one_port" value="22"></div>',
       '<div class="form-field"><label>Auth Method</label><select id="ts_server_one_auth" onchange="toggleTwoServerAuthInputs(\'one\')" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:13px"><option value="ssh_key">SSH key</option><option value="password">User/password</option></select></div>',
       '<div class="form-field" id="ts_server_one_key_wrap"><label>SSH Key Path</label><input type="text" id="ts_server_one_key" placeholder="~/.ssh/id_rsa"></div>',
@@ -1153,6 +1153,11 @@ function initTakDeployModeUI(rootEl){
       '<button type="button" onclick="installTakSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">3. Copy key to Server One</button>',
       '<button type="button" onclick="deployTakServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">4. Deploy Server One (DB)</button>',
       '<button type="button" onclick="deployTakServerTwo()" style="padding:8px 14px;background:rgba(34,197,94,0.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">5. Deploy Server Two (Core)</button>',
+      '</div>',
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">',
+      '<span style="font-size:11px;color:var(--text-dim)">Cloud key-only box (AWS EC2 / Azure)? Upload the key it was launched with (your <code>.pem</code>) — replaces steps 2 &amp; 3:</span>',
+      '<button type="button" onclick="uploadTakSshKeyPick()" style="padding:6px 12px;background:rgba(139,92,246,0.15);color:var(--purple,#a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">&#8593; Upload cloud key (.pem)</button>',
+      '<input type="file" id="ts_keyfile" accept=".pem,.key,.txt,.cer,.ppk" style="display:none" onchange="uploadTakSshKeyFile(this)">',
       '</div>',
       '<div id="two-server-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
       '<div id="two-server-preflight" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
@@ -1583,6 +1588,30 @@ async function installTakSshKey(){
     }catch(e){
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
       throw e;
+    }
+}
+
+function uploadTakSshKeyPick(){
+    var el=document.getElementById('ts_keyfile');
+    if(el){el.value='';el.click();}
+}
+
+async function uploadTakSshKeyFile(input){
+    var msg=document.getElementById('two-server-msg');
+    var f=(input&&input.files&&input.files[0])||null;
+    if(!f)return;
+    if(f.size>32768){if(msg){msg.textContent='✗ That file is too large to be an SSH key — pick your .pem private key.';msg.style.color='var(--red)';}return;}
+    if(msg){msg.textContent='Uploading key…';msg.style.color='var(--cyan)';}
+    try{
+      var text=await f.text();
+      var cfg=collectTakDeploymentConfigFromForm();
+      var r=await fetch('/api/takserver/two-server/upload-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg,private_key:text}),credentials:'same-origin'});
+      var d=await r.json();
+      if(!d.success)throw new Error(d.error||'Upload failed');
+      if(msg){msg.textContent='✓ '+(d.message||'Key uploaded')+(d.fingerprint?'  ('+d.fingerprint+')':'');msg.style.color='var(--green)';}
+      try{loadTakDeploymentConfig();}catch(e){}
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
     }
 }
 

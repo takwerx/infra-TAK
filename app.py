@@ -6254,6 +6254,79 @@ def takserver_two_server_ensure_ssh_key():
     })
 
 
+@app.route('/api/takserver/two-server/upload-ssh-key', methods=['POST'])
+@login_required
+def takserver_two_server_upload_ssh_key():
+    """v10.0.6: accept the operator's EXISTING SSH PRIVATE key (the AWS `.pem` / Azure key
+    the cloud DB box was launched with) so the console can reach Server One with NO password
+    and NO CLI — the universal path for cloud key-only boxes (EC2/Azure don't have SSH
+    passwords). Security: the key is written 0600 to a FIXED console-owned path (never a
+    request-controlled path → no traversal), validated as a real usable private key via
+    `ssh-keygen -y`, and NEVER logged or echoed back. Passphrase-protected keys are rejected
+    (can't be used non-interactively). Sets server_one.ssh_key_path + auth_method=ssh_key so
+    the deploy skips steps 2-3 entirely."""
+    data = request.get_json() or {}
+    key_text = (data.get('private_key') or '')
+    if not key_text.strip():
+        return jsonify({'success': False, 'error': 'No key provided.'}), 400
+    key_text = key_text.replace('\r\n', '\n').replace('\r', '\n')
+    if not key_text.endswith('\n'):
+        key_text += '\n'
+    if '-----BEGIN' not in key_text or 'PRIVATE KEY' not in key_text:
+        return jsonify({'success': False, 'error': 'That does not look like an SSH private key — expected a "-----BEGIN … PRIVATE KEY-----" block (e.g. your AWS .pem file).'}), 400
+    # FIXED destination — never request-controlled (no traversal). Console-owned ~/.ssh.
+    key_path = os.path.expanduser('~/.ssh/infratak_serverone')
+    try:
+        os.makedirs(os.path.dirname(key_path), mode=0o700, exist_ok=True)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Could not prepare key dir: {str(e)[:160]}'}), 400
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(key_text)
+        os.chmod(key_path, 0o600)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Could not write key: {str(e)[:160]}'}), 500
+    # Validate it's a usable, passphrase-free private key by deriving its public half.
+    try:
+        r = subprocess.run(['ssh-keygen', '-y', '-f', key_path], capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        try: os.remove(key_path)
+        except Exception: pass
+        return jsonify({'success': False, 'error': f'Key validation failed: {str(e)[:160]}'}), 500
+    if r.returncode != 0:
+        try: os.remove(key_path)   # don't leave a bad/sensitive file around
+        except Exception: pass
+        _err = (r.stderr or r.stdout or '').lower()
+        hint = ('the key is passphrase-protected — re-export it without a passphrase and upload that'
+                if 'passphrase' in _err or 'incorrect passphrase' in _err
+                else 'invalid or unsupported private key format')
+        return jsonify({'success': False, 'error': f'Key rejected: {hint}.'}), 400
+    fingerprint = ''
+    try:
+        fr = subprocess.run(['ssh-keygen', '-l', '-f', key_path], capture_output=True, text=True, timeout=5)
+        if fr.returncode == 0:
+            fingerprint = (fr.stdout or '').strip()
+    except Exception:
+        pass
+    # Point Server One at this key + ssh_key auth (skips generate/copy).
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    cfg['server_one'] = cfg.get('server_one') or {}
+    cfg['server_one']['ssh_key_path'] = key_path
+    cfg['server_one']['auth_method'] = 'ssh_key'
+    settings['tak_deployment'] = cfg
+    save_settings(settings)
+    return jsonify({
+        'success': True,
+        'key_path': key_path,
+        'fingerprint': fingerprint,
+        'message': 'SSH key uploaded — Server One will connect with it. Skip steps 2 & 3; go straight to 4. Deploy Server One.',
+    })
+
+
 @app.route('/api/takserver/two-server/install-ssh-key', methods=['POST'])
 @login_required
 def takserver_two_server_install_ssh_key():
