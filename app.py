@@ -56378,7 +56378,10 @@ def run_takserver_deploy(config):
                 log_step("  'Clean up & retry' to purge the broken state before trying again.")
                 deploy_status.update({'error': True, 'running': False})
                 return
-            r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y {pkg} 2>&1', check=False)
+            # --allow-downgrades: installing an OLDER TAK (e.g. 5.6 onto a box that had 5.7, to test
+            # an upgrade) is a downgrade; apt refuses with "Packages were downgraded and -y was used
+            # without --allow-downgrades" otherwise. Harmless on a fresh install (no prior version).
+            r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --allow-downgrades {pkg} 2>&1', check=False)
             if not r1:
                 log_step("  apt-get failed, trying dpkg + dependency fix...")
                 run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg -i {pkg} 2>&1', check=False)
@@ -56397,7 +56400,7 @@ def run_takserver_deploy(config):
             # despite our pre-flight purge), force a reinstall from the .deb.
             if not os.path.exists('/opt/tak'):
                 log_step("  /opt/tak missing after install — forcing reinstall from .deb...")
-                run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install --reinstall -y {pkg} 2>&1', check=False)
+                run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install --reinstall -y --allow-downgrades {pkg} 2>&1', check=False)
                 run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
             if not os.path.exists('/opt/tak'):
                 log_step("✗ FATAL: /opt/tak not found after install (even after forced reinstall) — run `dpkg --purge --force-all takserver && rm -rf /opt/tak` on the host and retry")
