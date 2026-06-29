@@ -18514,11 +18514,13 @@ def _get_takserver_version_info():
     out = {'version': '', 'update_available': False, 'latest': None}
     if not os.path.exists('/opt/tak') or not os.path.exists('/opt/tak/CoreConfig.xml'):
         return out
-    # Try dpkg: takserver (single-server) or takserver-core / takserver-database (two-server)
+    # dpkg-query (NOT the shimmed `dpkg`) — runs direct as the console user, read-only and fast,
+    # and is NOT routed through the broker. A shimmed `dpkg -s` round-trips the broker and can be
+    # slow/denied under the live gunicorn console, which silently blanked the version on Ubuntu.
     for pkg in ('takserver', 'takserver-core', 'takserver-database'):
-        r = subprocess.run(f"dpkg -s {pkg} 2>/dev/null | grep ^Version:", shell=True, capture_output=True, text=True, timeout=5)
+        r = subprocess.run(['dpkg-query', '-W', '-f=${Version}', pkg], capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout.strip():
-            out['version'] = r.stdout.strip().replace('Version:', '').strip()
+            out['version'] = r.stdout.strip()
             return out
     r = subprocess.run("rpm -q takserver 2>/dev/null", shell=True, capture_output=True, text=True, timeout=5)
     if r.returncode == 0 and r.stdout.strip():
@@ -18529,6 +18531,17 @@ def _get_takserver_version_info():
             ver = ver.replace('.noarch', '')
         if ver:
             out['version'] = ver
+    # Container: TAK isn't a dpkg/rpm package — derive the version from the bundle dir name
+    # (/opt/tak -> .../takserver-docker-X.X-RELEASE-XX/tak), so the cards/page show a version
+    # on arm64/container the same as native dpkg/rpm.
+    if not out['version'] and _tak_is_container():
+        try:
+            _base = os.path.basename(os.path.dirname(os.path.realpath('/opt/tak')))  # takserver-docker-X.X-RELEASE-XX
+            _pfx = 'takserver-docker-'
+            if _base.startswith(_pfx):
+                out['version'] = _base[len(_pfx):].replace('RELEASE-', 'RELEASE')  # 5.7-RELEASE-43 -> 5.7-RELEASE43
+        except Exception:
+            pass
     return out
 
 
