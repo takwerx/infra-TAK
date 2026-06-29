@@ -29769,7 +29769,17 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Everything the guard does is recorded here: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
   </div>
 
-  <div id="posture-banner" class="status-banner stopped"><div class="dot"></div><span id="posture-text">Loading…</span></div>
+  <div class="card">
+    <div class="card-title">Posture</div>
+    <div id="posture-banner" class="status-banner stopped" style="display:inline-flex;margin-bottom:14px"><div class="dot"></div><span id="posture-text">Loading…</span></div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="apply-btn" class="btn btn-primary" onclick="doApply()"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture</button>
+      <button id="revert-btn" class="btn btn-ghost" onclick="doRevert()"><span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard</button>
+      <a class="btn btn-ghost" href="/api/hardening/report" target="_blank"><span class="material-symbols-outlined" style="font-size:18px">description</span>Readiness Report</a>
+      <span id="action-msg" style="font-size:12px;margin-left:6px"></span>
+    </div>
+    <div id="action-log" class="ctl-detail" style="margin-top:12px;white-space:pre-wrap"></div>
+  </div>
 
   <div class="card">
     <div class="card-title">Posture controls</div>
@@ -29786,17 +29796,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="card-title">Break-glass recovery (W6)</div>
     <p style="font-size:13px;color:var(--text-secondary);line-height:1.6">If SSO/Authentik is ever down, console access is recovered from an <strong>on-box shell</strong> with <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code> — an access-controlled, auditable path, <strong>not</strong> a network backdoor. Hardening can never permanently lock you out.</p>
     <p id="breakglass-status" style="margin-top:10px;font-size:12px;font-family:'JetBrains Mono',monospace"></p>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Actions</div>
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button id="apply-btn" class="btn btn-primary" onclick="doApply()"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture</button>
-      <button id="revert-btn" class="btn btn-ghost" onclick="doRevert()"><span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard</button>
-      <a class="btn btn-ghost" href="/api/hardening/report" target="_blank"><span class="material-symbols-outlined" style="font-size:18px">description</span>Readiness Report</a>
-      <span id="action-msg" style="font-size:12px;margin-left:6px"></span>
-    </div>
-    <div id="action-log" class="ctl-detail" style="margin-top:12px;white-space:pre-wrap"></div>
   </div>
 
   <div class="card">
