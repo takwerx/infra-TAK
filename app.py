@@ -48362,7 +48362,7 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
                 with open(_clean_tmp, 'w', encoding='utf-8') as _f:
                     _f.write(_cc_clean)
                 subprocess.run(
-                    ['sudo', 'cp', os.path.abspath(_clean_tmp), coreconfig_path],
+                    _sudo_wrap(['cp', os.path.abspath(_clean_tmp), coreconfig_path]),
                     capture_output=True, text=True, timeout=10
                 )
             if plog:
@@ -48521,7 +48521,7 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         _patch_path = coreconfig_path + '.ldap-patch.xml'
         with open(_patch_path, 'w') as f:
             f.write(new_content)
-        r = subprocess.run(['sudo', 'cp', os.path.abspath(_patch_path), coreconfig_path],
+        r = subprocess.run(_sudo_wrap(['cp', os.path.abspath(_patch_path), coreconfig_path]),
                            capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             return False, f'sudo cp failed: {r.stderr.strip()[:200]}'
@@ -48632,7 +48632,7 @@ def _resync_ldap_credential_to_coreconfig():
         patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-resync.xml')
         with open(patch_path, 'w') as f:
             f.write(new_cc)
-        subprocess.run(['sudo', 'cp', patch_path, coreconfig],
+        subprocess.run(_sudo_wrap(['cp', patch_path, coreconfig]),
                        capture_output=True, text=True, timeout=10)
     fixes = []
     if cc_pass != env_pass:
@@ -52840,8 +52840,11 @@ def takserver_create_client_cert():
                 cmd += f' -ig {shlex.quote(g)}'
             for g in groups_out:
                 cmd += f' -og {shlex.quote(g)}'
-            cmd += f' {shlex.quote(pem_path)} 2>&1'
-            gr = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+            cmd += f' {shlex.quote(pem_path)}'
+            # v10.0.1 container: java + UserManager.jar live ONLY inside the takserver container
+            # (no host JDK), so run the group-assignment in-container; native path unchanged.
+            full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
+            gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=15)
             if gr.returncode != 0:
                 pass  # cert still created, group assignment is best-effort
 
