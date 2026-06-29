@@ -57075,12 +57075,20 @@ def takserver_federation_firewall():
     if not port or not isinstance(port, int) or port < 1 or port > 65535:
         return jsonify({'success': False, 'error': 'Invalid port'}), 400
     try:
+        be = _fw_backend()  # 'firewalld' on RHEL, 'ufw' on Debian — bare ufw broke on RHEL
         if action == 'open':
-            subprocess.run(_sudo_wrap(['ufw', 'allow', f'{port}/tcp']), capture_output=True, text=True, timeout=10)
+            _fw_allow(port, 'tcp')
+        elif be == 'firewalld':
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--remove-port={port}/tcp']), capture_output=True, text=True, timeout=10)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']), capture_output=True, text=True, timeout=10)
         else:
             subprocess.run(_sudo_wrap(['ufw', 'delete', 'allow', f'{port}/tcp']), capture_output=True, text=True, timeout=10)
-        r = _priv_pipe(['ufw', 'status'], ['grep', '-w', port], timeout=10)
-        is_open = 'ALLOW' in (r.stdout or '')
+        if be == 'firewalld':
+            r = _priv_pipe(['firewall-cmd', '--list-ports'], ['grep', '-w', f'{port}/tcp'], timeout=10)
+            is_open = bool((r.stdout or '').strip())
+        else:
+            r = _priv_pipe(['ufw', 'status'], ['grep', '-w', str(port)], timeout=10)  # str(port): grep argv must be a string
+            is_open = 'ALLOW' in (r.stdout or '')
         return jsonify({'success': True, 'firewall_open': is_open})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
