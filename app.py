@@ -53681,16 +53681,19 @@ def takserver_update():
         return jsonify({'error': 'TAK Server not installed. Deploy TAK Server first.'}), 400
     settings = load_settings()
     # v10.0.1: a container box must NEVER take the .deb/dpkg/apt upgrade path — it does not
-    # upgrade the image and litters the host. The data-preserving container upgrade (rebuild
-    # the image from the new takserver-docker-*.zip while keeping the DB volume + certs) is
-    # built separately; until it ships, gate here so Update can't run the destructive native
-    # path on a container box.
+    # upgrade the image and litters the host. Run the data-preserving container upgrade instead:
+    # rebuild the image from the new takserver-docker-*.zip while KEEPING the DB volume + certs.
     if _tak_is_container():
-        return jsonify({'error': 'Container (docker) upgrade is not enabled yet. On a container box, '
-                        'upgrading rebuilds the image from the new takserver-docker-*.zip while PRESERVING '
-                        'your database and certificates — that path is in active development and intentionally '
-                        'will NOT fall back to the .deb/apt upgrade (which would not touch the running image). '
-                        'Hold off on Update here; the data-preserving container upgrade ships next.'}), 400
+        if upgrade_status['running']:
+            return jsonify({'error': 'Update already in progress'}), 409
+        _zips = [f for f in os.listdir(UPLOAD_DIR) if f.lower().endswith('.zip') and 'docker' in f.lower()]
+        if not _zips:
+            return jsonify({'error': 'Container upgrade: upload the new takserver-docker-*.zip bundle (not a .deb).'}), 400
+        _zip = os.path.join(UPLOAD_DIR, sorted(_zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+        upgrade_log.clear()
+        upgrade_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_upgrade_container, args=(_zip,), daemon=True).start()
+        return jsonify({'success': True})
     if settings.get('pkg_mgr', 'apt') != 'apt':
         return jsonify({'error': 'TAK Server update is supported on Ubuntu only for now. Rocky/RHEL coming later.'}), 400
     if upgrade_status['running']:
@@ -54948,6 +54951,122 @@ def run_takserver_upgrade(pkg_path):
     except Exception as e:
         ulog("Error: " + str(e))
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
+def run_takserver_upgrade_container(zip_path):
+    """v10.0.1 — DATA-PRESERVING container upgrade. Rebuilds the TAK Server image from the new
+    takserver-docker-*.zip and recreates the containers while KEEPING the database (the
+    TAK_DB_VOLUME named volume) and the existing CA/certs + CoreConfig + UserAuthenticationFile.
+    Mirrors _deploy_takserver_container's unpack/build/run, but: extracts the new bundle ALONGSIDE
+    the old one (both inside the allowlisted bundle root) and carries certs/CoreConfig over in
+    place, NEVER `docker volume rm`s the DB, and does NO cert-gen / DB re-provision. Logs to
+    upgrade_log/upgrade_status (the Update panel). SACRED: the DB volume must never be removed
+    on this path — that is the whole point of an upgrade vs a redeploy."""
+    def ulog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        upgrade_log.append(entry); print(entry, flush=True)
+    def rc(cmd, timeout=2400):
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            if r.returncode != 0 and (r.stderr or r.stdout):
+                ulog(f"    ! {((r.stderr or r.stdout) or '').strip()[:200]}")
+            return r.returncode == 0
+        except Exception as e:
+            ulog(f"    ! {str(e)[:160]}"); return False
+    def _fail(msg):
+        ulog(f"✗ {msg}")
+        upgrade_status.update({'running': False, 'complete': False, 'error': True})
+    try:
+        ulog("=" * 50)
+        ulog(f"TAK Server CONTAINER upgrade — {os.path.basename(zip_path)}")
+        ulog("  Database volume + certificates are PRESERVED (no volume wipe, no cert-gen)")
+        ulog("=" * 50)
+        old_tak = os.path.realpath('/opt/tak')        # current bundle's tak/ dir
+        old_ctx = os.path.dirname(old_tak)            # current bundle dir (inside TAK_DOCKER_ROOT)
+
+        # 1) Stop+remove the OLD containers — NOT the volume (the DB stays in TAK_DB_VOLUME).
+        ulog("Step 1/6: Stopping current containers (database volume kept)...")
+        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]), capture_output=True, timeout=90)
+
+        # 2) Extract the new bundle ALONGSIDE the old (no wipe — keeps the old certs reachable for
+        #    an in-place broker copy; both dirs are inside the allowlisted ~/tak-docker root).
+        ulog("Step 2/6: Unpacking new bundle...")
+        try:
+            import zipfile
+            with zipfile.ZipFile(zip_path) as zf:
+                for info in zf.infolist():
+                    out_path = zf.extract(info, TAK_DOCKER_ROOT)
+                    mode = (info.external_attr >> 16) & 0xFFFF
+                    if mode and not info.is_dir():
+                        try: os.chmod(out_path, mode)
+                        except OSError: pass
+        except Exception as e:
+            return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
+        entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
+                   if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
+                   and os.path.isfile(os.path.join(TAK_DOCKER_ROOT, d, 'docker', 'Dockerfile.takserver'))
+                   and os.path.join(TAK_DOCKER_ROOT, d) != old_ctx]
+        entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
+        if not entries:
+            return _fail("No NEW takserver-docker bundle found (same version as installed, or not an official zip). "
+                         "Upload a different takserver-docker-*.zip. The old install is untouched.")
+        new_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0])
+        new_tak = os.path.join(new_ctx, 'tak')
+        ulog(f"✓ New bundle: {entries[0]}")
+
+        # 3) Carry the PRESERVED certs / CoreConfig / UserAuth over old -> new (in place, broker),
+        #    re-point /opt/tak, then drop the old bundle dir.
+        ulog("Step 3/6: Carrying over certs + CoreConfig (preserved)...")
+        subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.join(new_tak, 'certs')]), capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['cp', '-rp', os.path.join(old_tak, 'certs', 'files'), os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=120)
+        for f in ('CoreConfig.xml', 'UserAuthenticationFile.xml'):
+            subprocess.run(_sudo_wrap(['cp', '-p', os.path.join(old_tak, f), os.path.join(new_tak, f)]), capture_output=True, timeout=30)
+        if not os.path.exists(os.path.join(new_tak, 'certs', 'files', 'takserver.jks')):
+            return _fail("Certs did not carry over (takserver.jks missing in new bundle) — aborting before swap. Old install untouched.")
+        subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
+        rc(f'ln -sfn {shlex.quote(new_tak)} /opt/tak', timeout=15)
+        if old_ctx and old_ctx != new_ctx:
+            subprocess.run(_sudo_wrap(['rm', '-rf', old_ctx]), capture_output=True, timeout=60)
+        ulog("✓ certs + CoreConfig carried over; /opt/tak re-pointed")
+
+        # 4) Build the new-version images.
+        ulog("Step 4/6: Building new TAK Server images (minutes on arm64)...")
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1'):
+            return _fail("DB image build failed.")
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1'):
+            return _fail("TAK Server image build failed.")
+        ulog("✓ Images built")
+
+        # 5) Recreate the containers on the SAME volume + network. NO `docker volume rm`.
+        ulog("Step 5/6: Recreating containers (DB volume reused)...")
+        rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
+        rc(f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
+           f'-v {shlex.quote(new_tak)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
+           f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db', timeout=120)
+        time.sleep(8)
+        rc(f'docker run -v {shlex.quote(new_tak)}:/opt/tak:z --restart=always '
+           f'-p 8089:8089 -p 8443:8443 -p 8446:8446 --network {TAK_DOCKER_NET} '
+           f'--name {TAK_CONTAINER} -d {TAK_CONTAINER}', timeout=120)
+
+        # 6) Wait for messaging (TAK runs its schema migrations here against the preserved DB).
+        ulog("Step 6/6: Waiting for messaging microservice (schema migration; up to 10 min)...")
+        _up = False
+        for waited in range(0, 600, 10):
+            time.sleep(10)
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'grep', '-q', 'Started TAK Server messaging Microservice', '/opt/tak/logs/takserver-messaging.log']), capture_output=True)
+            if r.returncode == 0:
+                _up = True; ulog("✓ TAK Server messaging microservice started"); break
+            if waited and waited % 60 == 0:
+                upgrade_log.append(f"  ⏳ {waited//60} min …")
+        if not _up:
+            ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss).")
+        ulog("")
+        ulog("✓ Container upgrade complete — database and certificates preserved.")
+        upgrade_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        ulog(f"✗ Container upgrade failed: {str(e)[:200]}")
+        upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
 
 def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg):
     """Two-server upgrade: core first (local), then database (SSH to Server One)."""
