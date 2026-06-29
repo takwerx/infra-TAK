@@ -38449,30 +38449,6 @@ networks:
     else:
         plog("  ⚠ FQDN or token missing — skipping console app registration")
 
-    # Step 8c: bring up the FULL optimized stack INLINE — redis (cache/broker) + pgbouncer
-    # (PG pooler). v10.0.5: previously these were only added by _startup_migrations on a
-    # LATER console boot, so a fresh Authentik ran DEGRADED (no pooling → worker burns CPU,
-    # IdleSessionTimeout connection churn) until a restart. The ensures operate on the LOCAL
-    # ~/authentik, so only run inline for a LOCAL deploy (a remote Authentik lives on another
-    # box, optimized by ITS own console). Both ensures are idempotent + self-rolling-back and
-    # the whole block is guarded so it can NEVER fail the deploy (worst case: next-boot
-    # _startup_migrations still catches it, as before).
-    if deploy_cfg.get('target_mode') != 'remote':
-        try:
-            _ak_compose = os.path.expanduser('~/authentik/docker-compose.yml')
-            if os.path.exists(_ak_compose):
-                plog("")
-                plog("━━━ Step 8c/8: Optimizing stack (redis + pgbouncer, inline) ━━━")
-                _ensure_authentik_compose_patches(_ak_compose, plog)   # adds redis service + AUTHENTIK_REDIS__HOST + PG tuning
-                # FULL `up -d`: a service ADDED to the compose (redis) is otherwise declared
-                # but NEVER started — a targeted recreate skips it (root-caused live on rocky:
-                # redis listed by `compose config` yet zero container). Start everything.
-                _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=180, log_fn=plog)
-                _ensure_authentik_pgbouncer(plog)                       # then pgbouncer (own server+worker recreate; redis already up)
-                plog("  ✓ redis + pgbouncer up inline — no restart needed")
-        except Exception as _opt_e:
-            plog(f"  ⚠ inline redis/pgbouncer optimize skipped (next console restart retries): {str(_opt_e)[:160]}")
-
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     plog(f"🎉 Authentik deployed on remote host {host}!")
@@ -47743,6 +47719,21 @@ entries:
             _authentik_fix_trusted_proxy_cidrs(plog)
         except Exception as _tpc_e:
             plog(f"  ⚠ trusted-proxy CIDRs stamp skipped (non-fatal): {str(_tpc_e)[:120]}")
+        # v10.0.5: redis + pgbouncer must be UP at the end of a FRESH deploy, not deferred
+        # to a later console boot. _ensure_authentik_compose_patches (earlier, Step 6) ADDED
+        # the redis service to the compose, but nothing ever STARTED it — a service declared
+        # in compose yet never `up`'d shows in `docker compose config` with ZERO container
+        # (root-caused live on aws-rocky). A FULL `up -d` starts it; then install pgbouncer.
+        # Both are idempotent + self-rolling-back; try/except'd so this can NEVER fail the
+        # deploy (next-boot _startup_migrations still catches it, as before).
+        try:
+            plog("  Optimizing stack: starting redis + installing pgbouncer (inline)...")
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+            _ensure_authentik_pgbouncer(plog)
+            plog("  ✓ redis + pgbouncer up inline — no restart needed")
+        except Exception as _opt_e:
+            plog(f"  ⚠ inline redis/pgbouncer optimize skipped (next console restart retries): {str(_opt_e)[:160]}")
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
