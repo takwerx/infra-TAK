@@ -34,6 +34,7 @@ import logging
 import logging.handlers
 import os
 import pwd
+import shutil
 import socket
 import socketserver
 import struct
@@ -557,11 +558,28 @@ _TAK_CERT_SCRIPTS = ('/opt/tak/certs/makeRootCa.sh', '/opt/tak/certs/makeCert.sh
 # console has no `sudo -u postgres`, so TAK Server DB ops (health probes, vacuum/
 # reindex, db size/stats, snapshot pg_dump, rollback pg_restore, purge drop) route
 # `runuser -u postgres -- <pg tool>` through the broker. This grants the postgres
-# privilege level (DB admin) the ops already need — NOT root: the postgres user is
-# unprivileged at the OS layer, so even psql `COPY … TO PROGRAM` runs as postgres,
-# not root. Whitelist the pg binaries so `runuser -u postgres -- bash` stays denied.
+# privilege level (DB admin) the ops already need. The postgres OS user is
+# unprivileged at the OS layer, BUT psql `COPY … TO PROGRAM`/untrusted-language
+# functions execute shell AS postgres, and postgres → root is a documented pivot
+# (shared_preload). So we whitelist the pg binaries (no `runuser -u postgres --
+# bash`) AND bound `psql` to non-RCE SQL via _PSQL_FORBIDDEN below.
 _PG_AS_POSTGRES = {'psql', 'pg_dump', 'pg_dumpall', 'pg_restore', 'pg_isready',
                    'vacuumdb', 'reindexdb', 'createdb', 'dropdb', 'pg_basebackup'}
+
+# psql sub-strings that yield code execution / arbitrary file IO as the postgres
+# OS user. Matched case-insensitively against the whitespace-normalized psql argv
+# (see _check_runuser). The console's admin SQL (size/count/ALTER SYSTEM/reload)
+# contains none of these, so this blocks the escalation vector without affecting
+# legitimate use.
+_PSQL_FORBIDDEN = (
+    'program',                # COPY … TO/FROM PROGRAM, \copy … PROGRAM
+    '\\!',                    # psql shell-escape meta-command
+    'lo_import', 'lo_export', # large-object file IO
+    'pg_read_file', 'pg_read_binary_file', 'pg_read_server_files',
+    'pg_write_server_files', 'pg_ls_dir',  # server-side file functions
+    'plpython', 'plperlu',    # untrusted procedural languages
+    'language c',             # C-language function → native code
+)
 
 
 def _check_runuser(argv):
@@ -574,9 +592,25 @@ def _check_runuser(argv):
             return
         raise Denied(f'runuser: command not allowed as tak: {cmd}')
     if target == 'postgres':
-        if os.path.basename(cmd) in _PG_AS_POSTGRES:
-            return
-        raise Denied(f'runuser: command not allowed as postgres: {cmd}')
+        pgcmd = os.path.basename(cmd)
+        if pgcmd not in _PG_AS_POSTGRES:
+            raise Denied(f'runuser: command not allowed as postgres: {cmd}')
+        # `psql` can be turned into arbitrary code execution AS the postgres OS
+        # user — COPY … TO/FROM PROGRAM, \copy … PROGRAM, the \! shell escape, the
+        # untrusted procedural languages, and lo_*/server-side file functions — and
+        # postgres-OS-user → root is a documented pivot (write shared_preload, wait
+        # for a cluster restart; see the PGMiner incident). The console only ever
+        # runs admin SELECT/ALTER/size queries here, so refuse any of those
+        # primitives in the psql argv. pg_dump/pg_restore/pg_isready take no inline
+        # SQL and pass through. NB: a token blocklist is defense-in-depth, not a
+        # hermetic seal — the real boundary is that the console never passes
+        # attacker-controlled SQL.
+        if pgcmd == 'psql':
+            blob = ' '.join(' '.join(str(a) for a in argv[4:]).lower().split())
+            for tok in _PSQL_FORBIDDEN:
+                if tok in blob:
+                    raise Denied(f'runuser: psql primitive denied as postgres: {tok!r}')
+        return
     raise Denied(f'runuser: target user not allowed: {target}')
 
 
@@ -857,30 +891,52 @@ def _recv_all(conn):
     return bytes(buf)
 
 
+# Fixed, root-owned PATH used to resolve EVERY exec'd binary to a trusted
+# absolute location (see _do_exec). Identical to the systemd-run gate's pinned
+# PATH. Deliberately excludes /usr/local/* and anything writable by the console
+# user, so a basename allowlist match can never resolve to a caller-planted
+# binary.
+BROKER_TRUSTED_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
+
+
 def _do_exec(req):
     # NB: the allow/deny decision is made in _dispatch (so permissive mode can
-    # execute-and-log). Do NOT re-validate here or permissive mode would block.
+    # execute-and-log). Do NOT re-validate the ALLOWLIST here or permissive mode
+    # would block. The two steps below are EXECUTION-TIME HARDENING (not an
+    # allow/deny decision): they normalize WHAT actually runs so a request that
+    # passed the basename-only allowlist can't smuggle a different binary or a
+    # loader-hijacking environment past it. They apply in both modes.
     argv = req.get('argv')
     if not isinstance(argv, list) or not argv:
         raise Denied('argv must be a non-empty list')
+    # HARDENING (argv[0] spoof): check_exec matches the binary on basename ONLY,
+    # but subprocess runs argv[0] verbatim — so argv[0]='/home/takwerx/x/systemctl'
+    # would pass the allowlist (basename 'systemctl') yet execute the caller's
+    # binary as root. Resolve the basename against a FIXED trusted PATH and run
+    # THAT, ignoring any caller-supplied directory. Any argv[0] that carries a
+    # directory but doesn't resolve onto the trusted PATH is refused. The bash/
+    # runuser carve-outs reach here too, so their /tmp/bash spoof closes as well.
+    _resolved = shutil.which(os.path.basename(argv[0]), path=BROKER_TRUSTED_PATH)
+    if _resolved:
+        argv = [_resolved] + list(argv[1:])
+    elif '/' in argv[0]:
+        raise Denied(f'exec path not on trusted PATH: {argv[0]}')
     inp = req.get('input_b64')
     input_bytes = base64.b64decode(inp) if inp else None
     timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
     cwd = req.get('cwd') or None
     if cwd and not (isinstance(cwd, str) and os.path.isdir(cwd)):
         cwd = None
+    # HARDENING (env injection): NEVER honor a caller-supplied `env`. check_exec
+    # validates argv only; a merged-in LD_PRELOAD/LD_LIBRARY_PATH/BASH_ENV/ENV/PATH
+    # turns ANY allowed binary into arbitrary root code (the same vector the
+    # systemd-run gate pins exact --setenv strings against). No broker exec request
+    # carries env (the CLI proxy can't forward it either), so dropping it removes
+    # nothing legitimate. The child inherits the broker's own root env, plus only
+    # the explicit apt non-interactive keys below.
     env = None
-    extra_env = req.get('env')
-    if isinstance(extra_env, dict):
-        env = dict(os.environ)
-        for k, v in extra_env.items():
-            if isinstance(k, str) and isinstance(v, str):
-                env[k] = v
-    # apt is always non-interactive through the broker (the CLI proxy can't
-    # forward env, and a bare apt install of e.g. postfix would otherwise block on
-    # a debconf prompt). Safe + correct for every apt op the console runs.
     if os.path.basename(argv[0]) in ('apt', 'apt-get'):
-        env = dict(env or os.environ)
+        env = dict(os.environ)
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
         env.setdefault('NEEDRESTART_MODE', 'l')
     proc = subprocess.run(argv, input=input_bytes, capture_output=True,
