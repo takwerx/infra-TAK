@@ -5584,7 +5584,7 @@ def takserver_page():
         upgrade_error=upgrade_status.get('error', False),
         migrating=tak_migrate_status.get('running', False), migrate_done=_migrate_done,
         migrate_error=tak_migrate_status.get('error', False),
-        two_server_mode=_is_two_server, s1_host=_s1_host,
+        two_server_mode=_is_two_server, s1_host=_s1_host, tak_is_container=_tak_is_container(),
         total_ram_gb=_total_ram, recommended_heap_gb=_recommended_heap, current_heap_gb=_current_heap)
 
 @app.route('/api/takserver/deployment-config', methods=['GET'])
@@ -60594,7 +60594,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block;flex-shrink:0}
 .dot-pulse{animation:tak-badge-pulse 2s infinite}
 @keyframes tak-badge-pulse{0%,100%{opacity:1}50%{opacity:.4}}
-</style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}">
+</style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}" data-tak-container="{{ 'true' if tak_is_container else 'false' }}">
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header"><h1><img src="{{ tak_logo_url }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px;object-fit:contain"> TAK Server</h1><p>Team Awareness Kit Server</p></div>
@@ -60786,11 +60786,12 @@ function takPurgeFailed(){
 </div>
 <div id="tak-update-body" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 {% if two_server_mode %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px"><span style="color:var(--cyan);font-weight:600">Two-server mode detected.</span> Upload <strong>both</strong> the <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb packages from tak.gov. The update will upgrade the core on this host first, then the database on Server One ({{ s1_host }}) via SSH.</p>
+{% elif tak_is_container %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-docker-X.X-RELEASE-XX.zip</span> from tak.gov, upload it below, then click Update. This rebuilds the TAK Server container image from the new bundle and restarts it &mdash; your <strong>database and certificates are preserved</strong>.</p>
 {% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
 {% endif %}
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
-<input type="file" id="upgrade-file-input" style="display:none" accept=".deb" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
-<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package (.deb){% endif %}</div>
+<input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else '.deb' }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
+<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else '.deb' }}){% endif %}</div>
 <div id="upgrade-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
 </div>
 <div id="upgrade-progress-area" style="margin-bottom:16px"></div>

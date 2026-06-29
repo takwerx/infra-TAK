@@ -1738,9 +1738,13 @@ async function removeUpgradeFile(filename){
 }
 
 function uploadUpgradeDeb(file){
-  if(!file||!file.name.toLowerCase().endsWith('.deb')){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Select a .deb file.';m.style.color='var(--red)';}return;}
+  var _isCtr=document.body&&document.body.getAttribute('data-tak-container')==='true';
+  var _ext=_isCtr?'.zip':'.deb';
+  if(!file||!file.name.toLowerCase().endsWith(_ext)){var m=document.getElementById('tak-update-msg');if(m){m.textContent=_isCtr?'Select the takserver-docker-*.zip bundle.':'Select a .deb file.';m.style.color='var(--red)';}return;}
   var n=file.name.toLowerCase();
-  if(isUpgradeTwoServerMode()){
+  if(_isCtr){
+    if(n.indexOf('docker')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Upload the official takserver-docker-*.zip bundle (container upgrade).';m.style.color='var(--red)';}return;}
+  }else if(isUpgradeTwoServerMode()){
     if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database .deb are allowed.';m.style.color='var(--red)';}return;}
   }else{
     if(n.indexOf('core')!==-1||n.indexOf('database')!==-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='One-server upgrade: use the single takserver .deb, not core or database packages.';m.style.color='var(--red)';}return;}
