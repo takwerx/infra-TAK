@@ -7155,6 +7155,26 @@ def takserver_set_heap():
             _setenv_cur = ''
         if _setenv_cur:
             cleaned = _re.sub(r'\n*export JAVA_OPTS="\$JAVA_OPTS\s+-Xms\d+[gGmM]\s+-Xmx\d+[gGmM]"\n*', '\n', _setenv_cur)
+            # v10.0.5 container TAK: the container does NOT mount or read /etc/default/takserver
+            # (no systemd unit) — its entrypoint sources ONLY /opt/tak/setenv.sh, which RAM-auto-
+            # computes the per-process heaps UNLESS *_MAX_HEAP is already set (`if [ -z … ]`). So on
+            # container we must inject the operator's values into setenv.sh itself, or set-heap
+            # silently no-ops (confirmed on aws-arm: 8g written to /etc/default was ignored; the
+            # container kept the RAM-auto -Xmx). Idempotent managed block, prepended so it is in
+            # scope before setenv.sh's own `if [ -z ]` guards run.
+            if _tak_is_container():
+                _hm_a = '# >>> infra-TAK managed heap >>>'
+                _hm_b = '# <<< infra-TAK managed heap <<<'
+                cleaned = _re.sub(rf'{_re.escape(_hm_a)}.*?{_re.escape(_hm_b)}\n?', '', cleaned, flags=_re.DOTALL)
+                _hm_block = (f"{_hm_a}\n"
+                             f"# total {heap_gb}g via console — delete this block to revert to RAM-auto\n"
+                             f"export CONFIG_MAX_HEAP={config_mb}\n"
+                             f"export API_MAX_HEAP={api_mb}\n"
+                             f"export MESSAGING_MAX_HEAP={msg_mb}\n"
+                             f"export PLUGIN_MANAGER_MAX_HEAP={plugin_mb}\n"
+                             f"export RETENTION_MAX_HEAP={retain_mb}\n"
+                             f"{_hm_b}\n")
+                cleaned = _hm_block + cleaned
             if cleaned != _setenv_cur:
                 _write_priv(setenv, cleaned)
 
