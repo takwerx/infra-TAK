@@ -17710,9 +17710,10 @@ def wait_for_apt_lock(log_fn, log_list):
         return bool(r.stdout.strip())
 
     def is_locked():
-        # Check dpkg lock file (sudo so we see holder when app runs as non-root)
-        lock = subprocess.run('sudo lsof /var/lib/dpkg/lock-frontend 2>/dev/null',
-            shell=True, capture_output=True, text=True)
+        # Check dpkg lock file via the broker (literal `sudo lsof` threw 'user NOT in sudoers' on
+        # the non-root console; route through _sudo_wrap so it runs as root or fails open cleanly).
+        lock = subprocess.run(_sudo_wrap(['lsof', '/var/lib/dpkg/lock-frontend']),
+            capture_output=True, text=True)
         if lock.stdout.strip():
             return True
         # Check for active upgrade process (exclude the shutdown watcher)
@@ -18518,7 +18519,10 @@ def _get_takserver_version_info():
     # and is NOT routed through the broker. A shimmed `dpkg -s` round-trips the broker and can be
     # slow/denied under the live gunicorn console, which silently blanked the version on Ubuntu.
     for pkg in ('takserver', 'takserver-core', 'takserver-database'):
-        r = subprocess.run(['dpkg-query', '-W', '-f=${Version}', pkg], capture_output=True, text=True, timeout=5)
+        try:
+            r = subprocess.run(['dpkg-query', '-W', '-f=${Version}', pkg], capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, OSError):
+            break  # no dpkg-query on RHEL — fall through to the rpm check below
         if r.returncode == 0 and r.stdout.strip():
             out['version'] = r.stdout.strip()
             return out
