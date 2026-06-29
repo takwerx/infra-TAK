@@ -29771,7 +29771,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <div class="card">
     <div class="card-title">Least-Privilege Console — Privileged Broker</div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. Enabling routing makes the console's privileged actions go <em>through the guard</em>. <strong>Safe:</strong> the console still runs as root either way — this does not yet hand the console off to a non-root user (that stays gated on rulebook hardening).</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. <strong>When the console runs as a non-root user, the guard is the only way it can do privileged work — so routing is always on and mandatory (nothing to toggle).</strong> The <em>Enable routing</em> button applies only to a console still running as <strong>root</strong> (e.g. an in-place upgrade): it force-routes through the guard so you can dry-run the allowlist in learning mode before switching the console to a non-root user.</p>
     <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button id="broker-test-btn" class="btn btn-ghost" onclick="runBrokerSelftest()"><span class="material-symbols-outlined" style="font-size:18px">fact_check</span>Run self-test</button>
@@ -29887,12 +29887,17 @@ function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture
 function badge(on,label){var c=on?'var(--green)':'var(--text-dim)';var m=on?'&#10003;':'&#8211;';return '<span style="color:'+c+';margin-right:14px">'+m+' '+esc(label)+'</span>';}
 function renderBrokerStatus(d){
   var el=document.getElementById('broker-status');
+  var nonRoot=(d.console_uid!==undefined && d.console_uid!==0);
   if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — restart the console (or re-run <code>sudo ./start.sh</code>).</span>';}
   else{var mode='';if(d.routing_active){mode=(d.enforce===true)?'<span style="color:var(--yellow);margin-right:14px">&#9888; ENFORCING</span>':'<span style="color:var(--green);margin-right:14px">&#10003; permissive (learning)</span>';}
-    el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'socket ready')+badge(d.routing_active,'routing '+(d.routing_active?'ON':'off'))+mode;}
+    el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'socket ready')+badge(d.routing_active,'routing '+(d.routing_active?'ON':'off')+(nonRoot?' — mandatory (non-root console)':''))+mode;}
   var tb=document.getElementById('broker-toggle-btn');
-  if(d.force_enabled){tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Disable routing';}
-  else{tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing';}
+  // On a NON-ROOT console the broker is the only path to privilege, so routing is mandatory and
+  // can't be toggled (Disable would do nothing). Hide the misleading button; show it only on a
+  // root console, where Enable routing force-routes through the guard to dry-run before going non-root.
+  if(nonRoot){tb.style.display='none';}
+  else if(d.force_enabled){tb.style.display='';tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Disable routing';}
+  else{tb.style.display='';tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing';}
   document.getElementById('broker-test-btn').disabled=!d.socket_present;
 }
 function loadBroker(){
