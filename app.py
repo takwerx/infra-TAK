@@ -5392,8 +5392,10 @@ def console_broker_selftest():
     When routing IS active, an extra check exercises the console's own helpers."""
     checks = []
 
-    def add(name, ok, detail=''):
-        checks.append({'name': name, 'ok': bool(ok), 'detail': str(detail)[:300]})
+    def add(name, ok, detail='', level=None):
+        checks.append({'name': name, 'ok': bool(ok),
+                       'level': level or ('pass' if ok else 'fail'),
+                       'detail': str(detail)[:300]})
 
     info = _broker_status_dict()
     if not _broker_available():
@@ -5431,19 +5433,20 @@ def console_broker_selftest():
     except Exception as e:
         add('Allowed command runs', False, e)
 
-    # 4. policy DENIES write to sudoers (dry-run — valid in permissive mode too)
+    # 4. rulebook would DENY a sudoers write (dry-run verdict — NB this proves the
+    #    rulebook's answer, NOT that the console is confined to it; see capstone).
     try:
         r = _broker_request({'op': 'check', 'req': {'op': 'write', 'path': '/etc/sudoers.d/takwerx-evil'}})
-        add('Policy blocks sudoers write', r.get('ok') and r.get('verdict') == 'DENY', r.get('reason'))
+        add('Rulebook denies sudoers write (dry-run)', r.get('ok') and r.get('verdict') == 'DENY', r.get('reason'))
     except Exception as e:
-        add('Policy blocks sudoers write', False, e)
+        add('Rulebook denies sudoers write (dry-run)', False, e)
 
-    # 5. policy DENIES arbitrary shell
+    # 5. rulebook would DENY arbitrary shell (dry-run verdict)
     try:
         r = _broker_request({'op': 'check', 'req': {'op': 'exec', 'argv': ['bash', '-c', 'id']}})
-        add('Policy blocks arbitrary shell', r.get('ok') and r.get('verdict') == 'DENY', r.get('reason'))
+        add('Rulebook denies arbitrary shell (dry-run)', r.get('ok') and r.get('verdict') == 'DENY', r.get('reason'))
     except Exception as e:
-        add('Policy blocks arbitrary shell', False, e)
+        add('Rulebook denies arbitrary shell (dry-run)', False, e)
 
     # 6. when routing is on, prove the console's OWN helpers go through the broker
     if _broker_should_route():
@@ -5455,8 +5458,37 @@ def console_broker_selftest():
         except Exception as e:
             add('Console routes through guard', False, e)
 
-    all_ok = all(c['ok'] for c in checks)
-    return jsonify({'ok': all_ok, 'info': info, 'checks': checks})
+    # Up to here the checks prove the guard MECHANICALLY works. Whether it is an
+    # actual ENFORCED privilege boundary depends on two more things the panel must
+    # not hide: the console must run NON-ROOT (else it bypasses the guard directly)
+    # AND the broker must be ENFORCING (permissive only logs would-deny). State that
+    # honestly — a security reviewer reads this panel.
+    functional_ok = all(c['ok'] for c in checks)
+    console_root = (info.get('console_uid') == 0)
+    enforce = info.get('enforce')  # True=enforcing, False=permissive, None=unknown
+    enforced = (not console_root) and (enforce is True)
+    if console_root:
+        add('Guard is an ENFORCED boundary', False, level='warn',
+            detail='NO — the console runs as ROOT (uid 0): it can make privileged '
+                   'changes directly, bypassing the guard, which only mediates + '
+                   'audits. Migrate the console to non-root to make it a real boundary.')
+    elif enforce is False:
+        add('Guard is an ENFORCED boundary', False, level='warn',
+            detail='PARTIAL — the console is non-root, but the guard runs PERMISSIVE '
+                   '(learning): it logs what it would deny but does not block. Set '
+                   'TAKWERX_BROKER_ENFORCE=1 to enforce the rulebook.')
+    elif enforce is None:
+        add('Guard is an ENFORCED boundary', False, level='warn',
+            detail='UNKNOWN — could not read the broker enforce state.')
+    else:
+        add('Guard is an ENFORCED boundary', True,
+            detail='YES — console runs non-root and the guard is enforcing; '
+                   'privileged actions are confined to the rulebook.')
+    overall = 'pass' if (functional_ok and enforced) else ('warn' if functional_ok else 'fail')
+    return jsonify({'ok': functional_ok and enforced, 'overall': overall,
+                    'functional_ok': functional_ok, 'enforced': enforced,
+                    'console_root': console_root, 'enforce': enforce,
+                    'info': info, 'checks': checks})
 
 
 @app.route('/api/console/broker/routing', methods=['POST'])
@@ -30058,7 +30090,16 @@ function renderBrokerStatus(d){
   var nonRoot=(d.console_uid!==undefined && d.console_uid!==0);
   if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — restart the console (or re-run <code>sudo ./start.sh</code>).</span>';}
   else{var on=(d.service_active&&d.socket_present&&d.routing_active);
-    el.innerHTML=on?'<span style="color:var(--green);font-weight:600;font-size:14px">&#10003; Guard is ON</span>':'<span style="color:var(--yellow);font-weight:600;font-size:14px">&#9888; Guard is OFF</span>';}
+    var html=on?'<span style="color:var(--green);font-weight:600;font-size:14px">&#10003; Guard is ON</span>':'<span style="color:var(--yellow);font-weight:600;font-size:14px">&#9888; Guard is OFF</span>';
+    // Honesty banner: the guard is an ENFORCED boundary only when the console is
+    // non-root AND the broker is enforcing. Otherwise it mediates/audits but does
+    // not confine a root console — say so plainly (a reviewer reads this).
+    if(on){
+      if(!nonRoot){html+='<div style="margin-top:8px;color:var(--yellow);font-size:12px;line-height:1.5">&#9888; <strong>Mediating, not enforcing.</strong> The console runs as <strong>root</strong>, so it can still make privileged changes directly — the guard records them but cannot block them. Migrate the console to non-root to make this a real boundary.</div>';}
+      else if(d.enforce===false){html+='<div style="margin-top:8px;color:var(--yellow);font-size:12px;line-height:1.5">&#9888; <strong>Learning mode.</strong> The console is non-root, but the guard runs permissive — it logs what it would deny but does not block yet. Enforce mode makes the rulebook binding.</div>';}
+      else if(d.enforce===true){html+='<div style="margin-top:8px;color:var(--green);font-size:12px;line-height:1.5">&#10003; <strong>Enforced boundary.</strong> Console runs non-root and the guard is enforcing — privileged actions are confined to the rulebook.</div>';}
+    }
+    el.innerHTML=html;}
   var tb=document.getElementById('broker-toggle-btn');
   // On a NON-ROOT console the broker is the only path to privilege, so routing is mandatory and
   // can't be toggled (Disable would do nothing). Hide the misleading button; show it only on a
@@ -30079,10 +30120,16 @@ function runBrokerSelftest(){
   fetch('/api/console/broker/selftest').then(function(r){return r.json();}).then(function(d){
     if(d.error){out.innerHTML='<span style="color:var(--red)">'+esc(d.error)+'</span>';return;}
     var rows=(d.checks||[]).map(function(c){
-      var col=c.ok?'var(--green)':'var(--red)';var m=c.ok?'&#10003;':'&#10007;';
-      return '<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:'+col+'">'+m+' '+esc(c.name)+(c.ok?'':(c.detail?('  — '+esc(c.detail)):''))+'</div>';
+      var lvl=c.level||(c.ok?'pass':'fail');
+      var col=lvl==='pass'?'var(--green)':(lvl==='warn'?'var(--yellow)':'var(--red)');
+      var m=lvl==='pass'?'&#10003;':(lvl==='warn'?'&#9888;':'&#10007;');
+      var showDetail=(lvl!=='pass')&&c.detail;
+      return '<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:'+col+'">'+m+' '+esc(c.name)+(showDetail?('  — '+esc(c.detail)):'')+'</div>';
     }).join('');
-    out.innerHTML='<div style="margin-bottom:6px;font-weight:600;color:'+(d.ok?'var(--green)':'var(--red)')+'">'+(d.ok?'SELF-TEST PASSED':'SELF-TEST FAILED')+'</div>'+rows;
+    var ov=d.overall||(d.ok?'pass':'fail');
+    var hdrCol=ov==='pass'?'var(--green)':(ov==='warn'?'var(--yellow)':'var(--red)');
+    var hdrTxt=ov==='pass'?'SELF-TEST PASSED — guard enforced':(ov==='warn'?'GUARD WORKS — but NOT an enforced boundary in this posture':'SELF-TEST FAILED');
+    out.innerHTML='<div style="margin-bottom:6px;font-weight:600;color:'+hdrCol+'">'+esc(hdrTxt)+'</div>'+rows;
   }).catch(function(){out.innerHTML='<span style="color:var(--red)">Self-test request failed.</span>';});
 }
 function toggleBrokerRouting(){
