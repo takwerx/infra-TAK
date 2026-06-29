@@ -8340,7 +8340,7 @@ def guarddog_page():
     guarddog_monitors_tak.extend([
         {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
         {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
-        {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Daily (4:30am)', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). Prunes only cache older than 7 days, and only when the root disk is at/above 70% — keeps recent cache so rebuilds stay fast. Never touches images, containers, or volumes.'},
+        {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Hourly', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). At 70%+ root disk it prunes cache older than 7 days (keeps recent cache so rebuilds stay fast); at 85%+ it reclaims ALL unused cache to rescue a filling disk. Never touches images, containers, or volumes.'},
         {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
         {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
     ])
@@ -11902,7 +11902,7 @@ def guarddog_update():
         bc_tmr_path = '/etc/systemd/system/takbuildcachereclaim.timer'
         if os.path.isfile(bc_script) and not os.path.isfile(bc_tmr_path):
             _write_priv(bc_svc_path, f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={bc_script}\n')
-            _write_priv(bc_tmr_path, '[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
+            _write_priv(bc_tmr_path, '[Unit]\nDescription=Run Docker build-cache reclaim hourly (disk-capacity hygiene)\n\n[Timer]\nOnBootSec=45min\nOnUnitActiveSec=1h\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
         # TAK Portal timer — install if script exists but timer doesn't
         tp_script = '/opt/tak-guarddog/tak-takportal-watch.sh'
         tp_svc_path = '/etc/systemd/system/taktakportalguard.service'
@@ -12481,7 +12481,7 @@ def run_guarddog_deploy(alert_email):
             ('takswapreclaim.service', '[Unit]\nDescription=Guard Dog Swap Reclaim (stale-swap hygiene)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-swap-reclaim.sh\n'),
             ('takswapreclaim.timer', '[Unit]\nDescription=Run swap reclaim every 10 minutes\n\n[Timer]\nOnBootSec=12min\nOnUnitActiveSec=10min\nUnit=takswapreclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takbuildcachereclaim.service', '[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-buildcache-reclaim.sh\n'),
-            ('takbuildcachereclaim.timer', '[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takbuildcachereclaim.timer', '[Unit]\nDescription=Run Docker build-cache reclaim hourly (disk-capacity hygiene)\n\n[Timer]\nOnBootSec=45min\nOnUnitActiveSec=1h\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
