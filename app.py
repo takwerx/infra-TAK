@@ -9174,9 +9174,12 @@ def fail2ban_page():
     return r
 
 def _f2b_is_available():
-    """Return True if fail2ban-client is on the path."""
-    return bool(subprocess.run(['which', 'fail2ban-client'],
-                               capture_output=True).returncode == 0)
+    """Return True if fail2ban is actually installed. v10.0.5: `which fail2ban-client` is
+    POISONED by the broker shim — a fail2ban-client shim sits on the console PATH even when
+    fail2ban isn't installed, so `which` returned 0 and the installer falsely refused with
+    'fail2ban is already installed'. Check /etc/fail2ban (created by the package, never by
+    the shim) — matches the detect_modules card's `installed` logic."""
+    return os.path.exists('/etc/fail2ban')
 
 def _f2b_parse_status(raw):
     """Parse fail2ban-client status authentik output into a dict."""
