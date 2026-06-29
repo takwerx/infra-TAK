@@ -29759,6 +29759,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div id="posture-banner" class="status-banner stopped"><div class="dot"></div><span id="posture-text">Loading…</span></div>
 
   <div class="card">
+    <div class="card-title">Posture controls</div>
+    <div id="controls">Loading…</div>
+  </div>
+
+  <div class="card">
     <div class="card-title">Console Security Guard</div>
     <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A built-in security <strong>guard</strong> sits between the web console and the system &mdash; the console can't make powerful changes (installs, restarts, config edits) except through the guard, and every action is recorded. Press <strong>Run self-test</strong> to check it's working.</p>
     <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
@@ -29769,11 +29774,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <div id="broker-selftest" class="ctl-detail" style="margin-top:12px"></div>
     <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Everything the guard does is recorded here: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Posture controls</div>
-    <div id="controls">Loading…</div>
   </div>
 
   <div class="card">
@@ -29905,7 +29905,9 @@ function loadBroker(){
     .catch(function(){document.getElementById('broker-status').textContent='Failed to load guard status.';});
 }
 function runBrokerSelftest(){
-  var out=document.getElementById('broker-selftest');out.innerHTML='Running self-test…';
+  var out=document.getElementById('broker-selftest');
+  if(out.innerHTML.trim()!==''){out.innerHTML='';return;}  // already showing — second press collapses it
+  out.innerHTML='Running self-test…';
   fetch('/api/console/broker/selftest').then(function(r){return r.json();}).then(function(d){
     if(d.error){out.innerHTML='<span style="color:var(--red)">'+esc(d.error)+'</span>';return;}
     var rows=(d.checks||[]).map(function(c){
