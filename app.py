@@ -55067,6 +55067,18 @@ def run_takserver_upgrade_container(zip_path):
                 upgrade_log.append(f"  ⏳ {waited//60} min …")
         if not _up:
             ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss).")
+        # Re-sync the TAK Portal to the recreated TAK JVM — the rotation does this (Step 7) and
+        # it's exactly what 'patches the Portal back to working' on native. The upgrade recreated
+        # the containers, so the Portal must refresh its client cert + CA and reconnect, or
+        # webadmin/enrollment via the Portal breaks. Same helper, same as the native rotation.
+        try:
+            _pr = subprocess.run(_sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10)
+            if 'tak-portal' in (_pr.stdout or ''):
+                ulog("Re-syncing TAK Portal certs + reconnecting to the upgraded TAK Server...")
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=ulog, restart=True)
+                ulog(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
+        except Exception as _tpe:
+            ulog(f"  ⚠ TAK Portal cert sync skipped: {str(_tpe)[:120]}")
         ulog("")
         ulog("✓ Container upgrade complete — database and certificates preserved.")
         upgrade_status.update({'running': False, 'complete': True, 'error': False})
