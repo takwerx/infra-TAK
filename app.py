@@ -18232,11 +18232,28 @@ def _selfheal_takserver_le_cert(plog=None):
         else:
             print(m, flush=True)
     try:
-        if not os.path.exists('/opt/tak/renew-letsencrypt.sh'):
+        _renew_script = '/opt/tak/renew-letsencrypt.sh'
+        _renew_unit   = '/etc/systemd/system/takserver-cert-renewal.service'
+        script_present = os.path.exists(_renew_script)
+        unit_present   = os.path.exists(_renew_unit)
+        if not script_present and not unit_present:
             return  # box never had the LE-on-8446 setup
         settings = load_settings()
         host = _get_service_domain(settings, 'takserver')
         if not host:
+            return
+        # v10.0.5: a container-TAK redeploy/upgrade re-extracts /opt/tak and WIPES the
+        # renewal script, while the /etc systemd unit SURVIVES — so the cert-renewal
+        # timer 203/EXECs and (pre-fix) this self-heal early-returned on the missing
+        # script, leaving the box stuck (renewal broken AND self-heal disabled). The
+        # surviving unit is the real "LE-on-8446 was configured" sentinel; re-establish
+        # the full setup (script + service + timer + keystore). Idempotent — the
+        # rewritten script no-ops when the keystore already matches Caddy.
+        if unit_present and not script_present:
+            _log('takserver LE-cert self-heal: renewal script missing (a container '
+                 'redeploy likely re-extracted /opt/tak) but box is LE-on-8446 — '
+                 're-establishing renewal script + timer...')
+            install_le_cert_on_8446(host, _log, wait_for_cert=False)
             return
         # v0.9.51 — source cert is the uploaded PEM in custom mode, else Caddy's ACME store.
         # v10.0.5 non-root: the takwerx console can't stat/read Caddy's 0750 store, so stage a
