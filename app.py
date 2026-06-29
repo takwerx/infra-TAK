@@ -12963,6 +12963,24 @@ def fedhub_clear_registration_api():
     except Exception as e:
         return jsonify({'success': False, 'error': f'Failed saving settings: {str(e)[:220]}'}), 500
 
+    # Tear down the Guard Dog Fed Hub monitor. Otherwise its timer keeps SSH-poking
+    # the now-removed remote federation-hub every minute and logs "restart FAILED"
+    # forever (the watch can't tell an intentional removal from an outage). The GD
+    # deploy gates this monitor on fedhub being deployed, so it won't come back; this
+    # just retires the already-running timer + clears its stale state. All paths are
+    # broker-allow-listed (/etc/systemd/system/, /var/lib/takguard/), so non-root-safe.
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', '--now', 'takfedhubguard.timer']),
+                       capture_output=True, timeout=30)
+        for _p in ('/etc/systemd/system/takfedhubguard.timer',
+                   '/etc/systemd/system/takfedhubguard.service'):
+            subprocess.run(_sudo_wrap(['rm', '-f', _p]), capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        for _f in ('fedhub.failcount', 'fedhub_last_restart', 'fedhub_alert_sent'):
+            subprocess.run(_sudo_wrap(['rm', '-f', f'/var/lib/takguard/{_f}']), capture_output=True, timeout=10)
+    except Exception:
+        pass
+
     # Registration should still clear even if Caddy regeneration has a warning.
     try:
         _caddy_regenerate_if_fqdn()
