@@ -393,7 +393,18 @@ def _pg_exec(args, timeout=30, input_text=None, input_bytes=None, capture_binary
     directly — same result as the old sudo, no regression on root boxes. Returns
     the CompletedProcess (text unless capture_binary). NB: only for LOCAL pg; the
     two-server SSH path still runs `sudo -u postgres` on the REMOTE box as root."""
-    argv = _sudo_wrap(['runuser', '-u', 'postgres', '--'] + list(args))
+    # v10.0.1 container: the cot DB lives INSIDE the takserver-db container (a docker named
+    # volume), NOT a host postgres cluster — `runuser -u postgres` on the host has no postgres
+    # user/DB there. Run the tool inside the DB container as the postgres user (peer auth to the
+    # local cot DB). Add -i only when there's stdin (pg_dump/pg_restore streaming).
+    if _tak_is_container():
+        _exec = ['docker', 'exec']
+        if input_text is not None or input_bytes is not None:
+            _exec.append('-i')
+        _exec += ['-u', 'postgres', TAK_DB_CONTAINER] + list(args)
+        argv = _sudo_wrap(_exec)
+    else:
+        argv = _sudo_wrap(['runuser', '-u', 'postgres', '--'] + list(args))
     kw = {'capture_output': True, 'timeout': timeout}
     if capture_binary:
         if input_bytes is not None:
