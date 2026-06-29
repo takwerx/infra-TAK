@@ -52198,9 +52198,17 @@ def takserver_ca_info():
         ts_path = ts_files[-1]
         info['truststore_file'] = os.path.basename(ts_path)
         try:
-            r = subprocess.run(
-                ['keytool', '-list', '-keystore', ts_path, '-storepass', cert_pass],
-                capture_output=True, text=True, timeout=10)
+            if _tak_is_container():
+                # v10.0.1: no host keytool on a container box (JDK is inside the container) —
+                # list the truststore inside the running TAK container so old CAs are detected
+                # and the 'Revoke Old CA' box actually appears on arm64.
+                _kt = f'keytool -list -keystore {shlex.quote(ts_path)} -storepass {shlex.quote(cert_pass)}'
+                r = subprocess.run(f'docker exec {TAK_CONTAINER} bash -c {shlex.quote(_kt)}',
+                                   shell=True, capture_output=True, text=True, timeout=15)
+            else:
+                r = subprocess.run(
+                    ['keytool', '-list', '-keystore', ts_path, '-storepass', cert_pass],
+                    capture_output=True, text=True, timeout=10)
             aliases = []
             trusted_aliases = []
             for line in r.stdout.split('\n'):
@@ -53509,7 +53517,7 @@ def takserver_plugin_config_get(classname):
         return jsonify({'error': 'Invalid classname'}), 400
     fn = classname if classname.endswith('.yaml') else classname + '.yaml'
     path = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
-    r = subprocess.run(['sudo', 'cat', path], capture_output=True, text=True, timeout=5)
+    r = subprocess.run(_sudo_wrap(['cat', path]), capture_output=True, text=True, timeout=5)
     if r.returncode != 0:
         return jsonify({'exists': False, 'content': ''})
     return jsonify({'exists': True, 'content': r.stdout})
@@ -53587,7 +53595,7 @@ def takserver_security_config_get():
     if not os.path.exists(coreconfig_path):
         return jsonify({'error': 'TAK Server not installed'}), 400
     try:
-        r = subprocess.run(['sudo', 'cat', coreconfig_path], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['cat', coreconfig_path]), capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
             return jsonify({'error': 'Could not read CoreConfig.xml'}), 500
         content = r.stdout or ''
@@ -53614,7 +53622,7 @@ def takserver_security_config_post():
     if not os.path.exists(coreconfig_path):
         return jsonify({'error': 'TAK Server not installed'}), 400
     try:
-        r = subprocess.run(['sudo', 'cat', coreconfig_path], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['cat', coreconfig_path]), capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
             return jsonify({'error': 'Could not read CoreConfig.xml'}), 500
         content = r.stdout or ''
@@ -55152,7 +55160,7 @@ def run_takserver_two_server_db_migrate(
         db_pass = (tak_cfg_snapshot.get('database', {}).get('password') or '').strip()
         if not db_pass and os.path.exists('/opt/tak/CoreConfig.xml'):
             try:
-                r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=8)
+                r = subprocess.run(_sudo_wrap(['cat', '/opt/tak/CoreConfig.xml']), capture_output=True, text=True, timeout=8)
                 cc = r.stdout or ''
                 for pattern in (
                     r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
@@ -55262,7 +55270,7 @@ def run_takserver_two_server_db_migrate(
         mlog('')
         mlog('━━━ Updating CoreConfig.xml (this host) ━━━')
         try:
-            r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=8)
+            r = subprocess.run(_sudo_wrap(['cat', '/opt/tak/CoreConfig.xml']), capture_output=True, text=True, timeout=8)
             cc = r.stdout or ''
             if not cc.strip():
                 raise RuntimeError('empty CoreConfig')
@@ -56723,7 +56731,7 @@ def takserver_federation_info():
     if not os.path.exists(cc_path):
         return jsonify(info)
     try:
-        r = subprocess.run(['sudo', 'cat', cc_path], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(_sudo_wrap(['cat', cc_path]), capture_output=True, text=True, timeout=5)
         cc = r.stdout or ''
     except Exception:
         return jsonify(info)
