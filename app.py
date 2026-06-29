@@ -52621,9 +52621,21 @@ def takserver_rotate_rootca():
             log("")
 
             log("Step 1/8: Removing old certificate files...")
-            run('rm -rf /opt/tak/certs/files')
-            run('mkdir -p /opt/tak/certs/files')
-            run('chown -R tak:tak /opt/tak/certs/')
+            if _tak_is_container():
+                # v10.0.1: the cert files are owned by the container uid, so a HOST `rm -rf`
+                # as takwerx SILENTLY fails and the old truststore-*.jks survives — then Step 6's
+                # `keytool -import -alias root-ca` hits the existing `root-ca` alias and is dropped
+                # (check=False), so the new ROOT CA never lands in the truststore and EUDs get
+                # "cert not trusted". Clear the dir INSIDE the container (root there) so the
+                # rotation starts from a clean slate, exactly like the native rm does. The native
+                # branch below is byte-identical to before — Ubuntu/Rocky are untouched.
+                _tak_real = os.path.realpath('/opt/tak')
+                run(f"docker run --rm -v {shlex.quote(_tak_real)}:/opt/tak:z --entrypoint bash "
+                    f"{TAK_CONTAINER} -c 'rm -rf /opt/tak/certs/files && mkdir -p /opt/tak/certs/files' 2>&1")
+            else:
+                run('rm -rf /opt/tak/certs/files')
+                run('mkdir -p /opt/tak/certs/files')
+                run('chown -R tak:tak /opt/tak/certs/')
             log("✓ Old cert files cleared")
 
             _patch_openssl_string_mask()
