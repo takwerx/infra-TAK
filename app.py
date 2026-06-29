@@ -55637,14 +55637,41 @@ def _deploy_takserver_container(config):
         log_step(""); log_step("━━━ Step 6/9: Generating Certificates ━━━")
         log_step(f"  Root CA: {root_ca} | Intermediate CA: {int_ca}")
         run_cmd('rm -rf /opt/tak/certs/files', check=False)
-        run_cmd('cd /opt/tak/certs && cp cert-metadata.sh cert-metadata.sh.original 2>/dev/null; true', check=False)
-        for var, val in [('COUNTRY', config['cert_country']), ('STATE', config['cert_state']),
-                         ('CITY', config['cert_city']), ('ORGANIZATION', config['cert_org']),
-                         ('ORGANIZATIONAL_UNIT', config['cert_ou'])]:
-            if val:
-                run_cmd(f'''sed -i 's/^{var}=.*/{var}="{val}"/' /opt/tak/certs/cert-metadata.sh''', check=False)
         int_validity_days = config.get('intermediate_ca_validity_days', 730)
-        run_cmd(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
+        # v10.0.5 non-root: patch cert-metadata.sh via broker READ/MODIFY/WRITE — `sed` is
+        # broker-denied, so the old `cp`/`sed -i` here silently no-op'd, leaving STATE/CITY/OU
+        # unset -> makeRootCa "Please set STATE, CITY, ORGANIZATIONAL_UNIT" -> exit 255 -> 0
+        # certs. The native path (run_takserver_deploy) was already converted to this; the
+        # container path was missed. (The cert fields DO reach config; the WRITE was failing.)
+        try:
+            cm_path = '/opt/tak/certs/cert-metadata.sh'
+            orig_path = cm_path + '.original'
+            try:
+                base = _read_priv(orig_path)
+            except Exception:
+                base = _read_priv(cm_path)
+                _write_priv(orig_path, base)
+            repl = [('COUNTRY', config['cert_country']), ('STATE', config['cert_state']),
+                    ('CITY', config['cert_city']), ('ORGANIZATION', config['cert_org']),
+                    ('ORGANIZATIONAL_UNIT', config['cert_ou']),
+                    ('CA_VALIDITY', str(int_validity_days)),
+                    ('INTERMEDIATE_VALIDITY', str(int_validity_days))]
+            if cert_pass and cert_pass != 'atakatak':
+                repl += [('CAPASS', cert_pass), ('PASS', cert_pass)]
+            lines = base.splitlines(keepends=True)
+            for var, val in repl:
+                if not val:
+                    continue
+                for i, line in enumerate(lines):
+                    stripped = line.lstrip()
+                    if stripped.startswith(var + '='):
+                        indent = line[:len(line) - len(stripped)]
+                        safe = str(val).replace('"', '\\"')
+                        lines[i] = f'{indent}{var}="{safe}"\n'
+                        break
+            _write_priv(cm_path, ''.join(lines))
+        except Exception as _e:
+            log_step(f"  ✗ cert-metadata.sh patch failed: {_e}")
         _patch_openssl_string_mask(log_step)
         _patch_cert_metadata_password(cert_pass)
         # Container TAK user is uid 1000 — chown so makeCert (run as that user
