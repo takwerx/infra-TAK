@@ -5552,6 +5552,85 @@ def console_broker_routing():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+_NONROOT_MIGRATE_UNIT = 'infratak-nonroot-migrate'
+_NONROOT_MIGRATE_STATUS = '/var/lib/infratak-nonroot-migrate.status'
+_NONROOT_MIGRATE_LOG = '/var/log/takwerx-console-nonroot-migrate.log'
+
+
+@app.route('/api/console/migrate-nonroot', methods=['POST'])
+@login_required
+def console_migrate_nonroot_api():
+    """v10.0.5: flip a legacy ROOT console to the unprivileged takwerx user FROM THE
+    BROWSER (no CLI — the whole infra-TAK premise), wrapping
+    scripts/migrate-console-nonroot.sh --apply --auto-rollback. The migration
+    restarts/replaces the console process, so it MUST run DETACHED in its own cgroup
+    (systemd-run) to survive — same pattern as the kernel-patch job. The console is
+    ALREADY root here (the button only shows on a root console), so this is a
+    root->non-root provisioning step, NOT a privilege escalation; the script path is
+    fixed (no request input reaches the command). --auto-rollback restores the root
+    unit if the flip fails, so a botched migration cannot lock the operator out."""
+    if os.getuid() != 0:
+        return jsonify({'success': False, 'error': 'Console already runs non-root — nothing to migrate.'}), 400
+    if not (os.path.exists('/usr/bin/systemd-run') or os.path.exists('/bin/systemd-run')):
+        return jsonify({'success': False, 'error': 'systemd-run not found — cannot run the migration safely.'}), 500
+    install_dir = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(install_dir, 'scripts', 'migrate-console-nonroot.sh')
+    if not os.path.exists(script):
+        return jsonify({'success': False, 'error': f'migration script not found at {script}'}), 500
+    # Reset any prior transient unit so systemd accepts a fresh start of the same name.
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _NONROOT_MIGRATE_UNIT + '.service']),
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+    try:  # seed status so the poller has something the instant this returns (console is root here)
+        with open(_NONROOT_MIGRATE_STATUS, 'w') as f:
+            f.write('running')
+    except Exception:
+        pass
+    cmd = [
+        'systemd-run',
+        '--unit=' + _NONROOT_MIGRATE_UNIT,
+        '--description=infra-TAK console non-root migration (detached)',
+        '--property=StandardOutput=append:' + _NONROOT_MIGRATE_LOG,
+        '--property=StandardError=append:' + _NONROOT_MIGRATE_LOG,
+        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        '--no-block',
+        '/bin/bash', script, '--apply', '--auto-rollback',
+    ]
+    try:
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'could not launch migration: {e}'}), 500
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or '').strip()[:300]
+        return jsonify({'success': False, 'error': f'systemd-run failed: {err}'}), 500
+    return jsonify({'success': True,
+                    'message': 'Migration started. The console will restart as the takwerx user (~30–60s). This page reconnects automatically.'})
+
+
+@app.route('/api/console/migrate-nonroot/status')
+@login_required
+def console_migrate_nonroot_status_api():
+    """Poll the non-root migration. The page calls this after it reconnects: the
+    authoritative success signal is the console actually running non-root now;
+    otherwise read the breadcrumb the script writes (running / done / failed:<reason>)."""
+    nonroot = (os.getuid() != 0)
+    state, detail = 'unknown', ''
+    try:
+        with open(_NONROOT_MIGRATE_STATUS) as f:
+            raw = f.read().strip()
+        if raw.startswith('failed:'):
+            state, detail = 'failed', raw[len('failed:'):]
+        elif raw in ('running', 'done'):
+            state = raw
+    except Exception:
+        pass
+    if nonroot:           # console answering as non-root == migration succeeded
+        state = 'done'
+    return jsonify({'state': state, 'nonroot': nonroot, 'detail': detail})
+
+
 @app.route('/api/console/rollback', methods=['POST'])
 @login_required
 def console_rollback_api():
@@ -29966,6 +30045,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button id="broker-test-btn" class="btn btn-ghost" onclick="runBrokerSelftest()"><span class="material-symbols-outlined" style="font-size:18px">fact_check</span>Run self-test</button>
       <button id="broker-toggle-btn" class="btn btn-ghost" onclick="toggleBrokerRouting()"><span class="material-symbols-outlined" style="font-size:18px">shield</span>Turn on guard</button>
+      <button id="broker-migrate-btn" class="btn btn-primary" style="display:none" onclick="migrateNonroot()"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Switch to non-root</button>
       <span id="broker-msg" style="font-size:12px;margin-left:6px"></span>
     </div>
     <div id="broker-selftest" class="ctl-detail" style="margin-top:12px"></div>
@@ -30115,6 +30195,10 @@ function renderBrokerStatus(d){
   else if(d.force_enabled){tb.style.display='';tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Turn off guard';}
   else{tb.style.display='';tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Turn on guard';}
   document.getElementById('broker-test-btn').disabled=!d.socket_present;
+  // "Switch to non-root" — the browser path off root (no CLI). Only on a still-root
+  // console with the guard installed; on non-root boxes it's already done, so hide it.
+  var mb=document.getElementById('broker-migrate-btn');
+  if(mb){mb.style.display=(!nonRoot && d.installed)?'':'none';}
 }
 function loadBroker(){
   fetch('/api/console/broker/status').then(function(r){return r.json();}).then(renderBrokerStatus)
@@ -30150,6 +30234,32 @@ function toggleBrokerRouting(){
       if(d.success){m.textContent=d.restart_message||'Restarting…';m.style.color='var(--green)';setTimeout(function(){location.reload();},16000);}
       else{m.textContent='Error: '+(d.error||'failed');m.style.color='var(--red)';document.getElementById('broker-toggle-btn').disabled=false;}
     }).catch(function(){m.textContent='Request failed';m.style.color='var(--red)';document.getElementById('broker-toggle-btn').disabled=false;});
+  });
+}
+function migrateNonroot(){
+  if(!confirm('Switch the console to a non-root (unprivileged) user now?\\n\\nThe console restarts as the takwerx user — expect a brief disconnect (about 30-60 seconds). This page reconnects on its own. If the switch fails it rolls back to the current root console, so you are never locked out.'))return;
+  var m=document.getElementById('broker-msg');m.textContent='Starting migration…';m.style.color='var(--text-dim)';
+  var mb=document.getElementById('broker-migrate-btn');if(mb)mb.disabled=true;
+  fetch('/api/console/migrate-nonroot',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){m.textContent='Error: '+(d.error||'failed');m.style.color='var(--red)';if(mb)mb.disabled=false;return;}
+    m.textContent=d.message||'Migrating… reconnecting.';m.style.color='var(--green)';
+    setTimeout(function(){pollMigrate(0);},6000);
+  }).catch(function(){m.textContent='Request failed';m.style.color='var(--red)';if(mb)mb.disabled=false;});
+}
+function pollMigrate(n){
+  // The console restarts mid-migration, so early polls WILL fail (502/timeout) — expected.
+  // Keep trying ~3 min; success == the console answers as non-root. A dropped login
+  // session after the restart surfaces as a non-JSON/redirect → handled by reloading.
+  var m=document.getElementById('broker-msg');
+  if(n>45){m.innerHTML='Migration is taking longer than expected — <a href="javascript:location.reload()" style="color:var(--cyan)">refresh</a> to check, or see /var/log/takwerx-console-nonroot-migrate.log';m.style.color='var(--yellow)';return;}
+  fetch('/api/console/migrate-nonroot/status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(d.nonroot||d.state==='done'){m.textContent='✓ Now running non-root — reloading…';m.style.color='var(--green)';setTimeout(function(){location.reload();},2000);return;}
+    if(d.state==='failed'){m.textContent='Migration failed ('+(d.detail||'unknown')+') — rolled back to the root console.';m.style.color='var(--red)';var fb=document.getElementById('broker-migrate-btn');if(fb)fb.disabled=false;return;}
+    m.textContent='Migrating… (console restarting, '+(n*4)+'s)';m.style.color='var(--text-dim)';
+    setTimeout(function(){pollMigrate(n+1);},4000);
+  }).catch(function(){
+    m.textContent='Reconnecting… (console restarting, '+(n*4)+'s)';m.style.color='var(--text-dim)';
+    setTimeout(function(){pollMigrate(n+1);},4000);
   });
 }
 loadStatus();loadAssertions();loadAudit();loadBroker();

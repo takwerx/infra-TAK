@@ -25,15 +25,35 @@
 set -o pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-APPLY=0
-[ "${1:-}" = "--apply" ] && APPLY=1
+APPLY=0; AUTO_ROLLBACK=0
+for _a in "$@"; do
+    case "$_a" in
+        --apply)         APPLY=1 ;;
+        --auto-rollback) AUTO_ROLLBACK=1 ;;   # used by the in-console button: a
+                                              # failed flip restores the root unit
+                                              # so the operator is never locked out
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT=/etc/systemd/system/takwerx-console.service
 NONROOT_INSTALL=/opt/infratak
+# Status breadcrumb the in-console "Switch to non-root" button polls. running ->
+# done -> the console answers as takwerx; failed:<reason> -> rolled back to root.
+STATUS_FILE=/var/lib/infratak-nonroot-migrate.status
+_status() { echo "$1" > "$STATUS_FILE" 2>/dev/null || true; }
 
 say()  { echo -e "$@"; }
 step() { echo -e "${CYAN}▸ $*${NC}"; }
+
+# Auto-rollback (button path only): restore the backed-up root unit + restart so
+# the web UI comes back as the root console the operator started from.
+_rollback() {
+    say "${YELLOW}↩ Auto-rollback: restoring the root console unit…${NC}"
+    [ -f "${UNIT}.pre-nonroot.bak" ] && cp -a "${UNIT}.pre-nonroot.bak" "$UNIT" 2>/dev/null
+    systemctl daemon-reload 2>/dev/null
+    systemctl restart takwerx-console 2>/dev/null
+}
 
 # --- pre-flight -------------------------------------------------------------
 if [ "$EUID" -ne 0 ]; then
@@ -102,6 +122,7 @@ if [ "$APPLY" != "1" ]; then
 fi
 
 # --- APPLY ------------------------------------------------------------------
+_status running
 step "Backing up current unit"
 cp -a "$UNIT" "${UNIT}.pre-nonroot.bak"
 echo "$CUR_DIR" > /etc/takwerx-console.prenonroot-dir
@@ -110,6 +131,8 @@ say "  ✓ ${UNIT}.pre-nonroot.bak  (rollback: restore it + systemctl daemon-rel
 step "Running born-non-root flip (start.sh TAKWERX_NONROOT=1)"
 if ! TAKWERX_NONROOT=1 bash "$SCRIPT_DIR/start.sh"; then
     say "${RED}✗ start.sh non-root flip failed. The backup unit is at ${UNIT}.pre-nonroot.bak.${NC}"
+    [ "$AUTO_ROLLBACK" = "1" ] && _rollback
+    _status "failed:start.sh flip failed"
     exit 1
 fi
 
@@ -126,10 +149,13 @@ for i in $(seq 1 12); do
 done
 say "  user=$NEW_USER  dir=$NEW_DIR  login_http=$CODE"
 if [ "$NEW_USER" = "takwerx" ] && [ "$NEW_DIR" = "$NONROOT_INSTALL" ] && [ "$CODE" = "200" ]; then
+    _status done
     say "${GREEN}${BOLD}✓ Migration complete — console runs as takwerx from $NONROOT_INSTALL.${NC}"
     say "  Old install left at: $CUR_DIR  (remove once you've confirmed everything works)"
 else
     say "${RED}✗ Post-check failed (expected takwerx @ $NONROOT_INSTALL, login 200)."
     say "  Roll back: cp ${UNIT}.pre-nonroot.bak $UNIT && systemctl daemon-reload && systemctl restart takwerx-console${NC}"
+    [ "$AUTO_ROLLBACK" = "1" ] && _rollback
+    _status "failed:post-check user=$NEW_USER dir=$NEW_DIR http=$CODE"
     exit 1
 fi
