@@ -29771,7 +29771,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <div class="card">
     <div class="card-title">Least-Privilege Console — Privileged Broker</div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. <strong>When the console runs as a non-root user, the guard is the only way it can do privileged work — so routing is always on and mandatory (nothing to toggle).</strong> The <em>Enable routing</em> button applies only to a console still running as <strong>root</strong> (e.g. an in-place upgrade): it force-routes through the guard so you can dry-run the allowlist in learning mode before switching the console to a non-root user.</p>
+    <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. <strong>This console runs as a non-root user, so the guard is mandatory — routing is always on and there's nothing to toggle.</strong> Click <strong>Run self-test</strong> anytime (no restart) to prove it works: allowed actions succeed and dangerous ones (writing sudoers, arbitrary shells) are blocked.</p>
     <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button id="broker-test-btn" class="btn btn-ghost" onclick="runBrokerSelftest()"><span class="material-symbols-outlined" style="font-size:18px">fact_check</span>Run self-test</button>
@@ -29889,8 +29889,8 @@ function renderBrokerStatus(d){
   var el=document.getElementById('broker-status');
   var nonRoot=(d.console_uid!==undefined && d.console_uid!==0);
   if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — restart the console (or re-run <code>sudo ./start.sh</code>).</span>';}
-  else{var mode='';if(d.routing_active){mode=(d.enforce===true)?'<span style="color:var(--yellow);margin-right:14px">&#9888; ENFORCING</span>':'<span style="color:var(--green);margin-right:14px">&#10003; permissive (learning)</span>';}
-    el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'socket ready')+badge(d.routing_active,'routing '+(d.routing_active?'ON':'off')+(nonRoot?' — mandatory (non-root console)':''))+mode;}
+  else{var mode='';if(d.routing_active){mode=(d.enforce===true)?'<span style="color:var(--yellow);margin-right:14px">&#9888; enforcing &mdash; blocks anything not allowed</span>':'<span style="color:var(--green);margin-right:14px">&#10003; monitor mode &mdash; logging, not blocking yet</span>';}
+    el.innerHTML=badge(d.service_active,'guard running')+badge(d.socket_present,'guard connected')+badge(d.routing_active,(d.routing_active?'protecting all admin actions':'not protecting')+(nonRoot?' (non-root console)':''))+mode;}
   var tb=document.getElementById('broker-toggle-btn');
   // On a NON-ROOT console the broker is the only path to privilege, so routing is mandatory and
   // can't be toggled (Disable would do nothing). Hide the misleading button; show it only on a
@@ -29898,6 +29898,10 @@ function renderBrokerStatus(d){
   if(nonRoot){tb.style.display='none';}
   else if(d.force_enabled){tb.style.display='';tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Disable routing';}
   else{tb.style.display='';tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Enable routing';}
+  // The static description is the non-root (fresh-box) copy — no "Enable routing" language. Only a
+  // ROOT console swaps in the copy that explains the toggle, so a fresh deploy never sees it.
+  var desc=document.getElementById('broker-desc');
+  if(desc&&!nonRoot){desc.innerHTML='A small <strong>root "guard"</strong> daemon holds all privilege; the console asks it over a local socket and the guard enforces an allowlist + writes a single audit log. <strong>Run self-test</strong> proves it works (no restart). This console still runs as <strong>root</strong>, so privilege is not mediated yet — click <strong>Enable routing</strong> to force every privileged action through the guard in <em>learning mode</em> (it logs everything but blocks nothing), then watch the audit log to confirm the allowlist is complete before switching the console to a non-root user.';}
   document.getElementById('broker-test-btn').disabled=!d.socket_present;
 }
 function loadBroker(){
