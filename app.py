@@ -29756,13 +29756,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon material-symbols-outlined" style="font-size:24px">shield_toggle</span><span>Cyber Controls</span></h1>
   <p>Flip this assembled stack from the default <strong>Standard</strong> posture into <strong>Hardened</strong> — eliminating the on-sight disqualifiers a security reviewer fails a system for, then self-documenting what it did. Reversible, idempotent, with an on-box break-glass recovery path.</p></div>
 
-  <div id="posture-banner" class="status-banner stopped"><div class="dot"></div><span id="posture-text">Loading…</span></div>
-
-  <div class="card">
-    <div class="card-title">Posture controls</div>
-    <div id="controls">Loading…</div>
-  </div>
-
   <div class="card">
     <div class="card-title">Console Security Guard</div>
     <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A built-in security <strong>guard</strong> sits between the web console and the system &mdash; the console can't make powerful changes (installs, restarts, config edits) except through the guard, and every action is recorded. Press <strong>Run self-test</strong> to check it's working.</p>
@@ -29774,6 +29767,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <div id="broker-selftest" class="ctl-detail" style="margin-top:12px"></div>
     <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Everything the guard does is recorded here: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
+  </div>
+
+  <div id="posture-banner" class="status-banner stopped"><div class="dot"></div><span id="posture-text">Loading…</span></div>
+
+  <div class="card">
+    <div class="card-title">Posture controls</div>
+    <div id="controls">Loading…</div>
   </div>
 
   <div class="card">
