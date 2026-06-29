@@ -5577,15 +5577,25 @@ def console_migrate_nonroot_api():
     script = os.path.join(install_dir, 'scripts', 'migrate-console-nonroot.sh')
     if not os.path.exists(script):
         return jsonify({'success': False, 'error': f'migration script not found at {script}'}), 500
-    # Reset any prior transient unit so systemd accepts a fresh start of the same name.
+    # Refuse if a migration is already in flight (fixed unit name → one at a time);
+    # avoids a confusing "unit already exists" 500 on a double-click/retry.
+    try:
+        st = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _NONROOT_MIGRATE_UNIT + '.service']),
+                            capture_output=True, text=True, timeout=5)
+        if (st.stdout or '').strip() in ('active', 'activating'):
+            return jsonify({'success': False, 'error': 'A non-root migration is already running.'}), 409
+    except Exception:
+        pass
+    # Reset any prior FAILED transient unit so systemd accepts a fresh start of the same name.
     try:
         subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _NONROOT_MIGRATE_UNIT + '.service']),
                        capture_output=True, timeout=5)
     except Exception:
         pass
-    try:  # seed status so the poller has something the instant this returns (console is root here)
+    try:  # seed status (0600) so the poller has something the instant this returns (console is root here)
         with open(_NONROOT_MIGRATE_STATUS, 'w') as f:
             f.write('running')
+        os.chmod(_NONROOT_MIGRATE_STATUS, 0o600)
     except Exception:
         pass
     cmd = [
@@ -5620,7 +5630,9 @@ def console_migrate_nonroot_status_api():
     try:
         with open(_NONROOT_MIGRATE_STATUS) as f:
             raw = f.read().strip()
-        if raw.startswith('failed:'):
+        if raw.startswith('failed-rollback:'):   # flip failed AND rollback unverified — SSH recovery
+            state, detail = 'failed', raw[len('failed-rollback:'):]
+        elif raw.startswith('failed:'):
             state, detail = 'failed', raw[len('failed:'):]
         elif raw in ('running', 'done'):
             state = raw

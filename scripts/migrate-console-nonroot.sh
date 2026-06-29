@@ -41,18 +41,36 @@ NONROOT_INSTALL=/opt/infratak
 # Status breadcrumb the in-console "Switch to non-root" button polls. running ->
 # done -> the console answers as takwerx; failed:<reason> -> rolled back to root.
 STATUS_FILE=/var/lib/infratak-nonroot-migrate.status
-_status() { echo "$1" > "$STATUS_FILE" 2>/dev/null || true; }
+# 0600 (umask 077): the breadcrumb is only ever read by the root console (the
+# rollback case) or short-circuited by the live uid on the non-root console, so a
+# local user can neither read nor pre-poison it.
+_status() { ( umask 077; echo "$1" > "$STATUS_FILE" ) 2>/dev/null || true; }
 
 say()  { echo -e "$@"; }
 step() { echo -e "${CYAN}▸ $*${NC}"; }
 
-# Auto-rollback (button path only): restore the backed-up root unit + restart so
-# the web UI comes back as the root console the operator started from.
+# Auto-rollback (button path only): restore the backed-up root unit + restart, then
+# PROVE the root console actually answered — the whole point of this flag is "never
+# locked out", so we don't claim a clean rollback we didn't verify. Returns 0 if the
+# root console is back (HTTP 200), 1 otherwise (operator needs SSH; old install is
+# intact since start.sh rsyncs, never moves).
 _rollback() {
     say "${YELLOW}↩ Auto-rollback: restoring the root console unit…${NC}"
     [ -f "${UNIT}.pre-nonroot.bak" ] && cp -a "${UNIT}.pre-nonroot.bak" "$UNIT" 2>/dev/null
     systemctl daemon-reload 2>/dev/null
     systemctl restart takwerx-console 2>/dev/null
+    local rp rc i
+    rp=$(grep -oE 'console_port"[: ]+[0-9]+' "$CUR_DIR/.config/settings.json" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    [ -z "$rp" ] && rp=5001
+    rc=000
+    for i in $(seq 1 12); do
+        rc=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost:$rp/login" 2>/dev/null)
+        [ "$rc" != "000" ] && break; sleep 4
+    done
+    if [ "$rc" = "200" ]; then
+        say "${GREEN}  ✓ Root console restored (HTTP $rc).${NC}"; return 0
+    fi
+    say "${RED}  ✗ Rollback restart did not answer (HTTP $rc) — SSH recovery needed.${NC}"; return 1
 }
 
 # --- pre-flight -------------------------------------------------------------
@@ -131,8 +149,12 @@ say "  ✓ ${UNIT}.pre-nonroot.bak  (rollback: restore it + systemctl daemon-rel
 step "Running born-non-root flip (start.sh TAKWERX_NONROOT=1)"
 if ! TAKWERX_NONROOT=1 bash "$SCRIPT_DIR/start.sh"; then
     say "${RED}✗ start.sh non-root flip failed. The backup unit is at ${UNIT}.pre-nonroot.bak.${NC}"
-    [ "$AUTO_ROLLBACK" = "1" ] && _rollback
-    _status "failed:start.sh flip failed"
+    if [ "$AUTO_ROLLBACK" = "1" ]; then
+        if _rollback; then _status "failed:start.sh flip failed — rolled back to the root console";
+        else _status "failed-rollback:start.sh flip failed AND rollback unverified — recover via SSH (old install at $CUR_DIR)"; fi
+    else
+        _status "failed:start.sh flip failed"
+    fi
     exit 1
 fi
 
@@ -155,7 +177,11 @@ if [ "$NEW_USER" = "takwerx" ] && [ "$NEW_DIR" = "$NONROOT_INSTALL" ] && [ "$COD
 else
     say "${RED}✗ Post-check failed (expected takwerx @ $NONROOT_INSTALL, login 200)."
     say "  Roll back: cp ${UNIT}.pre-nonroot.bak $UNIT && systemctl daemon-reload && systemctl restart takwerx-console${NC}"
-    [ "$AUTO_ROLLBACK" = "1" ] && _rollback
-    _status "failed:post-check user=$NEW_USER dir=$NEW_DIR http=$CODE"
+    if [ "$AUTO_ROLLBACK" = "1" ]; then
+        if _rollback; then _status "failed:post-check failed (user=$NEW_USER http=$CODE) — rolled back to the root console";
+        else _status "failed-rollback:post-check failed AND rollback unverified — recover via SSH (old install at $CUR_DIR)"; fi
+    else
+        _status "failed:post-check user=$NEW_USER dir=$NEW_DIR http=$CODE"
+    fi
     exit 1
 fi
