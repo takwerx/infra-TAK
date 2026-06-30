@@ -6385,8 +6385,27 @@ def takserver_two_server_install_ssh_key():
     return jsonify({'success': True, 'message': 'Key installed on Server One. Next: 4. Deploy Server One (DB).'})
 
 
+def _valid_core_ip(value):
+    """core_ip is interpolated into root pg_hba / firewall commands on Server One and
+    MUST be a literal IPv4 (used as `<ip>/32` and a firewalld `family='ipv4'` source).
+    Strict IPv4 validation keeps the value correct AND makes the shell interpolation
+    injection-proof — a valid IPv4 contains no shell-significant characters."""
+    v = (value or '').strip()
+    if not v:
+        return False
+    try:
+        ipaddress.IPv4Address(v)
+        return True
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+
+
 def _resolve_core_ip(settings, cfg):
-    """Resolve Server Two (Core) public IP for firewall and pg_hba rules."""
+    """Resolve Server Two (Core) public IP for firewall and pg_hba rules.
+    Returns a VALIDATED IPv4 string, or None — callers must treat None as 'not set'.
+    server_two.host is operator-supplied via the request config blob, so it is
+    validated here (the single chokepoint feeding _setup_server_one[_rhel], which
+    interpolate core_ip into root shell commands on Server One)."""
     s2 = cfg.get('server_two', {})
     if s2.get('use_localhost'):
         core_ip = (settings.get('server_ip') or '').strip()
@@ -6399,8 +6418,9 @@ def _resolve_core_ip(settings, cfg):
                 core_ip = (r.stdout or '').strip() if r.returncode == 0 else ''
             except Exception:
                 pass
-        return core_ip or None
-    return (s2.get('host') or '').strip() or None
+    else:
+        core_ip = (s2.get('host') or '').strip()
+    return core_ip if _valid_core_ip(core_ip) else None
 
 
 def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
@@ -6412,6 +6432,11 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     remote access at the RHEL data dir. Heavily instrumented so the first live run shows exactly
     what the rpm did. All ops run over SSH on Server One (sudo there). Returns (ok, log, db_password)."""
     log = ['Server One detected as RHEL/Rocky family — using dnf / firewalld / systemctl / /var/lib/pgsql path.']
+    # Defense-in-depth: core_ip is interpolated into root pg_hba/firewalld commands below.
+    # _resolve_core_ip already validates it, but re-check at the sink so no future caller
+    # can reach the shell interpolation with a non-IPv4 (injection-proofing).
+    if not _valid_core_ip(core_ip):
+        return False, log + ['Refusing to configure Server One: core IP is not a valid IPv4 address.'], ''
     # EL version + arch for the EPEL/PGDG repo URLs.
     _, _elv = _ssh_probe(s1, '. /etc/os-release 2>/dev/null; echo "${VERSION_ID%%.*}"', timeout=10)
     el_ver = (_elv or '').strip()
@@ -6550,6 +6575,11 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     Returns (ok, log_lines, db_password).
     """
     log = []
+    # Defense-in-depth: core_ip is interpolated into root pg_hba/UFW commands on Server One
+    # (and the RHEL branch below). _resolve_core_ip validates it; re-check at the sink so no
+    # caller can reach the shell interpolation with a non-IPv4 value (injection-proofing).
+    if not _valid_core_ip(core_ip):
+        return False, ['Refusing to configure Server One: core IP is not a valid IPv4 address.'], ''
     # v10.0.5: the DB box (Server One) can be a DIFFERENT OS family than the console. Detect its
     # OS over SSH and dispatch to the RHEL/Rocky path (dnf/PGDG/.noarch.rpm/systemctl/firewalld/
     # /var/lib/pgsql) — mirrors the Debian steps below per TAK Config Guide 5.7 + the proven
