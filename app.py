@@ -5895,15 +5895,17 @@ def takserver_external_db_provision():
     try:
         r = subprocess.run(['which', 'psql'], capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
-            plog('  psql not found — installing postgresql-client...')
-            r2 = subprocess.run(
-                _sudo_wrap(['apt-get', 'install', '-y', 'postgresql-client']),
-                capture_output=True, text=True, timeout=120
-            )
-            if r2.returncode != 0:
-                plog(f'  ✗ Failed to install postgresql-client: {(r2.stderr or r2.stdout or "")[:300]}')
-                return jsonify({'success': False, 'log': log, 'error': 'Could not install postgresql-client'}), 500
-            plog('  ✓ postgresql-client installed')
+            # Multiplatform (CLAUDE.md): the psql client package name differs by family —
+            # Debian/Ubuntu = postgresql-client, RHEL/Rocky = postgresql (provides /usr/bin/psql).
+            # Go through the apt<->dnf shim (_pkg_install), never a bare apt-get (which doesn't
+            # exist on RHEL — that was the FileNotFoundError on the external-DB Rocky path).
+            client_pkg = 'postgresql' if _distro_family() == 'rhel' else 'postgresql-client'
+            plog(f'  psql not found — installing {client_pkg}...')
+            ok_inst, inst_out = _pkg_install(client_pkg, timeout=300)
+            if not ok_inst:
+                plog(f'  ✗ Failed to install {client_pkg}: {(inst_out or "")[:300]}')
+                return jsonify({'success': False, 'log': log, 'error': f'Could not install {client_pkg}'}), 500
+            plog(f'  ✓ {client_pkg} installed')
         else:
             plog('  ✓ psql available')
     except Exception as e:
