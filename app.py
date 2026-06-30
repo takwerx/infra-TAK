@@ -6403,11 +6403,135 @@ def _resolve_core_ip(settings, cfg):
     return (s2.get('host') or '').strip() or None
 
 
+def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
+    """RHEL/Rocky Server One (DB box) setup — the dnf/PGDG/.noarch.rpm/systemctl/firewalld/
+    /var/lib/pgsql mirror of the Debian _setup_server_one, per TAK Server Config Guide 5.7
+    (pp.14-16) and the proven single-server RHEL install. The takserver-database .noarch.rpm
+    is the DB installer (sets up the cot DB + martiuser, same role as the .deb); we install it,
+    then verify + SELF-HEAL (postgresql-15-setup initdb + start if the rpm didn't) and configure
+    remote access at the RHEL data dir. Heavily instrumented so the first live run shows exactly
+    what the rpm did. All ops run over SSH on Server One (sudo there). Returns (ok, log, db_password)."""
+    log = ['Server One detected as RHEL/Rocky family — using dnf / firewalld / systemctl / /var/lib/pgsql path.']
+    # EL version + arch for the EPEL/PGDG repo URLs.
+    _, _elv = _ssh_probe(s1, '. /etc/os-release 2>/dev/null; echo "${VERSION_ID%%.*}"', timeout=10)
+    el_ver = (_elv or '').strip()
+    el_ver = el_ver if el_ver in ('8', '9') else '9'
+    _, _ar = _ssh_probe(s1, 'uname -m', timeout=10)
+    el_arch = 'aarch64' if ('aarch64' in (_ar or '') or 'arm64' in (_ar or '')) else 'x86_64'
+    # Reusable SSH snippets: discover the PG data dir + service name (PGDG postgresql-15 vs base).
+    PGDATA = ('PGDATA=$(ls -d /var/lib/pgsql/*/data 2>/dev/null | sort -V | tail -1); '
+              '[ -z "$PGDATA" ] && [ -d /var/lib/pgsql/data ] && PGDATA=/var/lib/pgsql/data; true')
+    PGSVC = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; true')
+
+    # Step 1: repos — EPEL + PGDG (arch/EL-aware) + disable the system postgresql module + CRB.
+    repo_cmd = (
+        'sudo dnf -y install epel-release 2>&1 || '
+        f'sudo dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-{el_ver}.noarch.rpm 2>&1 || true; '
+        f'sudo dnf -y install https://download.postgresql.org/pub/repos/yum/reporpms/EL-{el_ver}-{el_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1 || true; '
+        'sudo dnf -qy module disable postgresql 2>&1 || true; '
+        'sudo dnf -y install dnf-plugins-core 2>&1 || true; '
+        '(sudo dnf config-manager --set-enabled crb 2>/dev/null || sudo dnf config-manager --set-enabled powertools 2>/dev/null || true); '
+        'echo REPO_DONE'
+    )
+    _, rout = _ssh_probe(s1, repo_cmd, timeout=240)
+    log.append('Repos (EPEL/PGDG/CRB): ' + ('configured.' if 'REPO_DONE' in (rout or '') else ('warnings — ' + (rout or '')[:300])))
+
+    # Step 2: install the takserver-database .noarch.rpm (the DB installer), unless already set up.
+    if db_pkg_path and db_pkg_name:
+        verify_cmd = (PGDATA + '; ' + PGSVC + '; '
+                      'sudo -u postgres psql -lqt 2>/dev/null | grep -qw cot && '
+                      'systemctl is-active "$PGSVC" >/dev/null 2>&1 && echo PG_OK')
+        vok, vout = _ssh_probe(s1, verify_cmd, timeout=15)
+        if vok and 'PG_OK' in (vout or ''):
+            log.append('PostgreSQL already running and cot exists — skipping rpm install.')
+        else:
+            sok, sout = _scp_to_host(s1, db_pkg_path, '/tmp/', timeout=300)
+            if not sok:
+                log.append('SCP of database rpm failed: ' + (sout or ''))
+                return False, log, ''
+            log.append('Copied database rpm to /tmp/ on Server One.')
+            install_cmd = f'cd /tmp && sudo dnf -y install ./{db_pkg_name} --setopt=clean_requirements_on_remove=false 2>&1; echo RC=$?'
+            _, iout = _ssh_probe(s1, install_cmd, timeout=600)
+            log.append('takserver-database rpm install output:')
+            log.append((iout or '')[:1000])
+    else:
+        _, iout = _ssh_probe(s1, (
+            'sudo dnf -y install postgresql15-server postgresql15-contrib postgis34_15 2>&1 || '
+            'sudo dnf -y install postgresql15-server postgresql15-contrib 2>&1; echo RC=$?'), timeout=600)
+        log.append('vanilla PG15 install: ' + (iout or '')[:300])
+
+    # Step 3: ensure the cluster is INITIALIZED + STARTED (self-heal — the rpm may or may not have).
+    init_cmd = (
+        PGDATA + '; ' + PGSVC + '; '
+        'if [ -z "$PGDATA" ] || [ ! -f "$PGDATA/PG_VERSION" ]; then '
+        '  SETUP=$(ls /usr/pgsql-*/bin/postgresql-*-setup 2>/dev/null | sort -V | tail -1); '
+        '  if [ -n "$SETUP" ]; then sudo "$SETUP" initdb 2>&1; else sudo postgresql-setup --initdb 2>&1; fi; '
+        '  PGDATA=$(ls -d /var/lib/pgsql/*/data 2>/dev/null | sort -V | tail -1); [ -z "$PGDATA" ] && PGDATA=/var/lib/pgsql/data; '
+        'fi; '
+        'sudo systemctl enable "$PGSVC" 2>/dev/null; sudo systemctl start "$PGSVC" 2>&1; '
+        'echo "PGDATA=$PGDATA PGSVC=$PGSVC ACTIVE=$(systemctl is-active "$PGSVC" 2>/dev/null)"'
+    )
+    _, nout = _ssh_probe(s1, init_cmd, timeout=120)
+    log.append('PG init/start: ' + (nout or '')[:300])
+
+    # Step 4: remote-access config (listen_addresses + pg_hba) at the RHEL data dir, then restart.
+    cfg_cmd = (
+        PGDATA + '; ' + PGSVC + '; '
+        '[ -z "$PGDATA" ] && { echo NO_PGDATA; exit 0; }; '
+        'sudo sed -i "/^[[:space:]]*#*[[:space:]]*listen_addresses[[:space:]]*=/d" "$PGDATA/postgresql.conf"; '
+        "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PGDATA/postgresql.conf\" >/dev/null; "
+        'sudo sed -i "s/md5host/md5\\nhost/g" "$PGDATA/pg_hba.conf"; '
+        f'grep -q "^host.*{core_ip}/32" "$PGDATA/pg_hba.conf" 2>/dev/null || '
+        f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$PGDATA/pg_hba.conf" >/dev/null; '
+        'sudo systemctl restart "$PGSVC" 2>&1; echo "ACTIVE=$(systemctl is-active "$PGSVC" 2>/dev/null)"'
+    )
+    _, cout = _ssh_probe(s1, cfg_cmd, timeout=40)
+    if 'NO_PGDATA' in (cout or '') or 'ACTIVE=active' not in (cout or ''):
+        log.append('PostgreSQL remote-access config FAILED: ' + (cout or '')[:300])
+        _, diag = _ssh_probe(s1, (
+            PGDATA + '; ' + PGSVC + '; echo "--- pgdata=$PGDATA svc=$PGSVC ---"; '
+            'sudo ls -la "$PGDATA" 2>&1 | head -6; echo "--- journal ---"; '
+            'sudo journalctl -u "$PGSVC" -n 25 --no-pager 2>&1 | tail -25; echo "--- rpm -qa postgres/takserver ---"; '
+            'rpm -qa 2>/dev/null | grep -iE "postgres|postgis|takserver" | head'), timeout=25)
+        log.append('Diagnostics from Server One:')
+        log.append((diag or '')[:1400])
+        return False, log, ''
+    log.append(f'PostgreSQL configured: listen_addresses=*, pg_hba host {core_ip}, service active.')
+
+    # Step 5: firewalld — open db_port FROM the core IP only (+ ssh); drop any broad port-open.
+    fw_cmd = (
+        'sudo systemctl enable --now firewalld 2>/dev/null || true; '
+        'sudo firewall-cmd --permanent --add-service=ssh 2>/dev/null || true; '
+        f'sudo firewall-cmd --permanent --add-rich-rule="rule family=\'ipv4\' source address=\'{core_ip}\' port protocol=\'tcp\' port=\'{db_port}\' accept" 2>&1 || true; '
+        f'sudo firewall-cmd --permanent --remove-port={db_port}/tcp 2>/dev/null || true; '
+        'sudo firewall-cmd --reload 2>&1; echo FW_DONE'
+    )
+    _, fout = _ssh_probe(s1, fw_cmd, timeout=40)
+    log.append('firewalld: ' + ('db port scoped to core, ssh allowed.' if 'FW_DONE' in (fout or '') else (fout or '')[:200]))
+
+    # Step 6: capture + verify the DB password (platform-neutral helpers — already work on RHEL).
+    db_password, _ = _fetch_db_password_from_server_one(s1)
+    if db_password:
+        log.append('Captured DB password from Server One.')
+        pw_ok, pw_msg = _verify_server_one_db_password(s1, db_password, db_port=db_port)
+        log.append('DB credential verified on Server One.' if pw_ok else f'Warning: captured password failed validation ({pw_msg}).')
+    else:
+        log.append('Warning: could not read DB password from Server One CoreConfig.')
+    return True, log, db_password
+
+
 def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     """Full Server One setup: optionally install DB .deb, configure PG for remote access, open UFW.
     Returns (ok, log_lines, db_password).
     """
     log = []
+    # v10.0.5: the DB box (Server One) can be a DIFFERENT OS family than the console. Detect its
+    # OS over SSH and dispatch to the RHEL/Rocky path (dnf/PGDG/.noarch.rpm/systemctl/firewalld/
+    # /var/lib/pgsql) — mirrors the Debian steps below per TAK Config Guide 5.7 + the proven
+    # single-server RHEL install. Default stays Debian (byte-identical to the original path).
+    _fam_ok, _fam = _ssh_probe(s1, '. /etc/os-release 2>/dev/null; echo "${ID} ${ID_LIKE}"', timeout=12)
+    if _fam_ok and any(t in (_fam or '').lower() for t in ('rhel', 'rocky', 'almalinux', 'centos', 'fedora')):
+        return _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path, db_pkg_name)
     # Kill stale apt/dpkg locks and fix broken packages from interrupted installs.
     apt_unlock = (
         'sudo killall -q apt-get dpkg unattended-upgr 2>/dev/null; '
