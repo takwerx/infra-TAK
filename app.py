@@ -6257,7 +6257,7 @@ def takserver_two_server_ensure_ssh_key():
 @app.route('/api/takserver/two-server/upload-ssh-key', methods=['POST'])
 @login_required
 def takserver_two_server_upload_ssh_key():
-    """v10.0.6: accept the operator's EXISTING SSH PRIVATE key (the AWS `.pem` / Azure key
+    """v10.0.5: accept the operator's EXISTING SSH PRIVATE key (the AWS `.pem` / Azure key
     the cloud DB box was launched with) so the console can reach Server One with NO password
     and NO CLI — the universal path for cloud key-only boxes (EC2/Azure don't have SSH
     passwords). Security: the key is written 0600 to a FIXED console-owned path (never a
