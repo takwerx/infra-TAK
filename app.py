@@ -52140,6 +52140,74 @@ def takserver_webadmin_authentik_status():
 
 @app.route('/api/takserver/connect-ldap', methods=['POST'])
 @login_required
+def _ensure_authentik_ldap_user_bind_ready(log_fn=None):
+    """Run the Authentik-side fixes that let REGULAR (non-webadmin) LDAP users bind and
+    self-register via QR. This is the *user-bind half* of 'Resync LDAP to TAK Server'
+    (takserver_connect_ldap), factored out so the TAK Server DEPLOY auto-connect can run
+    it too:
+      (1) strip the recursion-causing `password_stage` from the LDAP blueprint,
+      (2) clear the identification-stage password_stage / ensure the 3 ldap-* flow
+          bindings (_ensure_ldap_flow_authentication_none),
+      (3) remove the restrictive app policy that blocks QR registration for non-admins
+          (_ensure_app_access_policies).
+    WHY: the deploy auto-connect only ran _apply_ldap_to_coreconfig (TAK-side CoreConfig
+    wiring), so webadmin/8446 worked but a Portal-created user connected-but-never-
+    appeared on the Marti dashboard until the operator manually clicked Resync. Best-
+    effort: logs and continues on any sub-step failure (never aborts the deploy). Returns
+    (ok, summary). Keep in lockstep with the inline prep in takserver_connect_ldap below."""
+    def _log(m):
+        if log_fn:
+            try: log_fn(m)
+            except Exception: pass
+    msgs = []
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    is_remote_ak = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
+    # (1) Blueprint: remove recursion-causing password_stage (local or remote)
+    try:
+        if is_remote_ak:
+            ok_bp, out = _module_run(ak_cfg, "grep -q 'password_stage: !KeyOf ldap-authentication-password' ~/authentik/blueprints/tak-ldap-setup.yaml 2>/dev/null && sed -i '/password_stage: !KeyOf ldap-authentication-password/d' ~/authentik/blueprints/tak-ldap-setup.yaml && cd ~/authentik && docker compose restart worker 2>&1; echo BP_DONE", timeout=120)
+            if ok_bp and 'restart' in (out or '').lower():
+                time.sleep(10)
+            msgs.append('blueprint(remote) checked')
+        else:
+            bp_path = os.path.expanduser('~/authentik/blueprints/tak-ldap-setup.yaml')
+            if os.path.exists(bp_path):
+                with open(bp_path, 'r') as f:
+                    content = f.read()
+                if 'password_stage: !KeyOf ldap-authentication-password' in content:
+                    content = content.replace('      password_stage: !KeyOf ldap-authentication-password\n', '')
+                    with open(bp_path, 'w') as f:
+                        f.write(content)
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'worker']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+                    time.sleep(50)  # let blueprint reconcile + update identification stage
+                    msgs.append('blueprint(local) fixed')
+                else:
+                    msgs.append('blueprint(local) already clean')
+    except Exception as e:
+        msgs.append(f'blueprint skip ({str(e)[:60]})')
+    # (2) Flow: clear identification password_stage, ensure the 3 ldap-* bindings
+    try:
+        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+        msgs.append('flow OK' if ok_flow else f'flow: {err_flow}')
+    except Exception as e:
+        msgs.append(f'flow skip ({str(e)[:60]})')
+    # (3) App policies: open the LDAP app to all authenticated users (QR registration)
+    try:
+        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+        if ak_token:
+            ak_url = _get_authentik_api_url(settings)
+            _ensure_app_access_policies(ak_url, {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}, lambda m: msgs.append(m.strip()))
+            msgs.append('app policies OK')
+        else:
+            msgs.append('app policies skipped (no AK token)')
+    except Exception as e:
+        msgs.append(f'app policies skip ({str(e)[:60]})')
+    summary = '; '.join(msgs)
+    _log(summary)
+    return True, summary
+
+
 def takserver_connect_ldap():
     """One-shot: fix LDAP blueprint (remove recursion-causing password_stage), fix flow auth, ensure LDAP app open to all users (QR registration), ensure service account, ensure webadmin, patch CoreConfig, restart TAK Server."""
     diag = []
@@ -56900,6 +56968,16 @@ def _deploy_takserver_container(config):
                 ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
                 if ldap_ok:
                     log_step(f"✓ {ldap_msg}")
+                    # Also run the Authentik-side user-bind fixes (blueprint + flow + app
+                    # policies). Without these the deploy wires only the TAK side, so
+                    # webadmin/8446 works but a Portal-created user connects-but-never-
+                    # appears on the Marti dashboard until a manual 'Resync LDAP'. Best-
+                    # effort / non-fatal — never blocks the deploy.
+                    try:
+                        _ub_ok, _ub_msg = _ensure_authentik_ldap_user_bind_ready()
+                        log_step(f"  LDAP user-bind prep (Portal users): {(_ub_msg or '')[:180]}")
+                    except Exception as _ube:
+                        log_step(f"  ⚠ LDAP user-bind prep skipped: {str(_ube)[:120]} — run 'Resync LDAP to TAK Server' if Portal users don't appear")
                 else:
                     log_step(f"⚠ LDAP auto-connect: {ldap_msg} — use 'Connect TAK Server to LDAP' after deploy")
         except Exception as e:
@@ -57488,6 +57566,16 @@ def run_takserver_deploy(config):
                 ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
                 if ldap_ok:
                     log_step(f"✓ {ldap_msg}")
+                    # Also run the Authentik-side user-bind fixes (blueprint + flow + app
+                    # policies). Without these the deploy wires only the TAK side, so
+                    # webadmin/8446 works but a Portal-created user connects-but-never-
+                    # appears on the Marti dashboard until a manual 'Resync LDAP'. Best-
+                    # effort / non-fatal — never blocks the deploy.
+                    try:
+                        _ub_ok, _ub_msg = _ensure_authentik_ldap_user_bind_ready()
+                        log_step(f"  LDAP user-bind prep (Portal users): {(_ub_msg or '')[:180]}")
+                    except Exception as _ube:
+                        log_step(f"  ⚠ LDAP user-bind prep skipped: {str(_ube)[:120]} — run 'Resync LDAP to TAK Server' if Portal users don't appear")
                 else:
                     log_step(f"⚠ LDAP auto-connect: {ldap_msg} — use 'Connect TAK Server to LDAP' after deploy")
         except Exception as e:
