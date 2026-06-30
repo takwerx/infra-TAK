@@ -49939,9 +49939,15 @@ def _apply_ldap_to_coreconfig():
     # Verified: TAK-in-container preserves CoreConfig across `docker restart`, so a
     # plain restart suffices. Native branch is byte-identical to pre-v10.
     if _tak_is_container():
-        r = subprocess.run(_tak_systemctl('restart') + ' 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(_tak_systemctl('restart') + ' 2>&1', shell=True, capture_output=True, text=True, timeout=240)
     else:
-        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=60)
+        # v10.0.5: `systemctl restart takserver` BLOCKS until the unit's ExecStart
+        # returns, which on a native TAK (esp. a fresh box / remote split DB) routinely
+        # takes 100s+ (Step-7 deploy restart was observed at ~106s). The old 60s cap
+        # raised TimeoutExpired mid-restart → the LDAP connector was on disk but the
+        # auto-connect reported a misleading "⚠ LDAP auto-connect failed: …systemctl
+        # restart…", forcing a manual "Connect TAK Server to LDAP". 240s clears it.
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=240)
     if r.returncode != 0:
         return False, f'CoreConfig patched but TAK Server restart failed: {r.stderr.strip()[:120]}'
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
