@@ -7042,15 +7042,29 @@ def takserver_two_server_deploy_server_two():
     except Exception:
         pass
 
-    # Install core .deb
-    try:
-        r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', f'./{core_pkg}']], 'and', timeout=600, cwd=UPLOAD_DIR)
-        log.append(r.stdout or '')
-        log.append(r.stderr or '')
-        if r.returncode != 0:
-            return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'apt install failed')[:500], 'log': log}), 400
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:400], 'log': log}), 400
+    # Install the core package — Debian: apt; RHEL/Rocky: dnf (+ the repo prereqs the
+    # takserver-core rpm needs), mirroring the proven single-server RHEL deploy (Step 2/4).
+    if _distro_family() == 'rhel':
+        _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+        run_cmd('dnf install -y epel-release 2>&1', check=False, quiet=True)
+        run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', check=False, quiet=True)
+        run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
+        run_cmd('dnf install -y java-17-openjdk-devel 2>&1', check=False, quiet=True)
+        run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
+        _core_ok = run_cmd(f'cd {UPLOAD_DIR} && dnf install -y ./{core_pkg} --setopt=clean_requirements_on_remove=false 2>&1', "Installing takserver-core (dnf)...")
+        run_cmd(f'alternatives --set java java-17-openjdk.{_pg_arch} 2>/dev/null; true', check=False, quiet=True)
+        log.append('takserver-core installed via dnf (RHEL).' if _core_ok else 'takserver-core dnf install FAILED — see deploy log.')
+        if not _core_ok:
+            return jsonify({'success': False, 'error': 'Core package install (dnf) failed on Server Two — check the deploy log for the dnf error.', 'log': log}), 400
+    else:
+        try:
+            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', f'./{core_pkg}']], 'and', timeout=600, cwd=UPLOAD_DIR)
+            log.append(r.stdout or '')
+            log.append(r.stderr or '')
+            if r.returncode != 0:
+                return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'apt install failed')[:500], 'log': log}), 400
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)[:400], 'log': log}), 400
 
     # Patch CoreConfig.xml: JDBC URL and DB password
     core_config = '/opt/tak/CoreConfig.xml'
