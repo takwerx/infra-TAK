@@ -7068,6 +7068,11 @@ def takserver_two_server_deploy_server_two():
 
     # Patch CoreConfig.xml: JDBC URL and DB password
     core_config = '/opt/tak/CoreConfig.xml'
+    # RHEL: the takserver-core rpm ships CoreConfig.example.xml (not CoreConfig.xml). Seed it
+    # so the JDBC patch below runs (mirrors the single-server RHEL deploy); else TAK keeps the
+    # default localhost JDBC and never connects to Server One.
+    if _distro_family() == 'rhel' and not os.path.exists(core_config) and os.path.exists('/opt/tak/CoreConfig.example.xml'):
+        run_cmd('cp /opt/tak/CoreConfig.example.xml /opt/tak/CoreConfig.xml 2>&1; chown tak:tak /opt/tak/CoreConfig.xml 2>/dev/null; true', check=False, quiet=True)
     if os.path.exists(core_config):
         try:
             # v10.0.5 non-root: read/write CoreConfig via the broker (literal `sudo
