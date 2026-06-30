@@ -6519,6 +6519,29 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         log.append('DB credential verified on Server One.' if pw_ok else f'Warning: captured password failed validation ({pw_msg}).')
     else:
         log.append('Warning: could not read DB password from Server One CoreConfig.')
+
+    # Step 7: build the TAK schema (RHEL-only). The .noarch.rpm deliberately does NOT run
+    # SchemaManager — its own takserver-setup-db.sh says it "cannot be run by the RPM installer
+    # and must be a manual post-install step." (The Debian .deb's postinst DOES build the schema,
+    # which is why the .deb split never needed this.) Without it the cot DB comes up with the
+    # martiuser role + database but ZERO tables, so the core 500s on /oauth/token ("relation
+    # group_bitpos_sequence does not exist") and 8446 login fails. Run SchemaManager explicitly
+    # (idempotent 'upgrade' — reports "up to date" on re-runs; java + SchemaManager.jar both ship
+    # with takserver-database). Field-validated on aws-rocky1: 93 updates, cot 0→60 tables.
+    if db_pkg_path and db_password:
+        schema_cmd = (
+            'if [ -f /opt/tak/db-utils/SchemaManager.jar ]; then '
+            'cd /opt/tak/db-utils && sudo java -jar SchemaManager.jar '
+            f'-url jdbc:postgresql://127.0.0.1:{db_port}/cot -user martiuser '
+            f'-password {shlex.quote(db_password)} upgrade 2>&1 | tail -8; '
+            'else echo NO_SCHEMA_MANAGER; fi'
+        )
+        _, scout = _ssh_probe(s1, schema_cmd, timeout=240)
+        if 'up to date' in (scout or '') or 'Successfully applied' in (scout or ''):
+            log.append('TAK schema built on Server One (SchemaManager upgrade).')
+        else:
+            log.append('WARNING: TAK schema build did not confirm — the cot DB may have no tables '
+                       '(8446 login will 500). Output: ' + (scout or '')[:400])
     return True, log, db_password
 
 
