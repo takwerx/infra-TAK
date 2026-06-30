@@ -52160,52 +52160,69 @@ def _ensure_authentik_ldap_user_bind_ready(log_fn=None):
             try: log_fn(m)
             except Exception: pass
     msgs = []
-    settings = load_settings()
-    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
-    is_remote_ak = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
-    # (1) Blueprint: remove recursion-causing password_stage (local or remote)
+    # The deploy auto-connect calls this from a BACKGROUND THREAD with no Flask request
+    # context. Some Authentik helpers in the chain touch request-scoped globals (the audit
+    # log / session host read request.headers), which raises "Working outside of request
+    # context" — fine from the Resync button (a real request), fatal from the deploy thread.
+    # Push a throwaway request context so they resolve. The Authentik API URL is the fixed
+    # internal 127.0.0.1:9090 (NOT derived from request host), so this changes nothing the
+    # helper persists. Always popped in finally.
     try:
-        if is_remote_ak:
-            ok_bp, out = _module_run(ak_cfg, "grep -q 'password_stage: !KeyOf ldap-authentication-password' ~/authentik/blueprints/tak-ldap-setup.yaml 2>/dev/null && sed -i '/password_stage: !KeyOf ldap-authentication-password/d' ~/authentik/blueprints/tak-ldap-setup.yaml && cd ~/authentik && docker compose restart worker 2>&1; echo BP_DONE", timeout=120)
-            if ok_bp and 'restart' in (out or '').lower():
-                time.sleep(10)
-            msgs.append('blueprint(remote) checked')
-        else:
-            bp_path = os.path.expanduser('~/authentik/blueprints/tak-ldap-setup.yaml')
-            if os.path.exists(bp_path):
-                with open(bp_path, 'r') as f:
-                    content = f.read()
-                if 'password_stage: !KeyOf ldap-authentication-password' in content:
-                    content = content.replace('      password_stage: !KeyOf ldap-authentication-password\n', '')
-                    with open(bp_path, 'w') as f:
-                        f.write(content)
-                    subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'worker']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
-                    time.sleep(50)  # let blueprint reconcile + update identification stage
-                    msgs.append('blueprint(local) fixed')
-                else:
-                    msgs.append('blueprint(local) already clean')
-    except Exception as e:
-        msgs.append(f'blueprint skip ({str(e)[:60]})')
-    # (2) Flow: clear identification password_stage, ensure the 3 ldap-* bindings
+        _req_ctx = app.test_request_context()
+        _req_ctx.push()
+    except Exception:
+        _req_ctx = None
     try:
-        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
-        msgs.append('flow OK' if ok_flow else f'flow: {err_flow}')
-    except Exception as e:
-        msgs.append(f'flow skip ({str(e)[:60]})')
-    # (3) App policies: open the LDAP app to all authenticated users (QR registration)
-    try:
-        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
-        if ak_token:
-            ak_url = _get_authentik_api_url(settings)
-            _ensure_app_access_policies(ak_url, {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}, lambda m: msgs.append(m.strip()))
-            msgs.append('app policies OK')
-        else:
-            msgs.append('app policies skipped (no AK token)')
-    except Exception as e:
-        msgs.append(f'app policies skip ({str(e)[:60]})')
-    summary = '; '.join(msgs)
-    _log(summary)
-    return True, summary
+        settings = load_settings()
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        is_remote_ak = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
+        # (1) Blueprint: remove recursion-causing password_stage (local or remote)
+        try:
+            if is_remote_ak:
+                ok_bp, out = _module_run(ak_cfg, "grep -q 'password_stage: !KeyOf ldap-authentication-password' ~/authentik/blueprints/tak-ldap-setup.yaml 2>/dev/null && sed -i '/password_stage: !KeyOf ldap-authentication-password/d' ~/authentik/blueprints/tak-ldap-setup.yaml && cd ~/authentik && docker compose restart worker 2>&1; echo BP_DONE", timeout=120)
+                if ok_bp and 'restart' in (out or '').lower():
+                    time.sleep(10)
+                msgs.append('blueprint(remote) checked')
+            else:
+                bp_path = os.path.expanduser('~/authentik/blueprints/tak-ldap-setup.yaml')
+                if os.path.exists(bp_path):
+                    with open(bp_path, 'r') as f:
+                        content = f.read()
+                    if 'password_stage: !KeyOf ldap-authentication-password' in content:
+                        content = content.replace('      password_stage: !KeyOf ldap-authentication-password\n', '')
+                        with open(bp_path, 'w') as f:
+                            f.write(content)
+                        subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'worker']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+                        time.sleep(50)  # let blueprint reconcile + update identification stage
+                        msgs.append('blueprint(local) fixed')
+                    else:
+                        msgs.append('blueprint(local) already clean')
+        except Exception as e:
+            msgs.append(f'blueprint skip ({str(e)[:60]})')
+        # (2) Flow: clear identification password_stage, ensure the 3 ldap-* bindings
+        try:
+            ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+            msgs.append('flow OK' if ok_flow else f'flow: {err_flow}')
+        except Exception as e:
+            msgs.append(f'flow skip ({str(e)[:60]})')
+        # (3) App policies: open the LDAP app to all authenticated users (QR registration)
+        try:
+            ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+            if ak_token:
+                ak_url = _get_authentik_api_url(settings)
+                _ensure_app_access_policies(ak_url, {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}, lambda m: msgs.append(m.strip()))
+                msgs.append('app policies OK')
+            else:
+                msgs.append('app policies skipped (no AK token)')
+        except Exception as e:
+            msgs.append(f'app policies skip ({str(e)[:60]})')
+        summary = '; '.join(msgs)
+        _log(summary)
+        return True, summary
+    finally:
+        if _req_ctx is not None:
+            try: _req_ctx.pop()
+            except Exception: pass
 
 
 def takserver_connect_ldap():
