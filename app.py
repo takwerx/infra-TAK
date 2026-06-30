@@ -6419,8 +6419,10 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     _, _ar = _ssh_probe(s1, 'uname -m', timeout=10)
     el_arch = 'aarch64' if ('aarch64' in (_ar or '') or 'arm64' in (_ar or '')) else 'x86_64'
     # Reusable SSH snippets: discover the PG data dir + service name (PGDG postgresql-15 vs base).
-    PGDATA = ('PGDATA=$(ls -d /var/lib/pgsql/*/data 2>/dev/null | sort -V | tail -1); '
-              '[ -z "$PGDATA" ] && [ -d /var/lib/pgsql/data ] && PGDATA=/var/lib/pgsql/data; true')
+    # NB: /var/lib/pgsql is 0700 postgres-owned — the glob MUST run under sudo or it expands
+    # to nothing as the SSH login user (the bug that bit the first run: empty PGDATA).
+    PGDATA = ("PGDATA=$(sudo sh -c 'ls -d /var/lib/pgsql/*/data 2>/dev/null' | sort -V | tail -1); "
+              "[ -z \"$PGDATA\" ] && sudo test -d /var/lib/pgsql/data && PGDATA=/var/lib/pgsql/data; true")
     PGSVC = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; true')
 
     # Step 1: repos — EPEL + PGDG (arch/EL-aware) + disable the system postgresql module + CRB.
@@ -6466,7 +6468,7 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         'if [ -z "$PGDATA" ] || [ ! -f "$PGDATA/PG_VERSION" ]; then '
         '  SETUP=$(ls /usr/pgsql-*/bin/postgresql-*-setup 2>/dev/null | sort -V | tail -1); '
         '  if [ -n "$SETUP" ]; then sudo "$SETUP" initdb 2>&1; else sudo postgresql-setup --initdb 2>&1; fi; '
-        '  PGDATA=$(ls -d /var/lib/pgsql/*/data 2>/dev/null | sort -V | tail -1); [ -z "$PGDATA" ] && PGDATA=/var/lib/pgsql/data; '
+        "  PGDATA=$(sudo sh -c 'ls -d /var/lib/pgsql/*/data 2>/dev/null' | sort -V | tail -1); [ -z \"$PGDATA\" ] && PGDATA=/var/lib/pgsql/data; "
         'fi; '
         'sudo systemctl enable "$PGSVC" 2>/dev/null; sudo systemctl start "$PGSVC" 2>&1; '
         'echo "PGDATA=$PGDATA PGSVC=$PGSVC ACTIVE=$(systemctl is-active "$PGSVC" 2>/dev/null)"'
