@@ -24215,9 +24215,14 @@ def run_cloudtak_deploy(cfg=None):
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
         release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
         if os.path.exists(cloudtak_dir):
-            has_git  = os.path.isdir(os.path.join(cloudtak_dir, '.git'))
-            has_data = os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
-            if has_git:
+            # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
+            # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
+            # which os.path.isdir('.git') wrongly accepts, sending us down the in-place-update
+            # path that then dies "fatal: not a git repository". Ask git, not the filesystem.
+            _isrepo = subprocess.run(
+                f'git -C {cloudtak_dir} -c safe.directory={cloudtak_dir} rev-parse --is-inside-work-tree 2>/dev/null',
+                shell=True, capture_output=True, text=True).stdout.strip() == 'true'
+            if _isrepo:
                 # In-place update — NEVER rm -rf a CloudTAK tree: it holds
                 # .docker-store/ (the upstream `- .docker-store:/data` MinIO
                 # bind-mount), which is LIVE data, root-owned, and undeletable by the
@@ -24243,27 +24248,31 @@ def run_cloudtak_deploy(cfg=None):
                     plog(f"✗ In-place update failed: {(r.stderr or r.stdout or '').strip()[:200]}")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
-            elif has_data:
-                # No usable .git but live MinIO data present — a fresh clone would have
-                # to relocate the root-owned .docker-store, which the non-root console
-                # cannot do. Fail with an actionable message instead of the cryptic
-                # "destination path already exists and is not an empty directory".
-                plog("✗ ~/CloudTAK holds live data (.docker-store) but has no usable git checkout.")
-                plog(f"  A root operator must move or remove {cloudtak_dir}/.docker-store, then redeploy.")
-                cloudtak_deploy_status.update({'running': False, 'error': True})
-                return
             else:
-                # Empty/foreign dir — no .git, no live data — safe to clear and clone fresh.
-                plog(f"  ~/CloudTAK exists (no git, no data) — cloning {release_tag or 'latest'} fresh...")
-                subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=60)
-                _branch_flag = f' --branch {release_tag}' if release_tag else ''
+                # Dir exists but has NO valid git checkout (hollow/partial .git from an
+                # interrupted clone or a delete that left a stub). Don't rm the whole tree — it
+                # may hold .docker-store MinIO data. REPAIR the checkout IN PLACE: drop only the
+                # broken .git, re-init, fetch the target tag, checkout -f. Tracked source is
+                # restored; untracked .docker-store / .env / docker-compose.override.yml are left
+                # untouched. If the tree is root-owned (can't rm .git) the git ops fail and we
+                # surface an actionable message rather than the cryptic clone/update error.
+                plog(f"  ~/CloudTAK has no valid git checkout — repairing in place to {release_tag or 'latest'} (preserving data)...")
+                if release_tag:
+                    _fetchco = (f'git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && '
+                                f'git -c safe.directory={cloudtak_dir} checkout -f {release_tag}')
+                else:
+                    _fetchco = (f'git -c safe.directory={cloudtak_dir} fetch --depth 1 origin HEAD && '
+                                f'git -c safe.directory={cloudtak_dir} checkout -f FETCH_HEAD')
                 r = subprocess.run(
-                    f'git clone --depth 1{_branch_flag} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}',
+                    f'cd {cloudtak_dir} && rm -rf .git && git init -q && '
+                    f'git remote add origin https://github.com/dfpc-coe/CloudTAK.git && ' + _fetchco,
                     shell=True, capture_output=True, text=True, timeout=600)
                 if r.returncode != 0:
-                    plog(f"✗ Clone failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+                    plog(f"✗ In-place repair failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+                    plog(f"  If {cloudtak_dir} holds root-owned data, a root operator must clear it, then redeploy.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+                _cloudtak_git_prep(cloudtak_dir, plog)
         else:
             release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
             tag_label = release_tag or 'main (latest release tag unavailable)'
