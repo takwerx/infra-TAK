@@ -63130,6 +63130,76 @@ def _startup_ensure_hardening_posture():
 _startup_ensure_hardening_posture()
 
 
+def _startup_ensure_server_one_ssh_key():
+    """v10.0.5: re-home the split Server One SSH key for the non-root console ON STARTUP, so the
+    fix ships via a normal UPDATE (git pull + restart) — NOT only `sudo ./start.sh`. Fixes reach
+    the fleet through updates, and a restart re-runs app.py, not start.sh; a re-home gated behind
+    start.sh's provision_nonroot never reaches an updated box.
+
+    A ROOT-era split stored server_one.ssh_key_path under /root/.ssh, which the takwerx console
+    can't read (can't traverse /root) → console->Server One SSH dead (Guard Dog DB-auth watch,
+    remote-DB monitor, DB migration, Sync DB Password). Read the key via the BROKER (root) and
+    copy it into /home/takwerx/.ssh (same material — Server One already trusts it), then rewrite
+    the stored path. Idempotent; only acts as the NON-ROOT console when the stored key is not
+    already under the console home. Root console reads /root directly, so it's a no-op there."""
+    try:
+        if os.getuid() == 0:
+            return
+        settings = load_settings()
+        td = settings.get('tak_deployment') or {}
+        if (td.get('mode') or '') != 'two_server':
+            return
+        s1 = td.get('server_one') or {}
+        kp = (s1.get('ssh_key_path') or '').strip()
+        if not kp:
+            return
+        home = os.path.expanduser('~').rstrip('/')
+        if kp.startswith(home + '/'):
+            return  # already re-homed
+        ssh_dir = os.path.join(home, '.ssh')
+        dst = os.path.join(ssh_dir, os.path.basename(kp))
+        # Already have a readable copy in the console home? Just fix the stored path.
+        if os.path.isfile(dst) and os.access(dst, os.R_OK):
+            s1['ssh_key_path'] = dst; td['server_one'] = s1
+            settings['tak_deployment'] = td; save_settings(settings)
+            print('[startup-ssh] Server One key already at %s; stored path updated' % dst, flush=True)
+            return
+        # Wait briefly for the broker (started by _startup_ensure_broker) so _read_priv works.
+        if _broker_should_route():
+            for _ in range(20):
+                if _broker_available():
+                    break
+                time.sleep(0.25)
+        try:
+            key_data = _read_priv(kp)   # broker reads the root-owned key
+        except Exception as e:
+            print('[startup-ssh] could not read Server One key %s via broker: %s' % (kp, str(e)[:120]), flush=True)
+            return
+        if not key_data or 'PRIVATE KEY' not in key_data:
+            print('[startup-ssh] Server One key %s unreadable/empty — leaving path unchanged (needs re-key)' % kp, flush=True)
+            return
+        os.makedirs(ssh_dir, exist_ok=True)
+        os.chmod(ssh_dir, 0o700)
+        with open(dst, 'w') as f:
+            f.write(key_data if key_data.endswith('\n') else key_data + '\n')
+        os.chmod(dst, 0o600)
+        try:
+            pub = _read_priv(kp + '.pub')
+            if pub and 'ssh-' in pub:
+                with open(dst + '.pub', 'w') as f:
+                    f.write(pub if pub.endswith('\n') else pub + '\n')
+                os.chmod(dst + '.pub', 0o644)
+        except Exception:
+            pass
+        s1['ssh_key_path'] = dst; td['server_one'] = s1
+        settings['tak_deployment'] = td; save_settings(settings)
+        print('[startup-ssh] re-homed Server One SSH key %s -> %s (console->Server One SSH restored)' % (kp, dst), flush=True)
+    except Exception as e:
+        print('[startup-ssh] skipped (non-fatal): %s' % str(e)[:160], flush=True)
+
+_startup_ensure_server_one_ssh_key()
+
+
 # v0.9.58 (#6): startup migration — re-apply the trusted-upstream ignoreip to every
 # enabled fail2ban jail on boot, so the gateway/VNet whitelist + the mediamtx/recidive
 # baseline activate on a plain restart, not only when an operator next touches a jail
