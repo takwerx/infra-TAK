@@ -7096,13 +7096,15 @@ def takserver_two_server_deploy_server_two():
             'detail': msg_pw,
         }), 400
 
-    # Increase concurrent TCP connections per TAK guide
+    # Increase concurrent TCP connections per TAK guide.
+    # v10.0.5 non-root: `| sudo tee -a` is dead for takwerx — append via the broker.
     try:
-        subprocess.run(
-            'grep -q "soft nofile 32768" /etc/security/limits.conf 2>/dev/null || '
-            'printf "* soft nofile 32768\\n* hard nofile 32768\\n" | sudo tee -a /etc/security/limits.conf > /dev/null',
-            shell=True, capture_output=True, text=True, timeout=10
-        )
+        try:
+            _lc = _read_priv('/etc/security/limits.conf')
+        except Exception:
+            _lc = ''
+        if 'soft nofile 32768' not in _lc:
+            _write_priv('/etc/security/limits.conf', '* soft nofile 32768\n* hard nofile 32768\n', mode='a')
     except Exception:
         pass
 
@@ -13709,7 +13711,7 @@ def _fedhub_copy_file(cfg, src, dst_dir, timeout=300):
         return _scp_to_host(cfg['remote'], src, dst_dir, timeout=timeout)
     try:
         dst = os.path.join(dst_dir, os.path.basename(src))
-        r = subprocess.run(['sudo', 'cp', src, dst], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(_sudo_wrap(['cp', src, dst]), capture_output=True, text=True, timeout=60)  # v10.0.5 non-root
         return r.returncode == 0, (r.stdout + r.stderr).strip() or f'Copied to {dst}'
     except Exception as e:
         return False, str(e)
@@ -15776,7 +15778,15 @@ def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
             # on privileged paths) route through the root broker. No-op as root /
             # without the broker (shims fall through to the real binary).
             _env = _broker_shim_env()
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+            # The shims intercept BARE binaries, not a literal `sudo ` prefix — a co-located
+            # module command like `sudo ufw …`/`sudo systemctl …` would invoke /usr/bin/sudo
+            # and die (takwerx has no sudo). Under the non-root console, strip a leading `sudo `
+            # (at a command-segment start) so the bare binary routes through the shim/broker.
+            # Preserve `sudo -u X`/`sudo -n …` (run-as-user / gated-remote) — never strip those.
+            _cmd = cmd
+            if _env is not None:
+                _cmd = re.sub(r'(^|[;&|`(]\s*)sudo\s+(?=[^-\s])', r'\1', cmd)
+            r = subprocess.run(_cmd, shell=True, capture_output=True, text=True,
                                timeout=timeout, env=_env)
             return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
         except Exception as e:
@@ -43954,7 +43964,15 @@ def _autotune_log(msg):
     and applier so the whole story for a box is in one tailable file.
     """
     try:
-        os.makedirs(os.path.dirname(_AUTOTUNE_LOG_PATH), exist_ok=True)
+        _dir = os.path.dirname(_AUTOTUNE_LOG_PATH)
+        if not (os.path.isdir(_dir) and os.access(_dir, os.W_OK)):
+            # v10.0.5 non-root: /var/log/takguard is root-owned — create it + hand it to takwerx
+            # ONCE (guarded by os.access) so these frequent log appends need no per-line broker call.
+            try:
+                _makedirs_priv(_dir)
+                subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', _dir]), capture_output=True, timeout=10)
+            except Exception:
+                pass
         import datetime as _dt
         _ts = _dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         _line = f"{_ts} | {msg}\n"
