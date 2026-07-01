@@ -26222,28 +26222,47 @@ def webodm_reset_password():
 
 _webodm_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
 
+def _webodm_dir():
+    """Resolve the real local WebODM install dir. Fresh born-non-root installs live at ~/webodm;
+    a box FLIPPED from root keeps it at /root/webodm (WebODM is deliberately NOT auto-re-homed —
+    absolute binds + a special-uid Postgres data dir). Returns whichever actually holds a compose
+    file (broker-checked, since takwerx can't stat /root), else ~/webodm."""
+    home = os.path.join(os.path.expanduser('~'), 'webodm')
+    if os.path.exists(os.path.join(home, 'docker-compose.yml')):
+        return home
+    try:
+        if subprocess.run(_sudo_wrap(['test', '-f', '/root/webodm/docker-compose.yml']),
+                          capture_output=True, timeout=10).returncode == 0:
+            return '/root/webodm'
+    except Exception:
+        pass
+    return home
+
+def _webodm_compose(wo_dir, action, timeout=300):
+    """Run `docker compose <action>` in the WebODM dir via the broker — root can cd into /root
+    on a flipped box (takwerx can't), and docker routes through the broker either way."""
+    return subprocess.run(_sudo_wrap(['bash', '-lc',
+        'cd %s && docker compose %s' % (shlex.quote(wo_dir), action)]),
+        capture_output=True, text=True, timeout=timeout)
+
 def _run_webodm_update():
-    import subprocess as _sp
     global _webodm_update_status
-    wo_dir = os.path.expanduser('~/webodm')
-    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
     log = []
     def plog(msg):
         log.append(msg)
         _webodm_update_status['log'] = list(log)
     try:
         plog('Pulling latest WebODM images…')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'pull']),
-                    capture_output=True, text=True, timeout=300, cwd=wo_dir)
+        r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
         if r.returncode != 0:
-            raise RuntimeError(f'docker compose pull failed: {r.stderr[:300]}')
+            raise RuntimeError(f'docker compose pull failed: {(r.stderr or "")[:300]}')
         plog('Restarting containers with new images…')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d']),
-                    capture_output=True, text=True, timeout=120, cwd=wo_dir)
+        r = _webodm_compose(wo_dir, 'up -d', timeout=120)
         plog(r.stdout[-300:] if r.stdout else '(no output)')
         if r.returncode != 0:
-            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+            raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
         plog('Update complete.')
         _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -26342,17 +26361,12 @@ def webodm_uninstall():
         _module_run(deploy_cfg, f'rm -rf {wo_dir_remote}/db 2>/dev/null; true', timeout=15)
     else:
         import shutil as _sh
-        wo_dir = os.path.expanduser('~/webodm')
-        compose_path = os.path.join(wo_dir, 'docker-compose.yml')
-        if os.path.exists(compose_path):
-            _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'down', '--volumes']),
-                    capture_output=True, timeout=90, cwd=wo_dir)
-        db_dir = os.path.join(wo_dir, 'db')
-        if os.path.isdir(db_dir):
-            try:
-                _sh.rmtree(db_dir)
-            except Exception:
-                _sp.run(['rm', '-rf', db_dir], capture_output=True)
+        wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
+        if subprocess.run(_sudo_wrap(['test', '-f', os.path.join(wo_dir, 'docker-compose.yml')]),
+                          capture_output=True, timeout=10).returncode == 0:
+            _webodm_compose(wo_dir, 'down --volumes', timeout=90)
+        # Remove the Postgres data dir via the broker (root-owned on a flipped box); media/ is kept.
+        subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(wo_dir, 'db')]), capture_output=True, timeout=60)
     s['webodm_enabled'] = False
     deploy_cfg['deployed'] = False
     s['webodm_deployment'] = _normalize_module_deployment_config(deploy_cfg)
@@ -63351,8 +63365,11 @@ for _rh_sub, _rh_ctr in (
     ('CloudTAK',   'cloudtak-api'),
     ('netbird',    'netbird-server'),
     ('node-red',   'nodered'),
-    ('webodm',     'webapp'),
     ('authentik',  'authentik-server'),
+    # NB: WebODM is deliberately NOT auto-re-homed. Its compose uses ABSOLUTE /root/webodm binds
+    # AND its Postgres data dir (/root/webodm/db) is owned by a container-mapped uid — a blanket
+    # `chown -R takwerx` on a move would break Postgres and lose the WebODM DB. On a flipped box
+    # WebODM stays at /root; its console management resolves the dir via _webodm_dir() + broker.
 ):
     _startup_rehome_module(_rh_sub, _rh_ctr)
 
