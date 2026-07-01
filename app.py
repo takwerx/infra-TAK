@@ -1973,13 +1973,10 @@ def detect_modules():
             if (re.stdout or '').strip() == 'disabled':
                 for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
                     if os.path.exists(path):
-                        try:
-                            os.remove(path)
-                        except Exception:
-                            _run(f'rm -f {path}', shell=True, capture_output=True)
+                        _run(_sudo_wrap(['rm', '-f', path]), capture_output=True, timeout=10)  # v10.0.5 non-root: /usr root-owned
                 if os.path.exists('/etc/caddy'):
-                    _run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
-                _run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+                    _run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
+                _run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
                 caddy_installed = False
     modules['caddy'] = {'name': 'Caddy SSL', 'installed': caddy_installed, 'running': caddy_running,
         'description': "Domain setup, Let's Encrypt SSL & reverse proxy" if not has_fqdn else f"SSL & reverse proxy — {settings.get('fqdn', '')}",
@@ -20916,16 +20913,13 @@ def mediamtx_recovery():
             try:
                 with urllib.request.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as r:
                     content = r.read().decode('utf-8')
-                with open(editor_path, 'w') as f:
-                    f.write(content)
-                subprocess.run(
-                    f"sed -i 's/port=5000/port=5080/' {editor_path} 2>/dev/null; "
-                    f"sed -i 's/9997/9898/g' {editor_path} 2>/dev/null; "
-                    f"sed -i \"s/host='0\\.0\\.0\\.0'/host='127.0.0.1'/\" {editor_path} 2>/dev/null",
-                    shell=True,
-                    capture_output=True,
-                    timeout=10,
-                )
+                # v10.0.5 non-root: apply the bind-hardening patches in Python, then write via the
+                # broker (/opt/mediamtx-webeditor is root-owned on root-era installs; the old
+                # open('w') + `sed -i` failed as takwerx, leaving the editor bound to 0.0.0.0).
+                content = (content.replace('port=5000', 'port=5080')
+                                  .replace('9997', '9898')
+                                  .replace("host='0.0.0.0'", "host='127.0.0.1'"))
+                _write_priv(editor_path, content)
             except Exception:
                 pass  # keep existing file and just re-apply patches
         # 2) Apply endpoint patch only (keep core External Sources rendering unchanged)
@@ -20944,12 +20938,13 @@ def mediamtx_recovery():
                 if copy_ok:
                     _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
         else:
-            if os.path.isfile(editor_path):
-                with open(editor_path) as f:
-                    src = f.read()
-                src = _mediamtx_editor_endpoint_patch(src)
-                with open(editor_path, 'w') as f:
-                    f.write(src)
+            try:
+                src = _read_priv(editor_path)   # v10.0.5 non-root: broker (root-owned dir)
+                if src:
+                    src = _mediamtx_editor_endpoint_patch(src)
+                    _write_priv(editor_path, src)
+            except Exception:
+                pass
         # 3) Always sync live overlay file from current infra-TAK repo to target.
         # This prevents stale overlay scripts on existing installs from injecting old UI logic.
         try:
@@ -64392,31 +64387,23 @@ def _selfheal_takserver_half_configured(plog=None):
     if not os.path.isfile(postinst):
         return
     backup = postinst + '.infratak-selfheal-bak'
-    try:
-        shutil.copy2(postinst, backup)
-    except Exception as e:
-        _log(f'takserver self-heal: could not back up postinst ({e}) — skipping.')
+    # v10.0.5 non-root: /var/lib/dpkg/info is root-owned — back up / patch / restore via the broker.
+    _bk = subprocess.run(_sudo_wrap(['cp', '-p', postinst, backup]), capture_output=True, text=True, timeout=15)
+    if _bk.returncode != 0:
+        _log(f'takserver self-heal: could not back up postinst ({(_bk.stderr or "").strip()[:120]}) — skipping.')
         return
-
     try:
-        with open(postinst, 'w') as f:
-            f.write('#!/bin/sh\nexit 0\n')
-        os.chmod(postinst, 0o755)
-        subprocess.run(['dpkg', '--configure', 'takserver'],
+        _write_priv(postinst, '#!/bin/sh\nexit 0\n', perm=0o755)
+        subprocess.run(_sudo_wrap(['dpkg', '--configure', 'takserver']),
                        capture_output=True, text=True, timeout=180)
     except Exception as e:
         _log(f'takserver self-heal: dpkg --configure error ({e}).')
     finally:
         # ALWAYS restore the real postinst, no matter what happened above.
-        try:
-            shutil.move(backup, postinst)
-        except Exception:
-            try:
-                if os.path.exists(backup):
-                    shutil.copy2(backup, postinst)
-                    os.remove(backup)
-            except Exception:
-                pass
+        _rs = subprocess.run(_sudo_wrap(['mv', backup, postinst]), capture_output=True, timeout=15)
+        if _rs.returncode != 0:
+            subprocess.run(_sudo_wrap(['cp', '-p', backup, postinst]), capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['rm', '-f', backup]), capture_output=True, timeout=10)
 
     try:
         v = subprocess.run(['dpkg-query', '-W', '-f=${Status}', 'takserver'],
@@ -65589,28 +65576,18 @@ def _post_update_auto_deploy():
             # Must be tak:tak 600 — makeCert.sh sources it as user 'tak'; root:root 600 breaks
             # TAK Portal integration cert download with "cert-metadata.sh: Permission denied".
             _cm = '/opt/tak/certs/cert-metadata.sh'
-            if os.path.exists(_cm):
+            # v10.0.5 non-root: the takwerx console can't traverse tak-owned /opt/tak/certs to
+            # os.stat/chown/chmod this file — do it all through the broker (idempotent re-assert).
+            if subprocess.run(_sudo_wrap(['test', '-f', _cm]), capture_output=True, timeout=10).returncode == 0:
                 try:
-                    import stat, pwd, grp
-                    st = os.stat(_cm)
-                    tak_uid = pwd.getpwnam('tak').pw_uid
-                    tak_gid = grp.getgrnam('tak').gr_gid
-                    _want_mode = stat.S_IRUSR | stat.S_IWUSR  # 0o600
-                    _fixed = []
-                    if st.st_uid != tak_uid or st.st_gid != tak_gid:
-                        os.chown(_cm, tak_uid, tak_gid)
-                        _fixed.append('ownership→tak:tak')
-                    if (st.st_mode & 0o777) != _want_mode:
-                        os.chmod(_cm, _want_mode)
-                        _fixed.append('mode→600')
-                    if _fixed:
-                        print(f"Post-update: cert-metadata.sh fixed: {', '.join(_fixed)}")
-                    # Validate: source the file as 'tak' and confirm $DIR is populated
+                    subprocess.run(_sudo_wrap(['chown', 'tak:tak', _cm]), capture_output=True, timeout=10)
+                    _chmod_priv(_cm, 0o600)
+                    print("Post-update: cert-metadata.sh ownership/mode re-asserted (tak:tak 600)")
+                    # Validate: source the file as 'tak' via the broker (runuser) and confirm $DIR set.
                     _src_test = subprocess.run(
-                        ['sudo', '-u', 'tak', 'bash', '-c',
-                         'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR"'],
-                        capture_output=True, timeout=10
-                    )
+                        _sudo_wrap(['runuser', '-u', 'tak', '--', 'bash', '-c',
+                                    'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR"']),
+                        capture_output=True, timeout=10)
                     if _src_test.returncode != 0:
                         print("Post-update: WARNING cert-metadata.sh source-test-as-tak FAILED — "
                               "TAK Portal integration cert download may not work. "
@@ -67079,8 +67056,7 @@ def _post_update_auto_deploy():
 
                     _yml_changed = False
                     try:
-                        with open(_mtx_yml, 'r') as _f:
-                            _yml = _f.read()
+                        _yml = _read_priv(_mtx_yml)   # v10.0.5 non-root: /usr/local/etc root-owned
                         _new_yml = _yml
                         # apiAddress :PORT  → 127.0.0.1:PORT  (only when not already loopback)
                         _new_yml = re.sub(
@@ -67091,8 +67067,7 @@ def _post_update_auto_deploy():
                             r'\g<1>127.0.0.1:\g<2>', _new_yml, flags=re.MULTILINE)
                         if _new_yml != _yml:
                             _yml_changed = True
-                            with open(_mtx_yml, 'w') as _f:
-                                _f.write(_new_yml)
+                            _write_priv(_mtx_yml, _new_yml)   # v10.0.5 non-root: broker
                             print("  MediaMTX mediamtx.yml: apiAddress/hlsAddress bound to 127.0.0.1")
                     except Exception as _ye:
                         print(f"  WARNING: mediamtx.yml patch failed: {_ye}")
@@ -67100,14 +67075,12 @@ def _post_update_auto_deploy():
                     _webedit_changed = False
                     if os.path.exists(_webedit_py):
                         try:
-                            with open(_webedit_py, 'r') as _f:
-                                _wp = _f.read()
+                            _wp = _read_priv(_webedit_py)   # v10.0.5 non-root: root-owned dir
                             _new_wp = _wp.replace("host='0.0.0.0'", "host='127.0.0.1'")
                             _new_wp = _new_wp.replace('host="0.0.0.0"', 'host="127.0.0.1"')
                             if _new_wp != _wp:
                                 _webedit_changed = True
-                                with open(_webedit_py, 'w') as _f:
-                                    _f.write(_new_wp)
+                                _write_priv(_webedit_py, _new_wp)   # v10.0.5 non-root: broker
                                 print("  MediaMTX webedit: Flask host bound to 127.0.0.1")
                         except Exception as _we:
                             print(f"  WARNING: mediamtx_config_editor.py patch failed: {_we}")
