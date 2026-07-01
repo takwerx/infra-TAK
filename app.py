@@ -2003,10 +2003,19 @@ def detect_modules():
         ok, out = _ssh_probe(ak_cfg.get('remote', {}), 'docker ps --filter name=authentik-server --format "{{.Status}}"', timeout=12)
         ak_running = bool(ok and out and 'Up' in out)
     else:
-        ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
+        # v10.0.5 non-root INCIDENT: Authentik deployed during the ROOT era lives in
+        # /root/authentik. After the flip the console runs as takwerx (HOME=/home/takwerx) and
+        # can't even traverse /root to stat it, so a bare `~/authentik/docker-compose.yml` check
+        # false-reports "uninstalled" — which made generate_caddyfile() drop the forward_auth
+        # block from the infratak vhost (SSO bypass / console backdoor) AND hid Authentik in the
+        # UI. The authentik-server CONTAINER is the authoritative, non-root-safe install signal
+        # (docker routes through the broker shims); union it with the home-dir check.
+        _ak_home = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
+        _akc = _run('docker ps -a --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        ak_installed = _ak_home or bool((_akc.stdout or '').strip())
         if ak_installed:
             r = _run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-            ak_running = 'Up' in r.stdout
+            ak_running = 'Up' in (r.stdout or '')
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
     # TAK Portal - Docker-based user management (local only; stays with TAK Server)
