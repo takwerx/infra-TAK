@@ -63235,6 +63235,29 @@ def _startup_ensure_server_one_ssh_key():
 _startup_ensure_server_one_ssh_key()
 
 
+def _startup_ensure_console_state_dir():
+    """v10.0.5: /var/lib/takwerx-console holds the console's OWN runtime state (update-now.lock,
+    authentik-compose-heal.last, …). On a non-root console it must be takwerx-writable — a
+    root-created dir is root-owned, so the raw open() writes there fail [Errno 13] (seen on the
+    FRESH RHEL box aws-rocky: 'Update Now: lock-file IO error … Permission denied'). Ensure it
+    exists and is owned by the console user via the broker. Ships via update; idempotent."""
+    try:
+        d = '/var/lib/takwerx-console'
+        if os.getuid() == 0:
+            os.makedirs(d, exist_ok=True)
+            return
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return  # already console-writable
+        subprocess.run(_sudo_wrap(['mkdir', '-p', d]), capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', d]), capture_output=True, timeout=15)
+        if os.access(d, os.W_OK):
+            print('[startup] %s is now console-writable' % d, flush=True)
+    except Exception as e:
+        print('[startup] console state dir ensure (non-fatal): %s' % str(e)[:120], flush=True)
+
+_startup_ensure_console_state_dir()
+
+
 def _startup_rehome_module(subdir, container_name):
     """v10.0.5 (PILOT — TAK-Portal only): re-home a root-era module dir /root/<subdir> -> ~/<subdir>
     so the NON-ROOT console can manage it. On a box flipped from root, modules deployed root-era
@@ -63555,8 +63578,7 @@ def _startup_ensure_metrics_collector():
         # systemd unit
         unit_path = '/etc/systemd/system/tak-metrics-collector.service'
         if (open(unit_path).read() if os.path.exists(unit_path) else None) != _METRICS_COLLECTOR_UNIT:
-            with open(unit_path, 'w') as f:
-                f.write(_METRICS_COLLECTOR_UNIT)
+            _write_priv(unit_path, _METRICS_COLLECTOR_UNIT)   # v10.0.5 non-root: broker (root-owned /etc/systemd)
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, timeout=10)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'tak-metrics-collector.service']), capture_output=True, timeout=15)
@@ -63565,8 +63587,7 @@ def _startup_ensure_metrics_collector():
         now_active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'tak-metrics-collector.service']),
                                     capture_output=True, text=True, timeout=5).stdout.strip() == 'active'
         if now_active:
-            with open(marker, 'w') as f:
-                f.write(want)
+            _write_priv(marker, want)   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
             print("Startup migration: Guard Dog metrics collector applied %s + restarted" % want[:7])
         else:
             print("Startup migration: metrics collector restart not confirmed active — will retry next boot")
