@@ -8980,6 +8980,10 @@ def _deploy_health_agent_to_server_one(s1_cfg):
         'WantedBy=multi-user.target\n'
         "UNIT\n"
         'sudo mv /tmp/tak-db-health.service /etc/systemd/system/tak-db-health.service && '
+        # RHEL/SELinux: a unit mv'd in from /tmp keeps the tmp context → systemd (init_t) gets
+        # "Failed to open …: Permission denied" and the service never starts. restorecon fixes the
+        # unit + agent dir contexts; no-op on Ubuntu (no restorecon). `; true` keeps the && chain.
+        '{ command -v restorecon >/dev/null 2>&1 && sudo restorecon -RF /opt/tak-guarddog /etc/systemd/system/tak-db-health.service 2>/dev/null; true; } && '
         'sudo systemctl daemon-reload && '
         'sudo systemctl enable tak-db-health.service && '
         'sudo systemctl restart tak-db-health.service && '
@@ -13199,6 +13203,9 @@ def run_guarddog_deploy(alert_email):
                         'WantedBy=multi-user.target\n'
                         'UNIT\n'
                         'sudo mv /tmp/tak-db-health.service /etc/systemd/system/tak-db-health.service && '
+                        # RHEL/SELinux: restore the unit + agent contexts (mv from /tmp keeps tmp_t →
+                        # systemd can't open the unit). No-op on Ubuntu; `; true` keeps the && chain.
+                        '{ command -v restorecon >/dev/null 2>&1 && sudo restorecon -RF /opt/tak-guarddog /etc/systemd/system/tak-db-health.service 2>/dev/null; true; } && '
                         'sudo systemctl daemon-reload && '
                         'sudo systemctl enable tak-db-health.service && '
                         'sudo systemctl restart tak-db-health.service && '
@@ -22940,16 +22947,28 @@ def cloudtak_uninstall():
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': f'Remote uninstall failed on {rhost}: {(out or "unknown error")[:240]}'})
                     return
             else:
+                # v10.0.5 non-root: CloudTAK may live at ~/CloudTAK OR (root-era) /root/CloudTAK,
+                # which the takwerx console can't stat/cd/rm. The old ~/CloudTAK-only path silently
+                # no-op'd on flipped boxes (os.path.exists('/home/takwerx/CloudTAK') False) → the
+                # containers kept running and the tree stayed. Resolve the real dir (broker-check
+                # /root) and tear down through the BROKER (root cd's /root, removes root-owned
+                # containers / .docker-store / .git).
                 cloudtak_dir = os.path.expanduser('~/CloudTAK')
-                compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
-                compose_yaml = os.path.join(cloudtak_dir, 'compose.yaml')
-                if os.path.exists(cloudtak_dir):
-                    yml = compose_yml if os.path.exists(compose_yml) else (compose_yaml if os.path.exists(compose_yaml) else None)
-                    if yml:
-                        subprocess.run(
-                            _sudo_wrap(['docker', 'compose', '-f', yml, 'down', '-v', '--rmi', 'local']), capture_output=True, timeout=180, cwd=cloudtak_dir
-                        )
-                    subprocess.run(f'rm -rf "{cloudtak_dir}"', shell=True, capture_output=True, timeout=60)
+                if not os.path.exists(cloudtak_dir):
+                    _rchk = subprocess.run(_sudo_wrap(['test', '-d', '/root/CloudTAK']), capture_output=True, timeout=10)
+                    cloudtak_dir = '/root/CloudTAK' if _rchk.returncode == 0 else None
+                if cloudtak_dir:
+                    subprocess.run(_sudo_wrap(['bash', '-lc',
+                        'cd %s && { docker compose down -v --rmi local 2>/dev/null || '
+                        'docker-compose down -v --rmi local 2>/dev/null; }; true' % shlex.quote(cloudtak_dir)]),
+                        capture_output=True, timeout=300)
+                # Belt-and-suspenders: force-remove any surviving cloudtak-* containers by name
+                # (covers a dir-less / root-owned state where compose down didn't catch them).
+                subprocess.run(_sudo_wrap(['bash', '-lc',
+                    'docker ps -aq --filter name=cloudtak | xargs -r docker rm -f >/dev/null 2>&1; true']),
+                    capture_output=True, timeout=120)
+                if cloudtak_dir:
+                    subprocess.run(_sudo_wrap(['rm', '-rf', cloudtak_dir]), capture_output=True, timeout=120)
             cfg['deployed'] = False
             settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
             save_settings(settings)
