@@ -586,6 +586,57 @@ provision_nonroot() {
     CONFIG_DIR="$INSTALL_DIR/.config"
     AUTH_FILE="$CONFIG_DIR/auth.json"
     SETTINGS_FILE="$CONFIG_DIR/settings.json"
+
+    # 4. Re-home the Server One SSH key for takwerx (SPLIT deploys). An existing ROOT-era
+    #    split stored server_one.ssh_key_path under /root/.ssh — which the non-root console
+    #    (takwerx cannot traverse /root) can't read, silently breaking console->Server One
+    #    SSH: remote-DB unattended-upgrades monitor, Guard Dog DB-auth watch, DB migration,
+    #    Sync DB Password. Copy the key (SAME material — Server One's authorized_keys already
+    #    trusts it) into /home/takwerx/.ssh and rewrite the stored path. Runs as root here,
+    #    so it can read /root and chown to takwerx. Idempotent (skips keys already under the
+    #    takwerx home).
+    if [ -f "$SETTINGS_FILE" ]; then
+        mkdir -p "$NONROOT_HOME/.ssh"
+        chown "$NONROOT_USER:$NONROOT_GROUP" "$NONROOT_HOME/.ssh"
+        chmod 700 "$NONROOT_HOME/.ssh"
+        python3 - "$SETTINGS_FILE" "$NONROOT_HOME" "$NONROOT_USER" <<'PYEOF'
+import json, os, sys, shutil, pwd, grp
+sf, home, user = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(sf) as f: d = json.load(f)
+except Exception:
+    sys.exit(0)
+try:
+    uid = pwd.getpwnam(user).pw_uid; gid = grp.getgrnam(user).gr_gid
+except Exception:
+    sys.exit(0)
+home_prefix = home.rstrip('/') + '/'
+changed = False
+td = d.get('tak_deployment') or {}
+s1 = td.get('server_one') or {}
+kp = (s1.get('ssh_key_path') or '').strip()
+# Re-home only if a key is set and it is NOT already under the takwerx home (catches
+# /root/.ssh and any other stale non-takwerx path). Same material -> no ssh-copy-id needed.
+if kp and not kp.startswith(home_prefix):
+    if os.path.isfile(kp):
+        dst = os.path.join(home, '.ssh', os.path.basename(kp))
+        try:
+            shutil.copy2(kp, dst); os.chmod(dst, 0o600); os.chown(dst, uid, gid)
+            if os.path.isfile(kp + '.pub'):
+                shutil.copy2(kp + '.pub', dst + '.pub'); os.chmod(dst + '.pub', 0o644); os.chown(dst + '.pub', uid, gid)
+            s1['ssh_key_path'] = dst; td['server_one'] = s1; d['tak_deployment'] = td; changed = True
+            print(f"  re-homed Server One SSH key {kp} -> {dst}")
+        except Exception as e:
+            print(f"  WARN: could not re-home Server One SSH key ({kp}): {e}")
+    else:
+        print(f"  WARN: Server One SSH key path {kp} not found on disk — console->Server One SSH will need a re-key")
+if changed:
+    tmp = sf + '.tmp'
+    with open(tmp, 'w') as f: json.dump(d, f, indent=2)
+    os.replace(tmp, sf); os.chown(sf, uid, gid)
+PYEOF
+        chown "$NONROOT_USER:$NONROOT_GROUP" "$SETTINGS_FILE" 2>/dev/null || true
+    fi
     echo -e "  ${GREEN}✓ takwerx user ready; console will run from $NONROOT_INSTALL${NC}"
 }
 

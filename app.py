@@ -7108,6 +7108,18 @@ def takserver_two_server_deploy_server_two():
         run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
         _core_ok = run_cmd(f'cd {UPLOAD_DIR} && dnf install -y ./{core_pkg} --setopt=clean_requirements_on_remove=false 2>&1', "Installing takserver-core (dnf)...")
         run_cmd(f'alternatives --set java java-17-openjdk.{_pg_arch} 2>/dev/null; true', check=False, quiet=True)
+        # Idempotency: dnf exits non-zero on a re-install ("Transaction test error" when the
+        # package is already present) or on a postinstall-scriptlet hiccup, even though the
+        # package files installed fine. Don't hard-fail (which also SKIPS the JDBC patch below)
+        # if takserver-core is actually installed — verify with `rpm -q` and treat present as
+        # success. (Field-seen on a re-run split pre-stage: install succeeded, second attempt
+        # tripped a transaction-test error, whole pre-stage falsely reported failure.)
+        if not _core_ok:
+            _chk = subprocess.run('rpm -q takserver-core', shell=True, capture_output=True,
+                                  text=True, timeout=30, env=_broker_shim_env())
+            if _chk.returncode == 0:
+                _core_ok = True
+                log.append('takserver-core dnf exit non-zero but rpm -q confirms it is installed — continuing (idempotent).')
         log.append('takserver-core installed via dnf (RHEL).' if _core_ok else 'takserver-core dnf install FAILED — see deploy log.')
         if not _core_ok:
             return jsonify({'success': False, 'error': 'Core package install (dnf) failed on Server Two — check the deploy log for the dnf error.', 'log': log}), 400
@@ -22845,9 +22857,9 @@ def cloudtak_container_logs():
             capture_output=True, text=True, timeout=15)
     else:
         if os.path.exists(compose_yml):
-            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'logs', '--tail', lines]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, cwd=cloudtak_dir)
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'logs', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, cwd=cloudtak_dir)
         else:
-            r = subprocess.run(_sudo_wrap(['docker', 'logs', 'cloudtak-api-1', '--tail', lines]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+            r = subprocess.run(_sudo_wrap(['docker', 'logs', 'cloudtak-api-1', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
 
