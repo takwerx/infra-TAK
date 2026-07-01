@@ -2019,11 +2019,15 @@ def detect_modules():
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
     # TAK Portal - Docker-based user management (local only; stays with TAK Server)
-    portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+    # v10.0.5 non-root: a root-era TAK-Portal lives in /root/TAK-Portal, invisible to the
+    # takwerx console — union the home-dir check with the tak-portal container (broker shims).
+    _tp_home = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+    _tpc = _run('docker ps -a --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+    portal_installed = _tp_home or bool((_tpc.stdout or '').strip())
     portal_running = False
     if portal_installed:
         r = _run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        portal_running = 'Up' in r.stdout
+        portal_running = 'Up' in (r.stdout or '')
     modules['takportal'] = {'name': 'TAK Portal', 'installed': portal_installed, 'running': portal_running,
         'description': 'User & certificate management with Authentik', 'icon': '👥', 'route': '/takportal', 'priority': 3}
     # MediaMTX (local or remote deployment)
@@ -2080,12 +2084,13 @@ def detect_modules():
     else:
         nr_dir = os.path.expanduser('~/node-red')
         nr_compose = os.path.join(nr_dir, 'docker-compose.yml')
-        if os.path.exists(nr_compose):
+        # v10.0.5 non-root: union the home-dir check with the nodered container (a root-era
+        # ~/node-red at /root/node-red is invisible to the takwerx console).
+        _nrc = _run('docker ps -a --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        if os.path.exists(nr_compose) or bool((_nrc.stdout or '').strip()):
             nodered_installed = True
-            r = _run(f'docker compose -f "{nr_compose}" ps -q 2>/dev/null', shell=True, capture_output=True, text=True, timeout=8, cwd=nr_dir)
-            if r.returncode == 0 and (r.stdout or '').strip():
-                r2 = _run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-                nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
+            r2 = _run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
         if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
             nodered_installed = True
             r = _run(_sudo_wrap(['systemctl', 'is-active', 'nodered']), capture_output=True, text=True)
