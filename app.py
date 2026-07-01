@@ -11668,12 +11668,28 @@ def _monitor_health_check(monitor_id):
                 db_host = conf.get('db_host', '')
             if not db_host:
                 return None
+            # 1) Direct HTTP — works when 8080 is reachable from the console (host-firewall-scoped boxes).
             try:
                 req = urllib.request.Request(f'http://{db_host}:8080/health', method='GET')
                 with urllib.request.urlopen(req, timeout=4) as resp:
-                    return resp.status == 200
+                    if resp.status == 200:
+                        return True
             except Exception:
-                return False
+                pass
+            # 2) Fallback: poll /health over the SSH channel we ALREADY have to Server One. On cloud
+            # boxes Server One often has NO host firewall, so 8080 is governed by the provider security
+            # group (allows 22/5432 but not 8080) — the direct hit can't reach it even though the agent
+            # is healthy and SSH is open (TCP+SSH green). This also means 8080 never needs to be
+            # network-exposed (the endpoint exposes PG state), so the monitor works AND stays private.
+            try:
+                _s1 = _get_tak_deployment_config(load_settings()).get('server_one', {})
+                if _s1.get('host'):
+                    ok, out = _ssh_probe(_s1, 'curl -s -m4 -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/health', timeout=12)
+                    if ok and (out or '').strip().endswith('200'):
+                        return True
+            except Exception:
+                pass
+            return False
         if monitor_id == 'remotedb_auth':
             settings = load_settings()
             tak_cfg = _get_tak_deployment_config(settings)
