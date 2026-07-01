@@ -24272,8 +24272,19 @@ def run_cloudtak_deploy(cfg=None):
                 else:
                     _fetchco = (f'git -c safe.directory={cloudtak_dir} fetch --depth 1 origin HEAD && '
                                 f'git -c safe.directory={cloudtak_dir} checkout -f FETCH_HEAD')
+                # Drop the broken .git via the BROKER — a root-era hollow .git has root-owned
+                # objects (e.g. .git/objects/42/…), which a plain (takwerx) `rm -rf .git` can't
+                # remove ("Permission denied"). The broker rm runs as root. .docker-store and the
+                # rest of the tree stay untouched (git init + checkout -f run as takwerx after).
+                _grm = subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(cloudtak_dir, '.git')]),
+                                      capture_output=True, text=True, timeout=120)
+                if os.path.exists(os.path.join(cloudtak_dir, '.git')):
+                    plog(f"✗ In-place repair failed: could not remove {cloudtak_dir}/.git "
+                         f"({(_grm.stderr or _grm.stdout or 'broker rm failed').strip()[:160]})")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
                 r = subprocess.run(
-                    f'cd {cloudtak_dir} && rm -rf .git && git init -q && '
+                    f'cd {cloudtak_dir} && git init -q && '
                     f'git remote add origin https://github.com/dfpc-coe/CloudTAK.git && ' + _fetchco,
                     shell=True, capture_output=True, text=True, timeout=600)
                 if r.returncode != 0:
