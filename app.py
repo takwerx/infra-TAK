@@ -49092,17 +49092,7 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
                     f'\\1 xmlns="{_ns_uri}"',
                     _cc_clean, count=1
                 )
-            try:
-                with open(coreconfig_path, 'w', encoding='utf-8') as _f:
-                    _f.write(_cc_clean)
-            except PermissionError:
-                _clean_tmp = coreconfig_path + '.ns0-strip.xml'
-                with open(_clean_tmp, 'w', encoding='utf-8') as _f:
-                    _f.write(_cc_clean)
-                subprocess.run(
-                    _sudo_wrap(['cp', os.path.abspath(_clean_tmp), coreconfig_path]),
-                    capture_output=True, text=True, timeout=10
-                )
+            _write_priv(coreconfig_path, _cc_clean)   # v10.0.5 non-root: /opt/tak is tak-owned → broker
             if plog:
                 plog("  ✓ CoreConfig.xml: stripped legacy ns0: prefixes (was breaking LDAP auth)")
         # Register the namespace URI to the empty prefix so ET.write() emits clean XML
@@ -49256,13 +49246,7 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         )
         if new_content == content:
             return False, 'CoreConfig <auth> block not found or format not recognized (text patcher)'
-        _patch_path = coreconfig_path + '.ldap-patch.xml'
-        with open(_patch_path, 'w') as f:
-            f.write(new_content)
-        r = subprocess.run(_sudo_wrap(['cp', os.path.abspath(_patch_path), coreconfig_path]),
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            return False, f'sudo cp failed: {r.stderr.strip()[:200]}'
+        _write_priv(coreconfig_path, new_content)   # v10.0.5 non-root: broker (/opt/tak tak-owned)
         return True, f'CoreConfig.xml LDAP auth updated (text patcher, ldap://{ldap_host}:389)'
     except Exception as e:
         return False, f'CoreConfig.xml text patcher error: {e}'
@@ -49363,15 +49347,7 @@ def _resync_ldap_credential_to_coreconfig():
     if not needs_write:
         return False, 'credentials_match'
 
-    try:
-        with open(coreconfig, 'w') as f:
-            f.write(new_cc)
-    except PermissionError:
-        patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-resync.xml')
-        with open(patch_path, 'w') as f:
-            f.write(new_cc)
-        subprocess.run(_sudo_wrap(['cp', patch_path, coreconfig]),
-                       capture_output=True, text=True, timeout=10)
+    _write_priv(coreconfig, new_cc)   # v10.0.5 non-root: /opt/tak tak-owned → broker
     fixes = []
     if cc_pass != env_pass:
         fixes.append('credential')
@@ -56661,9 +56637,7 @@ def run_takserver_two_server_db_migrate(
                 raise RuntimeError('empty CoreConfig')
             cc = re.sub(r'jdbc:postgresql://[^"\']+', jdbc_url, cc, count=1)
             cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + pw_verify + m.group(2), cc, count=1)
-            proc = subprocess.run(['sudo', 'tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=10)
-            if proc.returncode != 0:
-                raise RuntimeError((proc.stderr or '')[:200])
+            _write_priv('/opt/tak/CoreConfig.xml', cc)   # v10.0.5 non-root: broker (was literal `sudo tee`)
             mlog(f'✓ JDBC → {new_host}:{db_port}')
         except Exception as e:
             mlog(f'✗ CoreConfig update failed: {e}')
@@ -66803,35 +66777,38 @@ def _post_update_auto_deploy():
                     _compromised = False
                     _quarantined = []
                     _pgconf_disabled = False
-                    if _pg_data_path and os.path.isdir(_pg_data_path):
+                    # v10.0.5 non-root: the postgres data dir is a ROOT-owned docker volume —
+                    # takwerx can't listdir/makedirs/rename/open inside it, so every raw op here
+                    # silently failed and MISSED the compromise. Route all of it through the broker.
+                    if _pg_data_path:
                         try:
-                            _so_files = [f for f in os.listdir(_pg_data_path)
-                                         if f.lower().endswith('.so')]
+                            _lsf = subprocess.run(_sudo_wrap(['find', _pg_data_path, '-maxdepth', '1', '-name', '*.so', '-type', 'f']),
+                                                  capture_output=True, text=True, timeout=30)
+                            _so_files = [os.path.basename(p) for p in (_lsf.stdout or '').splitlines() if p.strip().lower().endswith('.so')]
                             if _so_files:
                                 _compromised = True
                                 _ts = time.strftime('%Y%m%d-%H%M%S')
                                 _quar_dir = os.path.join(_pg_data_path, f'quarantine-{_ts}')
-                                try:
-                                    os.makedirs(_quar_dir, exist_ok=True)
-                                    for _f in _so_files:
-                                        try:
-                                            os.rename(os.path.join(_pg_data_path, _f),
-                                                      os.path.join(_quar_dir, _f))
-                                            _quarantined.append(_f)
-                                        except Exception as _qfe:
-                                            print(f"  WARNING: failed to quarantine {_f}: {_qfe}")
-                                    if _quarantined:
-                                        print(f"  Quarantined {len(_quarantined)} .so file(s) → {_quar_dir}")
-                                except Exception as _qde:
-                                    print(f"  WARNING: quarantine dir creation failed: {_qde}")
-                        except Exception:
-                            pass
+                                subprocess.run(_sudo_wrap(['mkdir', '-p', _quar_dir]), capture_output=True, timeout=15)
+                                for _f in _so_files:
+                                    _mvq = subprocess.run(_sudo_wrap(['mv', os.path.join(_pg_data_path, _f), os.path.join(_quar_dir, _f)]),
+                                                          capture_output=True, text=True, timeout=15)
+                                    if _mvq.returncode == 0:
+                                        _quarantined.append(_f)
+                                    else:
+                                        print(f"  WARNING: failed to quarantine {_f}: {(_mvq.stderr or '')[:120]}")
+                                if _quarantined:
+                                    print(f"  Quarantined {len(_quarantined)} .so file(s) → {_quar_dir}")
+                        except Exception as _qde:
+                            print(f"  WARNING: quarantine failed: {_qde}")
 
                         _pgconf = os.path.join(_pg_data_path, 'postgresql.conf')
-                        if os.path.exists(_pgconf):
+                        try:
+                            _conf = _read_priv(_pgconf)   # broker: root-owned volume
+                        except Exception:
+                            _conf = ''
+                        if _conf:
                             try:
-                                with open(_pgconf, 'r') as _cf:
-                                    _conf = _cf.read()
                                 _pat = re.compile(
                                     r"^([ \t]*shared_preload_libraries[ \t]*=[ \t]*['\"](.*?)['\"])",
                                     re.MULTILINE
@@ -66843,8 +66820,7 @@ def _post_update_auto_deploy():
                                         lambda mm: f"#INFRATAK_DISABLED# {mm.group(1)}",
                                         _conf
                                     )
-                                    with open(_pgconf, 'w') as _cf:
-                                        _cf.write(_new_conf)
+                                    _write_priv(_pgconf, _new_conf)   # broker
                                     _pgconf_disabled = True
                                     print(f"  Disabled malicious shared_preload_libraries → '{_m.group(2)}'")
                             except Exception as _ce:
