@@ -54859,6 +54859,7 @@ def _tak_snapshot(label, plog=None):
     # In a single-server deployment it runs locally as the postgres OS user.
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
     plog("  snapshot: pg_dump starting — cot database (may take 30–90s for large databases)…")
+    meta['db_dump'] = False   # set True only when a non-empty cot dump actually lands
     try:
         _snap_settings = load_settings()
         _snap_tak_cfg = _get_tak_deployment_config(_snap_settings)
@@ -54878,21 +54879,36 @@ def _tak_snapshot(label, plog=None):
             if _key:
                 _ssh_parts += ['-i', _key]
             _ssh_parts += [f'{_user}@{_host}', _ssh_dump_cmd]
-            with open(pg_dump_path, 'wb') as _f:
-                r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=300)
-            if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
-                plog(f"  snapshot: cot pg_dump (remote) written ({os.path.getsize(pg_dump_path) // 1024} KB)")
-            else:
-                plog(f"  snapshot: remote pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
-                try: os.remove(pg_dump_path)
+            # v10.0.5 non-root: the snapshot dir is root-owned (broker mkdir), so the non-root
+            # console can't open() a file inside it — a direct write here was the silent
+            # [Errno 13] that left two-server snapshots with NO database. Stream the SSH dump to
+            # a console-writable temp, then broker-cp it into the snapshot dir (cp is already
+            # broker-routed above for CoreConfig). Identical behaviour as root. NB: don't stat
+            # the dest — the root-owned dir isn't traversable by takwerx; trust the temp size + cp rc.
+            import tempfile
+            _fd, _tmp_dump = tempfile.mkstemp(prefix='cot-snap-', suffix='.pgdump')
+            os.close(_fd)
+            try:
+                with open(_tmp_dump, 'wb') as _f:
+                    r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=300)
+                if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
+                    _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
+                    if _cp.returncode == 0:
+                        meta['db_dump'] = True
+                        plog(f"  snapshot: cot pg_dump (remote) written ({os.path.getsize(_tmp_dump) // 1024} KB)")
+                    else:
+                        plog(f"  snapshot: pg_dump copy into snapshot FAILED: {(_cp.stderr or b'').decode()[:160]}")
+                else:
+                    plog(f"  snapshot: remote pg_dump FAILED: {(r2.stderr or b'').decode()[:200]}")
+            finally:
+                try: os.remove(_tmp_dump)
                 except Exception: pass
         elif _broker_should_route() and _broker_available():
-            # v10.0.5 non-root (DEFERRED — see HANDOFF/PUNCHLIST): a local pg_dump needs
-            # postgres + a write into the root-owned snapshot dir, and streaming it
-            # through the broker hits the 32MB socket cap. Skip the DB dump GRACEFULLY
-            # (config + certs ARE captured) rather than failing the snapshot or leaving
-            # a doomed [Errno 13]. Rollback already refuses a DB-restore without a dump.
-            plog("  snapshot: cot pg_dump SKIPPED on non-root console (config+certs captured; DB dump deferred)")
+            # v10.0.5 non-root SINGLE-server (still DEFERRED — see PUNCHLIST): a local pg_dump
+            # needs the postgres OS user AND streaming it through the broker exec proxy hits the
+            # 32MB socket cap, so we can't reliably capture it yet. Skip GRACEFULLY (config+certs
+            # ARE captured) and record db_dump=False so the caller/UI surfaces the gap honestly.
+            plog("  snapshot: cot pg_dump SKIPPED on non-root single-server console (config+certs captured; DB dump deferred)")
         else:
             with open(pg_dump_path, 'wb') as _f:
                 r2 = subprocess.run(
@@ -54900,9 +54916,10 @@ def _tak_snapshot(label, plog=None):
                     shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
                 )
             if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+                meta['db_dump'] = True
                 plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
             else:
-                plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+                plog(f"  snapshot: pg_dump FAILED: {(r2.stderr or b'').decode()[:200]}")
                 try: os.remove(pg_dump_path)
                 except Exception: pass
     except Exception as e:
@@ -54946,7 +54963,11 @@ def _tak_snapshot(label, plog=None):
     except Exception as e:
         plog(f"  snapshot: settings save failed: {e}")
 
-    plog(f"  ✓ snapshot [{label}]: done ({meta['size_mb']} MB, version={meta['tak_version']})")
+    if not meta.get('db_dump'):
+        plog(f"  ⚠ snapshot [{label}]: NO cot database dump captured — this snapshot restores "
+             f"CoreConfig / UserAuth / certs ONLY, not the database. DB-level rollback is NOT available.")
+    plog(f"  ✓ snapshot [{label}]: done ({meta['size_mb']} MB, version={meta['tak_version']}, "
+         f"db_dump={'yes' if meta.get('db_dump') else 'NO'})")
     return True, meta
 
 
@@ -55644,7 +55665,9 @@ def run_takserver_upgrade(pkg_path):
         ulog(f"Taking pre-upgrade snapshot [{snap_label}]…")
         snap_ok, snap_result = _tak_snapshot(snap_label, ulog)
         if snap_ok:
-            ulog(f"✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery")
+            ulog("✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery"
+                 if snap_result.get('db_dump')
+                 else "⚠ Pre-upgrade snapshot saved (config + certs) — but NO cot database dump captured; DB-level rollback is NOT available")
             # Tag source in settings
             try:
                 _s = load_settings()
@@ -55759,7 +55782,9 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         if not snap_ok:
             ulog(f"✗ Pre-upgrade snapshot failed — aborting upgrade to protect current data ({snap_result})")
             upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
-        ulog("✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery")
+        ulog("✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery"
+             if snap_result.get('db_dump')
+             else "⚠ Pre-upgrade snapshot saved (config + certs) — but NO cot database dump captured; DB-level rollback is NOT available")
         try:
             _s = load_settings()
             for sn in (_s.get('tak_snapshots') or []):
@@ -56213,7 +56238,9 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
         if not snap_ok:
             ulog(f"✗ Pre-upgrade snapshot failed — aborting upgrade to protect current data ({snap_result})")
             upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
-        ulog("✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery")
+        ulog("✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery"
+             if snap_result.get('db_dump')
+             else "⚠ Pre-upgrade snapshot saved (config + certs) — but NO cot database dump captured; DB-level rollback is NOT available")
         try:
             _s = load_settings()
             for sn in (_s.get('tak_snapshots') or []):
