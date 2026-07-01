@@ -1748,7 +1748,7 @@ function updateUpgradeFileReady(){
   var msg=document.getElementById('tak-update-msg');
   if(msg){
     if(upgradeFileReady)msg.textContent='';
-    else if(twoServer&&upgradeUploadedPackages.length>0)msg.textContent='Upload both core and database .deb packages.';
+    else if(twoServer&&upgradeUploadedPackages.length>0)msg.textContent='Upload both core and database packages.';
   }
 }
 
@@ -1781,7 +1781,7 @@ function uploadUpgradeDeb(file){
   if(_isCtr){
     if(n.indexOf('docker')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Upload the official takserver-docker-*.zip bundle (container upgrade).';m.style.color='var(--red)';}return;}
   }else if(isUpgradeTwoServerMode()){
-    if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database .deb are allowed.';m.style.color='var(--red)';}return;}
+    if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database packages are allowed.';m.style.color='var(--red)';}return;}
   }else{
     if(n.indexOf('core')!==-1||n.indexOf('database')!==-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='One-server upgrade: use the single takserver .deb, not core or database packages.';m.style.color='var(--red)';}return;}
   }
@@ -1843,7 +1843,9 @@ function loadExistingUpgradeFiles(){
   if(!pa)return;
   fetch('/api/upload/takserver/existing',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
     var twoServer=isUpgradeTwoServerMode();
-    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith('.deb'))return false;if(twoServer)return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return n.indexOf('core')===-1&&n.indexOf('database')===-1;});
+    var _rIsCtr=document.body&&document.body.getAttribute('data-tak-container')==='true';
+    var _rExt=_rIsCtr?'.zip':((document.body&&document.body.getAttribute('data-tak-native-ext'))||'.deb');
+    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith(_rExt))return false;if(twoServer)return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return n.indexOf('core')===-1&&n.indexOf('database')===-1;});
     if(pkgs.length===0)return;
     upgradeUploadedPackages=pkgs.slice();
     var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
@@ -1868,7 +1870,7 @@ function takToggleUpdate(){takToggleSection('tak-update');}
 function takToggleSection(id){var body=document.getElementById(id+'-body');var icon=document.getElementById(id+'-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';}
 async function startTakUpdate(){
   var btn=document.getElementById('tak-update-btn');var msg=document.getElementById('tak-update-msg');
-  if(!upgradeFileReady){if(msg){msg.textContent=isUpgradeTwoServerMode()?'Upload both core and database .deb packages first.':'Upload a .deb package first.';msg.style.color='var(--red)';}return;}
+  if(!upgradeFileReady){if(msg){var _uext=(document.body&&document.body.getAttribute('data-tak-container')==='true')?'.zip':((document.body&&document.body.getAttribute('data-tak-native-ext'))||'.deb');msg.textContent=isUpgradeTwoServerMode()?'Upload both core and database packages first.':('Upload a '+_uext+' package first.');msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;if(msg){msg.textContent='Starting update...';msg.style.color='var(--text-dim)';}
   try{
     var r=await fetch('/api/takserver/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});

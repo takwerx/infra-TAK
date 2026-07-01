@@ -4375,12 +4375,12 @@ def _w1_ufw_lock_console(log):
     (UFW delete allow ↔ firewalld remove-port). Returns False if a public allow survives."""
     port = int(load_settings().get('console_port') or 5001)
     be = _fw_backend()
-    if be == 'firewalld':
-        _fw_remove(port, 'tcp')
-    else:
-        subprocess.run('sudo ufw delete allow %s/tcp >/dev/null 2>&1; '
-                       'sudo ufw delete allow %s >/dev/null 2>&1; true' % (port, port),
-                       shell=True, capture_output=True, timeout=30)
+    # v10.0.5: both backends go through _fw_remove (→ _sudo_wrap → broker). The old UFW branch
+    # hand-rolled a literal `sudo ufw delete` shell string, which SILENTLY NO-OPS under the
+    # non-root console (takwerx has no sudo and can't run ufw directly), so W1 left :5001
+    # world-open while recording console_localhost_only=true. _fw_remove is broker-routed and
+    # backend-aware, so this closes on UFW and firewalld alike, root or non-root.
+    _fw_remove(port, 'tcp')
     fw_name = 'firewalld' if be == 'firewalld' else 'UFW'
     if _w1_console_port_public(str(port)):
         log('W1: WARNING — :%s still shows a public allow after removal' % port); return False
@@ -4389,11 +4389,9 @@ def _w1_ufw_lock_console(log):
 def _w1_ufw_unlock_console(log):
     port = int(load_settings().get('console_port') or 5001)
     be = _fw_backend()
-    if be == 'firewalld':
-        _fw_allow(port, 'tcp')
-    else:
-        subprocess.run('sudo ufw allow %s/tcp >/dev/null 2>&1 || ufw allow %s/tcp >/dev/null 2>&1; true'
-                       % (port, port), shell=True, capture_output=True, timeout=30)
+    # v10.0.5: broker-routed _fw_allow on both backends (the old literal `sudo ufw allow`
+    # no-op'd under the non-root console — same class of bug as the lock above).
+    _fw_allow(port, 'tcp')
     log('W1: %s public allow for :%s restored (Standard)' % ('firewalld' if be == 'firewalld' else 'UFW', port))
 
 def _hardening_control_w1():
@@ -54368,18 +54366,41 @@ def takserver_update():
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=run_takserver_upgrade_container, args=(_zip,), daemon=True).start()
         return jsonify({'success': True})
-    # RHEL/Rocky native: upgrade from the new takserver-*.noarch.rpm via dnf (single-server).
+    # RHEL/Rocky native: upgrade from the new takserver-*.noarch.rpm via dnf.
     if _distro_family() == 'rhel' or settings.get('pkg_mgr') == 'dnf':
         if upgrade_status['running']:
             return jsonify({'error': 'Update already in progress'}), 409
+        _tak_cfg = _get_tak_deployment_config(settings)
+        _all_rpms = sorted([f for f in os.listdir(UPLOAD_DIR) if f.endswith('.rpm')],
+                           key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)), reverse=True)
+        # v10.0.5: RHEL two-server (split) update — core (local dnf) + database rpm on Server One
+        # (SSH dnf) + SchemaManager on Server One. Previously ALL RHEL boxes fell through to the
+        # single-server path below, so a split update never touched the DB box.
+        if _tak_cfg.get('mode') == 'two_server':
+            _core_rpm = next((f for f in _all_rpms if 'core' in f.lower()), '')
+            _db_rpm = next((f for f in _all_rpms if 'database' in f.lower()), '')
+            if not _core_rpm or not _db_rpm:
+                return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .noarch.rpm packages. Upload both.'}), 400
+            _s1 = _tak_cfg.get('server_one', {})
+            if not _s1.get('host'):
+                return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
+            upgrade_log.clear()
+            upgrade_status.update({'running': True, 'complete': False, 'error': False})
+            threading.Thread(target=run_takserver_upgrade_two_server_rhel, args=(
+                os.path.join(UPLOAD_DIR, _core_rpm), os.path.join(UPLOAD_DIR, _db_rpm), _s1, _tak_cfg,
+            ), daemon=True).start()
+            return jsonify({'success': True})
         _rpms = sorted([f for f in os.listdir(UPLOAD_DIR)
                         if f.endswith('.rpm') and '-database' not in f.lower() and '-core' not in f.lower()],
                        key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)), reverse=True)
         if not _rpms:
             return jsonify({'error': 'No takserver .rpm found. Upload the new takserver-*.noarch.rpm from tak.gov first (the single-server package, not core/database).'}), 400
+        # external_db: pass the RDS block so the upgrade runs SchemaManager against the managed DB.
+        _edb = _tak_cfg.get('external_db') if _tak_cfg.get('mode') == 'external_db' else None
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade_rhel, args=(os.path.join(UPLOAD_DIR, _rpms[0]),), daemon=True).start()
+        threading.Thread(target=run_takserver_upgrade_rhel, args=(os.path.join(UPLOAD_DIR, _rpms[0]),),
+                         kwargs={'external_db': _edb}, daemon=True).start()
         return jsonify({'success': True})
     if upgrade_status['running']:
         return jsonify({'error': 'Update already in progress'}), 409
@@ -55701,12 +55722,17 @@ def run_takserver_upgrade(pkg_path):
         ulog("Error: " + str(e))
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
 
-def run_takserver_upgrade_rhel(rpm_path):
+def run_takserver_upgrade_rhel(rpm_path, external_db=None):
     """v10.0.1 — RHEL/Rocky native .rpm TAK Server upgrade via dnf. `dnf install` of the new .rpm
     upgrades in place and PRESERVES the existing cot database (TAK config guide §5.2.1 — dnf keeps
     the postgres data dir + a delete_old_cluster.sh). Mirrors the .deb path (run_takserver_upgrade):
     pre-upgrade snapshot (abort on fail) → dnf install → SELinux re-apply → CoreConfig sanitize +
-    LDAP resync → 8446 LE cert → restart → webadmin sync. Logs to upgrade_log/upgrade_status."""
+    LDAP resync → 8446 LE cert → restart → webadmin sync. Logs to upgrade_log/upgrade_status.
+
+    v10.0.5: external_db (dict from tak_deployment['external_db']) — when set (mode==external_db),
+    run SchemaManager against the managed RDS after the dnf upgrade and BEFORE the restart, so a
+    breaking schema jump is applied (the RHEL single path never did this — see HANDOFF 2026-07-01
+    caveat). Default None = byte-identical to the single_server path."""
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         upgrade_log.append(entry); print(entry, flush=True)
@@ -55774,6 +55800,22 @@ def run_takserver_upgrade_rhel(rpm_path):
         if takserver_host:
             ulog("Re-installing LE cert on 8446 (postinst may have reset connector)...")
             install_le_cert_on_8446(takserver_host, ulog, wait_for_cert=False)
+        # v10.0.5 external-DB: apply the new version's schema deltas to the managed RDS BEFORE
+        # the restart (the RHEL single path never did — validated 5.6→5.7 only because that jump
+        # was schema-compatible). SchemaManager reads the JDBC-preserved CoreConfig.xml from
+        # /opt/tak (no CLI flags — same proven block as the external-DB deploy). Idempotent
+        # 'upgrade': "already up to date" on a no-op jump.
+        if external_db and (external_db.get('host') or '').strip() and os.path.exists('/opt/tak/db-utils/SchemaManager.jar'):
+            ulog("External DB: running SchemaManager against RDS (applying schema deltas)...")
+            _sm = subprocess.run('cd /opt/tak && java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
+                                 shell=True, capture_output=True, text=True, timeout=300)
+            _smo = (_sm.stdout or '') + (_sm.stderr or '')
+            for _ln in _smo.strip().split('\n')[-12:]:
+                if _ln.strip(): upgrade_log.append("  " + _ln)
+            if _sm.returncode == 0 or 'SchemaManager complete' in _smo or 'up to date' in _smo.lower():
+                ulog("✓ SchemaManager upgrade complete (RDS schema current)")
+            else:
+                ulog(f"⚠ SchemaManager exited {_sm.returncode} — check output above; TAK may still start if schema was partially applied.")
         ulog("Restarting TAK Server...")
         subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)
         if _get_authentik_env_content(settings):
@@ -56116,6 +56158,232 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("\u2713 Two-server update complete")
         ulog(f"  Core: upgraded on this host")
         ulog(f"  Database: upgraded on {s1_host}")
+        ulog("=" * 50)
+        upgrade_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        ulog(f"✗ Error: {str(e)}")
+        upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
+
+def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, tak_cfg):
+    """v10.0.5 — RHEL/Rocky TWO-SERVER (split) TAK Server upgrade. dnf mirror of
+    run_takserver_upgrade_two_server: core first (local dnf), then the takserver-database
+    .noarch.rpm on Server One (SSH dnf), then SchemaManager on Server One, restore JDBC→Server
+    One in CoreConfig, restart. The dispatcher used to funnel ALL RHEL updates to the single-
+    server run_takserver_upgrade_rhel, so a RHEL split update never upgraded the DB box at all.
+
+    CRUX (rhel-split-schema-build): the takserver-database .noarch.rpm deliberately does NOT run
+    SchemaManager, so a split DB upgrade leaves the schema at the OLD version → the upgraded core
+    500s on /oauth/token ('group_bitpos_sequence does not exist') and 8446 login fails. We run
+    SchemaManager explicitly on Server One (same as _setup_server_one_rhel Step 7) after the db
+    rpm upgrade. Logs to upgrade_log/upgrade_status."""
+    def ulog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        upgrade_log.append(entry); print(entry, flush=True)
+    def rc(cmd, label=None, timeout=3600):
+        if label: ulog(label)
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            for ln in ((r.stdout or '') + (r.stderr or '')).strip().split('\n')[-12:]:
+                if ln.strip(): upgrade_log.append("  " + ln)
+            return r.returncode == 0
+        except Exception as e:
+            ulog(f"  ! {str(e)[:160]}"); return False
+    try:
+        import re as _re
+        core_name = os.path.basename(core_rpm_path)
+        db_name = os.path.basename(db_rpm_path)
+        s1_host = s1_cfg.get('host', '')
+        db_port = int(tak_cfg.get('database', {}).get('port') or 5432)
+        db_password = (tak_cfg.get('database', {}).get('password') or '').strip()
+        ulog("=" * 50)
+        ulog("TAK Server Two-Server Update — RHEL/Rocky .rpm")
+        ulog(f"  Core package: {core_name}")
+        ulog(f"  Database package: {db_name}")
+        ulog(f"  Server One (DB): {s1_host}")
+        ulog("=" * 50)
+        if subprocess.run(f'rpm -qp {shlex.quote(core_rpm_path)} > /dev/null 2>&1', shell=True, capture_output=True, timeout=30).returncode != 0:
+            ulog("✗ FATAL: the uploaded takserver-core .rpm is corrupted or incomplete (rpm -qp failed). Re-upload a fresh takserver-core-*.noarch.rpm.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+
+        # Pre-upgrade snapshot — abort if it fails (protect current data), same as the single path.
+        snap_label = f"pre-upgrade-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        ulog(f"Taking pre-upgrade snapshot [{snap_label}]…")
+        snap_ok, snap_result = _tak_snapshot(snap_label, ulog)
+        if not snap_ok:
+            ulog(f"✗ Pre-upgrade snapshot failed — aborting upgrade to protect current data ({snap_result})")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        ulog("✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery")
+        try:
+            _s = load_settings()
+            for sn in (_s.get('tak_snapshots') or []):
+                if sn.get('label') == snap_label: sn['source'] = 'pre-upgrade'
+            save_settings(_s)
+        except Exception: pass
+
+        # heap backup (native RHEL keeps JVM heap in /etc/default/takserver, same as .deb)
+        heap_backup = None
+        heap_file = '/etc/default/takserver'
+        if os.path.isfile(heap_file):
+            try:
+                heap_backup = _read_priv(heap_file)
+                if heap_backup and heap_backup.strip(): ulog("✓ JVM heap settings backed up")
+            except Exception:
+                heap_backup = None
+
+        # Repo prereqs (idempotent on an already-installed box; powertools/CRB + module disable).
+        rc('dnf config-manager --set-enabled powertools 2>/dev/null; dnf config-manager --set-enabled crb 2>/dev/null; '
+           'subscription-manager repos --enable codeready-builder-for-rhel-8-x86_64-rpms 2>/dev/null; '
+           'dnf -qy module disable postgresql 2>/dev/null; true')
+
+        # ━━━ Step 1/5: Stop TAK Server ━━━
+        ulog(""); ulog("━━━ Step 1/5: Stopping TAK Server ━━━")
+        subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, text=True, timeout=90)
+        ulog("✓ TAK Server stopped")
+
+        # ━━━ Step 2/5: Upgrade Core (this host, dnf) ━━━
+        ulog(""); ulog("━━━ Step 2/5: Upgrading Core (this host) ━━━")
+        _core_ok = rc(f'dnf install -y {shlex.quote(core_rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1',
+                      "Upgrading takserver-core via dnf (guide §5.2.1)...")
+        if not _core_ok:
+            # Idempotency: dnf can exit non-zero on a re-install / scriptlet hiccup though the
+            # package installed fine (mirrors the deploy pre-stage fix). rpm -q = truth.
+            _chk = subprocess.run('rpm -q takserver-core', shell=True, capture_output=True, text=True, timeout=30, env=_broker_shim_env())
+            if _chk.returncode == 0:
+                _core_ok = True
+                ulog("takserver-core dnf exit non-zero but rpm -q confirms it is installed — continuing (idempotent).")
+        if not _core_ok:
+            ulog("✗ Core upgrade failed — check the dnf error above."); upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        if not os.path.exists('/opt/tak'):
+            ulog("✗ FATAL: /opt/tak not found after core rpm upgrade — check `rpm -q takserver-core` / `dnf history`.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        ulog("✓ Core package upgraded")
+
+        # SELinux: re-apply under enforcing (postinst may reset it).
+        _enf = subprocess.run('getenforce 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+        if _enf == 'Enforcing' and os.path.exists('/opt/tak/apply-selinux.sh'):
+            ulog("Re-applying TAK Server SELinux policy...")
+            subprocess.run(_sudo_wrap(['bash', '/opt/tak/apply-selinux.sh']), cwd='/opt/tak', capture_output=True, text=True, timeout=120)
+
+        # Restore JDBC → Server One in CoreConfig (upgrade may reset it). Idempotent guard.
+        if s1_host:
+            try:
+                cc = _read_priv('/opt/tak/CoreConfig.xml')
+                jdbc_url = f'jdbc:postgresql://{s1_host}:{db_port}/cot'
+                if cc and '127.0.0.1' in cc and s1_host not in cc:
+                    cc = _re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
+                    if db_password:
+                        cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_password + m.group(2), cc)
+                    _write_priv('/opt/tak/CoreConfig.xml', cc)
+                    ulog(f"✓ CoreConfig.xml JDBC restored to {s1_host}:{db_port}")
+                else:
+                    ulog(f"✓ CoreConfig.xml JDBC already points to {s1_host}")
+            except Exception as e:
+                ulog(f"⚠ Could not verify CoreConfig JDBC: {e}")
+
+        # ━━━ Step 3/5: Upgrade Database on Server One (SSH dnf) ━━━
+        ulog(""); ulog(f"━━━ Step 3/5: Upgrading Database on Server One ({s1_host}) ━━━")
+        ok, scp_out = _scp_to_host(s1_cfg, db_rpm_path, '/tmp/', timeout=300)
+        if not ok:
+            ulog(f"✗ SCP failed: {(scp_out or '')[:300]}")
+            ulog("Core was upgraded but database was NOT. You can manually `dnf install` the database .rpm on Server One.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        ulog("✓ Package copied to Server One")
+        install_cmd = f'cd /tmp && sudo dnf -y install ./{db_name} --setopt=clean_requirements_on_remove=false 2>&1; echo RC=$?'
+        ulog(f"Installing {db_name} on Server One (dnf)...")
+        ok, install_out = _ssh_probe(s1_cfg, install_cmd, timeout=600)
+        for line in (install_out or '').strip().split('\n')[-12:]:
+            if line.strip(): upgrade_log.append("  " + line)
+        # dnf can exit non-zero on a re-install though the pkg is fine — verify PG + cot on Server One.
+        verify_cmd = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; '
+                      'sudo -u postgres psql -lqt 2>/dev/null | grep -qw cot && systemctl is-active "$PGSVC" >/dev/null 2>&1 && echo PG_OK')
+        vok, vout = _ssh_probe(s1_cfg, verify_cmd, timeout=15)
+        if 'PG_OK' in (vout or ''):
+            ulog("✓ Database package upgraded on Server One (PostgreSQL running, cot present)")
+        else:
+            ulog("✗ Database upgrade failed on Server One (PostgreSQL/cot check did not pass). Check Server One manually.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+
+        # Re-fetch password from Server One — the DB rpm upgrade may have regenerated it.
+        fresh_pw, _pw_err = _fetch_db_password_from_server_one(s1_cfg)
+        if fresh_pw and fresh_pw != db_password:
+            pw_ok, pw_msg = _verify_server_one_db_password(s1_cfg, fresh_pw, db_port=db_port)
+            if pw_ok:
+                ulog("⚠ DB password changed during upgrade — re-patching CoreConfig.xml")
+                try:
+                    cc = _read_priv('/opt/tak/CoreConfig.xml')
+                    cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + fresh_pw + m.group(2), cc)
+                    _write_priv('/opt/tak/CoreConfig.xml', cc)
+                    db_password = fresh_pw
+                    tak_cfg.setdefault('database', {})['password'] = fresh_pw
+                    _s2 = load_settings(); _s2['tak_deployment'] = tak_cfg; save_settings(_s2)
+                    ulog("✓ CoreConfig.xml and saved settings updated with new DB password")
+                except Exception as e:
+                    ulog(f"⚠ Could not update CoreConfig with new password: {e}")
+            else:
+                ulog(f"⚠ Fresh password from Server One also failed validation ({pw_msg})")
+        elif fresh_pw:
+            pw_ok, pw_msg = _verify_server_one_db_password(s1_cfg, fresh_pw, db_port=db_port)
+            ulog("✓ DB credential verified after upgrade" if pw_ok else f"⚠ DB credential check failed after upgrade: {pw_msg}")
+
+        # ━━━ Step 4/5: Build schema on Server One (SchemaManager) ━━━
+        # The .noarch.rpm does NOT build/upgrade the schema (rhel-split-schema-build). Run it
+        # explicitly against the split DB so the new version's deltas land, else the upgraded
+        # core 500s on /oauth/token. Idempotent 'upgrade' (mirrors _setup_server_one_rhel Step 7).
+        ulog(""); ulog("━━━ Step 4/5: Applying TAK schema on Server One (SchemaManager) ━━━")
+        if db_password:
+            schema_cmd = (
+                'if [ -f /opt/tak/db-utils/SchemaManager.jar ]; then '
+                'cd /opt/tak/db-utils && sudo java -jar SchemaManager.jar '
+                f'-url jdbc:postgresql://127.0.0.1:{db_port}/cot -user martiuser '
+                f'-password {shlex.quote(db_password)} upgrade 2>&1 | tail -12; '
+                'else echo NO_SCHEMA_MANAGER; fi'
+            )
+            _, scout = _ssh_probe(s1_cfg, schema_cmd, timeout=300)
+            for line in (scout or '').strip().split('\n')[-12:]:
+                if line.strip(): upgrade_log.append("  " + line)
+            if 'up to date' in (scout or '') or 'Successfully applied' in (scout or ''):
+                ulog("✓ TAK schema applied on Server One (SchemaManager upgrade)")
+            elif 'NO_SCHEMA_MANAGER' in (scout or ''):
+                ulog("⚠ SchemaManager.jar not found on Server One — schema NOT upgraded; 8446 login may 500 on a breaking jump.")
+            else:
+                ulog("⚠ SchemaManager did not confirm — verify Server One cot tables; 8446 login may 500 on a breaking jump.")
+        else:
+            ulog("⚠ No DB password available — cannot run SchemaManager on Server One. Schema NOT upgraded.")
+
+        # ━━━ Step 5/5: Start TAK Server ━━━
+        ulog(""); ulog("━━━ Step 5/5: Starting TAK Server ━━━")
+        if heap_backup and heap_backup.strip():
+            try:
+                _write_priv(heap_file, heap_backup); ulog("✓ JVM heap settings restored")
+            except Exception as e:
+                ulog(f"⚠ Could not restore heap settings: {e}")
+        ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
+        if ne_changed: ulog(f"NameEntry fix: {ne_msg}")
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed: ulog(f"LDAP resync: {resync_msg}")
+        settings = load_settings()
+        takserver_host = _get_service_domain(settings, 'takserver')
+        if takserver_host:
+            ulog("Re-installing LE cert on 8446 (postinst may have reset connector)...")
+            install_le_cert_on_8446(takserver_host, ulog, wait_for_cert=False)
+        subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)
+        ulog("Waiting 30 seconds for startup...")
+        for remaining in range(20, -1, -10):
+            time.sleep(10)
+            upgrade_log.append(f"  ⏳ {remaining//60:02d}:{remaining%60:02d} remaining")
+        ulog("✓ TAK Server started")
+        if _get_authentik_env_content(settings):
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
+        generate_caddyfile(settings)
+        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _rq = subprocess.run('rpm -q takserver-core 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+        ulog(f"✓ Installed: {_rq}" if _rq.startswith('takserver-core') else "⚠ rpm -q takserver-core did not report installed — verify manually")
+        ulog(""); ulog("=" * 50)
+        ulog("✓ Two-server RHEL update complete")
+        ulog(f"  Core: upgraded on this host")
+        ulog(f"  Database + schema: upgraded on {s1_host}")
         ulog("=" * 50)
         upgrade_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -61785,14 +62053,14 @@ function takPurgeFailed(){
 <span id="tak-update-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease{% if upgrading or upgrade_done or upgrade_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
 </div>
 <div id="tak-update-body" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
-{% if two_server_mode %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px"><span style="color:var(--cyan);font-weight:600">Two-server mode detected.</span> Upload <strong>both</strong> the <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb packages from tak.gov. The update will upgrade the core on this host first, then the database on Server One ({{ s1_host }}) via SSH.</p>
+{% if two_server_mode %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px"><span style="color:var(--cyan);font-weight:600">Two-server mode detected.</span> Upload <strong>both</strong> the <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} packages from tak.gov. The update will upgrade the core on this host first, then the database on Server One ({{ s1_host }}) via SSH.</p>
 {% elif tak_is_container %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-docker-X.X-RELEASE-XX.zip</span> from tak.gov, upload it below, then click Update. This rebuilds the TAK Server container image from the new bundle and restarts it &mdash; your <strong>database and certificates are preserved</strong>.</p>
 {% elif 'ubuntu' in settings.get('os_type', '') %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
 {% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-X.X-RELEASE-XX.noarch.rpm</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">dnf install ./package.rpm</span> and restarts TAK Server &mdash; your <strong>database is preserved</strong>.</p>
 {% endif %}
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
 <input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
-<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> .deb here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>
+<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>
 <div id="upgrade-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
 </div>
 <div id="upgrade-progress-area" style="margin-bottom:16px"></div>
@@ -62755,6 +63023,47 @@ def _startup_ensure_broker():
         print(f'Startup migration: broker ensure warning (non-fatal): {_e}', flush=True)
 
 _startup_ensure_broker()
+
+
+def _startup_ensure_hardening_posture():
+    """v10.0.5: re-assert the Hardened (W1) EXTERNAL side-effects on every console start.
+    A Hardened box's lockdown lives partly OUTSIDE the console's own state — the UFW/firewalld
+    :5001 close and Caddy's /login SSO-lock. start.sh (the non-root flip re-runs it, and it
+    unconditionally re-opens :5001), service deploys, and firewall re-opens all reset those
+    back to Standard shape while hardening.json still says 'hardened' — silently un-hardening
+    the box (backdoor :5001 world-open; /login password page served). This heals that drift:
+    if posture=='hardened', ensure the console port has NO public firewall allow and Caddy's
+    /login lock is live. Runs after _startup_ensure_broker so the broker can mediate the
+    privileged ops under the non-root console. Idempotent; no-op on Standard boxes."""
+    try:
+        h = load_hardening()
+        if (h.get('posture') or 'standard') != 'hardened':
+            return
+        w1 = (h.get('applied') or {}).get('W1_sso') or {}
+        # Under the non-root console the firewall/caddy ops route through the broker; give it a
+        # moment to accept connections after _startup_ensure_broker (re)started it.
+        if os.getuid() != 0 and _broker_should_route():
+            for _ in range(20):
+                if _broker_available():
+                    break
+                time.sleep(0.25)
+        port = int(load_settings().get('console_port') or 5001)
+        if _w1_console_port_public(str(port)):
+            _fw_remove(port, 'tcp')
+            still = _w1_console_port_public(str(port))
+            print('[startup-posture] hardened: re-closed public :%s (%s)' % (
+                port, 'STILL OPEN — check firewall/broker' if still else 'now localhost-only'), flush=True)
+        if w1.get('caddy_login_locked'):
+            try:
+                generate_caddyfile()
+                subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=20)
+                print('[startup-posture] hardened: Caddy /login SSO-lock re-asserted', flush=True)
+            except Exception as _ce:
+                print('[startup-posture] Caddy re-assert warning: %s' % str(_ce)[:140], flush=True)
+    except Exception as _e:
+        print('[startup-posture] skipped (non-fatal): %s' % str(_e)[:160], flush=True)
+
+_startup_ensure_hardening_posture()
 
 
 # v0.9.58 (#6): startup migration — re-apply the trusted-upstream ignoreip to every
