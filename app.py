@@ -8878,19 +8878,58 @@ def guarddog_deploy_api():
     threading.Thread(target=run_guarddog_deploy, args=(alert_email,), daemon=True).start()
     return jsonify({'success': True})
 
+def _remote_healthagent_fw_step(db_port, extra_src_ip=''):
+    """Shell snippet (run over SSH on Server One with sudo NOPASSWD) that opens 8080 — and,
+    on ufw, converges db_port — for the console's source IP(s), on whichever host firewall
+    Server One runs: firewalld (RHEL/Rocky), ufw (Debian), or no-op if neither. The caller
+    MUST set $SRC (console IP via $SSH_CLIENT) in the same shell before invoking this.
+
+    v10.0.5: the old code hard-coded `sudo ufw …`, which silently no-ops on a RHEL/Rocky
+    Server One (firewalld, no ufw) → 8080 either stayed closed (firewalld active) or was left
+    to the deploy's scoping. On firewalld we ONLY add a source-scoped 8080 rich-rule and drop
+    any broad 8080 open — db_port is left exactly as the split deploy scoped it, so TAK↔DB is
+    never touched here."""
+    dp = int(db_port)
+    esi = (extra_src_ip or '').strip()
+    fd = (
+        'for A in "$SRC" "' + esi + '"; do [ -n "$A" ] || continue; '
+        'sudo firewall-cmd --permanent --add-rich-rule="rule family=\'ipv4\' source address=\'$A\' '
+        'port port=\'8080\' protocol=\'tcp\' accept" >/dev/null 2>&1; done; '
+        'sudo firewall-cmd --permanent --remove-port=8080/tcp >/dev/null 2>&1; '
+        'sudo firewall-cmd --reload >/dev/null 2>&1; '
+    )
+    esi_ufw = ''
+    if esi:
+        esi_ufw = (f'sudo ufw allow from {esi} to any port 8080 proto tcp >/dev/null 2>&1; '
+                   f'sudo ufw allow from {esi} to any port {dp} proto tcp >/dev/null 2>&1; ')
+    ufw = (
+        'sudo ufw delete deny 8080/tcp >/dev/null 2>&1; '
+        f'sudo ufw delete deny {dp}/tcp >/dev/null 2>&1; '
+        f'sudo ufw delete allow {dp}/tcp >/dev/null 2>&1; '
+        'if [ -n "$SRC" ]; then sudo ufw allow from "$SRC" to any port 8080 proto tcp >/dev/null 2>&1; '
+        f'sudo ufw allow from "$SRC" to any port {dp} proto tcp >/dev/null 2>&1; fi; '
+        + esi_ufw +
+        'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
+        f'sudo ufw deny {dp}/tcp >/dev/null 2>&1; '
+    )
+    return ('if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then '
+            + fd + 'elif command -v ufw >/dev/null 2>&1; then ' + ufw + 'fi; ')
+
 def _deploy_health_agent_to_server_one(s1_cfg):
     """Deploy Guard Dog health agent to Server One (SCP + systemd + 8080). Returns (ok, message).
 
-    v0.9.12 hardening: UFW for port 8080 is source-scoped to the console's
-    public IP (settings.server_ip) and explicitly denied otherwise. The health
-    endpoint exposes Postgres state — it was publicly reachable pre-v0.9.12.
-    Falls back to public-allow only when no source IP is configured.
+    v0.9.12 hardening: host firewall for port 8080 is source-scoped to the console's
+    source IP and explicitly denied otherwise. The health endpoint exposes Postgres state —
+    it was publicly reachable pre-v0.9.12. Falls back to public-allow only when no source IP.
     """
     scripts_dir = os.path.join(BASE_DIR, 'scripts', 'guarddog')
     agent_src = os.path.join(scripts_dir, 'tak-db-health-agent.py')
     if not os.path.isfile(agent_src):
         return False, 'tak-db-health-agent.py not found'
-    scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/opt/', timeout=30)
+    # v10.0.5: land in /tmp, not /opt — Server One's SSH user (e.g. rocky) is NOT root and
+    # scp can't sudo, so a direct scp to the root-owned /opt failed with "Permission denied".
+    # setup_cmd then `sudo mv`s it from /tmp into /opt/tak-guarddog.
+    scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/tmp/', timeout=30)
     if not scp_ok:
         return False, f'SCP failed: {(scp_out or "")[:150]}'
     # v0.9.46: scope 8080 to the source IP Server One ACTUALLY sees from the console
@@ -8906,34 +8945,13 @@ def _deploy_health_agent_to_server_one(s1_cfg):
         _db_port = int(_dbp or 5432)
     except Exception:
         _db_port = 5432
-    _srvip_allows = ''
-    if _src_ip:
-        _srvip_allows = (
-            f'sudo ufw allow from {_src_ip} to any port 8080 proto tcp >/dev/null 2>&1; '
-            f'sudo ufw allow from {_src_ip} to any port {_db_port} proto tcp >/dev/null 2>&1; '
-        )
-    # ORDER MATTERS: UFW is first-match-wins and APPENDS new rules. A pre-existing
-    # `deny <port>/tcp` from an earlier deploy sits ABOVE a freshly-added scoped allow,
-    # so the deny wins and the allow never matches. Delete the deny FIRST, add the
-    # scoped allow(s), then re-add the deny LAST so it lands below the allows.
-    _ufw_step = (
-        'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
-        'sudo ufw delete deny 8080/tcp >/dev/null 2>&1; '
-        f'sudo ufw delete deny {_db_port}/tcp >/dev/null 2>&1; '
-        # `delete allow {port}/tcp` removes ONLY the broad Anywhere allow; scoped allows
-        # (incl. the core's existing DB ACL) survive, so TAK never loses its DB.
-        f'sudo ufw delete allow {_db_port}/tcp >/dev/null 2>&1; '
-        'if [ -n "$SRC" ]; then '
-        'sudo ufw allow from "$SRC" to any port 8080 proto tcp >/dev/null 2>&1; '
-        f'sudo ufw allow from "$SRC" to any port {_db_port} proto tcp >/dev/null 2>&1; '
-        'fi; '
-        + _srvip_allows +
-        'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
-        f'sudo ufw deny {_db_port}/tcp >/dev/null 2>&1; '
-    )
+    # Backend-aware (firewalld on RHEL/Rocky, ufw on Debian). $SRC is computed in setup_cmd
+    # below (the console IP Server One sees via $SSH_CLIENT), unioned with _src_ip.
+    _fw_step = _remote_healthagent_fw_step(_db_port, _src_ip)
     setup_cmd = (
+        'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
         'sudo mkdir -p /opt/tak-guarddog && '
-        'sudo mv /opt/tak-db-health-agent.py /opt/tak-guarddog/tak-db-health-agent.py && '
+        'sudo mv /tmp/tak-db-health-agent.py /opt/tak-guarddog/tak-db-health-agent.py && '
         'sudo chmod 644 /opt/tak-guarddog/tak-db-health-agent.py && '
         "cat > /tmp/tak-db-health.service << 'UNIT'\n"
         '[Unit]\n'
@@ -8951,7 +8969,7 @@ def _deploy_health_agent_to_server_one(s1_cfg):
         'sudo systemctl daemon-reload && '
         'sudo systemctl enable tak-db-health.service && '
         'sudo systemctl restart tak-db-health.service && '
-        + _ufw_step +
+        + _fw_step +
         'echo AGENT_OK'
     )
     ok, out = _ssh_probe(s1_cfg, setup_cmd, timeout=30)
@@ -13136,22 +13154,23 @@ def run_guarddog_deploy(alert_email):
             s1_cfg = tak_cfg.get('server_one', {})
             agent_src = os.path.join(scripts_dir, 'tak-db-health-agent.py')
             if os.path.isfile(agent_src):
-                scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/opt/', timeout=30)
+                # v10.0.5: land in /tmp — Server One's SSH user (e.g. rocky) isn't root and
+                # scp can't sudo, so a scp to root-owned /opt failed ("Permission denied").
+                scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/tmp/', timeout=30)
                 if scp_ok:
-                    # Create systemd service and open port 8080 on Server One.
-                    # v0.9.12: UFW source-scoped to console IP (settings.server_ip);
-                    # falls back to public-allow only when no source IP set.
+                    # Open port 8080 on Server One — backend-aware (firewalld on RHEL, ufw on
+                    # Debian; the old `sudo ufw` hard-code silently no-op'd on a Rocky Server One).
                     _gd_src_ip = _fedhub_caddy_source_ip(settings)
-                    if _gd_src_ip:
-                        _gd_ufw_step = (
-                            f'sudo ufw allow from {_gd_src_ip} to any port 8080 proto tcp >/dev/null 2>&1; '
-                            'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
-                        )
-                    else:
-                        _gd_ufw_step = 'sudo ufw allow 8080/tcp >/dev/null 2>&1; '
+                    try:
+                        _gd_dbh, _gd_dbp = _remotedb_host_port_from_tak_settings()
+                        _gd_db_port = int(_gd_dbp or 5432)
+                    except Exception:
+                        _gd_db_port = 5432
+                    _gd_fw_step = _remote_healthagent_fw_step(_gd_db_port, _gd_src_ip)
                     setup_cmd = (
+                        'SRC=$(echo "$SSH_CLIENT" | awk \'{print $1}\'); '
                         'sudo mkdir -p /opt/tak-guarddog && '
-                        'sudo mv /opt/tak-db-health-agent.py /opt/tak-guarddog/tak-db-health-agent.py && '
+                        'sudo mv /tmp/tak-db-health-agent.py /opt/tak-guarddog/tak-db-health-agent.py && '
                         'sudo chmod 644 /opt/tak-guarddog/tak-db-health-agent.py && '
                         'cat > /tmp/tak-db-health.service << \'UNIT\'\n'
                         '[Unit]\n'
@@ -13169,7 +13188,7 @@ def run_guarddog_deploy(alert_email):
                         'sudo systemctl daemon-reload && '
                         'sudo systemctl enable tak-db-health.service && '
                         'sudo systemctl restart tak-db-health.service && '
-                        + _gd_ufw_step +
+                        + _gd_fw_step +
                         'echo AGENT_OK'
                     )
                     ok, out = _ssh_probe(s1_cfg, setup_cmd, timeout=30)
