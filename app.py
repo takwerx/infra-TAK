@@ -63216,6 +63216,74 @@ def _startup_ensure_server_one_ssh_key():
 _startup_ensure_server_one_ssh_key()
 
 
+def _startup_rehome_module(subdir, container_name):
+    """v10.0.5 (PILOT — TAK-Portal only): re-home a root-era module dir /root/<subdir> -> ~/<subdir>
+    so the NON-ROOT console can manage it. On a box flipped from root, modules deployed root-era
+    live under /root, which the takwerx console can't traverse — so the ~200 `cd ~/<module> &&
+    docker compose …` management sites all target the wrong (missing) path. Moving the dir to the
+    console home makes every one of them work with zero per-site edits. Ships via UPDATE (startup
+    hook), broker-mediated so it can touch /root.
+
+    SAFE ONLY for modules whose compose data is in NAMED docker volumes (survives the dir move) —
+    verified for TAK-Portal (tak-portal_tak_portal_data; no bind mounts). Sequence: `docker compose
+    down` (keeps the named volume) from the current dir via the broker → verify the container is
+    gone → `mv` the dir to ~ + chown takwerx (broker) → `docker compose up -d` from the new home AS
+    TAKWERX (docker via broker shims) — the last step is the actual proof the non-root console can
+    now manage it. Same compose project name (dir basename is preserved) → the named volume
+    reattaches → no data loss. Idempotent (no-op once ~/<subdir> exists or /root/<subdir> is gone);
+    aborts BEFORE the move if the stack won't stop, so a partial state never loses data."""
+    try:
+        if os.getuid() == 0:
+            return
+        home = os.path.expanduser('~').rstrip('/')
+        dst = os.path.join(home, subdir)
+        src = os.path.join('/root', subdir)
+        if os.path.exists(dst):
+            return  # already home-resident (born-non-root or migrated) — nothing to do
+        if _broker_should_route():
+            for _ in range(20):
+                if _broker_available():
+                    break
+                time.sleep(0.25)
+        # takwerx can't stat /root — ask the broker whether a root-era install is there.
+        chk = subprocess.run(_sudo_wrap(['test', '-f', os.path.join(src, 'docker-compose.yml')]), capture_output=True, timeout=10)
+        if chk.returncode != 0:
+            return  # no root-era install to migrate
+        def _log(m):
+            print('[rehome:%s] %s' % (subdir, m), flush=True)
+        _log('root-era install at %s — migrating to %s (data is in a named volume, preserved)' % (src, dst))
+        # 1) Stop the stack (KEEP named volumes) from the current dir. Broker runs as root so it
+        #    can cd into /root; no `-v`, so the data volume is untouched.
+        subprocess.run(_sudo_wrap(['bash', '-lc', 'cd %s && docker compose down' % shlex.quote(src)]),
+                       capture_output=True, text=True, timeout=180)
+        _still = subprocess.run('docker ps --filter name=%s --format "{{.Names}}" 2>/dev/null' % shlex.quote(container_name),
+                                shell=True, capture_output=True, text=True, env=_broker_shim_env())
+        if (_still.stdout or '').strip():
+            _log('WARN: %s still running after `compose down` — aborting, left in place (no data touched)' % container_name)
+            return
+        # 2) Move + chown to takwerx (broker — reads /root, writes ~, chowns).
+        _mv = subprocess.run(_sudo_wrap(['mv', src, dst]), capture_output=True, text=True, timeout=120)
+        if _mv.returncode != 0 or not os.path.isdir(dst):
+            _log('ERROR: move failed (%s) — restarting stack in place' % (_mv.stderr or '')[:120])
+            subprocess.run(_sudo_wrap(['bash', '-lc', 'cd %s && docker compose up -d' % shlex.quote(src)]), capture_output=True, timeout=180)
+            return
+        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', dst]), capture_output=True, timeout=180)
+        # 3) Bring it up from the NEW home as takwerx (docker via broker shims) — proves the
+        #    non-root console can now manage it. Same project name (basename) -> volume reattaches.
+        _up = subprocess.run('cd %s && docker compose up -d' % shlex.quote(dst),
+                             shell=True, capture_output=True, text=True, timeout=300, env=_broker_shim_env())
+        if _up.returncode != 0:
+            _log('WARN: `docker compose up` from %s returned %d: %s' % (dst, _up.returncode, (_up.stderr or _up.stdout or '')[:160]))
+        else:
+            _log('re-homed %s -> %s and restarted from the new location (non-root manageable)' % (src, dst))
+    except Exception as e:
+        print('[rehome:%s] skipped (non-fatal): %s' % (subdir, str(e)[:160]), flush=True)
+
+# PILOT (v10.0.5): TAK-Portal ONLY — validate the re-home end-to-end before extending to
+# Authentik / CloudTAK / netbird / node-red (each re-verified for named-volume safety first).
+_startup_rehome_module('TAK-Portal', 'tak-portal')
+
+
 # v0.9.58 (#6): startup migration — re-apply the trusted-upstream ignoreip to every
 # enabled fail2ban jail on boot, so the gateway/VNet whitelist + the mediamtx/recidive
 # baseline activate on a plain restart, not only when an operator next touches a jail
