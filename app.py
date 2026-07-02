@@ -56035,86 +56035,119 @@ _snapshot_log   = []
 _snapshot_status = {'running': False, 'complete': False, 'error': False}
 
 def _tak_setup_snapshot_schedule(plog=None):
-    """v0.9.3: Write/update a systemd timer for scheduled TAK Server snapshots.
+    """v10.0.6: scheduled snapshots now run IN-PROCESS (see _tak_snapshot_scheduler) —
+    the v0.9.3 systemd timer NEVER worked (4 broken layers: parsed a `-p` port the
+    console unit doesn't have → bogus 2121; curled http on an https-only console; used
+    a session cookie nothing ever created; and the endpoint is @login_required with no
+    loopback bypass — it 401'd even when reachable). All it produced was a red
+    takserver-snapshot.service in `systemctl --failed` (seen on test12).
 
-    The timer calls POST /api/takserver/snapshot/run with source='scheduled'.
-    Schedule defaults to daily at 02:00 local time; operator can change via UI.
-    Idempotent — rewrites unit files each time so schedule changes take effect.
-    """
+    This function now just REMOVES the legacy units (idempotent, clears the failed
+    state) — the in-process scheduler reads tak_snapshot_schedule live, so enable/
+    disable/schedule changes need no setup step at all."""
     if plog is None:
         plog = lambda m: print(m, flush=True)
-
-    settings  = load_settings()
-    snap_cfg  = settings.get('tak_snapshot_schedule') or {}
-    enabled   = snap_cfg.get('enabled', False)
-    frequency = snap_cfg.get('frequency', 'daily')   # 'daily' | 'weekly'
-    hour      = int(snap_cfg.get('hour', 2))
-    minute    = int(snap_cfg.get('minute', 0))
-    retention = int(snap_cfg.get('retention', 7))
-
-    # Read the console port from environment or default
     try:
-        _port_r = subprocess.run(
-            "systemctl show takwerx-console --property=ExecStart 2>/dev/null | grep -o '\\-p [0-9]*' | awk '{print $2}'",
-            shell=True, capture_output=True, text=True, timeout=5
-        )
-        _port = (_port_r.stdout or '').strip() or '2121'
-    except Exception:
-        _port = '2121'
-
-    service_unit = f"""[Unit]
-Description=infra-TAK Scheduled TAK Server Snapshot
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/curl -s -X POST -H "Content-Type: application/json" \\
-    -b /opt/tak-console-session.cookie \\
-    http://127.0.0.1:{_port}/api/takserver/snapshot/run \\
-    -d '{{"source":"scheduled"}}'
-User=takwerx
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-    if frequency == 'weekly':
-        on_calendar = f"Sat *-*-* {hour:02d}:{minute:02d}:00"
-    else:
-        on_calendar = f"*-*-* {hour:02d}:{minute:02d}:00"
-
-    timer_unit = f"""[Unit]
-Description=infra-TAK Scheduled TAK Server Snapshot Timer
-Requires=takserver-snapshot.service
-
-[Timer]
-OnCalendar={on_calendar}
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-"""
-
-    svc_path   = '/etc/systemd/system/takserver-snapshot.service'
-    timer_path = '/etc/systemd/system/takserver-snapshot.timer'
-
-    try:
-        _write_priv(svc_path, service_unit)
-        _write_priv(timer_path, timer_unit)
-        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
-
-        if enabled:
-            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takserver-snapshot.timer']),
-                           capture_output=True, timeout=10)
-            plog(f"  snapshot schedule: enabled ({frequency} at {hour:02d}:{minute:02d}, retention={retention})")
-        else:
+        _legacy = ['/etc/systemd/system/takserver-snapshot.service',
+                   '/etc/systemd/system/takserver-snapshot.timer']
+        if any(os.path.exists(p) for p in _legacy):
             subprocess.run(_sudo_wrap(['systemctl', 'disable', '--now', 'takserver-snapshot.timer']),
                            capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['rm', '-f'] + _legacy), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'takserver-snapshot.service']),
+                           capture_output=True, timeout=10)
+            plog("  snapshot schedule: legacy systemd timer removed — scheduling is in-process now")
+        cfg = (load_settings().get('tak_snapshot_schedule') or {})
+        if cfg.get('enabled'):
+            plog(f"  snapshot schedule: enabled ({cfg.get('frequency', 'daily')} at "
+                 f"{int(cfg.get('hour', 2)):02d}:{int(cfg.get('minute', 0)):02d}, "
+                 f"retention={int(cfg.get('retention', 7))}) — runs in-process")
+        else:
             plog("  snapshot schedule: disabled")
         return True
     except Exception as e:
         plog(f"  snapshot schedule: error — {e}")
         return False
+
+
+def _tak_snapshot_scheduler():
+    """v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional
+    systemd timer — see _tak_setup_snapshot_schedule docstring). Daemon thread,
+    one-minute tick; reads tak_snapshot_schedule live so UI changes apply without
+    any restart. Catch-up semantics match the old timer's Persistent=true: if the
+    console was down at HH:MM, the snapshot fires on the next tick that day. The
+    occurrence is stamped BEFORE the run so a failing snapshot doesn't retry every
+    minute. Prunes only `scheduled-*` snapshots beyond the retention count —
+    manual and pre-update snapshots are never touched."""
+    global _snapshot_status, _snapshot_log
+    import time as _st
+    _st.sleep(180)  # let _startup_migrations finish before the first tick
+    while True:
+        try:
+            s = load_settings()
+            cfg = s.get('tak_snapshot_schedule') or {}
+            if not cfg.get('enabled') or not os.path.exists('/opt/tak'):
+                _st.sleep(60)
+                continue
+            now = datetime.now()
+            hour = max(0, min(23, int(cfg.get('hour', 2))))
+            minute = max(0, min(59, int(cfg.get('minute', 0))))
+            weekly = (cfg.get('frequency', 'daily') == 'weekly')
+            occurrence = now.strftime('%Y-%m-%d')
+            due = ((not weekly or now.weekday() == 5)                      # Sat for weekly
+                   and (now.hour, now.minute) >= (hour, minute)
+                   and cfg.get('last_scheduled_run') != occurrence
+                   and not _snapshot_status.get('running'))
+            if not due:
+                _st.sleep(60)
+                continue
+            # Stamp first — a failing snapshot must not re-fire every minute all day.
+            cfg['last_scheduled_run'] = occurrence
+            s['tak_snapshot_schedule'] = cfg
+            save_settings(s)
+            label = f"scheduled-{now.strftime('%Y%m%d-%H%M%S')}"
+            def plog(m):
+                entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+                _snapshot_log.append(entry)
+                print(f"[snapshot-scheduler] {m}", flush=True)
+            _snapshot_log = []
+            _snapshot_status = {'running': True, 'complete': False, 'error': False}
+            plog(f"scheduled snapshot starting — {label}")
+            ok, result = _tak_snapshot(label, plog)
+            if ok:
+                _snapshot_status = {'running': False, 'complete': True, 'error': False}
+                try:
+                    s2 = load_settings()
+                    sn = s2.get('tak_snapshots') or []
+                    for snap in sn:
+                        if snap.get('label') == label:
+                            snap['source'] = 'scheduled'
+                    # Retention: newest N scheduled snapshots survive.
+                    retention = max(1, min(90, int(cfg.get('retention', 7))))
+                    scheduled = sorted(
+                        [x for x in sn if x.get('source') == 'scheduled'
+                         or str(x.get('label', '')).startswith('scheduled-')],
+                        key=lambda x: x.get('taken_at', ''), reverse=True)
+                    for victim in scheduled[retention:]:
+                        v_ok, v_label = _validate_snapshot_label(victim.get('label', ''))
+                        if not v_ok:
+                            continue
+                        subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(SNAPSHOT_DIR, v_label)]),
+                                       capture_output=True, timeout=60)
+                        sn = [x for x in sn if x.get('label') != v_label]
+                        plog(f"retention: pruned old scheduled snapshot {v_label}")
+                    s2['tak_snapshots'] = sn
+                    save_settings(s2)
+                except Exception as _pe:
+                    plog(f"retention prune error (non-fatal): {str(_pe)[:120]}")
+                plog("scheduled snapshot complete")
+            else:
+                _snapshot_status = {'running': False, 'complete': False, 'error': True}
+                plog(f"scheduled snapshot FAILED: {result}")
+        except Exception as _sched_e:
+            print(f"[snapshot-scheduler] tick error (non-fatal): {str(_sched_e)[:200]}", flush=True)
+        _st.sleep(60)
 
 
 @app.route('/api/takserver/snapshot/schedule', methods=['GET'])
@@ -56125,10 +56158,9 @@ def takserver_snapshot_schedule_get_api():
     cfg = s.get('tak_snapshot_schedule') or {
         'enabled': False, 'frequency': 'daily', 'hour': 2, 'minute': 0, 'retention': 7
     }
-    # Check if timer is actually active
-    r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver-snapshot.timer']),
-                       capture_output=True, text=True)
-    cfg['timer_active'] = (r.stdout.strip() == 'active')
+    # v10.0.6: scheduling is in-process (daemon thread reads settings live), so
+    # "active" simply mirrors enabled — no systemd timer exists anymore.
+    cfg['timer_active'] = bool(cfg.get('enabled'))
     return jsonify(cfg)
 
 
@@ -66333,11 +66365,12 @@ def _startup_migrations():
         except Exception as _ak_rep_err:
             print(f"Startup migration: authentik reputation policy error (non-fatal): {_ak_rep_err}")
 
-        # v0.9.3: Ensure TAK Server snapshot timer matches settings (idempotent rewrite).
+        # v10.0.6: snapshot scheduling moved in-process — this call now just removes the
+        # legacy (never-functional) systemd units and clears their failed state. Runs
+        # UNCONDITIONALLY (not gated on enabled): boxes with the schedule since turned
+        # off still carry the red takserver-snapshot.service until cleaned.
         try:
-            _s = load_settings()
-            if (_s.get('tak_snapshot_schedule') or {}).get('enabled'):
-                _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
+            _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _snap_err:
             print(f"Startup migration: snapshot schedule error (non-fatal): {_snap_err}")
     except Exception as e:
@@ -68291,6 +68324,15 @@ try:
     _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
+
+# v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional systemd
+# timer). Reads tak_snapshot_schedule live each tick — no-op while disabled or when
+# TAK isn't installed.
+try:
+    import threading as _threading_snap
+    _threading_snap.Thread(target=_tak_snapshot_scheduler, daemon=True, name='tak-snapshot-scheduler').start()
+except Exception as _e:
+    print(f"[startup] failed to start snapshot scheduler (non-fatal): {_e}", flush=True)
 
 # v10.0.4: server_ip self-heal (belt-and-braces). The primary path is the unit's
 # ExecStartPre=selfheal_ip.py (heals BEFORE gunicorn binds, so a regenerated cert is
