@@ -19771,21 +19771,23 @@ def _get_netbird_version_info():
     if dash_ver:
         parts.append('dash ' + dash_ver)
     out['version'] = ' · '.join(parts)
-    mgmt_latest = _get_netbird_github_latest('netbird')
-    dash_latest = _get_netbird_github_latest('dashboard')
-    mgmt_latest_clean = (mgmt_latest or '').lstrip('vV')
-    dash_latest_clean = (dash_latest or '').lstrip('vV')
-    mgmt_behind = bool(mgmt_ver and mgmt_latest_clean
-                       and _netbird_version_tuple(mgmt_latest_clean) > _netbird_version_tuple(mgmt_ver))
-    dash_behind = bool(dash_ver and dash_latest_clean
-                       and _netbird_version_tuple(dash_latest_clean) > _netbird_version_tuple(dash_ver))
+    # v10.0.5: NetBird is PINNED (no :latest — see netbird pin policy). "Update Now" deploys the
+    # PINNED image, NOT GitHub's latest — so the update-available check must compare the running
+    # version against the PIN, else the badge never clears (GitHub latest > pin → perpetual
+    # "update available" right after a successful update, which is the bug being fixed).
+    mgmt_pin = NETBIRD_SERVER_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
+    dash_pin = NETBIRD_DASHBOARD_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
+    mgmt_behind = bool(mgmt_ver and mgmt_pin
+                       and _netbird_version_tuple(mgmt_pin) > _netbird_version_tuple(mgmt_ver))
+    dash_behind = bool(dash_ver and dash_pin
+                       and _netbird_version_tuple(dash_pin) > _netbird_version_tuple(dash_ver))
     if mgmt_behind or dash_behind:
         out['update_available'] = True
         latest_parts = []
         if mgmt_behind:
-            latest_parts.append(mgmt_latest_clean)
+            latest_parts.append(mgmt_pin)
         if dash_behind:
-            latest_parts.append('dash ' + dash_latest_clean)
+            latest_parts.append('dash ' + dash_pin)
         out['latest'] = ' · '.join(latest_parts)
     return out
 
