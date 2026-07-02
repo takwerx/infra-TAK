@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.4-alpha)**
+**Current release: [v10.0.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.5-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.5-alpha — 2026-07-02 — Run the whole stack without root: a one-click least-privilege console
+
+**Headline: the infra-TAK console — and the whole TAK stack it manages — can now run as an unprivileged user instead of root, and existing servers can switch over with a single click.** New installs come up non-root automatically; existing deployments get a **Switch to non-root** button on the **Cyber Controls** page. It migrates the running console to an unprivileged user, carries all of its state across, and relocates every managed service (Authentik/SSO, CloudTAK, TAK Portal, NetBird, Node-RED and more) into the new home so they stay manageable — with automatic rollback if anything doesn't come back cleanly, and without dropping SSO or your hardened firewall posture. Underneath, a small privileged broker mediates the handful of genuinely root-level operations the console still needs, so routine management no longer runs with full root. This release also completes the non-root switch on **Rocky / RHEL 9** (SELinux-aware migration and firewalld-correct port hardening, so admin services stay behind the reverse proxy) and strengthens two-server (separate database host) deployments. **Upgrade:** applied automatically on the next console update; switching to non-root is opt-in from the Cyber Controls page.
+
+Full notes: [v10.0.5-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.5-alpha).
 
 ### v10.0.4-alpha — 2026-06-24 — See exactly what your server exposes — and a server that heals its own address when the cloud changes it
 
