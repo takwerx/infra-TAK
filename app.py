@@ -8589,6 +8589,10 @@ def remote_assist_page():
     ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
     coturn_ip = settings.get('coturn_ip', '')
+    coturn_port = str(settings.get('coturn_port') or '3478')
+    # Legacy-NetBird coturn detection + shared-mode health (Mike/cfd2474, PR #49)
+    _nb_has, _nb_ctr, _nb_conf = _netbird_coturn_status() if ra.get('installed') else (False, None, None)
+    netbird_coturn_in_use = bool(settings.get('netbird_coturn_in_use'))
     r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
         settings=settings, ra=ra, version=VERSION,
         authentik_installed=ak.get('installed'),
@@ -8599,7 +8603,10 @@ def remote_assist_page():
         coturn_username=settings.get('coturn_username', ''),
         coturn_password=settings.get('coturn_password', ''),
         coturn_ip=coturn_ip,
-        coturn_url=(f'turn:{coturn_ip}:3478' if coturn_ip else ''),
+        coturn_url=(f'turn:{coturn_ip}:{coturn_port}' if coturn_ip else ''),
+        can_configure_nb_coturn=bool(_nb_has and _nb_ctr and _nb_conf),
+        netbird_coturn_in_use=netbird_coturn_in_use,
+        netbird_coturn_missing=(netbird_coturn_in_use and not _nb_ctr),
         deploying=_remote_assist_deploy_status.get('running', False),
         deploy_done=_remote_assist_deploy_status.get('complete', False)))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -8618,6 +8625,99 @@ _COTURN_USER_RE = re.compile(r'^[A-Za-z0-9._@+=-]{1,64}$')
 _COTURN_PASS_RE = re.compile(r'^[A-Za-z0-9._@+=!%^-]{8,128}$')
 
 
+def _netbird_coturn_status():
+    """(has_netbird, coturn_container, turnserver_conf_host_path).
+
+    Detects a LEGACY/classic NetBird install that runs a SEPARATE coturn
+    container with a bind-mounted /etc/turnserver.conf — that conf can take an
+    extra static `user=` line for Remote Assist (Mike/cfd2474, PR #49). The
+    infra-TAK NetBird hub (all-in-one netbird-server image) embeds its
+    STUN/TURN, so it returns (True, None, None) → standalone CoTURN on an
+    alternate port is the path there."""
+    import subprocess as _sp
+    has_netbird, container, conf_path = False, None, None
+    try:
+        r = _sp.run(['docker', 'ps', '--format', '{{.Names}}'],
+                    capture_output=True, text=True, timeout=10)
+        names = [c.strip() for c in (r.stdout or '').splitlines() if c.strip()]
+        has_netbird = any('netbird' in c.lower() for c in names)
+        if has_netbird:
+            for c in names:
+                cl = c.lower()
+                # Exclude our own Remote Assist coturn ("remote_assist"/"remote-assist"
+                # compose project names) — only a coturn that belongs to NetBird counts.
+                if 'coturn' in cl and 'remote' not in cl and 'assist' not in cl and 'infratak' not in cl:
+                    container = c
+                    break
+            if container:
+                ri = _sp.run(['docker', 'inspect', container],
+                             capture_output=True, text=True, timeout=10)
+                data = json.loads(ri.stdout or '[]')
+                for mount in (data[0].get('Mounts', []) if data else []):
+                    if mount.get('Destination') == '/etc/turnserver.conf':
+                        conf_path = mount.get('Source')
+                        break
+    except Exception:
+        pass
+    return has_netbird, container, conf_path
+
+
+@app.route('/api/remote-assist/coturn/configure-netbird', methods=['POST'])
+@login_required
+def remote_assist_coturn_configure_netbird():
+    """Shared mode: append a DEDICATED static `user=` credential to a legacy
+    NetBird coturn's turnserver.conf instead of running a second TURN server.
+    Never reuses NetBird's own TURN secret — WebRTC creds are browser-visible."""
+    import subprocess as _sp
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = (data.get('password') or '').strip()
+    # Same charsets as the standalone install: these values land in
+    # turnserver.conf, where an embedded newline would inject arbitrary
+    # coturn directives (listening-ip, cert paths, ...).
+    if not _COTURN_USER_RE.match(username):
+        return jsonify({'success': False, 'error': 'Username must be 1–64 chars: letters, digits, . _ @ + = -'})
+    if not _COTURN_PASS_RE.match(password):
+        return jsonify({'success': False, 'error': 'Password must be 8–128 chars: letters, digits, . _ @ + = ! % ^ - (no spaces/quotes).'})
+    has_nb, nb_container, conf_path = _netbird_coturn_status()
+    if not (has_nb and nb_container and conf_path):
+        return jsonify({'success': False, 'error': 'No NetBird coturn with a turnserver.conf mount found on this box.'})
+    settings = load_settings()
+    ip = (settings.get('server_ip') or '').strip()
+    if not _valid_core_ip(ip):
+        return jsonify({'success': False, 'error': 'Server public IP is not set — configure it on the Settings page first.'})
+    try:
+        # Never default to '' on a read failure — a blind write here would
+        # REPLACE NetBird's whole turnserver.conf with our single line.
+        try:
+            conf = _read_priv(conf_path)
+        except Exception as re_err:
+            return jsonify({'success': False, 'error': f'Could not read turnserver.conf ({str(re_err)[:120]}) — aborting without changes.'})
+        user_line = f'user={username}:{password}'
+        lines = conf.splitlines()
+        # Rotation must REVOKE: drop the previously-appended infra-TAK credential
+        # (tracked in settings) so re-configuring doesn't strand old creds live.
+        prev_user = settings.get('coturn_username', '')
+        prev_pass = settings.get('coturn_password', '')
+        prev_line = f'user={prev_user}:{prev_pass}' if prev_user else None
+        new_lines = [l for l in lines if not (prev_line and l.strip() == prev_line and l.strip() != user_line)]
+        if user_line not in [l.strip() for l in new_lines]:
+            new_lines.append(user_line)
+        if new_lines != lines:
+            _write_priv(conf_path, '\n'.join(new_lines).rstrip('\n') + '\n')
+            _sp.run(['docker', 'restart', nb_container], capture_output=True, timeout=90)
+        settings['coturn_installed'] = True
+        settings['coturn_username'] = username
+        settings['coturn_password'] = password
+        settings['coturn_ip'] = ip
+        settings['coturn_port'] = '3478'
+        settings['netbird_coturn_in_use'] = True
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
+
+
 @app.route('/api/remote-assist/coturn/install', methods=['POST'])
 @login_required
 def remote_assist_coturn_install():
@@ -8626,6 +8726,7 @@ def remote_assist_coturn_install():
     username = (data.get('username') or '').strip()
     password = (data.get('password') or '').strip()
     ip = (data.get('ip') or '').strip()
+    port = str(data.get('port') or '3478').strip() or '3478'
     if not username or not password or not ip:
         return jsonify({'success': False, 'error': 'All fields are required.'})
     if not _COTURN_USER_RE.match(username):
@@ -8634,18 +8735,26 @@ def remote_assist_coturn_install():
         return jsonify({'success': False, 'error': 'Password must be 8–128 chars: letters, digits, . _ @ + = ! % ^ - (no spaces/quotes).'})
     if not _valid_core_ip(ip):
         return jsonify({'success': False, 'error': 'Public IP must be a valid IPv4 address.'})
+    # Port is interpolated into the compose override — digits only, sane range.
+    if not port.isdigit() or not (1024 <= int(port) <= 65535):
+        return jsonify({'success': False, 'error': 'Port must be a number between 1024 and 65535 (default 3478).'})
 
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     if not os.path.exists(ra_dir):
         return jsonify({'success': False, 'error': 'EUD Remote Assist is not installed.'})
-    # CoTURN needs 3478. NetBird also runs a STUN/TURN server on 3478, so on a box with
-    # NetBird the container port-publish fails ("port is already allocated"). Detect it
-    # up front and explain, instead of surfacing a cryptic docker error.
-    try:
-        if detect_modules().get('netbird', {}).get('installed'):
-            return jsonify({'success': False, 'error': 'Port 3478 is already used by NetBird (it provides STUN/TURN). Run only one TURN server per box — uninstall NetBird first, or install CoTURN on a box without NetBird.'})
-    except Exception:
-        pass
+    # NetBird also serves STUN/TURN on 3478, so publishing 3478 next to it fails
+    # ("port is already allocated"). Guide instead of dead-ending: legacy NetBird
+    # (separate coturn container) → the Configure-NetBird flow; the all-in-one
+    # hub → pick an alternate port (Mike/cfd2474, PR #49).
+    if port == '3478':
+        try:
+            _nb_has, _nb_ctr, _nb_conf = _netbird_coturn_status()
+            if _nb_has:
+                if _nb_ctr and _nb_conf:
+                    return jsonify({'success': False, 'error': 'Port 3478 is used by NetBird\'s coturn. Use "Configure NetBird CoTURN" to add Remote Assist credentials to it instead of running a second TURN server — or choose a different port (e.g. 3479).'})
+                return jsonify({'success': False, 'error': 'Port 3478 is used by NetBird (it provides STUN/TURN). Choose a different port (e.g. 3479) to run CoTURN alongside it.'})
+        except Exception:
+            pass
     fqdn = (load_settings().get('fqdn') or 'remote-assist').strip()
     override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
     # Inputs are charset-validated above, so this interpolation cannot break the YAML.
@@ -8654,15 +8763,15 @@ def remote_assist_coturn_install():
     image: {COTURN_IMAGE}
     restart: unless-stopped
     ports:
-      - "3478:3478/tcp"
-      - "3478:3478/udp"
+      - "{port}:{port}/tcp"
+      - "{port}:{port}/udp"
       - "50000-50050:50000-50050/udp"
     command:
       - -c
       - ""
       - --log-file=stdout
       - --external-ip={ip}
-      - --listening-port=3478
+      - --listening-port={port}
       - --listening-ip=0.0.0.0
       - --min-port=50000
       - --max-port=50050
@@ -8689,12 +8798,16 @@ def remote_assist_coturn_install():
                 os.remove(override_path)
             except Exception:
                 pass
+            if 'allocated' in _err.lower() or 'in use' in _err.lower():
+                _err = f'Port conflict: {port} is already in use by another service — pick a different port (e.g. 3479) and try again. ({_err})'
             return jsonify({'success': False, 'error': _err[:400]})
         settings = load_settings()
         settings['coturn_installed'] = True
         settings['coturn_username'] = username
         settings['coturn_password'] = password
         settings['coturn_ip'] = ip
+        settings['coturn_port'] = port
+        settings['netbird_coturn_in_use'] = False
         save_settings(settings)
         return jsonify({'success': True})
     except Exception as e:
@@ -8708,12 +8821,28 @@ def remote_assist_coturn_uninstall():
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
     try:
-        if os.path.exists(override_path):
+        settings = load_settings()
+        if settings.get('netbird_coturn_in_use'):
+            # Shared mode: our only footprint is the appended user= line in
+            # NetBird's turnserver.conf — remove it, never touch NetBird itself.
+            _has_nb, nb_container, conf_path = _netbird_coturn_status()
+            user_line = f"user={settings.get('coturn_username', '')}:{settings.get('coturn_password', '')}"
+            if conf_path and settings.get('coturn_username'):
+                try:
+                    conf = _read_priv(conf_path)
+                    new_conf = '\n'.join(l for l in conf.splitlines() if l.strip() != user_line)
+                    if new_conf != conf:
+                        _write_priv(conf_path, new_conf.rstrip('\n') + '\n')
+                        if nb_container:
+                            _sp.run(['docker', 'restart', nb_container], capture_output=True, timeout=90)
+                except Exception:
+                    pass
+        elif os.path.exists(override_path):
             _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-s', '-v', '-f', 'coturn'),
                     cwd=ra_dir, capture_output=True, text=True, timeout=120)
             os.remove(override_path)
-        settings = load_settings()
-        for k in ('coturn_installed', 'coturn_username', 'coturn_password', 'coturn_ip'):
+        for k in ('coturn_installed', 'coturn_username', 'coturn_password', 'coturn_ip',
+                  'coturn_port', 'netbird_coturn_in_use'):
             settings.pop(k, None)
         save_settings(settings)
         return jsonify({'success': True})
@@ -9634,11 +9763,17 @@ def _exposure_report(force=False):
 
     rows = []
     red = yellow = 0
+    try:
+        coturn_port = int(settings.get('coturn_port') or 3478)
+    except Exception:
+        coturn_port = 3478
     for ent in PORT_EXPOSURE_POLICY:
         mod = ent['module']
         if mod is not None and mod not in installed:
             continue
         port = ent['port'] if ent['port'] is not None else console_port
+        if mod == 'remote_assist' and ent['port'] == 3478:
+            port = coturn_port  # CoTURN can run on an alternate port beside NetBird
         bind = _exposure_bind_of(port, listen_map)
         sev, note = _exposure_verdict(ent['tier'], bind, fw_states.get(port))
         if sev == 'alert':
@@ -9654,7 +9789,7 @@ def _exposure_report(force=False):
     # not reachable (e.g. rpcbind :111, which start.sh never opens), so it's not an
     # exposure — only flag listeners that are firewall-open, or where there's no
     # enabled host firewall to stop them.
-    known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22}
+    known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22, coturn_port}
     fw_enabled = bool(fwstatus.get('enabled'))
     blocked = 0
     undeclared = []
@@ -62049,6 +62184,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card">
     <div class="card-title">CoTURN Server (Optional)</div>
     {% if coturn_installed %}
+      {% if netbird_coturn_missing %}
+      <div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--red)">NetBird&#39;s coturn container is gone (NetBird updated or was removed) — TURN is DOWN for Remote Assist. Uninstall below, then install a standalone CoTURN server.</div>
+      {% elif netbird_coturn_in_use %}
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">TURN provided by NetBird&#39;s coturn (shared — dedicated Remote Assist credentials appended to its config).</div>
+      {% endif %}
       <div class="info-grid" style="margin-bottom:16px">
         <div class="info-item"><div class="info-label">Server URL</div><div class="info-value">{{ coturn_url }}</div></div>
         <div class="info-item"><div class="info-label">Username</div><div class="info-value">{{ coturn_username }}</div></div>
@@ -62056,8 +62196,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       </div>
       <button class="btn btn-danger" onclick="document.getElementById('uninstall-coturn-modal').classList.add('open')">Uninstall CoTURN</button>
     {% else %}
+      {% if can_configure_nb_coturn %}
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">NetBird with its own coturn container detected. Add dedicated Remote Assist credentials to NetBird&#39;s TURN server instead of running a second one — or install a standalone CoTURN on a different port.</p>
+      <button class="btn btn-primary" onclick="document.getElementById('configure-nb-coturn-modal').classList.add('open')">Configure NetBird CoTURN</button>
+      <button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.add('open')">Install standalone instead</button>
+      {% else %}
       <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">Install a local CoTURN (STUN/TURN) server to help WebRTC connections traverse NAT/firewalls. Runs alongside EUD Remote Assist.</p>
       <button class="btn btn-primary" onclick="document.getElementById('install-coturn-modal').classList.add('open')">Install CoTURN Server</button>
+      {% endif %}
     {% endif %}
   </div>
   <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
@@ -62083,9 +62229,18 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <p style="font-size:13px;color:var(--text-secondary)">Provide credentials and the public IPv4 address where the TURN server will be reachable.</p>
   <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="coturn-user" type="text" placeholder="turnuser" autocomplete="off"></div>
   <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password"></div>
-  <div style="margin-bottom:16px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('server_ip', '') }}"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('server_ip', '') }}"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="3478"><div style="font-size:11px;color:var(--text-dim);margin-top:4px">Use 3479 if NetBird already holds 3478 on this box.</div></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
   <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="configure-nb-coturn-modal"><div class="modal">
+  <h3>Configure NetBird CoTURN</h3>
+  <p style="font-size:13px;color:var(--text-secondary)">Adds a dedicated Remote Assist credential to NetBird&#39;s coturn (its own secret stays private) and restarts that container.</p>
+  <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="nb-coturn-user" type="text" placeholder="turnuser" autocomplete="off"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Password</label><input class="form-input" id="nb-coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('configure-nb-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doNBCoturnConfig()">Configure</button></div>
+  <div id="nb-coturn-config-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
 <div class="modal-overlay" id="uninstall-coturn-modal"><div class="modal">
   <h3>Uninstall CoTURN?</h3><p>This removes the CoTURN container and its configuration. EUD Remote Assist itself is unaffected.</p>
@@ -62152,11 +62307,20 @@ function refreshRaVersion(manual){
   }).catch(function(){restoreCheckBtn();});
 }
 function doCoturnInstall(){
-  var u=document.getElementById('coturn-user').value,p=document.getElementById('coturn-pass').value,ip=document.getElementById('coturn-ip').value,msg=document.getElementById('coturn-install-msg');
+  var u=document.getElementById('coturn-user').value,p=document.getElementById('coturn-pass').value,ip=document.getElementById('coturn-ip').value,port=(document.getElementById('coturn-port').value||'3478'),msg=document.getElementById('coturn-install-msg');
   if(!u||!p||!ip){msg.textContent='All fields are required.';return;}
   msg.style.color='var(--text-dim)';msg.textContent='Installing…';
-  fetch('/api/remote-assist/coturn/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,ip:ip}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+  fetch('/api/remote-assist/coturn/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,ip:ip,port:port}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
     if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Install failed';return;}
+    msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
+  }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
+}
+function doNBCoturnConfig(){
+  var u=document.getElementById('nb-coturn-user').value,p=document.getElementById('nb-coturn-pass').value,msg=document.getElementById('nb-coturn-config-msg');
+  if(!u||!p){msg.textContent='Username and password are required.';return;}
+  msg.style.color='var(--text-dim)';msg.textContent='Configuring…';
+  fetch('/api/remote-assist/coturn/configure-netbird',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Configure failed';return;}
     msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
