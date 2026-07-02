@@ -8574,9 +8574,41 @@ def remote_assist_update_status_api():
     return jsonify(_remote_assist_update_status)
 
 
+
+def check_netbird_coturn_status():
+    import subprocess, json
+    has_netbird = False
+    netbird_coturn_container = None
+    turnserver_conf_path = None
+    try:
+        out = subprocess.check_output(["docker", "ps", "--format", "{{.Names}}"], text=True)
+        containers = [c.strip() for c in out.split('\n') if c.strip()]
+        if any("netbird" in c.lower() for c in containers):
+            has_netbird = True
+            
+        if has_netbird:
+            for c in containers:
+                c_lower = c.lower()
+                if "coturn" in c_lower and "remote-assist" not in c_lower and "infratak" not in c_lower:
+                    netbird_coturn_container = c
+                    break
+            
+            if netbird_coturn_container:
+                inspect_out = subprocess.check_output(["docker", "inspect", netbird_coturn_container], text=True)
+                data = json.loads(inspect_out)
+                for mount in data[0].get('Mounts', []):
+                    if mount.get('Destination') == '/etc/turnserver.conf':
+                        turnserver_conf_path = mount.get('Source')
+                        break
+    except Exception:
+        pass
+    
+    return has_netbird, netbird_coturn_container, turnserver_conf_path
+
 @app.route('/remote-assist')
 @login_required
 def remote_assist_page():
+
     from flask import make_response
     settings = load_settings()
     modules = detect_modules()
@@ -8588,18 +8620,162 @@ def remote_assist_page():
     ra_url = f'https://{ra_host}' if ra_host else ''
     ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
+    
+    coturn_installed = settings.get('coturn_installed', False)
+    coturn_username = settings.get('coturn_username', '')
+    coturn_password = settings.get('coturn_password', '')
+    coturn_ip = settings.get('coturn_ip', '')
+    coturn_port = settings.get('coturn_port', '3478')
+    coturn_url = f"turn:{coturn_ip}:{coturn_port}" if coturn_ip else ""
+    
+    has_netbird, nb_container, nb_conf = check_netbird_coturn_status()
+    can_configure_nb_coturn = has_netbird and bool(nb_container) and bool(nb_conf)
+    
+    netbird_coturn_in_use = settings.get('netbird_coturn_in_use', False)
+    netbird_coturn_missing = netbird_coturn_in_use and not bool(nb_container)
+    
     r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
         settings=settings, ra=ra, version=VERSION,
         authentik_installed=ak.get('installed'),
         ra_host=ra_host, ra_url=ra_url,
         ra_vinfo=ra_vinfo, ra_commit=ra_commit,
         remote_assist_logo_url=REMOTE_ASSIST_LOGO_URL,
+        coturn_installed=coturn_installed, coturn_username=coturn_username,
+        coturn_password=coturn_password, coturn_url=coturn_url, coturn_ip=coturn_ip,
+        can_configure_nb_coturn=can_configure_nb_coturn,
+        netbird_coturn_missing=netbird_coturn_missing,
         deploying=_remote_assist_deploy_status.get('running', False),
         deploy_done=_remote_assist_deploy_status.get('complete', False)))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
 
 
+@app.route('/api/remote-assist/coturn/configure-netbird', methods=['POST'])
+@login_required
+def remote_assist_coturn_configure_nb():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    
+    if not username or not password:
+        return jsonify({'error': 'Missing credentials'}), 400
+        
+    has_netbird, nb_container, conf_path = check_netbird_coturn_status()
+    if not has_netbird or not nb_container or not conf_path:
+        return jsonify({'error': 'NetBird Coturn is not available for configuration.'}), 400
+        
+    try:
+        import subprocess
+        with open(conf_path, 'r') as f:
+            c = f.read()
+        
+        user_line = f"user={username}:{password}"
+        if user_line not in c:
+            with open(conf_path, 'a') as f:
+                f.write(f"\n{user_line}\n")
+                
+        subprocess.run(["docker", "restart", nb_container], check=True)
+        ip_out = subprocess.check_output(["curl", "-s", "https://api.ipify.org"]).decode().strip()
+        
+        settings = load_settings()
+        settings['coturn_installed'] = True
+        settings['coturn_username'] = username
+        settings['coturn_password'] = password
+        settings['coturn_ip'] = ip_out
+        settings['netbird_coturn_in_use'] = True
+        save_settings(settings)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/remote-assist/coturn/install', methods=['POST'])
+@login_required
+def remote_assist_coturn_install():
+    data = request.get_json() or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    ip = data.get('ip', '').strip()
+    port = data.get('port', '3478')
+    if isinstance(port, str): port = port.strip() or '3478'
+    else: port = str(port) or '3478'
+    import logging
+    logging.warning(f"DEBUG_INSTALL: data received={data}, port resolved to={port}")
+    if not username or not password or not ip:
+        return jsonify({'success': False, 'error': 'All fields are required.'})
+    
+    settings = load_settings()
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    if not os.path.exists(ra_dir):
+        return jsonify({'success': False, 'error': 'EUD Remote Assist is not installed.'})
+        
+    override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    
+    fqdn = settings.get('fqdn', 'remote-assist')
+    override_content = f"""services:
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    ports:
+      - "{port}:{port}/tcp"
+      - "{port}:{port}/udp"
+      - "50000-50050:50000-50050/udp"
+    command:
+      - -c
+      - ""
+      - --log-file=stdout
+      - --external-ip={ip}
+      - --listening-port={port}
+      - --listening-ip=0.0.0.0
+      - --min-port=50000
+      - --max-port=50050
+      - --user={username}:{password}
+      - --realm={fqdn}
+"""
+    try:
+        import subprocess as _sp
+        with open(override_path, 'w') as f:
+            f.write(override_content)
+        
+        result = _sp.run(['docker', 'compose', '-f', 'docker-compose.yml', '-f', 'docker-compose.override.yml', 'up', '-d', 'coturn'], cwd=ra_dir, capture_output=True, text=True)
+        if result.returncode != 0:
+            if "port is already allocated" in result.stderr or "Bind for" in result.stderr:
+                return jsonify({'success': False, 'error': f"Port conflict detected! It looks like port {port} is already in use by another service on your server. Please enter a different port (e.g. 3479)."})
+            else:
+                return jsonify({'success': False, 'error': f"Failed to start Coturn:\n{result.stderr.strip()}"})
+        
+        settings['coturn_installed'] = True
+        settings['coturn_username'] = username
+        settings['coturn_password'] = password
+        settings['coturn_ip'] = ip
+        settings['coturn_port'] = port
+        settings['netbird_coturn_in_use'] = False
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/remote-assist/coturn/uninstall', methods=['POST'])
+@login_required
+def remote_assist_coturn_uninstall():
+    settings = load_settings()
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    
+    try:
+        import subprocess as _sp
+        if os.path.exists(override_path):
+            _sp.run(['docker', 'compose', '-f', 'docker-compose.yml', '-f', 'docker-compose.override.yml', 'rm', '-s', '-v', '-f', 'coturn'], cwd=ra_dir)
+            os.remove(override_path)
+        
+        settings.pop('coturn_installed', None)
+        settings.pop('coturn_username', None)
+        settings.pop('coturn_password', None)
+        settings.pop('coturn_ip', None)
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 @app.route('/api/remote-assist/deploy', methods=['POST'])
 @login_required
 def remote_assist_deploy_api():
@@ -61901,6 +62077,29 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% if ra_vinfo.get('version') or ra_commit %}<div class="info-item"><div class="info-label">Installed version</div><div class="info-value" id="ra-installed-version">v{{ ra_vinfo.get('version') or ra_commit }}{% if ra_vinfo.get('running') and ra_vinfo.get('running') != ra_vinfo.get('version') %} <span id="ra-running-mismatch" style="color:var(--yellow)">(running v{{ ra_vinfo.get('running') }})</span>{% endif %}</div></div>{% endif %}
     <div class="info-item" id="ra-latest-row"{% if not ra_vinfo.get('latest') %} style="display:none"{% endif %}><div class="info-label">Newest version available</div><div class="info-value" id="ra-latest-version">{% if ra_vinfo.get('latest') %}v{{ ra_vinfo.get('latest') }} <span id="ra-latest-status" style="font-size:11px{% if ra_vinfo.get('update_available') %};color:var(--cyan){% else %};color:var(--text-dim){% endif %}">{% if ra_vinfo.get('update_available') %}update ready{% elif ra_vinfo.get('is_current') %}current{% endif %}</span>{% else %}<span style="color:var(--text-dim)">checking…</span>{% endif %}</div></div>
   </div></div>
+  <div class="card">
+    <div class="card-title">Coturn Server (Optional)</div>
+    {% if coturn_installed %}
+      <div class="info-grid" style="margin-bottom:16px">
+        <div class="info-item"><div class="info-label">Server URL</div><div class="info-value">{{ coturn_url }}</div></div>
+        <div class="info-item"><div class="info-label">Username</div><div class="info-value">{{ coturn_username }}</div></div>
+        <div class="info-item"><div class="info-label">Password</div><div class="info-value">{{ coturn_password }}</div></div>
+      </div>
+      <button class="btn btn-danger" onclick="document.getElementById('uninstall-coturn-modal').classList.add('open')">Uninstall Coturn</button>
+    {% else %}
+      {% if can_configure_nb_coturn %}
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">
+        NetBird installation detected with an existing Coturn container. You can configure NetBird's Coturn server instead of installing a new one.
+      </p>
+      <button class="btn btn-primary" onclick="document.getElementById('configure-nb-coturn-modal').classList.add('open')">Configure NetBird Coturn</button>
+      {% else %}
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">
+        Install a local Coturn server for STUN/TURN capabilities to assist with WebRTC connections.
+      </p>
+      <button class="btn btn-primary" onclick="document.getElementById('install-coturn-modal').classList.add('open')">Install Coturn Server</button>
+      {% endif %}
+    {% endif %}
+  </div>
   <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
   {% else %}
   <div class="card"><div class="card-title">Deploy EUD Remote Assist</div>
@@ -61918,6 +62117,29 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="configure-nb-coturn-modal"><div class="modal">
+  <h3>Configure NetBird Coturn</h3>
+  <p>Please provide credentials to append to your NetBird Coturn configuration.</p>
+  <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="nb-coturn-user" type="text" placeholder="turnuser"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="nb-coturn-pass" type="password" placeholder="Password"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('configure-nb-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doNBCoturnConfig()">Configure</button></div>
+  <div id="nb-coturn-config-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="install-coturn-modal"><div class="modal">
+  <h3>Install Coturn Server</h3>
+  <p>Please provide credentials and the public IP where the turn server will reside.</p>
+  <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="coturn-user" type="text" placeholder="turnuser"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="coturn-pass" type="password" placeholder="Password"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('public_ip', '') }}"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="3478"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
+  <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="uninstall-coturn-modal"><div class="modal">
+  <h3>Uninstall Coturn?</h3><p>This will remove the Coturn container and its configuration.</p>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doCoturnUninstall()">Uninstall</button></div>
+  <div id="coturn-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
@@ -61978,6 +62200,25 @@ function refreshRaVersion(manual){
     restoreCheckBtn();
   }).catch(function(){restoreCheckBtn();});
 }
+function doCoturnInstall(){
+  var u=document.getElementById('coturn-user').value, p=document.getElementById('coturn-pass').value, ip=document.getElementById('coturn-ip').value, port=document.getElementById('coturn-port').value || '3478', msg=document.getElementById('install-coturn-msg') || document.getElementById('coturn-install-msg') || {textContent: ''};
+  if(!u||!p||!ip){msg.textContent='All fields are required.';return;}
+  msg.textContent='Installing...';
+  fetch('/api/remote-assist/coturn/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,ip:ip,port:port}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d.error){msg.textContent=d.error;return;}
+    msg.textContent='Success! Reloading...';
+    setTimeout(function(){location.reload();},1000);
+  });
+}
+function doCoturnUninstall(){
+  var msg=document.getElementById('coturn-uninstall-msg');msg.textContent='Uninstalling...';
+  fetch('/api/remote-assist/coturn/uninstall',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d.error){msg.textContent=d.error;return;}
+    msg.textContent='Success! Reloading...';
+    setTimeout(function(){location.reload();},1000);
+  });
+}
+if(document.getElementById('ra-latest-version')){refreshRaVersion();setInterval(refreshRaVersion,60000);}
 </script>
 </body></html>'''
 
