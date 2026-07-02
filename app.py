@@ -25345,6 +25345,10 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
 # TAKWERX Email Relay — managed by TAK-infra
 inet_interfaces = all
 mynetworks = 127.0.0.0/8 [::1]/128 172.16.0.0/12
+# Send-only smarthost: never treat the base domain as a local destination
+# (default mydestination includes $mydomain -> 550 "User unknown in local
+# recipient table" for any address at the TAK base domain, GH #48)
+mydestination = $myhostname, localhost.localdomain, localhost
 relayhost = [{relay_host}]:{relay_port}
 smtp_sasl_auth_enable = yes
 smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
@@ -25370,6 +25374,9 @@ smtp_generic_maps = hash:/etc/postfix/generic
             existing = re.sub(r'^\s*relayhost\s*=.*$', '', existing, flags=re.MULTILINE)
             # Remove any existing mynetworks (we set it in our block for Docker relay)
             existing = re.sub(r'^\s*mynetworks\s*=.*$', '', existing, flags=re.MULTILINE)
+            # Remove any existing mydestination (package default includes $mydomain,
+            # which makes same-domain mail bounce locally — GH #48; ours wins)
+            existing = re.sub(r'^\s*mydestination\s*=.*$', '', existing, flags=re.MULTILINE)
             existing = existing.rstrip()
         _write_priv(main_cf_path, existing + '\n' + main_cf_additions)
         plog("✓ main.cf configured")
