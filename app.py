@@ -39980,6 +39980,10 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
                 _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120
             )
             plog("  ✓ PostgreSQL recreated with enterprise tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB, statement_timeout=120s, idle_session_timeout=300s)")
+            # The patch may also have ADDED services (redis) — a targeted recreate
+            # doesn't start those; full up -d is an idempotent no-op otherwise.
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
         else:
             _run_priv_chain([['docker', 'compose', 'exec', '-T', 'postgresql', 'psql', '-U', 'authentik', '-d', 'authentik', '-c', 'SELECT pg_reload_conf();']], 'and', timeout=15, cwd=ak_dir)
             plog("  ✓ PostgreSQL: tuning already current, config reloaded")
@@ -47076,6 +47080,17 @@ def _authentik_fix_pg_idle_timeout(plog):
     except Exception as e:
         plog(f"  ✗ pg idle timeout: Postgres recreate exception: {e}")
         return False
+
+    # The compose patch above may also have ADDED services (redis on pre-v0.9.17
+    # composes). A service declared in compose but never `up`'d has ZERO container —
+    # the targeted postgresql recreate doesn't start it (seen live: console restart
+    # brought up pgbouncer but not redis). Full up -d is an idempotent no-op otherwise.
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+        plog("  ✓ pg idle timeout: compose up -d — any newly declared services (redis) started")
+    except Exception as _up_e:
+        plog(f"  ⚠ pg idle timeout: full compose up -d failed (non-fatal): {str(_up_e)[:120]}")
 
     plog("  pg idle timeout: waiting up to 60s for Postgres to be ready")
     pg_ready = False
