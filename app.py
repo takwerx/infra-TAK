@@ -62950,12 +62950,30 @@ def _auto_update_guarddog():
         # (The hourly self-heal in tak-disk-watch.sh already protects the box regardless.)
         _bc_script = '/opt/tak-guarddog/tak-buildcache-reclaim.sh'
         _bc_tmr = '/etc/systemd/system/takbuildcachereclaim.timer'
-        if os.path.isfile(_bc_script) and not os.path.isfile(_bc_tmr):
-            _write_priv('/etc/systemd/system/takbuildcachereclaim.service', f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={_bc_script}\n')
-            _write_priv(_bc_tmr, '[Unit]\nDescription=Run Docker build-cache reclaim daily at 4:30am\n\n[Timer]\nOnCalendar=*-*-* 04:30:00\nPersistent=true\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n')
-            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
-            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takbuildcachereclaim.timer']), capture_output=True, timeout=10)
-            print("Guard Dog: installed takbuildcachereclaim.timer on startup.")
+        # v10.0.5: hourly, matching the Guard Dog update route (the two installers
+        # previously disagreed — startup=daily 04:30, update=hourly — so the cadence
+        # depended on which ran first per box). Hourly keeps the size-cap tier
+        # frequent enough fleet-wide.
+        _bc_tmr_body = '[Unit]\nDescription=Run Docker build-cache reclaim hourly (disk-capacity hygiene)\n\n[Timer]\nOnBootSec=45min\nOnUnitActiveSec=1h\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n'
+        if os.path.isfile(_bc_script):
+            _bc_reload = False
+            if not os.path.isfile(_bc_tmr):
+                _write_priv('/etc/systemd/system/takbuildcachereclaim.service', f'[Unit]\nDescription=Guard Dog Docker build-cache reclaim (disk-capacity hygiene)\nAfter=docker.service\n\n[Service]\nType=oneshot\nExecStart={_bc_script}\n')
+                _write_priv(_bc_tmr, _bc_tmr_body)
+                _bc_reload = True
+                print("Guard Dog: installed takbuildcachereclaim.timer on startup.")
+            else:
+                # Converge boxes still on the old daily (OnCalendar) timer to hourly.
+                try:
+                    if 'OnCalendar' in _read_priv(_bc_tmr):
+                        _write_priv(_bc_tmr, _bc_tmr_body)
+                        _bc_reload = True
+                        print("Guard Dog: upgraded takbuildcachereclaim.timer daily→hourly.")
+                except Exception:
+                    pass
+            if _bc_reload:
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+                subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takbuildcachereclaim.timer']), capture_output=True, timeout=10)
         if updated > 0:
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takremotedbauthguard.timer']), capture_output=True, timeout=10)

@@ -401,8 +401,16 @@ def _check_docker_mount(spec):
             return
         raise Denied(f'docker bind mount escapes bundle dir via symlink: {src}')
     bad = ('/', '/etc', '/root', '/home', '/boot', '/usr', '/bin', '/sbin',
-           '/lib', '/var/run', '/run', '/proc', '/sys', '/dev')
-    if real in bad or any(real.startswith(b + '/') for b in ('/etc', '/root', '/home', '/boot', '/proc', '/sys')):
+           '/lib', '/lib64', '/var/run', '/run', '/proc', '/sys', '/dev')
+    # Deny an exact match OR any CHILD of a sensitive root. The prefix loop MUST
+    # cover the same set as `bad`: a prior version only looped a narrow subset
+    # (/etc,/root,/home,/boot,/proc,/sys), so a SUBDIR of /usr,/bin,/sbin,/lib,
+    # /var/run,/run,/dev — e.g. `-v /usr/local/bin:/x:rw` — was neither an exact
+    # match nor caught by the prefix loop, and slipped the deny (a root-running
+    # container could then drop a root-owned binary onto the host PATH). '/' is
+    # excluded from the prefix loop (every abs path starts with it); the root
+    # mount is caught by the exact-match branch.
+    if real in bad or any(real.startswith(b + '/') for b in bad if b != '/'):
         raise Denied(f'docker bind mount of sensitive host path denied: {src}')
 
 
@@ -606,6 +614,17 @@ def _check_runuser(argv):
         # hermetic seal — the real boundary is that the console never passes
         # attacker-controlled SQL.
         if pgcmd == 'psql':
+            # Allowlist-shape the psql gate. The console only ever runs inline admin
+            # SQL (`psql -c "<fixed query>"`); it never reads SQL from a file or stdin.
+            # Reject the -f/--file/stdin forms: they execute a script file whose
+            # contents the token-blocklist below never sees, so `psql -f /tmp/x.sql`
+            # containing `COPY … TO PROGRAM 'sh …'` would bypass the RCE guard and
+            # run as the postgres OS user (documented postgres→root pivot). The
+            # PGOPTIONS-via-env vector is already closed — _do_exec drops all
+            # caller-supplied env.
+            for a in argv[5:]:
+                if a in ('-f', '--file', '-') or a.startswith('--file='):
+                    raise Denied(f'runuser: psql script/stdin input denied as postgres: {a!r}')
             blob = ' '.join(' '.join(str(a) for a in argv[4:]).lower().split())
             for tok in _PSQL_FORBIDDEN:
                 if tok in blob:
@@ -718,6 +737,16 @@ def _check_install(argv):
     paths = [a for a in paths if not (len(a) <= 4 and a.isdigit())]
     if paths:
         _path_allowed(paths[-1])   # dst = last positional path
+        # SOURCE hardening: install(1) reads its source(s) as ROOT and can copy to
+        # an allowlisted (console-readable) dest, so an unguarded source is an
+        # arbitrary root-READ primitive (e.g. `install -m 0644 /etc/shadow
+        # <allowlisted-dest>` then read the dest as the console user). A legit
+        # source may be any console-owned file, but never a deny-listed secret —
+        # reject sources in PATH_DENY.
+        for src in paths[:-1]:
+            sp = os.path.normpath(src)
+            if sp in PATH_DENY_EXACT or any(sp.startswith(d) for d in PATH_DENY_PREFIX):
+                raise Denied(f'install: source not permitted: {src}')
 
 
 # systemd-run is a DIRECT root-exec primitive (it can launch any command as root,
