@@ -28558,6 +28558,25 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
             else:
                 log(f'  ⚠ WebODM OIDC application error: {str(e)[:80]}')
 
+        # webadmin ships WITHOUT an email, but WebODM's OIDC callback hard-requires
+        # a non-empty email claim ("OIDC claims missing required sub or email" →
+        # generic "SSO login failed"; field: aws-rocky 2026-07-02). Heal an empty
+        # email with a deterministic synthetic address on the box FQDN. Other
+        # operator-created users must have an email set in Authentik to use SSO.
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/users/?search=webadmin', headers=_ak_headers)
+            _wa_users = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            _wa = next((u for u in _wa_users if u.get('username') == 'webadmin'), None)
+            if _wa and not (_wa.get('email') or '').strip():
+                _wa_email = f'webadmin@{fqdn.split(":")[0]}'
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/users/{_wa["pk"]}/',
+                    data=json.dumps({'email': _wa_email}).encode(),
+                    headers=_ak_headers, method='PATCH')
+                _urlreq.urlopen(req, timeout=10)
+                log(f'  ✓ webadmin had no email — set {_wa_email} (WebODM OIDC login requires an email claim)')
+        except Exception:
+            pass
+
         if oidc_pk and client_id and client_secret and settings:
             _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=plog)
         elif not client_secret:
@@ -48087,6 +48106,9 @@ entries:
                     if webadmin_pass:
                         try:
                             user_data = {'username': 'webadmin', 'name': 'TAK Admin', 'is_active': True,
+                                # Synthetic email — WebODM's OIDC login (and any OIDC consumer
+                                # requiring an email claim) fails on an email-less user.
+                                'email': f'webadmin@{(fqdn or "tak.local").split(":")[0]}',
                                 'groups': [group_pk] if group_pk else []}
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
                                 data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
@@ -51712,6 +51734,9 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                 # Keep webadmin as a true admin account in Authentik even when TAK was deployed first.
                 'is_superuser': True,
                 'path': 'users',
+                # Synthetic email — WebODM's OIDC login (and any OIDC consumer
+                # requiring an email claim) fails on an email-less user.
+                'email': f'webadmin@{((settings.get("fqdn") or "tak.local").strip() or "tak.local").split(":")[0]}',
                 'groups': [group_pk] if group_pk else []
             }
             req_local = _req.Request(f'{url}/api/v3/core/users/', data=json.dumps(ud).encode(), headers=headers, method='POST')
