@@ -64213,6 +64213,10 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
             _compose(src, 'up -d')
             return
         subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', dst]), capture_output=True, timeout=300)
+        if _distro_family() == 'rhel':
+            # mv preserves the /root-era SELinux label (admin_home_t) — benign in the
+            # field (0 AVC denials) but wrong under /home; relabel to the policy default.
+            subprocess.run(_sudo_wrap(['restorecon', '-R', dst]), capture_output=True, timeout=300)
         # 3) Up from the NEW home.
         _compose(dst, 'up -d')
         # 4) VERIFY the key container returns; ROLL BACK if not (never leave the module down).
