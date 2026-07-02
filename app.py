@@ -26538,6 +26538,7 @@ _tvr_update_status = {'running': False, 'complete': False, 'error': False, 'log'
 
 def _run_tvr_update():
     import subprocess as _sp
+    import secrets as _sec
     global _tvr_update_status
     log = []
     def plog(msg):
@@ -26545,8 +26546,15 @@ def _run_tvr_update():
         _tvr_update_status['log'] = list(log)
     try:
         tvr_dir = _tvr_dir()   # ~/tak-video-restreamer OR (flipped box) /root/tak-video-restreamer
-        plog('━━━ Step 1/3: Pulling latest source ━━━')
-        r = _sp.run(_sudo_wrap(['bash', '-lc', 'cd %s && git -c safe.directory=%s pull --ff-only' % (shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
+        plog('━━━ Step 1/4: Pulling latest source ━━━')
+        # infra-TAK OWNS docker-compose.yml + mediaMTX.yml (rewritten from templates at deploy)
+        # and patches the Dockerfile on arm64, so the clone is permanently dirty on tracked
+        # files — a plain pull aborts with "local changes would be overwritten by merge" the
+        # moment upstream touches them. Discard the console-written overlay, pull, then
+        # regenerate it in Step 2 (nothing user-authored lives in tracked files).
+        r = _sp.run(_sudo_wrap(['bash', '-lc',
+                    'cd %s && git -c safe.directory=%s checkout -- . && git -c safe.directory=%s pull --ff-only'
+                    % (shlex.quote(tvr_dir), shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
                     capture_output=True, text=True, timeout=120)
         plog((r.stdout + r.stderr).strip() or '(no output)')
         if r.returncode != 0:
@@ -26557,14 +26565,43 @@ def _run_tvr_update():
         plog(f'✓ Now at commit {new_sha}')
 
         plog('')
-        plog('━━━ Step 2/3: Rebuilding Docker image ━━━')
+        plog('━━━ Step 2/4: Re-applying infra-TAK configuration ━━━')
+        s = load_settings()
+        admin_pass = s.get('tak_video_restreamer_admin_password') or _sec.token_hex(16)
+        secret_key = s.get('tak_video_restreamer_secret_key') or _sec.token_hex(32)
+        if (s.get('tak_video_restreamer_admin_password') != admin_pass
+                or s.get('tak_video_restreamer_secret_key') != secret_key):
+            s['tak_video_restreamer_admin_password'] = admin_pass
+            s['tak_video_restreamer_secret_key'] = secret_key
+            save_settings(s)
+        fqdn = (s.get('fqdn') or '').strip()
+        cors_origins = f'https://{fqdn}' if fqdn else 'http://localhost:3100'
+        _write_priv(os.path.join(tvr_dir, 'docker-compose.yml'),
+                    TVR_DOCKER_COMPOSE.format(tvr_dir=tvr_dir, admin_pass=admin_pass,
+                                              secret_key=secret_key, cors_origins=cors_origins))
+        _write_priv(os.path.join(tvr_dir, 'mediaMTX.yml'), TVR_MEDIAMTX_YML)
+        plog('✓ docker-compose.yml + mediaMTX.yml regenerated (loopback binds, admin password preserved)')
+        if _host_arch() == 'arm64':
+            _tvr_dockerfile = os.path.join(tvr_dir, 'Dockerfile')
+            try:
+                _dfc = _read_priv(_tvr_dockerfile)
+                if '_linux_amd64' in _dfc and 'mediamtx_' in _dfc:
+                    _write_priv(_tvr_dockerfile, _dfc.replace('_linux_amd64', '_linux_arm64'))
+                    plog('✓ arm64: re-patched Dockerfile MediaMTX binary linux_amd64 → linux_arm64')
+                else:
+                    plog('⚠ arm64: Dockerfile MediaMTX amd64 pattern not found — bundled mediamtx may be wrong-arch')
+            except Exception as _de:
+                plog(f'⚠ arm64: could not re-patch Dockerfile (mediamtx may fail): {_de}')
+
+        plog('')
+        plog('━━━ Step 3/4: Rebuilding Docker image ━━━')
         r = _tvr_compose(tvr_dir, 'up -d --build', timeout=600)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
 
         plog('')
-        plog('━━━ Step 3/3: Saving new SHA ━━━')
+        plog('━━━ Step 4/4: Saving new SHA ━━━')
         s = load_settings()
         s['tak_video_restreamer_commit_sha'] = new_sha
         save_settings(s)
@@ -27320,6 +27357,10 @@ def _run_tvr_deploy(settings):
         plog('━━━ Step 2/6: Cloning Repository ━━━')
         if os.path.isdir(os.path.join(tvr_dir, '.git')):
             plog(f'  Repo already cloned at {tvr_dir} — pulling latest...')
+            # Discard the console-written overlay (compose/mediaMTX.yml/arm64 Dockerfile) so the
+            # pull can't abort on "local changes" — Step 3 regenerates all of it anyway.
+            _sp.run(['git', '-C', tvr_dir, 'checkout', '--', '.'],
+                    capture_output=True, text=True, timeout=30)
             r = _sp.run(['git', '-C', tvr_dir, 'pull', '--ff-only'],
                         capture_output=True, text=True, timeout=60)
             plog(f'  git pull: {r.stdout.strip() or r.stderr.strip()}')
