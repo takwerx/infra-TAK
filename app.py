@@ -63390,6 +63390,50 @@ for _rh_sub, _rh_ctr in (
     _startup_rehome_module(_rh_sub, _rh_ctr)
 
 
+def _startup_rehome_cesium():
+    """v10.0.5: re-home the Cesium 3D-Tiles static dir on a FLIPPED Ubuntu box. The tiles are served
+    by Caddy (file_server root ~/cesium-tiles) and managed by the console, but a root-era install
+    left them at /root/cesium-tiles — unreadable by BOTH the caddy user and the takwerx console, so
+    3D Tiles serves an EMPTY dir. Move the real tiles to ~/cesium-tiles (the born-non-root baseline,
+    caddy+takwerx readable). No containers — just a dir move + chown. RHEL uses /var/lib/cesium-tiles
+    (handled by _cesium_ensure_dir), so this is Ubuntu-only. Safe: only moves when /root has tiles
+    AND ~ is empty/stub — never clobbers a live home dir."""
+    try:
+        if os.getuid() == 0 or _distro_family() == 'rhel':
+            return
+        home = os.path.expanduser('~/cesium-tiles')
+        src = '/root/cesium-tiles'
+        if _broker_should_route():
+            for _ in range(20):
+                if _broker_available():
+                    break
+                time.sleep(0.25)
+        if subprocess.run(_sudo_wrap(['test', '-d', src]), capture_output=True, timeout=10).returncode != 0:
+            return  # no root-era tiles to migrate
+        def _has_files(d):
+            try:
+                for _r, _dd, _ff in os.walk(d):
+                    if _ff:
+                        return True
+            except Exception:
+                pass
+            return False
+        if os.path.isdir(home) and _has_files(home):
+            return  # ~/cesium-tiles already holds real tiles — don't clobber
+        if os.path.isdir(home):
+            subprocess.run(_sudo_wrap(['rm', '-rf', home]), capture_output=True, timeout=30)  # clear empty stub
+        _mv = subprocess.run(_sudo_wrap(['mv', src, home]), capture_output=True, text=True, timeout=180)
+        if _mv.returncode == 0 and os.path.isdir(home):
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', home]), capture_output=True, timeout=120)
+            print('[rehome:cesium-tiles] moved %s -> %s (3D Tiles now served from the console home)' % (src, home), flush=True)
+        else:
+            print('[rehome:cesium-tiles] move failed: %s' % (_mv.stderr or '')[:120], flush=True)
+    except Exception as e:
+        print('[rehome:cesium-tiles] skipped (non-fatal): %s' % str(e)[:140], flush=True)
+
+_startup_rehome_cesium()
+
+
 # v0.9.58 (#6): startup migration — re-apply the trusted-upstream ignoreip to every
 # enabled fail2ban jail on boot, so the gateway/VNet whitelist + the mediamtx/recidive
 # baseline activate on a plain restart, not only when an operator next touches a jail
