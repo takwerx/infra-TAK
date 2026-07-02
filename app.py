@@ -62228,7 +62228,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <h3>Install CoTURN Server</h3>
   <p style="font-size:13px;color:var(--text-secondary)">Provide credentials and the public IPv4 address where the TURN server will be reachable.</p>
   <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="coturn-user" type="text" placeholder="turnuser" autocomplete="off"></div>
-  <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Password</label>
+    <div style="display:flex;gap:6px;align-items:center"><input class="form-input" id="coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password" style="flex:1"><button type="button" onclick="togglePwInput('coturn-pass',this)" style="background:none;border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--text-dim);font-size:11px;padding:7px 9px">show</button></div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px">8&#8211;128 chars: letters, digits, and <span style="font-family:'JetBrains Mono',monospace">. _ @ + = ! % ^ -</span> &mdash; no spaces, quotes, or other symbols.</div>
+  </div>
   <div style="margin-bottom:12px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('server_ip', '') }}"></div>
   <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="3478"><div style="font-size:11px;color:var(--text-dim);margin-top:4px">Use 3479 if NetBird already holds 3478 on this box.</div></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
@@ -62238,7 +62241,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <h3>Configure NetBird CoTURN</h3>
   <p style="font-size:13px;color:var(--text-secondary)">Adds a dedicated Remote Assist credential to NetBird&#39;s coturn (its own secret stays private) and restarts that container.</p>
   <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="nb-coturn-user" type="text" placeholder="turnuser" autocomplete="off"></div>
-  <div style="margin-bottom:16px"><label class="form-label">Password</label><input class="form-input" id="nb-coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Password</label>
+    <div style="display:flex;gap:6px;align-items:center"><input class="form-input" id="nb-coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password" style="flex:1"><button type="button" onclick="togglePwInput('nb-coturn-pass',this)" style="background:none;border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--text-dim);font-size:11px;padding:7px 9px">show</button></div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px">8&#8211;128 chars: letters, digits, and <span style="font-family:'JetBrains Mono',monospace">. _ @ + = ! % ^ -</span> &mdash; no spaces, quotes, or other symbols.</div>
+  </div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('configure-nb-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doNBCoturnConfig()">Configure</button></div>
   <div id="nb-coturn-config-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
@@ -62315,6 +62321,7 @@ function doCoturnInstall(){
     msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
+function togglePwInput(id,btn){var i=document.getElementById(id);if(i.type==='password'){i.type='text';btn.textContent='hide';}else{i.type='password';btn.textContent='show';}}
 function doNBCoturnConfig(){
   var u=document.getElementById('nb-coturn-user').value,p=document.getElementById('nb-coturn-pass').value,msg=document.getElementById('nb-coturn-config-msg');
   if(!u||!p){msg.textContent='Username and password are required.';return;}
