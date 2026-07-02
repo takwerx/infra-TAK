@@ -29145,8 +29145,13 @@ server:
     container_name: netbird-server
     restart: unless-stopped
     ports:
-      - "33073:443"
-      - "10000:10000"
+      # Management (443) + signal (10000) are reached ONLY via Caddy on loopback
+      # (see generate_caddyfile: reverse_proxy h2c://127.0.0.1:33073 and :10000), so
+      # bind them to 127.0.0.1 — publishing 0.0.0.0 exposed them wherever the host
+      # firewall doesn't block docker-published ports (firewalld does NOT, so they
+      # showed EXPOSED on RHEL). STUN/TURN 3478/udp MUST stay public (peer mesh).
+      - "127.0.0.1:33073:443"
+      - "127.0.0.1:10000:10000"
       - "3478:3478/udp"
     volumes:
       - ./config.yaml:/etc/netbird/config.yaml
@@ -29162,7 +29167,9 @@ server:
     container_name: netbird-dashboard
     restart: unless-stopped
     ports:
-      - "8642:80"
+      # Dashboard is served only through Caddy on loopback (reverse_proxy
+      # 127.0.0.1:8642); bind 127.0.0.1 so it isn't publicly exposed on firewalld.
+      - "127.0.0.1:8642:80"
     environment:
       - NETBIRD_MGMT_API_ENDPOINT=https://{netbird_domain}
       - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://{netbird_domain}
@@ -41134,6 +41141,66 @@ def _heal_takwerx_user_missing_for_mediamtx(plog=None):
     except Exception as e:
         _log(f"  mediamtx: takwerx heal error (non-fatal): {e}")
         return False
+
+
+def _heal_container_ports_loopback(plog=None):
+    """v10.0.5: bind Caddy-fronted container ports to 127.0.0.1 on EXISTING installs,
+    so they ship via update (pull+restart), not only on a module redeploy.
+
+    Motivation: several containers published Caddy-facing ports to 0.0.0.0. On Ubuntu
+    ufw hides them; on RHEL firewalld exposes docker-published ports, so they showed
+    EXPOSED in the Service Exposure panel. The compose/overlay TEMPLATES are already
+    fixed — this heals boxes deployed before the fix. Idempotent: only recreates a
+    service when its on-disk config actually changed. Public streaming / STUN ports
+    are deliberately left alone.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+
+    # --- NetBird: dashboard(8642)/mgmt(33073)/signal(10000) → 127.0.0.1 (Caddy fronts
+    # them on loopback); 3478/udp stays public. Resolve the dir like _tvr_dir (re-homed
+    # to ~ on a flipped box, else /root-era). ---
+    try:
+        nb_dir = None
+        home_nb = os.path.expanduser('~/netbird')
+        if os.path.exists(os.path.join(home_nb, 'docker-compose.yml')):
+            nb_dir = home_nb
+        elif subprocess.run(_sudo_wrap(['test', '-f', '/root/netbird/docker-compose.yml']),
+                            capture_output=True, timeout=10).returncode == 0:
+            nb_dir = '/root/netbird'
+        if nb_dir:
+            compose = os.path.join(nb_dir, 'docker-compose.yml')
+            content = _read_priv(compose)
+            orig = content
+            for pub in ('- "33073:443"', '- "10000:10000"', '- "8642:80"'):
+                if pub in content:
+                    content = content.replace(pub, pub.replace('- "', '- "127.0.0.1:'))
+            if content != orig:
+                _write_priv(compose, content)
+                subprocess.run(_sudo_wrap(['bash', '-lc',
+                    'cd %s && docker compose up -d' % shlex.quote(nb_dir)]),
+                    capture_output=True, text=True, timeout=180)
+                _log("container-ports: NetBird dashboard/mgmt/signal re-bound to 127.0.0.1 (recreated; 3478/udp left public)")
+    except Exception as e:
+        _log(f"container-ports: NetBird loopback heal skipped (non-fatal): {str(e)[:140]}")
+
+    # --- MediaMTX web-editor: the ExecStartPre overlay script (ensure_overlay.py) now
+    # forces host=127.0.0.1. Refresh it on disk when stale + restart the editor so the
+    # new bind takes effect via update. ---
+    try:
+        ov = '/opt/mediamtx-webeditor/ensure_overlay.py'
+        if subprocess.run(_sudo_wrap(['test', '-f', ov]), capture_output=True, timeout=10).returncode == 0:
+            cur = ''
+            try:
+                cur = _read_priv(ov)
+            except Exception:
+                cur = ''
+            if cur != MEDIAMTX_ENSURE_OVERLAY_SCRIPT:
+                _write_priv(ov, MEDIAMTX_ENSURE_OVERLAY_SCRIPT, perm=0o755)
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, text=True, timeout=60)
+                _log("container-ports: mediamtx-webeditor overlay refreshed (loopback bind) + restarted")
+    except Exception as e:
+        _log(f"container-ports: mediamtx-webeditor loopback heal skipped (non-fatal): {str(e)[:140]}")
 
 
 def _heal_mediamtx_webeditor_writable_paths(plog=None):
@@ -65349,6 +65416,17 @@ def _startup_migrations():
             )
         except Exception as mtx_perm_err:
             print(f"Startup migration: mediamtx-webeditor perm-heal error (non-fatal): {mtx_perm_err}")
+
+        # v10.0.5 — bind Caddy-fronted container ports (NetBird dashboard/mgmt/signal,
+        # mediamtx web-editor) to 127.0.0.1 on existing installs. On RHEL firewalld
+        # exposes docker-published 0.0.0.0 ports (ufw hid them), so these showed EXPOSED
+        # in the Service Exposure panel. Ships the loopback fix via update. Idempotent.
+        try:
+            _heal_container_ports_loopback(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as cpl_err:
+            print(f"Startup migration: container-ports loopback heal error (non-fatal): {cpl_err}")
 
         # v0.9.27-alpha hotfix #4: reap ghost Channels backends left over
         # from prior server-1 restarts. Critical on the v0.9.26 → v0.9.27
