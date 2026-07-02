@@ -9466,6 +9466,7 @@ _KNOWN_PUBLIC_PORTS = {
     1935, 8555, 3100,                     # TAK Video Restreamer (RTMP 1935, RTSP 8554-8555, web 3100)
     25,                                   # Email Relay (localhost-bound normally)
     8080,                                 # Guard Dog health agent (two-server, source-scoped)
+    3478,                                 # CoTURN STUN/TURN (public by design; UDP relay range 50000-50050 never shows in the TCP-only sweep)
 }
 
 _exposure_cache = {'ts': 0.0, 'data': None}
