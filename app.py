@@ -8588,16 +8588,115 @@ def remote_assist_page():
     ra_url = f'https://{ra_host}' if ra_host else ''
     ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
+    coturn_ip = settings.get('coturn_ip', '')
     r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
         settings=settings, ra=ra, version=VERSION,
         authentik_installed=ak.get('installed'),
         ra_host=ra_host, ra_url=ra_url,
         ra_vinfo=ra_vinfo, ra_commit=ra_commit,
         remote_assist_logo_url=REMOTE_ASSIST_LOGO_URL,
+        coturn_installed=settings.get('coturn_installed', False),
+        coturn_username=settings.get('coturn_username', ''),
+        coturn_password=settings.get('coturn_password', ''),
+        coturn_ip=coturn_ip,
+        coturn_url=(f'turn:{coturn_ip}:3478' if coturn_ip else ''),
         deploying=_remote_assist_deploy_status.get('running', False),
         deploy_done=_remote_assist_deploy_status.get('complete', False)))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
+
+
+# CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
+COTURN_IMAGE = 'coturn/coturn:4.14.0'
+# Restrict credentials to a safe charset with NO YAML/shell metacharacters. The
+# values are interpolated into docker-compose.override.yml (then `docker compose up`),
+# so an unvalidated newline/quote could inject arbitrary compose directives
+# (privileged:true, host bind-mounts) — under the non-root/broker model `docker
+# compose` is NOT gated by the broker's `docker run` mount checks, so that would be a
+# real escalation. This charset makes injection impossible.
+_COTURN_USER_RE = re.compile(r'^[A-Za-z0-9._@+=-]{1,64}$')
+_COTURN_PASS_RE = re.compile(r'^[A-Za-z0-9._@+=!%^-]{8,128}$')
+
+
+@app.route('/api/remote-assist/coturn/install', methods=['POST'])
+@login_required
+def remote_assist_coturn_install():
+    import subprocess as _sp
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = (data.get('password') or '').strip()
+    ip = (data.get('ip') or '').strip()
+    if not username or not password or not ip:
+        return jsonify({'success': False, 'error': 'All fields are required.'})
+    if not _COTURN_USER_RE.match(username):
+        return jsonify({'success': False, 'error': 'Username must be 1–64 chars: letters, digits, . _ @ + = -'})
+    if not _COTURN_PASS_RE.match(password):
+        return jsonify({'success': False, 'error': 'Password must be 8–128 chars: letters, digits, . _ @ + = ! % ^ - (no spaces/quotes).'})
+    if not _valid_core_ip(ip):
+        return jsonify({'success': False, 'error': 'Public IP must be a valid IPv4 address.'})
+
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    if not os.path.exists(ra_dir):
+        return jsonify({'success': False, 'error': 'EUD Remote Assist is not installed.'})
+    fqdn = (load_settings().get('fqdn') or 'remote-assist').strip()
+    override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    # Inputs are charset-validated above, so this interpolation cannot break the YAML.
+    override_content = f"""services:
+  coturn:
+    image: {COTURN_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "50000-50050:50000-50050/udp"
+    command:
+      - -c
+      - ""
+      - --log-file=stdout
+      - --external-ip={ip}
+      - --listening-port=3478
+      - --listening-ip=0.0.0.0
+      - --min-port=50000
+      - --max-port=50050
+      - --user={username}:{password}
+      - --realm={fqdn}
+"""
+    try:
+        with open(override_path, 'w') as f:
+            f.write(override_content)
+        r = _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'up', '-d', 'coturn'),
+                    cwd=ra_dir, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'docker compose failed')[:300]})
+        settings = load_settings()
+        settings['coturn_installed'] = True
+        settings['coturn_username'] = username
+        settings['coturn_password'] = password
+        settings['coturn_ip'] = ip
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
+
+
+@app.route('/api/remote-assist/coturn/uninstall', methods=['POST'])
+@login_required
+def remote_assist_coturn_uninstall():
+    import subprocess as _sp
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    try:
+        if os.path.exists(override_path):
+            _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-s', '-v', '-f', 'coturn'),
+                    cwd=ra_dir, capture_output=True, text=True, timeout=120)
+            os.remove(override_path)
+        settings = load_settings()
+        for k in ('coturn_installed', 'coturn_username', 'coturn_password', 'coturn_ip'):
+            settings.pop(k, None)
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
 
 
 @app.route('/api/remote-assist/deploy', methods=['POST'])
@@ -9329,6 +9428,7 @@ PORT_EXPOSURE_POLICY = [
     {'module': 'mediamtx',   'label': 'MediaMTX RTSP',      'port': 8554, 'tier': 1, 'why': 'Streaming clients (auth+token)'},
     {'module': 'mediamtx',   'label': 'MediaMTX HLS',       'port': 8888, 'tier': 3, 'why': 'Reached via Caddy 443'},
     {'module': 'mediamtx',   'label': 'MediaMTX web-editor','port': 5080, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'remote_assist', 'label': 'CoTURN STUN/TURN', 'port': 3478, 'tier': 1, 'why': 'WebRTC NAT traversal — peers connect directly (public by design)'},
     {'module': 'guarddog',   'label': 'Guard Dog health agent', 'port': 8080, 'tier': 5, 'why': 'Reachable from console only (two-server)'},
 ]
 
@@ -61901,6 +62001,20 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% if ra_vinfo.get('version') or ra_commit %}<div class="info-item"><div class="info-label">Installed version</div><div class="info-value" id="ra-installed-version">v{{ ra_vinfo.get('version') or ra_commit }}{% if ra_vinfo.get('running') and ra_vinfo.get('running') != ra_vinfo.get('version') %} <span id="ra-running-mismatch" style="color:var(--yellow)">(running v{{ ra_vinfo.get('running') }})</span>{% endif %}</div></div>{% endif %}
     <div class="info-item" id="ra-latest-row"{% if not ra_vinfo.get('latest') %} style="display:none"{% endif %}><div class="info-label">Newest version available</div><div class="info-value" id="ra-latest-version">{% if ra_vinfo.get('latest') %}v{{ ra_vinfo.get('latest') }} <span id="ra-latest-status" style="font-size:11px{% if ra_vinfo.get('update_available') %};color:var(--cyan){% else %};color:var(--text-dim){% endif %}">{% if ra_vinfo.get('update_available') %}update ready{% elif ra_vinfo.get('is_current') %}current{% endif %}</span>{% else %}<span style="color:var(--text-dim)">checking…</span>{% endif %}</div></div>
   </div></div>
+  <div class="card">
+    <div class="card-title">CoTURN Server (Optional)</div>
+    {% if coturn_installed %}
+      <div class="info-grid" style="margin-bottom:16px">
+        <div class="info-item"><div class="info-label">Server URL</div><div class="info-value">{{ coturn_url }}</div></div>
+        <div class="info-item"><div class="info-label">Username</div><div class="info-value">{{ coturn_username }}</div></div>
+        <div class="info-item"><div class="info-label">Password</div><div class="info-value">{{ coturn_password }}</div></div>
+      </div>
+      <button class="btn btn-danger" onclick="document.getElementById('uninstall-coturn-modal').classList.add('open')">Uninstall CoTURN</button>
+    {% else %}
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">Install a local CoTURN (STUN/TURN) server to help WebRTC connections traverse NAT/firewalls. Runs alongside EUD Remote Assist.</p>
+      <button class="btn btn-primary" onclick="document.getElementById('install-coturn-modal').classList.add('open')">Install CoTURN Server</button>
+    {% endif %}
+  </div>
   <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
   {% else %}
   <div class="card"><div class="card-title">Deploy EUD Remote Assist</div>
@@ -61918,6 +62032,20 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="install-coturn-modal"><div class="modal">
+  <h3>Install CoTURN Server</h3>
+  <p style="font-size:13px;color:var(--text-secondary)">Provide credentials and the public IPv4 address where the TURN server will be reachable.</p>
+  <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="coturn-user" type="text" placeholder="turnuser" autocomplete="off"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Password</label><input class="form-input" id="coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('server_ip', '') }}"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
+  <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="uninstall-coturn-modal"><div class="modal">
+  <h3>Uninstall CoTURN?</h3><p>This removes the CoTURN container and its configuration. EUD Remote Assist itself is unaffected.</p>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doCoturnUninstall()">Uninstall</button></div>
+  <div id="coturn-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
@@ -61977,6 +62105,22 @@ function refreshRaVersion(manual){
     }
     restoreCheckBtn();
   }).catch(function(){restoreCheckBtn();});
+}
+function doCoturnInstall(){
+  var u=document.getElementById('coturn-user').value,p=document.getElementById('coturn-pass').value,ip=document.getElementById('coturn-ip').value,msg=document.getElementById('coturn-install-msg');
+  if(!u||!p||!ip){msg.textContent='All fields are required.';return;}
+  msg.style.color='var(--text-dim)';msg.textContent='Installing…';
+  fetch('/api/remote-assist/coturn/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,ip:ip}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Install failed';return;}
+    msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
+  }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
+}
+function doCoturnUninstall(){
+  var msg=document.getElementById('coturn-uninstall-msg');msg.style.color='var(--text-dim)';msg.textContent='Uninstalling…';
+  fetch('/api/remote-assist/coturn/uninstall',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Uninstall failed';return;}
+    msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
+  }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
 </script>
 </body></html>'''
