@@ -61692,7 +61692,7 @@ function updateWebODM(btn){
     });
 }
 function reapplyWebODM(btn){
-    if(!confirm('Re-run the WebODM deploy in place?\n\nThis re-clones the TAK overlay plugin, rewrites docker-compose (adding the one-click Authentik login config), and restarts the WebODM containers.\n\nProjects, accounts and processed data are KEPT. Running processing jobs will be interrupted and everyone is logged out of WebODM.'))return;
+    if(!confirm('Re-run the WebODM deploy in place?\\n\\nThis re-clones the TAK overlay plugin, rewrites docker-compose (adding the one-click Authentik login config), and restarts the WebODM containers.\\n\\nProjects, accounts and processed data are KEPT. Running processing jobs will be interrupted and everyone is logged out of WebODM.'))return;
     btn.disabled=true;btn.textContent='Starting…';
     fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
         if(d.success){window.location.reload();}
