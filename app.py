@@ -66140,6 +66140,23 @@ def _post_update_auto_deploy():
     state. Belt to Item 1's (single-flight lock) suspenders.
     """
     try:
+        # v10.0.6: clear the Update Now single-flight lock AT STARTUP. The lock
+        # cannot outlive the process that wrote it — update_apply() ends in a
+        # systemctl restart, so any lock present at import time belongs to a
+        # finished (or killed) update. Previously it was only cleared at the END
+        # of the migration thread (minutes of Guard Dog/Authentik work, or never
+        # if a transient gunicorn worker reaped the thread), locking the operator
+        # out of Update Now for the 20-min TTL after every successful update
+        # (field: aws-rocky + test12, 2026-07-02 — "already in progress 687s ago"
+        # on a box already restarted onto the new SHA).
+        _update_lock = '/var/lib/takwerx-console/update-now.lock'
+        _had_update_lock = os.path.exists(_update_lock)
+        if _had_update_lock:
+            try:
+                os.unlink(_update_lock)
+                print("Post-update: cleared Update Now single-flight lock at startup", flush=True)
+            except Exception as _ce:
+                print(f"Post-update: could not clear Update Now lock at startup (non-fatal): {_ce}", flush=True)
         s = load_settings()
         last_ver = s.get('last_console_version', '')
         # Dev-channel iterations keep the SAME version string (e.g. 0.9.52-alpha) but advance the
@@ -66198,34 +66215,23 @@ def _post_update_auto_deploy():
             except Exception as _shce:
                 print(f"Post-update (same-version): compose self-heal error (non-fatal): {_shce}", flush=True)
 
-            # v0.9.24 Items 1+2: even a no-op deploy (same VERSION) must
-            # release the Update Now single-flight lock — the operator did
-            # click the button and expects to be able to click it again.
-            # If the lock is present on a same-version restart, the previous
-            # deploy was likely interrupted (killed mid-bootstrap, OOM, manual
-            # restart, etc.) — run the service recovery sweep to bring up any
-            # service that ended in Exited/inactive state before clearing.
-            try:
-                _update_lock = '/var/lib/takwerx-console/update-now.lock'
-                if os.path.exists(_update_lock):
-                    print(
-                        "Post-update: same-version restart with active Update Now lock "
-                        "(prior deploy likely interrupted) — running service recovery sweep",
-                        flush=True
+            # v0.9.24 Item 2 (lock itself now cleared at startup above): a lock
+            # present on a same-version restart means the previous deploy was
+            # likely interrupted (killed mid-bootstrap, OOM, manual restart) —
+            # run the service recovery sweep to bring up any service that ended
+            # in Exited/inactive state.
+            if _had_update_lock:
+                print(
+                    "Post-update: same-version restart with active Update Now lock "
+                    "(prior deploy likely interrupted) — running service recovery sweep",
+                    flush=True
+                )
+                try:
+                    _post_update_service_recovery_sweep(
+                        lambda m: print(f"Post-update sweep: {m}", flush=True)
                     )
-                    try:
-                        _post_update_service_recovery_sweep(
-                            lambda m: print(f"Post-update sweep: {m}", flush=True)
-                        )
-                    except Exception as _se:
-                        print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
-                    try:
-                        os.unlink(_update_lock)
-                        print("Post-update: cleared Update Now single-flight lock", flush=True)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                except Exception as _se:
+                    print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
             return
 
         lock_path = '/tmp/takwerx-post-update.lock'
