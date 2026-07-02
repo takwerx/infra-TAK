@@ -8604,6 +8604,7 @@ def remote_assist_page():
         coturn_password=settings.get('coturn_password', ''),
         coturn_ip=coturn_ip,
         coturn_url=(f'turn:{coturn_ip}:{coturn_port}' if coturn_ip else ''),
+        coturn_suggested_port=('3479' if _nb_has else '3478'),
         can_configure_nb_coturn=bool(_nb_has and _nb_ctr and _nb_conf),
         netbird_coturn_in_use=netbird_coturn_in_use,
         netbird_coturn_missing=(netbird_coturn_in_use and not _nb_ctr),
@@ -62233,7 +62234,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div style="font-size:11px;color:var(--text-dim);margin-top:4px">8&#8211;128 chars: letters, digits, and <span style="font-family:'JetBrains Mono',monospace">. _ @ + = ! % ^ -</span> &mdash; no spaces, quotes, or other symbols.</div>
   </div>
   <div style="margin-bottom:12px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('server_ip', '') }}"></div>
-  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="3478"><div style="font-size:11px;color:var(--text-dim);margin-top:4px">Use 3479 if NetBird already holds 3478 on this box.</div></div>
+  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="{{ coturn_suggested_port }}">{% if coturn_suggested_port != '3478' %}<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Pre-set to 3479 — NetBird on this box already uses the standard port 3478. Any port works; Remote Assist clients are told which one.</div>{% endif %}</div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
   <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
