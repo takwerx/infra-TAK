@@ -25949,7 +25949,6 @@ services:
     entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
-      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/media/plugins/webodm-tak-overlay:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
     ports:
       - "127.0.0.1:{wo_port}:8000"
@@ -25972,7 +25971,6 @@ services:
     entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
-      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/media/plugins/webodm-tak-overlay:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
     depends_on:
       - wo_db
@@ -26048,7 +26046,11 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg,
         f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
         f'git clone --depth=1 https://github.com/Humble-Helper-96/webodm-tak-overlay.git '
-        f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1',
+        f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1 && '
+        # Upstream ships an empty __init__.py; WebODM needs Plugin re-exported
+        # at package level or the plugin never loads (GH #50).
+        f'{{ grep -q Plugin {wo_dir_remote}/plugins/webodm-tak-overlay/__init__.py 2>/dev/null || '
+        f'echo from .plugin import Plugin > {wo_dir_remote}/plugins/webodm-tak-overlay/__init__.py; }}',
         timeout=90, log_fn=plog)
     if not ok:
         plog(f'✗ Plugin clone failed: {(out or "")[-300:]}')
@@ -26219,6 +26221,19 @@ def _run_webodm_deploy(settings):
         if r.returncode != 0:
             raise RuntimeError(f'Plugin clone failed: {r.stderr[:300]}')
         plog(f'Plugin cloned: {plugin_dir}')
+        # The plugin repo ships an EMPTY __init__.py, but WebODM's loader does
+        # getattr(<package>, "Plugin") — without a package-level re-export the
+        # plugin never instantiates and silently never appears (GH #50).
+        init_py = os.path.join(plugin_dir, '__init__.py')
+        try:
+            with open(init_py) as f:
+                _init_ok = 'Plugin' in f.read()
+        except OSError:
+            _init_ok = False
+        if not _init_ok:
+            with open(init_py, 'w') as f:
+                f.write('from .plugin import Plugin\n')
+            plog('Patched plugin __init__.py (re-export Plugin for the WebODM loader)')
 
         plog('Writing docker-compose.yml…')
         wo_secret = _sec.token_hex(32)
