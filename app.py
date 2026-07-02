@@ -62192,8 +62192,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       {% endif %}
       <div class="info-grid" style="margin-bottom:16px">
         <div class="info-item"><div class="info-label">Server URL</div><div class="info-value">{{ coturn_url }}</div></div>
-        <div class="info-item"><div class="info-label">Username</div><div class="info-value">{{ coturn_username }}</div></div>
-        <div class="info-item"><div class="info-label">Password</div><div class="info-value">{{ coturn_password }}</div></div>
+        <div class="info-item"><div class="info-label">Username</div><div class="info-value"><span id="coturn-user-val" data-val="{{ coturn_username|e }}">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span> <button type="button" onclick="toggleCredVal('coturn-user-val',this)" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button></div></div>
+        <div class="info-item"><div class="info-label">Password</div><div class="info-value"><span id="coturn-pass-val" data-val="{{ coturn_password|e }}">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span> <button type="button" onclick="toggleCredVal('coturn-pass-val',this)" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button></div></div>
       </div>
       <button class="btn btn-danger" onclick="document.getElementById('uninstall-coturn-modal').classList.add('open')">Uninstall CoTURN</button>
     {% else %}
@@ -62323,6 +62323,7 @@ function doCoturnInstall(){
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
 function togglePwInput(id,btn){var i=document.getElementById(id);if(i.type==='password'){i.type='text';btn.textContent='hide';}else{i.type='password';btn.textContent='show';}}
+function toggleCredVal(id,btn){var s=document.getElementById(id);if(btn.textContent==='show'){s.textContent=s.getAttribute('data-val');btn.textContent='hide';}else{s.textContent='••••••••';btn.textContent='show';}}
 function doNBCoturnConfig(){
   var u=document.getElementById('nb-coturn-user').value,p=document.getElementById('nb-coturn-pass').value,msg=document.getElementById('nb-coturn-config-msg');
   if(!u||!p){msg.textContent='Username and password are required.';return;}
