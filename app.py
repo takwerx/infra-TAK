@@ -26086,6 +26086,7 @@ services:
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
+      - {wo_dir}/local_settings.py:/webodm/webodm/local_settings.py:ro,z
     ports:
       - "127.0.0.1:{wo_port}:8000"
     depends_on:
@@ -26108,6 +26109,7 @@ services:
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
+      - {wo_dir}/local_settings.py:/webodm/webodm/local_settings.py:ro,z
     depends_on:
       - wo_db
       - wo_broker
@@ -26135,6 +26137,112 @@ def _webodm_deploy_log(msg, status=None):
     _webodm_deploy_status['log'].append(msg)
     if status:
         _webodm_deploy_status.update(status)
+
+
+WEBODM_LOCAL_SETTINGS_STUB = (
+    '# Managed by infra-TAK. OIDC login config is written here after the\n'
+    '# Authentik step of a WebODM deploy (GH #50). Do not edit by hand.\n'
+)
+
+
+def _webodm_local_settings_content(settings, client_id, client_secret):
+    """Render WebODM's local_settings.py enabling native OIDC login against
+    Authentik. WebODM >= 3.2.2 (app/oidc_providers.py) requires exactly these
+    keys: name, client_id, client_secret, auth_endpoint, token_endpoint,
+    userinfo_endpoint — a missing/empty key silently disables the provider."""
+    ak_base = _get_authentik_base_url(settings)
+    return (
+        '# Managed by infra-TAK — WebODM native OIDC login via Authentik (GH #50).\n'
+        '# Rewritten on WebODM deploy and Authentik repair. Do not edit by hand.\n'
+        'OIDC_AUTH_PROVIDERS = [{\n'
+        "    'name': 'Authentik',\n"
+        f"    'client_id': {json.dumps(client_id)},\n"
+        f"    'client_secret': {json.dumps(client_secret)},\n"
+        f"    'auth_endpoint': {json.dumps(ak_base + '/application/o/authorize/')},\n"
+        f"    'token_endpoint': {json.dumps(ak_base + '/application/o/token/')},\n"
+        f"    'userinfo_endpoint': {json.dumps(ak_base + '/application/o/userinfo/')},\n"
+        '}]\n'
+    )
+
+
+def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=None):
+    """Write {wo_dir}/local_settings.py with the OIDC provider block and restart
+    the WebODM containers when it changed. Handles local installs (incl. a
+    flipped box keeping /root/webodm — broker-routed reads/writes) and remote
+    deployments. The webapp/worker only pick the file up through the compose
+    mount, so on pre-mount installs we write the file and tell the operator a
+    redeploy is needed instead of restarting for nothing."""
+    def log(msg):
+        if plog:
+            plog(msg)
+    if not client_id or not client_secret:
+        return False
+    content = _webodm_local_settings_content(settings, client_id, client_secret)
+    deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+    try:
+        if deploy_cfg.get('target_mode') == 'remote':
+            if not deploy_cfg.get('deployed'):
+                return False
+            wo_dir = (deploy_cfg.get('remote', {}).get('_resolved_wo_dir') or '~/webodm').strip()
+            ok, existing = _module_run(deploy_cfg,
+                f'cat {wo_dir}/local_settings.py 2>/dev/null; true', timeout=15)
+            ok_m, _ = _module_run(deploy_cfg,
+                f'grep -q local_settings.py {wo_dir}/docker-compose.yml', timeout=15)
+            mount_present = bool(ok_m)
+            if ok and (existing or '').strip() == content.strip():
+                if mount_present:
+                    log('  ✓ WebODM OIDC login already configured')
+                else:
+                    log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                return True
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tf:
+                tf.write(content)
+                tmp_ls = tf.name
+            try:
+                ok_cp, _ = _module_copy(deploy_cfg, tmp_ls, f'{wo_dir}/local_settings.py', log_fn=plog)
+            finally:
+                try:
+                    os.unlink(tmp_ls)
+                except Exception:
+                    pass
+            if not ok_cp:
+                log('  ⚠ Could not write local_settings.py on remote — WebODM keeps manual login')
+                return False
+            _module_run(deploy_cfg, f'chmod 600 {wo_dir}/local_settings.py', timeout=15)
+            if not mount_present:
+                log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                return True
+            _module_run(deploy_cfg, 'docker restart webapp wo_worker 2>&1', timeout=120)
+            log('  ✓ WebODM native OIDC login configured (webapp restarted)')
+            return True
+
+        wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
+        compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+        try:
+            compose_txt = _read_priv(compose_path)
+        except Exception:
+            return False   # WebODM not installed locally
+        ls_path = os.path.join(wo_dir, 'local_settings.py')
+        try:
+            existing = _read_priv(ls_path)
+        except Exception:
+            existing = ''
+        mount_present = 'local_settings.py' in compose_txt
+        if existing.strip() == content.strip() and mount_present:
+            log('  ✓ WebODM OIDC login already configured')
+            return True
+        _write_priv(ls_path, content, perm=0o600)
+        if not mount_present:
+            log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+            return True
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'webapp', 'wo_worker']),
+                       capture_output=True, timeout=120)
+        log('  ✓ WebODM native OIDC login configured (webapp restarted)')
+        return True
+    except Exception as e:
+        log(f'  ⚠ WebODM OIDC local_settings error: {str(e)[:120]}')
+        return False
 
 
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
@@ -26170,7 +26278,12 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
 
     # Create directory structure on remote
     plog('━━━ Creating directories (remote) ━━━')
-    ok, out = _module_run(deploy_cfg, f'mkdir -p {wo_dir_remote}/plugins {wo_dir_remote}/media {wo_dir_remote}/db', timeout=15, log_fn=plog)
+    # local_settings.py must exist before `compose up` — Docker would otherwise
+    # create a DIRECTORY at the mount source. touch keeps existing OIDC creds.
+    ok, out = _module_run(deploy_cfg,
+        f'mkdir -p {wo_dir_remote}/plugins {wo_dir_remote}/media {wo_dir_remote}/db && '
+        f'touch {wo_dir_remote}/local_settings.py && chmod 600 {wo_dir_remote}/local_settings.py',
+        timeout=15, log_fn=plog)
     if not ok:
         plog(f'✗ mkdir failed: {out}')
         _webodm_deploy_status.update({'running': False, 'error': True})
@@ -26370,6 +26483,14 @@ def _run_webodm_deploy(settings):
             with open(init_py, 'w') as f:
                 f.write('from .plugin import Plugin\n')
             plog('Patched plugin __init__.py (re-export Plugin for the WebODM loader)')
+
+        # local_settings.py must exist before `compose up` — Docker would otherwise
+        # create a DIRECTORY at the mount source. A redeploy keeps existing OIDC creds.
+        ls_path = os.path.join(wo_dir, 'local_settings.py')
+        if not os.path.exists(ls_path):
+            with open(ls_path, 'w') as f:
+                f.write(WEBODM_LOCAL_SETTINGS_STUB)
+        os.chmod(ls_path, 0o600)
 
         plog('Writing docker-compose.yml…')
         wo_secret = _sec.token_hex(32)
@@ -28308,6 +28429,128 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
             log("  ⚠ Could not create or find WebODM proxy provider")
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+
+    # ── Native OIDC login (GH #50) — WebODM >= 3.2.2 ships first-party OIDC
+    # (app/views/oidc.py): an OAuth2 provider here + OIDC_AUTH_PROVIDERS in the
+    # mounted local_settings.py turns WebODM's login page into a single
+    # "Login with Authentik" button, killing the double login behind
+    # forward_auth. The proxy provider above stays in front (defense in depth).
+    # WebODM calls the token/userinfo endpoints from inside the webapp
+    # container with verify=True, so this needs the public https Authentik URL
+    # presenting a cert the container's CA bundle trusts (LE / public custom).
+    try:
+        ak_public = _get_authentik_base_url(settings) if settings else ''
+        if not ak_public.startswith('https://'):
+            log('  ⚠ No public https Authentik URL — skipping WebODM OIDC login setup')
+            return True
+        wo_base = f'https://{_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}"}'
+        redirect_uris_obj = [{'matching_mode': 'strict', 'url': f'{wo_base}/oidc/callback/'}]
+
+        # Signing key + openid/email/profile scope mappings (NetBird pattern —
+        # WebODM requests scope "openid email").
+        signing_key_pk = None
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/crypto/certificatekeypairs/?has_key=true&ordering=name&page_size=50', headers=_ak_headers)
+            certs = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            signing_key_pk = next((c['pk'] for c in certs if 'authentik' in (c.get('name') or '').lower() and 'self-signed' in (c.get('name') or '').lower()),
+                                  certs[0]['pk'] if certs else None)
+        except Exception:
+            pass
+        scope_mapping_pks = []
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
+            mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in ('openid', 'email', 'profile')]
+        except Exception:
+            pass
+        _oidc_extras = {}
+        if signing_key_pk:
+            _oidc_extras['signing_key'] = signing_key_pk
+        if scope_mapping_pks:
+            _oidc_extras['property_mappings'] = scope_mapping_pks
+
+        _oidc_name = 'WebODM OIDC'
+        oidc_pk, client_id, client_secret = None, '', ''
+        # Reuse an existing provider (keeps client_id/secret stable across
+        # deploys/repairs); heal redirect_uris + grant_types on it. A provider
+        # missing its secret is useless — delete and recreate.
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/?search=WebODM', headers=_ak_headers)
+            for ex in json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']:
+                if ex.get('name') != _oidc_name:
+                    continue
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/{ex["pk"]}/', headers=_ak_headers)
+                detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                if detail.get('client_id') and detail.get('client_secret'):
+                    oidc_pk, client_id, client_secret = ex['pk'], detail['client_id'], detail['client_secret']
+                    patch = {'redirect_uris': redirect_uris_obj, 'client_type': 'confidential',
+                             'grant_types': ['authorization_code', 'refresh_token']}
+                    patch.update(_oidc_extras)
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/{oidc_pk}/',
+                            data=json.dumps(patch).encode(), headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log('  ✓ WebODM OIDC provider already exists (healed)')
+                else:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/{ex["pk"]}/',
+                            headers=_ak_headers, method='DELETE')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                break
+        except Exception:
+            pass
+        if not oidc_pk:
+            payload = {
+                'name': _oidc_name,
+                'authorization_flow': flow_pk,
+                'invalidation_flow': inv_flow_pk,
+                'client_type': 'confidential',
+                'redirect_uris': redirect_uris_obj,
+                # grant_types defaults to EMPTY on Authentik 2024.x+ create — an
+                # empty list rejects every OIDC login before the user sees a
+                # form (the NetBird/FedHub trap). Set it explicitly.
+                'grant_types': ['authorization_code', 'refresh_token'],
+            }
+            payload.update(_oidc_extras)
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/',
+                data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
+            p = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+            oidc_pk, client_id, client_secret = p.get('pk'), p.get('client_id', ''), p.get('client_secret', '')
+            log(f'  ✓ WebODM OIDC provider created, client_id={client_id[:8]}...')
+
+        # Separate application — an Authentik app holds ONE provider and the
+        # 'webodm' app already carries the proxy provider. blank://blank keeps
+        # this one out of the user launcher (same trick as the SSO connector).
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                data=json.dumps({'name': _oidc_name, 'slug': 'webodm-oidc',
+                    'provider': oidc_pk, 'meta_launch_url': 'blank://blank'}).encode(),
+                headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'WebODM OIDC' created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/webodm-oidc/',
+                        data=json.dumps({'provider': oidc_pk, 'meta_launch_url': 'blank://blank'}).encode(),
+                        headers=_ak_headers, method='PATCH')
+                    _urlreq.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                log("  ✓ Application 'WebODM OIDC' updated")
+            else:
+                log(f'  ⚠ WebODM OIDC application error: {str(e)[:80]}')
+
+        if oidc_pk and client_id and client_secret and settings:
+            _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=plog)
+        elif not client_secret:
+            log('  ⚠ No OIDC client secret — WebODM keeps manual login only')
+    except Exception as e:
+        log(f'  ⚠ WebODM OIDC setup error: {str(e)[:120]}')
     return True
 
 
