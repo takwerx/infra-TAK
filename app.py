@@ -26446,7 +26446,6 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
 def _run_webodm_deploy(settings):
     import subprocess as _sp
     import secrets as _sec
-    import shutil as _sh
     plog = _webodm_deploy_log
     deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
     if deploy_cfg.get('target_mode') == 'remote':
@@ -26473,7 +26472,11 @@ def _run_webodm_deploy(settings):
 
         plog('Installing TAK overlay plugin…')
         if os.path.isdir(plugin_dir):
-            _sh.rmtree(plugin_dir)
+            # Broker-routed: the running container (root) drops __pycache__/*.pyc
+            # into the bind-mounted plugin dir, which plain rmtree can't remove
+            # under the non-root console (reapply path; fresh deploys never hit it).
+            subprocess.run(_sudo_wrap(['rm', '-rf', plugin_dir]),
+                           capture_output=True, timeout=60, check=True)
         r = _sp.run(['git', 'clone', '--depth=1',
                      'https://github.com/Humble-Helper-96/webodm-tak-overlay.git',
                      plugin_dir], capture_output=True, text=True, timeout=60)
