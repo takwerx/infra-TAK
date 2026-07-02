@@ -19654,17 +19654,40 @@ def _get_tvr_latest_commit_sha(use_cache=True):
         return _tvr_release_cache.get('sha') or None
 
 
+def _tvr_dir():
+    """Resolve the real TAK Video Restreamer install dir. Fresh born-non-root installs live at
+    ~/tak-video-restreamer; a box FLIPPED from root keeps it at /root/tak-video-restreamer (TVR is
+    NOT auto-re-homed — its compose has ABSOLUTE /root binds + a bind-mounted data dir, like WebODM).
+    Returns whichever holds a compose (broker-checked, since takwerx can't stat /root), else ~."""
+    home = os.path.expanduser('~/tak-video-restreamer')
+    if os.path.exists(os.path.join(home, 'docker-compose.yml')):
+        return home
+    try:
+        if subprocess.run(_sudo_wrap(['test', '-f', '/root/tak-video-restreamer/docker-compose.yml']),
+                          capture_output=True, timeout=10).returncode == 0:
+            return '/root/tak-video-restreamer'
+    except Exception:
+        pass
+    return home
+
+def _tvr_compose(tvr_dir, action, timeout=120):
+    """Run `docker compose <action>` in the TVR dir via the broker (root can cd into /root on a
+    flipped box; the old cwd=TVR_INSTALL_DIR chdir'd as takwerx and EPERM'd)."""
+    return subprocess.run(_sudo_wrap(['bash', '-lc',
+        'cd %s && docker compose %s' % (shlex.quote(tvr_dir), action)]),
+        capture_output=True, text=True, timeout=timeout)
+
 def _get_tvr_version_info():
     """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based).
     Compares FULL local vs remote SHAs — git's --short length is adaptive (7+ as the repo
     grows) so the old short-vs-[:7] compare could mismatch; display values stay 7 chars."""
     import subprocess as _sp
     info = {'version': '', 'update_available': False, 'latest': None}
-    tvr_dir = os.path.expanduser('~/tak-video-restreamer')
+    tvr_dir = _tvr_dir()
     local_full = ''
     try:
-        r = _sp.run(['git', 'rev-parse', 'HEAD'],
-                    capture_output=True, text=True, timeout=5, cwd=tvr_dir)
+        r = _sp.run(_sudo_wrap(['bash', '-lc', 'cd %s && git -c safe.directory=%s rev-parse HEAD' % (shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
+                    capture_output=True, text=True, timeout=8)
         if r.returncode == 0:
             local_full = r.stdout.strip()
             info['version'] = local_full[:7]
@@ -26438,15 +26461,11 @@ def tvr_control():
     action = data.get('action', '').strip().lower()
     if action not in ('start', 'stop', 'restart'):
         return jsonify({'success': False, 'error': 'Invalid action'}), 400
-    compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
-    if not os.path.exists(compose_path):
+    tvr_dir = _tvr_dir()   # ~/tak-video-restreamer OR (flipped box) /root/tak-video-restreamer
+    if subprocess.run(_sudo_wrap(['test', '-f', os.path.join(tvr_dir, 'docker-compose.yml')]), capture_output=True, timeout=10).returncode != 0:
         return jsonify({'success': False, 'error': 'Compose file not found — deploy first'}), 404
-    cmd_map = {
-        'start':   ['docker', 'compose', '-f', compose_path, 'up', '-d'],
-        'stop':    ['docker', 'compose', '-f', compose_path, 'stop'],
-        'restart': ['docker', 'compose', '-f', compose_path, 'restart'],
-    }
-    r = _sp.run(cmd_map[action], capture_output=True, text=True, timeout=60, cwd=TVR_INSTALL_DIR)
+    _act = {'start': 'up -d', 'stop': 'stop', 'restart': 'restart'}[action]
+    r = _tvr_compose(tvr_dir, _act, timeout=60)
     if r.returncode != 0:
         return jsonify({'success': False, 'error': (r.stderr or r.stdout)[:300]})
     return jsonify({'success': True})
@@ -26474,10 +26493,9 @@ def tvr_uninstall():
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
-    compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
-    if os.path.exists(compose_path):
-        _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'down']),
-                capture_output=True, timeout=60, cwd=TVR_INSTALL_DIR)
+    tvr_dir = _tvr_dir()
+    if subprocess.run(_sudo_wrap(['test', '-f', os.path.join(tvr_dir, 'docker-compose.yml')]), capture_output=True, timeout=10).returncode == 0:
+        _tvr_compose(tvr_dir, 'down', timeout=60)
     s = load_settings()
     s['tak_video_restreamer_enabled'] = False
     save_settings(s)
@@ -26499,17 +26517,15 @@ def tvr_set_password():
     s['tak_video_restreamer_admin_password'] = new_password
     save_settings(s)
     # Rewrite docker-compose.yml with the new password and restart (no rebuild)
-    compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
-    if os.path.exists(compose_path):
+    tvr_dir = _tvr_dir()
+    compose_path = os.path.join(tvr_dir, 'docker-compose.yml')
+    if subprocess.run(_sudo_wrap(['test', '-f', compose_path]), capture_output=True, timeout=10).returncode == 0:
         try:
-            with open(compose_path, 'r') as f:
-                content = f.read()
+            content = _read_priv(compose_path)   # v10.0.5 non-root: broker (root-owned on flipped box)
             import re as _re
             content = _re.sub(r'(- ADMIN_PASSWORD=).*', f'- ADMIN_PASSWORD={new_password}', content)
-            with open(compose_path, 'w') as f:
-                f.write(content)
-            _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d']),
-                    capture_output=True, timeout=60, cwd=TVR_INSTALL_DIR)
+            _write_priv(compose_path, content)
+            _tvr_compose(tvr_dir, 'up -d', timeout=60)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
     return jsonify({'success': True})
@@ -26526,22 +26542,21 @@ def _run_tvr_update():
         log.append(msg)
         _tvr_update_status['log'] = list(log)
     try:
+        tvr_dir = _tvr_dir()   # ~/tak-video-restreamer OR (flipped box) /root/tak-video-restreamer
         plog('━━━ Step 1/3: Pulling latest source ━━━')
-        r = _sp.run(['git', 'pull', '--ff-only'],
-                    capture_output=True, text=True, timeout=120, cwd=TVR_INSTALL_DIR)
+        r = _sp.run(_sudo_wrap(['bash', '-lc', 'cd %s && git -c safe.directory=%s pull --ff-only' % (shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
+                    capture_output=True, text=True, timeout=120)
         plog((r.stdout + r.stderr).strip() or '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'git pull failed: {r.stderr[:300]}')
-        r2 = _sp.run(['git', 'rev-parse', '--short', 'HEAD'],
-                     capture_output=True, text=True, timeout=5, cwd=TVR_INSTALL_DIR)
+        r2 = _sp.run(_sudo_wrap(['bash', '-lc', 'cd %s && git -c safe.directory=%s rev-parse --short HEAD' % (shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
+                     capture_output=True, text=True, timeout=8)
         new_sha = r2.stdout.strip()
         plog(f'✓ Now at commit {new_sha}')
 
         plog('')
         plog('━━━ Step 2/3: Rebuilding Docker image ━━━')
-        compose_path = os.path.join(TVR_INSTALL_DIR, 'docker-compose.yml')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build']),
-                    capture_output=True, text=True, timeout=600, cwd=TVR_INSTALL_DIR)
+        r = _tvr_compose(tvr_dir, 'up -d --build', timeout=600)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
@@ -63361,11 +63376,12 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
 # per-module verify+rollback restores it in place if anything goes wrong, and break-glass is the
 # SSH tunnel to :5001). No-op on fresh born-non-root boxes (dirs already under ~) and root consoles.
 for _rh_sub, _rh_ctr in (
-    ('TAK-Portal', 'tak-portal'),
-    ('CloudTAK',   'cloudtak-api'),
-    ('netbird',    'netbird-server'),
-    ('node-red',   'nodered'),
-    ('authentik',  'authentik-server'),
+    ('TAK-Portal',        'tak-portal'),
+    ('CloudTAK',          'cloudtak-api'),
+    ('netbird',           'netbird-server'),
+    ('node-red',          'nodered'),
+    ('eud-remote-assist', 'eud-remote-assist-nginx'),
+    ('authentik',         'authentik-server'),
     # NB: WebODM is deliberately NOT auto-re-homed. Its compose uses ABSOLUTE /root/webodm binds
     # AND its Postgres data dir (/root/webodm/db) is owned by a container-mapped uid — a blanket
     # `chown -R takwerx` on a move would break Postgres and lose the WebODM DB. On a flipped box
