@@ -719,6 +719,19 @@ def main():
         src = src.replace('port=5000', 'port=int(os.environ.get("PORT", 5080))', 1)
         changed = True
 
+    # 1b. Loopback bind: upstream ships host='0.0.0.0'; force 127.0.0.1 so the
+    # web-editor is reached ONLY via Caddy locally. This overlay only touches the
+    # LOCAL editor (it returns early above when the editor isn't on this box), so
+    # loopback is always correct here. Without it, 5080 is publicly bound and
+    # exposed wherever the host firewall doesn't block it — firewalld opens it on
+    # RHEL, so it showed EXPOSED (red) in the Service Exposure panel. Runs every
+    # start, so it also survives a mediamtx update that re-clones the editor
+    # (fresh 0.0.0.0) after the deploy-time sed.
+    for _pub in ("host='0.0.0.0'", 'host="0.0.0.0"'):
+        if _pub in src:
+            src = src.replace(_pub, _pub.replace('0.0.0.0', '127.0.0.1'))
+            changed = True
+
     # 2. API port patch: 9997 -> 9898
     if '9997' in src:
         src = src.replace('9997', '9898')
@@ -62865,14 +62878,18 @@ print("=" * 50)
 
 # === A6 hardening: source-scope UFW for local Guard Dog health endpoint ===
 def _auto_harden_guarddog_8080(settings=None, plog=None):
-    """v0.9.12 A6: apply UFW source-scope + deny for the local Guard Dog health
-    endpoint (tak-health.service, port 8080).
+    """v0.9.12 A6: source-scope the local Guard Dog health endpoint
+    (tak-health.service, port 8080) so only the console's IP can reach it.
 
-    Idempotent — skips if `ufw deny 8080/tcp` already present.
-    For single-server installs (console IP == this box) the deny rule blocks all
-    external traffic; UFW's default loopback policy still allows localhost access.
-    For two-server the source-scope allows only the console's public IP.
-    Falls back to no-op if Guard Dog is not installed or UFW is unavailable.
+    v10.0.5: BACKEND-AWARE (ufw↔firewalld) via the _fw_* shim. The old version was
+    raw-ufw-only and gated on `command -v ufw`: on RHEL/firewalld boxes (where ufw may
+    even be installed but firewalld is the ACTIVE backend) it applied ufw rules that
+    the live firewall ignored, while firewalld kept 8080 opened UNCONDITIONALLY
+    (--add-port) — the Service Exposure panel's "source-scope defeated by an
+    unconditional allow" (root-caused live on Rocky 9.8). Now: drop any unconditional
+    8080 allow, then allow ONLY from the console IP, on whichever backend is active.
+    Idempotent (both _fw_ ops are no-op-safe). No-op if Guard Dog / health service /
+    firewall absent, or server IP unknown.
     """
     _log = plog or (lambda m: print(m, flush=True))
     if not os.path.exists('/opt/tak-guarddog'):
@@ -62884,27 +62901,22 @@ def _auto_harden_guarddog_8080(settings=None, plog=None):
     )
     if r.returncode not in (0,) and 'enabled' not in (r.stdout or '').lower() and 'static' not in (r.stdout or '').lower():
         return False
-    # UFW available?
-    if subprocess.run('command -v ufw >/dev/null 2>&1', shell=True, timeout=5).returncode != 0:
-        return False
-    # Idempotency: already denied?
-    chk = _priv_pipe(['ufw', 'status'], ['grep', '-E', '8080.*DENY'], timeout=5)
-    if chk.returncode == 0:
-        _log("Startup migration: guarddog 8080: UFW deny already set (idempotent — skipping)")
-        return False
+    be = _fw_backend()
+    if be is None:
+        return False   # no host firewall present
     s = settings or load_settings()
     src_ip = _fedhub_caddy_source_ip(s)
-    if src_ip:
-        subprocess.run(
-            _sudo_wrap(['ufw', 'allow', 'from', src_ip, 'to', 'any', 'port', '8080', 'proto', 'tcp']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5
-        )
-        _log(f"Startup migration: guarddog 8080: UFW source-scoped ALLOW from {src_ip}")
-    else:
-        _log("Startup migration: guarddog 8080: Settings → Server IP not set — skipping source-scope (set server_ip to harden)")
+    if not src_ip:
+        _log("Startup migration: guarddog 8080: Server IP not set — skipping source-scope (set server_ip to harden)")
         return False
-    subprocess.run(_sudo_wrap(['ufw', 'deny', '8080/tcp']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5)
-    _log("Startup migration: guarddog 8080: UFW deny 8080/tcp applied")
-    return True
+    # Remove any unconditional allow (both backends), then add the source-scoped
+    # allow (ufw `allow from` / firewalld rich rule). On firewalld the default-drop
+    # public zone denies everything else; on ufw the default-deny does the same.
+    _fw_remove(8080, 'tcp')
+    ok, msg = _fw_allow_from(src_ip, 8080, 'tcp')
+    _log(f"Startup migration: guarddog 8080: source-scoped ALLOW from {src_ip} ({be}); unconditional allow removed"
+         if ok else f"Startup migration: guarddog 8080: source-scope FAILED on {be}: {str(msg)[:120]}")
+    return bool(ok)
 
 
 # === Auto-update Guard Dog scripts on console startup ===
@@ -63279,9 +63291,16 @@ def _startup_ensure_hardening_posture():
                     break
                 time.sleep(0.25)
         port = int(load_settings().get('console_port') or 5001)
-        if _w1_console_port_public(str(port)):
-            _fw_remove(port, 'tcp')
-            still = _w1_console_port_public(str(port))
+        # Always re-remove the public console-port allow on a hardened box (idempotent —
+        # _fw_remove no-ops when the port isn't open). Do NOT gate on
+        # _w1_console_port_public() detection: on firewalld, right after the broker
+        # (re)start during a non-root flip, that read can race/misparse and wrongly
+        # report the port closed, silently skipping the re-close and leaving :5001
+        # world-open on a box that says it's hardened (root-caused live on Rocky 9.8).
+        was_public = _w1_console_port_public(str(port))
+        _fw_remove(port, 'tcp')
+        still = _w1_console_port_public(str(port))
+        if was_public or still:
             print('[startup-posture] hardened: re-closed public :%s (%s)' % (
                 port, 'STILL OPEN — check firewall/broker' if still else 'now localhost-only'), flush=True)
         if w1.get('caddy_login_locked'):
