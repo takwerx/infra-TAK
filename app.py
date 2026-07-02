@@ -55703,7 +55703,46 @@ def _tak_snapshot(label, plog=None):
         _snap_tak_cfg = _get_tak_deployment_config(_snap_settings)
         _snap_two_server = _snap_tak_cfg.get('mode') == 'two_server'
         _snap_s1 = _snap_tak_cfg.get('server_one', {})
-        if _snap_two_server and _snap_s1.get('host'):
+        _snap_edb = _snap_tak_cfg.get('external_db', {}) if _snap_tak_cfg.get('mode') == 'external_db' else {}
+        if _snap_edb.get('host'):
+            # external_db / RDS: the DB is managed (no SSH, no local postgres) — dump over
+            # TCP with the client pg_dump. Stream to a console-writable temp, then broker-cp
+            # into the root-owned snapshot dir (same pattern as the two-server branch).
+            # Previously this mode fell through to the local branch: non-root skipped
+            # "deferred", root hard-failed (no local postgres OS user). PLAN-v10.0.6 §3.
+            import shutil as _shu
+            _eh = _snap_edb['host']
+            _ep = int(_snap_edb.get('port') or 5432)
+            _en = _snap_edb.get('name') or 'cot'
+            _eu = _snap_edb.get('user') or 'martiuser'
+            if not _shu.which('pg_dump'):
+                plog("  snapshot: external-DB mode but no pg_dump client on this box — DB dump skipped "
+                     "(managed-DB automated backups still apply; install postgresql client tools to capture dumps in snapshots)")
+            else:
+                plog(f"  snapshot: external-DB mode — pg_dump over TCP from {_eh}:{_ep}")
+                import tempfile
+                _fd, _tmp_dump = tempfile.mkstemp(prefix='cot-snap-', suffix='.pgdump')
+                os.close(_fd)
+                try:
+                    _pg_env = dict(os.environ)
+                    _pg_env['PGPASSWORD'] = _snap_edb.get('password') or ''
+                    with open(_tmp_dump, 'wb') as _f:
+                        r2 = subprocess.run(
+                            ['pg_dump', '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
+                            stdout=_f, stderr=subprocess.PIPE, timeout=600, env=_pg_env)
+                    if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
+                        _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
+                        if _cp.returncode == 0:
+                            meta['db_dump'] = True
+                            plog(f"  snapshot: cot pg_dump (external DB {_eh}) written ({os.path.getsize(_tmp_dump) // 1024} KB)")
+                        else:
+                            plog(f"  snapshot: pg_dump copy into snapshot FAILED: {(_cp.stderr or b'').decode()[:160]}")
+                    else:
+                        plog(f"  snapshot: external-DB pg_dump FAILED (check network path + client-vs-server version): {(r2.stderr or b'').decode()[:200]}")
+                finally:
+                    try: os.remove(_tmp_dump)
+                    except Exception: pass
+        elif _snap_two_server and _snap_s1.get('host'):
             plog("  snapshot: two-server mode — streaming pg_dump from Server One via SSH")
             _ssh_dump_cmd = 'sudo -u postgres pg_dump -Fc cot'
             _host = (_snap_s1.get('host') or '').strip()
