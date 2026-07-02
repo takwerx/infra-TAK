@@ -19445,8 +19445,13 @@ def _get_caddy_version_info():
             if m:
                 out['version'] = 'v' + m.group(1).strip()
         if out['version']:
-            apt = _priv_pipe(['apt', 'list', '--upgradable'], ['grep', '-i', 'caddy'], timeout=10)
-            if apt.returncode == 0 and (apt.stdout or '').strip():
+            # Family-branched: bare `apt` on RHEL raised FileNotFoundError every
+            # poll (benign but noisy in the broker audit log — seen on aws-rocky).
+            if _distro_family() == 'rhel':
+                chk = _priv_pipe(['dnf', '-q', 'check-update', 'caddy'], ['grep', '-i', 'caddy'], timeout=15)
+            else:
+                chk = _priv_pipe(['apt', 'list', '--upgradable'], ['grep', '-i', 'caddy'], timeout=10)
+            if chk.returncode == 0 and (chk.stdout or '').strip():
                 out['update_available'] = True
     except (subprocess.TimeoutExpired, OSError):
         pass
