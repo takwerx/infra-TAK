@@ -8638,6 +8638,14 @@ def remote_assist_coturn_install():
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     if not os.path.exists(ra_dir):
         return jsonify({'success': False, 'error': 'EUD Remote Assist is not installed.'})
+    # CoTURN needs 3478. NetBird also runs a STUN/TURN server on 3478, so on a box with
+    # NetBird the container port-publish fails ("port is already allocated"). Detect it
+    # up front and explain, instead of surfacing a cryptic docker error.
+    try:
+        if detect_modules().get('netbird', {}).get('installed'):
+            return jsonify({'success': False, 'error': 'Port 3478 is already used by NetBird (it provides STUN/TURN). Run only one TURN server per box — uninstall NetBird first, or install CoTURN on a box without NetBird.'})
+    except Exception:
+        pass
     fqdn = (load_settings().get('fqdn') or 'remote-assist').strip()
     override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
     # Inputs are charset-validated above, so this interpolation cannot break the YAML.
@@ -8667,7 +8675,21 @@ def remote_assist_coturn_install():
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'up', '-d', 'coturn'),
                     cwd=ra_dir, capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
-            return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'docker compose failed')[:300]})
+            # docker compose writes pull PROGRESS to stderr, so the head of stderr is
+            # noise — surface the actual failure (last Error/failed line, e.g. a port
+            # conflict), and roll back the half-written override so a retry is clean.
+            _out = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+            _lines = [l.strip() for l in _out.splitlines() if l.strip()]
+            _err = next((l for l in reversed(_lines)
+                         if any(k in l.lower() for k in ('error', 'failed', 'allocated', 'in use'))),
+                        (_lines[-1] if _lines else 'docker compose failed'))
+            try:
+                _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-sfv', 'coturn'),
+                        cwd=ra_dir, capture_output=True, timeout=60)
+                os.remove(override_path)
+            except Exception:
+                pass
+            return jsonify({'success': False, 'error': _err[:400]})
         settings = load_settings()
         settings['coturn_installed'] = True
         settings['coturn_username'] = username
