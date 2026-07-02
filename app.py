@@ -26498,12 +26498,14 @@ def _run_webodm_deploy(settings):
             plog('Patched plugin __init__.py (re-export Plugin for the WebODM loader)')
 
         # local_settings.py must exist before `compose up` — Docker would otherwise
-        # create a DIRECTORY at the mount source. A redeploy keeps existing OIDC creds.
+        # create a DIRECTORY at the mount source. A reapply keeps existing OIDC creds;
+        # the file can be ROOT-owned (the Authentik sweep writes it via the broker on
+        # non-root boxes), so chmod must be broker-routed too.
         ls_path = os.path.join(wo_dir, 'local_settings.py')
         if not os.path.exists(ls_path):
             with open(ls_path, 'w') as f:
                 f.write(WEBODM_LOCAL_SETTINGS_STUB)
-        os.chmod(ls_path, 0o600)
+        _chmod_priv(ls_path, 0o600)
 
         plog('Writing docker-compose.yml…')
         wo_secret = _sec.token_hex(32)
