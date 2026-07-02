@@ -5614,6 +5614,23 @@ def console_migrate_nonroot_api():
         '--property=StandardOutput=append:' + _NONROOT_MIGRATE_LOG,
         '--property=StandardError=append:' + _NONROOT_MIGRATE_LOG,
         '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+    ]
+    # RHEL/SELinux: the transient migrate unit must run UNCONFINED. Otherwise, under
+    # enforcing SELinux it runs in a confined domain and the flip's provision rsync
+    # (start.sh: rsync of the current install → /opt/infratak) is denied search
+    # access to the current install's home dir (/home/<user>) even as root, so
+    # start.sh exits non-zero and the migration auto-rolls-back. Root-caused live on
+    # Rocky 9.8: `SELinux is preventing /usr/bin/rsync from search access on the
+    # directory rocky`. Same unconfined_service_t treatment the console + broker
+    # units already carry (see _startup_ensure_broker). No-op where SELinux is
+    # Disabled or absent (Ubuntu/Debian), so the happy path is unchanged.
+    try:
+        _ge = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=5)
+        if _ge.returncode == 0 and _ge.stdout.strip() != 'Disabled':
+            cmd.append('--property=SELinuxContext=system_u:system_r:unconfined_service_t:s0')
+    except Exception:
+        pass
+    cmd += [
         '--no-block',
         '/bin/bash', script, '--apply', '--auto-rollback',
     ]
