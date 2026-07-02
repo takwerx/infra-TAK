@@ -26456,6 +26456,16 @@ def _run_webodm_deploy(settings):
     wo_port = settings.get('webodm_port', 8765)
     plugin_dir = os.path.join(wo_dir, 'plugins', 'webodm-tak-overlay')
     compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    # Reapply guard: on a box flipped from root, a root-era install lives at
+    # /root/webodm (deliberately not re-homed). Deploying to ~/webodm there
+    # would create a SECOND install and orphan the existing projects/DB.
+    _existing_dir = _webodm_dir()
+    if _existing_dir != wo_dir:
+        plog(f'ERROR: existing WebODM install found at {_existing_dir} (root-era install on a non-root box). '
+             f'An in-place reapply would create a second install at {wo_dir} and orphan the existing data. '
+             f'Uninstall WebODM from the console first, then deploy fresh.')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
     try:
         plog('Creating directories…')
         for sub in ['', 'plugins', 'media', 'db']:
@@ -61353,8 +61363,8 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 <div class="main">
 <div class="section-title"><img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)">WebODM</div>
 
-{% if not wo.get('installed') %}
-<!-- Deploy state -->
+{% if not wo.get('installed') or deploying or deploy_error %}
+<!-- Deploy state (also shown for an in-place Reapply on an installed box) -->
 <div style="background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px">
 <div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">Drone Photo Processing for TAK</div>
 <div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install the TAK Incident Overlay plugin by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a>. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
@@ -61573,6 +61583,7 @@ function woTestSsh(){
 <button class="btn btn-primary btn-sm" id="wo-update-btn" onclick="updateWebODM(this)">↑ Update to v{{ wo_latest }}</button>
 {% endif %}
 <button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
+<button class="btn btn-ghost" onclick="reapplyWebODM(this)" title="Re-run the deploy in place: re-clone the TAK overlay plugin, refresh docker-compose and the OIDC login config, restart containers. Projects and data are kept.">⟳ Reapply Plugin &amp; Config</button>
 <button class="btn btn-ghost" onclick="openWoPwModal()" title="Show admin accounts and reset password">🔑 Account Recovery</button>
 <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">Uninstall</button>
 </div>
@@ -61644,8 +61655,13 @@ function startDeploy(){
     var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;
     var st=document.getElementById('deploy-status');if(st)st.textContent='Saving config…';
     // Persist deployment config (incl. ODM resource caps) before kicking off the deploy,
-    // which reads the saved webodm_deployment cfg and takes no request body.
-    fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    // which reads the saved webodm_deployment cfg and takes no request body. The config
+    // form only exists in the fresh-deploy state — on Retry (error state) there is no
+    // form, so skip the save and deploy with the already-saved config (_woCfg would
+    // throw on the missing elements).
+    (document.getElementById('wo-remote-cfg')
+      ? fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+      : Promise.resolve())
       .then(function(){if(st)st.textContent='Starting deploy…';return fetch('/api/webodm/deploy',{method:'POST'});})
       .then(r=>r.json()).then(d=>{
         if(d.success){window.location.reload();}
@@ -61674,6 +61690,14 @@ function updateWebODM(btn){
         if(d.started){setTimeout(poll,1000);}
         else{btn.disabled=false;btn.textContent='↑ Update to latest';showToast('Error: '+(d.error||'unknown'));}
     });
+}
+function reapplyWebODM(btn){
+    if(!confirm('Re-run the WebODM deploy in place?\n\nThis re-clones the TAK overlay plugin, rewrites docker-compose (adding the one-click Authentik login config), and restarts the WebODM containers.\n\nProjects, accounts and processed data are KEPT. Running processing jobs will be interrupted and everyone is logged out of WebODM.'))return;
+    btn.disabled=true;btn.textContent='Starting…';
+    fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.reload();}
+        else{showToast('Error: '+(d.error||'unknown'));btn.disabled=false;btn.textContent='⟳ Reapply Plugin & Config';}
+    }).catch(e=>{showToast('Network error');btn.disabled=false;btn.textContent='⟳ Reapply Plugin & Config';});
 }
 function repairAuthentik(btn){
     btn.disabled=true;btn.textContent='Repairing…';
