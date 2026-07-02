@@ -63192,7 +63192,16 @@ def _startup_ensure_broker():
                 src_hash = hashlib.sha1(bf.read()).hexdigest()
         except OSError:
             src_hash = ''
-        stamp = '/var/log/takwerx-broker/.srcstamp'
+        # v10.0.5: stamp lives in the console-owned CONFIG_DIR, NOT the root-owned
+        # broker log dir. The old location (/var/log/takwerx-broker/.srcstamp, 0750
+        # root) was unreadable/unwritable by the non-root console, so both the raw
+        # open() read and write below silently EPERM'd → old_hash always '' →
+        # src_hash != old_hash always true → the broker restarted on EVERY console
+        # restart (harmless but wasteful). CONFIG_DIR is takwerx-owned, so plain
+        # open() works in every mode with no broker round-trip (and we must NOT
+        # allowlist the broker's audit-log dir for console writes). One transitional
+        # broker restart on first run after this change, then it settles.
+        stamp = os.path.join(CONFIG_DIR, '.broker_srcstamp')
         old_hash = ''
         try:
             with open(stamp) as sf:
