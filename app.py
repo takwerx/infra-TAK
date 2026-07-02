@@ -9005,7 +9005,7 @@ def _find_ssh_key_for_server_one(s1_cfg):
     for candidate in [
         os.path.expanduser('~/.ssh/id_rsa'),
         os.path.expanduser('~/.ssh/id_ed25519'),
-        os.path.expanduser('~/.ssh/infra-tak-server-one'),
+        os.path.expanduser('~/.ssh/infratak_serverone'),  # canonical Server One key name (see key_path at deploy)
     ]:
         if os.path.exists(candidate):
             return candidate
@@ -12861,7 +12861,15 @@ def run_guarddog_deploy(alert_email):
         s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip() if is_two_server else ''
         s1_user = (tak_cfg.get('server_one', {}).get('ssh_user') or 'root').strip() if is_two_server else ''
         db_port = str(int(tak_cfg.get('database', {}).get('port') or 5432)) if is_two_server else '5432'
-        ssh_key_path = os.path.expanduser('~/.ssh/infra-tak-server-one') if is_two_server else ''
+        # Resolve the REAL Server One key from config (canonical name is
+        # ~/.ssh/infratak_serverone), never a hardcoded legacy name. The old
+        # hardcoded '~/.ssh/infra-tak-server-one' didn't exist on non-root/flipped
+        # boxes → every two-server DB script (auto-vacuum, cotdb-watch, db-repack,
+        # retention-guard, remotedb watchers) got a dead SSH_KEY and skipped/failed.
+        ssh_key_path = ''
+        if is_two_server:
+            _s1 = dict(tak_cfg.get('server_one', {}))
+            ssh_key_path = _find_ssh_key_for_server_one(_s1) or (_s1.get('ssh_key_path') or '').strip()
         if is_two_server and s1_host:
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
@@ -62897,8 +62905,13 @@ def _auto_update_guarddog():
         tak_cfg = _get_tak_deployment_config(settings)
         is_two_server = tak_cfg.get('mode') == 'two_server'
         s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip() if is_two_server else ''
-        s1_user = (tak_cfg.get('server_one', {}).get('user') or 'root').strip() if is_two_server else ''
-        ssh_key_path = (tak_cfg.get('server_one', {}).get('ssh_key_path') or '').strip() if is_two_server else ''
+        s1_user = (tak_cfg.get('server_one', {}).get('ssh_user') or 'root').strip() if is_two_server else ''
+        # normalized config key is 'ssh_user' (not 'user') and the Server One key is
+        # ~/.ssh/infratak_serverone — resolve via the same helper the deploy path uses.
+        ssh_key_path = ''
+        if is_two_server:
+            _s1 = dict(tak_cfg.get('server_one', {}))
+            ssh_key_path = _find_ssh_key_for_server_one(_s1) or (_s1.get('ssh_key_path') or '').strip()
         db_port = str(tak_cfg.get('database', {}).get('port') or 5432) if is_two_server else '5432'
         alert_email = (settings.get('guarddog_alert_email') or '').strip()
         cert_pass = _get_tak_cert_password(settings)
@@ -62926,7 +62939,7 @@ def _auto_update_guarddog():
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
-                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infra-tak-server-one'))
+                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'))
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
             if name == 'tak-fedhub-watch.sh':
                 _fh_cfg = _get_fedhub_deployment_config(settings)
