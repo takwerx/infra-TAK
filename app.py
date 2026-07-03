@@ -373,6 +373,23 @@ def _makedirs_priv(path, mode=None, exist_ok=True):
         os.chmod(path, int(mode))
 
 
+def _pg_dump_priv(dest_path, db='cot', timeout=600, container=None):
+    """v10.0.8 (PLAN §B): local pg_dump written to disk BY THE BROKER — the dump
+    never crosses the socket, so the 32MB message cap that forced the non-root
+    single-server snapshot to skip its DB dump does not apply. The broker runs
+    `runuser -u postgres -- pg_dump -Fc <db>` (or, for container TAK where the
+    cot DB lives inside takserver-db, `docker exec -u postgres takserver-db
+    pg_dump -Fc <db>`) with stdout pointed at dest_path, which must resolve
+    under /opt/tak/snapshots/ (broker-enforced, fail-closed).
+    Returns the dump size in bytes; raises BrokerError on refusal/failure."""
+    resp = _broker_request({'op': 'pg_dump', 'path': dest_path, 'db': db,
+                            'container': container, 'timeout': timeout},
+                           timeout=timeout + 30)
+    if not resp.get('ok'):
+        raise BrokerError(f"broker pg_dump failed ({dest_path}): {resp.get('error')}")
+    return int(resp.get('size') or 0)
+
+
 def _chmod_priv(path, mode):
     """chmod a privileged path. Routes through the broker when non-root; otherwise
     native os.chmod. Raw os.chmod on a root-owned path (e.g. /swapfile) by the
@@ -651,7 +668,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.7-alpha"
+VERSION = "10.0.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -5379,10 +5396,14 @@ def _broker_service_active():
 
 def _broker_status_dict():
     enforce = None
+    enforce_info = {}
+    deny_count = None
     try:
         if _broker_available():
             pong = _broker_request({'op': 'ping'}, timeout=5)
             enforce = bool(pong.get('enforce'))
+            enforce_info = pong.get('enforce_info') or {}
+            deny_count = pong.get('deny_count')
     except Exception:
         pass
     return {
@@ -5392,6 +5413,11 @@ def _broker_status_dict():
         'routing_active': _broker_should_route(),
         'force_enabled': _broker_force_enabled_in_unit(),
         'enforce': enforce,   # None=unknown, False=permissive (learning), True=enforcing
+        # v10.0.8 §C: how the mode was decided (env / audit-gate / kill switch),
+        # flip stamp, or the stay-permissive reason — plus denials since the
+        # broker last started (read-only counter for the Cyber Controls card).
+        'enforce_info': enforce_info,
+        'deny_count': deny_count,
         'console_uid': os.getuid(),
         'audit_log': '/var/log/takwerx-broker/audit.log',
         'socket': BROKER_SOCKET,
@@ -19962,6 +19988,31 @@ def _get_tvr_latest_commit_sha(use_cache=True):
         return _tvr_release_cache.get('sha') or None
 
 
+def _broker_compose(dirpath, action, timeout=300):
+    """Run `docker compose <action>` for a module dir WITHOUT a shell (v10.0.8 §A:
+    the broker denies bash, so the old `bash -lc cd <dir> && docker compose …`
+    pattern WOULD-DENY'd on every poll). `--project-directory` is equivalent to
+    the cd: project name (dir basename), .env discovery, and relative binds all
+    resolve from the project directory."""
+    return subprocess.run(
+        _sudo_wrap(['docker', 'compose', '--project-directory', dirpath] + shlex.split(action)),
+        capture_output=True, text=True, timeout=timeout)
+
+
+def _module_git(repo_dir, *git_args, **kw):
+    """Run git on a module repo (v10.0.8 §A — no `bash -lc cd … && git` through
+    the broker). Home-resident repos (console-owned) run git DIRECTLY as the
+    console user; root-era repos (/root/<module> on a flipped box) route through
+    the broker, whose _check_git gate only admits root-era module dirs — the
+    broker never runs git as root over a takwerx-writable repo (.git/hooks and
+    .git/config there would be root-exec plants)."""
+    timeout = kw.pop('timeout', 60)
+    argv = ['git', '-C', repo_dir, '-c', 'safe.directory=%s' % repo_dir] + list(git_args)
+    if repo_dir.startswith('/root/'):
+        argv = _sudo_wrap(argv)
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
 def _tvr_dir():
     """Resolve the real TAK Video Restreamer install dir. Fresh born-non-root installs live at
     ~/tak-video-restreamer; a box FLIPPED from root keeps it at /root/tak-video-restreamer (TVR is
@@ -19979,11 +20030,9 @@ def _tvr_dir():
     return home
 
 def _tvr_compose(tvr_dir, action, timeout=120):
-    """Run `docker compose <action>` in the TVR dir via the broker (root can cd into /root on a
-    flipped box; the old cwd=TVR_INSTALL_DIR chdir'd as takwerx and EPERM'd)."""
-    return subprocess.run(_sudo_wrap(['bash', '-lc',
-        'cd %s && docker compose %s' % (shlex.quote(tvr_dir), action)]),
-        capture_output=True, text=True, timeout=timeout)
+    """Run `docker compose <action>` in the TVR dir via the broker — root reaches /root on a
+    flipped box; --project-directory replaces the old bash-cd (denied by the rulebook)."""
+    return _broker_compose(tvr_dir, action, timeout=timeout)
 
 def _get_tvr_version_info():
     """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based).
@@ -19994,8 +20043,7 @@ def _get_tvr_version_info():
     tvr_dir = _tvr_dir()
     local_full = ''
     try:
-        r = _sp.run(_sudo_wrap(['bash', '-lc', 'cd %s && git -c safe.directory=%s rev-parse HEAD' % (shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
-                    capture_output=True, text=True, timeout=8)
+        r = _module_git(tvr_dir, 'rev-parse', 'HEAD', timeout=8)
         if r.returncode == 0:
             local_full = r.stdout.strip()
             info['version'] = local_full[:7]
@@ -23312,15 +23360,19 @@ def cloudtak_uninstall():
                     _rchk = subprocess.run(_sudo_wrap(['test', '-d', '/root/CloudTAK']), capture_output=True, timeout=10)
                     cloudtak_dir = '/root/CloudTAK' if _rchk.returncode == 0 else None
                 if cloudtak_dir:
-                    subprocess.run(_sudo_wrap(['bash', '-lc',
-                        'cd %s && { docker compose down -v --rmi local 2>/dev/null || '
-                        'docker-compose down -v --rmi local 2>/dev/null; }; true' % shlex.quote(cloudtak_dir)]),
-                        capture_output=True, timeout=300)
+                    # v10.0.8: no shell — --project-directory replaces the bash-cd (denied by
+                    # the broker rulebook). `docker compose` only: the legacy docker-compose
+                    # fallback was itself a bug (see cloudtak-update-docker-compose memory).
+                    _broker_compose(cloudtak_dir, 'down -v --rmi local', timeout=300)
                 # Belt-and-suspenders: force-remove any surviving cloudtak-* containers by name
-                # (covers a dir-less / root-owned state where compose down didn't catch them).
-                subprocess.run(_sudo_wrap(['bash', '-lc',
-                    'docker ps -aq --filter name=cloudtak | xargs -r docker rm -f >/dev/null 2>&1; true']),
-                    capture_output=True, timeout=120)
+                # (covers a dir-less / root-owned state where compose down didn't catch them) —
+                # two broker calls replace the old bash+xargs pipeline (both denied).
+                _ids = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cloudtak']),
+                                      capture_output=True, text=True, timeout=30)
+                _surv = (_ids.stdout or '').split()
+                if _surv:
+                    subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _surv),
+                                   capture_output=True, timeout=120)
                 if cloudtak_dir:
                     subprocess.run(_sudo_wrap(['rm', '-rf', cloudtak_dir]), capture_output=True, timeout=120)
             cfg['deployed'] = False
@@ -26730,11 +26782,9 @@ def _webodm_dir():
     return home
 
 def _webodm_compose(wo_dir, action, timeout=300):
-    """Run `docker compose <action>` in the WebODM dir via the broker — root can cd into /root
-    on a flipped box (takwerx can't), and docker routes through the broker either way."""
-    return subprocess.run(_sudo_wrap(['bash', '-lc',
-        'cd %s && docker compose %s' % (shlex.quote(wo_dir), action)]),
-        capture_output=True, text=True, timeout=timeout)
+    """Run `docker compose <action>` in the WebODM dir via the broker — root reaches /root on a
+    flipped box (takwerx can't); --project-directory replaces the old bash-cd (denied)."""
+    return _broker_compose(wo_dir, action, timeout=timeout)
 
 def _run_webodm_update():
     global _webodm_update_status
@@ -27018,15 +27068,13 @@ def _run_tvr_update():
         # files — a plain pull aborts with "local changes would be overwritten by merge" the
         # moment upstream touches them. Discard the console-written overlay, pull, then
         # regenerate it in Step 2 (nothing user-authored lives in tracked files).
-        r = _sp.run(_sudo_wrap(['bash', '-lc',
-                    'cd %s && git -c safe.directory=%s checkout -- . && git -c safe.directory=%s pull --ff-only'
-                    % (shlex.quote(tvr_dir), shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
-                    capture_output=True, text=True, timeout=120)
+        r = _module_git(tvr_dir, 'checkout', '--', '.', timeout=60)
+        if r.returncode == 0:
+            r = _module_git(tvr_dir, 'pull', '--ff-only', timeout=120)
         plog((r.stdout + r.stderr).strip() or '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'git pull failed: {r.stderr[:300]}')
-        r2 = _sp.run(_sudo_wrap(['bash', '-lc', 'cd %s && git -c safe.directory=%s rev-parse --short HEAD' % (shlex.quote(tvr_dir), shlex.quote(tvr_dir))]),
-                     capture_output=True, text=True, timeout=8)
+        r2 = _module_git(tvr_dir, 'rev-parse', '--short', 'HEAD', timeout=8)
         new_sha = r2.stdout.strip()
         plog(f'✓ Now at commit {new_sha}')
 
@@ -31271,6 +31319,15 @@ function renderBrokerStatus(d){
       // yet a boundary, and that is the one case worth a caution.
       if(nonRoot){html+='<div style="margin-top:8px;color:var(--green);font-size:12px;line-height:1.5">&#10003; Console runs <strong>unprivileged</strong> and is confined to the guard — it cannot make privileged changes except through it.</div>';}
       else{html+='<div style="margin-top:8px;color:var(--yellow);font-size:12px;line-height:1.5">&#9888; Console runs as <strong>root</strong> — the guard records changes but cannot block them yet. Fresh installs are non-root automatically; an existing root box is switched with the on-box migration.</div>';}
+      // v10.0.8: enforce state + read-only denial counter (PLAN §C)
+      var ei=d.enforce_info||{};
+      if(d.enforce===true){
+        var dc=(d.deny_count===null||d.deny_count===undefined)?null:d.deny_count;
+        html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--green)">&#128274; <strong>ENFORCING</strong> — requests outside the rulebook are refused'+(ei.clean_since?(' (audit clean since '+esc(ei.clean_since)+')'):'')+'.</div>';
+        if(dc!==null){html+='<div style="font-size:12px;line-height:1.5;color:'+(dc>0?'var(--yellow)':'var(--text-dim)')+'">'+(dc>0?('&#9888; '+dc+' request'+(dc===1?'':'s')+' DENIED since the guard last started — check the audit log.'):'0 denials since the guard last started.')+'</div>';}
+      }else if(d.enforce===false){
+        html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--text-dim)">Watch mode — the guard flips to enforcing on its own after 72&nbsp;hours of clean audit'+(ei.stay_permissive_reason?(' (currently: '+esc(ei.stay_permissive_reason)+')'):'')+'.</div>';
+      }
     }
     el.innerHTML=html;}
   var tb=document.getElementById('broker-toggle-btn');
@@ -41761,9 +41818,7 @@ def _heal_container_ports_loopback(plog=None):
                     content = content.replace(pub, pub.replace('- "', '- "127.0.0.1:'))
             if content != orig:
                 _write_priv(compose, content)
-                subprocess.run(_sudo_wrap(['bash', '-lc',
-                    'cd %s && docker compose up -d' % shlex.quote(nb_dir)]),
-                    capture_output=True, text=True, timeout=180)
+                _broker_compose(nb_dir, 'up -d', timeout=180)
                 _log("container-ports: NetBird dashboard/mgmt/signal re-bound to 127.0.0.1 (recreated; 3478/udp left public)")
     except Exception as e:
         _log(f"container-ports: NetBird loopback heal skipped (non-fatal): {str(e)[:140]}")
@@ -55799,11 +55854,19 @@ def _tak_snapshot(label, plog=None):
                 try: os.remove(_tmp_dump)
                 except Exception: pass
         elif _broker_should_route() and _broker_available():
-            # v10.0.5 non-root SINGLE-server (still DEFERRED — see PUNCHLIST): a local pg_dump
-            # needs the postgres OS user AND streaming it through the broker exec proxy hits the
-            # 32MB socket cap, so we can't reliably capture it yet. Skip GRACEFULLY (config+certs
-            # ARE captured) and record db_dump=False so the caller/UI surfaces the gap honestly.
-            plog("  snapshot: cot pg_dump SKIPPED on non-root single-server console (config+certs captured; DB dump deferred)")
+            # v10.0.8 (PLAN §B): non-root SINGLE-server — the broker writes the dump to disk
+            # itself (broker pg_dump op), so the 32MB socket cap that forced the v10.0.5
+            # "DB dump deferred" skip no longer applies. Honest warning path on failure.
+            try:
+                _sz = _pg_dump_priv(pg_dump_path, db='cot', timeout=600,
+                                    container=(TAK_DB_CONTAINER if _tak_is_container() else None))
+                if _sz > 0:
+                    meta['db_dump'] = True
+                    plog(f"  snapshot: cot pg_dump written via broker ({_sz // 1024} KB)")
+                else:
+                    plog("  snapshot: broker pg_dump produced an EMPTY dump — db_dump=False (config+certs captured)")
+            except Exception as _pg_e:
+                plog(f"  snapshot: broker pg_dump FAILED: {str(_pg_e)[:200]} — db_dump=False (config+certs captured)")
         else:
             with open(pg_dump_path, 'wb') as _f:
                 r2 = subprocess.run(
@@ -55892,10 +55955,16 @@ def _tak_rollback(label, plog=None):
 
     plog(f"  rollback [{label}]: starting")
 
-    # 1. Validate
+    # 1. Validate. os.path.exists is authoritative as root; on the non-root
+    # console the root-owned snapshot dir may not be stat-able — confirm via a
+    # broker `test -f` before declaring the dump missing (v10.0.8).
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
     if not os.path.exists(pg_dump_path):
-        return False, f"Snapshot '{label}' has no cot.pgdump — cannot restore database"
+        _via_broker = (_broker_should_route() and _broker_available()
+                       and subprocess.run(_sudo_wrap(['test', '-f', pg_dump_path]),
+                                          capture_output=True, timeout=10).returncode == 0)
+        if not _via_broker:
+            return False, f"Snapshot '{label}' has no cot.pgdump — cannot restore database"
 
     # 2. Stop TAK Server
     plog("  rollback: stopping takserver…")
@@ -55959,8 +56028,15 @@ def _tak_rollback(label, plog=None):
     # Stage a console-readable copy via the broker (cp + chown to the console uid,
     # inside /opt/tak/snapshots/), open THAT, and remove it afterwards. On root the
     # broker doesn't route, so _staged_dump stays the original path (opened directly).
+    # v10.0.8: staging is now ONLY for the two-server SSH stream — the local restore
+    # goes through the broker pg_restore op (the broker opens the dump as root and
+    # feeds pg_restore itself; a staged copy pushed through the exec proxy would hit
+    # the 32MB socket cap on any real database).
+    _rb_settings = load_settings()
+    _rb_tak_cfg  = _get_tak_deployment_config(_rb_settings)
+    _rb_two_server = _rb_tak_cfg.get('mode') == 'two_server' and (_rb_tak_cfg.get('server_one', {}) or {}).get('host')
     _staged_dump = pg_dump_path
-    if _broker_should_route() and _broker_available():
+    if _rb_two_server and _broker_should_route() and _broker_available():
         _staged_dump = os.path.join(snap_path, '.cot.pgdump.staged')
         try:
             subprocess.run(_sudo_wrap(['cp', pg_dump_path, _staged_dump]), capture_output=True, check=True, timeout=120)
@@ -55970,11 +56046,8 @@ def _tak_rollback(label, plog=None):
             _staged_dump = pg_dump_path  # fall back; open() may still work as root
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
-        _rb_settings = load_settings()
-        _rb_tak_cfg  = _get_tak_deployment_config(_rb_settings)
-        _rb_two_server = _rb_tak_cfg.get('mode') == 'two_server'
         _rb_s1 = _rb_tak_cfg.get('server_one', {})
-        if _rb_two_server and _rb_s1.get('host'):
+        if _rb_two_server:
             plog("  rollback: two-server mode — streaming pg_restore to Server One via SSH")
             _rb_host = (_rb_s1.get('host') or '').strip()
             _rb_user = (_rb_s1.get('ssh_user') or 'root').strip() or 'root'
@@ -55996,8 +56069,25 @@ def _tak_rollback(label, plog=None):
                     plog("  rollback: pg_restore (remote) successful")
             else:
                 plog(f"  rollback: remote pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
-        else:
-            pg_container = 'takserver-db'
+        elif _broker_should_route() and _broker_available():
+            # v10.0.8 non-root single-server: broker pg_restore op — the broker
+            # opens the dump as root and feeds pg_restore/docker-exec itself, so
+            # nothing crosses the socket. Covers native (runuser postgres) AND
+            # container TAK (docker exec takserver-db) via the container key.
+            resp = _broker_request({'op': 'pg_restore', 'path': pg_dump_path, 'db': 'cot',
+                                    'container': (TAK_DB_CONTAINER if _tak_is_container() else None),
+                                    'timeout': 600}, timeout=630)
+            if resp.get('ok') and resp.get('returncode') in (0, 1):
+                stderr = (resp.get('stderr') or '')[:200]
+                if stderr:
+                    plog(f"  rollback: pg_restore warnings (non-fatal): {stderr}")
+                else:
+                    plog("  rollback: pg_restore successful")
+            else:
+                plog(f"  rollback: pg_restore failed (exit {resp.get('returncode')}): "
+                     f"{(resp.get('error') or resp.get('stderr') or '')[:200]}")
+        elif _tak_is_container():
+            pg_container = TAK_DB_CONTAINER
             r = subprocess.run(
                 _sudo_wrap(['docker', 'ps', '-q', '--filter', f'name={pg_container}']), capture_output=True, text=True, timeout=10
             )
@@ -56018,6 +56108,24 @@ def _tak_rollback(label, plog=None):
                     plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
             else:
                 plog(f"  rollback: {pg_container} not running — skipping pg_restore")
+        else:
+            # v10.0.8: ROOT native single-server — restore directly via the local
+            # postgres OS user. The old code only knew the takserver-db container
+            # and silently SKIPPED the DB restore on native installs (the dump was
+            # captured but never came back — the same class of gap as the non-root
+            # "DB dump deferred" this release closes).
+            with open(_staged_dump, 'rb') as _f:
+                r2 = subprocess.run(['runuser', '-u', 'postgres', '--',
+                                     'pg_restore', '--clean', '-d', 'cot'],
+                                    stdin=_f, capture_output=True, timeout=600)
+            if r2.returncode in (0, 1):
+                stderr = (r2.stderr or b'').decode()[:400]
+                if stderr:
+                    plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
+                else:
+                    plog("  rollback: pg_restore successful")
+            else:
+                plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
     except Exception as e:
         plog(f"  rollback: pg_restore exception: {e}")
     finally:
@@ -64033,6 +64141,19 @@ def _startup_ensure_broker():
                 selinux_line = 'SELinuxContext=system_u:system_r:unconfined_service_t:s0\n'
         except Exception:
             pass
+        svc = '/etc/systemd/system/takwerx-broker.service'
+        existing = ''
+        if os.path.exists(svc):
+            with open(svc) as f:
+                existing = f.read()
+        # v10.0.8: PRESERVE the ENFORCE env line start.sh wrote (fresh installs are
+        # born enforcing; the operator kill switch is =0) — regenerating the unit
+        # here must never change the enforce posture.
+        enforce_line = ''
+        for _ln in existing.splitlines():
+            if _ln.strip().startswith('Environment=TAKWERX_BROKER_ENFORCE='):
+                enforce_line = _ln.strip() + '\n'
+                break
         unit = (
             '[Unit]\n'
             'Description=infra-TAK privileged broker (least-privilege console mediation)\n'
@@ -64045,15 +64166,12 @@ def _startup_ensure_broker():
             'Restart=always\n'
             'RestartSec=2\n'
             'RuntimeMaxSec=24h\n'
-            'Environment=PYTHONUNBUFFERED=1\n\n'
+            'Environment=PYTHONUNBUFFERED=1\n'
+            f'{enforce_line}'
+            '\n'
             '[Install]\n'
             'WantedBy=multi-user.target\n'
         )
-        svc = '/etc/systemd/system/takwerx-broker.service'
-        existing = ''
-        if os.path.exists(svc):
-            with open(svc) as f:
-                existing = f.read()
         unit_changed = (existing != unit)
         if unit_changed:
             with open(svc, 'w') as f:
@@ -64273,18 +64391,15 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
                     break
                 time.sleep(0.25)
         # takwerx can't stat /root — ask the broker whether a root-era install is there (either
-        # compose filename). No install → nothing to migrate.
-        chk = subprocess.run(_sudo_wrap(['bash', '-lc',
-            'test -f %s/docker-compose.yml || test -f %s/compose.yaml' % (shlex.quote(src), shlex.quote(src))]),
-            capture_output=True, timeout=10)
-        if chk.returncode != 0:
+        # compose filename; two `test -f` calls, no shell). No install → nothing to migrate.
+        if not any(subprocess.run(_sudo_wrap(['test', '-f', os.path.join(src, _cf)]),
+                                  capture_output=True, timeout=10).returncode == 0
+                   for _cf in ('docker-compose.yml', 'compose.yaml')):
             return
         def _log(m):
             print('[rehome:%s] %s' % (subdir, m), flush=True)
-        def _compose(dirpath, action):   # run `docker compose <action>` in dirpath via broker (root)
-            return subprocess.run(_sudo_wrap(['bash', '-lc',
-                'cd %s && docker compose %s' % (shlex.quote(dirpath), action)]),
-                capture_output=True, text=True, timeout=300)
+        def _compose(dirpath, action):   # `docker compose <action>` in dirpath via broker (root)
+            return _broker_compose(dirpath, action, timeout=300)
         def _key_up():                    # key container present AND actually Up (not Restarting/Exited)
             r = subprocess.run('docker ps --filter name=%s --format "{{.Status}}" 2>/dev/null' % shlex.quote(container_name),
                                shell=True, capture_output=True, text=True, env=_broker_shim_env())
@@ -66698,17 +66813,27 @@ def _post_update_auto_deploy():
                     subprocess.run(_sudo_wrap(['chown', 'tak:tak', _cm]), capture_output=True, timeout=10)
                     _chmod_priv(_cm, 0o600)
                     print("Post-update: cert-metadata.sh ownership/mode re-asserted (tak:tak 600)")
-                    # Validate: source the file as 'tak' via the broker (runuser) and confirm $DIR set.
-                    _src_test = subprocess.run(
-                        _sudo_wrap(['runuser', '-u', 'tak', '--', 'bash', '-c',
-                                    'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR"']),
-                        capture_output=True, timeout=10)
-                    if _src_test.returncode != 0:
-                        print("Post-update: WARNING cert-metadata.sh source-test-as-tak FAILED — "
+                    # Validate that cert-metadata.sh defines a non-empty DIR (what makeCert.sh
+                    # sources it for). v10.0.8: read the file via the broker and check in Python
+                    # instead of `runuser -u tak -- bash -c '. cert-metadata.sh …'` — running an
+                    # arbitrary shell as the cert user is a privilege the broker rulebook (rightly)
+                    # refuses. tak-readability is already guaranteed by the chown/chmod just above,
+                    # so the remaining check is purely content: is DIR set. `_cm` is under the
+                    # allowlisted /opt/tak/ prefix, so the broker read is permitted.
+                    _dir_ok = False
+                    try:
+                        _cm_body = _read_priv(_cm)
+                        # match `DIR=<non-empty>` / `DIR = "…"` (skip a bare `DIR=` or `DIR=""`)
+                        _dm = re.search(r'(?m)^\s*DIR\s*=\s*([\'"]?)(.+?)\1\s*$', _cm_body or '')
+                        _dir_ok = bool(_dm and _dm.group(2).strip())
+                    except Exception:
+                        _dir_ok = False
+                    if not _dir_ok:
+                        print("Post-update: WARNING cert-metadata.sh has no non-empty DIR= — "
                               "TAK Portal integration cert download may not work. "
                               "Check /opt/tak/certs/cert-metadata.sh ownership and content.")
                     else:
-                        print("Post-update: cert-metadata.sh source-test-as-tak OK")
+                        print("Post-update: cert-metadata.sh content-check OK (DIR set)")
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
 

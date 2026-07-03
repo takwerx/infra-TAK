@@ -41,6 +41,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -68,16 +69,47 @@ except KeyError:
     _NONROOT_HOME = '/home/takwerx'
 TAK_BUNDLE_DIR = os.path.join(_NONROOT_HOME, 'tak-docker')
 
-# ENFORCE vs PERMISSIVE (v10.0.5).
-#   PERMISSIVE (default this release): a request that fails the rulebook is still
-#   EXECUTED, but logged as WOULD-DENY. The console runs as ROOT today, so routing
-#   through the broker must MEDIATE + AUDIT, never break a legit op (denying a
-#   binary the console needs buys no security while root). Permissive mode lets us
-#   collect the real binary/path needs from WOULD-DENY records and build an
-#   accurate enforce-list BEFORE the non-root flip.
-#   ENFORCE (set TAKWERX_BROKER_ENFORCE=1): deny means deny. This is the posture
-#   the box must be in BEFORE the console is ever flipped to a non-root user.
+# Module install dirs (v10.0.8 harvest — PLAN-v10.0.8 §A). Each module lives at
+# ~/<name> on a born-non-root box, or (root-era install on a FLIPPED box) at
+# /root/<name>. The console legitimately reads/writes compose+config files there,
+# and the v10.0.5 re-home migration mv/chown's /root/<name> -> ~/<name>. Both
+# roots are allowlisted for the path-checked ops:
+#   /root/<name>  — root-owned, lexical match is safe (console can't plant links)
+#   ~/<name>      — console-OWNED, so realpath containment is REQUIRED (same
+#                   symlink-escape reasoning as TAK_BUNDLE_DIR).
+MODULE_DIR_NAMES = (
+    'tak-video-restreamer', 'webodm', 'netbird', 'cesium-tiles',
+    'TAK-Portal', 'CloudTAK', 'node-red', 'authentik', 'eud-remote-assist',
+)
+ROOT_MODULE_DIRS = tuple('/root/%s/' % n for n in MODULE_DIR_NAMES)
+HOME_MODULE_DIRS = tuple(os.path.join(_NONROOT_HOME, n) + '/' for n in MODULE_DIR_NAMES)
+
+# ENFORCE vs PERMISSIVE (v10.0.5 → cutover v10.0.8, PLAN-v10.0.8 §C).
+#   PERMISSIVE: a request that fails the rulebook is still EXECUTED, but logged
+#   as WOULD-DENY. This was the v10.0.5–10.0.7 learning posture used to harvest
+#   the real binary/path needs and complete the rulebook.
+#   ENFORCE: deny means deny — the non-root console is a real privilege boundary.
+#
+# How the mode is decided at daemon start (_resolve_enforce):
+#   TAKWERX_BROKER_ENFORCE=1  -> ENFORCE (start.sh writes this on FRESH installs)
+#   TAKWERX_BROKER_ENFORCE=0  -> PERMISSIVE (operator KILL SWITCH: add
+#                                `Environment=TAKWERX_BROKER_ENFORCE=0` to the
+#                                broker unit + `systemctl daemon-reload` +
+#                                `systemctl restart takwerx-broker` over SSH;
+#                                break-glass only)
+#   unset (EXISTING boxes)    -> self-gating migration: the broker flips itself
+#       to ENFORCE only after a CLEAN AUDIT WINDOW — zero WOULD-DENY in the last
+#       ENFORCE_CLEAN_SECS of its own audit log, with at least that much history
+#       present. Once flipped, the decision is stamped in ENFORCE_STATE_FILE
+#       (root-owned — the console cannot write it) and sticks across restarts.
+#       A box that is not clean logs WHY and stays permissive — never brick a
+#       customer's console. The gate lives HERE, not in the console: the console
+#       must not be able to write the broker unit/env (trust anchor), and the
+#       broker owns the audit log it judges by.
 ENFORCE = os.environ.get('TAKWERX_BROKER_ENFORCE') == '1'
+ENFORCE_INFO = {'source': 'env' if os.environ.get('TAKWERX_BROKER_ENFORCE') else 'default'}
+ENFORCE_STATE_FILE = '/var/lib/takwerx-broker/enforce.json'
+ENFORCE_CLEAN_SECS = 72 * 3600      # 72h clean window (PLAN §A re-sweep target)
 
 # ---------------------------------------------------------------------------
 # POLICY / RULEBOOK  — the security core. Tightening these is core .5 work;
@@ -129,6 +161,12 @@ EXEC_ALLOW = {
     'getenforce', 'getsebool', 'restorecon', 'semanage', 'semodule', 'chcon',
     # read-only inspection (routed for a single audit point)
     'ss', 'ip', 'getent', 'getcap',
+    # v10.0.8 harvest (born-non-root fleet): `lsof` is read-only (the console
+    # checks whether the apt/dpkg lock is held before an install). `find` is
+    # read-only TOO once its exec/write/delete actions are gated (see _check_find)
+    # — the console uses it to scan a container's postgres volume for planted
+    # `.so` files (the PGMiner shared_preload check).
+    'lsof', 'find',
     # gpg --dearmor of an apt repo signing key (gated — see _check_gpg)
     'gpg',
     # package managers (gated — see _check_pkgmgr: install/remove only, no -o hooks).
@@ -139,6 +177,16 @@ EXEC_ALLOW = {
     # privileged file IO via coreutils — TARGET PATHS are validated (see below)
     'tee', 'cat', 'cp', 'mv', 'rm', 'mkdir', 'rmdir', 'chmod', 'chown',
     'touch', 'ln', 'install',
+    # v10.0.8 harvest: `test` is a pure predicate — it cannot write, exec, or
+    # read file CONTENTS; worst case it leaks existence/type of a path. The
+    # console uses it to probe root-era module dirs (/root/<module>) that
+    # takwerx cannot stat. Unrestricted args are acceptable for a no-side-effect
+    # binary.
+    'test',
+    # v10.0.8 harvest: git for root-era module repos (TVR/WebODM stay at /root on
+    # a flipped box). Tightly gated — see _check_git: -C <root-era module dir>
+    # only; home-resident repos run git DIRECTLY as the console user, never here.
+    'git',
     # transient-unit launcher — a DIRECT root-exec primitive, so gated to the ONE
     # fixed kernel-patch shape (see _check_systemd_run). No broader than the
     # already-allowed `systemctl start <console-written-unit>`.
@@ -168,7 +216,10 @@ PKGMGR_SUBCMDS = {
 EXEC_DENY = {
     'sh', 'bash', 'dash', 'zsh', 'ksh', 'csh', 'tcsh',     # arbitrary shell
     'su', 'sudo', 'pkexec', 'runuser', 'setpriv',          # privilege pivots
-    'env', 'nohup', 'nice', 'timeout', 'xargs', 'find',    # exec wrappers / -exec
+    'env', 'nohup', 'nice', 'timeout', 'xargs',            # exec wrappers
+    # NB: `find` moved to EXEC_ALLOW (v10.0.8) but is gated read-only by
+    # _check_find — its -exec/-delete/-fprint* actions (the reason it lived here)
+    # stay denied, so it is NOT a blanket allow.
     'perl', 'python', 'python3', 'ruby', 'awk', 'gawk',    # interpreters
     'sed', 'dd', 'psql', 'openssl',                        # arbitrary write/exec
     'setsebool', 'setcap',                                 # confinement / caps
@@ -221,9 +272,25 @@ PATH_ALLOW = (
     '/var/lib/takguard/',       # Guard Dog state dir (mkdir/chmod by the console)
     '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (chown to takwerx)
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
+    # v10.0.8 harvest additions (PLAN-v10.0.8 §A):
+    '/var/lib/takwerx-console/',  # console state dir (mkdir/chown at startup)
+    '/var/lib/caddy/',            # Caddy data dir: LE cert reads (cert sync into TAK)
+                                  # + the custom-cert caddy-readable copy writes.
+                                  # root/caddy-owned — lexical match is safe.
     # NOTE: /usr/local/bin/ and /usr/sbin/ are deliberately NOT prefix-allowed —
     # they are on root's PATH, so a write there is an escalation primitive. The
     # one legit exception (the ufw->firewalld shim) is the EXACT path below.
+) + ROOT_MODULE_DIRS + HOME_MODULE_DIRS   # module dirs, both roots (v10.0.8 §A)
+
+# READ-ONLY prefixes: the broker `read` op only — NEVER writes or the
+# path-checked coreutils. v10.0.8: the split Server One re-home
+# (_startup_ensure_server_one_ssh_key) reads a ROOT-era SSH key under /root/.ssh
+# via _read_priv and copies it into the console home (Server One already trusts
+# that key — it is the console's own operational credential). A WRITE grant here
+# would let the console plant /root/.ssh/authorized_keys (root login) — that
+# stays denied.
+PATH_ALLOW_READONLY = (
+    '/root/.ssh/',
 )
 
 # Exact privileged paths that are read/written but aren't directories.
@@ -263,6 +330,10 @@ PATH_DENY_EXACT = {
 }
 PATH_DENY_PREFIX = (
     '/etc/sudoers.d/',                   # no minting new sudoers rules
+    # v10.0.8: the broker unit itself is deny-listed (trust anchor), but a
+    # systemd DROP-IN under its .d/ dir would override ExecStart/Environment
+    # just the same (incl. the ENFORCE flag) — deny the whole drop-in dir.
+    BROKER_UNIT + '.d/',
 )
 
 
@@ -301,6 +372,11 @@ def _within_realpath(path, root):
     the reason `_abs` avoids realpath, root-owned legit symlinks like /opt/tak,
     does not apply to this prefix.)"""
     try:
+        # If the console-owned ROOT itself has been replaced with a symlink
+        # (~/netbird -> /etc), realpath(root) == realpath(path) for an escaping
+        # path and the containment compare below would pass — reject that first.
+        if os.path.islink(root):
+            return False
         rr = os.path.realpath(root)
         rp = os.path.realpath(path)
     except OSError:
@@ -308,9 +384,18 @@ def _within_realpath(path, root):
     return rp == rr or rp.startswith(rr + '/')
 
 
-def _path_allowed(path):
+# Prefixes the CONSOLE USER can write to directly (its own home) — a lexical
+# allowlist match is not enough there, because the console could plant a symlink
+# (dir/x -> /etc) and have the broker follow it out. These require realpath
+# containment; every other allowlisted prefix is root-owned, so the cheaper
+# lexical match in _abs stays safe.
+_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS
+
+
+def _path_allowed(path, readonly=False):
     """True if `path` is within the privileged read/write allowlist and not in
-    the deny set. Raises Denied with a reason otherwise."""
+    the deny set. Raises Denied with a reason otherwise. `readonly=True` (the
+    broker `read` op) additionally admits the PATH_ALLOW_READONLY prefixes."""
     p = _abs(path)
     if p in PATH_DENY_EXACT:
         raise Denied(f'path is in deny-list: {p}')
@@ -319,14 +404,17 @@ def _path_allowed(path):
             raise Denied(f'path is under deny-prefix {d}: {p}')
     if p in PATH_ALLOW_EXACT:
         return p
+    if readonly:
+        for a in PATH_ALLOW_READONLY:
+            if p.startswith(a) or p == a.rstrip('/'):
+                return p
     for a in PATH_ALLOW:
         # match a child of the dir, OR the allowlisted dir itself (no trailing /)
         if p.startswith(a) or p == a.rstrip('/'):
-            # The bundle dir is the lone console-WRITABLE prefix — require realpath
-            # containment so a planted symlink under it can't escape (the other
-            # prefixes are root-owned, so they keep the cheaper lexical match).
-            if a == TAK_BUNDLE_DIR + '/' and not _within_realpath(p, TAK_BUNDLE_DIR):
-                raise Denied(f'symlink escape from bundle dir: {p}')
+            # Console-writable prefixes (the bundle dir + home module dirs)
+            # require realpath containment so a planted symlink can't escape.
+            if a in _CONSOLE_OWNED_PREFIXES and not _within_realpath(p, a.rstrip('/')):
+                raise Denied(f'symlink escape from console-owned dir: {p}')
             return p
     raise Denied(f'path not in allow-list: {p}')
 
@@ -455,8 +543,14 @@ def check_exec(argv, cwd=None):
         _check_chcon(argv, cwd)
     elif base == 'gpg':
         _check_gpg(argv)
+    elif base == 'git':
+        _check_git(argv)
+    elif base == 'find':
+        _check_find(argv)
     elif base == 'install':
         _check_install(argv)
+    elif base == 'cp':
+        _check_cp(argv, cwd)
     elif base == 'sysctl':
         _check_sysctl(argv)
     elif base in PATH_CHECKED_BINS:
@@ -633,6 +727,80 @@ def _check_runuser(argv):
     raise Denied(f'runuser: target user not allowed: {target}')
 
 
+# git subcommands the console uses on a root-era module repo (version poll +
+# module update). Read/refresh only — no push, no arbitrary config. NB: `fetch`
+# is deliberately NOT here — no caller uses it, and `git fetch <repo>` accepts a
+# transport-schemed remote (`ext::sh -c …`, `ssh://…`) that runs an arbitrary
+# command AS ROOT. `pull` shares that risk, so its positional args are
+# additionally scheme-filtered below.
+_GIT_SUBCMDS = {'rev-parse', 'pull', 'checkout', 'describe', 'status', 'log'}
+# Flags allowed AFTER the subcommand. Closed set: several git flags execute
+# commands (--upload-pack=<cmd> runs locally for local/ssh remotes,
+# --receive-pack likewise), so unknown flags are denied, not ignored.
+_GIT_SUBFLAGS = {'--ff-only', '--short', '--', '-q', '--quiet', '--tags',
+                 '--porcelain', '--abbrev-ref', '--oneline'}
+
+
+def _check_git(argv):
+    """git for ROOT-ERA module repos only (v10.0.8 — PLAN §A). Allowed shape:
+        git -C /root/<module> [-c safe.directory=<x>] <read/refresh subcommand> ...
+    Constraints:
+      * -C is REQUIRED and must be a root-era module dir (root-owned — the
+        console cannot plant hooks/config there). Home-resident repos are
+        console-owned; the console runs git on those DIRECTLY as takwerx, so a
+        broker (root) git over a takwerx-writable repo — where .git/hooks and
+        .git/config are attacker-plantable root-exec vectors — never happens.
+      * -c is allowed for safe.directory ONLY (other config keys, e.g.
+        core.fsmonitor / core.sshCommand, execute commands).
+      * subcommand must be in the read/refresh set (no push/gc/filter-branch).
+    """
+    root_dirs = tuple(d.rstrip('/') for d in ROOT_MODULE_DIRS)
+    saw_c_dir = None
+    sub = None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '-C':
+            if i + 1 >= len(argv):
+                raise Denied('git: -C without a directory')
+            saw_c_dir = os.path.normpath(argv[i + 1])
+            i += 2
+            continue
+        if a == '-c':
+            if i + 1 >= len(argv) or not argv[i + 1].startswith('safe.directory='):
+                raise Denied('git: only -c safe.directory=<dir> is allowed')
+            i += 2
+            continue
+        if a.startswith('-'):
+            # global flags before the subcommand can redirect execution
+            # (--exec-path=<dir> runs the caller's git-* binaries as root);
+            # post-subcommand flags are a CLOSED set for the same reason
+            # (--upload-pack=<cmd> executes locally on pull/fetch).
+            if sub is None:
+                raise Denied(f'git: global option not allowed: {a}')
+            if a not in _GIT_SUBFLAGS:
+                raise Denied(f'git: option not allowed: {a}')
+            i += 1
+            continue
+        if sub is None:
+            sub = a
+            i += 1
+            continue
+        # Positional AFTER the subcommand. The console only ever passes a bare
+        # ref/pathspec (HEAD, ., a branch name). A transport-schemed remote
+        # (`ext::sh -c …`, `ssh://…`, `file://…`, an absolute path) as a `pull`
+        # positional makes git run an arbitrary command AS ROOT — refuse any
+        # positional carrying a scheme (`:`) or an absolute path. Legit refs and
+        # pathspecs never contain ':' and never start with '/'.
+        if ':' in a or a.startswith('/'):
+            raise Denied(f'git: positional looks like a remote/URL, refused: {a}')
+        i += 1
+    if saw_c_dir not in root_dirs:
+        raise Denied(f'git: -C must be a root-era module dir, got: {saw_c_dir}')
+    if sub not in _GIT_SUBCMDS:
+        raise Denied(f'git: subcommand not allowed: {sub}')
+
+
 # TAK's rpm/deb ships apply-selinux.sh which compiles + installs TAK's own SELinux
 # policy module (and uses sudo internally), so it must run as root. Allow ONLY this
 # one exact, TAK-provided script — never `bash -c`, never any other path.
@@ -673,6 +841,62 @@ def _check_gpg(argv):
     if out is None:
         raise Denied('gpg: --dearmor requires -o <allowlisted path>')
     _path_allowed(out)
+
+
+# find actions that WRITE, DELETE, or EXECUTE — the reason find was denied. Every
+# other find primitive only reads/traverses/prints-to-stdout, which is harmless
+# metadata inspection (same class as `test`/`ss`). NB: match the base action name
+# AND its `=`/space forms; `-fprintf FILE` etc. write to an arbitrary path.
+_FIND_DENIED_ACTIONS = ('-exec', '-execdir', '-ok', '-okdir', '-delete',
+                        '-fprintf', '-fprint', '-fprint0', '-fls')
+
+
+def _check_find(argv):
+    """find is read-only ONLY once its command/write/delete actions are refused.
+    The console uses `find <dir> -maxdepth N -name … -type f` to scan a container
+    volume for planted `.so` files. Deny -exec*/-ok*/-delete/-fprint*/-fls (which
+    run commands or write files as root); everything else is traversal + stdout."""
+    for a in argv[1:]:
+        base = a.split('=', 1)[0]
+        if base in _FIND_DENIED_ACTIONS:
+            raise Denied(f'find: action not allowed: {a}')
+
+
+def _check_cp(argv, cwd=None):
+    """cp: the DESTINATION (last positional) must be allowlisted; the SOURCE is a
+    root READ, allowed from anywhere EXCEPT a deny-listed secret — the same model
+    as install(1) (the console stages e.g. an LE p12 or a module overlay from
+    /tmp or its own install tree into an allowlisted dir). One extra guard cp
+    needs that install does not: a RECURSIVE copy (`cp -r /etc …`) would clone a
+    whole secret tree past the single-path deny check, so for -r/-R/-a every
+    source must ALSO be allowlisted (strict), not merely non-deny."""
+    recursive = False
+    positionals = []
+    for a in argv[1:]:
+        if a == '--':
+            continue
+        if a.startswith('-') and a != '-':
+            if a in ('-r', '-R', '-a', '--recursive', '--archive') or (
+                    len(a) > 1 and a[0] == '-' and not a.startswith('--')
+                    and any(c in a[1:] for c in 'raR')):
+                recursive = True
+            continue
+        positionals.append(a)
+    if len(positionals) < 2:
+        raise Denied('cp: need at least a source and a destination')
+    base_cwd = cwd if (cwd and isinstance(cwd, str) and cwd.startswith('/')) else '/'
+    def _resolve(p):
+        return p if p.startswith('/') else os.path.join(base_cwd, p)
+    dst = _resolve(positionals[-1])
+    _path_allowed(dst)                       # destination must be allowlisted
+    for src in positionals[:-1]:
+        sp = _resolve(src)
+        if recursive:
+            _path_allowed(sp)                # -r: source strictly allowlisted too
+        else:
+            spn = os.path.normpath(sp)
+            if spn in PATH_DENY_EXACT or any(spn.startswith(d) for d in PATH_DENY_PREFIX):
+                raise Denied(f'cp: source not permitted: {src}')
 
 
 def _check_chcon(argv, cwd=None):
@@ -775,23 +999,48 @@ _SYSTEMD_RUN_ALLOWED_SETENV = {
 }
 
 
+# v10.0.8: second fixed systemd-run shape — the non-root migration job
+# (app.py console_migrate_nonroot_api). Only launched by a ROOT console (the
+# route refuses non-root), but permissive root boxes route it through the broker
+# for audit, so the shape must be in the rulebook or it pollutes the clean-audit
+# flip gate with WOULD-DENY noise. Same inherent power as the kernel-patch job.
+_MIGRATE_UNIT_NAME = 'infratak-nonroot-migrate'
+_MIGRATE_LOG = '/var/log/takwerx-console-nonroot-migrate.log'
+_MIGRATE_SCRIPT_SUFFIX = '/scripts/migrate-console-nonroot.sh'
+_MIGRATE_ALLOWED_PROPERTIES = {
+    'StandardOutput=append:' + _MIGRATE_LOG,
+    'StandardError=append:' + _MIGRATE_LOG,
+    # RHEL/SELinux: the migrate unit must run unconfined (same treatment the
+    # console + broker units already carry) — exact string, nothing else.
+    'SELinuxContext=system_u:system_r:unconfined_service_t:s0',
+}
+
+
 def _check_systemd_run(argv):
-    """Allow ONLY the fixed kernel-patch transient-unit invocation."""
-    saw_unit = False
+    """Allow ONLY the two fixed transient-unit invocations: the kernel-patch job
+    and the non-root migration job. Everything else is denied."""
+    saw_unit = None
     positionals = []
+    props = []
     for a in argv[1:]:
+        if positionals:
+            # past the launched command — the rest are ITS args (validated as
+            # part of the fixed positional shape below), not systemd-run flags
+            positionals.append(a)
+            continue
         if a in ('--no-block', '--collect'):
             continue
         if a.startswith('--unit='):
-            if a.split('=', 1)[1] != _KPATCH_UNIT_NAME:
-                raise Denied(f'systemd-run: only unit {_KPATCH_UNIT_NAME} allowed')
-            saw_unit = True
+            unit = a.split('=', 1)[1]
+            if unit not in (_KPATCH_UNIT_NAME, _MIGRATE_UNIT_NAME):
+                raise Denied(f'systemd-run: only units {_KPATCH_UNIT_NAME}/'
+                             f'{_MIGRATE_UNIT_NAME} allowed')
+            saw_unit = unit
             continue
         if a.startswith('--description='):
             continue
         if a.startswith('--property='):
-            if a.split('=', 1)[1] not in _SYSTEMD_RUN_ALLOWED_PROPERTIES:
-                raise Denied(f'systemd-run: property not allowed: {a}')
+            props.append(a.split('=', 1)[1])
             continue
         if a.startswith('--setenv='):
             if a.split('=', 1)[1] not in _SYSTEMD_RUN_ALLOWED_SETENV:
@@ -800,10 +1049,28 @@ def _check_systemd_run(argv):
         if a.startswith('-'):
             raise Denied(f'systemd-run: flag not allowed: {a}')
         positionals.append(a)
-    if not saw_unit:
-        raise Denied(f'systemd-run: missing required --unit={_KPATCH_UNIT_NAME}')
-    if positionals != ['/bin/bash', _KPATCH_SCRIPT]:
-        raise Denied(f'systemd-run: only `/bin/bash {_KPATCH_SCRIPT}` allowed')
+    if saw_unit is None:
+        raise Denied('systemd-run: missing required --unit=')
+    if saw_unit == _KPATCH_UNIT_NAME:
+        for p in props:
+            if p not in _SYSTEMD_RUN_ALLOWED_PROPERTIES:
+                raise Denied(f'systemd-run: property not allowed: --property={p}')
+        if positionals != ['/bin/bash', _KPATCH_SCRIPT]:
+            raise Denied(f'systemd-run: only `/bin/bash {_KPATCH_SCRIPT}` allowed')
+        return
+    # migrate shape: /bin/bash <install>/scripts/migrate-console-nonroot.sh
+    # --apply --auto-rollback. The install dir varies per box; the script is
+    # console-written either way — same inherent near-root as a console-written
+    # unit, so pin everything EXCEPT the install prefix.
+    for p in props:
+        if p not in _MIGRATE_ALLOWED_PROPERTIES:
+            raise Denied(f'systemd-run: property not allowed: --property={p}')
+    if (len(positionals) != 4 or positionals[0] != '/bin/bash'
+            or not positionals[1].endswith(_MIGRATE_SCRIPT_SUFFIX)
+            or '..' in positionals[1].split('/')
+            or positionals[2:] != ['--apply', '--auto-rollback']):
+        raise Denied('systemd-run: only `/bin/bash <install>%s --apply '
+                     '--auto-rollback` allowed' % _MIGRATE_SCRIPT_SUFFIX)
 
 
 def _check_systemctl(argv):
@@ -867,9 +1134,16 @@ def _make_audit_logger():
 
 
 AUDIT = None
+# post-flip DENY visibility (PLAN-v10.0.8 §C): count denials since daemon start
+# so the Cyber Controls card can surface them (read via ping — the console
+# cannot read the audit log dir directly). WARNING level makes them stand out
+# in `journalctl -u takwerx-broker -p warning`.
+_DENY_LOCK = threading.Lock()
+_DENY_COUNT = 0
 
 
 def audit(peer, op, summary, verdict, detail=''):
+    global _DENY_COUNT
     if AUDIT is None:
         return
     rec = {
@@ -879,7 +1153,12 @@ def audit(peer, op, summary, verdict, detail=''):
     }
     if detail:
         rec['detail'] = detail[:500]
-    AUDIT.info(json.dumps(rec))
+    if verdict == 'DENY':
+        with _DENY_LOCK:
+            _DENY_COUNT += 1
+        AUDIT.warning(json.dumps(rec))
+    else:
+        AUDIT.info(json.dumps(rec))
 
 
 # ---------------------------------------------------------------------------
@@ -978,23 +1257,38 @@ def _do_exec(req):
     }
 
 
+def _is_console_owned(path):
+    """True if `path` is under a console-WRITABLE allowlist prefix (bundle dir or
+    a home module dir). Those dirs are owned by the console user, so it can plant
+    a symlink at the target between the allowlist check and the write."""
+    return any(path == p.rstrip('/') or path.startswith(p) for p in _CONSOLE_OWNED_PREFIXES)
+
+
 def _do_write(req):
     # Decision made in _dispatch; here only normalize (reject NUL/traversal) so
     # permissive mode can still execute an off-allowlist write (console is root).
-    # NB: we deliberately follow symlinks here. The symlink-escape vector (M2) is
-    # closed elsewhere: a non-root console cannot plant a symlink in the
-    # allowlisted dirs (they are root-owned), and `ln` is path-checked so it
-    # cannot create one pointing outside the allowlist. O_NOFOLLOW would also
-    # break LEGIT symlinked targets (e.g. /etc/os-release -> /usr/lib/os-release).
+    # We deliberately follow symlinks for ROOT-owned prefixes (a non-root console
+    # cannot plant a symlink there, and legit targets like /etc/os-release ->
+    # /usr/lib/os-release must resolve). For CONSOLE-OWNED prefixes the console
+    # CAN swap the final component to a symlink after the allowlist check passed
+    # (TOCTOU), so open the final component O_NOFOLLOW there — a swapped symlink
+    # then fails the open instead of redirecting a root write off-allowlist.
     path = _abs(req.get('path'))
     content = base64.b64decode(req.get('content_b64') or '')
     mode = req.get('mode', 'w')
     append = mode in ('a', 'ab')
-    with open(path, 'ab' if append else 'wb') as f:
-        f.write(content)
-    perm = req.get('perm')
-    if perm is not None:
-        os.chmod(path, int(perm))
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    if _is_console_owned(path):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o644)
+    try:
+        if content:
+            os.write(fd, content)
+        perm = req.get('perm')
+        if perm is not None:
+            os.fchmod(fd, int(perm))   # fchmod on the fd — never re-resolves the path
+    finally:
+        os.close(fd)
     return {'ok': True}
 
 
@@ -1014,6 +1308,168 @@ def _do_read(req):
     return {'ok': True, 'content_b64': base64.b64encode(data).decode()}
 
 
+# ---------------------------------------------------------------------------
+# pg_dump-to-FILE op (v10.0.8 — PLAN §B). The non-root snapshot path could not
+# stream a pg_dump through the exec proxy (MAX_MSG 32MiB cap → the DB dump was
+# skipped and snapshots shipped config-only). This op has the BROKER write the
+# dump to disk itself: it opens the destination file as root and runs
+# `runuser -u postgres -- pg_dump -Fc <db>` with stdout pointed at it, so the
+# socket never carries the dump. Fail-closed in BOTH broker modes (a brand-new
+# op has no root-era behavior for permissive mode to preserve).
+# ---------------------------------------------------------------------------
+SNAPSHOT_DIR = '/opt/tak/snapshots'
+# Container-TAK installs keep the cot DB INSIDE this container (no host postgres
+# user/cluster) — the op then runs `docker exec -u postgres <this> pg_dump`.
+# Fixed name; any other container is denied.
+_PG_DUMP_CONTAINER = 'takserver-db'
+# Dump-authenticity key (SECURITY, v10.0.8): the snapshot dir lives under the
+# console-writable /opt/tak/ prefix, so the console CAN write arbitrary bytes to
+# a *.pgdump path. Restoring an attacker-crafted pg custom archive would run its
+# embedded TOC (COPY … FROM PROGRAM / plpython) as the postgres superuser — a
+# documented postgres→root pivot, and exactly the code-exec the psql gate
+# (_PSQL_FORBIDDEN) exists to deny. So the broker HMACs every dump it PRODUCES
+# (sidecar <path>.hmac) and refuses to pg_restore any file whose HMAC does not
+# verify. The key is root-only (0600); the console cannot forge the sidecar.
+_DUMP_HMAC_KEY_FILE = '/var/lib/takwerx-broker/dump.key'
+
+
+def _dump_hmac_key():
+    """Read (or create once) the root-only key used to authenticate broker dumps."""
+    try:
+        with open(_DUMP_HMAC_KEY_FILE, 'rb') as f:
+            k = f.read()
+            if len(k) >= 32:
+                return k
+    except OSError:
+        pass
+    k = os.urandom(32)
+    try:
+        os.makedirs(os.path.dirname(_DUMP_HMAC_KEY_FILE), exist_ok=True)
+        tmp = _DUMP_HMAC_KEY_FILE + '.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, k)
+        os.close(fd)
+        os.replace(tmp, _DUMP_HMAC_KEY_FILE)
+    except OSError:
+        pass   # can't persist — HMAC then only holds within this boot; still fail-closed
+    return k
+
+
+def _dump_hmac(path):
+    import hashlib
+    import hmac as _hmac
+    h = _hmac.new(_dump_hmac_key(), digestmod=hashlib.sha256)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _check_pg_dump(req):
+    path = req.get('path')
+    p = _abs(path)
+    # /opt/tak is a symlink on container installs — compare realpaths (the tree
+    # is root-owned, so following links here is safe).
+    if not _within_realpath(p, SNAPSHOT_DIR):
+        raise Denied(f'pg_dump: destination must be under {SNAPSHOT_DIR}/: {p}')
+    db = req.get('db') or 'cot'
+    if not (isinstance(db, str) and db.replace('_', '').isalnum()):
+        raise Denied(f'pg_dump: invalid database name: {db!r}')
+    container = req.get('container')
+    if container is not None and container != _PG_DUMP_CONTAINER:
+        raise Denied(f'pg_dump: only container {_PG_DUMP_CONTAINER} allowed: {container!r}')
+
+
+def _do_pg_dump(req):
+    path = _abs(req.get('path'))
+    db = req.get('db') or 'cot'
+    if req.get('container'):
+        docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+        if not docker:
+            return {'ok': False, 'error': 'docker not found on trusted PATH'}
+        argv = [docker, 'exec', '-u', 'postgres', _PG_DUMP_CONTAINER,
+                'pg_dump', '-Fc', db]
+    else:
+        runuser = shutil.which('runuser', path=BROKER_TRUSTED_PATH)
+        pg_dump = shutil.which('pg_dump', path=BROKER_TRUSTED_PATH)
+        if not runuser or not pg_dump:
+            return {'ok': False, 'error': 'runuser/pg_dump not found on trusted PATH'}
+        argv = [runuser, '-u', 'postgres', '--', pg_dump, '-Fc', db]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
+    # stdout goes straight to the root-opened file — the 32MiB socket cap never
+    # applies, and postgres needs no write access to the snapshot dir.
+    with open(path, 'wb') as out:
+        proc = subprocess.run(argv, stdout=out, stderr=subprocess.PIPE, timeout=timeout)
+    if proc.returncode != 0:
+        try:
+            os.unlink(path)    # never leave a truncated/empty dump behind
+        except OSError:
+            pass
+        return {'ok': False, 'returncode': proc.returncode,
+                'error': (proc.stderr or b'').decode(errors='replace')[:500]}
+    os.chmod(path, 0o600)
+    # Authenticity sidecar — proves the broker produced this dump, so pg_restore
+    # will accept it (and reject any console-planted archive). Best-effort: if the
+    # sidecar can't be written, restore simply won't trust the dump later.
+    try:
+        sc = path + '.hmac'
+        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, _dump_hmac(path).encode())
+        os.close(fd)
+    except OSError:
+        pass
+    return {'ok': True, 'size': os.path.getsize(path)}
+
+
+def _check_pg_restore(req):
+    # same gate as pg_dump: source file must live under the snapshot tree
+    _check_pg_dump(req)
+
+
+def _do_pg_restore(req):
+    """Symmetric to _do_pg_dump (v10.0.8 §B): the broker opens the snapshot dump
+    as root and feeds it to pg_restore's stdin — the dump never crosses the
+    socket (the old stage-copy + exec-proxy path hit the 32MiB cap on any real
+    database). NB: pg_restore exits 1 on non-fatal warnings; the returncode is
+    passed through for the caller to interpret, as before."""
+    path = _abs(req.get('path'))
+    db = req.get('db') or 'cot'
+    if not os.path.isfile(path):
+        return {'ok': False, 'code': 'ENOENT', 'error': f'dump not found: {path}'}
+    # AUTHENTICITY (v10.0.8): only restore a dump the broker itself produced —
+    # verify the HMAC sidecar. Without this, the console (which can write bytes to
+    # the /opt/tak/snapshots tree) could restore a crafted archive whose TOC runs
+    # code as the postgres superuser. Constant-time compare.
+    import hmac as _hmac
+    try:
+        with open(path + '.hmac') as f:
+            want = f.read().strip()
+    except OSError:
+        want = ''
+    if not want or not _hmac.compare_digest(want, _dump_hmac(path)):
+        return {'ok': False, 'code': 'DENIED',
+                'error': 'dump failed authenticity check — not a broker-produced snapshot'}
+    if req.get('container'):
+        docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+        if not docker:
+            return {'ok': False, 'error': 'docker not found on trusted PATH'}
+        argv = [docker, 'exec', '-i', '-u', 'postgres', _PG_DUMP_CONTAINER,
+                'pg_restore', '--clean', '-d', db]
+    else:
+        runuser = shutil.which('runuser', path=BROKER_TRUSTED_PATH)
+        pg_restore = shutil.which('pg_restore', path=BROKER_TRUSTED_PATH)
+        if not runuser or not pg_restore:
+            return {'ok': False, 'error': 'runuser/pg_restore not found on trusted PATH'}
+        argv = [runuser, '-u', 'postgres', '--', pg_restore, '--clean', '-d', db]
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
+    with open(path, 'rb') as inp:
+        proc = subprocess.run(argv, stdin=inp, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=timeout)
+    return {'ok': True, 'returncode': proc.returncode,
+            'stderr': (proc.stderr or b'').decode(errors='replace')[-500:]}
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -1022,7 +1478,11 @@ def _evaluate(req):
         if op == 'exec':
             check_exec(req.get('argv') or [], req.get('cwd'))
         elif op in ('write', 'read'):
-            _path_allowed(req.get('path'))
+            _path_allowed(req.get('path'), readonly=(op == 'read'))
+        elif op == 'pg_dump':
+            _check_pg_dump(req)
+        elif op == 'pg_restore':
+            _check_pg_restore(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -1055,13 +1515,23 @@ def _dispatch(req, peer):
     op = req.get('op')
     if op == 'ping':
         audit(peer, 'ping', '', 'ALLOW')
-        return {'ok': True, 'pong': True, 'enforce': ENFORCE}
+        return {'ok': True, 'pong': True, 'enforce': ENFORCE,
+                'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT}
     # dry-run: report what the rulebook WOULD do, without executing. Used by the
     # self-test to verify deny rules even while the broker runs permissive.
     if op == 'check':
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
+    if op in ('pg_dump', 'pg_restore'):
+        verdict, reason = _evaluate(req)
+        summary = _summary(req)
+        if verdict == 'DENY':
+            # fail-closed in BOTH modes — new ops, nothing legacy to preserve
+            audit(peer, op, summary, 'DENY', reason)
+            return {'ok': False, 'code': 'DENIED', 'error': reason}
+        audit(peer, op, summary, 'ALLOW')
+        return _do_pg_dump(req) if op == 'pg_dump' else _do_pg_restore(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
         summary = _summary(req)
@@ -1130,12 +1600,107 @@ class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     allow_reuse_address = True
 
 
+def _audit_line_ts(line):
+    """Epoch seconds from an audit line's asctime prefix, or None."""
+    try:
+        return time.mktime(time.strptime(line[:19], '%Y-%m-%d %H:%M:%S'))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _audit_clean_window(now=None):
+    """Evaluate the ENFORCE flip gate against the broker's own audit history:
+    returns (clean: bool, why: str, clean_since: str|None). Clean means the log
+    holds at least ENFORCE_CLEAN_SECS of history AND no WOULD-DENY inside that
+    window. A fresh/empty log is NOT clean — no evidence, no flip."""
+    now = now or time.time()
+    files = [AUDIT_LOG + (('.%d' % i) if i else '') for i in range(10, -1, -1)]
+    oldest_ts = None
+    newest_wd = None
+    for fp in files:
+        if not os.path.isfile(fp):
+            continue
+        try:
+            with open(fp, errors='replace') as f:
+                for line in f:
+                    ts = _audit_line_ts(line)
+                    if ts is None:
+                        continue
+                    if oldest_ts is None or ts < oldest_ts:
+                        oldest_ts = ts
+                    if '"verdict": "WOULD-DENY"' in line and (newest_wd is None or ts > newest_wd):
+                        newest_wd = ts
+        except OSError:
+            continue
+    if oldest_ts is None:
+        return False, 'no audit history yet', None
+    if now - oldest_ts < ENFORCE_CLEAN_SECS:
+        return False, ('audit history spans only %.1fh (< %dh required)'
+                       % ((now - oldest_ts) / 3600.0, ENFORCE_CLEAN_SECS // 3600)), None
+    if newest_wd is not None and now - newest_wd < ENFORCE_CLEAN_SECS:
+        return False, ('WOULD-DENY seen %.1fh ago (need %dh clean)'
+                       % ((now - newest_wd) / 3600.0, ENFORCE_CLEAN_SECS // 3600)), None
+    since = newest_wd or oldest_ts
+    return True, '', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(since))
+
+
+def _resolve_enforce():
+    """Decide the broker mode at daemon start (see the ENFORCE block up top).
+    Returns (enforce: bool, info: dict). Never raises."""
+    env = os.environ.get('TAKWERX_BROKER_ENFORCE')
+    if env == '1':
+        return True, {'source': 'env', 'flipped_at': 'install'}
+    if env == '0':
+        return False, {'source': 'env-killswitch',
+                       'stay_permissive_reason': 'TAKWERX_BROKER_ENFORCE=0 kill switch set'}
+    # existing box — sticky stamp first, then the clean-audit gate
+    try:
+        with open(ENFORCE_STATE_FILE) as f:
+            state = json.load(f)
+        if state.get('flipped_at'):
+            state.setdefault('source', 'audit-gate')
+            return True, state
+    except (OSError, ValueError):
+        pass
+    try:
+        clean, why, since = _audit_clean_window()
+    except Exception as e:  # never let the gate crash the daemon
+        clean, why, since = False, f'gate evaluation error: {e}', None
+    if not clean:
+        return False, {'source': 'audit-gate', 'stay_permissive_reason': why}
+    state = {'source': 'audit-gate',
+             'flipped_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+             'clean_since': since}
+    try:
+        os.makedirs(os.path.dirname(ENFORCE_STATE_FILE), exist_ok=True)
+        tmp = ENFORCE_STATE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(state, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ENFORCE_STATE_FILE)
+    except OSError as e:
+        # can't persist the stamp — still enforce this run (the gate re-passes
+        # next start as long as the audit stays clean)
+        state['stamp_warning'] = str(e)
+    return True, state
+
+
 def serve():
-    global AUDIT
+    global AUDIT, ENFORCE, ENFORCE_INFO
     if os.geteuid() != 0:
         sys.stderr.write('takwerx-broker: serve must run as root\n')
         return 2
     AUDIT = _make_audit_logger()
+    ENFORCE, ENFORCE_INFO = _resolve_enforce()
+    if ENFORCE:
+        _mode_msg = ('broker ENFORCE enabled (source=%s%s)'
+                     % (ENFORCE_INFO.get('source'),
+                        ', audit clean since %s' % ENFORCE_INFO['clean_since']
+                        if ENFORCE_INFO.get('clean_since') else ''))
+    else:
+        _mode_msg = ('broker staying PERMISSIVE: %s'
+                     % ENFORCE_INFO.get('stay_permissive_reason', 'unknown'))
+    AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO', 'summary': _mode_msg}))
     # fresh socket
     try:
         if os.path.exists(SOCKET_PATH):
@@ -1283,6 +1848,22 @@ def cli_selftest():
         check('Policy blocks arbitrary shell', r.get('ok') and r.get('verdict') == 'DENY', str(r))
     except Exception as e:
         check('Policy blocks arbitrary shell', False, str(e))
+
+    # 7. v10.0.8 gates: git outside module dirs, pg_dump outside the snapshot
+    #    tree, and a WRITE to the read-only /root/.ssh grant — all DENY.
+    for name, req in (
+        ('Policy blocks git outside module dirs',
+         {'op': 'exec', 'argv': ['git', '-C', '/etc', 'rev-parse', 'HEAD']}),
+        ('Policy blocks pg_dump outside snapshots',
+         {'op': 'pg_dump', 'path': '/etc/evil.pgdump'}),
+        ('Policy blocks write to /root/.ssh',
+         {'op': 'write', 'path': '/root/.ssh/authorized_keys'}),
+    ):
+        try:
+            r = client_send({'op': 'check', 'req': req})
+            check(name, r.get('ok') and r.get('verdict') == 'DENY', str(r))
+        except Exception as e:
+            check(name, False, str(e))
 
     return _print_selftest(results)
 

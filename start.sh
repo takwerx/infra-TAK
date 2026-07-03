@@ -506,6 +506,22 @@ install_broker() {
         BROKER_SELINUX="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
     fi
 
+    # v10.0.8 ENFORCE cutover (PLAN-v10.0.8 §C): FRESH installs (no prior broker
+    # audit history) are born ENFORCING — deny means deny from day one. EXISTING
+    # boxes keep the env UNSET: the broker self-gates, flipping to enforce only
+    # after 72h of clean audit (see _resolve_enforce in takwerx_broker.py), so an
+    # incomplete rulebook can never brick a customer console on update. If a
+    # prior run of this installer already wrote ENFORCE=1, keep it (re-running
+    # start.sh must not downgrade the posture).
+    # KILL SWITCH (break-glass, operator SSH only): change the line to
+    # Environment=TAKWERX_BROKER_ENFORCE=0, rm /var/lib/takwerx-broker/enforce.json,
+    # then systemctl daemon-reload && systemctl restart takwerx-broker.
+    local BROKER_ENFORCE=""
+    if [ ! -f /var/log/takwerx-broker/audit.log ] || \
+       grep -q 'TAKWERX_BROKER_ENFORCE=1' /etc/systemd/system/takwerx-broker.service 2>/dev/null; then
+        BROKER_ENFORCE="Environment=TAKWERX_BROKER_ENFORCE=1"
+    fi
+
     cat > /etc/systemd/system/takwerx-broker.service << EOF
 [Unit]
 Description=infra-TAK privileged broker (least-privilege console mediation)
@@ -520,7 +536,8 @@ Restart=always
 RestartSec=2
 RuntimeMaxSec=24h
 Environment=PYTHONUNBUFFERED=1
-
+${BROKER_ENFORCE:+$BROKER_ENFORCE
+}
 [Install]
 WantedBy=multi-user.target
 EOF
