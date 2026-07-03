@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.5-alpha)**
+**Current release: [v10.0.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.6-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.6-alpha — 2026-07-03 — WebODM single sign-on, TURN alongside NetBird, same-domain email fixed, and scheduled TAK backups that actually run
+
+**Headline: three user-reported issues fixed end-to-end, and scheduled TAK Server snapshots now genuinely work.** **WebODM** (GitHub #50): the TAK Incident Overlay plugin now actually appears after install (the upstream plugin shipped a packaging defect the deploy now patches automatically), and the double login is gone — WebODM's login page becomes a single **"Login with Authentik"** button using WebODM's native OpenID Connect, with the reverse-proxy gate still in front. Existing WebODM installs get both fixes without losing projects via the new **"⟳ Reapply Plugin & Config"** button on the WebODM page. **Email Relay** (GitHub #48): mail sent *to your own domain* no longer bounces with `550 User unknown` — the relay is now strictly send-only and routes everything through your provider; redeploying the Email Relay applies the fix on existing boxes. **TURN for EUD Remote Assist** (GitHub #49): CoTURN now coexists with NetBird — on boxes running a NetBird hub it installs cleanly on an alternate port (the UI suggests one automatically), and on legacy NetBird installs it can share NetBird's own TURN with dedicated credentials; credential fields gained show/hide toggles and stricter validation. **Scheduled snapshots**: the TAK Server snapshot schedule used to silently never run (and left a red failed unit in `systemctl`) — scheduling now runs inside the console itself, catches up missed runs, enforces the retention count you configure, and cleans up the old broken timer automatically. **Also fixed:** the **Update Now** button no longer locks out for 20 minutes after a successful update; servers upgraded from older releases now reliably start Authentik's redis cache; snapshots on managed/RDS databases can capture a real database dump; and RHEL boxes lose a noisy every-few-seconds package-manager error. Works identically on **Ubuntu 22.04, Rocky / RHEL 9, and ARM64**. **Upgrade:** applied automatically on the next console update; WebODM boxes should click **Reapply Plugin & Config** once, Email Relay boxes should redeploy the relay (Switch Provider → same provider) to pick up the mail fix.
+
+Full notes: [v10.0.6-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.6-alpha).
 
 ### v10.0.5-alpha — 2026-07-02 — Run the whole stack without root: a one-click least-privilege console
 
