@@ -29795,6 +29795,18 @@ def _run_netbird_deploy(settings):
     nb_dir = NETBIRD_INSTALL_DIR
 
     try:
+        # Pre-flight: the hub compose publishes 3478:3478/udp unconditionally. If the
+        # Remote-Assist CoTURN holds 3478 (pre-10.0.7 install or manual entry — the
+        # fleet default is 3479 since ce16627), `compose up` would die with a raw
+        # "port is already allocated". Refuse with guidance instead.
+        if (settings.get('coturn_installed')
+                and str(settings.get('coturn_port') or '') == '3478'
+                and not settings.get('netbird_coturn_in_use')):
+            raise RuntimeError(
+                'Remote Assist CoTURN is running on port 3478, which NetBird needs for its '
+                'TURN server. Reinstall CoTURN on port 3479 (Remote Assist page → uninstall '
+                'CoTURN → install with port 3479 — the fleet default), then deploy NetBird.')
+
         plog('━━━ Step 1/6: Checking Docker ━━━')
         r = _sp.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
         if r.returncode != 0:
