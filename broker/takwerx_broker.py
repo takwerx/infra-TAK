@@ -63,10 +63,24 @@ BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
 # /opt/tak` FROM here — both were denied because /home is forbidden, which is
 # the v10.0.5 container-deploy exit-126 regression. Allow this ONE subtree (NOT
 # /home at large): it is takwerx-owned and is the intended /opt/tak source.
+# Resolve the console user's ACTUAL home. NB: `takwerx` is created as a SYSTEM
+# account (`useradd --system -d /nonexistent`), so its /etc/passwd home is the
+# `/nonexistent` sentinel — but the console runs with HOME=/home/takwerx and puts
+# every module there (it uses os.path.expanduser('~'), i.e. $HOME, not passwd).
+# The broker must match the console, or home-resident modules (the majority of the
+# born-non-root fleet) fail the allowlist. So: use the passwd home only if it is a
+# REAL directory; otherwise fall back to the /home/<user> convention start.sh
+# provisions. (Discovered in the v10.0.8 field test — the passwd home was
+# /nonexistent and every ~/<module> path WOULD-DENY'd.)
+_CONV_HOME = '/home/' + BROKER_USER
 try:
-    _NONROOT_HOME = pwd.getpwnam(BROKER_USER).pw_dir or '/home/takwerx'
+    _PW_HOME = pwd.getpwnam(BROKER_USER).pw_dir or ''
 except KeyError:
-    _NONROOT_HOME = '/home/takwerx'
+    _PW_HOME = ''
+if _PW_HOME and _PW_HOME not in ('/nonexistent', '/', '') and os.path.isdir(_PW_HOME):
+    _NONROOT_HOME = _PW_HOME
+else:
+    _NONROOT_HOME = _CONV_HOME
 TAK_BUNDLE_DIR = os.path.join(_NONROOT_HOME, 'tak-docker')
 
 # Module install dirs (v10.0.8 harvest — PLAN-v10.0.8 §A). Each module lives at
@@ -82,7 +96,13 @@ MODULE_DIR_NAMES = (
     'TAK-Portal', 'CloudTAK', 'node-red', 'authentik', 'eud-remote-assist',
 )
 ROOT_MODULE_DIRS = tuple('/root/%s/' % n for n in MODULE_DIR_NAMES)
-HOME_MODULE_DIRS = tuple(os.path.join(_NONROOT_HOME, n) + '/' for n in MODULE_DIR_NAMES)
+# Allowlist module dirs under EVERY plausible console home (the resolved home AND
+# the /home/<user> convention), deduped — so a passwd/HOME mismatch can't strand
+# them. The /nonexistent sentinel is dropped (nothing lives there anyway).
+_HOME_ROOTS = tuple(dict.fromkeys(
+    h for h in (_NONROOT_HOME, _CONV_HOME) if h and h not in ('/nonexistent', '/')))
+HOME_MODULE_DIRS = tuple(
+    os.path.join(h, n) + '/' for h in _HOME_ROOTS for n in MODULE_DIR_NAMES)
 
 # ENFORCE vs PERMISSIVE (v10.0.5 → cutover v10.0.8, PLAN-v10.0.8 §C).
 #   PERMISSIVE: a request that fails the rulebook is still EXECUTED, but logged
