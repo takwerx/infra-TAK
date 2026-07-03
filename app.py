@@ -651,7 +651,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.6-alpha"
+VERSION = "10.0.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -8589,7 +8589,7 @@ def remote_assist_page():
     ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
     coturn_ip = settings.get('coturn_ip', '')
-    coturn_port = str(settings.get('coturn_port') or '3478')
+    coturn_port = str(settings.get('coturn_port') or COTURN_DEFAULT_PORT)
     # Legacy-NetBird coturn detection + shared-mode health (Mike/cfd2474, PR #49)
     _nb_has, _nb_ctr, _nb_conf = _netbird_coturn_status() if ra.get('installed') else (False, None, None)
     netbird_coturn_in_use = bool(settings.get('netbird_coturn_in_use'))
@@ -8604,7 +8604,7 @@ def remote_assist_page():
         coturn_password=settings.get('coturn_password', ''),
         coturn_ip=coturn_ip,
         coturn_url=(f'turn:{coturn_ip}:{coturn_port}' if coturn_ip else ''),
-        coturn_suggested_port=('3479' if _nb_has else '3478'),
+        coturn_suggested_port=COTURN_DEFAULT_PORT,
         can_configure_nb_coturn=bool(_nb_has and _nb_ctr and _nb_conf),
         netbird_coturn_in_use=netbird_coturn_in_use,
         netbird_coturn_missing=(netbird_coturn_in_use and not _nb_ctr),
@@ -8616,6 +8616,12 @@ def remote_assist_page():
 
 # CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
 COTURN_IMAGE = 'coturn/coturn:4.14.0'
+# Fleet constant (v10.0.7): standalone Remote-Assist CoTURN ALWAYS defaults to 3479,
+# never 3478 — 3478 is reserved for NetBird's TURN so the two can land on one box in
+# ANY install order with zero conflicts. RA clients are explicitly told URL+port by
+# the module, so the non-IANA port costs nothing. (3478 in settings still occurs
+# legitimately: NetBird-shared mode, and pre-10.0.7 standalone installs.)
+COTURN_DEFAULT_PORT = '3479'
 # Restrict credentials to a safe charset with NO YAML/shell metacharacters. The
 # values are interpolated into docker-compose.override.yml (then `docker compose up`),
 # so an unvalidated newline/quote could inject arbitrary compose directives
@@ -8727,7 +8733,7 @@ def remote_assist_coturn_install():
     username = (data.get('username') or '').strip()
     password = (data.get('password') or '').strip()
     ip = (data.get('ip') or '').strip()
-    port = str(data.get('port') or '3478').strip() or '3478'
+    port = str(data.get('port') or COTURN_DEFAULT_PORT).strip() or COTURN_DEFAULT_PORT
     if not username or not password or not ip:
         return jsonify({'success': False, 'error': 'All fields are required.'})
     if not _COTURN_USER_RE.match(username):
@@ -8738,7 +8744,7 @@ def remote_assist_coturn_install():
         return jsonify({'success': False, 'error': 'Public IP must be a valid IPv4 address.'})
     # Port is interpolated into the compose override — digits only, sane range.
     if not port.isdigit() or not (1024 <= int(port) <= 65535):
-        return jsonify({'success': False, 'error': 'Port must be a number between 1024 and 65535 (default 3478).'})
+        return jsonify({'success': False, 'error': 'Port must be a number between 1024 and 65535 (default 3479).'})
 
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     if not os.path.exists(ra_dir):
@@ -62622,7 +62628,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div style="font-size:11px;color:var(--text-dim);margin-top:4px">8&#8211;128 chars: letters, digits, and <span style="font-family:'JetBrains Mono',monospace">. _ @ + = ! % ^ -</span> &mdash; no spaces, quotes, or other symbols.</div>
   </div>
   <div style="margin-bottom:12px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('server_ip', '') }}"></div>
-  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="{{ coturn_suggested_port }}">{% if coturn_suggested_port != '3478' %}<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Pre-set to 3479 — NetBird on this box already uses the standard port 3478. Any port works; Remote Assist clients are told which one.</div>{% endif %}</div>
+  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3479" value="{{ coturn_suggested_port }}"><div style="font-size:11px;color:var(--text-dim);margin-top:4px">Remote Assist TURN runs on 3479 — port 3478 is reserved for NetBird, so both can be installed on the same box in any order. Clients are told which port to use.</div></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
   <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
