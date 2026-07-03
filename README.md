@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.7-alpha)**
+**Current release: [v10.0.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.8-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.8-alpha — 2026-07-03 — The security guard becomes a real lock — safely, on your terms
+
+**Headline: the least-privilege "guard" that mediates every privileged action can now actually *block* anything outside its allow-list — and turning that on is a deliberate, one-way operator choice, so it can never surprise a production box.** For several releases the guard has run in *watch* mode: it records what a compromised console would try but lets everything through. This release completes the allow-list so the guard recognizes every legitimate operation your servers perform (validated with zero false-flags across Ubuntu 22.04, Rocky / RHEL 9, and ARM64), then adds enforcement — but **opt-in**. A box never flips itself: after it has run 72 hours with a completely clean record it becomes *eligible*, and a new **"Turn on enforcing"** button appears on the Cyber Controls page. Enabling it is confirmed and one-way from the browser (turning it back off requires SSH break-glass), so a hacked console can only ever make a box *more* locked down. **Existing boxes stay in watch mode until you press the button; brand-new installs are opted-in but still watch for 72 hours first, so a fresh box never breaks its own setup.** Also in this release: **TAK Server snapshots on unprivileged consoles now capture a real database dump** (previously they silently shipped config-only backups with no database), with dumps authenticated so only genuine snapshots can be restored; the **CloudTAK cryptominer scanner** now runs correctly under the guard; and a batch of hardening from an internal security review. **Upgrade:** applied automatically on the next console update — your boxes keep running exactly as before, in watch mode, until you choose to enforce.
+
+Full notes: [v10.0.8-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.8-alpha).
 
 ### v10.0.7-alpha — 2026-07-03 — One TURN port per job: Remote Assist always on 3479, NetBird always on 3478
 
