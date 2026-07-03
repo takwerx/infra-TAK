@@ -110,26 +110,34 @@ HOME_MODULE_DIRS = tuple(
 #   the real binary/path needs and complete the rulebook.
 #   ENFORCE: deny means deny — the non-root console is a real privilege boundary.
 #
-# How the mode is decided at daemon start (_resolve_enforce):
-#   TAKWERX_BROKER_ENFORCE=1  -> ENFORCE (start.sh writes this on FRESH installs)
-#   TAKWERX_BROKER_ENFORCE=0  -> PERMISSIVE (operator KILL SWITCH: add
-#                                `Environment=TAKWERX_BROKER_ENFORCE=0` to the
-#                                broker unit + `systemctl daemon-reload` +
-#                                `systemctl restart takwerx-broker` over SSH;
-#                                break-glass only)
-#   unset (EXISTING boxes)    -> self-gating migration: the broker flips itself
-#       to ENFORCE only after a CLEAN AUDIT WINDOW — zero WOULD-DENY in the last
-#       ENFORCE_CLEAN_SECS of its own audit log, with at least that much history
-#       present. Once flipped, the decision is stamped in ENFORCE_STATE_FILE
-#       (root-owned — the console cannot write it) and sticks across restarts.
-#       A box that is not clean logs WHY and stays permissive — never brick a
-#       customer's console. The gate lives HERE, not in the console: the console
-#       must not be able to write the broker unit/env (trust anchor), and the
-#       broker owns the audit log it judges by.
+# How the mode is decided at daemon start (_resolve_enforce). ENFORCE is now
+# OPT-IN (v10.0.8) — a box NEVER flips itself; an operator turns it on, and the
+# 72h clean window is the READINESS gate the operator waits for, not an automatic
+# trigger. "Don't break production" is therefore the default posture.
+#   TAKWERX_BROKER_ENFORCE=0  -> PERMISSIVE, hard. The KILL SWITCH / break-glass:
+#       add `Environment=TAKWERX_BROKER_ENFORCE=0` to the broker unit +
+#       `systemctl daemon-reload` + restart, over SSH. Overrides opt-in.
+#   TAKWERX_BROKER_ENFORCE=1  -> ENFORCE, hard (explicit override; testing).
+#   unset  ->  OPT-IN gate:
+#       * If the operator has NOT opted in (no ENFORCE_OPTIN_FILE) -> PERMISSIVE
+#         forever (watch mode), regardless of how clean the box is. The box still
+#         reports its readiness (clean-for-Nh) so the console can light up the
+#         "Turn on enforcing" button once eligible.
+#       * If the operator HAS opted in (ENFORCE_OPTIN_FILE present — created by the
+#         console's "Turn on enforcing" action via the enforce_enable op, or by
+#         start.sh on a FRESH install) -> ENFORCE only once the audit window is
+#         CLEAN (>=ENFORCE_CLEAN_SECS of history, zero WOULD-DENY within it). Until
+#         then it stays PERMISSIVE and reports why (so a fresh box watches 72h
+#         before it ever blocks — it never breaks its own initial deploy).
+#   Opt-in is a RATCHET: the enforce_enable op only ever CREATES the marker, never
+#   removes it. Turning enforcement back OFF is the SSH-only ENFORCE=0 kill switch —
+#   so a compromised console can only ever make the box MORE locked down, never less.
+#   The opt-in marker and the flip stamp are root-owned; the console cannot forge them.
 ENFORCE = os.environ.get('TAKWERX_BROKER_ENFORCE') == '1'
 ENFORCE_INFO = {'source': 'env' if os.environ.get('TAKWERX_BROKER_ENFORCE') else 'default'}
 ENFORCE_STATE_FILE = '/var/lib/takwerx-broker/enforce.json'
-ENFORCE_CLEAN_SECS = 72 * 3600      # 72h clean window (PLAN §A re-sweep target)
+ENFORCE_OPTIN_FILE = '/var/lib/takwerx-broker/enforce-optin'
+ENFORCE_CLEAN_SECS = 72 * 3600      # 72h clean readiness window (PLAN §A re-sweep target)
 
 # ---------------------------------------------------------------------------
 # POLICY / RULEBOOK  — the security core. Tightening these is core .5 work;
@@ -1658,7 +1666,12 @@ def _dispatch(req, peer):
     if op == 'ping':
         audit(peer, 'ping', '', 'ALLOW')
         return {'ok': True, 'pong': True, 'enforce': ENFORCE,
-                'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT}
+                'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT,
+                'readiness': _enforce_readiness()}
+    if op == 'enforce_enable':
+        # Operator opts the box in to enforcement (ratchet — enable only). Audited.
+        audit(peer, 'enforce_enable', '', 'ALLOW')
+        return _do_enforce_enable(req)
     # dry-run: report what the rulebook WOULD do, without executing. Used by the
     # self-test to verify deny rules even while the broker runs permissive.
     if op == 'check':
@@ -1790,33 +1803,63 @@ def _audit_clean_window(now=None):
     return True, '', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(since))
 
 
+def _enforce_readiness():
+    """Report the box's enforce readiness for the console card WITHOUT changing
+    mode. Returns a dict: opted_in, clean, ready, reason, clean_since. Never
+    raises. `ready` = opted_in is not required — a box is 'ready' (eligible) once
+    its audit window is clean, whether or not the operator has opted in yet."""
+    try:
+        opted_in = os.path.exists(ENFORCE_OPTIN_FILE)
+    except OSError:
+        opted_in = False
+    try:
+        clean, why, since = _audit_clean_window()
+    except Exception as e:
+        clean, why, since = False, f'gate evaluation error: {e}', None
+    return {'opted_in': opted_in, 'clean': clean, 'ready': clean,
+            'reason': why, 'clean_since': since,
+            'clean_secs_required': ENFORCE_CLEAN_SECS}
+
+
 def _resolve_enforce():
     """Decide the broker mode at daemon start (see the ENFORCE block up top).
-    Returns (enforce: bool, info: dict). Never raises."""
+    OPT-IN: a box enforces only if the operator has opted in AND the audit window
+    is clean. It never flips on its own. Returns (enforce, info). Never raises."""
     env = os.environ.get('TAKWERX_BROKER_ENFORCE')
-    if env == '1':
-        return True, {'source': 'env', 'flipped_at': 'install'}
     if env == '0':
         return False, {'source': 'env-killswitch',
                        'stay_permissive_reason': 'TAKWERX_BROKER_ENFORCE=0 kill switch set'}
-    # existing box — sticky stamp first, then the clean-audit gate
+    if env == '1':
+        return True, {'source': 'env', 'flipped_at': 'install'}
+    # Sticky stamp: once a box has enforced (opted-in + clean), keep enforcing
+    # across restarts even if new WOULD-DENYs appear (they can't, in enforce mode).
     try:
         with open(ENFORCE_STATE_FILE) as f:
             state = json.load(f)
         if state.get('flipped_at'):
-            state.setdefault('source', 'audit-gate')
+            state.setdefault('source', 'opt-in')
             return True, state
     except (OSError, ValueError):
         pass
-    try:
-        clean, why, since = _audit_clean_window()
-    except Exception as e:  # never let the gate crash the daemon
-        clean, why, since = False, f'gate evaluation error: {e}', None
-    if not clean:
-        return False, {'source': 'audit-gate', 'stay_permissive_reason': why}
-    state = {'source': 'audit-gate',
+    rd = _enforce_readiness()
+    if not rd['opted_in']:
+        # Operator has not turned enforcement on — stay in watch mode regardless
+        # of readiness. This is the production-safe default.
+        msg = ('operator has not enabled enforcement; ' +
+               ('READY to enable (audit clean)' if rd['clean']
+                else 'not yet eligible — %s' % rd['reason']))
+        return False, {'source': 'opt-in', 'opted_in': False, 'ready': rd['clean'],
+                       'stay_permissive_reason': msg, 'clean_since': rd['clean_since']}
+    if not rd['clean']:
+        # Opted in but not yet proven clean (e.g. a fresh box in its first 72h, or
+        # a box still shaking out coverage) — watch until the window is clean.
+        return False, {'source': 'opt-in', 'opted_in': True, 'ready': False,
+                       'stay_permissive_reason':
+                           'enforcement enabled — waiting for clean window: %s' % rd['reason']}
+    # Opted in AND clean -> enforce, and stamp it sticky.
+    state = {'source': 'opt-in', 'opted_in': True,
              'flipped_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-             'clean_since': since}
+             'clean_since': rd['clean_since']}
     try:
         os.makedirs(os.path.dirname(ENFORCE_STATE_FILE), exist_ok=True)
         tmp = ENFORCE_STATE_FILE + '.tmp'
@@ -1825,10 +1868,26 @@ def _resolve_enforce():
         os.chmod(tmp, 0o600)
         os.replace(tmp, ENFORCE_STATE_FILE)
     except OSError as e:
-        # can't persist the stamp — still enforce this run (the gate re-passes
-        # next start as long as the audit stays clean)
         state['stamp_warning'] = str(e)
     return True, state
+
+
+def _do_enforce_enable(req):
+    """Create the opt-in marker (RATCHET — only ever enables). The box will then
+    enforce on the NEXT broker start IF its audit window is clean; the console
+    restarts the broker right after calling this. Never removes the marker —
+    turning enforcement off is the SSH-only ENFORCE=0 kill switch."""
+    try:
+        os.makedirs(os.path.dirname(ENFORCE_OPTIN_FILE), exist_ok=True)
+        with open(ENFORCE_OPTIN_FILE, 'w') as f:
+            f.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + '\n')
+        os.chmod(ENFORCE_OPTIN_FILE, 0o644)
+    except OSError as e:
+        return {'ok': False, 'error': f'could not write opt-in marker: {e}'}
+    rd = _enforce_readiness()
+    return {'ok': True, 'opted_in': True, 'ready': rd['clean'], 'reason': rd['reason'],
+            'note': ('will enforce on next broker restart (audit clean)' if rd['clean']
+                     else 'opted in; will enforce once the audit window is clean — %s' % rd['reason'])}
 
 
 def serve():

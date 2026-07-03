@@ -5398,12 +5398,14 @@ def _broker_status_dict():
     enforce = None
     enforce_info = {}
     deny_count = None
+    readiness = {}
     try:
         if _broker_available():
             pong = _broker_request({'op': 'ping'}, timeout=5)
             enforce = bool(pong.get('enforce'))
             enforce_info = pong.get('enforce_info') or {}
             deny_count = pong.get('deny_count')
+            readiness = pong.get('readiness') or {}
     except Exception:
         pass
     return {
@@ -5412,12 +5414,13 @@ def _broker_status_dict():
         'socket_present': _broker_available(),
         'routing_active': _broker_should_route(),
         'force_enabled': _broker_force_enabled_in_unit(),
-        'enforce': enforce,   # None=unknown, False=permissive (learning), True=enforcing
-        # v10.0.8 §C: how the mode was decided (env / audit-gate / kill switch),
-        # flip stamp, or the stay-permissive reason — plus denials since the
-        # broker last started (read-only counter for the Cyber Controls card).
+        'enforce': enforce,   # None=unknown, False=permissive (watch), True=enforcing
+        # v10.0.8: how the mode was decided, the stay-permissive reason, denials
+        # since start, and opt-in readiness (opted_in / ready / clean_since /
+        # reason) so the card can render the "Turn on enforcing" flow.
         'enforce_info': enforce_info,
         'deny_count': deny_count,
+        'readiness': readiness,
         'console_uid': os.getuid(),
         'audit_log': '/var/log/takwerx-broker/audit.log',
         'socket': BROKER_SOCKET,
@@ -5598,6 +5601,39 @@ def console_broker_routing():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/console/broker/enforce', methods=['POST'])
+@login_required
+def console_broker_enforce():
+    """v10.0.8: OPT IN to enforcement (deliberate — the box never flips on its own).
+    Calls the broker `enforce_enable` op (a ratchet: it only ever CREATES the
+    root-owned opt-in marker, never removes it), then restarts the broker so it
+    re-evaluates. The broker enforces ONLY once its 72h audit window is clean;
+    until then it reports 'enabled — waiting for clean window'. Turning enforcement
+    back OFF is intentionally NOT exposed here — that is the SSH-only break-glass
+    kill switch (Environment=TAKWERX_BROKER_ENFORCE=0), so a compromised console can
+    only ever make the box MORE locked down."""
+    if not _broker_available():
+        return jsonify({'success': False,
+                        'error': 'Guard is not running — cannot enable enforcement. Check: systemctl status takwerx-broker'}), 400
+    try:
+        resp = _broker_request({'op': 'enforce_enable'}, timeout=15)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'could not reach the guard: {e}'}), 500
+    if not resp.get('ok'):
+        return jsonify({'success': False, 'error': resp.get('error') or 'guard refused the request'}), 500
+    # Restart the broker so _resolve_enforce re-runs with the marker present.
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']), capture_output=True, timeout=20)
+    except Exception:
+        pass
+    return jsonify({
+        'success': True,
+        'opted_in': True,
+        'ready': bool(resp.get('ready')),
+        'message': resp.get('note') or 'Enforcement enabled.',
+    })
 
 
 _NONROOT_MIGRATE_UNIT = 'infratak-nonroot-migrate'
@@ -31319,14 +31355,26 @@ function renderBrokerStatus(d){
       // yet a boundary, and that is the one case worth a caution.
       if(nonRoot){html+='<div style="margin-top:8px;color:var(--green);font-size:12px;line-height:1.5">&#10003; Console runs <strong>unprivileged</strong> and is confined to the guard — it cannot make privileged changes except through it.</div>';}
       else{html+='<div style="margin-top:8px;color:var(--yellow);font-size:12px;line-height:1.5">&#9888; Console runs as <strong>root</strong> — the guard records changes but cannot block them yet. Fresh installs are non-root automatically; an existing root box is switched with the on-box migration.</div>';}
-      // v10.0.8: enforce state + read-only denial counter (PLAN §C)
+      // v10.0.8: enforce state, opt-in flow, and read-only denial counter.
       var ei=d.enforce_info||{};
+      var rd=d.readiness||{};
       if(d.enforce===true){
         var dc=(d.deny_count===null||d.deny_count===undefined)?null:d.deny_count;
-        html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--green)">&#128274; <strong>ENFORCING</strong> — requests outside the rulebook are refused'+(ei.clean_since?(' (audit clean since '+esc(ei.clean_since)+')'):'')+'.</div>';
+        html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--green)">&#128274; <strong>ENFORCING</strong> — requests outside the rulebook are refused'+(ei.clean_since?(' (clean since '+esc(ei.clean_since)+')'):'')+'.</div>';
         if(dc!==null){html+='<div style="font-size:12px;line-height:1.5;color:'+(dc>0?'var(--yellow)':'var(--text-dim)')+'">'+(dc>0?('&#9888; '+dc+' request'+(dc===1?'':'s')+' DENIED since the guard last started — check the audit log.'):'0 denials since the guard last started.')+'</div>';}
       }else if(d.enforce===false){
-        html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--text-dim)">Watch mode — the guard flips to enforcing on its own after 72&nbsp;hours of clean audit'+(ei.stay_permissive_reason?(' (currently: '+esc(ei.stay_permissive_reason)+')'):'')+'.</div>';
+        if(rd.opted_in){
+          // enforcement enabled by the operator — will switch on once clean
+          html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--cyan)">Enforcing is <strong>enabled</strong> and will switch on automatically once the guard has 72&nbsp;hours of clean audit'+(rd.reason?(' — '+esc(rd.reason)):'')+'.</div>';
+        }else if(rd.ready){
+          // clean for 72h+ — green light: offer the deliberate flip
+          html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--green)">&#9989; <strong>Ready to enforce.</strong> The guard has been clean for 72&nbsp;hours — nothing legitimate is being flagged, so blocking is safe to turn on.</div>';
+          html+='<button id="broker-enforce-btn" onclick="turnOnEnforcing()" class="btn btn-primary" style="margin-top:8px"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Turn on enforcing</button>';
+        }else{
+          // watching, not yet eligible — show the countdown reason
+          html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--text-dim)">Watch mode — recording, blocking nothing. Not yet eligible to enforce'+(rd.reason?(': '+esc(rd.reason)):'')+'. It becomes eligible after 72&nbsp;hours with a clean record.</div>';
+        }
+        html+='<div id="broker-enforce-msg" style="margin-top:6px;font-size:12px"></div>';
       }
     }
     el.innerHTML=html;}
@@ -31365,6 +31413,15 @@ function runBrokerSelftest(){
     var hdrTxt=ov==='pass'?'SELF-TEST PASSED — console confined to the guard':(ov==='warn'?'GUARD ON — but the console runs as root (not yet a boundary)':'SELF-TEST FAILED');
     out.innerHTML='<div style="margin-bottom:6px;font-weight:600;color:'+hdrCol+'">'+esc(hdrTxt)+'</div>'+rows;
   }).catch(function(){out.innerHTML='<span style="color:var(--red)">Self-test request failed.</span>';});
+}
+function turnOnEnforcing(){
+  if(!confirm('Turn on ENFORCING for this box?\\n\\nThe guard will start BLOCKING anything not on its allow-list (not just recording it). This box has been clean for 72 hours, so nothing legitimate should be affected. To turn enforcing back off you would need SSH access to the box (break-glass) — it cannot be undone from here.\\n\\nProceed?'))return;
+  var m=document.getElementById('broker-enforce-msg');if(m){m.textContent='Enabling enforcement… the guard will restart briefly.';m.style.color='var(--text-dim)';}
+  var b=document.getElementById('broker-enforce-btn');if(b)b.disabled=true;
+  fetch('/api/console/broker/enforce',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(function(r){return r.json();}).then(function(d){
+    if(d.success){if(m){m.textContent=d.message||'Enforcement enabled.';m.style.color='var(--green)';}setTimeout(loadBroker,4000);}
+    else{if(m){m.textContent='Error: '+(d.error||'failed');m.style.color='var(--red)';}if(b)b.disabled=false;}
+  }).catch(function(){if(m){m.textContent='Request failed';m.style.color='var(--red)';}if(b)b.disabled=false;});
 }
 function toggleBrokerRouting(){
   fetch('/api/console/broker/status').then(function(r){return r.json();}).then(function(s){
