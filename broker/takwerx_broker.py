@@ -1385,6 +1385,100 @@ def _dump_hmac(path):
     return h.hexdigest()
 
 
+# PGMiner incident-response scan (v10.0.8 — closes harvest class 9). The CloudTAK
+# postgis (and TAK Server) databases were exploited in the wild by a crypto-miner
+# that drops a malicious `.so` into the postgres data dir and auto-loads it via
+# shared_preload_libraries (see the May 2026 incident). The console's scanner needs
+# to read/quarantine files in that data dir, which lives in a ROOT-owned docker
+# volume with a random name — un-allowlistable, and it must work with the container
+# STOPPED (host access, not `docker exec`). Rather than open the whole
+# /var/lib/docker/volumes tree to the console, the broker does the fixed, safe
+# remediation ITSELF, scoped to an allowlisted postgres container's own volume:
+# find `.so` at depth 1, quarantine them, and comment out a live
+# shared_preload_libraries. It NEVER writes attacker-controlled content (no .so
+# writes, no arbitrary conf) — so it cannot be turned into a malware-plant.
+_PGMINER_CONTAINERS = {'cloudtak-postgis-1', 'takserver-db'}
+
+
+def _check_pgminer_scan(req):
+    c = req.get('container')
+    if c not in _PGMINER_CONTAINERS:
+        raise Denied(f'pgminer_scan: container not allowed: {c!r}')
+
+
+def _resolve_pg_data_dir(container):
+    """Host path of `container`'s /var/lib/postgresql/data mount, or None. Works on
+    a stopped-but-existing container. Constrained to a real docker-volume _data
+    path so a renamed/hostile container can't redirect it off-volume."""
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return None
+    try:
+        r = subprocess.run(
+            [docker, 'inspect', container, '-f',
+             '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}'
+             '{{.Source}}{{end}}{{end}}'],
+            capture_output=True, text=True, timeout=15)
+    except subprocess.SubprocessError:
+        return None
+    p = (r.stdout or '').strip()
+    if (r.returncode == 0 and p.startswith('/var/lib/docker/volumes/')
+            and p.endswith('/_data') and '..' not in p.split('/') and os.path.isdir(p)):
+        return p
+    return None
+
+
+def _do_pgminer_scan(req):
+    container = req.get('container')
+    data = _resolve_pg_data_dir(container)
+    if not data:
+        return {'ok': False, 'error': f'could not resolve postgres data volume for {container}'}
+    out = {'ok': True, 'container': container, 'data_dir': data,
+           'so_files': [], 'quarantined': [], 'preload_disabled': False, 'preload_was': None}
+    # 1. malicious .so at depth 1 (the shared_preload payload)
+    try:
+        so = [f for f in os.listdir(data)
+              if f.endswith('.so') and os.path.isfile(os.path.join(data, f))]
+    except OSError as e:
+        return {'ok': False, 'error': f'listdir failed: {e}'}
+    out['so_files'] = so
+    if so:
+        qdir = os.path.join(data, 'quarantine-' + time.strftime('%Y%m%d-%H%M%S'))
+        try:
+            os.makedirs(qdir, exist_ok=True)
+            for f in so:
+                try:
+                    os.replace(os.path.join(data, f), os.path.join(qdir, f))
+                    out['quarantined'].append(f)
+                except OSError:
+                    pass
+        except OSError as e:
+            out['quarantine_error'] = str(e)
+    # 2. comment out a live shared_preload_libraries (the auto-load hook)
+    conf = os.path.join(data, 'postgresql.conf')
+    try:
+        with open(conf) as f:
+            body = f.read()
+    except OSError:
+        body = ''
+    if body:
+        import re as _re
+        pat = _re.compile(
+            r"(?m)^([ \t]*shared_preload_libraries[ \t]*=[ \t]*['\"](.*?)['\"])")
+        m = pat.search(body)
+        if m and m.group(2).strip():
+            out['preload_was'] = m.group(2)
+            new = pat.sub(lambda mm: '#INFRATAK_DISABLED# ' + mm.group(1), body)
+            try:
+                with open(conf, 'w') as f:
+                    f.write(new)
+                out['preload_disabled'] = True
+            except OSError as e:
+                out['preload_error'] = str(e)
+    out['compromised'] = bool(out['quarantined'] or out['preload_disabled'])
+    return out
+
+
 def _check_pg_dump(req):
     path = req.get('path')
     p = _abs(path)
@@ -1490,6 +1584,30 @@ def _do_pg_restore(req):
             'stderr': (proc.stderr or b'').decode(errors='replace')[-500:]}
 
 
+# /etc/ssl/openssl.cnf is a ROOT CODE-EXEC surface (it can load engines/providers
+# via .so). The console's ONE legitimate edit is flipping the cert subject encoding
+# for TAK client compat: `string_mask = utf8only` -> `string_mask = nombstr`. So
+# rather than allowlist writes to it (which would hand the console a code-exec
+# primitive), the broker permits a write ONLY when the new content is EXACTLY the
+# current file with that single substitution applied — nothing else changed.
+_OPENSSL_CNF = '/etc/ssl/openssl.cnf'
+_OPENSSL_FROM = 'string_mask = utf8only'
+_OPENSSL_TO = 'string_mask = nombstr'
+
+
+def _check_openssl_cnf_write(req):
+    try:
+        with open(_OPENSSL_CNF) as f:
+            cur = f.read()
+    except OSError as e:
+        raise Denied(f'openssl.cnf: cannot read current file to validate patch: {e}')
+    new = base64.b64decode(req.get('content_b64') or '').decode('utf-8', 'replace')
+    expected = cur.replace(_OPENSSL_FROM, _OPENSSL_TO)
+    if new != expected:
+        raise Denied('openssl.cnf: write is not the exact string_mask patch (refused '
+                     '— this file can load code, so only the one known edit is allowed)')
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -1497,12 +1615,16 @@ def _evaluate(req):
     try:
         if op == 'exec':
             check_exec(req.get('argv') or [], req.get('cwd'))
+        elif op == 'write' and _abs(req.get('path')) == _OPENSSL_CNF:
+            _check_openssl_cnf_write(req)      # exact-patch gate, not a blanket allow
         elif op in ('write', 'read'):
             _path_allowed(req.get('path'), readonly=(op == 'read'))
         elif op == 'pg_dump':
             _check_pg_dump(req)
         elif op == 'pg_restore':
             _check_pg_restore(req)
+        elif op == 'pgminer_scan':
+            _check_pgminer_scan(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -1543,15 +1665,19 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore'):
+    if op in ('pg_dump', 'pg_restore', 'pgminer_scan'):
         verdict, reason = _evaluate(req)
-        summary = _summary(req)
+        summary = req.get('container', '') if op == 'pgminer_scan' else _summary(req)
         if verdict == 'DENY':
             # fail-closed in BOTH modes — new ops, nothing legacy to preserve
             audit(peer, op, summary, 'DENY', reason)
             return {'ok': False, 'code': 'DENIED', 'error': reason}
         audit(peer, op, summary, 'ALLOW')
-        return _do_pg_dump(req) if op == 'pg_dump' else _do_pg_restore(req)
+        if op == 'pg_dump':
+            return _do_pg_dump(req)
+        if op == 'pg_restore':
+            return _do_pg_restore(req)
+        return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
         summary = _summary(req)
@@ -1878,6 +2004,11 @@ def cli_selftest():
          {'op': 'pg_dump', 'path': '/etc/evil.pgdump'}),
         ('Policy blocks write to /root/.ssh',
          {'op': 'write', 'path': '/root/.ssh/authorized_keys'}),
+        ('Policy blocks non-patch openssl.cnf write',
+         {'op': 'write', 'path': '/etc/ssl/openssl.cnf',
+          'content_b64': base64.b64encode(b'engines=/tmp/evil.so\n').decode()}),
+        ('Policy blocks pgminer_scan of an unlisted container',
+         {'op': 'pgminer_scan', 'container': 'evil'}),
     ):
         try:
             r = client_send({'op': 'check', 'req': req})

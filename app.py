@@ -67976,72 +67976,86 @@ def _post_update_auto_deploy():
                         return
                     print("Post-update: CloudTAK security hardening (v0.9.11)...")
 
-                    # 1. Locate postgis data volume host path (works for running OR
-                    #    stopped container as long as the container still exists).
-                    _pg_data_path = None
-                    try:
-                        _ins = subprocess.run(
-                            _sudo_wrap(['docker', 'inspect', 'cloudtak-postgis-1', '-f',
-                             '{{ range .Mounts }}{{ if eq .Destination "/var/lib/postgresql/data" }}{{ .Source }}{{ end }}{{ end }}']),
-                            capture_output=True, text=True, timeout=10
-                        )
-                        if _ins.returncode == 0 and _ins.stdout.strip():
-                            _pg_data_path = _ins.stdout.strip()
-                    except Exception:
-                        pass
-
-                    # 2. Detection
+                    # 1-2. Detect + remediate the PGMiner payload. v10.0.8: the postgres
+                    #    data dir is a ROOT-owned docker volume with a RANDOM name and must
+                    #    be scannable with the container stopped, so a non-root console can't
+                    #    reach it and the path can't be allowlisted. The broker does the fixed,
+                    #    scoped remediation ITSELF (pgminer_scan op) on the resolved
+                    #    cloudtak-postgis volume: find + quarantine .so, comment a live
+                    #    shared_preload_libraries. It never writes attacker content, so it
+                    #    can't be turned into a malware-plant. A pre-broker root console falls
+                    #    back to the direct host-volume scan.
                     _compromised = False
                     _quarantined = []
                     _pgconf_disabled = False
-                    # v10.0.5 non-root: the postgres data dir is a ROOT-owned docker volume —
-                    # takwerx can't listdir/makedirs/rename/open inside it, so every raw op here
-                    # silently failed and MISSED the compromise. Route all of it through the broker.
-                    if _pg_data_path:
+                    if _broker_should_route() and _broker_available():
                         try:
-                            _lsf = subprocess.run(_sudo_wrap(['find', _pg_data_path, '-maxdepth', '1', '-name', '*.so', '-type', 'f']),
-                                                  capture_output=True, text=True, timeout=30)
-                            _so_files = [os.path.basename(p) for p in (_lsf.stdout or '').splitlines() if p.strip().lower().endswith('.so')]
-                            if _so_files:
-                                _compromised = True
-                                _ts = time.strftime('%Y%m%d-%H%M%S')
-                                _quar_dir = os.path.join(_pg_data_path, f'quarantine-{_ts}')
-                                subprocess.run(_sudo_wrap(['mkdir', '-p', _quar_dir]), capture_output=True, timeout=15)
-                                for _f in _so_files:
-                                    _mvq = subprocess.run(_sudo_wrap(['mv', os.path.join(_pg_data_path, _f), os.path.join(_quar_dir, _f)]),
-                                                          capture_output=True, text=True, timeout=15)
-                                    if _mvq.returncode == 0:
-                                        _quarantined.append(_f)
-                                    else:
-                                        print(f"  WARNING: failed to quarantine {_f}: {(_mvq.stderr or '')[:120]}")
+                            _scan = _broker_request({'op': 'pgminer_scan',
+                                                     'container': 'cloudtak-postgis-1'}, timeout=90)
+                            if _scan.get('ok'):
+                                _quarantined = _scan.get('quarantined') or []
+                                _pgconf_disabled = bool(_scan.get('preload_disabled'))
+                                _compromised = bool(_scan.get('compromised'))
                                 if _quarantined:
-                                    print(f"  Quarantined {len(_quarantined)} .so file(s) → {_quar_dir}")
-                        except Exception as _qde:
-                            print(f"  WARNING: quarantine failed: {_qde}")
-
-                        _pgconf = os.path.join(_pg_data_path, 'postgresql.conf')
+                                    print(f"  Quarantined {len(_quarantined)} .so file(s) in {_scan.get('data_dir')}")
+                                if _pgconf_disabled:
+                                    print(f"  Disabled malicious shared_preload_libraries → '{_scan.get('preload_was')}'")
+                            else:
+                                print(f"  WARNING: PGMiner scan via broker failed: {_scan.get('error')}")
+                        except Exception as _se:
+                            print(f"  WARNING: PGMiner scan via broker error: {_se}")
+                    else:
+                        # Pre-broker ROOT console: scan the host volume directly (root can).
+                        _pg_data_path = None
                         try:
-                            _conf = _read_priv(_pgconf)   # broker: root-owned volume
+                            _ins = subprocess.run(
+                                ['docker', 'inspect', 'cloudtak-postgis-1', '-f',
+                                 '{{ range .Mounts }}{{ if eq .Destination "/var/lib/postgresql/data" }}{{ .Source }}{{ end }}{{ end }}'],
+                                capture_output=True, text=True, timeout=10)
+                            if _ins.returncode == 0 and _ins.stdout.strip():
+                                _pg_data_path = _ins.stdout.strip()
                         except Exception:
-                            _conf = ''
-                        if _conf:
+                            pass
+                        if _pg_data_path:
                             try:
-                                _pat = re.compile(
-                                    r"^([ \t]*shared_preload_libraries[ \t]*=[ \t]*['\"](.*?)['\"])",
-                                    re.MULTILINE
-                                )
-                                _m = _pat.search(_conf)
-                                if _m and _m.group(2).strip():
+                                _lsf = subprocess.run(['find', _pg_data_path, '-maxdepth', '1', '-name', '*.so', '-type', 'f'],
+                                                      capture_output=True, text=True, timeout=30)
+                                _so_files = [os.path.basename(p) for p in (_lsf.stdout or '').splitlines() if p.strip().lower().endswith('.so')]
+                                if _so_files:
                                     _compromised = True
-                                    _new_conf = _pat.sub(
-                                        lambda mm: f"#INFRATAK_DISABLED# {mm.group(1)}",
-                                        _conf
-                                    )
-                                    _write_priv(_pgconf, _new_conf)   # broker
-                                    _pgconf_disabled = True
-                                    print(f"  Disabled malicious shared_preload_libraries → '{_m.group(2)}'")
-                            except Exception as _ce:
-                                print(f"  WARNING: postgresql.conf scan failed: {_ce}")
+                                    _ts = time.strftime('%Y%m%d-%H%M%S')
+                                    _quar_dir = os.path.join(_pg_data_path, f'quarantine-{_ts}')
+                                    subprocess.run(['mkdir', '-p', _quar_dir], capture_output=True, timeout=15)
+                                    for _f in _so_files:
+                                        _mvq = subprocess.run(['mv', os.path.join(_pg_data_path, _f), os.path.join(_quar_dir, _f)],
+                                                              capture_output=True, text=True, timeout=15)
+                                        if _mvq.returncode == 0:
+                                            _quarantined.append(_f)
+                                    if _quarantined:
+                                        print(f"  Quarantined {len(_quarantined)} .so file(s) → {_quar_dir}")
+                            except Exception as _qde:
+                                print(f"  WARNING: quarantine failed: {_qde}")
+                            _pgconf = os.path.join(_pg_data_path, 'postgresql.conf')
+                            try:
+                                with open(_pgconf) as _cf:
+                                    _conf = _cf.read()
+                            except Exception:
+                                _conf = ''
+                            if _conf:
+                                try:
+                                    _pat = re.compile(
+                                        r"^([ \t]*shared_preload_libraries[ \t]*=[ \t]*['\"](.*?)['\"])",
+                                        re.MULTILINE)
+                                    _m = _pat.search(_conf)
+                                    if _m and _m.group(2).strip():
+                                        _compromised = True
+                                        _new_conf = _pat.sub(lambda mm: f"#INFRATAK_DISABLED# {mm.group(1)}", _conf)
+                                        with open(_pgconf, 'w') as _cf:
+                                            _cf.write(_new_conf)
+                                        _pgconf_disabled = True
+                                        print(f"  Disabled malicious shared_preload_libraries → '{_m.group(2)}'")
+                                except Exception as _ce:
+                                    print(f"  WARNING: postgresql.conf scan failed: {_ce}")
 
                     # 3. If compromised: stop everything, write a banner file, do
                     #    NOT recreate. Operator must do Remove + Reinstall.
