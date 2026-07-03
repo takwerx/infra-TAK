@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.6-alpha)**
+**Current release: [v10.0.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.7-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.7-alpha — 2026-07-03 — One TURN port per job: Remote Assist always on 3479, NetBird always on 3478
+
+**Headline: the Remote Assist TURN server (CoTURN) and NetBird now have a permanent port split, so they can be installed on the same server in any order without conflicts.** Previously the suggested CoTURN port depended on whether NetBird was already installed — which meant the "right" port changed from box to box, and installing CoTURN first on the standard port would make a later NetBird deployment fail with a raw Docker error. Now it's fixed and fleet-wide: **CoTURN always installs on 3479, and 3478 is permanently reserved for NetBird** (Remote Assist clients are told the port explicitly, so nothing needs the standard port). The NetBird deploy also gained a pre-flight check: if an older CoTURN install is still holding 3478, it refuses up front with clear instructions (uninstall CoTURN, reinstall — it lands on 3479 automatically) instead of failing mid-deploy. **Existing CoTURN installs keep working unchanged on their current port.** Remember to open **UDP/TCP 3479 + UDP 50000–50050** in your cloud security group for new installs. Validated on **Ubuntu 22.04, Rocky / RHEL 9, and ARM64** (fresh ARM64 install landed on 3479 first try). **Upgrade:** applied automatically on the next console update; no action required unless you plan to add NetBird to a box whose CoTURN sits on 3478.
+
+Full notes: [v10.0.7-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.7-alpha).
 
 ### v10.0.6-alpha — 2026-07-03 — WebODM single sign-on, TURN alongside NetBird, same-domain email fixed, and scheduled TAK backups that actually run
 
