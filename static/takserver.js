@@ -1139,7 +1139,7 @@ function initTakDeployModeUI(rootEl){
       '<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px">',
       '<div style="font-size:12px;color:var(--cyan);font-weight:600;margin-bottom:8px">Server Two: Core Server</div>',
       '<div class="form-field"><label>Host / IP</label><input type="text" id="ts_server_two_host" placeholder="10.0.0.22"></div>',
-      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_two_user" placeholder="root"></div>',
+      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_two_user" placeholder="root"><div style="font-size:10px;color:var(--text-dim);margin-top:3px">Cloud boxes use the AMI/admin user (AWS: <code>rocky</code>/<code>ubuntu</code>/<code>ec2-user</code>; Azure: your VM admin), <b>not</b> <code>root</code>. VPS / SSD&nbsp;Nodes use <code>root</code>.</div></div>',
       '<div class="form-field"><label>SSH Port</label><input type="number" id="ts_server_two_port" value="22"></div>',
       '<div class="form-field"><label>Auth Method</label><select id="ts_server_two_auth" onchange="toggleTwoServerAuthInputs(\'two\')" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:13px"><option value="ssh_key">SSH key</option><option value="password">User/password</option></select></div>',
       '<div class="form-field" id="ts_server_two_key_wrap"><label>SSH Key Path</label><input type="text" id="ts_server_two_key" placeholder="~/.ssh/id_rsa"></div>',
@@ -1819,7 +1819,16 @@ function uploadUpgradeDeb(file){
       updateUpgradeFileReady();
       var m=document.getElementById('tak-update-msg');if(m)m.textContent='';
     }
-    else{barInner.style.background='var(--red)';pct.textContent='\u2717';pct.style.color='var(--red)';}
+    else{
+      // Non-200 (e.g. wrong package family for this OS). Surface the server's
+      // message \u2014 a bare red \u2717 left operators guessing why the upload failed.
+      var _emsg='Upload rejected';
+      try{var _ed=JSON.parse(xhr.responseText);if(_ed&&_ed.error)_emsg=_ed.error;}catch(_e){}
+      barInner.style.background='var(--red)';pct.style.color='var(--red)';
+      lbl.innerHTML=file.name+' \u2014 <span style="color:var(--red)">'+_emsg+'</span>';
+      pct.textContent='\u2717';
+      var _xb=document.createElement('span');_xb.textContent=' \u2717';_xb.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;opacity:0.8';_xb.title='Dismiss';_xb.onclick=function(ev){ev.stopPropagation();row.remove();};pct.appendChild(_xb);
+    }
   };
   xhr.onerror=function(){row._xhr=null;upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='\u2717 Failed';pct.style.color='var(--red)';};
   xhr.onabort=function(){row._xhr=null;upgradeXhr=null;};

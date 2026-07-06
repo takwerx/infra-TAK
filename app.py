@@ -668,7 +668,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.8-alpha"
+VERSION = "10.0.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -698,11 +698,11 @@ REMOTE_ASSIST_PORT = 8767
 REMOTE_ASSIST_DEVICE_PORT = 8448
 REMOTE_ASSIST_OIDC_SLUG = "eud-remote-assist"
 REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
-# Fleet-vetted NetBird image pins — NEVER ':latest' (boxes deployed days apart must
-# converge to one version; netbirdio pushes new minors every few days). Bump these in an
-# infra-TAK release after T&E. Current values = what ':latest' resolved to on 2026-06-10.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.39.0"
+# NetBird tracks upstream: the module checks netbirdio's latest GitHub release and the
+# operator decides when to click Update (which docker-compose-pulls the newest image).
+# NOT pinned/vetted — only Authentik follows the vetted-release model on this fleet.
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:latest"
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:latest"
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
@@ -8252,7 +8252,11 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
         f'NGINX_BIND_ADDR=127.0.0.1',
         f'HTTP_PORT={REMOTE_ASSIST_PORT}',
         f'NGINX_ENABLE_TLS=false',
-        f'PHONEDB_TLS_INSECURE=true',
+        # v10.0.9 security scan: keep upstream TLS verification ON for the phonedb.net
+        # lookup (upstream .env.example ships it disabled-by-default — a MITM could inject
+        # crafted HTML into device model metadata rendered in the admin console). CJIS bar
+        # forbids disabled cert verification; the lookup is non-critical, so fail-closed.
+        f'PHONEDB_TLS_INSECURE=false',
     ]
     env_path = os.path.join(ra_dir, '.env')
     with open(env_path, 'w') as f:
@@ -15407,6 +15411,17 @@ def caddy_set_ssl_mode():
         restart_r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         if restart_r.returncode != 0:
             return jsonify({'success': False, 'error': f'Switched setting, but Caddy reload failed: {(reload_r.stdout or reload_r.stderr or "").strip()[:300]}'}), 500
+    # v10.0.9: switching to LE makes Caddy reissue the stream cert with a fresh 0600
+    # dir/file, dropping MediaMTX's group-read grant → crash-loop (memory
+    # mediamtx-cert-grant-renewal-fragile gap 2). Re-assert the grant once the ACME
+    # cert has had time to issue — in the background so the response isn't blocked.
+    if os.path.exists('/etc/systemd/system/mediamtx.service'):
+        def _delayed_mtx_grant():
+            for _ in range(20):  # up to ~100s for ACME issuance
+                time.sleep(5)
+                if _reassert_mediamtx_cert_grant(lambda m: print(f"ssl-mode flip: {m}", flush=True)):
+                    return
+        threading.Thread(target=_delayed_mtx_grant, daemon=True).start()
     return jsonify({'success': True, 'message': "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."})
 
 
@@ -17551,21 +17566,38 @@ def _check_authentik_api_reachable(settings):
 
 
 def _get_authentik_env_content(settings):
-    """Return raw content of Authentik .env (local file or fetched via SSH when remote). None if unavailable."""
+    """Return raw content of Authentik .env (local file or fetched via SSH when remote). None if unavailable.
+
+    v10.0.9: on a non-root (takwerx) console the Authentik .env may be (a) still at the root-era
+    /root/authentik/.env, or (b) present at ~/authentik/.env but owned root:root — a raw open()
+    then returns nothing, so callers read an EMPTY token and (e.g.) overwrite TAK Portal's good
+    token with "" during the non-root flip window. Try both candidate paths, and for each fall
+    back to a privileged read (_read_priv → broker/sudo) so a root-owned or not-yet-re-homed .env
+    is still reachable. (memory nonroot-flip-strands-root-era-module-dirs)"""
     cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     if cfg.get('target_mode') == 'remote' and (cfg.get('remote', {}).get('host') or '').strip():
         ok, out = _ssh_probe(cfg['remote'], 'cat ~/authentik/.env 2>/dev/null', timeout=15)
         if ok and out and out.strip():
             return out.strip()
         return None
-    path = os.path.expanduser('~/authentik/.env')
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path) as f:
-            return f.read()
-    except Exception:
-        return None
+    for path in (os.path.expanduser('~/authentik/.env'), '/root/authentik/.env'):
+        # Fast path: direct read when the console can read it.
+        try:
+            if os.path.isfile(path):
+                with open(path) as f:
+                    txt = f.read()
+                if txt and txt.strip():
+                    return txt
+        except Exception:
+            pass
+        # Privileged read: reaches a root-owned / not-yet-re-homed .env from the takwerx console.
+        try:
+            txt = _read_priv(path)
+            if txt and txt.strip():
+                return txt
+        except Exception:
+            pass
+    return None
 
 
 def _get_authentik_env_value(settings, key):
@@ -20163,23 +20195,22 @@ def _get_netbird_version_info():
     if dash_ver:
         parts.append('dash ' + dash_ver)
     out['version'] = ' · '.join(parts)
-    # v10.0.5: NetBird is PINNED (no :latest — see netbird pin policy). "Update Now" deploys the
-    # PINNED image, NOT GitHub's latest — so the update-available check must compare the running
-    # version against the PIN, else the badge never clears (GitHub latest > pin → perpetual
-    # "update available" right after a successful update, which is the bug being fixed).
-    mgmt_pin = NETBIRD_SERVER_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
-    dash_pin = NETBIRD_DASHBOARD_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
-    mgmt_behind = bool(mgmt_ver and mgmt_pin
-                       and _netbird_version_tuple(mgmt_pin) > _netbird_version_tuple(mgmt_ver))
-    dash_behind = bool(dash_ver and dash_pin
-                       and _netbird_version_tuple(dash_pin) > _netbird_version_tuple(dash_ver))
+    # NetBird tracks upstream (images are :latest). Compare the running image version against
+    # netbirdio's latest GitHub release so the badge lights when a newer release ships and
+    # clears after the operator clicks Update (which docker-compose-pulls the newest image).
+    mgmt_latest = (_get_netbird_github_latest('netbird') or '').lstrip('vV')
+    dash_latest = (_get_netbird_github_latest('dashboard') or '').lstrip('vV')
+    mgmt_behind = bool(mgmt_ver and mgmt_latest
+                       and _netbird_version_tuple(mgmt_latest) > _netbird_version_tuple(mgmt_ver))
+    dash_behind = bool(dash_ver and dash_latest
+                       and _netbird_version_tuple(dash_latest) > _netbird_version_tuple(dash_ver))
     if mgmt_behind or dash_behind:
         out['update_available'] = True
         latest_parts = []
         if mgmt_behind:
-            latest_parts.append(mgmt_pin)
+            latest_parts.append(mgmt_latest)
         if dash_behind:
-            latest_parts.append('dash ' + dash_pin)
+            latest_parts.append('dash ' + dash_latest)
         out['latest'] = ' · '.join(latest_parts)
     return out
 
@@ -20341,6 +20372,15 @@ def _takportal_build_settings_dict(settings):
     """Build infra-TAK managed TAK Portal settings dict (no merge)."""
     server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    # v10.0.9 preserve-on-empty: if the .env read comes back empty (e.g. a config rebuild racing
+    # the non-root flip's authentik re-home), do NOT clobber a good token already in TAK Portal's
+    # settings.json — reuse the existing one. Same "never overwrite good state with nothing" rule
+    # as Node-RED config persistence. Only touches the empty case; healthy builds are unchanged.
+    if not (ak_token or '').strip():
+        _existing = _takportal_get_existing_settings()
+        _prev_tok = (_existing.get('AUTHENTIK_TOKEN') or '').strip() if isinstance(_existing, dict) else ''
+        if _prev_tok:
+            ak_token = _prev_tok
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
     ak_upstream = _get_authentik_upstream(settings)
@@ -20428,6 +20468,59 @@ def _takportal_merged_settings_json(settings):
             continue
         merged[k] = v
     return json.dumps(merged, indent=2)
+
+
+def _heal_takportal_authentik_token(plog=None):
+    """v10.0.9: self-heal TAK Portal's AUTHENTIK_TOKEN when it was blanked by a config rebuild
+    that raced the non-root flip's Authentik re-home (memory nonroot-flip-strands-root-era-module-dirs).
+
+    On a box flipped to non-root, a TAK Portal 'update config' that ran BEFORE ~/authentik/.env
+    became readable wrote AUTHENTIK_TOKEN:"" — freezing TAK Portal user management ('Missing
+    AUTHENTIK_TOKEN in settings.json'). The token reads fine after the re-home, but settings.json
+    was never rebuilt. This re-pushes a valid token on the next console boot so an affected box
+    self-heals through the normal update (pull + restart) path — no manual 'Update config'.
+
+    Idempotent: skips when the token is already present, TAK Portal isn't running, or no valid
+    token can be read. Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'tak-portal']),
+                           capture_output=True, text=True, timeout=8)
+        if (r.stdout or '').strip() != 'true':
+            return False  # container not running — nothing to heal / can't push
+        existing = _takportal_get_existing_settings()
+        if not isinstance(existing, dict):
+            return False
+        if (existing.get('AUTHENTIK_TOKEN') or '').strip():
+            return False  # token present — healthy box, leave it alone
+        settings = load_settings()
+        new_tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                   or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '').strip()
+        if not new_tok:
+            _log("  takportal: AUTHENTIK_TOKEN blank but none readable from Authentik .env yet — skip heal")
+            return False
+        _log("  takportal: AUTHENTIK_TOKEN blank in settings.json — re-pushing valid token (non-root flip-window heal)")
+        settings_json = _takportal_merged_settings_json(settings)
+        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-heal-')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(settings_json)
+            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
+                                capture_output=True, text=True, timeout=20)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if cp.returncode != 0:
+            _log(f"  takportal: heal docker cp failed: {(cp.stderr or cp.stdout or '').strip()[:200]}")
+            return False
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+        _log("  ✓ takportal: AUTHENTIK_TOKEN restored + container restarted")
+        return True
+    except Exception as e:
+        _log(f"  takportal: AUTHENTIK_TOKEN heal error (non-fatal): {e}")
+        return False
 
 
 def _takportal_setup_ssh(log_fn=None):
@@ -27266,6 +27359,43 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
     return message
 
 
+def _authentik_ldap_recreate_in_flight():
+    """True while authentik-ldap-1 exists but is not Up (mid-recreate/restarting).
+
+    The Email-Relay deploy's SMTP restart must not touch the Authentik stack while the
+    LDAP outpost is being recreated (e.g. an Authentik deploy's outpost step just ran) —
+    concurrent compose ops collide on the container name and abort mid-recreate, leaving
+    Authentik down (memory authentik-deploy-emailrelay-smtp-restart-conflict)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=authentik-ldap-1',
+                                       '--format', '{{.Status}}']),
+                           capture_output=True, text=True, timeout=10)
+        lines = [l for l in (r.stdout or '').strip().splitlines() if l.strip()]
+        if not lines:
+            return False  # no LDAP outpost container — nothing to race
+        return not lines[0].startswith('Up')
+    except Exception:
+        return False
+
+
+def _authentik_recover_compose_conflict(ak_dir, err, plog):
+    """Self-heal the 'container name already in use' compose abort: rm -f the conflicting
+    container(s) named in the error, then bring the full stack up. This is the manual
+    recovery operators used to run by hand (docker rm -f + up -d), now automatic."""
+    import re as _re
+    names = set(_re.findall(r'container name "/?([A-Za-z0-9._-]+)" is already in use', err))
+    if not names:
+        names = {'authentik-ldap-1'}  # the historical collider
+    for ref in sorted(names):
+        plog(f"  Removing conflicting container {ref}...")
+        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', ref]), capture_output=True, text=True, timeout=60)
+    r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--remove-orphans']),
+                       cwd=ak_dir, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f'Authentik recovery up -d failed: {(r.stderr or r.stdout)[:400]}')
+    plog("  ✓ Authentik stack recovered (conflicting containers removed, full up -d)")
+
+
 def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
     """Push SMTP settings into Authentik .env, restart containers, and set up recovery flow.
     Used by both the Email Relay deploy and the 'Configure Authentik' button.
@@ -27361,11 +27491,27 @@ services:
     # server/postgres/redis down + orphan containers (Authentik DOWN after a
     # "successful" deploy → broken LDAP flow → 8446 WebTAK). --no-deps leaves
     # postgres/redis/ldap untouched. --remove-orphans cleans any prior orphan.
+    # Pre-flight (v10.0.9): if the LDAP outpost is mid-recreate (Email Relay deployed
+    # right after/during an Authentik deploy), wait for it to settle before any compose
+    # op — bounded so a genuinely-down outpost cannot hang the deploy.
+    for _i in range(18):  # up to ~90s
+        if not _authentik_ldap_recreate_in_flight():
+            break
+        if _i == 0:
+            _log("  Authentik LDAP outpost is mid-recreate — waiting for it to settle...")
+        time.sleep(5)
     _log("  Recreating Authentik server + worker for SMTP (ldap/db/redis untouched)...")
     r = subprocess.run(
         _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', '--remove-orphans', 'server', 'worker']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
-        raise RuntimeError(f'Authentik restart failed: {r.stderr or r.stdout}')
+        _err = r.stderr or r.stdout or ''
+        if 'already in use' in _err:
+            # The race still fired: compose aborted mid-recreate. Recover automatically
+            # instead of leaving Authentik down for a manual rm -f + up -d.
+            _log("  ⚠ Compose name conflict detected — running automatic recovery...")
+            _authentik_recover_compose_conflict(ak_dir, _err, _log)
+        else:
+            raise RuntimeError(f'Authentik restart failed: {_err}')
 
     ak_token = ''
     if os.path.exists(env_path):
@@ -29498,7 +29644,14 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
 
 
 def _netbird_peer_stats_from_db(nb_dir=None):
-    """Read peer counts from local management store (same-host, no PAT required)."""
+    """Read peer counts from local management store (same-host, no PAT required).
+
+    Review #2 (PR #42) note: this SQL is fully static — no user/remote input is
+    interpolated, so there is no injection surface (opened `mode=ro` besides). The residual
+    risk is schema-coupling to NetBird's internal `store.db` (`peers.peer_status_connected`);
+    since NetBird tracks upstream (:latest), an upstream schema change could break this read —
+    it fails soft (try/except → None → callers fall back to the mgmt API), so a broken read
+    only blanks the peer-count stat, never the deploy."""
     import sqlite3
     nb_dir = nb_dir or NETBIRD_INSTALL_DIR
     db_path = os.path.join(nb_dir, 'data', 'store.db')
@@ -29544,7 +29697,13 @@ def _netbird_pat_is_valid(pat):
 
 
 def _netbird_finalize_account_store(plog=None):
-    """Clear onboarding/user-approval gates that hide admin menus (Setup Keys, etc.)."""
+    """Clear onboarding/user-approval gates that hide admin menus (Setup Keys, etc.).
+
+    Review #2 (PR #42) note: all three UPDATEs are static literals with no user/remote
+    input, so there is no injection surface. The residual is schema-coupling to NetBird's
+    internal `store.db` (account_onboardings / accounts / users); since NetBird tracks
+    upstream (:latest), an upstream schema change could break these — failure is soft
+    (try/except → False), so at worst the admin-menu gates aren't cleared, never a crash."""
     import sqlite3
     _log = plog or (lambda m: None)
     db_path = os.path.join(NETBIRD_INSTALL_DIR, 'data', 'store.db')
@@ -34891,6 +35050,18 @@ sudo netbird up --management-url {{ netbird_url }}</span>
         3. Set the <strong>Management URL</strong> to: <code style="color:var(--cyan);font-family:'JetBrains Mono'">{{ netbird_url }}</code><br>
         4. Click <strong>Connect</strong>. It will open Authentik in your browser. Log in, and the device will register.
       </p>
+
+      <div style="margin-top:16px;padding:10px 12px;border:1px solid rgba(234,179,8,.25);border-radius:6px;background:rgba(234,179,8,.06)">
+        <div style="font-size:12px;font-weight:600;color:var(--yellow)">Peers behind strict / symmetric NAT</div>
+        <p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-top:4px">
+          Most peers connect directly via STUN (UDP&nbsp;3478) or relay over 443. A peer behind
+          <strong>strict or symmetric NAT</strong> (some cellular/CGNAT and corporate networks) can't hole-punch and
+          must fall back to a <strong>TURN relay</strong>. If such a peer shows connected in the dashboard but
+          traffic doesn't flow, the box needs the CoTURN TURN relay reachable — see the Remote Assist
+          page's CoTURN setup (the 3478/3479 port split keeps NetBird and Remote Assist TURN from
+          colliding). Do <em>not</em> blindly open the legacy 49152–65535 TURN range.
+        </p>
+      </div>
     </div>
 
     <div class="card" id="netbird-logs-card" style="display:none">
@@ -41839,6 +42010,89 @@ def _heal_takwerx_user_missing_for_mediamtx(plog=None):
         return False
     except Exception as e:
         _log(f"  mediamtx: takwerx heal error (non-fatal): {e}")
+        return False
+
+
+def _reassert_mediamtx_cert_grant(plog=None):
+    """v10.0.9: re-assert MediaMTX's read access to Caddy's LE cert/key.
+
+    The grant (takwerx∈caddy group + g+rx on Caddy's cert dir chain + g+r on the
+    stream cert/key) is applied once at MediaMTX deploy time, but Caddy rewrites the
+    cert file 0600 caddy:caddy on every ~60-day LE renewal AND on an ssl_mode flip that
+    reissues certs — either drops the group-read bit and crash-loops mediamtx on the
+    cert path (memory mediamtx-cert-grant-renewal-fragile, gaps 2+3). This makes the
+    grant idempotent and renewal-proof so it can run on every console boot and after any
+    ssl_mode change.
+
+    Gating (all required): mediamtx.service exists, MediaMTX TLS is wired (mediamtx.yml
+    points hlsServerCert at Caddy's cert path), the stream cert file exists. Restarts
+    mediamtx ONLY when the grant was actually missing (cert/key not group-readable), so
+    a healthy box is never needlessly bounced. Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        if not os.path.exists('/etc/systemd/system/mediamtx.service'):
+            return False
+        settings = load_settings()
+        if not settings.get('fqdn'):
+            return False  # no domain → no LE cert path to grant (port-5080 plaintext)
+        mtx_domain = _get_service_domain(settings, 'mediamtx')
+        if not mtx_domain:
+            return False
+        cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+        cert_dir = f'{cert_base}/{mtx_domain}'
+        cert_file = f'{cert_dir}/{mtx_domain}.crt'
+        key_file = f'{cert_dir}/{mtx_domain}.key'
+        # Only act when MediaMTX is actually configured to read these files (TLS wired).
+        yml = '/usr/local/etc/mediamtx.yml'
+        try:
+            with open(yml) as f:
+                yml_txt = f.read()
+        except Exception:
+            return False
+        if cert_file not in yml_txt:
+            return False  # TLS not wired to Caddy's cert — nothing to grant (custom/plaintext)
+        if not os.path.exists(cert_file):
+            return False  # cert not issued yet — deploy/renewal will re-run this
+        # Detect whether the grant is already intact: takwerx (running mediamtx) can read
+        # the cert only if the file is group-readable AND the dir chain is group-traversable.
+        need = False
+        try:
+            import stat as _st
+            if not (os.stat(cert_file).st_mode & _st.S_IRGRP) or not (os.stat(key_file).st_mode & _st.S_IRGRP):
+                need = True
+            else:
+                for d in (cert_base, cert_dir):
+                    m = os.stat(d).st_mode
+                    if not (m & _st.S_IRGRP) or not (m & _st.S_IXGRP):
+                        need = True
+                        break
+        except Exception:
+            need = True  # can't stat (perm denied climbing the chain) → re-apply
+        if not need:
+            return False  # grant intact — healthy box, no restart
+        _log("  mediamtx: cert-read grant missing (renewal/ssl-flip dropped group perms) — re-applying")
+        subprocess.run('usermod -aG caddy takwerx 2>/dev/null; true', shell=True, capture_output=True, timeout=5)
+        for d in ('/var/lib/caddy',
+                  '/var/lib/caddy/.local',
+                  '/var/lib/caddy/.local/share',
+                  '/var/lib/caddy/.local/share/caddy',
+                  '/var/lib/caddy/.local/share/caddy/certificates',
+                  cert_base,
+                  cert_dir):
+            if os.path.exists(d):
+                subprocess.run(_sudo_wrap(['chmod', 'g+rx', d]), capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]), capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=20)
+        time.sleep(2)
+        r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=5)
+        if r.stdout.strip() == 'active':
+            _log("  ✓ mediamtx cert-read grant re-applied; service active")
+            return True
+        _log(f"  ⚠ mediamtx cert-read grant re-applied but service is {r.stdout.strip()!r}")
+        return False
+    except Exception as e:
+        _log(f"  mediamtx: cert-grant re-assert error (non-fatal): {e}")
         return False
 
 
@@ -66346,6 +66600,28 @@ def _startup_migrations():
             )
         except Exception as wx_err:
             print(f"Startup migration: takwerx user heal error (non-fatal): {wx_err}")
+
+        # v10.0.9 — re-assert MediaMTX's read access to Caddy's LE cert on every boot.
+        # Caddy rewrites the cert 0600 on each ~60-day renewal, dropping the group-read
+        # grant → mediamtx crash-loops on the cert path until re-deployed. This heals it
+        # on the next console restart. Idempotent + restart-only-when-broken.
+        try:
+            _reassert_mediamtx_cert_grant(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as mtx_cert_err:
+            print(f"Startup migration: mediamtx cert-grant re-assert error (non-fatal): {mtx_cert_err}")
+
+        # v10.0.9 — self-heal TAK Portal's AUTHENTIK_TOKEN if it was blanked by a config
+        # rebuild that raced the non-root flip's Authentik re-home (test6/test8 hit this:
+        # 'Missing AUTHENTIK_TOKEN in settings.json'). Re-pushes a valid token now that the
+        # .env is readable. Idempotent: skips when the token is already present.
+        try:
+            _heal_takportal_authentik_token(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as tp_tok_err:
+            print(f"Startup migration: takportal token heal error (non-fatal): {tp_tok_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
