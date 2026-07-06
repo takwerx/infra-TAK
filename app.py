@@ -7844,6 +7844,7 @@ def netbird_page():
         netbird_upstream_newer=nb_vinfo.get('upstream_newer', False),
         netbird_upstream_latest=nb_vinfo.get('upstream_latest') or '',
         netbird_channel=nb_vinfo.get('channel', 'main'),
+        netbird_vetted=nb_vinfo.get('vetted') or '',
         deploy_log=_netbird_deploy_status.get('log', []),
         deploy_error=_netbird_deploy_status.get('error', False)
     )
@@ -35092,7 +35093,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="page-header">
     <h1>
       <img src="https://netbird.io/favicon.ico" alt="" style="height:32px;width:auto;object-fit:contain">
-      <span>NetBird VPN</span>{% if netbird_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ netbird_version }}</span>{% endif %}{% if netbird_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:4px">{{ netbird_latest }} available</span>{% endif %}{% if netbird_upstream_newer and netbird_upstream_latest %} <span style="font-size:11px;color:#f59e0b;font-weight:600;margin-left:4px" title="netbirdio has shipped v{{ netbird_upstream_latest }}, newer than the vetted pin. Not auto-installed — bump the dev pin to try it on dev, then promote to main if login + a peer connect pass.">↑ v{{ netbird_upstream_latest }} available upstream</span>{% endif %}
+      <span>NetBird VPN</span>{% if netbird_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ netbird_version }}</span>{% endif %}{% if netbird_channel == 'dev' and netbird_vetted %} <span style="color:#f59e0b;font-size:11px" title="Main channel is pinned to v{{ netbird_vetted }} — what production customers run">· main: v{{ netbird_vetted }}</span>{% endif %}{% if netbird_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:4px" title="Update to install v{{ netbird_latest }}">· v{{ netbird_latest }} available</span>{% elif netbird_upstream_newer and netbird_upstream_latest %} <span style="font-size:11px;color:#f59e0b;font-weight:600;margin-left:4px" title="netbirdio has shipped v{{ netbird_upstream_latest }}, newer than the vetted pin. Not auto-installed — bump the dev pin to try it on dev, then promote to main if login + a peer connect pass.">· ↑ v{{ netbird_upstream_latest }} available upstream</span>{% elif netbird_channel == 'main' %} <span style="color:var(--green);font-size:10px" title="Running the fleet-vetted NetBird release">· vetted ✓</span>{% endif %}
     </h1>
     <p>Zero-trust overlay WireGuard VPN with Authentik Identity Management and automatic NAT traversal</p>
   </div>
