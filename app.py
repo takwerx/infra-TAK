@@ -698,11 +698,16 @@ REMOTE_ASSIST_PORT = 8767
 REMOTE_ASSIST_DEVICE_PORT = 8448
 REMOTE_ASSIST_OIDC_SLUG = "eud-remote-assist"
 REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
-# NetBird tracks upstream: the module checks netbirdio's latest GitHub release and the
-# operator decides when to click Update (which docker-compose-pulls the newest image).
-# NOT pinned/vetted — only Authentik follows the vetted-release model on this fleet.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:latest"
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:latest"
+# NetBird is PINNED to a vetted, tested version — like Authentik, it is a stateful control
+# plane (own DB + OIDC/JWT auth config) and netbirdio ships breaking changes frequently. A
+# v10.0.9 experiment to track :latest pulled a huge jump (server 0.72.3→"24.04", dashboard
+# v2.39→v2.90) whose new auth model rejected every token → fleet-wide 401 "token invalid".
+# So NetBird follows the vetted-release model: the card shows the running version and offers
+# Update, but Update installs THIS pin, not raw upstream. Bump these ONLY after T&E, and
+# validate dashboard login + a peer connect on the new version before promoting. These values
+# = the last field-validated working pair. (recovery proven on test6/8/12 2026-07-06)
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.39.0"
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
@@ -7864,10 +7869,10 @@ def netbird_control_api():
     
     import subprocess as _sp
     if action == 'update':
-        # v10.0.9: NetBird tracks upstream (:latest). Existing boxes' on-disk compose still
-        # carries the tag it was deployed with (e.g. the old 0.72.3 pin), so a bare `pull`
-        # would re-fetch that exact tag and the update badge would never clear. Rewrite the
-        # image tags to the current constants (:latest) first, so pull actually gets newest.
+        # v10.0.9: NetBird is pinned. A box may carry a stale/broken tag on disk (an older pin,
+        # or the briefly-shipped :latest that broke auth), so rewrite the compose to the vetted
+        # pin BEFORE pull — Update always converges the box onto the tested image, never chases
+        # upstream latest. (Bumping the pin in a release is what actually moves NetBird forward.)
         _netbird_sync_compose_image_tags(nb_dir)
         pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)
@@ -20200,22 +20205,23 @@ def _get_netbird_version_info():
     if dash_ver:
         parts.append('dash ' + dash_ver)
     out['version'] = ' · '.join(parts)
-    # NetBird tracks upstream (images are :latest). Compare the running image version against
-    # netbirdio's latest GitHub release so the badge lights when a newer release ships and
-    # clears after the operator clicks Update (which docker-compose-pulls the newest image).
-    mgmt_latest = (_get_netbird_github_latest('netbird') or '').lstrip('vV')
-    dash_latest = (_get_netbird_github_latest('dashboard') or '').lstrip('vV')
-    mgmt_behind = bool(mgmt_ver and mgmt_latest
-                       and _netbird_version_tuple(mgmt_latest) > _netbird_version_tuple(mgmt_ver))
-    dash_behind = bool(dash_ver and dash_latest
-                       and _netbird_version_tuple(dash_latest) > _netbird_version_tuple(dash_ver))
+    # NetBird is PINNED (see NETBIRD_SERVER_IMAGE). "Update Now" installs the PIN, not GitHub's
+    # latest — so the update-available check compares the running version against the PIN, else
+    # the badge never clears (a newer upstream would show a perpetual "update available" that
+    # Update can't satisfy, and — as v10.0.9 proved — chasing latest breaks NetBird's auth).
+    mgmt_pin = NETBIRD_SERVER_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
+    dash_pin = NETBIRD_DASHBOARD_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
+    mgmt_behind = bool(mgmt_ver and mgmt_pin
+                       and _netbird_version_tuple(mgmt_pin) > _netbird_version_tuple(mgmt_ver))
+    dash_behind = bool(dash_ver and dash_pin
+                       and _netbird_version_tuple(dash_pin) > _netbird_version_tuple(dash_ver))
     if mgmt_behind or dash_behind:
         out['update_available'] = True
         latest_parts = []
         if mgmt_behind:
-            latest_parts.append(mgmt_latest)
+            latest_parts.append(mgmt_pin)
         if dash_behind:
-            latest_parts.append('dash ' + dash_latest)
+            latest_parts.append('dash ' + dash_pin)
         out['latest'] = ' · '.join(latest_parts)
     return out
 
@@ -29650,9 +29656,9 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
 
 def _netbird_sync_compose_image_tags(nb_dir):
     """Rewrite the NetBird compose's image: tags to the current NETBIRD_SERVER_IMAGE /
-    NETBIRD_DASHBOARD_IMAGE constants (:latest). Existing boxes were deployed with a fixed tag
-    baked into docker-compose.yml; since NetBird now tracks upstream, `docker compose pull` must
-    run against :latest to actually fetch the newest image. Idempotent; best-effort (never raises)."""
+    NETBIRD_DASHBOARD_IMAGE constants (the vetted PIN). A box may carry a different tag on disk —
+    an older pin, or the broken :latest a box was briefly moved to — so pin the compose before
+    any `docker compose pull` so it fetches exactly the vetted image. Idempotent; best-effort."""
     import re as _re
     compose = os.path.join(nb_dir, 'docker-compose.yml')
     try:
@@ -29677,15 +29683,59 @@ def _netbird_sync_compose_image_tags(nb_dir):
             return False
 
 
+def _heal_netbird_pinned_image(plog=None):
+    """v10.0.9: roll a NetBird box back onto the vetted pin if its compose carries a different
+    image tag — e.g. the briefly-shipped :latest that jumped server 0.72.3→"24.04" / dashboard
+    v2.39→v2.90 and broke auth fleet-wide (401 'token invalid'). Detects drift from the on-disk
+    compose tag, rewrites to the pin, pulls, and recreates so the box self-heals on the next
+    console boot. Idempotent: a box already on the pin is a no-op (no pull, no restart).
+    Best-effort; never raises. (Recovery proven manually on test6/8/12 2026-07-06 — 0.72.3 starts
+    clean against the newer-migrated store.db and the 401s stop.)"""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        nb_dir = None
+        for d in (os.path.expanduser('~/netbird'), '/root/netbird'):
+            if os.path.isfile(os.path.join(d, 'docker-compose.yml')):
+                nb_dir = d
+                break
+        if not nb_dir:
+            return False  # NetBird not installed
+        compose = os.path.join(nb_dir, 'docker-compose.yml')
+        try:
+            with open(compose) as f:
+                txt = f.read()
+        except Exception:
+            try:
+                txt = _read_priv(compose)
+            except Exception:
+                return False
+        if NETBIRD_SERVER_IMAGE in txt and NETBIRD_DASHBOARD_IMAGE in txt:
+            return False  # already on the vetted pin — healthy, no-op
+        _log(f"  netbird: compose off the vetted pin — restoring {NETBIRD_SERVER_IMAGE} + recreating")
+        _netbird_sync_compose_image_tags(nb_dir)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
+                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=180)
+        if r.returncode == 0:
+            _log("  ✓ netbird: restored to vetted pin + recreated")
+            return True
+        _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+        return False
+    except Exception as e:
+        _log(f"  netbird: pin-restore heal error (non-fatal): {e}")
+        return False
+
+
 def _netbird_peer_stats_from_db(nb_dir=None):
     """Read peer counts from local management store (same-host, no PAT required).
 
     Review #2 (PR #42) note: this SQL is fully static — no user/remote input is
     interpolated, so there is no injection surface (opened `mode=ro` besides). The residual
     risk is schema-coupling to NetBird's internal `store.db` (`peers.peer_status_connected`);
-    since NetBird tracks upstream (:latest), an upstream schema change could break this read —
-    it fails soft (try/except → None → callers fall back to the mgmt API), so a broken read
-    only blanks the peer-count stat, never the deploy."""
+    tolerated because the image is PINNED (NETBIRD_SERVER_IMAGE) so the schema is fixed — RE-VERIFY
+    this table/column on any pin bump. Fails soft (try/except → None → callers fall back to the
+    mgmt API), so a broken read only blanks the peer-count stat, never the deploy."""
     import sqlite3
     nb_dir = nb_dir or NETBIRD_INSTALL_DIR
     db_path = os.path.join(nb_dir, 'data', 'store.db')
@@ -29735,9 +29785,9 @@ def _netbird_finalize_account_store(plog=None):
 
     Review #2 (PR #42) note: all three UPDATEs are static literals with no user/remote
     input, so there is no injection surface. The residual is schema-coupling to NetBird's
-    internal `store.db` (account_onboardings / accounts / users); since NetBird tracks
-    upstream (:latest), an upstream schema change could break these — failure is soft
-    (try/except → False), so at worst the admin-menu gates aren't cleared, never a crash."""
+    internal `store.db` (account_onboardings / accounts / users), tolerated because the image
+    is PINNED (NETBIRD_SERVER_IMAGE) — RE-VERIFY these tables/columns on any pin bump. Failure
+    is soft (try/except → False), so at worst the admin-menu gates aren't cleared, never a crash."""
     import sqlite3
     _log = plog or (lambda m: None)
     db_path = os.path.join(NETBIRD_INSTALL_DIR, 'data', 'store.db')
@@ -66662,6 +66712,16 @@ def _startup_migrations():
             )
         except Exception as tp_tok_err:
             print(f"Startup migration: takportal token heal error (non-fatal): {tp_tok_err}")
+
+        # v10.0.9 — roll NetBird back onto the vetted pin if a box drifted off it (the
+        # briefly-shipped :latest broke auth fleet-wide with 401 'token invalid'). No-op on
+        # boxes already on the pin. See _heal_netbird_pinned_image.
+        try:
+            _heal_netbird_pinned_image(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as nb_pin_err:
+            print(f"Startup migration: netbird pin-restore error (non-fatal): {nb_pin_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
