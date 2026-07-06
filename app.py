@@ -701,13 +701,29 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # NetBird is PINNED to a vetted, tested version — like Authentik, it is a stateful control
 # plane (own DB + OIDC/JWT auth config) and netbirdio ships breaking changes frequently. A
 # v10.0.9 experiment to track :latest pulled a huge jump (server 0.72.3→"24.04", dashboard
-# v2.39→v2.90) whose new auth model rejected every token → fleet-wide 401 "token invalid".
-# So NetBird follows the vetted-release model: the card shows the running version and offers
-# Update, but Update installs THIS pin, not raw upstream. Bump these ONLY after T&E, and
-# validate dashboard login + a peer connect on the new version before promoting. These values
-# = the last field-validated working pair. (recovery proven on test6/8/12 2026-07-06)
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"
+# v2.39→v2.90) whose new auth model rejected every token → fleet-wide 401 "token invalid"
+# (root cause: netbirdio changed config.yaml's schema, so the new server read the 0.72-format
+# auth config as empty and rejected every login). So NetBird follows the SAME dev/vetted model
+# as Authentik:
+#   - Main-channel boxes run the VETTED pins below (never offered a version above them).
+#   - Dev-channel boxes (update_channel='dev') run the DEV candidate — bump those to try a newer
+#     NetBird, validate dashboard-login + a peer connect, then promote DEV → VETTED in a release.
+# The card shows the running version + (on dev) surfaces when upstream has shipped something
+# newer, as AWARENESS only — Update always installs the channel target, never raw upstream.
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.39.0"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.72.3"  # DEV candidate under validation (== vetted until a newer one is being tried)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.39.0"
+
+
+def _get_netbird_target_images(settings=None):
+    """(server_image, dashboard_image) for this box's update channel — mirrors
+    _get_authentik_target_release. Dev channel → the candidate under validation; main → the
+    vetted pins. Deploy/update/self-heal all converge a box onto its channel target."""
+    s = settings if settings is not None else load_settings()
+    if (s.get('update_channel') or 'main').strip().lower() == 'dev':
+        return NETBIRD_SERVER_DEV_IMAGE, NETBIRD_DASHBOARD_DEV_IMAGE
+    return NETBIRD_SERVER_IMAGE, NETBIRD_DASHBOARD_IMAGE
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
@@ -7825,6 +7841,9 @@ def netbird_page():
         netbird_version=nb_vinfo.get('version', ''),
         netbird_update_available=nb_vinfo.get('update_available', False),
         netbird_latest=nb_vinfo.get('latest') or '',
+        netbird_upstream_newer=nb_vinfo.get('upstream_newer', False),
+        netbird_upstream_latest=nb_vinfo.get('upstream_latest') or '',
+        netbird_channel=nb_vinfo.get('channel', 'main'),
         deploy_log=_netbird_deploy_status.get('log', []),
         deploy_error=_netbird_deploy_status.get('error', False)
     )
@@ -20205,12 +20224,17 @@ def _get_netbird_version_info():
     if dash_ver:
         parts.append('dash ' + dash_ver)
     out['version'] = ' · '.join(parts)
-    # NetBird is PINNED (see NETBIRD_SERVER_IMAGE). "Update Now" installs the PIN, not GitHub's
-    # latest — so the update-available check compares the running version against the PIN, else
-    # the badge never clears (a newer upstream would show a perpetual "update available" that
-    # Update can't satisfy, and — as v10.0.9 proved — chasing latest breaks NetBird's auth).
-    mgmt_pin = NETBIRD_SERVER_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
-    dash_pin = NETBIRD_DASHBOARD_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
+    # NetBird is PINNED, dev/vetted like Authentik. "Update Now" installs the channel TARGET
+    # (dev candidate on the dev channel, vetted pin on main) — never raw upstream. So the
+    # update-available check compares the running version against the channel target, else the
+    # badge never clears (chasing latest also breaks NetBird's auth — see v10.0.9).
+    _s = load_settings()
+    _channel = (_s.get('update_channel') or 'main').strip().lower()
+    _srv_img, _dash_img = _get_netbird_target_images(_s)
+    mgmt_pin = _srv_img.rsplit(':', 1)[-1].lstrip('vV')
+    dash_pin = _dash_img.rsplit(':', 1)[-1].lstrip('vV')
+    out['channel'] = _channel
+    out['vetted'] = NETBIRD_SERVER_IMAGE.rsplit(':', 1)[-1].lstrip('vV')
     mgmt_behind = bool(mgmt_ver and mgmt_pin
                        and _netbird_version_tuple(mgmt_pin) > _netbird_version_tuple(mgmt_ver))
     dash_behind = bool(dash_ver and dash_pin
@@ -20223,6 +20247,20 @@ def _get_netbird_version_info():
         if dash_behind:
             latest_parts.append('dash ' + dash_pin)
         out['latest'] = ' · '.join(latest_parts)
+    # Dev channel only: surface when netbirdio has shipped a server release newer than our
+    # vetted pin, so you SEE there's something to try on dev (bump NETBIRD_SERVER_DEV_IMAGE to
+    # try it, promote to vetted once login + a peer connect pass). Awareness ONLY — never
+    # changes what Update installs. Main stays pinned-and-quiet (no GitHub call).
+    out['upstream_latest'] = None
+    out['upstream_newer'] = False
+    if _channel == 'dev':
+        try:
+            _up = (_get_netbird_github_latest('netbird') or '').lstrip('vV')
+            if _up and _netbird_version_tuple(_up) > _netbird_version_tuple(mgmt_pin):
+                out['upstream_latest'] = _up
+                out['upstream_newer'] = True
+        except Exception:
+            pass
     return out
 
 
@@ -29666,8 +29704,9 @@ def _netbird_sync_compose_image_tags(nb_dir):
             txt = f.read()
     except Exception:
         return False
-    new = _re.sub(r'(image:\s*)netbirdio/netbird-server:\S+', rf'\1{NETBIRD_SERVER_IMAGE}', txt)
-    new = _re.sub(r'(image:\s*)netbirdio/dashboard:\S+', rf'\1{NETBIRD_DASHBOARD_IMAGE}', new)
+    _srv_img, _dash_img = _get_netbird_target_images()
+    new = _re.sub(r'(image:\s*)netbirdio/netbird-server:\S+', rf'\1{_srv_img}', txt)
+    new = _re.sub(r'(image:\s*)netbirdio/dashboard:\S+', rf'\1{_dash_img}', new)
     if new == txt:
         return False  # already current — nothing to do
     try:
@@ -29709,9 +29748,10 @@ def _heal_netbird_pinned_image(plog=None):
                 txt = _read_priv(compose)
             except Exception:
                 return False
-        if NETBIRD_SERVER_IMAGE in txt and NETBIRD_DASHBOARD_IMAGE in txt:
-            return False  # already on the vetted pin — healthy, no-op
-        _log(f"  netbird: compose off the vetted pin — restoring {NETBIRD_SERVER_IMAGE} + recreating")
+        _srv_img, _dash_img = _get_netbird_target_images()
+        if _srv_img in txt and _dash_img in txt:
+            return False  # already on this channel's target — healthy, no-op
+        _log(f"  netbird: compose off the {('dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted')} pin — restoring {_srv_img} + recreating")
         _netbird_sync_compose_image_tags(nb_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)
@@ -30035,9 +30075,10 @@ server:
   authSecret: "{auth_secret}"
 """
 
+    _nb_srv_img, _nb_dash_img = _get_netbird_target_images()  # reads update_channel from settings
     compose_content = f"""services:
   netbird-server:
-    image: {NETBIRD_SERVER_IMAGE}
+    image: {_nb_srv_img}
     container_name: netbird-server
     restart: unless-stopped
     ports:
@@ -30059,7 +30100,7 @@ server:
         max-file: "5"
 
   dashboard:
-    image: {NETBIRD_DASHBOARD_IMAGE}
+    image: {_nb_dash_img}
     container_name: netbird-dashboard
     restart: unless-stopped
     ports:
@@ -35051,7 +35092,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="page-header">
     <h1>
       <img src="https://netbird.io/favicon.ico" alt="" style="height:32px;width:auto;object-fit:contain">
-      <span>NetBird VPN</span>{% if netbird_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ netbird_version }}</span>{% endif %}{% if netbird_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:4px">{{ netbird_latest }} available</span>{% endif %}
+      <span>NetBird VPN</span>{% if netbird_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ netbird_version }}</span>{% endif %}{% if netbird_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:4px">{{ netbird_latest }} available</span>{% endif %}{% if netbird_upstream_newer and netbird_upstream_latest %} <span style="font-size:11px;color:#f59e0b;font-weight:600;margin-left:4px" title="netbirdio has shipped v{{ netbird_upstream_latest }}, newer than the vetted pin. Not auto-installed — bump the dev pin to try it on dev, then promote to main if login + a peer connect pass.">↑ v{{ netbird_upstream_latest }} available upstream</span>{% endif %}
     </h1>
     <p>Zero-trust overlay WireGuard VPN with Authentik Identity Management and automatic NAT traversal</p>
   </div>
