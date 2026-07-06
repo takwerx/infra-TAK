@@ -7864,6 +7864,11 @@ def netbird_control_api():
     
     import subprocess as _sp
     if action == 'update':
+        # v10.0.9: NetBird tracks upstream (:latest). Existing boxes' on-disk compose still
+        # carries the tag it was deployed with (e.g. the old 0.72.3 pin), so a bare `pull`
+        # would re-fetch that exact tag and the update badge would never clear. Rewrite the
+        # image tags to the current constants (:latest) first, so pull actually gets newest.
+        _netbird_sync_compose_image_tags(nb_dir)
         pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)
         if pull.returncode != 0:
@@ -29643,6 +29648,35 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
     return _req.urlopen(req, timeout=timeout, context=ctx)
 
 
+def _netbird_sync_compose_image_tags(nb_dir):
+    """Rewrite the NetBird compose's image: tags to the current NETBIRD_SERVER_IMAGE /
+    NETBIRD_DASHBOARD_IMAGE constants (:latest). Existing boxes were deployed with a fixed tag
+    baked into docker-compose.yml; since NetBird now tracks upstream, `docker compose pull` must
+    run against :latest to actually fetch the newest image. Idempotent; best-effort (never raises)."""
+    import re as _re
+    compose = os.path.join(nb_dir, 'docker-compose.yml')
+    try:
+        with open(compose) as f:
+            txt = f.read()
+    except Exception:
+        return False
+    new = _re.sub(r'(image:\s*)netbirdio/netbird-server:\S+', rf'\1{NETBIRD_SERVER_IMAGE}', txt)
+    new = _re.sub(r'(image:\s*)netbirdio/dashboard:\S+', rf'\1{NETBIRD_DASHBOARD_IMAGE}', new)
+    if new == txt:
+        return False  # already current — nothing to do
+    try:
+        with open(compose, 'w') as f:
+            f.write(new)
+        return True
+    except Exception:
+        # root-era compose the non-root console can't write directly — route through the broker.
+        try:
+            _write_priv(compose, new)
+            return True
+        except Exception:
+            return False
+
+
 def _netbird_peer_stats_from_db(nb_dir=None):
     """Read peer counts from local management store (same-host, no PAT required).
 
@@ -42051,27 +42085,34 @@ def _reassert_mediamtx_cert_grant(plog=None):
             return False
         if cert_file not in yml_txt:
             return False  # TLS not wired to Caddy's cert — nothing to grant (custom/plaintext)
-        if not os.path.exists(cert_file):
+        # PRIVILEGED checks: under a ~60-day renewal Caddy resets the cert dirs to 0700
+        # caddy:caddy, so the takwerx console cannot os.stat / os.path.exists them at all
+        # (traversal denied). The prior os.path.exists() gate then returned False and the heal
+        # never fired on exactly the broken box. Use sudo stat so the check survives the lock.
+        def _pmode(p):
+            r = subprocess.run(_sudo_wrap(['stat', '-c', '%a', p]), capture_output=True, text=True, timeout=8)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        def _grp(mode):  # octal group digit
+            return int(mode[-2]) if len(mode) >= 2 and mode[-2].isdigit() else 0
+        cert_mode = _pmode(cert_file)
+        if not cert_mode:
             return False  # cert not issued yet — deploy/renewal will re-run this
-        # Detect whether the grant is already intact: takwerx (running mediamtx) can read
-        # the cert only if the file is group-readable AND the dir chain is group-traversable.
-        need = False
-        try:
-            import stat as _st
-            if not (os.stat(cert_file).st_mode & _st.S_IRGRP) or not (os.stat(key_file).st_mode & _st.S_IRGRP):
-                need = True
-            else:
-                for d in (cert_base, cert_dir):
-                    m = os.stat(d).st_mode
-                    if not (m & _st.S_IRGRP) or not (m & _st.S_IXGRP):
-                        need = True
-                        break
-        except Exception:
-            need = True  # can't stat (perm denied climbing the chain) → re-apply
+        key_mode = _pmode(key_file)
+        # Grant is intact only if cert+key are group-readable AND every dir up the Caddy chain
+        # is group-readable+traversable (rx). Any missing bit → re-apply.
+        need = (_grp(cert_mode) & 4) == 0 or (bool(key_mode) and (_grp(key_mode) & 4) == 0)
+        if not need:
+            for d in (cert_base, cert_dir):
+                dmode = _pmode(d)
+                if dmode and (_grp(dmode) & 5) != 5:
+                    need = True
+                    break
         if not need:
             return False  # grant intact — healthy box, no restart
         _log("  mediamtx: cert-read grant missing (renewal/ssl-flip dropped group perms) — re-applying")
         subprocess.run('usermod -aG caddy takwerx 2>/dev/null; true', shell=True, capture_output=True, timeout=5)
+        # chmod via sudo unconditionally (no os.path.exists guard — the console can't stat under
+        # the locked caddy dirs; a chmod on a non-existent path just errors harmlessly).
         for d in ('/var/lib/caddy',
                   '/var/lib/caddy/.local',
                   '/var/lib/caddy/.local/share',
@@ -42079,8 +42120,7 @@ def _reassert_mediamtx_cert_grant(plog=None):
                   '/var/lib/caddy/.local/share/caddy/certificates',
                   cert_base,
                   cert_dir):
-            if os.path.exists(d):
-                subprocess.run(_sudo_wrap(['chmod', 'g+rx', d]), capture_output=True, timeout=5)
+            subprocess.run(_sudo_wrap(['chmod', 'g+rx', d]), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=20)
