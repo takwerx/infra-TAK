@@ -8038,6 +8038,28 @@ _CONN_CGNAT_NET = ipaddress.ip_network('100.64.0.0/10')  # RFC 6598 — what Sta
 
 _connectivity_detect_status = {'running': False, 'complete': False, 'error': '', 'log': [], 'result': None}
 
+_conn_cloud_cache = {'checked': False, 'is_cloud': False}
+
+
+def _conn_is_cloud():
+    """Is this box a cloud VM? Every cloud's IMDS (AWS/Azure/OCI/GCP) answers SOMETHING on
+    link-local 169.254.169.254 — even a 4xx counts; home networks have nothing there.
+    Cached for the process lifetime (a box doesn't change worlds without a reboot).
+    On a cloud VM the wizard is a verifier, not a pathfinder — the static/portable
+    question is suppressed and Class A gets cloud copy instead of router talk."""
+    if _conn_cloud_cache['checked']:
+        return _conn_cloud_cache['is_cloud']
+    is_cloud = False
+    try:
+        urllib.request.urlopen('http://169.254.169.254/', timeout=1.5)
+        is_cloud = True
+    except urllib.error.HTTPError:
+        is_cloud = True   # an HTTP error status is still an answer — something lives there
+    except Exception:
+        is_cloud = False
+    _conn_cloud_cache.update({'checked': True, 'is_cloud': is_cloud})
+    return is_cloud
+
 
 def _conn_ip_kind(ip_str):
     """'public' | 'private' (RFC 1918) | 'cgnat' (100.64/10) | 'other' | 'invalid'."""
@@ -8164,10 +8186,12 @@ def _conn_hairpin_probe(settings, log):
         return {'tested': True, 'ok': False, 'error': str(ex)[:120]}
 
 
-def _conn_classify(intent, stun_res, trace):
+def _conn_classify(intent, stun_res, trace, is_cloud=False):
     """Leg 2 — Class A (clean public) / B (double-NAT) / C (CGNAT), + the recommendation.
     Portable intent overrides the recommendation to the anchor regardless of class:
-    a port-forward is glued to one network and dies on the next one (PLAN §7a/§7b)."""
+    a port-forward is glued to one network and dies on the next one (PLAN §7a/§7b).
+    Cloud VMs (is_cloud) never travel and have no router — Class A becomes 'verify
+    your cloud firewall', and the portable override does not apply."""
     reasons = []
     ext_ip = stun_res.get('external_ip') or ''
     ext_kind = _conn_ip_kind(ext_ip)
@@ -8204,7 +8228,11 @@ def _conn_classify(intent, stun_res, trace):
     else:
         net_class = 'unknown'
         reasons.append('could not establish a public IP — check outbound connectivity and re-run')
-    if intent == 'portable':
+    if is_cloud and net_class == 'A':
+        recommendation = 'cloud_verify'
+        reasons.append('Cloud VM: reachability is provided by the host — what usually needs '
+                       'attention is the cloud firewall (security list / NSG ingress)')
+    elif intent == 'portable' and not is_cloud:
         recommendation = 'anchor'
         reasons.append('Portable box: recommendation is the anchor regardless of class — '
                        'this network\'s answer would be stale on the next network')
@@ -8228,15 +8256,17 @@ def _run_connectivity_detect(settings):
 
     try:
         intent = settings.get('connectivity_intent') or ''
-        log('Leg 1 — DETECT starting (intent: %s)' % (intent or 'not chosen yet'))
+        is_cloud = _conn_is_cloud()
+        log('Leg 1 — DETECT starting (intent: %s%s)'
+            % (intent or 'not chosen yet', ', cloud VM' if is_cloud else ''))
         local = _conn_local_network(log)
         stun_res = _conn_stun_probe(log)
         trace = _conn_traceroute(log)
         gw_fp = _conn_gateway_fingerprint(local.get('gateway', ''), log) if local.get('gateway') else {}
         hairpin = _conn_hairpin_probe(settings, log)
-        result = _conn_classify(intent, stun_res, trace)
-        result.update({'intent': intent, 'local': local, 'stun': stun_res, 'trace': trace,
-                       'gateway_fingerprint': gw_fp, 'hairpin': hairpin})
+        result = _conn_classify(intent, stun_res, trace, is_cloud=is_cloud)
+        result.update({'intent': intent, 'cloud': is_cloud, 'local': local, 'stun': stun_res,
+                       'trace': trace, 'gateway_fingerprint': gw_fp, 'hairpin': hairpin})
         st['result'] = result
         log('Classification: Class %s — recommendation: %s' % (result['net_class'], result['recommendation']))
         st.update({'running': False, 'complete': True, 'error': ''})
@@ -8253,6 +8283,7 @@ def connectivity_page():
         settings=settings,
         version=VERSION,
         intent=settings.get('connectivity_intent', ''),
+        is_cloud=_conn_is_cloud(),
     )
 
 
@@ -35870,6 +35901,15 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <p>Make this box reachable by TAK clients from anywhere — detect the network's reality, then follow the right path. No networking degree required.</p>
   </div>
 
+  {% if is_cloud %}
+  <div class="card">
+    <div class="card-title">Step 1 — Where will this box live?</div>
+    <div style="display:flex;align-items:center;gap:12px;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.25);border-radius:10px;padding:14px 18px;font-size:13px;line-height:1.6">
+      <span class="material-symbols-outlined" style="color:var(--cyan);font-size:24px">cloud_done</span>
+      <span><b>Cloud server detected</b> — this box lives in a datacenter with its own public front door, so the stays-put-or-travels question doesn't apply. Run detection below to verify the internet can actually reach your TAK ports (the usual culprit on cloud is a missing security-list / firewall ingress rule, not NAT).</span>
+    </div>
+  </div>
+  {% else %}
   <div class="card">
     <div class="card-title">Step 1 — Where will this box live?</div>
     <div class="intent-tiles">
@@ -35886,6 +35926,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <div id="intent-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
   </div>
+  {% endif %}
 
   <div class="card">
     <div class="card-title">Step 2 — Detect this network</div>
@@ -35919,11 +35960,14 @@ const RECO_TEXT = {
   'anchor': '<b>Recommended path: the anchor.</b> This box dials OUT over an encrypted tunnel to a small always-free public VPS (Oracle Free Tier). Friends and clients connect to the anchor\\'s public address with <b>no VPN</b> — identical from any network this box sits on. Stand the anchor up with <code>scripts/connectivity-anchor-bootstrap.sh</code>; guided setup ships in a later step of this wizard.',
   'ddns_portforward': '<b>Recommended path: DDNS + one port-forward.</b> This network has a clean public IP. A dynamic-DNS hostname (Cloudflare) plus forwarding the TAK ports on your router makes this box reachable — friends connect to a name, no VPN. Automation for this path ships in the next wizard step.',
   'bridge_then_ddns': '<b>Recommended path: bridge the upstream gateway, then re-detect.</b> Two routers are NATing in a row. Put the ISP\\'s gateway in bridge / IP-passthrough mode so your own router holds the public IP, then run detection again — this box should re-classify as Class A.',
-  'rerun': 'Detection could not establish this network\\'s public IP. Check that the box has outbound internet and run detection again.'
+  'rerun': 'Detection could not establish this network\\'s public IP. Check that the box has outbound internet and run detection again.',
+  'cloud_verify': '<b>Cloud VM — already reachable.</b> The internet routes straight to this box\\'s public IP; there is no router and nothing to forward. What\\'s worth checking is the cloud-side firewall (security list / NSG): make sure the TAK ports are open as ingress, set up your domain via the Caddy module, and use VERIFY (coming in a later wizard step) to prove each port is green from outside.'
 };
 
 function paintIntent(){
-  document.getElementById('tile-static').classList.toggle('selected', currentIntent==='static');
+  const ts = document.getElementById('tile-static');
+  if(!ts) return;   // cloud VM: intent tiles are not rendered
+  ts.classList.toggle('selected', currentIntent==='static');
   document.getElementById('tile-portable').classList.toggle('selected', currentIntent==='portable');
 }
 async function setIntent(intent){
