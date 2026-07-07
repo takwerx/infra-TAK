@@ -35914,12 +35914,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="card-title">Step 1 — Where will this box live?</div>
     <div class="intent-tiles">
       <button type="button" class="intent-tile" id="tile-static" onclick="setIntent('static')">
-        <span class="t-emoji">🏠</span>
+        <span class="material-symbols-outlined" style="font-size:30px;color:var(--cyan)">home_work</span>
         <div class="t-title">It stays in one place</div>
         <div class="t-desc">Home, office, or on-premises server room — plugged into the same network all the time. The wizard tunes the answer to that one network (a port-forward or DDNS can work here).</div>
       </button>
       <button type="button" class="intent-tile" id="tile-portable" onclick="setIntent('portable')">
-        <span class="t-emoji">🎒</span>
+        <span class="material-symbols-outlined" style="font-size:30px;color:var(--cyan)">travel</span>
         <div class="t-title">It moves with me</div>
         <div class="t-desc">Travels between networks (home, work, hotspots). Port-forwards die on the next network — the box will dial OUT to a fixed public anchor instead, so friends always hit the same address.</div>
       </button>
