@@ -40,7 +40,7 @@ git remote set-url origin https://github.com/takwerx/infra-TAK.git
 
 **No `grep -oP`?** Run **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**, **`cd`** to that path, then run the four lines starting with **`git fetch https://github.com/...`** (skip the **`cd`** line).
 
-**Shallow / single-branch clone** (`fetch` errors): [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md).
+**Shallow / single-branch clone** (`fetch` errors): clone the full repository (not a single-branch or shallow clone) and re-run `start.sh` from that directory.
 
 **After the console is up:** If **Guard Dog** is installed, open **Guard Dog** and click **↻ Update Guard Dog** once (see **Guard Dog** note under **Quick Start**).
 
@@ -87,13 +87,9 @@ The script will:
 
 Then open your browser to the URL shown and log in.
 
-**Updating:** After `git pull` or **Update Now**, restart the console with `sudo systemctl restart takwerx-console`. Your password and config live in the install directory's `.config/`. If you run `start.sh` from a different clone or path, the service keeps using the original install directory so your password continues to work. **Node-RED / Configurator code** (`nodered/`): after pulling **dev** on the VPS, also run **`bash nodered/deploy.sh`** from that install directory (see **[docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md)**).
+**Updating:** After `git pull` or **Update Now**, restart the console with `sudo systemctl restart takwerx-console`. Your password and config live in the install directory's `.config/`. If you run `start.sh` from a different clone or path, the service keeps using the original install directory so your password continues to work. **Node-RED / Configurator code** (`nodered/`): after pulling on the VPS, also run **`bash nodered/deploy.sh`** from that install directory.
 
 **Guard Dog — automatic since v0.4.7-alpha:** Guard Dog scripts are automatically re-deployed when the console detects a version change. No manual button press needed after upgrading. The button still exists as a fallback if you change alert email or server nickname. Set **Notifications** → alert email and use **Send test email** to verify. Details: [docs/GUARDDOG.md](docs/GUARDDOG.md).
-
-**Testing Update Now before you ship a release:** Maintainers should follow [docs/TESTING-UPDATES.md](docs/TESTING-UPDATES.md) on a test VPS (fake low `VERSION`, click **Update Now**, then restore). Pushing a Git **tag** is what shows customers “Update Available”; test the button before pushing the tag.
-
-**Test & Evaluation procedure (T&E) before any merge to `main`:** Maintainers run the canonical soak/validation procedure in [docs/TEST-AND-EVALUATION-PROCEDURE.md](docs/TEST-AND-EVALUATION-PROCEDURE.md) on the dev fleet (currently `test6` / `test8` / `test12`, ≥60 min soak each) before proposing a release. **Two-actor protocol:** the operator does the `git pull` + `systemctl restart takwerx-console` manually on each test box (same path customers hit; catches pull-path failures under operator eyes); the agent does pre-flight, post-pull verification, the soak, the health-check matrix, and the PASS/FAIL gate. Operator says **“perform the test and evaluation procedure”** to trigger it.
 
 **Upgrading from v0.1.x to v0.2.0:** v0.2.0 switches from Flask dev server to gunicorn (production server). The upgrade is automatic — just `git pull` and restart. On first restart, the console installs gunicorn, rewrites the systemd service, and starts the production server transparently. No manual steps needed.
 
@@ -208,7 +204,7 @@ start.sh                    ← One CLI command to launch everything
 
 ## Ports
 
-> **v0.9.12 hardening:** Every host port is classified by exposure tier. **Tier 1 (Public)** is reachable from the internet, **Tier 3 (Caddy-loopback)** binds to `127.0.0.1` and is reached only via Caddy on 443, **Tier 4 (Docker-internal)** has no host port at all, **Tier 5 (Source-scoped)** is allowed only from a specific peer IP. Full policy: [docs/PORT-EXPOSURE-POLICY.md](docs/PORT-EXPOSURE-POLICY.md).
+> **v0.9.12 hardening:** Every host port is classified by exposure tier. **Tier 1 (Public)** is reachable from the internet, **Tier 3 (Caddy-loopback)** binds to `127.0.0.1` and is reached only via Caddy on 443, **Tier 4 (Docker-internal)** has no host port at all, **Tier 5 (Source-scoped)** is allowed only from a specific peer IP.
 
 ### Tier 1 — Public (open in UFW)
 
@@ -334,10 +330,8 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ## Design notes
 
-- **[References](docs/REFERENCES.md)** — Canonical links (e.g. [TAK Server API](https://docs.tak.gov/api/takserver)) for development and integration.
 - **[Authentik login branding](docs/AUTHENTIK-LOGIN-BRANDING.md)** — Custom CSS vs **Brand → Attributes** (`theme: dark`), black backgrounds, flow wording; links to official Authentik docs and community guides.
 - **[Guard Dog](docs/GUARDDOG.md)** — How Guard Dog works: monitors, 15‑minute boot delay and cooldowns, TAK Server soft start (after PostgreSQL and network), 4GB swap on deploy for memory stability, and restart-loop protection. Apply Docker container log limits from the Guard Dog page without redeploying a module.
-- **[MediaMTX access driven by TAK Portal / LDAP](docs/MEDIAMTX-TAKPORTAL-ACCESS.md)** — How stream.fqdn admin vs viewer logic can be driven from TAK Portal (one place to manage users, no separate MediaMTX or Authentik user management). **Do not configure the email/SMTP portion of MediaMTX** — request access and approval notifications are handled by TAK Portal's open request-access page and Email Relay.
 
 ---
 
@@ -501,7 +495,7 @@ Full notes: [v0.9.45-alpha release notes](https://github.com/takwerx/infra-TAK/r
 
 ### v0.9.44-alpha — 2026-06-03 — Daily console-restart timer (wedged-worker recovery)
 
-**Headline:** the console (`takwerx-console`, gunicorn 1 worker / 4 threads) can wedge — the worker stops serving while port 5001 stays in `LISTEN`, so systemd still reports `active (running)` and nothing recovers it; front door and backdoor both hang while Authentik stays up (hit test6 and test8 the same day, after 5–7 days of uptime). The only periodic restart in the project was Authentik's — the console had none. This adds **`takconsolerestart.timer`**: a daily 04:00 oneshot that bounces the console (idle-gated via a new localhost-only `GET /api/console/restart-safe`, so it defers if a deploy/update is in flight and restarts immediately if the worker is unresponsive). Self-installs on every boot via `_startup_migrations`, so fresh installs and existing boxes both get it on their next restart. Bonus: a long-lived console now loads pulled code instead of running a stale process across `git pull`s.
+**Headline:** the console (`takwerx-console`, gunicorn 1 worker / 4 threads) can wedge — the worker stops serving while port 5001 stays in `LISTEN`, so systemd still reports `active (running)` and nothing recovers it; front door and backdoor both hang while Authentik stays up (observed in the field after 5–7 days of uptime). The only periodic restart in the project was Authentik's — the console had none. This adds **`takconsolerestart.timer`**: a daily 04:00 oneshot that bounces the console (idle-gated via a new localhost-only `GET /api/console/restart-safe`, so it defers if a deploy/update is in flight and restarts immediately if the worker is unresponsive). Self-installs on every boot via `_startup_migrations`, so fresh installs and existing boxes both get it on their next restart. Bonus: a long-lived console now loads pulled code instead of running a stale process across `git pull`s.
 
 Full notes: [v0.9.44-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v0.9.44-alpha).
 
