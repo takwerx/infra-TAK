@@ -8194,6 +8194,7 @@ def _conn_classify(intent, stun_res, trace, is_cloud=False):
     Cloud VMs (is_cloud) never travel and have no router — Class A becomes 'verify
     your cloud firewall', and the portable override does not apply."""
     reasons = []
+    provisional = False
     ext_ip = stun_res.get('external_ip') or ''
     ext_kind = _conn_ip_kind(ext_ip)
     # Only hops BEFORE the first public hop describe our side of the NAT; private
@@ -8210,6 +8211,20 @@ def _conn_classify(intent, stun_res, trace, is_cloud=False):
             cgnat_hop = h['ip']
     cgnat = bool(cgnat_hop) or ext_kind == 'cgnat'
     double_nat = (not cgnat) and len(set(pre_public)) >= 2
+    # Opaque path: every hop between the local gateway and the first public hop stayed
+    # silent. Mobile carriers (field-observed: Verizon hotspot, 2026-07-07) hand out
+    # public-looking IPs while firewalling ALL inbound at the carrier edge — no CGNAT
+    # hop to catch, STUN looks clean, but Class A is a lie only VERIFY can expose.
+    silent_mid, answered_mid, saw_public = 0, 0, False
+    for h in trace.get('hops', [])[1:]:
+        if h.get('kind') == 'public':
+            saw_public = True
+            break
+        if h.get('ip'):
+            answered_mid += 1
+        else:
+            silent_mid += 1
+    path_opaque = saw_public and silent_mid >= 2 and answered_mid == 0
     if cgnat_hop:
         reasons.append('traceroute hop %s is in 100.64.0.0/10 — carrier-grade NAT' % cgnat_hop)
     if ext_kind == 'cgnat':
@@ -8226,6 +8241,11 @@ def _conn_classify(intent, stun_res, trace, is_cloud=False):
     elif ext_kind == 'public':
         net_class = 'A'
         reasons.append('Class A: clean public IP %s — port-forward + DDNS works here' % ext_ip)
+        if path_opaque:
+            provisional = True
+            reasons.append('…but every hop to the internet stayed silent — mobile/hotspot '
+                           'carriers often show a public IP while still blocking ALL inbound. '
+                           'Treat Class A as provisional until VERIFY proves a port from outside')
     else:
         net_class = 'unknown'
         reasons.append('could not establish a public IP — check outbound connectivity and re-run')
@@ -8246,7 +8266,7 @@ def _conn_classify(intent, stun_res, trace, is_cloud=False):
     else:
         recommendation = 'rerun'
     return {'net_class': net_class, 'cgnat': cgnat, 'double_nat': double_nat,
-            'recommendation': recommendation, 'reasons': reasons}
+            'provisional': provisional, 'recommendation': recommendation, 'reasons': reasons}
 
 
 def _run_connectivity_detect(settings):
@@ -36016,8 +36036,8 @@ function renderResult(res){
   document.getElementById('result-card').style.display = 'block';
   const badge = document.getElementById('class-badge');
   badge.className = 'class-badge class-' + res.net_class;
-  badge.textContent = res.net_class === 'unknown' ? 'UNCLASSIFIED' : ('CLASS ' + res.net_class);
-  document.getElementById('class-caption').textContent = CLASS_CAPTIONS[res.net_class] || '';
+  badge.textContent = res.net_class === 'unknown' ? 'UNCLASSIFIED' : ('CLASS ' + res.net_class + (res.provisional ? '?' : ''));
+  document.getElementById('class-caption').textContent = (CLASS_CAPTIONS[res.net_class] || '') + (res.provisional ? ' — provisional: this carrier hides its network, inbound is unproven' : '');
   const stun = res.stun || {}, local = res.local || {}, hair = res.hairpin || {};
   const items = [
     ['Public IP (STUN)', stun.external_ip || stun.error || '—'],
