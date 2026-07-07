@@ -357,7 +357,9 @@ install_dependencies() {
     # pyyaml: the module compose patchers use it for ROBUST, IDEMPOTENT YAML edits.
     # Without it they fall back to a legacy text patcher that double-appends keys on
     # re-deploy (duplicate `healthcheck` -> "mapping key already defined" parse error).
-    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn pyyaml 2>"$apt_log"; then
+    # pystun3: Connectivity Wizard (v10.1.0) NAT/public-IP detection. Pinned — pure-python,
+    # vetted at 2.0.0; bump deliberately, not by re-running start.sh.
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn pyyaml pystun3==2.0.0 2>"$apt_log"; then
         echo -e "${RED}  pip install failed:${NC}"
         tail -20 "$apt_log"
         rm -f "$apt_log"

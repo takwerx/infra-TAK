@@ -668,7 +668,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.9-alpha"
+VERSION = "10.1.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2313,6 +2313,17 @@ def detect_modules():
         'priority': 14,
     }
 
+    # Connectivity Wizard (v10.1.0) — built-in console tool, no deploy step: always present.
+    modules['connectivity'] = {
+        'name': 'Connectivity Wizard',
+        'installed': True,
+        'running': True,
+        'description': 'Detect this network\'s reality (public IP, double-NAT, CGNAT) and guide the box to reachable-from-anywhere',
+        'icon': '🧭',
+        'route': '/connectivity',
+        'priority': 15,
+    }
+
     # EUD Remote Assist Portal
     ra_enabled = settings.get('remote_assist_enabled', False)
     ra_running = False
@@ -2513,6 +2524,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     ra = modules.get('remote_assist', {})
     if ra.get('installed'):
         parts.append(link('/remote-assist', f'<img src="{REMOTE_ASSIST_LOGO_URL}" alt="EUD Remote Assist" class="nav-icon" style="height:22px;width:auto;max-width:140px;object-fit:contain;display:block">', 'EUD Remote Assist'))
+    parts.append(link('/connectivity', '<span class="nav-icon material-symbols-outlined">travel_explore</span>Connectivity'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -8004,6 +8016,292 @@ def netbird_uninstall_api():
 @login_required
 def netbird_uninstall_status_api():
     return jsonify(_netbird_uninstall_status)
+
+
+# ── Connectivity Wizard (v10.1.0) ─────────────────────────────────────────────
+# Leg 0 (Intent: static vs portable) + Leg 1 (Detect: STUN / traceroute / CGNAT)
+# per docs/PLAN-v10.1.0-connectivity-wizard.md (private notes repo).
+
+# pystun3's bundled default server list is stale (returns NAT type but a null
+# external IP) — always probe an explicit list, first server that returns an
+# external IP wins. NAT-type strings vary per server (Google lacks the RFC 3489
+# changed-address test), so nat_type is informational; classification keys on
+# external-IP vs traceroute-hop analysis, which is deterministic.
+CONNECTIVITY_STUN_SERVERS = [
+    ('stun.l.google.com', 19302),
+    ('stun.counterpath.com', 3478),
+    ('stun.cloudflare.com', 3478),
+    ('stun.sipgate.net', 3478),
+]
+
+_CONN_CGNAT_NET = ipaddress.ip_network('100.64.0.0/10')  # RFC 6598 — what Starlink hands out
+
+_connectivity_detect_status = {'running': False, 'complete': False, 'error': '', 'log': [], 'result': None}
+
+
+def _conn_ip_kind(ip_str):
+    """'public' | 'private' (RFC 1918) | 'cgnat' (100.64/10) | 'other' | 'invalid'."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except (ValueError, TypeError):
+        return 'invalid'
+    if ip in _CONN_CGNAT_NET:
+        return 'cgnat'
+    if ip.is_private:
+        return 'private'
+    if ip.is_global:
+        return 'public'
+    return 'other'
+
+
+def _conn_local_network(log):
+    """LAN address(es) + default gateway via iproute2 (Leg 1, box-side, no privileges needed)."""
+    info = {'interfaces': [], 'gateway': '', 'gateway_iface': ''}
+    try:
+        r = subprocess.run(['ip', '-4', 'route', 'show', 'default'],
+                           capture_output=True, text=True, timeout=5)
+        m = re.search(r'default via (\S+) dev (\S+)', r.stdout or '')
+        if m:
+            info['gateway'], info['gateway_iface'] = m.group(1), m.group(2)
+            log('Default gateway: %s via %s' % (info['gateway'], info['gateway_iface']))
+        r = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in (r.stdout or '').splitlines():
+            m = re.match(r'\d+:\s+(\S+)\s+inet\s+([\d.]+)/(\d+)', line.strip())
+            if m:
+                info['interfaces'].append({'iface': m.group(1), 'ip': m.group(2), 'prefix': int(m.group(3))})
+        if info['interfaces']:
+            log('LAN: ' + ', '.join('%s=%s' % (i['iface'], i['ip']) for i in info['interfaces']))
+    except Exception as ex:
+        log('Local network detection failed: %s' % str(ex)[:120])
+    return info
+
+
+def _conn_stun_probe(log):
+    """Public IP + NAT type via STUN (pystun3) — the Leg 1 keystone signal."""
+    try:
+        import stun
+    except ImportError:
+        log('pystun3 is not installed — re-run `sudo ./start.sh` to pull new console dependencies')
+        return {'error': 'pystun3 not installed (re-run sudo ./start.sh)'}
+    for host, port in CONNECTIVITY_STUN_SERVERS:
+        try:
+            nat_type, ext_ip, ext_port = stun.get_ip_info(source_port=0, stun_host=host, stun_port=port)
+            if ext_ip:
+                log('STUN %s:%s → %s, external %s:%s' % (host, port, nat_type, ext_ip, ext_port))
+                return {'nat_type': nat_type or '', 'external_ip': ext_ip,
+                        'external_port': ext_port, 'server': '%s:%s' % (host, port)}
+            log('STUN %s:%s returned no external IP — trying next server' % (host, port))
+        except Exception as ex:
+            log('STUN %s:%s failed: %s' % (host, port, str(ex)[:80]))
+    return {'error': 'all STUN servers failed (is outbound UDP blocked?)'}
+
+
+def _conn_traceroute(log):
+    """First hops toward 1.1.1.1 — the double-NAT vs CGNAT discriminator."""
+    tr = shutil.which('traceroute')
+    if not tr:
+        log('traceroute not present — installing via package shim')
+        try:
+            _pkg_install(['traceroute'], log_fn=log)
+        except Exception as ex:
+            log('traceroute install failed: %s' % str(ex)[:120])
+        tr = shutil.which('traceroute')
+        if not tr:
+            return {'hops': [], 'error': 'traceroute unavailable'}
+    try:
+        r = subprocess.run([tr, '-n', '-m', '6', '-q', '1', '-w', '2', '1.1.1.1'],
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {'hops': [], 'error': 'traceroute timed out'}
+    hops = []
+    for line in (r.stdout or '').splitlines():
+        m = re.match(r'\s*(\d+)\s+([\d.]+|\*)', line)
+        if not m:
+            continue
+        ip = m.group(2) if m.group(2) != '*' else ''
+        hops.append({'hop': int(m.group(1)), 'ip': ip,
+                     'kind': _conn_ip_kind(ip) if ip else 'no-reply'})
+    if hops:
+        log('Route: ' + ' → '.join((h['ip'] or '*') + ('(%s)' % h['kind'] if h['ip'] else '')
+                                   for h in hops))
+    return {'hops': hops}
+
+
+def _conn_gateway_fingerprint(gw_ip, log):
+    """Best-effort gateway model hint (feeds the Leg 3 known-gateways table later)."""
+    try:
+        ipaddress.ip_address(gw_ip)
+    except (ValueError, TypeError):
+        return {}
+    try:
+        req = urllib.request.Request('http://%s/' % gw_ip, method='GET')
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            server = resp.headers.get('Server', '')
+            body = resp.read(4096).decode('utf-8', 'replace')
+        m = re.search(r'<title[^>]*>(.*?)</title>', body, re.I | re.S)
+        title = m.group(1).strip()[:120] if m else ''
+        if server or title:
+            log('Gateway fingerprint: server=%r title=%r' % (server, title))
+        return {'server': server, 'title': title}
+    except Exception as ex:
+        return {'error': str(ex)[:120]}
+
+
+def _conn_hairpin_probe(settings, log):
+    """Can the box reach its own FQDN? (NAT-hairpin signal, reused idea from the FQDN migration probe)."""
+    fqdn = (settings.get('fqdn') or '').strip()
+    if not fqdn:
+        return {'tested': False}
+    try:
+        r = subprocess.run(['curl', '-skm', '6', '-o', '/dev/null', '-w', '%{http_code}',
+                            'https://%s/' % fqdn], capture_output=True, text=True, timeout=12)
+        code = (r.stdout or '').strip()
+        ok = code.isdigit() and code != '000'
+        log('Hairpin: https://%s/ → %s' % (fqdn, code if ok else 'unreachable (hairpin NAT likely)'))
+        return {'tested': True, 'ok': ok, 'http_code': code}
+    except Exception as ex:
+        return {'tested': True, 'ok': False, 'error': str(ex)[:120]}
+
+
+def _conn_classify(intent, stun_res, trace):
+    """Leg 2 — Class A (clean public) / B (double-NAT) / C (CGNAT), + the recommendation.
+    Portable intent overrides the recommendation to the anchor regardless of class:
+    a port-forward is glued to one network and dies on the next one (PLAN §7a/§7b)."""
+    reasons = []
+    ext_ip = stun_res.get('external_ip') or ''
+    ext_kind = _conn_ip_kind(ext_ip)
+    # Only hops BEFORE the first public hop describe our side of the NAT; private
+    # hops inside a carrier core after a public hop would be false double-NAT.
+    pre_public, cgnat_hop = [], ''
+    for h in trace.get('hops', []):
+        if not h['ip']:
+            continue
+        if h['kind'] == 'public':
+            break
+        if h['kind'] == 'private':
+            pre_public.append(h['ip'])
+        elif h['kind'] == 'cgnat' and not cgnat_hop:
+            cgnat_hop = h['ip']
+    cgnat = bool(cgnat_hop) or ext_kind == 'cgnat'
+    double_nat = (not cgnat) and len(set(pre_public)) >= 2
+    if cgnat_hop:
+        reasons.append('traceroute hop %s is in 100.64.0.0/10 — carrier-grade NAT' % cgnat_hop)
+    if ext_kind == 'cgnat':
+        reasons.append('STUN external IP %s is itself CGNAT space' % ext_ip)
+    if double_nat:
+        reasons.append('two RFC-1918 gateways before the first public hop (%s) — double-NAT'
+                       % ' → '.join(sorted(set(pre_public))))
+    if cgnat:
+        net_class = 'C'
+        reasons.append('Class C: no public inbound is possible on this network')
+    elif double_nat:
+        net_class = 'B'
+        reasons.append('Class B: bridge/IP-passthrough the upstream gateway, then re-detect')
+    elif ext_kind == 'public':
+        net_class = 'A'
+        reasons.append('Class A: clean public IP %s — port-forward + DDNS works here' % ext_ip)
+    else:
+        net_class = 'unknown'
+        reasons.append('could not establish a public IP — check outbound connectivity and re-run')
+    if intent == 'portable':
+        recommendation = 'anchor'
+        reasons.append('Portable box: recommendation is the anchor regardless of class — '
+                       'this network\'s answer would be stale on the next network')
+    elif net_class == 'A':
+        recommendation = 'ddns_portforward'
+    elif net_class == 'B':
+        recommendation = 'bridge_then_ddns'
+    elif net_class == 'C':
+        recommendation = 'anchor'
+    else:
+        recommendation = 'rerun'
+    return {'net_class': net_class, 'cgnat': cgnat, 'double_nat': double_nat,
+            'recommendation': recommendation, 'reasons': reasons}
+
+
+def _run_connectivity_detect(settings):
+    st = _connectivity_detect_status
+
+    def log(msg):
+        st['log'].append(msg)
+
+    try:
+        intent = settings.get('connectivity_intent') or ''
+        log('Leg 1 — DETECT starting (intent: %s)' % (intent or 'not chosen yet'))
+        local = _conn_local_network(log)
+        stun_res = _conn_stun_probe(log)
+        trace = _conn_traceroute(log)
+        gw_fp = _conn_gateway_fingerprint(local.get('gateway', ''), log) if local.get('gateway') else {}
+        hairpin = _conn_hairpin_probe(settings, log)
+        result = _conn_classify(intent, stun_res, trace)
+        result.update({'intent': intent, 'local': local, 'stun': stun_res, 'trace': trace,
+                       'gateway_fingerprint': gw_fp, 'hairpin': hairpin})
+        st['result'] = result
+        log('Classification: Class %s — recommendation: %s' % (result['net_class'], result['recommendation']))
+        st.update({'running': False, 'complete': True, 'error': ''})
+    except Exception as ex:
+        st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
+
+
+@app.route('/connectivity')
+@login_required
+def connectivity_page():
+    settings = load_settings()
+    return render_template_string(
+        CONNECTIVITY_TEMPLATE,
+        settings=settings,
+        version=VERSION,
+        intent=settings.get('connectivity_intent', ''),
+    )
+
+
+@app.route('/api/connectivity/state')
+@login_required
+def connectivity_state_api():
+    settings = load_settings()
+    return jsonify({
+        'intent': settings.get('connectivity_intent', ''),
+        'detect_running': _connectivity_detect_status.get('running', False),
+        'has_result': _connectivity_detect_status.get('result') is not None,
+    })
+
+
+@app.route('/api/connectivity/intent', methods=['POST'])
+@login_required
+def connectivity_intent_api():
+    intent = ((request.json or {}).get('intent') or '').strip()
+    if intent not in ('static', 'portable'):
+        return jsonify({'error': 'intent must be "static" or "portable"'}), 400
+    settings = load_settings()
+    settings['connectivity_intent'] = intent
+    save_settings(settings)
+    return jsonify({'success': True, 'intent': intent})
+
+
+@app.route('/api/connectivity/detect', methods=['POST'])
+@login_required
+def connectivity_detect_api():
+    if _connectivity_detect_status.get('running'):
+        return jsonify({'error': 'Detection already in progress'}), 409
+    _connectivity_detect_status.update(
+        {'running': True, 'complete': False, 'error': '', 'log': [], 'result': None})
+    settings = load_settings()
+    threading.Thread(target=_run_connectivity_detect, args=(settings,), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/detect-status')
+@login_required
+def connectivity_detect_status_api():
+    st = _connectivity_detect_status
+    return jsonify({
+        'running': st.get('running', False),
+        'complete': st.get('complete', False),
+        'error': st.get('error', ''),
+        'log': st.get('log', []),
+        'result': st.get('result'),
+    })
 
 
 # ── EUD Remote Assist Portal ──────────────────────────────────────────────────
@@ -35518,6 +35816,192 @@ function confirmUninstallNetbird() {
 </body></html>
 '''
 
+
+CONNECTIVITY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Connectivity Wizard — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:1080px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700;display:flex;align-items:center;gap:12px}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
+.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.5;cursor:default}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
+.intent-tiles{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.intent-tile{background:#0a0e1a;border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left}
+.intent-tile:hover{border-color:var(--border-hover)}
+.intent-tile.selected{border-color:var(--cyan);background:rgba(6,182,212,.06)}
+.intent-tile .t-emoji{font-size:26px}.intent-tile .t-title{font-size:14px;font-weight:700;margin:8px 0 4px}
+.intent-tile .t-desc{font-size:12px;color:var(--text-dim);line-height:1.5}
+.class-badge{display:inline-flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;font-weight:700;font-size:14px;padding:6px 14px;border-radius:8px}
+.class-A{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.class-B{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.3)}
+.class-C{background:rgba(6,182,212,.1);color:var(--cyan);border:1px solid rgba(6,182,212,.3)}
+.class-unknown{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.reco-banner{border-radius:10px;padding:16px 18px;font-size:13px;line-height:1.6;margin-top:16px;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.25)}
+.reasons{margin-top:14px;font-size:12px;color:var(--text-secondary);line-height:1.7}
+.hops{font-family:'JetBrains Mono',monospace;font-size:12px;margin-top:10px;color:var(--text-secondary)}
+.hops .cgnat{color:var(--cyan);font-weight:700}.hops .private{color:var(--yellow)}.hops .public{color:var(--green)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><span style="font-size:28px">🧭</span><span>Connectivity Wizard</span></h1>
+    <p>Make this box reachable by TAK clients from anywhere — detect the network's reality, then follow the right path. No networking degree required.</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 1 — Where will this box live?</div>
+    <div class="intent-tiles">
+      <button type="button" class="intent-tile" id="tile-static" onclick="setIntent('static')">
+        <span class="t-emoji">🏠</span>
+        <div class="t-title">It stays in one place</div>
+        <div class="t-desc">Home or office — plugged into the same router all the time. The wizard tunes the answer to that one network (a port-forward or DDNS can work here).</div>
+      </button>
+      <button type="button" class="intent-tile" id="tile-portable" onclick="setIntent('portable')">
+        <span class="t-emoji">🎒</span>
+        <div class="t-title">It moves with me</div>
+        <div class="t-desc">Travels between networks (home, work, hotspots). Port-forwards die on the next network — the box will dial OUT to a fixed public anchor instead, so friends always hit the same address.</div>
+      </button>
+    </div>
+    <div id="intent-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step 2 — Detect this network</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Probes the box's real situation: public IP + NAT type (STUN), carrier-grade NAT (100.64/10), double-NAT, gateway model, hairpin. All outbound — nothing is exposed by detection. Re-run this on every new network a portable box joins.</p>
+    <button class="btn btn-primary" id="detect-btn" onclick="runDetect()">Run Detection</button>
+    <div class="log-box" id="detect-log" style="display:none"></div>
+  </div>
+
+  <div class="card" id="result-card" style="display:none">
+    <div class="card-title">Result</div>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <span class="class-badge" id="class-badge"></span>
+      <span id="class-caption" style="font-size:13px;color:var(--text-secondary)"></span>
+    </div>
+    <div class="info-grid" style="margin-top:16px" id="result-grid"></div>
+    <div class="hops" id="result-hops"></div>
+    <div class="reasons" id="result-reasons"></div>
+    <div class="reco-banner" id="reco-banner"></div>
+  </div>
+</div>
+
+<script>
+let currentIntent = {{ intent|tojson }};
+const CLASS_CAPTIONS = {
+  'A': 'Clean public IP — the easy path',
+  'B': 'Double-NAT — two routers between you and the internet',
+  'C': 'Carrier-grade NAT — this network can never accept inbound connections',
+  'unknown': 'Could not classify this network'
+};
+const RECO_TEXT = {
+  'anchor': '<b>Recommended path: the anchor.</b> This box dials OUT over an encrypted tunnel to a small always-free public VPS (Oracle Free Tier). Friends and clients connect to the anchor\\'s public address with <b>no VPN</b> — identical from any network this box sits on. Stand the anchor up with <code>scripts/connectivity-anchor-bootstrap.sh</code>; guided setup ships in a later step of this wizard.',
+  'ddns_portforward': '<b>Recommended path: DDNS + one port-forward.</b> This network has a clean public IP. A dynamic-DNS hostname (Cloudflare) plus forwarding the TAK ports on your router makes this box reachable — friends connect to a name, no VPN. Automation for this path ships in the next wizard step.',
+  'bridge_then_ddns': '<b>Recommended path: bridge the upstream gateway, then re-detect.</b> Two routers are NATing in a row. Put the ISP\\'s gateway in bridge / IP-passthrough mode so your own router holds the public IP, then run detection again — this box should re-classify as Class A.',
+  'rerun': 'Detection could not establish this network\\'s public IP. Check that the box has outbound internet and run detection again.'
+};
+
+function paintIntent(){
+  document.getElementById('tile-static').classList.toggle('selected', currentIntent==='static');
+  document.getElementById('tile-portable').classList.toggle('selected', currentIntent==='portable');
+}
+async function setIntent(intent){
+  try{
+    const r = await fetch('/api/connectivity/intent', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({intent})});
+    const d = await r.json();
+    if(d.success){ currentIntent = intent; paintIntent();
+      document.getElementById('intent-status').textContent = intent==='portable'
+        ? 'Saved — portable: the recommendation will always be the anchor; re-run detection on every new network.'
+        : 'Saved — static: detection will pick the cheapest path for this one network.';
+    } else { document.getElementById('intent-status').textContent = d.error || 'Save failed'; }
+  }catch(e){ document.getElementById('intent-status').textContent = 'Save failed: '+e; }
+}
+
+let pollTimer = null;
+async function runDetect(){
+  const btn = document.getElementById('detect-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Detecting…';
+  document.getElementById('detect-log').style.display = 'block';
+  document.getElementById('result-card').style.display = 'none';
+  try{
+    const r = await fetch('/api/connectivity/detect', {method:'POST'});
+    if(r.status === 409){ /* already running — just poll */ }
+  }catch(e){}
+  pollTimer = setInterval(pollDetect, 1500);
+}
+async function pollDetect(){
+  try{
+    const r = await fetch('/api/connectivity/detect-status');
+    const d = await r.json();
+    const logEl = document.getElementById('detect-log');
+    logEl.textContent = (d.log || []).join('\\n');
+    logEl.scrollTop = logEl.scrollHeight;
+    if(!d.running){
+      clearInterval(pollTimer); pollTimer = null;
+      const btn = document.getElementById('detect-btn');
+      btn.disabled = false; btn.textContent = 'Run Detection Again';
+      if(d.error){ logEl.textContent += '\\nERROR: ' + d.error; }
+      if(d.result){ renderResult(d.result); }
+    }
+  }catch(e){}
+}
+function esc(s){ const d = document.createElement('div'); d.textContent = (s==null?'':String(s)); return d.innerHTML; }
+function renderResult(res){
+  document.getElementById('result-card').style.display = 'block';
+  const badge = document.getElementById('class-badge');
+  badge.className = 'class-badge class-' + res.net_class;
+  badge.textContent = res.net_class === 'unknown' ? 'UNCLASSIFIED' : ('CLASS ' + res.net_class);
+  document.getElementById('class-caption').textContent = CLASS_CAPTIONS[res.net_class] || '';
+  const stun = res.stun || {}, local = res.local || {}, hair = res.hairpin || {};
+  const items = [
+    ['Public IP (STUN)', stun.external_ip || stun.error || '—'],
+    ['NAT type', stun.nat_type || '—'],
+    ['LAN address', (local.interfaces && local.interfaces.length) ? local.interfaces.map(i=>i.iface+' '+i.ip).join(', ') : '—'],
+    ['Default gateway', local.gateway ? (local.gateway + (local.gateway_iface ? ' ('+local.gateway_iface+')' : '')) : '—'],
+    ['CGNAT (100.64/10)', res.cgnat ? 'YES' : 'no'],
+    ['Double-NAT', res.double_nat ? 'YES' : 'no'],
+    ['Hairpin (own FQDN)', hair.tested ? (hair.ok ? 'reachable' : 'NOT reachable') : 'not tested (no FQDN set)'],
+    ['Gateway fingerprint', (res.gateway_fingerprint && (res.gateway_fingerprint.title || res.gateway_fingerprint.server)) || '—']
+  ];
+  document.getElementById('result-grid').innerHTML = items.map(([l,v]) =>
+    '<div class="info-item"><div class="info-label">'+esc(l)+'</div><div class="info-value">'+esc(v)+'</div></div>').join('');
+  const hops = (res.trace && res.trace.hops) || [];
+  document.getElementById('result-hops').innerHTML = hops.length
+    ? 'Route: ' + hops.map(h => h.ip ? '<span class="'+esc(h.kind)+'">'+esc(h.ip)+'</span>' : '*').join(' → ')
+    : '';
+  document.getElementById('result-reasons').innerHTML =
+    (res.reasons || []).map(r => '• ' + esc(r)).join('<br>');
+  document.getElementById('reco-banner').innerHTML = RECO_TEXT[res.recommendation] || '';
+}
+paintIntent();
+// If a detection is already running/finished (page reload), pick it up.
+fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
+  if(d.detect_running){ runDetect(); }
+  else if(d.has_result){ document.getElementById('detect-log').style.display='block'; pollDetect(); }
+}).catch(()=>{});
+</script>
+</body></html>'''
 
 MEDIAMTX_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>MediaMTX — infra-TAK</title>
