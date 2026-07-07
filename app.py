@@ -2320,6 +2320,7 @@ def detect_modules():
         'running': True,
         'description': 'Detect this network\'s reality (public IP, double-NAT, CGNAT) and guide the box to reachable-from-anywhere',
         'icon': '🧭',
+        'icon_url': '/static/connectivity-icon.svg',
         'route': '/connectivity',
         'priority': 15,
     }
