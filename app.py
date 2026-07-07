@@ -35916,7 +35916,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <button type="button" class="intent-tile" id="tile-static" onclick="setIntent('static')">
         <span class="t-emoji">🏠</span>
         <div class="t-title">It stays in one place</div>
-        <div class="t-desc">Home or office — plugged into the same router all the time. The wizard tunes the answer to that one network (a port-forward or DDNS can work here).</div>
+        <div class="t-desc">Home, office, or on-premises server room — plugged into the same network all the time. The wizard tunes the answer to that one network (a port-forward or DDNS can work here).</div>
       </button>
       <button type="button" class="intent-tile" id="tile-portable" onclick="setIntent('portable')">
         <span class="t-emoji">🎒</span>
