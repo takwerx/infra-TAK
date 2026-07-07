@@ -21,7 +21,11 @@ tak-cad-docs/
 # Internal working notes + dev tooling moved to the PRIVATE repo
 # takwerx/infra-TAK-notes. This repo is public — keep these out of it.
 # Open ~/GitHub/infra-TAK.code-workspace to edit both repos together.
-docs/
+# docs/ contents are ignored by default (private-by-default), with an explicit allow-list
+# for product-safe docs that are intentionally public (scrub before adding a new one).
+docs/*
+!docs/GUARDDOG.md
+!docs/AUTHENTIK-LOGIN-BRANDING.md
 memory-bank/
 .cursor/
 .cursorrules
