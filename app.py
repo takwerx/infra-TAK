@@ -2524,7 +2524,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     ra = modules.get('remote_assist', {})
     if ra.get('installed'):
         parts.append(link('/remote-assist', f'<img src="{REMOTE_ASSIST_LOGO_URL}" alt="EUD Remote Assist" class="nav-icon" style="height:22px;width:auto;max-width:140px;object-fit:contain;display:block">', 'EUD Remote Assist'))
-    parts.append(link('/connectivity', '<span class="nav-icon material-symbols-outlined">travel_explore</span>Connectivity'))
+    parts.append(link('/connectivity', '<span class="nav-icon material-symbols-outlined">broadcast_on_home</span>Connectivity'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -35866,7 +35866,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><span style="font-size:28px">🧭</span><span>Connectivity Wizard</span></h1>
+    <h1><span class="material-symbols-outlined" style="font-size:30px;color:var(--cyan)">broadcast_on_home</span><span>Connectivity Wizard</span></h1>
     <p>Make this box reachable by TAK clients from anywhere — detect the network's reality, then follow the right path. No networking degree required.</p>
   </div>
 
