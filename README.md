@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.8-alpha)**
+**Current release: [v10.0.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.9-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -342,6 +342,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.0.9-alpha — 2026-07-06 — Self-healing cleanup: user management, streaming, and safer module updates
+
+**Headline: a batch of reliability fixes that repair affected boxes automatically on the next update — no manual steps.** If your TAK Portal Users page ever showed *"Missing AUTHENTIK_TOKEN"* and you couldn't add or list users, that's fixed: the console detects the cleared identity-provider token and restores it on restart, and prevents it from being wiped in the first place. **Video streaming keeps working across automatic certificate renewals** — a renewal used to quietly revoke the streaming server's access to the fresh certificate and could take streaming down until a redeploy; the console now re-grants that access on startup and after any renewal. **NetBird now updates on a tested-version track, the same model as the identity provider:** the console shows you when a newer NetBird has shipped upstream, but only installs versions that have been validated first — so an update can't leave your overlay VPN rejecting every login. **Deploying Email Relay while your identity provider is running** no longer risks a timing collision that could knock the provider offline (the deploy now waits it out and self-recovers). And **uploading the wrong TAK Server package for your OS** now gives a clear, immediate message instead of a confusing late error. **Upgrade:** applied automatically on the next console update; affected boxes repair themselves on restart, and healthy boxes are left untouched.
+
+Full notes: [v10.0.9-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.9-alpha).
 
 ### v10.0.8-alpha — 2026-07-03 — The security guard becomes a real lock — safely, on your terms
 
