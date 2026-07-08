@@ -36224,6 +36224,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .hops .cgnat{color:var(--cyan);font-weight:700}.hops .private{color:var(--yellow)}.hops .public{color:var(--green)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
+.seg{display:inline-flex;background:#0a0e1a;border:1px solid var(--border);border-radius:9px;padding:3px;gap:3px;margin-bottom:20px}
+.seg-btn{padding:7px 20px;border:none;background:none;color:var(--text-dim);font-size:12px;font-weight:600;cursor:pointer;border-radius:6px;font-family:inherit;transition:all .15s}
+.seg-btn:hover{color:var(--text-secondary)}
+.seg-btn.active{background:var(--accent);color:#fff}
+.filebtn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);transition:all .15s;white-space:nowrap}
+.filebtn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.filebtn.loaded{border-color:rgba(16,185,129,.4);color:var(--green)}
+textarea.form-input{resize:vertical}
 </style></head>
 <body>
 {{ sidebar_html }}
@@ -36287,32 +36295,36 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       Create the relay VM first (Oracle Free Tier — see the relay runbook); then just enter its IP and
       upload its key below, and this box sets up the whole tunnel for you.
     </p>
-    <div id="anchor-status-line" style="font-size:12px;margin-bottom:14px"></div>
+    <div id="anchor-status-line" style="font-size:12px;margin-bottom:18px"></div>
 
-    <label class="form-label">Relay public IP</label>
-    <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:16px">
-
-    <div style="display:flex;gap:8px;margin-bottom:16px">
-      <button type="button" class="control-btn" id="mode-auto-btn" onclick="setAnchorMode('auto')" style="flex:1">Automatic (upload key)</button>
-      <button type="button" class="control-btn" id="mode-manual-btn" onclick="setAnchorMode('manual')" style="flex:1">Manual (paste key)</button>
+    <div class="seg">
+      <button type="button" class="seg-btn active" id="seg-auto" onclick="setAnchorMode('auto')">Automatic</button>
+      <button type="button" class="seg-btn" id="seg-manual" onclick="setAnchorMode('manual')">Manual</button>
     </div>
 
+    <label class="form-label">Relay public IP</label>
+    <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:18px">
+
     <div id="anchor-mode-auto">
-      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Upload the SSH key you downloaded when you created the Oracle VM (the <code>.key</code> file). This box will SSH in, set up the relay, and wire up the tunnel — nothing else to do.</p>
-      <label class="form-label">SSH username <span style="color:var(--text-dim);font-weight:400">(Oracle Ubuntu = ubuntu)</span></label>
-      <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:12px;max-width:220px">
-      <label class="form-label">Relay SSH private key</label>
-      <div style="margin-bottom:8px">
-        <input type="file" id="anchor-key-file" accept=".key,.pem,.txt,text/plain" onchange="loadKeyFile(event)" style="font-size:12px;color:var(--text-secondary)">
-        <span style="font-size:11px;color:var(--text-dim);margin-left:8px">choose the .key file you downloaded from Oracle — or paste it below</span>
+      <label class="form-label">Relay SSH key <span style="color:var(--text-dim);font-weight:400">— the .key file Oracle gave you</span></label>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+        <input type="file" id="anchor-key-file" accept=".key,.pem,.txt,text/plain" onchange="loadKeyFile(event)" style="display:none">
+        <label for="anchor-key-file" class="filebtn">Choose .key file</label>
+        <span id="anchor-key-name" style="font-size:12px;color:var(--text-dim)">no file chosen</span>
       </div>
-      <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;… or paste the whole .key file here …&#10;-----END OPENSSH PRIVATE KEY-----" style="margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
-      <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay Automatically</button>
+      <div style="margin-bottom:16px"><a href="#" onclick="togglePaste(event)" style="font-size:11px;color:var(--accent);text-decoration:none">or paste the key text instead</a></div>
+      <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="Paste the private key text here" style="display:none;margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+      <label class="form-label">SSH username</label>
+      <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
+        <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="443" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 443 slips through restrictive networks</span>
+      </div>
       <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
 
     <div id="anchor-mode-manual" style="display:none">
-      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Already ran <code>connectivity-anchor-bootstrap.sh setup</code> on the relay yourself? Paste the WireGuard public key it printed.</p>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Already ran the relay setup script yourself? Paste the WireGuard public key it printed.</p>
       <label class="form-label">Relay WireGuard public key</label>
       <input class="form-input" id="anchor-pubkey" placeholder="44-character key ending in =" style="margin-bottom:16px">
       <button class="btn btn-primary" id="anchor-connect-btn" onclick="connectAnchor()">Connect to Relay</button>
@@ -36324,10 +36336,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         </div>
       </div>
     </div>
-
-    <label class="form-label" style="margin-top:16px">WireGuard port</label>
-    <input class="form-input" id="anchor-port" value="443" style="margin-top:6px;max-width:160px">
-    <div style="font-size:11px;color:var(--text-dim);margin-top:6px">Default 443 — survives restrictive networks (looks like HTTPS). Change only if your anchor uses a different port.</div>
   </div>
 </div>
 
@@ -36455,15 +36463,23 @@ function loadKeyFile(ev){
   const reader = new FileReader();
   reader.onload = function(e){
     document.getElementById('anchor-ssh-key').value = e.target.result;
+    document.getElementById('anchor-key-name').textContent = f.name;
+    document.querySelector('label[for="anchor-key-file"]').classList.add('loaded');
     document.getElementById('anchor-provision-log').style.display = 'none';
   };
   reader.readAsText(f);
 }
+function togglePaste(ev){
+  ev.preventDefault();
+  const ta = document.getElementById('anchor-ssh-key');
+  ta.style.display = (ta.style.display === 'none') ? 'block' : 'none';
+  if(ta.style.display === 'block') ta.focus();
+}
 function setAnchorMode(mode){
   document.getElementById('anchor-mode-auto').style.display = (mode==='auto') ? 'block' : 'none';
   document.getElementById('anchor-mode-manual').style.display = (mode==='manual') ? 'block' : 'none';
-  document.getElementById('mode-auto-btn').style.borderColor = (mode==='auto') ? 'var(--cyan)' : '';
-  document.getElementById('mode-manual-btn').style.borderColor = (mode==='manual') ? 'var(--cyan)' : '';
+  document.getElementById('seg-auto').classList.toggle('active', mode==='auto');
+  document.getElementById('seg-manual').classList.toggle('active', mode==='manual');
 }
 let provPollTimer = null;
 async function provisionAnchor(){
