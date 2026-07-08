@@ -638,24 +638,40 @@ def _check_netplan(argv):
 
 
 def _check_nmcli(argv):
-    """nmcli: exactly the four WiFi-card shapes (NetworkManager boxes):
+    """nmcli: exactly the WiFi-card shapes (NetworkManager boxes):
       nmcli dev wifi rescan
       nmcli -t -f SSID,SIGNAL dev wifi list
       nmcli -t -f NAME,TYPE connection show
-      nmcli dev wifi connect <ssid> [password <psk>]
-    Free args (ssid/psk) must not start with '-' — no option injection. Every
-    other nmcli verb (con mod, con up, radio, device set, …) is denied."""
+      nmcli connection add type wifi con-name <ssid> ifname <iface|*> ssid <ssid>
+            connection.autoconnect yes [wifi-sec.key-mgmt wpa-psk wifi-sec.psk <psk>]
+      nmcli connection modify <ssid> wifi-sec.psk <psk>
+    `connection add` creates a PROFILE and activates nothing — deliberately NOT
+    `dev wifi connect`, which switches the live network (can drop the console's
+    own uplink) and fails for out-of-range SSIDs (breaks pre-provision). Free
+    args (ssid/iface/psk) must not start with '-' — no option injection. Every
+    other nmcli verb (con up/down/delete, radio, device set, …) is denied."""
     rest = argv[1:]
     if rest == ['dev', 'wifi', 'rescan']:
         return
     if rest in (['-t', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list'],
                 ['-t', '-f', 'NAME,TYPE', 'connection', 'show']):
         return
-    if (len(rest) in (4, 6) and rest[0:3] == ['dev', 'wifi', 'connect']
-            and not rest[3].startswith('-')
-            and (len(rest) == 4 or (rest[4] == 'password' and not rest[5].startswith('-')))):
+
+    def _free(a):
+        return bool(a) and not a.startswith('-')
+    if (len(rest) in (12, 16)
+            and rest[0:5] == ['connection', 'add', 'type', 'wifi', 'con-name']
+            and _free(rest[5]) and rest[6] == 'ifname'
+            and (rest[7] == '*' or _IFACE_RE.match(rest[7]))
+            and rest[8] == 'ssid' and _free(rest[9])
+            and rest[10:12] == ['connection.autoconnect', 'yes']
+            and (len(rest) == 12 or (rest[12:15] == ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk']
+                                     and _free(rest[15])))):
         return
-    raise Denied('nmcli: only the WiFi scan/list/connect shapes are allowed')
+    if (len(rest) == 5 and rest[0:2] == ['connection', 'modify']
+            and _free(rest[2]) and rest[3] == 'wifi-sec.psk' and _free(rest[4])):
+        return
+    raise Denied('nmcli: only the WiFi scan/list/profile-add shapes are allowed')
 
 
 def _check_pkgmgr(argv):
@@ -1717,11 +1733,11 @@ def _summary(req):
     if op == 'exec':
         argv = [str(a) for a in (req.get('argv') or [])]
         # Redact secrets that legitimately ride in argv (v10.1.0: the nmcli WiFi
-        # connect shape carries the operator-entered PSK — it must never reach
+        # profile shapes carry the operator-entered PSK — it must never reach
         # the persistent audit log or journald; CJIS "secrets never logged").
-        # Generic rule: the token FOLLOWING a literal `password` argument.
+        # Generic rule: the token FOLLOWING a literal password-ish key.
         for i, a in enumerate(argv[:-1]):
-            if a == 'password':
+            if a in ('password', 'wifi-sec.psk'):
                 argv[i + 1] = '***'
         return ' '.join(argv)[:200]
     return str(req.get('path'))[:200]

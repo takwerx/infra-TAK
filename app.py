@@ -8916,14 +8916,30 @@ def _conn_wifi_add(ssid, psk):
         return False, 'Network name must be 1–32 characters.'
     if psk and not (8 <= len(psk) <= 63):
         return False, 'WiFi password must be 8–63 characters (WPA requirement).'
-    # NetworkManager path (RHEL / any box with nmcli): additive by nature.
+    # NetworkManager path (RHEL / any box with nmcli).
+    # v10.1.0 parity fix: use `connection add` (create the PROFILE, activate
+    # nothing), NOT `dev wifi connect` — connect ACTIVATES, i.e. it switches
+    # the box onto the new network immediately (breaking the "adding never
+    # disconnects the one you're on" promise) and it FAILS outright for an SSID
+    # that isn't in range (breaking pre-provision, the flagship Leg 6 feature).
+    # `connection add` + autoconnect matches netplan's additive semantics:
+    # NM joins the network when it sees it, current connection untouched.
     if shutil.which('nmcli'):
-        cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
-        if psk:
-            cmd += ['password', psk]
+        iface = _conn_wifi_iface() or '*'
+        if ssid in _conn_wifi_saved():
+            if not psk:
+                return True, ''
+            # Same SSID re-added with a (possibly new) password → update in place.
+            cmd = ['nmcli', 'connection', 'modify', ssid, 'wifi-sec.psk', psk]
+        else:
+            cmd = ['nmcli', 'connection', 'add', 'type', 'wifi',
+                   'con-name', ssid, 'ifname', iface, 'ssid', ssid,
+                   'connection.autoconnect', 'yes']
+            if psk:
+                cmd += ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', psk]
         r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
         if r.returncode != 0:
-            return False, (r.stderr or r.stdout or 'nmcli connect failed').strip()[:200]
+            return False, (r.stderr or r.stdout or 'nmcli profile add failed').strip()[:200]
         return True, ''
     # netplan path (Ubuntu).
     f = _conn_wifi_netplan_file()
