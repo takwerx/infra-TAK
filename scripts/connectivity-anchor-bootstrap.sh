@@ -25,7 +25,10 @@
 set -euo pipefail
 
 WG_IF="wg0"
-WG_PORT="51820"
+# Field-proven default (2026-07-07, fire-station Starlink): restrictive guest networks
+# filter uncommon high UDP ports (51820) but pass UDP 443 — it looks like HTTPS/QUIC.
+# 443 is the portable-survivor default; override with WG_PORT=51820 on permissive networks.
+WG_PORT="${WG_PORT:-443}"
 WG_NET="172.31.99.0/24"          # deliberately NOT in 100.64/10 — must never collide with carrier CGNAT space
 ANCHOR_WG_IP="172.31.99.1"
 BOX_WG_IP="172.31.99.2"
@@ -194,6 +197,11 @@ EOF
     systemctl enable --now "wg-quick@${WG_IF}" >/dev/null
     apply_forward_rules
     write_prober
+    # Persist the DNAT/forward/INPUT rules across reboots (Oracle images don't by default).
+    if ! command -v netfilter-persistent >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive pkg_install iptables-persistent >/dev/null 2>&1 || true
+    fi
+    persist_iptables
     local pub_ip; pub_ip=$(public_ip)
     echo ""
     echo "✓ Anchor is up.  Public IP: ${pub_ip}"
@@ -202,7 +210,9 @@ EOF
     echo "  VERIFY prober        : http://${pub_ip}:${PROBER_PORT}/probe  token: $(cat "$PROBER_TOKEN_FILE")"
     echo ""
     echo "NEXT: 1) open udp/${WG_PORT}, tcp/{${TAK_PORTS// /,}}, tcp/${PROBER_PORT} in the cloud"
-    echo "         provider firewall (OCI Security List) — the script cannot reach that."
+    echo "         provider firewall (OCI NSG / Security List) — the script cannot reach that."
+    echo "         ⚠ OCI TRAP: put the port in DESTINATION Port Range, leave SOURCE blank."
+    echo "         A port in the Source field matches nothing and silently drops all traffic."
     echo "      2) on the infra-TAK box: wg genkey, then run:  $0 add-box <box-public-key>"
 }
 
