@@ -9013,7 +9013,8 @@ def _conn_wifi_add(ssid, psk):
 @app.route('/api/connectivity/wifi/list')
 @login_required
 def connectivity_wifi_list_api():
-    return jsonify({'iface': _conn_wifi_iface(), 'saved': _conn_wifi_saved()})
+    return jsonify({'iface': _conn_wifi_iface(), 'saved': _conn_wifi_saved(),
+                    'current': _conn_wifi_current()})
 
 
 @app.route('/api/connectivity/wifi/scan')
@@ -9031,6 +9032,112 @@ def connectivity_wifi_add_api():
     if not ssid:
         return jsonify({'success': False, 'error': 'Enter a network name (SSID).'}), 400
     ok, err = _conn_wifi_add(ssid, psk)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True})
+
+
+# ── Leg 6c — CURRENT + FORGET (which network the box is on; drop a saved one) ──
+def _conn_wifi_current():
+    """SSID the box is CURRENTLY associated to (''=not connected). Reads `iw dev`
+    (broker-gated, cross-platform) — the associated interface prints an `ssid`
+    line. No nmcli-specific shape needed."""
+    iface = _conn_wifi_iface()
+    if not iface:
+        return ''
+    try:
+        _ensure_iw()
+        r = subprocess.run(_sudo_wrap(['iw', 'dev']), capture_output=True, text=True, timeout=8)
+        cur_if = None
+        for ln in (r.stdout or '').splitlines():
+            s = ln.strip()
+            if s.startswith('Interface '):
+                cur_if = s.split(None, 1)[1].strip()
+            elif s.startswith('ssid ') and cur_if == iface:
+                return s[5:].strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _conn_wifi_forget(ssid):
+    """Remove a saved network. Returns (ok, error). nmcli: delete the profile.
+    netplan: strip the SSID from every netplan file that has it, then
+    validate-before-apply (revert on failure). Never touches other APs."""
+    ssid = (ssid or '').strip()
+    if not ssid:
+        return False, 'No network specified.'
+    if shutil.which('nmcli'):
+        r = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'delete', ssid]),
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or 'delete failed').strip()[:200]
+        return True, ''
+    # netplan: read-modify-write each file that contains the AP (via broker).
+    import glob as _glob
+    import yaml as _yaml
+    touched = False
+    for f in sorted(_glob.glob('/etc/netplan/*.yaml')):
+        try:
+            r = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=8)
+            if r.returncode != 0 or 'access-points' not in (r.stdout or ''):
+                continue
+            doc = _yaml.safe_load(r.stdout or '') or {}
+            wifis = ((doc.get('network') or {}).get('wifis') or {})
+            removed_here = False
+            for _iface, cfg in wifis.items():
+                aps = cfg.get('access-points') or {}
+                if ssid in aps:
+                    del aps[ssid]
+                    removed_here = True
+            if not removed_here:
+                continue
+            new_yaml = _yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(prefix='netplan-', suffix='.yaml')
+                os.write(fd, new_yaml.encode())
+                os.close(fd)
+                os.chmod(tmp, 0o600)
+                bak = f + '.infratak-forget.bak'
+                _run_priv_chain([['cp', '-a', f, bak]], mode='and')
+                _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp, f]], mode='and')
+                gen = _run_priv_chain([['netplan', 'generate']], mode='and')
+                if not gen or gen.returncode != 0:
+                    _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
+                    return False, 'Config failed validation — reverted, nothing changed.'
+                touched = True
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    if not touched:
+        return False, 'That network is not saved on this box.'
+    _run_priv_chain([['netplan', 'apply']], mode='and')
+    return True, ''
+
+
+@app.route('/api/connectivity/wifi/forget', methods=['POST'])
+@login_required
+def connectivity_wifi_forget_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    if not ssid:
+        return jsonify({'success': False, 'error': 'No network specified.'}), 400
+    # Forgetting the network the box is CURRENTLY using disconnects it. Allow it,
+    # but require the operator to acknowledge (client sends confirm=true) AND warn
+    # if the Setup AP isn't armed to catch the box.
+    current = _conn_wifi_current()
+    if ssid == current and not data.get('confirm'):
+        ap = _conn_setup_ap_read_conf()
+        return jsonify({'success': False, 'needs_confirm': True, 'is_current': True,
+                        'setup_ap_ready': bool(ap.get('has_password')),
+                        'error': 'This is the network the box is using right now — forgetting it disconnects the box.'}), 409
+    ok, err = _conn_wifi_forget(ssid)
     if not ok:
         return jsonify({'success': False, 'error': err}), 400
     return jsonify({'success': True})
@@ -37320,11 +37427,37 @@ async function refreshWifiSaved(){
     const d = await r.json();
     const el = document.getElementById('wifi-saved');
     if(d.saved && d.saved.length){
-      el.innerHTML = 'Known networks: ' + d.saved.map(s => '<span style="color:var(--text-secondary)">' + esc(s) + '</span>').join(', ');
+      const cur = d.current || '';
+      el.innerHTML = 'Known networks: ' + d.saved.map(s => {
+        const isCur = (s === cur);
+        return '<span style="display:inline-flex;align-items:center;gap:4px;margin-right:10px;white-space:nowrap">'
+          + (isCur ? '<span class="dot" style="background:var(--green);width:7px;height:7px"></span>' : '')
+          + '<span style="color:' + (isCur ? 'var(--green)' : 'var(--text-secondary)') + '">' + esc(s) + (isCur ? ' (connected now)' : '') + '</span>'
+          + ' <span onclick="forgetWifi(' + JSON.stringify(s).replace(/"/g,'&quot;') + ',' + isCur + ')" title="Forget this network" style="cursor:pointer;color:var(--text-dim);font-size:14px;line-height:1">&times;</span>'
+          + '</span>';
+      }).join('');
     } else {
       el.textContent = 'No saved WiFi networks yet.';
     }
   }catch(e){}
+}
+async function forgetWifi(ssid, isCurrent){
+  let msg = 'Forget “' + ssid + '”? The box will no longer join it automatically.';
+  if(isCurrent){ msg = 'Forget “' + ssid + '” — the network the box is using RIGHT NOW?\n\nThis disconnects the box. If you are managing it remotely you will lose access unless the Setup WiFi is set up to catch it. Only do this if you are near the box.'; }
+  if(!confirm(msg)) return;
+  try{
+    let r = await fetch('/api/connectivity/wifi/forget', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid: ssid, confirm: !!isCurrent})});
+    let d = await r.json();
+    if(d.needs_confirm){
+      // server flagged current-network without confirm — our isCurrent check should
+      // have caught it, but honor the server gate.
+      if(!confirm('This is the active network — really disconnect the box?')) return;
+      r = await fetch('/api/connectivity/wifi/forget', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid: ssid, confirm: true})});
+      d = await r.json();
+    }
+    if(!d.success && d.error){ alert(d.error); }
+  }catch(e){}
+  setTimeout(refreshWifiSaved, 1500);
 }
 async function scanWifi(){
   const btn = document.getElementById('wifi-scan-btn');

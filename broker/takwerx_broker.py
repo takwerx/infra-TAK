@@ -671,7 +671,10 @@ def _check_nmcli(argv):
     if (len(rest) == 5 and rest[0:2] == ['connection', 'modify']
             and _free(rest[2]) and rest[3] == 'wifi-sec.psk' and _free(rest[4])):
         return
-    raise Denied('nmcli: only the WiFi scan/list/profile-add shapes are allowed')
+    # v10.1.0 Leg 6c: forget a saved network.  nmcli connection delete <name>
+    if len(rest) == 3 and rest[0:2] == ['connection', 'delete'] and _free(rest[2]):
+        return
+    raise Denied('nmcli: only the WiFi scan/list/profile-add/delete shapes are allowed')
 
 
 def _check_pkgmgr(argv):
