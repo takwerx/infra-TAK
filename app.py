@@ -8667,6 +8667,104 @@ def connectivity_anchor_provision_status_api():
                     'error': st.get('error', ''), 'log': st.get('log', [])})
 
 
+# ── Leg 5 — VERIFY (green/red reachability matrix) ─────────────────────────────
+# Proves clients can actually reach the stack from the public internet — the loop
+# that kills router/NSG trial-and-error. v1 vantage decision (deliberate deviation
+# from the PLAN's relay-side :5099 prober): the relay CANNOT probe its own public
+# IP — locally-originated packets skip the PREROUTING DNAT and never traverse the
+# cloud NSG, so a relay-side self-probe false-REDs a perfectly working setup. A
+# direct outbound TCP connect from THIS BOX to the relay's public endpoint walks
+# the true client path end-to-end (internet → cloud NSG → relay DNAT → WireGuard →
+# box service) — the same round trip the LDAP-outpost FQDN probe validated in the
+# field 2026-07-08. The :5099 seed prober stays on the relay for a future
+# third-vantage / Class-A probe-back build.
+_CONN_VERIFY_PORTS = [
+    (443,  'Web UIs (Portal / CloudTAK / Authentik via Caddy)', True),
+    (8089, 'TAK streaming (CoT / ATAK-iTAK connections)',        True),
+    (8443, 'Marti API / WebTAK',                                  True),
+    (8446, 'Certificate + QR enrollment',                         True),
+    (80,   "Let's Encrypt renewal (HTTP-01)",                     False),
+]
+
+_connectivity_verify_status = {'running': False, 'complete': False, 'error': '', 'result': None}
+
+
+def _conn_verify_tcp(host, port, timeout=5):
+    """One TCP connect probe. Returns {'state','ms','detail'} and never raises."""
+    import socket as _s
+    t0 = time.time()
+    try:
+        with _s.create_connection((host, port), timeout=timeout):
+            return {'state': 'green', 'ms': int((time.time() - t0) * 1000), 'detail': ''}
+    except OSError as ex:
+        return {'state': 'red', 'ms': int((time.time() - t0) * 1000),
+                'detail': (getattr(ex, 'strerror', '') or str(ex))[:80]}
+
+
+def _run_connectivity_verify(settings):
+    st = _connectivity_verify_status
+    try:
+        anchor = settings.get('connectivity_anchor') or {}
+        result = {'ports': {}, 'target': '', 'mode': '', 'vantage': '', 'ts': int(time.time())}
+        if anchor.get('anchor_ip'):
+            result['target'] = anchor['anchor_ip']
+            result['mode'] = 'relay'
+            result['vantage'] = ("this box → the relay's public address — the exact path clients take "
+                                 "(internet → cloud firewall/NSG → relay forward → tunnel → this box)")
+        else:
+            fqdn = (settings.get('fqdn') or '').split(':')[0].strip()
+            result['target'] = fqdn or (settings.get('server_ip') or '').strip()
+            result['mode'] = 'direct'
+            result['vantage'] = ("this box → its own public address. On a home network without NAT "
+                                 "hairpin this can show red even when outside clients connect fine — "
+                                 "confirm with a phone on cellular if reds look wrong.")
+        if not result['target']:
+            st.update({'running': False, 'complete': True, 'result': None,
+                       'error': 'Nothing to verify yet — connect a relay (or set an FQDN / public IP) first.'})
+            return
+        required_green = 0
+        for port, label, required in _CONN_VERIFY_PORTS:
+            probe = _conn_verify_tcp(result['target'], port)
+            probe['label'] = label
+            probe['required'] = required
+            if probe['state'] == 'red':
+                # The killer diagnostic: is the service even listening locally? Separates
+                # "deploy the module first" from "the path (router/NSG/forward) is blocked".
+                local = _conn_verify_tcp('127.0.0.1', port, timeout=2)
+                probe['local_listener'] = (local['state'] == 'green')
+                probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
+                                 + ('relay cloud firewall/NSG ingress + forwarded ports' if result['mode'] == 'relay'
+                                    else 'router port forward + ISP/CGNAT')) if probe['local_listener'] else \
+                                'nothing listening on this box yet — deploy the module that owns this port'
+            if probe['state'] == 'green' and required:
+                required_green += 1
+            result['ports'][str(port)] = probe
+        result['all_green'] = required_green == sum(1 for _, _, req in _CONN_VERIFY_PORTS if req)
+        st.update({'running': False, 'complete': True, 'error': '', 'result': result})
+    except Exception as ex:
+        st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
+
+
+@app.route('/api/connectivity/verify', methods=['POST'])
+@login_required
+def connectivity_verify_api():
+    if _connectivity_verify_status.get('running'):
+        return jsonify({'error': 'A verify run is already in progress'}), 409
+    _connectivity_verify_status.update(
+        {'running': True, 'complete': False, 'error': '', 'result': None})
+    settings = load_settings()
+    threading.Thread(target=_run_connectivity_verify, args=(settings,), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/verify-status')
+@login_required
+def connectivity_verify_status_api():
+    st = _connectivity_verify_status
+    return jsonify({'running': st.get('running', False), 'complete': st.get('complete', False),
+                    'error': st.get('error', ''), 'result': st.get('result')})
+
+
 # ── Leg 6 — WIFI JOIN (tell the box its next network, from the browser) ────────
 # Kills the netplan hand-edit for a portable box: scan/list networks + add one from
 # the UI. SAFETY MODEL (headless box reached remotely — a bad apply strands it):
@@ -13424,8 +13522,8 @@ def _guarddog_diskio_report_inner():
 def _guarddog_timer_list():
     """All Guard Dog timer unit names (core + optional service monitors)."""
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
-            'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer',
-            'takcertguard.timer', 'takintcaguard.timer',
+            'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takrelayguard.timer',
+            'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
             'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
@@ -14139,7 +14237,11 @@ def run_guarddog_deploy(alert_email):
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
-            'tak-buildcache-reclaim.sh'
+            'tak-buildcache-reclaim.sh',
+            # v10.1.0 Leg 7: relay tunnel health. Installed fleet-wide — the script
+            # no-ops silently when no relay is configured (no /etc/wireguard/wg0.conf),
+            # and starts watching the moment the operator connects a relay later.
+            'tak-relay-watch.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -14233,6 +14335,8 @@ def run_guarddog_deploy(alert_email):
             ('takbuildcachereclaim.timer', '[Unit]\nDescription=Run Docker build-cache reclaim hourly (disk-capacity hygiene)\n\n[Timer]\nOnBootSec=45min\nOnUnitActiveSec=1h\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takrelayguard.service', '[Unit]\nDescription=TAK Relay Tunnel Monitor (connectivity anchor)\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-relay-watch.sh\n'),
+            ('takrelayguard.timer', '[Unit]\nDescription=TAK Relay Tunnel Monitor Timer\nRequires=takrelayguard.service\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
             ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takcertguard.service', '[Unit]\nDescription=TAK Certificate Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cert-watch.sh\n'),
@@ -14388,7 +14492,7 @@ def run_guarddog_deploy(alert_email):
             return
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
                   'takswapreclaim.timer', 'takbuildcachereclaim.timer',
-                  'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
+                  'taknetguard.timer', 'takrelayguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
             timers.append('takcotdbguard.timer')
@@ -36540,6 +36644,22 @@ textarea.form-input{resize:vertical}
     </div>
   </div>
 
+  <div class="card" id="verify-card">
+    <div class="card-title">Verify Reachability</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      Prove that clients can actually reach this stack from the public internet — every port TAK
+      needs, tested end-to-end over the real path (relay firewall, cloud security lists, port
+      forwards, tunnel). Fix anything red, then run it again until it&#39;s all green.
+    </p>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+      <button class="btn btn-primary" id="verify-btn" onclick="runVerify()">Verify Reachability</button>
+      <span id="verify-status" style="font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div id="verify-banner" style="display:none;margin-bottom:14px"></div>
+    <div id="verify-matrix" style="display:flex;flex-direction:column;gap:8px"></div>
+    <div id="verify-vantage" style="margin-top:12px;font-size:11px;color:var(--text-dim)"></div>
+  </div>
+
   <div class="card" id="wifi-card">
     <div class="card-title">WiFi Networks</div>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
@@ -36571,10 +36691,10 @@ const CLASS_CAPTIONS = {
 };
 const RECO_TEXT = {
   'anchor': '<b>Recommended path: a relay.</b> This box dials OUT over an encrypted tunnel to a small always-free public VPS (Oracle Free Tier). Friends and clients connect to the relay\\'s public address with <b>no VPN</b> — identical from any network this box sits on. Set one up in the <b>Connect a Relay</b> card below — enter its IP and upload its key, and this box does the rest.',
-  'ddns_portforward': '<b>Recommended path: DDNS + one port-forward.</b> This network has a clean public IP. A dynamic-DNS hostname (Cloudflare) plus forwarding the TAK ports on your router makes this box reachable — friends connect to a name, no VPN. Automation for this path ships in the next wizard step.',
-  'bridge_then_ddns': '<b>Recommended path: bridge the upstream gateway, then re-detect.</b> Two routers are NATing in a row. Put the ISP\\'s gateway in bridge / IP-passthrough mode so your own router holds the public IP, then run detection again — this box should re-classify as Class A.',
+  'ddns_portforward': '<b>Recommended path: DDNS + port forwarding.</b> This network has a clean public IP. A dynamic-DNS hostname (Cloudflare) plus forwarding the TAK ports on your router makes this box reachable — friends connect to a name, no VPN. Follow the <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/DDNS-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">step-by-step guide &#8599;</a> (DHCP reservation, the five forwards, Cloudflare token, never-DMZ), then prove it with <b>Verify Reachability</b> below.',
+  'bridge_then_ddns': '<b>Recommended path: bridge the upstream gateway, then re-detect.</b> Two routers are NATing in a row. Put the ISP\\'s gateway in bridge / IP-passthrough mode so your own router holds the public IP, then run detection again — this box should re-classify as Class A. (Full walk-through of the direct path: <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/DDNS-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">DDNS guide &#8599;</a>.)',
   'rerun': 'Detection could not establish this network\\'s public IP. Check that the box has outbound internet and run detection again.',
-  'cloud_verify': '<b>Cloud VM — already reachable.</b> The internet routes straight to this box\\'s public IP; there is no router and nothing to forward. What\\'s worth checking is the cloud-side firewall (security list / NSG): make sure the TAK ports are open as ingress, set up your domain via the Caddy module, and use VERIFY (coming in a later wizard step) to prove each port is green from outside.'
+  'cloud_verify': '<b>Cloud VM — already reachable.</b> The internet routes straight to this box\\'s public IP; there is no router and nothing to forward. What\\'s worth checking is the cloud-side firewall (security list / NSG): make sure the TAK ports are open as ingress, set up your domain via the Caddy module, and prove each port with <b>Verify Reachability</b> below.'
 };
 
 function paintIntent(){
@@ -36757,6 +36877,64 @@ async function pollProvision(){
       refreshAnchorStatus();
     }
   }catch(e){}
+}
+let verifyTimer = null;
+async function runVerify(){
+  const btn = document.getElementById('verify-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Verifying…';
+  document.getElementById('verify-status').textContent = 'connecting to each port from this box over the public path…';
+  try{
+    const r = await fetch('/api/connectivity/verify', {method:'POST'});
+    if(r.status === 409){ /* already running — just poll */ }
+  }catch(e){}
+  verifyTimer = setInterval(pollVerify, 1200);
+}
+async function pollVerify(){
+  try{
+    const r = await fetch('/api/connectivity/verify-status');
+    const d = await r.json();
+    if(!d.running){
+      clearInterval(verifyTimer); verifyTimer = null;
+      const btn = document.getElementById('verify-btn');
+      btn.disabled = false; btn.textContent = 'Verify Again';
+      document.getElementById('verify-status').textContent = '';
+      if(d.error){
+        document.getElementById('verify-status').textContent = d.error;
+        return;
+      }
+      if(d.result){ renderVerify(d.result); }
+    }
+  }catch(e){}
+}
+function renderVerify(res){
+  const banner = document.getElementById('verify-banner');
+  banner.style.display = 'block';
+  if(res.all_green){
+    banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:10px;padding:14px 16px">'
+      + '<span class="dot" style="background:var(--green)"></span>'
+      + '<div style="font-size:13px;font-weight:600;color:var(--green)">All green — clients on the public internet can reach this stack.</div></div>';
+  }else{
+    banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);border-radius:10px;padding:14px 16px">'
+      + '<span class="dot" style="background:var(--red)"></span>'
+      + '<div style="font-size:13px;color:var(--text-secondary)"><b style="color:var(--red)">Not reachable yet.</b> Fix the red rows below, then Verify Again — repeat until all green.</div></div>';
+  }
+  const order = ['443','8089','8443','8446','80'];
+  const rows = [];
+  for(const p of order){
+    const v = (res.ports || {})[p];
+    if(!v) continue;
+    const green = v.state === 'green';
+    const dotColor = green ? 'var(--green)' : (v.required ? 'var(--red)' : 'var(--yellow)');
+    let detail = green ? ('connected' + (v.ms != null ? ' · ' + v.ms + ' ms' : '')) : (v.hint || v.detail || 'no route');
+    rows.push('<div style="display:flex;align-items:center;gap:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
+      + '<span class="dot" style="background:' + dotColor + ';flex-shrink:0"></span>'
+      + '<span style="font-family:\\'JetBrains Mono\\',monospace;font-size:13px;min-width:52px">' + esc(p) + '</span>'
+      + '<span style="font-size:12px;color:var(--text-secondary);flex:1">' + esc(v.label || '') + (v.required ? '' : ' <span style="color:var(--text-dim)">(optional)</span>') + '</span>'
+      + '<span style="font-size:11px;color:' + (green ? 'var(--text-dim)' : 'var(--text-secondary)') + ';max-width:46%;text-align:right">' + esc(detail) + '</span>'
+      + '</div>');
+  }
+  document.getElementById('verify-matrix').innerHTML = rows.join('');
+  document.getElementById('verify-vantage').textContent = 'Tested: ' + (res.target || '') + ' — ' + (res.vantage || '');
 }
 async function refreshWifiSaved(){
   try{
@@ -40932,42 +41110,12 @@ networks:
         _remote_ram_mb = int((_ram_out or '0').strip())
     except Exception:
         pass
-    if _remote_ram_mb >= 49152:
-        _pg_cmd_remote = _AUTHENTIK_PG_COMMAND_ENTERPRISE
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — enterprise PG settings")
-    elif _remote_ram_mb >= 16384:
-        _pg_cmd_remote = ('postgres -c max_connections=1000 -c shared_buffers=4GB '
-                          '-c effective_cache_size=12GB -c work_mem=8MB '
-                          '-c maintenance_work_mem=512MB -c wal_buffers=16MB '
-                          '-c max_wal_size=2GB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — 16GB PG tier")
-    elif _remote_ram_mb >= 8192:
-        _pg_cmd_remote = ('postgres -c max_connections=500 -c shared_buffers=2GB '
-                          '-c effective_cache_size=6GB -c work_mem=4MB '
-                          '-c maintenance_work_mem=256MB -c wal_buffers=8MB '
-                          '-c max_wal_size=1GB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — 8GB PG tier")
-    elif _remote_ram_mb >= 4096:
-        _pg_cmd_remote = ('postgres -c max_connections=300 -c shared_buffers=1GB '
-                          '-c effective_cache_size=3GB -c work_mem=2MB '
-                          '-c maintenance_work_mem=128MB -c wal_buffers=4MB '
-                          '-c max_wal_size=512MB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — 4GB PG tier")
-    else:
-        _pg_cmd_remote = ('postgres -c max_connections=200 -c shared_buffers=256MB '
-                          '-c effective_cache_size=768MB -c work_mem=1MB '
-                          '-c maintenance_work_mem=64MB -c wal_buffers=2MB '
-                          '-c max_wal_size=256MB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        _tier = f"{_remote_ram_mb} MB" if _remote_ram_mb > 0 else "unknown (probe failed)"
-        plog(f"  Remote RAM: {_tier} — minimum safe PG settings")
+    # v10.1.0: tier ladder factored into _authentik_pg_command_for_ram so the
+    # LOCAL deploy paths use the identical deterministic autotune (they used to
+    # hardcode enterprise — 12GB shared_buffers on any box).
+    _pg_cmd_remote, _pg_tier_remote = _authentik_pg_command_for_ram(_remote_ram_mb)
+    _ram_label = f"{_remote_ram_mb} MB" if _remote_ram_mb > 0 else "unknown (probe failed)"
+    plog(f"  Remote RAM: {_ram_label} — {_pg_tier_remote} PG settings")
     compose_content = compose_content.replace(
         'command: ' + _AUTHENTIK_PG_COMMAND_ENTERPRISE,
         'command: ' + _pg_cmd_remote,
@@ -41390,29 +41538,16 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.28-alpha: enterprise PG tuning is now defined once at the top
-        # of app.py as _AUTHENTIK_PG_COMMAND_ENTERPRISE. The legacy patcher
-        # writes that canonical string unconditionally — no operator-override
-        # preservation (per .cursor/rules/fleet-uniform-config.mdc).
-        #
-        # Historical note: v0.9.23-v0.9.27 used a smaller command with
-        # max_connections=500 and no memory tuning. v0.9.28 raises this to
-        # max_connections=2000 + shared_buffers=12GB etc. to absorb the
-        # Authentik #20714 channels_postgres leak amplifier at production
-        # scale (100s of TAK clients per Authentik instance).
-        pg_cmd = _AUTHENTIK_PG_COMMAND_ENTERPRISE
+        # v10.1.0: RAM-tiered canonical command (_authentik_pg_command_for_ram) —
+        # the legacy patcher used to write enterprise (12GB shared_buffers)
+        # unconditionally, which over-provisions any box under 48GB. Still no
+        # operator-override preservation (per .cursor/rules/fleet-uniform-config.mdc):
+        # any command that differs from this box's tier-canonical string is rewritten.
+        pg_cmd, _pg_tier_lbl = _authentik_pg_command_for_ram(_local_ram_mb())
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
-        # Enterprise migration: detect any non-enterprise command line
-        # (anything missing shared_buffers, or max_connections < 2000,
-        # is treated as needing update). The detection is intentionally
-        # permissive — if any required enterprise arg is missing/lower,
-        # we rewrite the whole command to canonical.
         _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
-        _pg_sb_match = re.search(r'shared_buffers=(\d+)([KMG]?B)', _pg_full)
-        _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 2000)
-        _sb_needs = not _pg_sb_match  # enterprise requires shared_buffers tuning
-        needs_pg_update = has_pg_cmd and (_mc_needs or _sb_needs)
+        needs_pg_update = has_pg_cmd and (pg_cmd not in _pg_full)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -41424,7 +41559,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                 lines = patched
                 changed = True
                 if plog:
-                    plog(f"  ✓ Added enterprise PostgreSQL tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB)")
+                    plog(f"  ✓ Added PostgreSQL tuning ({_pg_tier_lbl})")
         elif needs_pg_update:
             for i, line in enumerate(lines):
                 if 'command: postgres' in line and 'max_connections' in line:
@@ -41433,7 +41568,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        plog(f"  ✓ Updated PostgreSQL to enterprise tuning (max_connections={_old_mc}→2000, +shared_buffers=12GB, +effective_cache_size=36GB) [legacy patcher]")
+                        plog(f"  ✓ Updated PostgreSQL tuning to {_pg_tier_lbl} (max_connections was {_old_mc}) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -41579,33 +41714,30 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     services = data.setdefault('services', {})
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
-    # v0.9.28-alpha: enterprise PG tuning (12-core / 48 GB hardware tier).
-    # The canonical command string is _AUTHENTIK_PG_COMMAND_ENTERPRISE at the
-    # top of app.py — referenced here so all migration paths converge to the
-    # same string. NO max(cur, target) override-preservation — fleet uniform
-    # config rule (.cursor/rules/fleet-uniform-config.mdc).
-    #
-    # Note on size deltas vs v0.9.27:
-    #   max_connections 500 → 2000  (maintainer-endorsed Authentik #20714 mitigation)
-    #   + shared_buffers=12GB, effective_cache_size=36GB (PG canonical 25%/75% of 48GB)
-    #   + work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB
-    #
-    # Memory budget on a 48 GB box at peak: ~35-38 GB (PG shared + 1500
-    # backends @ 10 MB + Authentik containers + OS), leaves ~10 GB headroom.
-    _pg_target_cmd = _AUTHENTIK_PG_COMMAND_ENTERPRISE
+    # v10.1.0: RAM-tiered deterministic autotune (was: unconditional enterprise —
+    # 12GB shared_buffers regardless of box RAM, an 8× over-provision on a 16GB
+    # NUC that only ran on Linux overcommit; confirmed live 2026-07-08). The
+    # canonical ladder is _authentik_pg_command_for_ram at the top of app.py —
+    # the remote deploy uses the same one, so every box converges from the same
+    # observable (total RAM). NO max(cur, target) override-preservation — fleet
+    # uniform config rule (.cursor/rules/fleet-uniform-config.mdc).
+    _local_ram = _local_ram_mb()
+    _pg_target_cmd, _pg_tier = _authentik_pg_command_for_ram(_local_ram)
     pg = services.setdefault('postgresql', {})
     _existing_pg_cmd = str(pg.get('command') or '')
     _pg_mc_m = re.search(r'max_connections=(\d+)', _existing_pg_cmd)
-    _pg_sb_m = re.search(r'shared_buffers=', _existing_pg_cmd)
-    # Enterprise convergence: always write canonical command when current
-    # differs. Per fleet-uniform-config rule, no per-box override carve-out.
+    _pg_sb_m = re.search(r'shared_buffers=(\S+)', _existing_pg_cmd)
+    # Tier convergence: always write the canonical command when current differs.
+    # Per fleet-uniform-config rule, no per-box override carve-out.
     if pg.get('command') != _pg_target_cmd:
         _old_mc = _pg_mc_m.group(1) if _pg_mc_m else '(none)'
-        _had_sb = 'yes' if _pg_sb_m else 'no'
+        _old_sb = _pg_sb_m.group(1) if _pg_sb_m else '(none)'
         pg['command'] = _pg_target_cmd
         changed = True
         if plog:
-            plog(f"  ✓ Set enterprise PostgreSQL tuning (max_connections={_old_mc}→2000, shared_buffers tuned={_had_sb}→yes-12GB, +effective_cache_size=36GB +work_mem=16MB +maintenance_work_mem=2GB +wal_buffers=64MB +max_wal_size=4GB)")
+            _new_mc = re.search(r'max_connections=(\d+)', _pg_target_cmd).group(1)
+            _new_sb = re.search(r'shared_buffers=(\S+)', _pg_target_cmd).group(1)
+            plog(f"  ✓ Set PostgreSQL tuning for {_local_ram} MB RAM ({_pg_tier}): max_connections={_old_mc}→{_new_mc}, shared_buffers={_old_sb}→{_new_sb}")
 
     # ── Server healthcheck ────────────────────────────────────────────────────
     _target_hc = {
@@ -44085,6 +44217,70 @@ _AUTHENTIK_PG_COMMAND_ENTERPRISE = (
     ' -c tcp_keepalives_interval=10'
     ' -c tcp_keepalives_count=6'
 )
+
+# Shared timeout/keepalive tail — identical across every PG tier.
+_AUTHENTIK_PG_COMMAND_TAIL = (
+    ' -c statement_timeout=120s'
+    ' -c idle_session_timeout=300s'
+    ' -c idle_in_transaction_session_timeout=300s'
+    ' -c tcp_keepalives_idle=60'
+    ' -c tcp_keepalives_interval=10'
+    ' -c tcp_keepalives_count=6'
+)
+
+
+def _local_ram_mb():
+    """Total RAM of THIS box in MB (0 if unreadable). Same observable the remote
+    deploy probes with `free -m` — keyed off /proc/meminfo locally."""
+    try:
+        with open('/proc/meminfo') as _f:
+            for _l in _f:
+                if _l.startswith('MemTotal:'):
+                    return int(_l.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _authentik_pg_command_for_ram(ram_mb):
+    """Deterministic RAM→PG-tuning ladder. Returns (command_string, tier_label).
+
+    v10.1.0: the LOCAL Authentik deploy hardcoded _AUTHENTIK_PG_COMMAND_ENTERPRISE
+    (12GB shared_buffers, sized for the 48GB hardware tier) regardless of box RAM —
+    an 8× over-provision on a 16GB NUC that only ran at all thanks to Linux
+    overcommit ([[authentik-pg-tuning-ignores-box-ram]], confirmed live 2026-07-08).
+    The REMOTE deploy already tiered by probed RAM; this helper is that same ladder,
+    factored out so every writer (remote deploy, local deploy, legacy patcher)
+    converges on the same deterministic autotune — fleet-uniform rule: same signal
+    → same config on every box, no operator-override preservation.
+
+    Probe-failure (ram_mb=0) gets the minimum-safe tier, matching the remote path.
+
+    Thresholds sit at ~92% of the nominal size: a physical 16GB box reports ~15.9GB
+    (kernel/firmware reservations), and a hard >=16384 gate would demote real
+    hardware one tier down. Deterministic and identical on every box.
+    """
+    if ram_mb >= 45056:
+        return _AUTHENTIK_PG_COMMAND_ENTERPRISE, 'enterprise (48GB+)'
+    if ram_mb >= 15000:
+        return ('postgres -c max_connections=1000 -c shared_buffers=4GB'
+                ' -c effective_cache_size=12GB -c work_mem=8MB'
+                ' -c maintenance_work_mem=512MB -c wal_buffers=16MB'
+                ' -c max_wal_size=2GB' + _AUTHENTIK_PG_COMMAND_TAIL), '16GB tier'
+    if ram_mb >= 7500:
+        return ('postgres -c max_connections=500 -c shared_buffers=2GB'
+                ' -c effective_cache_size=6GB -c work_mem=4MB'
+                ' -c maintenance_work_mem=256MB -c wal_buffers=8MB'
+                ' -c max_wal_size=1GB' + _AUTHENTIK_PG_COMMAND_TAIL), '8GB tier'
+    if ram_mb >= 3700:
+        return ('postgres -c max_connections=300 -c shared_buffers=1GB'
+                ' -c effective_cache_size=3GB -c work_mem=2MB'
+                ' -c maintenance_work_mem=128MB -c wal_buffers=4MB'
+                ' -c max_wal_size=512MB' + _AUTHENTIK_PG_COMMAND_TAIL), '4GB tier'
+    return ('postgres -c max_connections=200 -c shared_buffers=256MB'
+            ' -c effective_cache_size=768MB -c work_mem=1MB'
+            ' -c maintenance_work_mem=64MB -c wal_buffers=2MB'
+            ' -c max_wal_size=256MB' + _AUTHENTIK_PG_COMMAND_TAIL), 'minimum-safe tier'
 
 # v0.9.28-alpha: enterprise scaling — PgBouncer tier.
 #   DEFAULT_POOL_SIZE 75 → 300: with PG max_connections bumped to 2000, the

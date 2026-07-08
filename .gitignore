@@ -27,6 +27,7 @@ docs/*
 !docs/GUARDDOG.md
 !docs/AUTHENTIK-LOGIN-BRANDING.md
 !docs/RELAY-SETUP.md
+!docs/DDNS-SETUP.md
 memory-bank/
 .cursor/
 .cursorrules
