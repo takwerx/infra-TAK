@@ -8415,45 +8415,40 @@ def connectivity_anchor_status_api():
     return jsonify(_conn_anchor_status())
 
 
-@app.route('/api/connectivity/anchor/configure', methods=['POST'])
-@login_required
-def connectivity_anchor_configure_api():
-    data = request.get_json(silent=True) or {}
-    anchor_ip = (data.get('anchor_ip') or '').strip()
-    anchor_pubkey = (data.get('anchor_pubkey') or '').strip()
-    wg_port = data.get('wg_port', 443)
-    # Strict validation — these feed a config file + systemd, never a shell.
+def _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, wg_port):
+    """Shared strict validation. Returns (ok, wg_port_int_or_error_string)."""
     try:
         ipaddress.ip_address(anchor_ip)
     except (ValueError, TypeError):
-        return jsonify({'success': False, 'error': 'Anchor IP is not a valid IP address.'}), 400
-    if not _CONN_WG_KEY_RE.fullmatch(anchor_pubkey):
-        return jsonify({'success': False, 'error': 'Anchor WireGuard public key is malformed (expected a 44-char base64 key ending in "=").'}), 400
+        return False, 'Anchor IP is not a valid IP address.'
+    if anchor_pubkey is not None and not _CONN_WG_KEY_RE.fullmatch(anchor_pubkey or ''):
+        return False, 'Anchor WireGuard public key is malformed (expected a 44-char base64 key ending in "=").'
     try:
         wg_port = int(wg_port)
     except (ValueError, TypeError):
-        return jsonify({'success': False, 'error': 'WireGuard port must be a number.'}), 400
+        return False, 'WireGuard port must be a number.'
     if not (1 <= wg_port <= 65535):
-        return jsonify({'success': False, 'error': 'WireGuard port out of range.'}), 400
+        return False, 'WireGuard port out of range.'
+    return True, wg_port
 
-    # Ensure wireguard-tools is present (fresh boxes won't have it).
+
+def _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port):
+    """Generate the box keypair, write /etc/wireguard/wg0.conf, bring up the tunnel.
+    Callers must have validated inputs already. Returns (ok, box_pubkey, error)."""
     if not shutil.which('wg'):
         try:
             _pkg_install(['wireguard-tools'])
         except Exception as ex:
-            return jsonify({'success': False, 'error': 'Could not install wireguard-tools: %s' % str(ex)[:160]}), 500
+            return False, '', 'Could not install wireguard-tools: %s' % str(ex)[:160]
         if not shutil.which('wg'):
-            return jsonify({'success': False, 'error': 'wireguard-tools unavailable after install.'}), 500
-
-    # Generate the box keypair (wg genkey/pubkey do not need root).
+            return False, '', 'wireguard-tools unavailable after install.'
     try:
         priv = subprocess.run(['wg', 'genkey'], capture_output=True, text=True, timeout=10).stdout.strip()
         pub = subprocess.run(['wg', 'pubkey'], input=priv + '\n', capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception as ex:
-        return jsonify({'success': False, 'error': 'Key generation failed: %s' % str(ex)[:160]}), 500
+        return False, '', 'Key generation failed: %s' % str(ex)[:160]
     if not (_CONN_WG_KEY_RE.fullmatch(priv) and _CONN_WG_KEY_RE.fullmatch(pub)):
-        return jsonify({'success': False, 'error': 'Generated key looked malformed — aborting.'}), 500
-
+        return False, '', 'Generated key looked malformed — aborting.'
     conf = (
         '[Interface]\n'
         'Address = %s/24\n'
@@ -8464,8 +8459,6 @@ def connectivity_anchor_configure_api():
         'AllowedIPs = %s/32\n'
         'PersistentKeepalive = 25\n'
     ) % (_CONN_BOX_WG_IP, priv, anchor_pubkey, anchor_ip, wg_port, _CONN_ANCHOR_WG_IP)
-
-    # Write via a console-owned 0600 temp, then privileged install to /etc/wireguard.
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(prefix='wg-', suffix='.conf')
@@ -8476,23 +8469,34 @@ def connectivity_anchor_configure_api():
             ['install', '-D', '-m', '600', '-o', 'root', '-g', 'root', tmp_path, _conn_wg_conf_path()],
         ], mode='and')
         if not inst or inst.returncode != 0:
-            err = (inst.stderr if inst else '') or 'install failed'
-            return jsonify({'success': False, 'error': 'Could not write tunnel config: %s' % err[:160]}), 500
+            return False, '', 'Could not write tunnel config: %s' % ((inst.stderr if inst else '') or 'install failed')[:160]
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
-
-    # Bring the tunnel up (restart is idempotent if it was already configured).
     up = _run_priv_chain([
-        ['systemctl', 'enable', _CONN_WG_IF and 'wg-quick@%s' % _CONN_WG_IF],
+        ['systemctl', 'enable', 'wg-quick@%s' % _CONN_WG_IF],
         ['systemctl', 'restart', 'wg-quick@%s' % _CONN_WG_IF],
     ], mode='seq')
     if not up or up.returncode != 0:
-        err = (up.stderr if up else '') or 'systemctl failed'
-        return jsonify({'success': False, 'error': 'Tunnel config written but bring-up failed: %s' % err[:160]}), 500
+        return False, '', 'Tunnel config written but bring-up failed: %s' % ((up.stderr if up else '') or 'systemctl failed')[:160]
+    return True, pub, ''
+
+
+@app.route('/api/connectivity/anchor/configure', methods=['POST'])
+@login_required
+def connectivity_anchor_configure_api():
+    data = request.get_json(silent=True) or {}
+    anchor_ip = (data.get('anchor_ip') or '').strip()
+    anchor_pubkey = (data.get('anchor_pubkey') or '').strip()
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, data.get('wg_port', 443))
+    if not ok:
+        return jsonify({'success': False, 'error': wg_port}), 400
+    cfg_ok, pub, err = _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port)
+    if not cfg_ok:
+        return jsonify({'success': False, 'error': err}), 500
 
     settings = load_settings()
     settings['connectivity_anchor'] = {
@@ -8519,6 +8523,148 @@ def connectivity_anchor_disconnect_api():
     settings.pop('connectivity_anchor', None)
     save_settings(settings)
     return jsonify({'success': True})
+
+
+# ── Leg 4 (full) — PROVISION ANCHOR OVER SSH (upload the .key, console does it all) ──
+# Mirrors the TAK split-deploy pattern (takserver_two_server_upload_ssh_key): the
+# operator makes the Oracle VM + downloads its SSH key, then just enters the anchor
+# IP and uploads that key. The console SSHes in, runs the bootstrap, reads the WG
+# public key out of the output, configures the box tunnel, and authorizes the box on
+# the anchor with add-box — no terminal, no hand-copied keys.
+_CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
+                              'dev/scripts/connectivity-anchor-bootstrap.sh')
+_CONN_ANCHOR_KEY_PATH = os.path.expanduser('~/.ssh/infratak_anchor')
+_CONN_SSH_USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}$')
+_connectivity_provision_status = {'running': False, 'complete': False, 'error': '', 'log': []}
+
+
+def _conn_prov_log(msg):
+    _connectivity_provision_status['log'].append(msg)
+
+
+def _conn_write_anchor_key(key_text):
+    """Write + validate the uploaded anchor SSH private key to a FIXED 0600 path
+    (never request-controlled → no traversal). Rejects passphrase-protected keys
+    (can't be used non-interactively). Returns (ok, error). Mirrors split-deploy."""
+    key_text = (key_text or '').replace('\r\n', '\n').replace('\r', '\n')
+    if not key_text.strip():
+        return False, 'No SSH key provided.'
+    if not key_text.endswith('\n'):
+        key_text += '\n'
+    if '-----BEGIN' not in key_text or 'PRIVATE KEY' not in key_text:
+        return False, 'That does not look like an SSH private key (expected a "-----BEGIN … PRIVATE KEY-----" block, e.g. the Oracle .key file).'
+    try:
+        os.makedirs(os.path.dirname(_CONN_ANCHOR_KEY_PATH), mode=0o700, exist_ok=True)
+        fd = os.open(_CONN_ANCHOR_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(key_text)
+        os.chmod(_CONN_ANCHOR_KEY_PATH, 0o600)
+    except Exception as e:
+        return False, 'Could not store key: %s' % str(e)[:160]
+    try:
+        r = subprocess.run(['ssh-keygen', '-y', '-f', _CONN_ANCHOR_KEY_PATH],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        try:
+            os.remove(_CONN_ANCHOR_KEY_PATH)
+        except Exception:
+            pass
+        return False, 'Key validation failed: %s' % str(e)[:160]
+    if r.returncode != 0:
+        try:
+            os.remove(_CONN_ANCHOR_KEY_PATH)
+        except Exception:
+            pass
+        _e = (r.stderr or r.stdout or '').lower()
+        if 'passphrase' in _e:
+            return False, 'The key is passphrase-protected — re-export it without a passphrase and upload that.'
+        return False, 'Invalid or unsupported private key format.'
+    return True, ''
+
+
+def _conn_anchor_ssh(anchor_ip, ssh_user, remote_cmd, timeout=180):
+    """Run one command on the anchor over SSH with the uploaded key. Returns (ok, output)."""
+    host_cfg = {'host': anchor_ip, 'ssh_user': ssh_user, 'ssh_port': 22,
+                'auth_method': 'ssh_key', 'ssh_key_path': _CONN_ANCHOR_KEY_PATH}
+    return _ssh_probe(host_cfg, remote_cmd, timeout=timeout)
+
+
+def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
+    st = _connectivity_provision_status
+    try:
+        _conn_prov_log('Connecting to anchor %s as %s…' % (anchor_ip, ssh_user))
+        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, 'echo anchor-reachable', timeout=25)
+        if not ok:
+            st.update({'running': False, 'complete': True, 'error': 'Cannot SSH to the anchor: %s' % out[:200]})
+            return
+        # Fetch + run the bootstrap on the anchor. WG_PORT is an int (validated); the
+        # URL is a fixed constant. Nothing operator-typed lands in this remote shell string.
+        _conn_prov_log('Running the anchor bootstrap (this installs WireGuard + forwards)…')
+        setup_cmd = ("curl -fsSL '%s' -o ~/connectivity-anchor-bootstrap.sh && "
+                     "chmod +x ~/connectivity-anchor-bootstrap.sh && "
+                     "sudo WG_PORT=%d bash ~/connectivity-anchor-bootstrap.sh setup"
+                     ) % (_CONN_ANCHOR_BOOTSTRAP_RAW, wg_port)
+        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, setup_cmd, timeout=240)
+        if not ok:
+            st.update({'running': False, 'complete': True, 'error': 'Anchor bootstrap failed: %s' % out[:300]})
+            return
+        m = re.search(r'WireGuard public key\s*:\s*([A-Za-z0-9+/]{43}=)', out)
+        if not m:
+            st.update({'running': False, 'complete': True, 'error': 'Could not read the anchor WireGuard key from the bootstrap output.'})
+            return
+        anchor_pubkey = m.group(1)
+        _conn_prov_log('Anchor is up. Configuring this box\'s tunnel…')
+        cfg_ok, box_pub, err = _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port)
+        if not cfg_ok:
+            st.update({'running': False, 'complete': True, 'error': err})
+            return
+        _conn_prov_log('Authorizing this box on the anchor…')
+        # box_pub is a validated base64 WG key (fullmatch in _conn_configure_box_tunnel).
+        addbox_cmd = 'sudo bash ~/connectivity-anchor-bootstrap.sh add-box %s' % box_pub
+        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, addbox_cmd, timeout=60)
+        if not ok:
+            st.update({'running': False, 'complete': True, 'error': 'Box configured but add-box on the anchor failed: %s' % out[:200]})
+            return
+        settings = load_settings()
+        settings['connectivity_anchor'] = {
+            'anchor_ip': anchor_ip, 'anchor_pubkey': anchor_pubkey,
+            'wg_port': wg_port, 'box_pubkey': box_pub, 'provisioned': True,
+        }
+        save_settings(settings)
+        _conn_prov_log('Done. The tunnel is dialing — status will show connected shortly.')
+        st.update({'running': False, 'complete': True, 'error': ''})
+    except Exception as ex:
+        st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
+
+
+@app.route('/api/connectivity/anchor/provision', methods=['POST'])
+@login_required
+def connectivity_anchor_provision_api():
+    if _connectivity_provision_status.get('running'):
+        return jsonify({'success': False, 'error': 'A provisioning run is already in progress.'}), 409
+    data = request.get_json(silent=True) or {}
+    anchor_ip = (data.get('anchor_ip') or '').strip()
+    ssh_user = (data.get('ssh_user') or 'ubuntu').strip()
+    ssh_key = data.get('ssh_private_key') or ''
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, None, data.get('wg_port', 443))
+    if not ok:
+        return jsonify({'success': False, 'error': wg_port}), 400
+    if not _CONN_SSH_USER_RE.fullmatch(ssh_user):
+        return jsonify({'success': False, 'error': 'SSH username has invalid characters.'}), 400
+    key_ok, key_err = _conn_write_anchor_key(ssh_key)
+    if not key_ok:
+        return jsonify({'success': False, 'error': key_err}), 400
+    _connectivity_provision_status.update({'running': True, 'complete': False, 'error': '', 'log': []})
+    threading.Thread(target=_run_connectivity_provision, args=(anchor_ip, ssh_user, wg_port), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/anchor/provision-status')
+@login_required
+def connectivity_anchor_provision_status_api():
+    st = _connectivity_provision_status
+    return jsonify({'running': st.get('running', False), 'complete': st.get('complete', False),
+                    'error': st.get('error', ''), 'log': st.get('log', [])})
 
 
 # ── EUD Remote Assist Portal ──────────────────────────────────────────────────
@@ -36143,25 +36289,42 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       this box configures its own tunnel automatically.
     </p>
     <div id="anchor-status-line" style="font-size:12px;margin-bottom:14px"></div>
-    <div id="anchor-form">
-      <label class="form-label">Anchor public IP</label>
-      <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:12px">
-      <label class="form-label">Anchor WireGuard public key <span style="color:var(--text-dim);font-weight:400">(printed by the anchor's setup)</span></label>
-      <input class="form-input" id="anchor-pubkey" placeholder="44-character key ending in =" style="margin-bottom:12px">
-      <label class="form-label">WireGuard port</label>
-      <input class="form-input" id="anchor-port" value="443" style="margin-bottom:16px;max-width:160px">
-      <div style="font-size:11px;color:var(--text-dim);margin-bottom:16px">Default 443 — survives restrictive networks (looks like HTTPS). Only change it if your anchor uses a different port.</div>
+
+    <label class="form-label">Anchor public IP</label>
+    <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:16px">
+
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <button type="button" class="control-btn" id="mode-auto-btn" onclick="setAnchorMode('auto')" style="flex:1">Automatic (upload key)</button>
+      <button type="button" class="control-btn" id="mode-manual-btn" onclick="setAnchorMode('manual')" style="flex:1">Manual (paste key)</button>
+    </div>
+
+    <div id="anchor-mode-auto">
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Upload the SSH key you downloaded when you created the Oracle VM (the <code>.key</code> file). This box will SSH in, run the anchor setup, and wire up the tunnel — nothing else to do.</p>
+      <label class="form-label">SSH username <span style="color:var(--text-dim);font-weight:400">(Oracle Ubuntu = ubuntu)</span></label>
+      <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:12px;max-width:220px">
+      <label class="form-label">Anchor SSH private key</label>
+      <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;… paste the whole .key file …&#10;-----END OPENSSH PRIVATE KEY-----" style="margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+      <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Anchor Automatically</button>
+      <div class="log-box" id="anchor-provision-log" style="display:none"></div>
+    </div>
+
+    <div id="anchor-mode-manual" style="display:none">
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Already ran <code>connectivity-anchor-bootstrap.sh setup</code> on the anchor yourself? Paste the WireGuard public key it printed.</p>
+      <label class="form-label">Anchor WireGuard public key</label>
+      <input class="form-input" id="anchor-pubkey" placeholder="44-character key ending in =" style="margin-bottom:16px">
       <button class="btn btn-primary" id="anchor-connect-btn" onclick="connectAnchor()">Connect to Anchor</button>
       <div id="anchor-connect-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
-    </div>
-    <div id="anchor-next" style="display:none;margin-top:16px">
-      <div class="reco-banner">
-        <b>Almost there — one step on the anchor.</b> This box is now dialing the anchor. To let it in,
-        run this on the <b>anchor</b> (paste the box key it's asking for):
-        <div class="terminal-block" style="margin-top:10px"><span id="anchor-addbox-cmd"></span></div>
-        Once you run it, the tunnel comes up within a few seconds — status shows below.
+      <div id="anchor-next" style="display:none;margin-top:16px">
+        <div class="reco-banner">
+          <b>One step on the anchor.</b> This box is dialing the anchor; to let it in, run this on the <b>anchor</b>:
+          <div class="terminal-block" style="margin-top:10px"><span id="anchor-addbox-cmd"></span></div>
+        </div>
       </div>
     </div>
+
+    <label class="form-label" style="margin-top:16px">WireGuard port</label>
+    <input class="form-input" id="anchor-port" value="443" style="margin-top:6px;max-width:160px">
+    <div style="font-size:11px;color:var(--text-dim);margin-top:6px">Default 443 — survives restrictive networks (looks like HTTPS). Change only if your anchor uses a different port.</div>
   </div>
 </div>
 
@@ -36283,6 +36446,47 @@ async function refreshAnchorStatus(){
     }
   }catch(e){}
 }
+function setAnchorMode(mode){
+  document.getElementById('anchor-mode-auto').style.display = (mode==='auto') ? 'block' : 'none';
+  document.getElementById('anchor-mode-manual').style.display = (mode==='manual') ? 'block' : 'none';
+  document.getElementById('mode-auto-btn').style.borderColor = (mode==='auto') ? 'var(--cyan)' : '';
+  document.getElementById('mode-manual-btn').style.borderColor = (mode==='manual') ? 'var(--cyan)' : '';
+}
+let provPollTimer = null;
+async function provisionAnchor(){
+  const btn = document.getElementById('anchor-provision-btn');
+  const log = document.getElementById('anchor-provision-log');
+  const ip = document.getElementById('anchor-ip').value.trim();
+  const user = document.getElementById('anchor-ssh-user').value.trim() || 'ubuntu';
+  const key = document.getElementById('anchor-ssh-key').value;
+  const port = document.getElementById('anchor-port').value.trim() || '443';
+  if(!ip || !key.trim()){ log.style.display='block'; log.textContent = 'Enter the anchor IP and paste the SSH key first.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Setting up…';
+  log.style.display = 'block'; log.textContent = 'Starting…';
+  try{
+    const r = await fetch('/api/connectivity/anchor/provision', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({anchor_ip: ip, ssh_user: user, ssh_private_key: key, wg_port: parseInt(port,10)})});
+    const d = await r.json();
+    if(!d.success){ log.textContent = d.error || 'Failed to start.'; btn.disabled=false; btn.textContent='Set Up Anchor Automatically'; return; }
+    provPollTimer = setInterval(pollProvision, 1500);
+  }catch(e){ log.textContent = 'Failed: '+e; btn.disabled=false; btn.textContent='Set Up Anchor Automatically'; }
+}
+async function pollProvision(){
+  try{
+    const r = await fetch('/api/connectivity/anchor/provision-status');
+    const d = await r.json();
+    const log = document.getElementById('anchor-provision-log');
+    log.textContent = (d.log||[]).join('\\n');
+    log.scrollTop = log.scrollHeight;
+    if(!d.running && d.complete){
+      clearInterval(provPollTimer); provPollTimer = null;
+      const btn = document.getElementById('anchor-provision-btn');
+      btn.disabled = false; btn.textContent = 'Set Up Anchor Again';
+      if(d.error){ log.textContent += '\\nERROR: ' + d.error; }
+      refreshAnchorStatus();
+    }
+  }catch(e){}
+}
 async function connectAnchor(){
   const btn = document.getElementById('anchor-connect-btn');
   const st = document.getElementById('anchor-connect-status');
@@ -36308,6 +36512,7 @@ async function connectAnchor(){
   btn.disabled = false; btn.textContent = 'Reconnect';
 }
 setInterval(function(){ if(document.getElementById('anchor-card').style.display !== 'none'){ refreshAnchorStatus(); } }, 5000);
+setAnchorMode('auto');
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
 fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
