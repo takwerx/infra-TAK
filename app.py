@@ -10498,6 +10498,14 @@ def guarddog_page():
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
     ])
+    # v10.1.0 Leg 7: relay (connectivity anchor) health — only shown once a relay is
+    # configured. When up, the relay IS the box's ingress; a stale tunnel = clients
+    # can't reach the box, so it belongs on the health board next to everything else.
+    if (settings.get('connectivity_anchor') or {}).get('anchor_ip'):
+        _anchor_ip = settings['connectivity_anchor'].get('anchor_ip')
+        guarddog_services.append({'id': 'relay', 'name': f'Relay ({_anchor_ip})', 'monitored': gd.get('installed'), 'monitors': [
+            {'name': 'Tunnel', 'id': 'relay_tunnel', 'interval': '1 min', 'desc': f'Checks the WireGuard tunnel to the relay ({_anchor_ip}) by handshake age (fresh = healthy). Alerts after 3 consecutive stale checks (~3 min) and auto-clears on recovery. While the tunnel is down, no-VPN clients cannot reach this box through the relay address.'},
+        ]})
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
     # Detect if Guard Dog config is current or needs re-deploy
@@ -13028,6 +13036,7 @@ def _guarddog_service_monitor_ids(settings):
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
         'updates': ['updates_check'],
+        'relay': ['relay_tunnel'],
     }
     return multi
 
@@ -13059,6 +13068,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('cloudtak')
     if modules.get('guarddog', {}).get('installed'):
         ids.append('updates')
+    if (settings.get('connectivity_anchor') or {}).get('anchor_ip'):
+        ids.append('relay')
     return ids
 
 
@@ -13232,6 +13243,16 @@ def _monitor_health_check(monitor_id):
     """Quick health check for individual monitors. Returns True/False/None."""
     import socket
     try:
+        if monitor_id == 'relay_tunnel':
+            # Healthy = a fresh WireGuard handshake (<180s). Mirrors the Leg 7
+            # watcher's threshold. None if no relay configured / interface absent.
+            st = _conn_anchor_status()
+            if not st.get('configured'):
+                return None
+            hs = st.get('handshake_secs')
+            if hs is None:
+                return False
+            return hs <= 180
         if monitor_id == 'port8089':
             r = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=2)
             return 'LISTEN' in (r.stdout or '')
