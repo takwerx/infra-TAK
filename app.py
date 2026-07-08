@@ -36303,7 +36303,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <label class="form-label">SSH username <span style="color:var(--text-dim);font-weight:400">(Oracle Ubuntu = ubuntu)</span></label>
       <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:12px;max-width:220px">
       <label class="form-label">Anchor SSH private key</label>
-      <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;… paste the whole .key file …&#10;-----END OPENSSH PRIVATE KEY-----" style="margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+      <div style="margin-bottom:8px">
+        <input type="file" id="anchor-key-file" accept=".key,.pem,.txt,text/plain" onchange="loadKeyFile(event)" style="font-size:12px;color:var(--text-secondary)">
+        <span style="font-size:11px;color:var(--text-dim);margin-left:8px">choose the .key file you downloaded from Oracle — or paste it below</span>
+      </div>
+      <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;… or paste the whole .key file here …&#10;-----END OPENSSH PRIVATE KEY-----" style="margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
       <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Anchor Automatically</button>
       <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
@@ -36445,6 +36449,16 @@ async function refreshAnchorStatus(){
       el.innerHTML = '<span style="color:var(--text-dim)">Not connected to an anchor yet.</span>';
     }
   }catch(e){}
+}
+function loadKeyFile(ev){
+  const f = ev.target.files && ev.target.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = function(e){
+    document.getElementById('anchor-ssh-key').value = e.target.result;
+    document.getElementById('anchor-provision-log').style.display = 'none';
+  };
+  reader.readAsText(f);
 }
 function setAnchorMode(mode){
   document.getElementById('anchor-mode-auto').style.display = (mode==='auto') ? 'block' : 'none';
