@@ -8613,7 +8613,7 @@ def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
             st.update({'running': False, 'complete': True, 'error': 'Could not read the relay WireGuard key from the setup output.'})
             return
         anchor_pubkey = m.group(1)
-        _conn_prov_log('Anchor is up. Configuring this box\'s tunnel…')
+        _conn_prov_log('Relay is up. Configuring this box\'s tunnel…')
         cfg_ok, box_pub, err = _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port)
         if not cfg_ok:
             st.update({'running': False, 'complete': True, 'error': err})
@@ -36292,7 +36292,7 @@ textarea.form-input{resize:vertical}
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
       Your box has no public inbound, so it dials OUT to a small always-free public VPS (the relay).
       Friends connect to the relay's public address with no VPN, from any network your box is on.
-      Create the relay VM first (Oracle Free Tier — see the relay runbook); then just enter its IP and
+      Create the relay VM first (Oracle Free Tier — <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/RELAY-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">step-by-step guide &#8599;</a>); then just enter its IP and
       upload its key below, and this box sets up the whole tunnel for you.
     </p>
     <div id="anchor-status-line" style="font-size:12px;margin-bottom:18px"></div>
