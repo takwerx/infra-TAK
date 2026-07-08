@@ -36533,6 +36533,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
 .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.5;cursor:default}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn:disabled{opacity:.5;cursor:default}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;max-width:400px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;outline:none;transition:border-color .2s}
+.form-input:focus{border-color:var(--accent)}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
 .intent-tiles{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .intent-tile{background:#0a0e1a;border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left;color:var(--text-primary);font-family:inherit}
