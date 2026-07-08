@@ -8255,7 +8255,7 @@ def _conn_classify(intent, stun_res, trace, is_cloud=False):
                        'attention is the cloud firewall (security list / NSG ingress)')
     elif intent == 'portable' and not is_cloud:
         recommendation = 'anchor'
-        reasons.append('Portable box: recommendation is the anchor regardless of class — '
+        reasons.append('Portable box: recommendation is the relay regardless of class — '
                        'this network\'s answer would be stale on the next network')
     elif net_class == 'A':
         recommendation = 'ddns_portforward'
@@ -8592,14 +8592,14 @@ def _conn_anchor_ssh(anchor_ip, ssh_user, remote_cmd, timeout=180):
 def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
     st = _connectivity_provision_status
     try:
-        _conn_prov_log('Connecting to anchor %s as %s…' % (anchor_ip, ssh_user))
-        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, 'echo anchor-reachable', timeout=25)
+        _conn_prov_log('Connecting to relay %s as %s…' % (anchor_ip, ssh_user))
+        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, 'echo relay-reachable', timeout=25)
         if not ok:
-            st.update({'running': False, 'complete': True, 'error': 'Cannot SSH to the anchor: %s' % out[:200]})
+            st.update({'running': False, 'complete': True, 'error': 'Cannot SSH to the relay: %s' % out[:200]})
             return
         # Fetch + run the bootstrap on the anchor. WG_PORT is an int (validated); the
         # URL is a fixed constant. Nothing operator-typed lands in this remote shell string.
-        _conn_prov_log('Running the anchor bootstrap (this installs WireGuard + forwards)…')
+        _conn_prov_log('Running the relay setup (this installs WireGuard + forwards)…')
         setup_cmd = ("curl -fsSL '%s' -o ~/connectivity-anchor-bootstrap.sh && "
                      "chmod +x ~/connectivity-anchor-bootstrap.sh && "
                      "sudo WG_PORT=%d bash ~/connectivity-anchor-bootstrap.sh setup"
@@ -8610,7 +8610,7 @@ def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
             return
         m = re.search(r'WireGuard public key\s*:\s*([A-Za-z0-9+/]{43}=)', out)
         if not m:
-            st.update({'running': False, 'complete': True, 'error': 'Could not read the anchor WireGuard key from the bootstrap output.'})
+            st.update({'running': False, 'complete': True, 'error': 'Could not read the relay WireGuard key from the setup output.'})
             return
         anchor_pubkey = m.group(1)
         _conn_prov_log('Anchor is up. Configuring this box\'s tunnel…')
@@ -8618,12 +8618,12 @@ def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
         if not cfg_ok:
             st.update({'running': False, 'complete': True, 'error': err})
             return
-        _conn_prov_log('Authorizing this box on the anchor…')
+        _conn_prov_log('Authorizing this box on the relay…')
         # box_pub is a validated base64 WG key (fullmatch in _conn_configure_box_tunnel).
         addbox_cmd = 'sudo bash ~/connectivity-anchor-bootstrap.sh add-box %s' % box_pub
         ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, addbox_cmd, timeout=60)
         if not ok:
-            st.update({'running': False, 'complete': True, 'error': 'Box configured but add-box on the anchor failed: %s' % out[:200]})
+            st.update({'running': False, 'complete': True, 'error': 'Box configured but authorizing it on the relay failed: %s' % out[:200]})
             return
         settings = load_settings()
         settings['connectivity_anchor'] = {
@@ -36280,17 +36280,16 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   <div class="card" id="anchor-card" style="display:none">
-    <div class="card-title">Connect an Anchor</div>
+    <div class="card-title">Connect a Relay</div>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
-      Your box has no public inbound, so it dials OUT to a small always-free public VPS (the anchor).
-      Friends connect to the anchor's public address with no VPN, from any network your box is on.
-      Stand the anchor up first (Oracle Free Tier — see the anchor runbook), run
-      <code>connectivity-anchor-bootstrap.sh setup</code> on it, then paste its details below and
-      this box configures its own tunnel automatically.
+      Your box has no public inbound, so it dials OUT to a small always-free public VPS (the relay).
+      Friends connect to the relay's public address with no VPN, from any network your box is on.
+      Create the relay VM first (Oracle Free Tier — see the relay runbook); then just enter its IP and
+      upload its key below, and this box sets up the whole tunnel for you.
     </p>
     <div id="anchor-status-line" style="font-size:12px;margin-bottom:14px"></div>
 
-    <label class="form-label">Anchor public IP</label>
+    <label class="form-label">Relay public IP</label>
     <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:16px">
 
     <div style="display:flex;gap:8px;margin-bottom:16px">
@@ -36299,28 +36298,28 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
 
     <div id="anchor-mode-auto">
-      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Upload the SSH key you downloaded when you created the Oracle VM (the <code>.key</code> file). This box will SSH in, run the anchor setup, and wire up the tunnel — nothing else to do.</p>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Upload the SSH key you downloaded when you created the Oracle VM (the <code>.key</code> file). This box will SSH in, set up the relay, and wire up the tunnel — nothing else to do.</p>
       <label class="form-label">SSH username <span style="color:var(--text-dim);font-weight:400">(Oracle Ubuntu = ubuntu)</span></label>
       <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:12px;max-width:220px">
-      <label class="form-label">Anchor SSH private key</label>
+      <label class="form-label">Relay SSH private key</label>
       <div style="margin-bottom:8px">
         <input type="file" id="anchor-key-file" accept=".key,.pem,.txt,text/plain" onchange="loadKeyFile(event)" style="font-size:12px;color:var(--text-secondary)">
         <span style="font-size:11px;color:var(--text-dim);margin-left:8px">choose the .key file you downloaded from Oracle — or paste it below</span>
       </div>
       <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;… or paste the whole .key file here …&#10;-----END OPENSSH PRIVATE KEY-----" style="margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
-      <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Anchor Automatically</button>
+      <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay Automatically</button>
       <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
 
     <div id="anchor-mode-manual" style="display:none">
-      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Already ran <code>connectivity-anchor-bootstrap.sh setup</code> on the anchor yourself? Paste the WireGuard public key it printed.</p>
-      <label class="form-label">Anchor WireGuard public key</label>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Already ran <code>connectivity-anchor-bootstrap.sh setup</code> on the relay yourself? Paste the WireGuard public key it printed.</p>
+      <label class="form-label">Relay WireGuard public key</label>
       <input class="form-input" id="anchor-pubkey" placeholder="44-character key ending in =" style="margin-bottom:16px">
-      <button class="btn btn-primary" id="anchor-connect-btn" onclick="connectAnchor()">Connect to Anchor</button>
+      <button class="btn btn-primary" id="anchor-connect-btn" onclick="connectAnchor()">Connect to Relay</button>
       <div id="anchor-connect-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
       <div id="anchor-next" style="display:none;margin-top:16px">
         <div class="reco-banner">
-          <b>One step on the anchor.</b> This box is dialing the anchor; to let it in, run this on the <b>anchor</b>:
+          <b>One step on the relay.</b> This box is dialing the relay; to let it in, run this on the <b>relay</b>:
           <div class="terminal-block" style="margin-top:10px"><span id="anchor-addbox-cmd"></span></div>
         </div>
       </div>
@@ -36341,7 +36340,7 @@ const CLASS_CAPTIONS = {
   'unknown': 'Could not classify this network'
 };
 const RECO_TEXT = {
-  'anchor': '<b>Recommended path: the anchor.</b> This box dials OUT over an encrypted tunnel to a small always-free public VPS (Oracle Free Tier). Friends and clients connect to the anchor\\'s public address with <b>no VPN</b> — identical from any network this box sits on. Stand the anchor up with <code>scripts/connectivity-anchor-bootstrap.sh</code>; guided setup ships in a later step of this wizard.',
+  'anchor': '<b>Recommended path: a relay.</b> This box dials OUT over an encrypted tunnel to a small always-free public VPS (Oracle Free Tier). Friends and clients connect to the relay\\'s public address with <b>no VPN</b> — identical from any network this box sits on. Set one up in the <b>Connect a Relay</b> card below — enter its IP and upload its key, and this box does the rest.',
   'ddns_portforward': '<b>Recommended path: DDNS + one port-forward.</b> This network has a clean public IP. A dynamic-DNS hostname (Cloudflare) plus forwarding the TAK ports on your router makes this box reachable — friends connect to a name, no VPN. Automation for this path ships in the next wizard step.',
   'bridge_then_ddns': '<b>Recommended path: bridge the upstream gateway, then re-detect.</b> Two routers are NATing in a row. Put the ISP\\'s gateway in bridge / IP-passthrough mode so your own router holds the public IP, then run detection again — this box should re-classify as Class A.',
   'rerun': 'Detection could not establish this network\\'s public IP. Check that the box has outbound internet and run detection again.',
@@ -36360,7 +36359,7 @@ async function setIntent(intent){
     const d = await r.json();
     if(d.success){ currentIntent = intent; paintIntent();
       document.getElementById('intent-status').textContent = intent==='portable'
-        ? 'Saved — portable: the recommendation will always be the anchor; re-run detection on every new network.'
+        ? 'Saved — portable: the recommendation will always be a relay; re-run detection on every new network.'
         : 'Saved — static: detection will pick the cheapest path for this one network.';
     } else { document.getElementById('intent-status').textContent = d.error || 'Save failed'; }
   }catch(e){ document.getElementById('intent-status').textContent = 'Save failed: '+e; }
@@ -36440,13 +36439,13 @@ async function refreshAnchorStatus(){
     if(d.up && d.handshake_secs != null && d.handshake_secs < 180){
       el.innerHTML = '<span style="color:var(--green)">● Tunnel UP</span> — last handshake ' + esc(fmtAge(d.handshake_secs)) + (d.endpoint ? ' · ' + esc(d.endpoint) : '');
     } else if(d.configured){
-      el.innerHTML = '<span style="color:var(--yellow)">● Configured, waiting for handshake</span>' + (d.endpoint ? ' · ' + esc(d.endpoint) : '') + ' — run the add-box command on the anchor if you haven\\'t.';
+      el.innerHTML = '<span style="color:var(--yellow)">● Configured, waiting for handshake</span>' + (d.endpoint ? ' · ' + esc(d.endpoint) : '') + ' — run the add-box command on the relay if you haven\\'t.';
       if(d.box_pubkey){
         document.getElementById('anchor-next').style.display = 'block';
         document.getElementById('anchor-addbox-cmd').textContent = 'sudo ./connectivity-anchor-bootstrap.sh add-box ' + d.box_pubkey;
       }
     } else {
-      el.innerHTML = '<span style="color:var(--text-dim)">Not connected to an anchor yet.</span>';
+      el.innerHTML = '<span style="color:var(--text-dim)">Not connected to a relay yet.</span>';
     }
   }catch(e){}
 }
@@ -36474,16 +36473,16 @@ async function provisionAnchor(){
   const user = document.getElementById('anchor-ssh-user').value.trim() || 'ubuntu';
   const key = document.getElementById('anchor-ssh-key').value;
   const port = document.getElementById('anchor-port').value.trim() || '443';
-  if(!ip || !key.trim()){ log.style.display='block'; log.textContent = 'Enter the anchor IP and paste the SSH key first.'; return; }
+  if(!ip || !key.trim()){ log.style.display='block'; log.textContent = 'Enter the relay IP and paste the SSH key first.'; return; }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Setting up…';
   log.style.display = 'block'; log.textContent = 'Starting…';
   try{
     const r = await fetch('/api/connectivity/anchor/provision', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({anchor_ip: ip, ssh_user: user, ssh_private_key: key, wg_port: parseInt(port,10)})});
     const d = await r.json();
-    if(!d.success){ log.textContent = d.error || 'Failed to start.'; btn.disabled=false; btn.textContent='Set Up Anchor Automatically'; return; }
+    if(!d.success){ log.textContent = d.error || 'Failed to start.'; btn.disabled=false; btn.textContent='Set Up Relay Automatically'; return; }
     provPollTimer = setInterval(pollProvision, 1500);
-  }catch(e){ log.textContent = 'Failed: '+e; btn.disabled=false; btn.textContent='Set Up Anchor Automatically'; }
+  }catch(e){ log.textContent = 'Failed: '+e; btn.disabled=false; btn.textContent='Set Up Relay Automatically'; }
 }
 async function pollProvision(){
   try{
@@ -36495,7 +36494,7 @@ async function pollProvision(){
     if(!d.running && d.complete){
       clearInterval(provPollTimer); provPollTimer = null;
       const btn = document.getElementById('anchor-provision-btn');
-      btn.disabled = false; btn.textContent = 'Set Up Anchor Again';
+      btn.disabled = false; btn.textContent = 'Set Up Relay Again';
       if(d.error){ log.textContent += '\\nERROR: ' + d.error; }
       refreshAnchorStatus();
     }
