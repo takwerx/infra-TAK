@@ -52176,28 +52176,40 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
     if not _ensure_ldapsearch():
         plog("  \u2717 ldapsearch not available — install ldap-utils (Debian) or openldap-clients (RHEL).")
         return False
+    # v10.1.0: a LIVE ldapsearch bind is the ONLY proof. The old Docker-log fallback
+    # ("authenticated from session") was a FALSE POSITIVE — the outpost emits that on a
+    # cached-session renewal for any previously-authenticated SA, independent of whether
+    # the CURRENT password binds. Field-confirmed 2026-07-08: a stale SA password sailed
+    # through that grep as "verified", TAK deployed on a broken bind, and QR enrollment
+    # failed with LDAP err 49 until a manual Resync. Root cause is a password MISMATCH —
+    # retesting never fixes it — so this now actively SETS the SA password (once) mid-loop,
+    # then only green-lights on a real live bind. Memory: authentik-ldapservice-password-mismatch-fresh-deploy.
+    healed = False
     for i in range(1, attempts + 1):
         plog(f"  Final check: LDAP SA bind ({i}/{attempts})...")
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
-            plog("  \u2713 LDAP service-account bind verified (adm_ldapservice). Safe to proceed to TAK Server.")
+            plog("  ✓ LDAP service-account bind verified via live ldapsearch (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
-        # Fallback: directly check Docker logs for a recent "authenticated from session"
-        # entry for the SA.  This catches the case where ldapsearch's exit code is
-        # misleading (e.g. bind succeeds but base-scope search returns LDAP error 32)
-        # and _test_ldap_bind_dn_verdict mis-classifies the result as inconclusive.
-        try:
-            r_fb = subprocess.run(
-                _sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '90s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-            fb_log = (r_fb.stdout or '').lower()
-            if 'authenticated from session' in fb_log and 'adm_ldapservice' in fb_log:
-                plog("  \u2713 LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.")
-                return True
-        except Exception:
-            pass
+        # Not binding. After a few settle attempts, actively sync the SA password to the
+        # .env value (the real fix), then keep verifying with the live bind — no fake
+        # log-grep shortcut. _ensure_authentik_ldap_service_account sets the password via
+        # the Authentik API + recreates the outpost; called at most once.
+        if not healed and i >= 3:
+            healed = True
+            plog("  ⏳ SA bind not passing — actively syncing adm_ldapservice password to the .env value…")
+            try:
+                ok_sa, msg_sa = _ensure_authentik_ldap_service_account()
+                plog(f"     adm_ldapservice password sync: {str(msg_sa)[:120]}")
+                if ok_sa and _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+                    plog("  ✓ LDAP SA bind verified via live ldapsearch after password sync. Safe to proceed.")
+                    return True
+            except Exception as _sae:
+                plog(f"     SA password sync error: {str(_sae)[:120]}")
         if i < attempts:
             time.sleep(delay_sec)
-    plog("  \u2717 Final LDAP SA bind failed after Caddy/SMTP/restart.")
-    plog("     Check: docker logs authentik-ldap-1 — fix flow/outpost errors before deploying TAK Server.")
+    plog("  ✗ Final LDAP SA bind FAILED — live ldapsearch never returned 0, even after a password sync.")
+    plog("     Do NOT trust an 8446 login yet: TAK enrollment will reject users (LDAP err 49) until this binds.")
+    plog("     Inspect: docker logs authentik-ldap-1 (flow spiral / outpost error), then 'Resync LDAP to TAK Server'.")
     return False
 
 
