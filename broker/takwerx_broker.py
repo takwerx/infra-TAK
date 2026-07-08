@@ -34,6 +34,7 @@ import logging
 import logging.handlers
 import os
 import pwd
+import re
 import shutil
 import socket
 import socketserver
@@ -219,6 +220,21 @@ EXEC_ALLOW = {
     # fixed kernel-patch shape (see _check_systemd_run). No broader than the
     # already-allowed `systemctl start <console-written-unit>`.
     'systemd-run',
+    # v10.1.0 Leg 6 (WiFi Join) — these were MISSING, so the whole WiFi card
+    # no-op'd on non-root boxes (scan denied → empty list; add denied at
+    # netplan generate). Field-hit 2026-07-08 on the NUC. All three tightly
+    # gated to the exact shapes the WiFi card issues:
+    #   iw      — `iw dev` + `iw dev <iface> scan` ONLY (read-only wireless
+    #             inspection; set/del/txpower shapes denied — see _check_iw)
+    #   netplan — `netplan generate|apply` ONLY, no further args (see
+    #             _check_netplan). State-changing by design: that IS the
+    #             feature, and the console validates-before-apply with a
+    #             backup/restore. The netplan YAML itself is written via the
+    #             already-path-checked install/cp under /etc/netplan/.
+    #   nmcli   — the four fixed WiFi shapes (rescan / list / connection show /
+    #             connect <ssid> [password <psk>]) — see _check_nmcli; free
+    #             args may not start with '-' (no option injection).
+    'iw', 'netplan', 'nmcli',
 }
 
 # Package-manager subcommands the console legitimately uses. Anything else (and
@@ -292,6 +308,9 @@ PATH_ALLOW = (
     '/usr/share/keyrings/',      # apt repo signing keys (gpg --dearmor dest)
     '/etc/debsig/',              # debsig policy dir — TAK .deb signature verification
     '/usr/share/debsig/',        # debsig keyring dir (same)
+    '/etc/netplan/',             # v10.1.0 Leg 6 WiFi Join: cat/cp/install of the
+                                 # netplan YAML (additive AP add, validate-before-apply).
+                                 # Root-owned dir; console cannot symlink-plant here.
     '/opt/tak/',
     '/opt/tak-guarddog/',
     TAK_BUNDLE_DIR + '/',        # console-owned TAK docker bundle (ln source for /opt/tak)
@@ -581,9 +600,62 @@ def check_exec(argv, cwd=None):
         _check_cp(argv, cwd)
     elif base == 'sysctl':
         _check_sysctl(argv)
+    elif base == 'iw':
+        _check_iw(argv)
+    elif base == 'netplan':
+        _check_netplan(argv)
+    elif base == 'nmcli':
+        _check_nmcli(argv)
     elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
+
+
+_IFACE_RE = re.compile(r'^[A-Za-z0-9_.:][A-Za-z0-9_.:-]{0,14}$')  # no leading '-' (option smuggling)
+
+
+def _check_iw(argv):
+    """iw: read-only wireless inspection ONLY — `iw dev` (list interfaces) and
+    `iw dev <iface> scan`. Every state-changing shape (set txpower, interface
+    add/del, connect, reg set, …) is denied. v10.1.0 Leg 6 WiFi scan."""
+    rest = argv[1:]
+    if rest == ['dev']:
+        return
+    if len(rest) == 3 and rest[0] == 'dev' and rest[2] == 'scan' and _IFACE_RE.match(rest[1]):
+        return
+    raise Denied('iw: only `iw dev` and `iw dev <iface> scan` allowed')
+
+
+def _check_netplan(argv):
+    """netplan: `generate` (validate) and `apply` only, with NO further args —
+    the console's WiFi add validates-before-apply with a backup/restore. The
+    YAML content itself arrives via the path-checked install/cp under
+    /etc/netplan/, so this cannot apply a file the path rules didn't admit.
+    `netplan set`/`try --state`/anything else is denied."""
+    if len(argv) == 2 and argv[1] in ('generate', 'apply'):
+        return
+    raise Denied('netplan: only `netplan generate` / `netplan apply` allowed')
+
+
+def _check_nmcli(argv):
+    """nmcli: exactly the four WiFi-card shapes (NetworkManager boxes):
+      nmcli dev wifi rescan
+      nmcli -t -f SSID,SIGNAL dev wifi list
+      nmcli -t -f NAME,TYPE connection show
+      nmcli dev wifi connect <ssid> [password <psk>]
+    Free args (ssid/psk) must not start with '-' — no option injection. Every
+    other nmcli verb (con mod, con up, radio, device set, …) is denied."""
+    rest = argv[1:]
+    if rest == ['dev', 'wifi', 'rescan']:
+        return
+    if rest in (['-t', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list'],
+                ['-t', '-f', 'NAME,TYPE', 'connection', 'show']):
+        return
+    if (len(rest) in (4, 6) and rest[0:3] == ['dev', 'wifi', 'connect']
+            and not rest[3].startswith('-')
+            and (len(rest) == 4 or (rest[4] == 'password' and not rest[5].startswith('-')))):
+        return
+    raise Denied('nmcli: only the WiFi scan/list/connect shapes are allowed')
 
 
 def _check_pkgmgr(argv):
@@ -1643,7 +1715,15 @@ def _evaluate(req):
 def _summary(req):
     op = req.get('op')
     if op == 'exec':
-        return ' '.join(map(str, req.get('argv') or []))[:200]
+        argv = [str(a) for a in (req.get('argv') or [])]
+        # Redact secrets that legitimately ride in argv (v10.1.0: the nmcli WiFi
+        # connect shape carries the operator-entered PSK — it must never reach
+        # the persistent audit log or journald; CJIS "secrets never logged").
+        # Generic rule: the token FOLLOWING a literal `password` argument.
+        for i, a in enumerate(argv[:-1]):
+            if a == 'password':
+                argv[i + 1] = '***'
+        return ' '.join(argv)[:200]
     return str(req.get('path'))[:200]
 
 

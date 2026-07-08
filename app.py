@@ -8777,9 +8777,30 @@ def connectivity_verify_status_api():
 #    (Ubuntu). Both via the privileged broker (_sudo_wrap / _run_priv_chain).
 
 
+def _ensure_iw():
+    """Ensure the `iw` CLI exists (wireless scan/detect on netplan boxes without
+    NetworkManager). Field gap 2026-07-08: stock Ubuntu 22.04 SERVER does not ship
+    `iw` (desktop does) — so on exactly the boxes that need the netplan path, the
+    WiFi card's scan silently returned nothing. Mirrors _ensure_ldapsearch: tiny
+    package, installed on demand through the apt↔dnf shim (package is named `iw`
+    on both families). Checks sbin paths explicitly — the console user's PATH may
+    exclude /usr/sbin even when the binary is installed."""
+    for p in ('/usr/sbin/iw', '/sbin/iw', '/usr/bin/iw'):
+        if os.path.exists(p):
+            return True
+    if shutil.which('iw'):
+        return True
+    try:
+        _pkg_install('iw', timeout=120)
+    except Exception:
+        pass
+    return any(os.path.exists(p) for p in ('/usr/sbin/iw', '/sbin/iw', '/usr/bin/iw')) or bool(shutil.which('iw'))
+
+
 def _conn_wifi_iface():
     """Detect the wireless interface name (e.g. wlp1s0). Empty if none."""
     try:
+        _ensure_iw()
         r = subprocess.run(_sudo_wrap(['iw', 'dev']), capture_output=True, text=True, timeout=8)
         m = re.search(r'Interface\s+(\S+)', r.stdout or '')
         if m:
@@ -8861,6 +8882,7 @@ def _conn_wifi_scan():
     iface = _conn_wifi_iface()
     if iface:
         try:
+            _ensure_iw()
             r = subprocess.run(_sudo_wrap(['iw', 'dev', iface, 'scan']),
                                capture_output=True, text=True, timeout=25)
             for line in (r.stdout or '').splitlines():
