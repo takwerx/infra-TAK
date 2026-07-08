@@ -1,0 +1,273 @@
+#!/bin/bash
+# infra-TAK Setup AP engine — v10.1.0 Leg 6b.
+#
+# When the box has no way onto the internet, it broadcasts its OWN wifi
+# (`infraTAK-setup-<host>`, WPA2) so an operator can join from a laptop, land on
+# the infra-TAK console login (captive redirect), and use the WiFi card to pick a
+# real network. The box has ONE radio: broadcasting the AP means it is NOT a wifi
+# client, so this is only ever used when there is no uplink to lose.
+#
+# Usage: tak-setup-ap.sh {start|stop|status}
+#
+# CARDINAL RULE — never strand the box: `start` must, on ANY failure, tear the AP
+# down and hand the radio back to the normal client stack (so a known network can
+# re-join). The `trap` below guarantees that. `stop` always restores the client.
+#
+# Multiplatform:
+#   - NetworkManager present (RHEL / any nmcli box): `nmcli device wifi hotspot`
+#     does AP + DHCP in one managed step; stop = bring the hotspot down + let NM
+#     re-autoconnect. Preferred when available (fewer moving parts).
+#   - netplan / no NM (Ubuntu server): hostapd (AP) + dnsmasq (DHCP + captive DNS),
+#     with the client wpa_supplicant released first and `netplan apply` to restore.
+set -u
+
+STATE_DIR="/var/lib/takguard"
+CONF="$STATE_DIR/setup-ap.conf"          # written by the console: SSID_SUFFIX/PASS/etc.
+ACTIVE_FLAG="$STATE_DIR/setup-ap.active"
+AP_IP="10.42.0.1"
+AP_CIDR="24"
+AP_RANGE_LO="10.42.0.50"
+AP_RANGE_HI="10.42.0.150"
+HOSTAPD_CONF="/tmp/takwerx-hostapd.conf"
+DNSMASQ_CONF="/tmp/takwerx-dnsmasq-ap.conf"
+LOG="/var/log/takguard/setup-ap.log"
+# CONSOLE_PORT is written into the conf by the console (which knows CONFIG_DIR —
+# it is NOT reliably /root/.config on non-root boxes; N1). Default 5001.
+CONSOLE_PORT="5001"
+
+mkdir -p "$STATE_DIR" /var/log/takguard 2>/dev/null
+log(){ echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $*" >> "$LOG"; }
+
+# ---- config (SSID + password) ----------------------------------------------
+HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
+AP_SSID="infraTAK-setup-${HOSTNAME_SHORT}"
+AP_PASS=""
+# Parse the conf by ASSIGNMENT, never `source` it — the values are operator-typed
+# and sourcing would execute shell metacharacters as root (finding D). cut -d= -f2-
+# keeps '=' inside a value intact; the value is assigned verbatim, never evaluated.
+conf_get(){ grep -m1 "^$1=" "$CONF" 2>/dev/null | cut -d= -f2-; }
+if [ -r "$CONF" ]; then
+    _s="$(conf_get SETUP_AP_SSID)"; [ -n "$_s" ] && AP_SSID="$_s"
+    _p="$(conf_get SETUP_AP_PASS)"; [ -n "$_p" ] && AP_PASS="$_p"
+    _cp="$(conf_get SETUP_AP_CONSOLE_PORT)"
+    case "$_cp" in ''|*[!0-9]*) : ;; *) CONSOLE_PORT="$_cp" ;; esac
+fi
+# WPA2 requires 8..63 chars. If unset/short, generate a RANDOM PSK once and persist
+# it (root-600) — NEVER derive it from the hostname (finding B: the hostname is
+# advertised in the SSID, so a host-derived key is effectively public). The console
+# reveals this generated key so the operator can type it.
+if [ "${#AP_PASS}" -lt 8 ]; then
+    AP_PASS="$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 14)"
+    [ "${#AP_PASS}" -ge 8 ] || AP_PASS="infratak-$(date +%s | tail -c 6)"
+    _auto="$(conf_get SETUP_AP_AUTO)"; [ -n "$_auto" ] || _auto=1
+    _cport="$(conf_get SETUP_AP_CONSOLE_PORT)"; [ -n "$_cport" ] || _cport="$CONSOLE_PORT"
+    umask 077
+    { echo "# infra-TAK Setup AP config (password auto-generated $(date -u +%FT%TZ))"
+      echo "SETUP_AP_SSID=$AP_SSID"
+      echo "SETUP_AP_PASS=$AP_PASS"
+      echo "SETUP_AP_CONSOLE_PORT=$_cport"
+      echo "SETUP_AP_AUTO=$_auto"
+    } > "$CONF" 2>/dev/null || true
+    chmod 600 "$CONF" 2>/dev/null || true
+fi
+
+wifi_iface(){
+    for n in $(ls /sys/class/net 2>/dev/null); do
+        [ -d "/sys/class/net/$n/wireless" ] && { echo "$n"; return; }
+    done
+    command -v iw >/dev/null 2>&1 && iw dev 2>/dev/null | awk '/Interface/{print $2; exit}'
+}
+IFACE="$(wifi_iface)"
+
+have_nm(){ command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; }
+
+# ---- capability guard -------------------------------------------------------
+ap_capable(){
+    command -v iw >/dev/null 2>&1 || return 0   # can't check → let it try
+    iw list 2>/dev/null | awk '/Supported interface modes/{f=1} f&&/\* AP$/{print;exit}' | grep -q AP
+}
+
+# ---- restore the client (the never-strand path) -----------------------------
+restore_client(){
+    log "restore_client: handing radio back to the client stack"
+    rm -f "$ACTIVE_FLAG"
+    pkill -f "hostapd $HOSTAPD_CONF" 2>/dev/null
+    pkill -f "dnsmasq.*$DNSMASQ_CONF" 2>/dev/null
+    # drop the captive :80 redirect responder + firewall rule
+    pkill -f 'takwerx-captive' 2>/dev/null
+    if [ -n "$IFACE" ]; then
+        iptables -t nat -D PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-ports 8088 2>/dev/null
+        # Tear down the interface-isolation rules added in apply_isolation (finding A).
+        while iptables -D INPUT -i "$IFACE" -j takwerx_setupap 2>/dev/null; do :; done
+        while iptables -D FORWARD -i "$IFACE" -j DROP 2>/dev/null; do :; done
+        while iptables -D DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null; do :; done
+        iptables -F takwerx_setupap 2>/dev/null
+        iptables -X takwerx_setupap 2>/dev/null
+        ip addr flush dev "$IFACE" 2>/dev/null
+        ip link set "$IFACE" down 2>/dev/null
+    fi
+    if have_nm; then
+        nmcli connection down takwerx-hotspot 2>/dev/null
+        nmcli radio wifi on 2>/dev/null
+        # NM re-autoconnects known profiles on its own.
+    else
+        [ -n "$IFACE" ] && ip link set "$IFACE" up 2>/dev/null
+        netplan apply 2>>"$LOG" || log "restore_client: netplan apply returned non-zero"
+    fi
+}
+
+# Firewall-isolate the AP interface (finding A). A device that joins the setup AP
+# must reach ONLY the console login, the captive responder, and DHCP/DNS on the box
+# — never SSH, TAK (native OR Docker-published), CloudTAK, MediaMTX, etc. Covers all
+# three packet paths:
+#   INPUT       — host-local services (native SSH/TAK/console)
+#   FORWARD     — anything routed off the AP interface (blocks reaching containers,
+#                 and there's no upstream anyway — the setup AP is not an internet AP)
+#   DOCKER-USER — Docker's own hook; container-published ports DNAT past INPUT
+# Plus the captive :80→:8088 redirect + responder. Applies to NM and hostapd alike.
+apply_isolation(){
+    iptables -N takwerx_setupap 2>/dev/null || iptables -F takwerx_setupap
+    iptables -A takwerx_setupap -p udp --dport 67 -j ACCEPT               # DHCP
+    iptables -A takwerx_setupap -p udp --dport 53 -j ACCEPT               # captive DNS
+    iptables -A takwerx_setupap -p tcp --dport 53 -j ACCEPT
+    iptables -A takwerx_setupap -p tcp --dport 80 -j ACCEPT               # → REDIRECT :8088
+    iptables -A takwerx_setupap -p tcp --dport 8088 -j ACCEPT             # captive responder
+    iptables -A takwerx_setupap -p tcp --dport "$CONSOLE_PORT" -j ACCEPT  # console login
+    iptables -A takwerx_setupap -p icmp -j ACCEPT
+    iptables -A takwerx_setupap -j DROP                                   # everything else
+    iptables -I INPUT -i "$IFACE" -j takwerx_setupap
+    # Block everything routed FROM the AP interface (containers + no-internet-by-design).
+    iptables -I FORWARD -i "$IFACE" -j DROP
+    # Docker publishes container ports via DNAT that bypasses INPUT; DOCKER-USER is the
+    # sanctioned hook and is consulted before the per-container ACCEPTs. No-op if absent.
+    iptables -I DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null || true
+
+    # captive :80 responder (302 → the console) on :8088; redirect AP :80 to it.
+    iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-ports 8088
+    CAP_AP_IP="$AP_IP" CAP_PORT="$CONSOLE_PORT" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
+import os, http.server, socketserver
+PORT = 8088
+LOC = 'https://%s:%s/' % (os.environ.get('CAP_AP_IP', '10.42.0.1'), os.environ.get('CAP_PORT', '5001'))
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(s):
+        s.send_response(302); s.send_header('Location', LOC); s.end_headers()
+    def log_message(s, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+# Bind the AP address only — never 0.0.0.0 (finding E).
+socketserver.TCPServer((os.environ.get('CAP_AP_IP', '10.42.0.1'), PORT), H).serve_forever()
+PY" >>"$LOG" 2>&1 &
+}
+
+start_ap(){
+    [ -f "$ACTIVE_FLAG" ] && { log "start: AP already active"; echo "already-active"; return 0; }
+    if [ -z "$IFACE" ]; then log "start: no wifi interface"; echo "no-wifi-interface"; return 2; fi
+    if ! ap_capable; then log "start: radio has no AP mode"; echo "no-ap-mode"; return 3; fi
+    log "start: bringing up AP ssid='$AP_SSID' iface='$IFACE' nm=$(have_nm && echo yes || echo no)"
+
+    # ANY failure past this point restores the client and reports failure.
+    trap 'log "start: FAILED — restoring client"; restore_client; echo "start-failed"; exit 9' ERR
+
+    if have_nm; then
+        set -e
+        nmcli radio wifi on
+        nmcli device disconnect "$IFACE" 2>/dev/null || true
+        nmcli connection delete takwerx-hotspot 2>/dev/null || true
+        # Write the profile keyfile directly (mode 600) rather than passing the PSK
+        # on the nmcli command line — argv is world-readable via /proc/<pid>/cmdline
+        # and the non-root console user could read the key during the modify window
+        # (finding C). NM reads the psk from the 600 keyfile instead.
+        NMCONN="/etc/NetworkManager/system-connections/takwerx-hotspot.nmconnection"
+        umask 077
+        cat > "$NMCONN" <<EOF
+[connection]
+id=takwerx-hotspot
+type=wifi
+interface-name=$IFACE
+autoconnect=false
+
+[wifi]
+mode=ap
+band=bg
+ssid=$AP_SSID
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$AP_PASS
+
+[ipv4]
+method=shared
+
+[ipv6]
+method=ignore
+EOF
+        chmod 600 "$NMCONN"
+        nmcli connection reload
+        nmcli connection up takwerx-hotspot
+        set +e
+    else
+        command -v hostapd  >/dev/null 2>&1 || { log "start: installing hostapd";  DEBIAN_FRONTEND=noninteractive apt-get install -y hostapd  >>"$LOG" 2>&1; }
+        command -v dnsmasq  >/dev/null 2>&1 || { log "start: installing dnsmasq";  DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq  >>"$LOG" 2>&1; }
+        set -e
+        # release the client so hostapd can own the radio
+        systemctl stop "wpa_supplicant@${IFACE}.service" 2>/dev/null || true
+        pkill -f "wpa_supplicant.*${IFACE}" 2>/dev/null || true
+        ip addr flush dev "$IFACE"
+        ip link set "$IFACE" down; ip link set "$IFACE" up
+        ip addr add "${AP_IP}/${AP_CIDR}" dev "$IFACE"
+
+        cat > "$HOSTAPD_CONF" <<EOF
+interface=$IFACE
+driver=nl80211
+ssid=$AP_SSID
+hw_mode=g
+channel=6
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$AP_PASS
+ignore_broadcast_ssid=0
+EOF
+        chmod 600 "$HOSTAPD_CONF"
+
+        cat > "$DNSMASQ_CONF" <<EOF
+interface=$IFACE
+bind-interfaces
+except-interface=lo
+dhcp-range=${AP_RANGE_LO},${AP_RANGE_HI},255.255.255.0,12h
+dhcp-option=3,${AP_IP}
+dhcp-option=6,${AP_IP}
+address=/#/${AP_IP}
+no-resolv
+no-hosts
+EOF
+        chmod 600 "$DNSMASQ_CONF"
+
+        dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file=/tmp/takwerx-dnsmasq-ap.pid
+        hostapd -B "$HOSTAPD_CONF" >>"$LOG" 2>&1
+        set +e
+    fi
+
+    # Isolation + captive apply to BOTH the NM and hostapd paths (finding A re-review:
+    # the NM/RHEL path had none, and Docker-published ports route via FORWARD, not
+    # INPUT). Run AFTER the AP is up regardless of how it was created.
+    apply_isolation
+
+    trap - ERR
+    touch "$ACTIVE_FLAG"
+    log "start: AP UP ssid='$AP_SSID' ip=$AP_IP"
+    echo "started"
+}
+
+case "${1:-}" in
+    start)  start_ap ;;
+    stop)   restore_client; log "stop: done"; echo "stopped" ;;
+    status)
+        if [ -f "$ACTIVE_FLAG" ]; then
+            echo "active ssid=$AP_SSID ip=$AP_IP"
+        else
+            echo "inactive"
+        fi
+        ;;
+    *) echo "usage: $0 {start|stop|status}"; exit 1 ;;
+esac

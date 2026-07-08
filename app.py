@@ -9036,6 +9036,165 @@ def connectivity_wifi_add_api():
     return jsonify({'success': True})
 
 
+# ── Leg 6b — SETUP AP (broadcast own wifi for local provisioning) ─────────────
+# When the box has no uplink, it broadcasts `infraTAK-setup-<host>` (WPA2) so an
+# operator joins from a laptop, lands on the console login (captive redirect), and
+# uses the WiFi card to pick a real network. ONE radio: broadcasting = not a wifi
+# client, so this only runs with no uplink to lose. The powerful bits live in the
+# root systemd unit takwerx-setup-ap.service (engine tak-setup-ap.sh); the console
+# only start/stops that unit through the broker — no new broker privilege.
+_SETUP_AP_CONF = '/var/lib/takguard/setup-ap.conf'
+_SETUP_AP_ACTIVE_FLAG = '/var/lib/takguard/setup-ap.active'
+
+
+def _conn_setup_ap_default_ssid():
+    try:
+        h = socket.gethostname().split('.')[0]
+    except Exception:
+        h = 'box'
+    return 'infraTAK-setup-%s' % h
+
+
+def _conn_setup_ap_read_conf():
+    """Read the engine conf via the broker (root-600). Returns a dict of the
+    SETUP_AP_* keys (ssid/auto only — never returns the password)."""
+    out = {'ssid': _conn_setup_ap_default_ssid(), 'auto': True, 'has_password': False}
+    try:
+        r = subprocess.run(_sudo_wrap(['cat', _SETUP_AP_CONF]), capture_output=True, text=True, timeout=8)
+        for ln in (r.stdout or '').splitlines():
+            ln = ln.strip()
+            if ln.startswith('SETUP_AP_SSID='):
+                v = ln.split('=', 1)[1].strip().strip('"').strip("'")
+                if v:
+                    out['ssid'] = v
+            elif ln.startswith('SETUP_AP_AUTO='):
+                out['auto'] = ln.split('=', 1)[1].strip() != '0'
+            elif ln.startswith('SETUP_AP_PASS=') and len(ln.split('=', 1)[1].strip()) >= 8:
+                out['has_password'] = True
+    except Exception:
+        pass
+    return out
+
+
+def _conn_setup_ap_write_conf(ssid, password, auto):
+    """Write the root-600 engine conf via a temp file + privileged install."""
+    ssid = (ssid or '').strip() or _conn_setup_ap_default_ssid()
+    try:
+        _console_port = int(load_settings().get('console_port') or 5001)
+    except Exception:
+        _console_port = 5001
+    lines = ['# infra-TAK Setup AP config (managed by the console)\n',
+             'SETUP_AP_SSID=%s\n' % ssid,
+             'SETUP_AP_CONSOLE_PORT=%d\n' % _console_port,
+             'SETUP_AP_AUTO=%s\n' % ('1' if auto else '0')]
+    if password:
+        lines.append('SETUP_AP_PASS=%s\n' % password)
+    tmp = None
+    try:
+        _makedirs_priv('/var/lib/takguard')
+        fd, tmp = tempfile.mkstemp(prefix='setup-ap-', suffix='.conf')
+        # If no new password given, preserve the existing one (read via broker).
+        if not password:
+            try:
+                r = subprocess.run(_sudo_wrap(['cat', _SETUP_AP_CONF]), capture_output=True, text=True, timeout=8)
+                for ln in (r.stdout or '').splitlines():
+                    if ln.strip().startswith('SETUP_AP_PASS='):
+                        lines.append(ln if ln.endswith('\n') else ln + '\n')
+                        break
+            except Exception:
+                pass
+        os.write(fd, ''.join(lines).encode())
+        os.close(fd)
+        os.chmod(tmp, 0o600)
+        inst = _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp, _SETUP_AP_CONF]], mode='and')
+        return bool(inst and inst.returncode == 0)
+    except Exception:
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _conn_setup_ap_status():
+    st = {'active': os.path.exists(_SETUP_AP_ACTIVE_FLAG), 'ap_capable': None, 'has_wifi': bool(_conn_wifi_iface())}
+    st.update(_conn_setup_ap_read_conf())
+    return st
+
+
+@app.route('/api/connectivity/setup-ap/status')
+@login_required
+def connectivity_setup_ap_status_api():
+    return jsonify(_conn_setup_ap_status())
+
+
+@app.route('/api/connectivity/setup-ap/reveal')
+@login_required
+def connectivity_setup_ap_reveal_api():
+    """Return the current setup-AP password (the operator must be able to read it
+    to type it on a laptop — the engine may have auto-generated a random one).
+    On-demand only (not in the status poll), authenticated. Read via the broker."""
+    pw = ''
+    try:
+        r = subprocess.run(_sudo_wrap(['cat', _SETUP_AP_CONF]), capture_output=True, text=True, timeout=8)
+        for ln in (r.stdout or '').splitlines():
+            if ln.strip().startswith('SETUP_AP_PASS='):
+                pw = ln.split('=', 1)[1].strip()
+                break
+    except Exception:
+        pass
+    return jsonify({'password': pw})
+
+
+@app.route('/api/connectivity/setup-ap/config', methods=['POST'])
+@login_required
+def connectivity_setup_ap_config_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    password = data.get('password') or ''
+    auto = bool(data.get('auto', True))
+    if password and not (8 <= len(password) <= 63):
+        return jsonify({'success': False, 'error': 'Setup-WiFi password must be 8–63 characters (WPA2).'}), 400
+    if ssid and not (1 <= len(ssid.encode('utf-8')) <= 32):
+        return jsonify({'success': False, 'error': 'Setup-WiFi name must be 1–32 characters.'}), 400
+    # Strict charset (defense-in-depth: the root engine parses the conf by
+    # assignment, not `source`, but never let shell-active bytes into a
+    # root-read config file). Reject shell metacharacters, quotes, newlines.
+    _bad = set('`$();&|<>\\\'"\n\r\t')
+    if any(c in _bad for c in ssid) or any(c in _bad for c in password):
+        return jsonify({'success': False, 'error': 'Name/password may not contain quotes, newlines, or any of ` $ ( ) ; & | < > \\'}), 400
+    if not _conn_setup_ap_write_conf(ssid, password, auto):
+        return jsonify({'success': False, 'error': 'Could not save Setup AP config.'}), 500
+    return jsonify({'success': True, 'status': _conn_setup_ap_status()})
+
+
+@app.route('/api/connectivity/setup-ap/start', methods=['POST'])
+@login_required
+def connectivity_setup_ap_start_api():
+    if not _conn_wifi_iface():
+        return jsonify({'success': False, 'error': 'No wireless interface on this box — cannot broadcast a setup network.'}), 400
+    # Start the root service through the broker. This SEVERS any wifi uplink (the
+    # radio becomes the AP), so the HTTP response is sent before the switch lands;
+    # the operator reconnects locally to the setup wifi.
+    r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'takwerx-setup-ap.service']),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'start failed').strip()[:200]}), 500
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/setup-ap/stop', methods=['POST'])
+@login_required
+def connectivity_setup_ap_stop_api():
+    r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'stop failed').strip()[:200]}), 500
+    return jsonify({'success': True})
+
+
 # ── EUD Remote Assist Portal ──────────────────────────────────────────────────
 
 _remote_assist_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
@@ -13588,6 +13747,7 @@ def _guarddog_timer_list():
     """All Guard Dog timer unit names (core + optional service monitors)."""
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
             'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takrelayguard.timer',
+            'takwerxsetupapwatch.timer',
             'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
             'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
@@ -14306,7 +14466,11 @@ def run_guarddog_deploy(alert_email):
             # v10.1.0 Leg 7: relay tunnel health. Installed fleet-wide — the script
             # no-ops silently when no relay is configured (no /etc/wireguard/wg0.conf),
             # and starts watching the moment the operator connects a relay later.
-            'tak-relay-watch.sh'
+            'tak-relay-watch.sh',
+            # v10.1.0 Leg 6b: Setup AP engine + auto-trigger watcher. The engine is
+            # invoked by a systemd unit (console start/stop) and by the watcher; the
+            # watcher no-ops on boxes with no wifi radio or with auto-AP disabled.
+            'tak-setup-ap.sh', 'tak-setup-ap-watch.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -14402,6 +14566,12 @@ def run_guarddog_deploy(alert_email):
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takrelayguard.service', '[Unit]\nDescription=TAK Relay Tunnel Monitor (connectivity anchor)\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-relay-watch.sh\n'),
             ('takrelayguard.timer', '[Unit]\nDescription=TAK Relay Tunnel Monitor Timer\nRequires=takrelayguard.service\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
+            # v10.1.0 Leg 6b: Setup AP. The service is the console's start/stop handle
+            # (RemainAfterExit so `systemctl start` = AP up, `stop` = AP down + client
+            # restored). The watcher timer drives the automatic no-uplink trigger.
+            ('takwerx-setup-ap.service', '[Unit]\nDescription=infra-TAK Setup AP (broadcast own wifi for local provisioning)\nAfter=network.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/opt/tak-guarddog/tak-setup-ap.sh start\nExecStop=/opt/tak-guarddog/tak-setup-ap.sh stop\n'),
+            ('takwerxsetupapwatch.service', '[Unit]\nDescription=infra-TAK Setup AP auto-trigger watcher\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-setup-ap-watch.sh\n'),
+            ('takwerxsetupapwatch.timer', '[Unit]\nDescription=infra-TAK Setup AP watcher timer\nRequires=takwerxsetupapwatch.service\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=30s\nAccuracySec=10s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
             ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takcertguard.service', '[Unit]\nDescription=TAK Certificate Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cert-watch.sh\n'),
@@ -14557,7 +14727,8 @@ def run_guarddog_deploy(alert_email):
             return
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
                   'takswapreclaim.timer', 'takbuildcachereclaim.timer',
-                  'taknetguard.timer', 'takrelayguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
+                  'taknetguard.timer', 'takrelayguard.timer', 'takwerxsetupapwatch.timer',
+                  'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
             timers.append('takcotdbguard.timer')
@@ -36770,6 +36941,45 @@ textarea.form-input{resize:vertical}
     <button class="btn btn-primary" id="wifi-add-btn" onclick="addWifi()">Add Network</button>
     <div id="wifi-add-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
+
+  <div class="card" id="setupap-card">
+    <div class="card-title">Setup Network (connect a laptop directly)</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      When this box can&#39;t reach the internet, it broadcasts its own WiFi so you can join it
+      from a laptop or phone — right here in a new location — log in, and pick a network above.
+      It does this <b>automatically</b> when it has no connection; you can also start it now.
+    </p>
+    <div id="setupap-state" style="font-size:13px;margin-bottom:10px"></div>
+    <div id="setupap-current" style="font-size:12px;color:var(--text-dim);margin-bottom:16px"></div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:20px;margin-bottom:16px">
+      <div style="flex:1;min-width:240px">
+        <label class="form-label">Setup WiFi name</label>
+        <input class="form-input" id="setupap-ssid" placeholder="infraTAK-setup-…" style="margin-bottom:14px">
+        <label class="form-label">Setup WiFi password <span style="color:var(--text-dim);font-weight:400">(8–63 chars — you type this on your laptop)</span></label>
+        <div style="position:relative;max-width:320px">
+          <input class="form-input" id="setupap-pass" type="password" placeholder="leave blank to keep current" style="max-width:none;padding-right:44px">
+          <span onclick="toggleSetupPass()" id="setupap-eye" class="material-symbols-outlined" title="Show password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:19px;color:var(--text-dim);user-select:none">visibility</span>
+        </div>
+      </div>
+    </div>
+    <label style="display:flex;align-items:center;gap:9px;font-size:13px;color:var(--text-secondary);margin-bottom:18px;cursor:pointer">
+      <input type="checkbox" id="setupap-auto" checked style="width:16px;height:16px;accent-color:var(--accent)">
+      Automatically broadcast when the box has no internet (recommended)
+    </label>
+
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <button class="control-btn" id="setupap-save" onclick="saveSetupAp()">Save settings</button>
+      <button class="btn btn-primary" id="setupap-start" onclick="startSetupAp()">Start Setup WiFi now</button>
+      <button class="control-btn" id="setupap-stop" onclick="stopSetupAp()" style="display:none">Stop &amp; reconnect</button>
+      <span id="setupap-status" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+    <div style="margin-top:14px;padding:12px 14px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.22);border-radius:8px;font-size:12px;color:var(--text-secondary)">
+      <b style="color:var(--yellow)">Heads up:</b> starting the Setup WiFi disconnects this box from its current
+      WiFi (one radio can&#39;t do both). You&#39;ll lose remote access until you join the Setup WiFi from a nearby
+      device — then your browser opens the login automatically. Don&#39;t start it remotely unless someone is at the box.
+    </div>
+  </div>
 </div>
 
 <script>
@@ -37034,6 +37244,76 @@ function toggleWifiPsk(){
   e.textContent = show ? 'visibility_off' : 'visibility';
   e.title = show ? 'Hide password' : 'Show password';
 }
+function toggleSetupPass(){
+  const i = document.getElementById('setupap-pass'), e = document.getElementById('setupap-eye');
+  const show = i.type === 'password';
+  i.type = show ? 'text' : 'password';
+  e.textContent = show ? 'visibility_off' : 'visibility';
+}
+async function refreshSetupAp(){
+  try{
+    const r = await fetch('/api/connectivity/setup-ap/status');
+    const d = await r.json();
+    const ssid = document.getElementById('setupap-ssid');
+    if(document.activeElement !== ssid && !ssid.value){ ssid.placeholder = d.ssid || 'infraTAK-setup-…'; }
+    document.getElementById('setupap-auto').checked = !!d.auto;
+    const stateEl = document.getElementById('setupap-state');
+    const startBtn = document.getElementById('setupap-start');
+    const stopBtn = document.getElementById('setupap-stop');
+    const curEl = document.getElementById('setupap-current');
+    curEl.innerHTML = 'Setup WiFi name: <b style="color:var(--text-secondary);font-family:\\'JetBrains Mono\\',monospace">' + esc(d.ssid) + '</b> · '
+      + (d.has_password ? '<a href="#" onclick="revealSetupPass(event)" style="color:var(--accent);text-decoration:none">show password</a> <span id="setupap-revealed" style="font-family:\\'JetBrains Mono\\',monospace"></span>'
+                        : '<span style="color:var(--yellow)">no password set — a random one is generated on first use (show it after)</span>');
+    if(!d.has_wifi){
+      stateEl.innerHTML = '<span style="color:var(--text-dim)">This box has no WiFi radio — the Setup Network feature needs one.</span>';
+      startBtn.disabled = true;
+    }else if(d.active){
+      stateEl.innerHTML = '<span class="dot" style="background:var(--green)"></span> <b style="color:var(--green)">Setup WiFi is broadcasting</b> as “' + esc(d.ssid) + '”. Join it from a device to configure a network.';
+      startBtn.style.display = 'none'; stopBtn.style.display = 'inline-flex';
+    }else{
+      stateEl.innerHTML = '<span class="dot" style="background:var(--text-dim)"></span> Setup WiFi is off — the box is using its normal connection.' + (d.has_password ? '' : ' <span style="color:var(--yellow)">Set a password below before you rely on it.</span>');
+      startBtn.style.display = 'inline-flex'; stopBtn.style.display = 'none';
+    }
+  }catch(e){}
+}
+async function revealSetupPass(ev){
+  if(ev) ev.preventDefault();
+  const el = document.getElementById('setupap-revealed');
+  try{ const r = await fetch('/api/connectivity/setup-ap/reveal'); const d = await r.json();
+    el.textContent = d.password ? ('  ' + d.password) : '  (generated on first use)';
+  }catch(e){}
+}
+async function saveSetupAp(){
+  const btn = document.getElementById('setupap-save');
+  btn.disabled = true;
+  const body = {ssid: document.getElementById('setupap-ssid').value.trim(),
+                password: document.getElementById('setupap-pass').value,
+                auto: document.getElementById('setupap-auto').checked};
+  const s = document.getElementById('setupap-status');
+  try{
+    const r = await fetch('/api/connectivity/setup-ap/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    s.textContent = d.success ? 'Saved.' : (d.error || 'Save failed');
+    s.style.color = d.success ? 'var(--green)' : 'var(--red)';
+    if(d.success){ document.getElementById('setupap-pass').value = ''; refreshSetupAp(); }
+  }catch(e){ s.textContent = 'Save failed'; s.style.color = 'var(--red)'; }
+  btn.disabled = false;
+}
+async function startSetupAp(){
+  if(!confirm('Start the Setup WiFi now?\n\nThis disconnects the box from its current WiFi. You will lose access here until you join the Setup WiFi from a device next to the box.')) return;
+  const s = document.getElementById('setupap-status');
+  s.textContent = 'Starting… you may lose this page as the box switches to Setup WiFi.'; s.style.color = 'var(--text-dim)';
+  try{ await fetch('/api/connectivity/setup-ap/start', {method:'POST'}); }catch(e){}
+  setTimeout(refreshSetupAp, 4000);
+}
+async function stopSetupAp(){
+  const s = document.getElementById('setupap-status');
+  s.textContent = 'Stopping Setup WiFi and reconnecting…'; s.style.color = 'var(--text-dim)';
+  try{ const r = await fetch('/api/connectivity/setup-ap/stop', {method:'POST'}); const d = await r.json();
+    s.textContent = d.success ? 'Reconnecting to your network…' : (d.error || 'Stop failed');
+  }catch(e){}
+  setTimeout(refreshSetupAp, 4000);
+}
 async function refreshWifiSaved(){
   try{
     const r = await fetch('/api/connectivity/wifi/list');
@@ -37086,6 +37366,8 @@ setInterval(function(){ if(document.getElementById('anchor-card').style.display 
 // On landing, surface an already-configured relay without needing to Run Detection.
 refreshAnchorStatus();
 refreshWifiSaved();
+refreshSetupAp();
+setInterval(refreshSetupAp, 7000);
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
 fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
