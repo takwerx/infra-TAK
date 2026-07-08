@@ -190,6 +190,11 @@ EXEC_ALLOW = {
     'getenforce', 'getsebool', 'restorecon', 'semanage', 'semodule', 'chcon',
     # read-only inspection (routed for a single audit point)
     'ss', 'ip', 'getent', 'getcap',
+    # v10.1.0: `wg show …` is read-only WireGuard inspection (relay tunnel status /
+    # handshake age for the connectivity anchor + Guard Dog relay health). Gated to
+    # the `show` subcommand only — `wg set`/`setconf`/`genkey` are denied (see
+    # _check_wg). Same read-only class as `ss`/`ip`.
+    'wg',
     # v10.0.8 harvest (born-non-root fleet): `lsof` is read-only (the console
     # checks whether the apt/dpkg lock is held before an install). `find` is
     # read-only TOO once its exec/write/delete actions are gated (see _check_find)
@@ -606,6 +611,8 @@ def check_exec(argv, cwd=None):
         _check_netplan(argv)
     elif base == 'nmcli':
         _check_nmcli(argv)
+    elif base == 'wg':
+        _check_wg(argv)
     elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
@@ -624,6 +631,16 @@ def _check_iw(argv):
     if len(rest) == 3 and rest[0] == 'dev' and rest[2] == 'scan' and _IFACE_RE.match(rest[1]):
         return
     raise Denied('iw: only `iw dev` and `iw dev <iface> scan` allowed')
+
+
+def _check_wg(argv):
+    """wg: read-only `wg show …` ONLY. Every mutating subcommand (set, setconf,
+    addconf, syncconf, genkey, genpsk, pubkey) is denied — the console reads tunnel
+    status/handshake age; it never reconfigures WireGuard (that's the anchor
+    bootstrap's job, run as root)."""
+    if len(argv) >= 2 and argv[1] == 'show':
+        return
+    raise Denied('wg: only `wg show` is allowed')
 
 
 def _check_netplan(argv):
