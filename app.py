@@ -42067,7 +42067,7 @@ def _record_spiral_repair_attempt(outcome, evidence):
         pass
 
 
-def _ensure_authentik_ldap_outpost_on_fqdn(plog):
+def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
     """v0.8.5 PROACTIVE routing migration. Complements _apply_authentik_ldap_routing_repair
     (reactive) by migrating any box where the LDAP outpost is on internal direct routing
     (`http://authentik-server-1:9000`) to FQDN routing (`https://<fqdn>`) — without waiting
@@ -42084,7 +42084,10 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
       2. Outpost AUTHENTIK_HOST == http://authentik-server-1:9000 (internal direct)
       3. .env has AUTHENTIK_HOST=https://<fqdn> (FQDN configured)
       4. https://<fqdn>/-/health/live/ reachable from inside the LDAP container (Caddy up)
-      5. TAK Server installed at /opt/tak (heavy LDAP load profile — not light/console-only)
+      5. TAK Server installed at /opt/tak (heavy LDAP load profile — not light/console-only).
+         Waived with require_tak=False — used by the Authentik deploy's final SA-bind verify,
+         which runs BEFORE TAK exists and deadlocks on internal routing (2026.x flow recursion
+         kills every bind regardless of password; field-confirmed 2026-07-08 on a fresh deploy).
 
     Only when ALL pass do we migrate. Failure on any → log skip reason and exit. Idempotent.
 
@@ -42100,7 +42103,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
         return
 
     try:
-        if not os.path.exists('/opt/tak'):
+        if require_tak and not os.path.exists('/opt/tak'):
             plog("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
             return
 
@@ -52177,26 +52180,45 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
         plog("  \u2717 ldapsearch not available — install ldap-utils (Debian) or openldap-clients (RHEL).")
         return False
     # v10.1.0: a LIVE ldapsearch bind is the ONLY proof. The old Docker-log fallback
-    # ("authenticated from session") was a FALSE POSITIVE — the outpost emits that on a
-    # cached-session renewal for any previously-authenticated SA, independent of whether
-    # the CURRENT password binds. Field-confirmed 2026-07-08: a stale SA password sailed
-    # through that grep as "verified", TAK deployed on a broken bind, and QR enrollment
-    # failed with LDAP err 49 until a manual Resync. Root cause is a password MISMATCH —
-    # retesting never fixes it — so this now actively SETS the SA password (once) mid-loop,
-    # then only green-lights on a real live bind. Memory: authentik-ldapservice-password-mismatch-fresh-deploy.
+    # ("authenticated from session") was a FALSE POSITIVE — the outpost emits that line
+    # even while serving err-49 rejections from its failure cache, independent of whether
+    # the CURRENT password binds. Two real diseases hide behind that mask, each with a
+    # one-shot heal below: (1) fresh deploys ship the outpost on internal routing, which
+    # the 2026.x flow recursion turns into guaranteed bind failure (the common case —
+    # field-confirmed 2026-07-08, NUC); (2) SA password drift between Authentik's DB and
+    # .env (memory: authentik-ldapservice-password-mismatch-fresh-deploy). Retesting fixes
+    # neither, so the loop heals both, and only green-lights on a real live bind.
+    healed_routing = False
     healed = False
     for i in range(1, attempts + 1):
         plog(f"  Final check: LDAP SA bind ({i}/{attempts})...")
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
             plog("  ✓ LDAP service-account bind verified via live ldapsearch (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
-        # Not binding. After a few settle attempts, actively sync the SA password to the
-        # .env value (the real fix), then keep verifying with the live bind — no fake
-        # log-grep shortcut. _ensure_authentik_ldap_service_account sets the password via
-        # the Authentik API + recreates the outpost; called at most once.
-        if not healed and i >= 3:
+        # Heal 1 — ROUTING (the usual fresh-deploy disease, field-confirmed 2026-07-08 NUC):
+        # a fresh deploy ships the outpost on internal routing (http://authentik-server-1:9000),
+        # which exposes the Authentik 2026.x flow recursion — the FIRST bind dies with
+        # "exceeded stage recursion depth" and the outpost then serves cached 0ms rejections
+        # for the correct password. No amount of password syncing fixes it, and the FQDN
+        # migration normally waits for TAK to be installed — which deadlocks this gate on the
+        # Authentik-then-TAK deploy order. Migrate to FQDN-via-Caddy now (hairpin-safe
+        # host-gateway, validates + rolls back if FQDN isn't viable), then re-verify live.
+        if not healed_routing and i >= 3:
+            healed_routing = True
+            plog("  ⏳ SA bind not passing — checking LDAP outpost routing (internal routing spirals on Authentik 2026.x)…")
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=False)
+                if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+                    plog("  ✓ LDAP SA bind verified via live ldapsearch after routing migration. Safe to proceed.")
+                    return True
+            except Exception as _rte:
+                plog(f"     routing migration error: {str(_rte)[:120]}")
+        # Heal 2 — PASSWORD: sync the SA password to the .env value, then keep verifying
+        # with the live bind — no fake log-grep shortcut. _ensure_authentik_ldap_service_account
+        # sets the password via the Authentik API + recreates the outpost; called at most once.
+        if not healed and i >= 5:
             healed = True
-            plog("  ⏳ SA bind not passing — actively syncing adm_ldapservice password to the .env value…")
+            plog("  ⏳ SA bind still not passing — actively syncing adm_ldapservice password to the .env value…")
             try:
                 ok_sa, msg_sa = _ensure_authentik_ldap_service_account()
                 plog(f"     adm_ldapservice password sync: {str(msg_sa)[:120]}")
@@ -52207,7 +52229,7 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
                 plog(f"     SA password sync error: {str(_sae)[:120]}")
         if i < attempts:
             time.sleep(delay_sec)
-    plog("  ✗ Final LDAP SA bind FAILED — live ldapsearch never returned 0, even after a password sync.")
+    plog("  ✗ Final LDAP SA bind FAILED — live ldapsearch never returned 0, even after routing + password heals.")
     plog("     Do NOT trust an 8446 login yet: TAK enrollment will reject users (LDAP err 49) until this binds.")
     plog("     Inspect: docker logs authentik-ldap-1 (flow spiral / outpost error), then 'Resync LDAP to TAK Server'.")
     return False
