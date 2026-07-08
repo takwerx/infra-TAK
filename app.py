@@ -19587,16 +19587,33 @@ def generate_caddyfile(settings=None):
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
+    # v10.1.0: the marker is now ALWAYS emitted at the end of the generated file. It used to
+    # exist only if an operator already knew the magic string and typed it in by hand — so in
+    # practice every regeneration (module deploy/remove, domain change, cert-mode flip, W1,
+    # Fed Hub) silently wiped custom entries. Field complaint 2026-07-08. Capture takes the
+    # content AFTER the marker line (not including it) so exactly one marker section exists.
+    user_blocks = ''
     if os.path.exists(CADDYFILE_PATH):
         try:
             with open(CADDYFILE_PATH) as f:
                 existing = f.read()
             if CADDYFILE_USER_BLOCKS_MARKER in existing:
-                user_blocks = existing[existing.index(CADDYFILE_USER_BLOCKS_MARKER):].rstrip()
-                if user_blocks:
-                    caddyfile = caddyfile.rstrip() + '\n\n' + user_blocks
+                after = existing.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[1]
+                # Drop our own help comments (re-emitted fresh below on every regen — they must
+                # not accumulate as "user content"); keep everything else verbatim.
+                _help_prefixes = ('# Anything below this line survives',
+                                  '# Add custom site blocks here')
+                user_lines = [l for l in after.splitlines()
+                              if not l.strip().startswith(_help_prefixes)]
+                user_blocks = '\n'.join(user_lines).strip('\n')
         except Exception:
             pass
+    caddyfile = (caddyfile.rstrip() + '\n\n'
+                 + CADDYFILE_USER_BLOCKS_MARKER + '\n'
+                 + '# Anything below this line survives every infra-TAK regeneration.\n'
+                 + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
+    if user_blocks:
+        caddyfile += '\n' + user_blocks + '\n'
     # v10.0.5 non-root: /etc/caddy may not exist yet (RHEL copr caddy doesn't
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
