@@ -36297,45 +36297,24 @@ textarea.form-input{resize:vertical}
     </p>
     <div id="anchor-status-line" style="font-size:12px;margin-bottom:18px"></div>
 
-    <div class="seg">
-      <button type="button" class="seg-btn active" id="seg-auto" onclick="setAnchorMode('auto')">Automatic</button>
-      <button type="button" class="seg-btn" id="seg-manual" onclick="setAnchorMode('manual')">Manual</button>
-    </div>
-
     <label class="form-label">Relay public IP</label>
     <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:18px">
 
-    <div id="anchor-mode-auto">
-      <label class="form-label">Relay SSH key <span style="color:var(--text-dim);font-weight:400">— the .key file Oracle gave you</span></label>
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
-        <input type="file" id="anchor-key-file" accept=".key,.pem,.txt,text/plain" onchange="loadKeyFile(event)" style="display:none">
-        <label for="anchor-key-file" class="filebtn">Choose .key file</label>
-        <span id="anchor-key-name" style="font-size:12px;color:var(--text-dim)">no file chosen</span>
-      </div>
-      <div style="margin-bottom:16px"><a href="#" onclick="togglePaste(event)" style="font-size:11px;color:var(--accent);text-decoration:none">or paste the key text instead</a></div>
-      <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="Paste the private key text here" style="display:none;margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
-      <label class="form-label">SSH username</label>
-      <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
-      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
-        <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
-        <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="443" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 443 slips through restrictive networks</span>
-      </div>
-      <div class="log-box" id="anchor-provision-log" style="display:none"></div>
+    <label class="form-label">Relay SSH key <span style="color:var(--text-dim);font-weight:400">— the .key file Oracle gave you</span></label>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <input type="file" id="anchor-key-file" accept=".key,.pem,.txt,text/plain" onchange="loadKeyFile(event)" style="display:none">
+      <label for="anchor-key-file" class="filebtn">Choose .key file</label>
+      <span id="anchor-key-name" style="font-size:12px;color:var(--text-dim)">no file chosen</span>
     </div>
-
-    <div id="anchor-mode-manual" style="display:none">
-      <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Already ran the relay setup script yourself? Paste the WireGuard public key it printed.</p>
-      <label class="form-label">Relay WireGuard public key</label>
-      <input class="form-input" id="anchor-pubkey" placeholder="44-character key ending in =" style="margin-bottom:16px">
-      <button class="btn btn-primary" id="anchor-connect-btn" onclick="connectAnchor()">Connect to Relay</button>
-      <div id="anchor-connect-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
-      <div id="anchor-next" style="display:none;margin-top:16px">
-        <div class="reco-banner">
-          <b>One step on the relay.</b> This box is dialing the relay; to let it in, run this on the <b>relay</b>:
-          <div class="terminal-block" style="margin-top:10px"><span id="anchor-addbox-cmd"></span></div>
-        </div>
-      </div>
+    <div style="margin-bottom:16px"><a href="#" onclick="togglePaste(event)" style="font-size:11px;color:var(--accent);text-decoration:none">or paste the key text instead</a></div>
+    <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="Paste the private key text here" style="display:none;margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+    <label class="form-label">SSH username</label>
+    <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
+      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="443" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 443 slips through restrictive networks</span>
     </div>
+    <div class="log-box" id="anchor-provision-log" style="display:none"></div>
   </div>
 </div>
 
@@ -36475,12 +36454,6 @@ function togglePaste(ev){
   ta.style.display = (ta.style.display === 'none') ? 'block' : 'none';
   if(ta.style.display === 'block') ta.focus();
 }
-function setAnchorMode(mode){
-  document.getElementById('anchor-mode-auto').style.display = (mode==='auto') ? 'block' : 'none';
-  document.getElementById('anchor-mode-manual').style.display = (mode==='manual') ? 'block' : 'none';
-  document.getElementById('seg-auto').classList.toggle('active', mode==='auto');
-  document.getElementById('seg-manual').classList.toggle('active', mode==='manual');
-}
 let provPollTimer = null;
 async function provisionAnchor(){
   const btn = document.getElementById('anchor-provision-btn');
@@ -36516,32 +36489,7 @@ async function pollProvision(){
     }
   }catch(e){}
 }
-async function connectAnchor(){
-  const btn = document.getElementById('anchor-connect-btn');
-  const st = document.getElementById('anchor-connect-status');
-  const ip = document.getElementById('anchor-ip').value.trim();
-  const pubkey = document.getElementById('anchor-pubkey').value.trim();
-  const port = document.getElementById('anchor-port').value.trim() || '443';
-  if(!ip || !pubkey){ st.textContent = 'Enter the anchor IP and its WireGuard public key first.'; return; }
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Configuring…';
-  st.textContent = '';
-  try{
-    const r = await fetch('/api/connectivity/anchor/configure', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({anchor_ip: ip, anchor_pubkey: pubkey, wg_port: parseInt(port,10)})});
-    const d = await r.json();
-    if(d.success){
-      st.innerHTML = '<span style="color:var(--green)">Box tunnel configured.</span> Now authorize it on the anchor:';
-      document.getElementById('anchor-next').style.display = 'block';
-      document.getElementById('anchor-addbox-cmd').textContent = d.add_box_cmd;
-      refreshAnchorStatus();
-    } else {
-      st.textContent = d.error || 'Configuration failed.';
-    }
-  }catch(e){ st.textContent = 'Configuration failed: ' + e; }
-  btn.disabled = false; btn.textContent = 'Reconnect';
-}
 setInterval(function(){ if(document.getElementById('anchor-card').style.display !== 'none'){ refreshAnchorStatus(); } }, 5000);
-setAnchorMode('auto');
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
 fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
