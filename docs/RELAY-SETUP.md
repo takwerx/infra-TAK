@@ -42,17 +42,26 @@ Fresh VMs often launch without one.
 On the **Networking** tab → click the network security group (**ig-quick-action-NSG**) → **Add
 Rules**. Add these ingress rules, each with **Source `0.0.0.0/0`**:
 
-| Protocol | Port |
-|---|---|
-| UDP | 443 |
-| TCP | 8089 |
-| TCP | 8443 |
-| TCP | 8446 |
-| TCP | 5099 |
+| Protocol | Port | What it carries |
+|---|---|---|
+| **UDP** | **443** | WireGuard tunnel (your box dials in) |
+| **TCP** | **80** | Let's Encrypt cert validation + HTTP→HTTPS redirect |
+| **TCP** | **443** | HTTPS — all web UIs (Portal enrollment, Authentik, CloudTAK, admin) |
+| TCP | 8089 | ATAK / iTAK / WinTAK client connections |
+| TCP | 8443 | TAK admin WebGUI (client-cert auth) |
+| TCP | 8446 | TAK admin WebGUI (Let's Encrypt / LDAP login) |
+| TCP | 5099 | Relay reachability prober |
 
-> **Watch out for the port field.** Oracle's Add-Rule dialog has two port boxes — *Source Port
+> **⚠️ UDP 443 AND TCP 443 are BOTH required — they're different.** UDP 443 is the WireGuard
+> tunnel; TCP 443 is the HTTPS web traffic. Same number, different protocol. If you add only UDP 443,
+> the tunnel comes up but no website loads (and Let's Encrypt can't issue). Add both rows.
+>
+> **⚠️ Watch out for the port field.** Oracle's Add-Rule dialog has two port boxes — *Source Port
 > Range* first, then *Destination Port Range*. Put the port number in **Destination Port Range** and
 > leave Source blank. Putting it in Source silently drops all traffic while looking correct.
+
+*(Video, optional — only if you use MediaMTX/CloudTAK streaming: TCP 8554/8322/8890/18554/11935/18890,
+UDP 8000/8001.)*
 
 ## 4. Finish in the console — automatically
 
