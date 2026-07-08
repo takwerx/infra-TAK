@@ -33,6 +33,10 @@ WG_NET="172.31.99.0/24"          # deliberately NOT in 100.64/10 — must never 
 ANCHOR_WG_IP="172.31.99.1"
 BOX_WG_IP="172.31.99.2"
 TAK_PORTS="${TAK_PORTS:-8089 8443 8446}"   # streaming / Marti+WebTAK / cert enrollment
+WEB_PORTS="${WEB_PORTS:-80 443}"           # Caddy: Let's Encrypt ACME challenge + all web UIs
+                                           # (Portal, Authentik, CloudTAK, console). Without these a
+                                           # relayed box can never get a cert or serve the web side.
+FWD_PORTS="$WEB_PORTS $TAK_PORTS"          # everything the relay forwards to the box
 PROBER_PORT="5099"
 PROBER_DIR="/opt/takwerx-prober"
 PROBER_TOKEN_FILE="/etc/takwerx-prober.token"
@@ -74,7 +78,7 @@ apply_forward_rules() {
     # DNAT the TAK ports to the box's overlay IP. MASQUERADE on the tunnel so the
     # return path works without policy routing on the box. Known v1 tradeoff: TAK
     # sees the anchor's overlay IP as the client source, not the client's real IP.
-    for p in $TAK_PORTS; do
+    for p in $FWD_PORTS; do
         ipt_ensure nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "${BOX_WG_IP}:${p}"
         # Oracle images ship a FORWARD chain ending in REJECT — insert, don't append.
         ipt_ensure filter FORWARD -d "$BOX_WG_IP" -p tcp --dport "$p" -j ACCEPT
@@ -87,7 +91,7 @@ apply_forward_rules() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
         ufw allow "${WG_PORT}/udp" >/dev/null
         ufw allow "${PROBER_PORT}/tcp" >/dev/null
-        for p in $TAK_PORTS; do ufw allow "${p}/tcp" >/dev/null; done
+        for p in $FWD_PORTS; do ufw allow "${p}/tcp" >/dev/null; done
     fi
     persist_iptables
 }
@@ -206,7 +210,7 @@ EOF
     echo ""
     echo "✓ Anchor is up.  Public IP: ${pub_ip}"
     echo "  WireGuard public key : $(cat "$WG_DIR/anchor.pub")"
-    echo "  Forwarded TAK ports  : ${TAK_PORTS} → ${BOX_WG_IP} (kernel DNAT, no TLS in path)"
+    echo "  Forwarded ports      : ${FWD_PORTS} → ${BOX_WG_IP} (kernel DNAT, no TLS in path)"
     echo "  VERIFY prober        : http://${pub_ip}:${PROBER_PORT}/probe  token: $(cat "$PROBER_TOKEN_FILE")"
     echo ""
     echo "NEXT: 1) open udp/${WG_PORT}, tcp/{${TAK_PORTS// /,}}, tcp/${PROBER_PORT} in the cloud"
