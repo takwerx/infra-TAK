@@ -42030,12 +42030,21 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             _record_spiral_repair_attempt('recreate_failed', evidence)
             return
 
-        _t.sleep(30)
-        _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '30s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-        _val_out = (_val.stdout or '').lower()
-        connected = 'successfully connected websocket' in _val_out
-        has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
-        has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+        # Poll up to 2 min for the websocket, don't single-sample at 30s: a slow outpost
+        # (cold image, busy box, or an upstream auth hiccup it retries through) connects
+        # late and a one-shot check false-rolled-back the migration (field-hit 2026-07-08,
+        # NUC — validation window closed before the outpost finished starting). Hard TLS /
+        # routing errors still abort the wait early; only a confirmed websocket passes.
+        connected = has_tls_err = has_route_err = False
+        for _val_i in range(8):
+            _t.sleep(15)
+            _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '150s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+            _val_out = (_val.stdout or '').lower()
+            connected = 'successfully connected websocket' in _val_out
+            has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
+            has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+            if connected or has_tls_err or has_route_err:
+                break
 
         if connected and not has_tls_err and not has_route_err:
             plog(f"  ✓ routing repair: LDAP outpost healthy on https://{fqdn} via Caddy (spiral broken)")
@@ -42156,7 +42165,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             plog(f"  proactive routing: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — "
                  f"migrating anyway; outpost will reach Caddy via host-gateway (post-recreate validation confirms or rolls back)")
         else:
-            plog(f"  proactive routing: all preconditions met (TAK installed, FQDN configured, Caddy reachable) — migrating outpost to FQDN")
+            plog(f"  proactive routing: preconditions met (FQDN configured, Caddy reachable from container{', TAK installed' if os.path.exists('/opt/tak') else ''}) — migrating outpost to FQDN")
 
         import time as _t
         backup_path = f'{compose_path}.bak.proactive-routing.{int(_t.time())}'
@@ -42184,12 +42193,21 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
             return
 
-        _t.sleep(30)
-        _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '30s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-        _val_out = (_val.stdout or '').lower()
-        connected = 'successfully connected websocket' in _val_out
-        has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
-        has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+        # Poll up to 2 min for the websocket, don't single-sample at 30s: a slow outpost
+        # (cold image, busy box, or an upstream auth hiccup it retries through) connects
+        # late and a one-shot check false-rolled-back the migration (field-hit 2026-07-08,
+        # NUC — validation window closed before the outpost finished starting). Hard TLS /
+        # routing errors still abort the wait early; only a confirmed websocket passes.
+        connected = has_tls_err = has_route_err = False
+        for _val_i in range(8):
+            _t.sleep(15)
+            _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '150s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+            _val_out = (_val.stdout or '').lower()
+            connected = 'successfully connected websocket' in _val_out
+            has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
+            has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+            if connected or has_tls_err or has_route_err:
+                break
 
         if connected and not has_tls_err and not has_route_err:
             plog(f"  ✓ proactive routing: LDAP outpost healthy on https://{fqdn} via Caddy")
@@ -49949,7 +49967,13 @@ entries:
                             user_data = {'username': 'webadmin', 'name': 'TAK Admin', 'is_active': True,
                                 # Synthetic email — WebODM's OIDC login (and any OIDC consumer
                                 # requiring an email claim) fails on an email-less user.
-                                'email': f'webadmin@{(fqdn or "tak.local").split(":")[0]}',
+                                # settings.get, NOT the bare `fqdn` local — fqdn is only assigned in
+                                # Step 12 (line ~50296), so referencing it here raised UnboundLocalError,
+                                # the except at "Admin group setup error" swallowed it, and the REST of
+                                # Step 11 — including the real-outpost-token swap into compose — was
+                                # skipped: the LDAP outpost stayed on AUTHENTIK_TOKEN: placeholder and
+                                # 403'd forever. Field-hit 2026-07-08 (NUC redeploy with leftover /opt/tak).
+                                'email': f'webadmin@{(settings.get("fqdn") or "tak.local").split(":")[0]}',
                                 'groups': [group_pk] if group_pk else []}
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
                                 data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
