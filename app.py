@@ -36288,7 +36288,23 @@ textarea.form-input{resize:vertical}
   </div>
 
   <div class="card" id="anchor-card" style="display:none">
-    <div class="card-title">Connect a Relay</div>
+    <div class="card-title" id="anchor-card-title">Connect a Relay</div>
+
+    <div id="anchor-connected" style="display:none">
+      <div style="display:flex;align-items:center;gap:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:10px;padding:16px 18px">
+        <span class="dot" style="background:var(--green)"></span>
+        <div style="flex:1">
+          <div style="font-size:14px;font-weight:600;color:var(--green)">Relay connected</div>
+          <div id="anchor-connected-detail" style="font-size:12px;color:var(--text-secondary);margin-top:3px;font-family:'JetBrains Mono',monospace"></div>
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:16px;align-items:center">
+        <a href="#" onclick="reconfigureRelay(event)" style="font-size:12px;color:var(--accent);text-decoration:none">Reconfigure / use a different relay</a>
+        <a href="#" onclick="disconnectRelay(event)" style="font-size:12px;color:var(--red);text-decoration:none">Disconnect</a>
+      </div>
+    </div>
+
+    <div id="anchor-form">
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
       Your box has no public inbound, so it dials OUT to a small always-free public VPS (the relay).
       Friends connect to the relay's public address with no VPN, from any network your box is on.
@@ -36315,6 +36331,7 @@ textarea.form-input{resize:vertical}
       <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="443" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 443 slips through restrictive networks</span>
     </div>
     <div class="log-box" id="anchor-provision-log" style="display:none"></div>
+    </div>
   </div>
 </div>
 
@@ -36407,9 +36424,10 @@ function renderResult(res){
   document.getElementById('result-reasons').innerHTML =
     (res.reasons || []).map(r => '• ' + esc(r)).join('<br>');
   document.getElementById('reco-banner').innerHTML = RECO_TEXT[res.recommendation] || '';
-  // Reveal the Connect-Anchor card when the anchor is the recommended path.
-  document.getElementById('anchor-card').style.display = (res.recommendation === 'anchor') ? 'block' : 'none';
-  if(res.recommendation === 'anchor'){ refreshAnchorStatus(); }
+  // Reveal the relay card when the relay is recommended; refreshAnchorStatus also
+  // reveals it if a relay is already configured, and won't hide a connected one.
+  if(res.recommendation === 'anchor'){ document.getElementById('anchor-card').style.display = 'block'; }
+  refreshAnchorStatus();
 }
 
 function fmtAge(s){
@@ -36418,19 +36436,43 @@ function fmtAge(s){
   if(s < 5400) return Math.round(s/60) + ' min ago';
   return Math.round(s/3600) + ' h ago';
 }
+let anchorReconfiguring = false;
+function showRelayForm(show){
+  document.getElementById('anchor-form').style.display = show ? 'block' : 'none';
+  document.getElementById('anchor-connected').style.display = show ? 'none' : 'block';
+  document.getElementById('anchor-card-title').textContent = show ? 'Connect a Relay' : 'Relay';
+}
+function reconfigureRelay(ev){ if(ev) ev.preventDefault(); anchorReconfiguring = true; showRelayForm(true); }
+async function disconnectRelay(ev){
+  if(ev) ev.preventDefault();
+  if(!confirm('Disconnect this box from the relay? Friends will lose access until you reconnect.')) return;
+  try{ await fetch('/api/connectivity/anchor/disconnect', {method:'POST'}); }catch(e){}
+  anchorReconfiguring = true; showRelayForm(true);
+  document.getElementById('anchor-status-line').innerHTML = '<span style="color:var(--text-dim)">Disconnected.</span>';
+  refreshAnchorStatus();
+}
 async function refreshAnchorStatus(){
   try{
     const r = await fetch('/api/connectivity/anchor/status');
     const d = await r.json();
+    // Once a relay is set up, the card leads with a connected summary; the form
+    // hides behind Reconfigure so a returning operator isn't shown an empty form.
+    const connected = d.up && d.handshake_secs != null && d.handshake_secs < 180;
+    if((d.configured || connected) && !anchorReconfiguring){
+      document.getElementById('anchor-card').style.display = 'block';
+      showRelayForm(false);
+      const detail = (connected ? 'Tunnel up · ' : 'Configured, waiting for handshake · ')
+        + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||443) : ''))
+        + (d.handshake_secs != null ? ' · last handshake ' + fmtAge(d.handshake_secs) : '');
+      document.getElementById('anchor-connected-detail').textContent = detail;
+    } else if(!d.configured && !anchorReconfiguring){
+      showRelayForm(true);
+    }
     const el = document.getElementById('anchor-status-line');
-    if(d.up && d.handshake_secs != null && d.handshake_secs < 180){
+    if(connected){
       el.innerHTML = '<span style="color:var(--green)">● Tunnel UP</span> — last handshake ' + esc(fmtAge(d.handshake_secs)) + (d.endpoint ? ' · ' + esc(d.endpoint) : '');
     } else if(d.configured){
-      el.innerHTML = '<span style="color:var(--yellow)">● Configured, waiting for handshake</span>' + (d.endpoint ? ' · ' + esc(d.endpoint) : '') + ' — run the add-box command on the relay if you haven\\'t.';
-      if(d.box_pubkey){
-        document.getElementById('anchor-next').style.display = 'block';
-        document.getElementById('anchor-addbox-cmd').textContent = 'sudo ./connectivity-anchor-bootstrap.sh add-box ' + d.box_pubkey;
-      }
+      el.innerHTML = '<span style="color:var(--yellow)">● Configured, waiting for handshake</span>' + (d.endpoint ? ' · ' + esc(d.endpoint) : '');
     } else {
       el.innerHTML = '<span style="color:var(--text-dim)">Not connected to a relay yet.</span>';
     }
@@ -36485,11 +36527,14 @@ async function pollProvision(){
       const btn = document.getElementById('anchor-provision-btn');
       btn.disabled = false; btn.textContent = 'Set Up Relay Again';
       if(d.error){ log.textContent += '\\nERROR: ' + d.error; }
+      else { anchorReconfiguring = false; }
       refreshAnchorStatus();
     }
   }catch(e){}
 }
 setInterval(function(){ if(document.getElementById('anchor-card').style.display !== 'none'){ refreshAnchorStatus(); } }, 5000);
+// On landing, surface an already-configured relay without needing to Run Detection.
+refreshAnchorStatus();
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
 fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
