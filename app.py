@@ -8667,6 +8667,212 @@ def connectivity_anchor_provision_status_api():
                     'error': st.get('error', ''), 'log': st.get('log', [])})
 
 
+# ── Leg 6 — WIFI JOIN (tell the box its next network, from the browser) ────────
+# Kills the netplan hand-edit for a portable box: scan/list networks + add one from
+# the UI. SAFETY MODEL (headless box reached remotely — a bad apply strands it):
+#  - ADDITIVE ONLY: never removes an existing access-point, so the current
+#    connection can't be dropped by adding a new one.
+#  - VALIDATE BEFORE APPLY: back up the netplan file, write the new one, run
+#    `netplan generate`; if it fails, RESTORE the backup and abort — never apply
+#    an unvalidated config.
+#  - Multiplatform: nmcli (NetworkManager / RHEL) when present, else netplan
+#    (Ubuntu). Both via the privileged broker (_sudo_wrap / _run_priv_chain).
+
+
+def _conn_wifi_iface():
+    """Detect the wireless interface name (e.g. wlp1s0). Empty if none."""
+    try:
+        r = subprocess.run(_sudo_wrap(['iw', 'dev']), capture_output=True, text=True, timeout=8)
+        m = re.search(r'Interface\s+(\S+)', r.stdout or '')
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    try:
+        for n in sorted(os.listdir('/sys/class/net')):
+            if os.path.exists('/sys/class/net/%s/wireless' % n):
+                return n
+    except Exception:
+        pass
+    return ''
+
+
+def _conn_wifi_netplan_file():
+    """The netplan file that defines the wifis: block (where APs live)."""
+    try:
+        import glob as _glob
+        for f in sorted(_glob.glob('/etc/netplan/*.yaml')):
+            try:
+                with open(f) as fh:
+                    if 'wifis' in fh.read():
+                        return f
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ''
+
+
+def _conn_wifi_saved():
+    """SSIDs the box already knows (from nmcli or the netplan file)."""
+    out = []
+    if shutil.which('nmcli'):
+        try:
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']),
+                               capture_output=True, text=True, timeout=10)
+            for line in (r.stdout or '').splitlines():
+                p = line.split(':')
+                if len(p) >= 2 and 'wireless' in p[1]:
+                    out.append(p[0])
+        except Exception:
+            pass
+        return out
+    f = _conn_wifi_netplan_file()
+    if f:
+        try:
+            import yaml as _yaml
+            with open(f) as fh:
+                doc = _yaml.safe_load(fh) or {}
+            for _iface, cfg in ((doc.get('network') or {}).get('wifis') or {}).items():
+                out.extend(list((cfg.get('access-points') or {}).keys()))
+        except Exception:
+            pass
+    return out
+
+
+def _conn_wifi_scan():
+    """Best-effort list of visible SSIDs (+ signal where available)."""
+    nets, seen = [], set()
+
+    def _add(ssid, signal=''):
+        ssid = (ssid or '').strip()
+        if ssid and ssid not in seen:
+            seen.add(ssid)
+            nets.append({'ssid': ssid, 'signal': signal})
+    if shutil.which('nmcli'):
+        try:
+            subprocess.run(_sudo_wrap(['nmcli', 'dev', 'wifi', 'rescan']), capture_output=True, timeout=15)
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list']),
+                               capture_output=True, text=True, timeout=20)
+            for line in (r.stdout or '').splitlines():
+                p = line.rsplit(':', 1)
+                _add(p[0], p[1] if len(p) > 1 else '')
+        except Exception:
+            pass
+        return nets
+    iface = _conn_wifi_iface()
+    if iface:
+        try:
+            r = subprocess.run(_sudo_wrap(['iw', 'dev', iface, 'scan']),
+                               capture_output=True, text=True, timeout=25)
+            for line in (r.stdout or '').splitlines():
+                s = line.strip()
+                if s.startswith('SSID:'):
+                    _add(s[5:])
+        except Exception:
+            pass
+    return nets
+
+
+def _conn_wifi_add(ssid, psk):
+    """Add a wifi network ADDITIVELY and bring config up. Returns (ok, error).
+    netplan path validates-before-apply with backup/restore; never strands."""
+    if not (1 <= len(ssid.encode('utf-8')) <= 32):
+        return False, 'Network name must be 1–32 characters.'
+    if psk and not (8 <= len(psk) <= 63):
+        return False, 'WiFi password must be 8–63 characters (WPA requirement).'
+    # NetworkManager path (RHEL / any box with nmcli): additive by nature.
+    if shutil.which('nmcli'):
+        cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
+        if psk:
+            cmd += ['password', psk]
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or 'nmcli connect failed').strip()[:200]
+        return True, ''
+    # netplan path (Ubuntu).
+    f = _conn_wifi_netplan_file()
+    if not f:
+        return False, 'No netplan wifi config found on this box.'
+    iface = _conn_wifi_iface()
+    if not iface:
+        return False, 'No wireless interface detected.'
+    try:
+        import yaml as _yaml
+        # Read current config via privileged cat (file may be root-only).
+        cur = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=10)
+        doc = _yaml.safe_load(cur.stdout or '') or {}
+        net = doc.setdefault('network', {})
+        net.setdefault('version', 2)
+        wifis = net.setdefault('wifis', {})
+        ap = wifis.setdefault(iface, {})
+        ap.setdefault('dhcp4', True)
+        points = ap.setdefault('access-points', {})
+        # ADDITIVE: add/replace only THIS ssid, keep every other AP untouched.
+        if psk:
+            points[ssid] = {'auth': {'key-management': 'psk', 'password': psk}}
+        else:
+            points[ssid] = {}
+        new_yaml = _yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
+    except Exception as ex:
+        return False, 'Could not read/parse netplan config: %s' % str(ex)[:160]
+    # Write via temp → privileged install, keeping a backup for restore-on-failure.
+    tmp_path = bak = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix='netplan-', suffix='.yaml')
+        os.write(fd, new_yaml.encode())
+        os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        bak = f + '.infratak-wifi.bak'
+        _run_priv_chain([['cp', '-a', f, bak]], mode='and')
+        inst = _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp_path, f]], mode='and')
+        if not inst or inst.returncode != 0:
+            return False, 'Could not write netplan config.'
+        # VALIDATE — if generate fails, restore the backup and abort (never apply).
+        gen = _run_priv_chain([['netplan', 'generate']], mode='and')
+        if not gen or gen.returncode != 0:
+            _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
+            return False, 'New network config failed validation — reverted, nothing changed. (%s)' \
+                % ((gen.stderr if gen else '') or '')[:140]
+        # Apply is additive (adds the SSID; does not drop the current connection).
+        appl = _run_priv_chain([['netplan', 'apply']], mode='and')
+        if not appl or appl.returncode != 0:
+            return False, 'Config validated but apply failed: %s' % ((appl.stderr if appl else '') or '')[:140]
+        return True, ''
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+@app.route('/api/connectivity/wifi/list')
+@login_required
+def connectivity_wifi_list_api():
+    return jsonify({'iface': _conn_wifi_iface(), 'saved': _conn_wifi_saved()})
+
+
+@app.route('/api/connectivity/wifi/scan')
+@login_required
+def connectivity_wifi_scan_api():
+    return jsonify({'networks': _conn_wifi_scan()})
+
+
+@app.route('/api/connectivity/wifi/add', methods=['POST'])
+@login_required
+def connectivity_wifi_add_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    psk = data.get('password') or ''
+    if not ssid:
+        return jsonify({'success': False, 'error': 'Enter a network name (SSID).'}), 400
+    ok, err = _conn_wifi_add(ssid, psk)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True})
+
+
 # ── EUD Remote Assist Portal ──────────────────────────────────────────────────
 
 _remote_assist_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
@@ -36333,6 +36539,26 @@ textarea.form-input{resize:vertical}
     <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
   </div>
+
+  <div class="card" id="wifi-card">
+    <div class="card-title">WiFi Networks</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      Tell this box about a WiFi network — including one you're <b>not on yet</b>, so a portable box
+      joins it automatically when you get there. Adding a network never disconnects the one you're on.
+    </p>
+    <div id="wifi-saved" style="font-size:12px;color:var(--text-dim);margin-bottom:14px"></div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <button class="control-btn" id="wifi-scan-btn" onclick="scanWifi()">Scan for networks</button>
+      <span id="wifi-scan-status" style="font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div id="wifi-scan-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px"></div>
+    <label class="form-label">Network name (SSID)</label>
+    <input class="form-input" id="wifi-ssid" placeholder="exact network name" style="margin-bottom:12px;max-width:320px">
+    <label class="form-label">WiFi password <span style="color:var(--text-dim);font-weight:400">(leave blank for an open network)</span></label>
+    <input class="form-input" id="wifi-psk" type="password" placeholder="8–63 characters" style="margin-bottom:16px;max-width:320px">
+    <button class="btn btn-primary" id="wifi-add-btn" onclick="addWifi()">Add Network</button>
+    <div id="wifi-add-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
 </div>
 
 <script>
@@ -36532,9 +36758,58 @@ async function pollProvision(){
     }
   }catch(e){}
 }
+async function refreshWifiSaved(){
+  try{
+    const r = await fetch('/api/connectivity/wifi/list');
+    const d = await r.json();
+    const el = document.getElementById('wifi-saved');
+    if(d.saved && d.saved.length){
+      el.innerHTML = 'Known networks: ' + d.saved.map(s => '<span style="color:var(--text-secondary)">' + esc(s) + '</span>').join(', ');
+    } else {
+      el.textContent = 'No saved WiFi networks yet.';
+    }
+  }catch(e){}
+}
+async function scanWifi(){
+  const btn = document.getElementById('wifi-scan-btn');
+  const st = document.getElementById('wifi-scan-status');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Scanning…'; st.textContent = '';
+  try{
+    const r = await fetch('/api/connectivity/wifi/scan');
+    const d = await r.json();
+    const list = document.getElementById('wifi-scan-list');
+    const nets = (d.networks || []).filter(n => n.ssid);
+    if(!nets.length){ st.textContent = 'No networks found (or scanning not supported here — type the name below).'; }
+    list.innerHTML = nets.map(n =>
+      '<button type="button" class="control-btn" style="font-size:12px;padding:6px 12px" onclick="pickWifi(' + JSON.stringify(n.ssid).replace(/"/g,'&quot;') + ')">'
+      + esc(n.ssid) + (n.signal ? ' <span style="color:var(--text-dim)">· ' + esc(n.signal) + '</span>' : '') + '</button>').join('');
+  }catch(e){ st.textContent = 'Scan failed.'; }
+  btn.disabled = false; btn.textContent = 'Scan for networks';
+}
+function pickWifi(ssid){ document.getElementById('wifi-ssid').value = ssid; document.getElementById('wifi-psk').focus(); }
+async function addWifi(){
+  const btn = document.getElementById('wifi-add-btn');
+  const st = document.getElementById('wifi-add-status');
+  const ssid = document.getElementById('wifi-ssid').value.trim();
+  const psk = document.getElementById('wifi-psk').value;
+  if(!ssid){ st.textContent = 'Enter a network name first.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Adding…'; st.textContent = '';
+  try{
+    const r = await fetch('/api/connectivity/wifi/add', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ssid: ssid, password: psk})});
+    const d = await r.json();
+    if(d.success){
+      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '”.</span> The box will join it automatically when in range.';
+      document.getElementById('wifi-psk').value = '';
+      refreshWifiSaved();
+    } else { st.textContent = d.error || 'Could not add network.'; }
+  }catch(e){ st.textContent = 'Failed: ' + e; }
+  btn.disabled = false; btn.textContent = 'Add Network';
+}
 setInterval(function(){ if(document.getElementById('anchor-card').style.display !== 'none'){ refreshAnchorStatus(); } }, 5000);
 // On landing, surface an already-configured relay without needing to Run Detection.
 refreshAnchorStatus();
+refreshWifiSaved();
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
 fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
