@@ -8817,14 +8817,21 @@ def _conn_wifi_iface():
 
 
 def _conn_wifi_netplan_file():
-    """The netplan file that defines the wifis: block (where APs live)."""
+    """The netplan file that defines the wifis: block (where APs live).
+
+    Reads via the BROKER — netplan yamls are root-600 by design (they hold WiFi
+    PSKs; cloud-init tightened this after CVE-2022-… era), so a direct open() as
+    the non-root console EPERMs on every file and this reported 'No netplan wifi
+    config found' on a box that was ON WiFi at that very moment (field-hit
+    2026-07-08, NUC — first live Leg 6 test). Returns '' if no file has a
+    wifis: block (caller creates our own layered file)."""
     try:
         import glob as _glob
         for f in sorted(_glob.glob('/etc/netplan/*.yaml')):
             try:
-                with open(f) as fh:
-                    if 'wifis' in fh.read():
-                        return f
+                r = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=8)
+                if r.returncode == 0 and 'wifis' in (r.stdout or ''):
+                    return f
             except Exception:
                 continue
     except Exception:
@@ -8846,16 +8853,24 @@ def _conn_wifi_saved():
         except Exception:
             pass
         return out
-    f = _conn_wifi_netplan_file()
-    if f:
-        try:
-            import yaml as _yaml
-            with open(f) as fh:
-                doc = _yaml.safe_load(fh) or {}
-            for _iface, cfg in ((doc.get('network') or {}).get('wifis') or {}).items():
-                out.extend(list((cfg.get('access-points') or {}).keys()))
-        except Exception:
-            pass
+    # netplan branch: read every yaml via the broker (root-600 files — a direct
+    # open() EPERMs as the non-root console and the saved list showed empty even
+    # while the box was connected; same field bug as _conn_wifi_netplan_file).
+    try:
+        import glob as _glob
+        import yaml as _yaml
+        for f in sorted(_glob.glob('/etc/netplan/*.yaml')):
+            try:
+                r = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=8)
+                doc = _yaml.safe_load(r.stdout or '') or {}
+                for _iface, cfg in ((doc.get('network') or {}).get('wifis') or {}).items():
+                    for _ssid in (cfg.get('access-points') or {}).keys():
+                        if _ssid not in out:
+                            out.append(_ssid)
+            except Exception:
+                continue
+    except Exception:
+        pass
     return out
 
 
@@ -8912,8 +8927,14 @@ def _conn_wifi_add(ssid, psk):
         return True, ''
     # netplan path (Ubuntu).
     f = _conn_wifi_netplan_file()
+    created_new = False
     if not f:
-        return False, 'No netplan wifi config found on this box.'
+        # No wifis: block anywhere (ethernet-only cloud-init, or WiFi configured
+        # outside netplan). Create our OWN lexically-layered file instead of
+        # failing — netplan merges mappings across files, and never touching
+        # cloud-init's file means cloud-init can't clobber our APs later.
+        f = '/etc/netplan/90-infratak-wifi.yaml'
+        created_new = True
     iface = _conn_wifi_iface()
     if not iface:
         return False, 'No wireless interface detected.'
@@ -8944,14 +8965,20 @@ def _conn_wifi_add(ssid, psk):
         os.close(fd)
         os.chmod(tmp_path, 0o600)
         bak = f + '.infratak-wifi.bak'
-        _run_priv_chain([['cp', '-a', f, bak]], mode='and')
+        if not created_new:
+            _run_priv_chain([['cp', '-a', f, bak]], mode='and')
         inst = _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp_path, f]], mode='and')
         if not inst or inst.returncode != 0:
             return False, 'Could not write netplan config.'
-        # VALIDATE — if generate fails, restore the backup and abort (never apply).
+        # VALIDATE — if generate fails, roll back and abort (never apply). For a
+        # freshly created file there is no backup to restore — remove it instead
+        # (leaves the box exactly as it was).
         gen = _run_priv_chain([['netplan', 'generate']], mode='and')
         if not gen or gen.returncode != 0:
-            _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
+            if created_new:
+                _run_priv_chain([['rm', '-f', f], ['netplan', 'generate']], mode='seq')
+            else:
+                _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
             return False, 'New network config failed validation — reverted, nothing changed. (%s)' \
                 % ((gen.stderr if gen else '') or '')[:140]
         # Apply is additive (adds the SSID; does not drop the current connection).
@@ -36720,7 +36747,10 @@ textarea.form-input{resize:vertical}
     <label class="form-label">Network name (SSID)</label>
     <input class="form-input" id="wifi-ssid" placeholder="exact network name" style="margin-bottom:12px;max-width:320px">
     <label class="form-label">WiFi password <span style="color:var(--text-dim);font-weight:400">(leave blank for an open network)</span></label>
-    <input class="form-input" id="wifi-psk" type="password" placeholder="8–63 characters" style="margin-bottom:16px;max-width:320px">
+    <div style="position:relative;max-width:320px;margin-bottom:16px">
+      <input class="form-input" id="wifi-psk" type="password" placeholder="8–63 characters" style="max-width:none;padding-right:44px">
+      <span onclick="toggleWifiPsk()" id="wifi-psk-eye" class="material-symbols-outlined" title="Show password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:19px;color:var(--text-dim);user-select:none">visibility</span>
+    </div>
     <button class="btn btn-primary" id="wifi-add-btn" onclick="addWifi()">Add Network</button>
     <div id="wifi-add-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
@@ -36980,6 +37010,13 @@ function renderVerify(res){
   }
   document.getElementById('verify-matrix').innerHTML = rows.join('');
   document.getElementById('verify-vantage').textContent = 'Tested: ' + (res.target || '') + ' — ' + (res.vantage || '');
+}
+function toggleWifiPsk(){
+  const i = document.getElementById('wifi-psk'), e = document.getElementById('wifi-psk-eye');
+  const show = i.type === 'password';
+  i.type = show ? 'text' : 'password';
+  e.textContent = show ? 'visibility_off' : 'visibility';
+  e.title = show ? 'Hide password' : 'Show password';
 }
 async function refreshWifiSaved(){
   try{
