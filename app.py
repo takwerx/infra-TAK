@@ -36208,11 +36208,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.5;cursor:default}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
 .intent-tiles{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.intent-tile{background:#0a0e1a;border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left}
+.intent-tile{background:#0a0e1a;border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left;color:var(--text-primary);font-family:inherit}
 .intent-tile:hover{border-color:var(--border-hover)}
 .intent-tile.selected{border-color:var(--cyan);background:rgba(6,182,212,.06)}
-.intent-tile .t-emoji{font-size:26px}.intent-tile .t-title{font-size:14px;font-weight:700;margin:8px 0 4px}
-.intent-tile .t-desc{font-size:12px;color:var(--text-dim);line-height:1.5}
+.intent-tile .t-emoji{font-size:26px}.intent-tile .t-title{font-size:14px;font-weight:700;margin:8px 0 4px;color:var(--text-primary)}
+.intent-tile .t-desc{font-size:12px;color:var(--text-secondary);line-height:1.5}
 .class-badge{display:inline-flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;font-weight:700;font-size:14px;padding:6px 14px;border-radius:8px}
 .class-A{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.3)}
 .class-B{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.3)}
