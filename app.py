@@ -8356,6 +8356,171 @@ def connectivity_detect_status_api():
     })
 
 
+# ── Leg 4 — CONNECT ANCHOR (box-side automation) ──────────────────────────────
+# Turns the manual wg0.conf hand-assembly into a form: the console generates the
+# box WireGuard keypair, writes the tunnel config, and dials the anchor. The
+# anchor VPS itself is still stood up manually (RUNBOOK-oracle-anchor-provisioning,
+# private notes) — this automates only the box half. Field-validated field defaults
+# from the 2026-07-07 Starlink build: overlay 172.31.99.0/24, box .2, anchor .1,
+# udp/443 (guest nets filter high UDP ports; 443 looks like HTTPS/QUIC).
+_CONN_WG_IF = 'wg0'
+_CONN_BOX_WG_IP = '172.31.99.2'
+_CONN_ANCHOR_WG_IP = '172.31.99.1'
+_CONN_WG_KEY_RE = re.compile(r'^[A-Za-z0-9+/]{43}=$')  # 32-byte base64 WireGuard key
+
+
+def _conn_wg_conf_path():
+    return '/etc/wireguard/%s.conf' % _CONN_WG_IF
+
+
+def _conn_anchor_status():
+    """Parse `wg show wg0` into a status dict. Never raises."""
+    out = {'configured': False, 'up': False, 'handshake_secs': None,
+           'endpoint': '', 'rx_bytes': None, 'tx_bytes': None}
+    settings = load_settings()
+    anchor = settings.get('connectivity_anchor') or {}
+    if anchor.get('anchor_ip'):
+        out['configured'] = True
+        out['anchor_ip'] = anchor.get('anchor_ip')
+        out['wg_port'] = anchor.get('wg_port')
+        out['box_pubkey'] = anchor.get('box_pubkey', '')
+    try:
+        r = subprocess.run(_sudo_wrap(['wg', 'show', _CONN_WG_IF, 'dump']),
+                           capture_output=True, text=True, timeout=8)
+        if r.returncode != 0 or not r.stdout.strip():
+            return out
+        lines = r.stdout.strip().splitlines()
+        # dump format: first line = interface; peer lines follow (tab-separated).
+        # peer: pubkey preshared endpoint allowed-ips latest-handshake rx tx keepalive
+        for ln in lines[1:]:
+            f = ln.split('\t')
+            if len(f) >= 8:
+                out['up'] = True
+                out['endpoint'] = f[2] if f[2] != '(none)' else ''
+                hs = int(f[4]) if f[4].isdigit() else 0
+                out['rx_bytes'] = int(f[5]) if f[5].isdigit() else 0
+                out['tx_bytes'] = int(f[6]) if f[6].isdigit() else 0
+                if hs > 0:
+                    import time as _t
+                    # dump gives an absolute epoch for latest handshake; convert to age.
+                    out['handshake_secs'] = max(0, int(_t.time()) - hs)
+    except Exception:
+        pass
+    return out
+
+
+@app.route('/api/connectivity/anchor/status')
+@login_required
+def connectivity_anchor_status_api():
+    return jsonify(_conn_anchor_status())
+
+
+@app.route('/api/connectivity/anchor/configure', methods=['POST'])
+@login_required
+def connectivity_anchor_configure_api():
+    data = request.get_json(silent=True) or {}
+    anchor_ip = (data.get('anchor_ip') or '').strip()
+    anchor_pubkey = (data.get('anchor_pubkey') or '').strip()
+    wg_port = data.get('wg_port', 443)
+    # Strict validation — these feed a config file + systemd, never a shell.
+    try:
+        ipaddress.ip_address(anchor_ip)
+    except (ValueError, TypeError):
+        return jsonify({'success': False, 'error': 'Anchor IP is not a valid IP address.'}), 400
+    if not _CONN_WG_KEY_RE.fullmatch(anchor_pubkey):
+        return jsonify({'success': False, 'error': 'Anchor WireGuard public key is malformed (expected a 44-char base64 key ending in "=").'}), 400
+    try:
+        wg_port = int(wg_port)
+    except (ValueError, TypeError):
+        return jsonify({'success': False, 'error': 'WireGuard port must be a number.'}), 400
+    if not (1 <= wg_port <= 65535):
+        return jsonify({'success': False, 'error': 'WireGuard port out of range.'}), 400
+
+    # Ensure wireguard-tools is present (fresh boxes won't have it).
+    if not shutil.which('wg'):
+        try:
+            _pkg_install(['wireguard-tools'])
+        except Exception as ex:
+            return jsonify({'success': False, 'error': 'Could not install wireguard-tools: %s' % str(ex)[:160]}), 500
+        if not shutil.which('wg'):
+            return jsonify({'success': False, 'error': 'wireguard-tools unavailable after install.'}), 500
+
+    # Generate the box keypair (wg genkey/pubkey do not need root).
+    try:
+        priv = subprocess.run(['wg', 'genkey'], capture_output=True, text=True, timeout=10).stdout.strip()
+        pub = subprocess.run(['wg', 'pubkey'], input=priv + '\n', capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception as ex:
+        return jsonify({'success': False, 'error': 'Key generation failed: %s' % str(ex)[:160]}), 500
+    if not (_CONN_WG_KEY_RE.fullmatch(priv) and _CONN_WG_KEY_RE.fullmatch(pub)):
+        return jsonify({'success': False, 'error': 'Generated key looked malformed — aborting.'}), 500
+
+    conf = (
+        '[Interface]\n'
+        'Address = %s/24\n'
+        'PrivateKey = %s\n\n'
+        '[Peer]\n'
+        'PublicKey = %s\n'
+        'Endpoint = %s:%d\n'
+        'AllowedIPs = %s/32\n'
+        'PersistentKeepalive = 25\n'
+    ) % (_CONN_BOX_WG_IP, priv, anchor_pubkey, anchor_ip, wg_port, _CONN_ANCHOR_WG_IP)
+
+    # Write via a console-owned 0600 temp, then privileged install to /etc/wireguard.
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix='wg-', suffix='.conf')
+        os.write(fd, conf.encode())
+        os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        inst = _run_priv_chain([
+            ['install', '-D', '-m', '600', '-o', 'root', '-g', 'root', tmp_path, _conn_wg_conf_path()],
+        ], mode='and')
+        if not inst or inst.returncode != 0:
+            err = (inst.stderr if inst else '') or 'install failed'
+            return jsonify({'success': False, 'error': 'Could not write tunnel config: %s' % err[:160]}), 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    # Bring the tunnel up (restart is idempotent if it was already configured).
+    up = _run_priv_chain([
+        ['systemctl', 'enable', _CONN_WG_IF and 'wg-quick@%s' % _CONN_WG_IF],
+        ['systemctl', 'restart', 'wg-quick@%s' % _CONN_WG_IF],
+    ], mode='seq')
+    if not up or up.returncode != 0:
+        err = (up.stderr if up else '') or 'systemctl failed'
+        return jsonify({'success': False, 'error': 'Tunnel config written but bring-up failed: %s' % err[:160]}), 500
+
+    settings = load_settings()
+    settings['connectivity_anchor'] = {
+        'anchor_ip': anchor_ip, 'anchor_pubkey': anchor_pubkey,
+        'wg_port': wg_port, 'box_pubkey': pub,
+    }
+    save_settings(settings)
+    return jsonify({
+        'success': True,
+        'box_pubkey': pub,
+        'add_box_cmd': 'sudo ./connectivity-anchor-bootstrap.sh add-box %s' % pub,
+    })
+
+
+@app.route('/api/connectivity/anchor/disconnect', methods=['POST'])
+@login_required
+def connectivity_anchor_disconnect_api():
+    _run_priv_chain([
+        ['systemctl', 'disable', 'wg-quick@%s' % _CONN_WG_IF],
+        ['systemctl', 'stop', 'wg-quick@%s' % _CONN_WG_IF],
+        ['rm', '-f', _conn_wg_conf_path()],
+    ], mode='seq')
+    settings = load_settings()
+    settings.pop('connectivity_anchor', None)
+    save_settings(settings)
+    return jsonify({'success': True})
+
+
 # ── EUD Remote Assist Portal ──────────────────────────────────────────────────
 
 _remote_assist_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
@@ -35967,6 +36132,37 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="reasons" id="result-reasons"></div>
     <div class="reco-banner" id="reco-banner"></div>
   </div>
+
+  <div class="card" id="anchor-card" style="display:none">
+    <div class="card-title">Connect an Anchor</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      Your box has no public inbound, so it dials OUT to a small always-free public VPS (the anchor).
+      Friends connect to the anchor's public address with no VPN, from any network your box is on.
+      Stand the anchor up first (Oracle Free Tier — see the anchor runbook), run
+      <code>connectivity-anchor-bootstrap.sh setup</code> on it, then paste its details below and
+      this box configures its own tunnel automatically.
+    </p>
+    <div id="anchor-status-line" style="font-size:12px;margin-bottom:14px"></div>
+    <div id="anchor-form">
+      <label class="form-label">Anchor public IP</label>
+      <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:12px">
+      <label class="form-label">Anchor WireGuard public key <span style="color:var(--text-dim);font-weight:400">(printed by the anchor's setup)</span></label>
+      <input class="form-input" id="anchor-pubkey" placeholder="44-character key ending in =" style="margin-bottom:12px">
+      <label class="form-label">WireGuard port</label>
+      <input class="form-input" id="anchor-port" value="443" style="margin-bottom:16px;max-width:160px">
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:16px">Default 443 — survives restrictive networks (looks like HTTPS). Only change it if your anchor uses a different port.</div>
+      <button class="btn btn-primary" id="anchor-connect-btn" onclick="connectAnchor()">Connect to Anchor</button>
+      <div id="anchor-connect-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    </div>
+    <div id="anchor-next" style="display:none;margin-top:16px">
+      <div class="reco-banner">
+        <b>Almost there — one step on the anchor.</b> This box is now dialing the anchor. To let it in,
+        run this on the <b>anchor</b> (paste the box key it's asking for):
+        <div class="terminal-block" style="margin-top:10px"><span id="anchor-addbox-cmd"></span></div>
+        Once you run it, the tunnel comes up within a few seconds — status shows below.
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -36058,7 +36254,60 @@ function renderResult(res){
   document.getElementById('result-reasons').innerHTML =
     (res.reasons || []).map(r => '• ' + esc(r)).join('<br>');
   document.getElementById('reco-banner').innerHTML = RECO_TEXT[res.recommendation] || '';
+  // Reveal the Connect-Anchor card when the anchor is the recommended path.
+  document.getElementById('anchor-card').style.display = (res.recommendation === 'anchor') ? 'block' : 'none';
+  if(res.recommendation === 'anchor'){ refreshAnchorStatus(); }
 }
+
+function fmtAge(s){
+  if(s == null) return 'no handshake yet';
+  if(s < 90) return s + 's ago';
+  if(s < 5400) return Math.round(s/60) + ' min ago';
+  return Math.round(s/3600) + ' h ago';
+}
+async function refreshAnchorStatus(){
+  try{
+    const r = await fetch('/api/connectivity/anchor/status');
+    const d = await r.json();
+    const el = document.getElementById('anchor-status-line');
+    if(d.up && d.handshake_secs != null && d.handshake_secs < 180){
+      el.innerHTML = '<span style="color:var(--green)">● Tunnel UP</span> — last handshake ' + esc(fmtAge(d.handshake_secs)) + (d.endpoint ? ' · ' + esc(d.endpoint) : '');
+    } else if(d.configured){
+      el.innerHTML = '<span style="color:var(--yellow)">● Configured, waiting for handshake</span>' + (d.endpoint ? ' · ' + esc(d.endpoint) : '') + ' — run the add-box command on the anchor if you haven\\'t.';
+      if(d.box_pubkey){
+        document.getElementById('anchor-next').style.display = 'block';
+        document.getElementById('anchor-addbox-cmd').textContent = 'sudo ./connectivity-anchor-bootstrap.sh add-box ' + d.box_pubkey;
+      }
+    } else {
+      el.innerHTML = '<span style="color:var(--text-dim)">Not connected to an anchor yet.</span>';
+    }
+  }catch(e){}
+}
+async function connectAnchor(){
+  const btn = document.getElementById('anchor-connect-btn');
+  const st = document.getElementById('anchor-connect-status');
+  const ip = document.getElementById('anchor-ip').value.trim();
+  const pubkey = document.getElementById('anchor-pubkey').value.trim();
+  const port = document.getElementById('anchor-port').value.trim() || '443';
+  if(!ip || !pubkey){ st.textContent = 'Enter the anchor IP and its WireGuard public key first.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Configuring…';
+  st.textContent = '';
+  try{
+    const r = await fetch('/api/connectivity/anchor/configure', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({anchor_ip: ip, anchor_pubkey: pubkey, wg_port: parseInt(port,10)})});
+    const d = await r.json();
+    if(d.success){
+      st.innerHTML = '<span style="color:var(--green)">Box tunnel configured.</span> Now authorize it on the anchor:';
+      document.getElementById('anchor-next').style.display = 'block';
+      document.getElementById('anchor-addbox-cmd').textContent = d.add_box_cmd;
+      refreshAnchorStatus();
+    } else {
+      st.textContent = d.error || 'Configuration failed.';
+    }
+  }catch(e){ st.textContent = 'Configuration failed: ' + e; }
+  btn.disabled = false; btn.textContent = 'Reconnect';
+}
+setInterval(function(){ if(document.getElementById('anchor-card').style.display !== 'none'){ refreshAnchorStatus(); } }, 5000);
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
 fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
