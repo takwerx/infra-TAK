@@ -2517,20 +2517,27 @@ def render_default_cert_password_warning(settings):
 
 
 def render_gd_delivery_gap_banner(settings):
-    """v10.1.1 (F5): show a dismissible-by-fixing banner when Guard Dog is deployed
-    but has NO notification email configured — the gap that let NE-TAK's disk
-    warnings land in a UI nobody had open while the disk filled to 97%. Turns
-    "monitoring existed" into "a human finds out". Settings-only (no subprocess),
-    so it's cheap on every page load. Links to the Guard Dog settings."""
+    """v10.1.1 (F5): show a banner ONLY when Guard Dog has an ACTIVE alert (a
+    monitor is down) AND no notification email/SMS is configured — the gap that
+    let NE-TAK's disk warnings land in a UI nobody had open while the disk filled
+    to 97%. NOT a standing "you have no email" nag: v0.9.35 already removed a
+    per-page nag banner (render_default_cert_password_warning) for being too
+    alarmist. This fires only when there is genuinely something to deliver and
+    nowhere to deliver it. Reads the in-memory GD monitor cache (no subprocess);
+    stays quiet on a healthy box or before the cache is warm."""
     try:
         s = settings or {}
-        # Only meaningful once Guard Dog has actually been deployed on this box.
         if not (s.get('guarddog_deployed_version') or '').strip():
-            return ''
+            return ''  # Guard Dog not deployed here
         has_email = bool((s.get('guarddog_alert_email') or '').strip()
                          or (s.get('guarddog_deployed_email') or '').strip())
         has_sms = bool((s.get('guarddog_sms') or {}).get('provider'))
         if has_email or has_sms:
+            return ''  # a delivery path exists
+        # Only nag when a monitor is ACTUALLY down (an alert with nowhere to go).
+        # Fail quiet on a cold/empty cache — never nag a box we haven't assessed.
+        mon = _guarddog_page_cache.get('monitor_result') or {}
+        if not any(v is False for v in mon.values()):
             return ''
     except Exception:
         return ''
@@ -2538,9 +2545,9 @@ def render_gd_delivery_gap_banner(settings):
         '<div style="position:relative;z-index:40;background:rgba(234,179,8,.12);'
         'border-bottom:1px solid rgba(234,179,8,.4);color:#eab308;'
         'padding:8px 16px;font-size:13px;text-align:center;font-weight:600">'
-        '⚠ Guard Dog is monitoring this box but no notification email is configured — '
-        'alerts (disk full, DB bloat, cert expiry) have nowhere to go. '
-        '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure it →</a>'
+        '⚠ Guard Dog has an active alert but no notification email is configured — '
+        'this alert has nowhere to go. '
+        '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure notifications →</a>'
         '</div>'
     )
 
