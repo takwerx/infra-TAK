@@ -68754,17 +68754,29 @@ def _startup_migrations():
         # socket can come up AFTER the console (field 2026-07-09, tak-10: the
         # X-Authentik strip migration lost this race — broker mkdir returned 125,
         # generate_caddyfile threw, the box stayed exposed with the flag unset).
-        # Rather than every broker-dependent migration carrying its own retry
-        # loop, block here until the broker ANSWERS (op:ping, not just socket
-        # presence). gunicorn --timeout is 300s, so a 60s worst-case wait is safe.
+        # Rather than every broker-dependent migration carrying its own retry loop,
+        # block here until the broker mediates a real EXEC.
+        #
+        # Probe with exec, NOT op:ping (T&E 2026-07-09, test12): the long-running
+        # field broker (only start.sh restarts it, never a console pull) can hang
+        # its ping response, so pinging timed out the full 60s on every non-root
+        # box — false alarm + 60s added to every startup, no protection. exec is
+        # the path the migrations actually use and it responds instantly; a cheap
+        # `systemctl --version` (what the broker's own selftest uses — allowlisted,
+        # always rc 0, no dependency on any service's state) proves the broker is
+        # mediating. Short 30s cap; the per-migration retries remain the backstop.
         if _broker_should_route():
             _bk_t0 = time.time()
             _bk_ok = False
-            while time.time() - _bk_t0 < 60:
+            while time.time() - _bk_t0 < 30:
                 try:
-                    if _broker_available() and _broker_request({'op': 'ping'}, timeout=5).get('ok'):
-                        _bk_ok = True
-                        break
+                    if _broker_available():
+                        _bk = subprocess.run(
+                            _sudo_wrap(['systemctl', '--version']),
+                            capture_output=True, text=True, timeout=8)
+                        if _bk.returncode == 0 and 'systemd' in (_bk.stdout or ''):
+                            _bk_ok = True
+                            break
                 except Exception:
                     pass
                 time.sleep(2)
@@ -68772,7 +68784,7 @@ def _startup_migrations():
             if _bk_ok and _bk_waited >= 2:
                 print(f"Startup migrations: broker ready after {_bk_waited:.0f}s wait", flush=True)
             elif not _bk_ok:
-                print("Startup migration: ⚠ broker NOT answering after 60s — broker-dependent "
+                print("Startup migration: ⚠ broker not mediating exec after 30s — broker-dependent "
                       "migrations may fail and will retry on the next console restart", flush=True)
 
         s = load_settings()
