@@ -37428,7 +37428,7 @@ async function saveSetupAp(){
   btn.disabled = false;
 }
 async function startSetupAp(){
-  if(!confirm('Start the Setup WiFi now?\n\nThis disconnects the box from its current WiFi. You will lose access here until you join the Setup WiFi from a device next to the box.')) return;
+  if(!confirm('Start the Setup WiFi now?\\n\\nThis disconnects the box from its current WiFi. You will lose access here until you join the Setup WiFi from a device next to the box.')) return;
   const s = document.getElementById('setupap-status');
   s.textContent = 'Starting… you may lose this page as the box switches to Setup WiFi.'; s.style.color = 'var(--text-dim)';
   try{ await fetch('/api/connectivity/setup-ap/start', {method:'POST'}); }catch(e){}
@@ -37464,7 +37464,7 @@ async function refreshWifiSaved(){
 }
 async function forgetWifi(ssid, isCurrent){
   let msg = 'Forget “' + ssid + '”? The box will no longer join it automatically.';
-  if(isCurrent){ msg = 'Forget “' + ssid + '” — the network the box is using RIGHT NOW?\n\nThis disconnects the box. If you are managing it remotely you will lose access unless the Setup WiFi is set up to catch it. Only do this if you are near the box.'; }
+  if(isCurrent){ msg = 'Forget “' + ssid + '” — the network the box is using RIGHT NOW?\\n\\nThis disconnects the box. If you are managing it remotely you will lose access unless the Setup WiFi is set up to catch it. Only do this if you are near the box.'; }
   if(!confirm(msg)) return;
   try{
     let r = await fetch('/api/connectivity/wifi/forget', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid: ssid, confirm: !!isCurrent})});
