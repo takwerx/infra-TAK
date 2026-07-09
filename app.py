@@ -8909,6 +8909,41 @@ def _conn_wifi_scan():
     return nets
 
 
+def _conn_wifi_visible():
+    """SSIDs currently in range, from the radio's CACHED scan results — cheap and
+    instant (no active scan), so it's safe to include on the list poll. nmcli uses
+    its cached `dev wifi list`; netplan uses `iw dev <iface> scan dump` (kernel
+    cache from the client's periodic background scans). The active 'Scan for
+    networks' button refreshes the cache. Best-effort; empty if unavailable."""
+    seen = set()
+    if shutil.which('nmcli'):
+        try:
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID', 'dev', 'wifi', 'list']),
+                               capture_output=True, text=True, timeout=8)
+            for ln in (r.stdout or '').splitlines():
+                s = ln.strip()
+                if s:
+                    seen.add(s)
+        except Exception:
+            pass
+        return list(seen)
+    iface = _conn_wifi_iface()
+    if iface:
+        try:
+            _ensure_iw()
+            r = subprocess.run(_sudo_wrap(['iw', 'dev', iface, 'scan', 'dump']),
+                               capture_output=True, text=True, timeout=8)
+            for ln in (r.stdout or '').splitlines():
+                s = ln.strip()
+                if s.startswith('SSID:'):
+                    v = s[5:].strip()
+                    if v:
+                        seen.add(v)
+        except Exception:
+            pass
+    return list(seen)
+
+
 def _conn_wifi_add(ssid, psk):
     """Add a wifi network ADDITIVELY and bring config up. Returns (ok, error).
     netplan path validates-before-apply with backup/restore; never strands."""
@@ -9014,7 +9049,7 @@ def _conn_wifi_add(ssid, psk):
 @login_required
 def connectivity_wifi_list_api():
     return jsonify({'iface': _conn_wifi_iface(), 'saved': _conn_wifi_saved(),
-                    'current': _conn_wifi_current()})
+                    'current': _conn_wifi_current(), 'visible': _conn_wifi_visible()})
 
 
 @app.route('/api/connectivity/wifi/scan')
@@ -37508,14 +37543,21 @@ async function refreshWifiSaved(){
       const cur = d.current || '';
       // Connected network first, then the rest alphabetically.
       const ordered = d.saved.slice().sort((a,b) => (a===cur?-1:b===cur?1:a.localeCompare(b)));
+      const visible = d.visible || [];
       let html = '<div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Known networks</div>';
       html += ordered.map(s => {
         const isCur = (s === cur);
+        const inRange = isCur || visible.indexOf(s) !== -1;
         const j = JSON.stringify(s).replace(/"/g,'&quot;');
+        const badge = isCur
+          ? '<span style="color:var(--text-dim);font-size:11px">— connected now</span>'
+          : (inRange
+              ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
+              : '<span style="color:var(--text-dim);font-size:11px">not in range</span>');
         return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:#0a0e1a;border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
-          + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : 'var(--text-dim)') + ';flex-shrink:0"></span>'
-          + '<span style="flex:1;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px">' + esc(s) + (isCur ? ' <span style="color:var(--text-dim);font-size:11px">— connected now</span>' : '') + '</span>'
-          + (isCur ? '' : '<button type="button" onclick="useWifi(' + j + ')" title="Switch the box to this network now" style="background:rgba(59,130,246,.12);color:var(--accent);border:1px solid rgba(59,130,246,.3);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">Use</button>')
+          + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : (inRange ? 'var(--green)' : 'var(--text-dim)')) + ';flex-shrink:0"></span>'
+          + '<span style="flex:1;min-width:0;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px;overflow:hidden;text-overflow:ellipsis">' + esc(s) + ' ' + badge + '</span>'
+          + (isCur ? '' : '<button type="button" onclick="useWifi(' + j + ')"' + (inRange ? '' : ' disabled') + ' title="' + (inRange ? 'Switch the box to this network now' : 'Not in range right now') + '" style="background:rgba(59,130,246,' + (inRange ? '.12' : '.04') + ');color:var(--accent);border:1px solid rgba(59,130,246,' + (inRange ? '.3' : '.12') + ');border-radius:6px;padding:4px 12px;font-size:12px;cursor:' + (inRange ? 'pointer' : 'default') + ';opacity:' + (inRange ? '1' : '.45') + '">Use</button>')
           + '<button type="button" onclick="forgetWifi(' + j + ',' + isCur + ')" title="Remove this saved network" style="background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">Remove</button>'
           + '</div>';
       }).join('');

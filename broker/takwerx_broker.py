@@ -628,15 +628,18 @@ _IFACE_RE = re.compile(r'^[A-Za-z0-9_.:][A-Za-z0-9_.:-]{0,14}$')  # no leading '
 
 
 def _check_iw(argv):
-    """iw: read-only wireless inspection ONLY — `iw dev` (list interfaces) and
-    `iw dev <iface> scan`. Every state-changing shape (set txpower, interface
-    add/del, connect, reg set, …) is denied. v10.1.0 Leg 6 WiFi scan."""
+    """iw: read-only wireless inspection ONLY — `iw dev` (list interfaces),
+    `iw dev <iface> scan` (active scan) and `iw dev <iface> scan dump` (cached
+    results, no radio activity). Every state-changing shape (set txpower,
+    interface add/del, connect, reg set, …) is denied. v10.1.0 Leg 6."""
     rest = argv[1:]
     if rest == ['dev']:
         return
     if len(rest) == 3 and rest[0] == 'dev' and rest[2] == 'scan' and _IFACE_RE.match(rest[1]):
         return
-    raise Denied('iw: only `iw dev` and `iw dev <iface> scan` allowed')
+    if len(rest) == 4 and rest[0] == 'dev' and rest[2] == 'scan' and rest[3] == 'dump' and _IFACE_RE.match(rest[1]):
+        return
+    raise Denied('iw: only `iw dev` and `iw dev <iface> scan [dump]` allowed')
 
 
 def _check_wpa_cli(argv):
