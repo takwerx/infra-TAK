@@ -142,19 +142,52 @@ apply_isolation(){
     # sanctioned hook and is consulted before the per-container ACCEPTs. No-op if absent.
     iptables -I DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null || true
 
-    # captive :80 responder (302 → the console) on :8088; redirect AP :80 to it.
+    # captive :80 responder on :8088; redirect AP :80 to it.
+    #
+    # Serve a real HTML LANDING PAGE (HTTP 200), NOT a 302 to the console's
+    # self-signed HTTPS. Field-tested 2026-07-08: Windows followed the 302 fine,
+    # but macOS's Captive Network Assistant refuses the auto-redirect to a
+    # self-signed HTTPS origin and silently does nothing. A self-contained 200
+    # page with a big tap-through link works on macOS (and stays fine on Windows/
+    # Android): the CNA popup shows the page, the user taps "Open setup", which
+    # hands off to the real browser where the cert warning can be accepted.
     iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-ports 8088
     CAP_AP_IP="$AP_IP" CAP_PORT="$CONSOLE_PORT" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
 import os, http.server, socketserver
 PORT = 8088
-LOC = 'https://%s:%s/' % (os.environ.get('CAP_AP_IP', '10.42.0.1'), os.environ.get('CAP_PORT', '5001'))
+IP = os.environ.get('CAP_AP_IP', '10.42.0.1')
+CP = os.environ.get('CAP_PORT', '5001')
+URL = 'https://%s:%s/' % (IP, CP)
+PAGE = ('<!doctype html><html><head><meta charset=utf-8>'
+        '<meta name=viewport content=\"width=device-width,initial-scale=1\">'
+        '<title>infra-TAK setup</title>'
+        '<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0f1219;'
+        'color:#f1f5f9;margin:0;padding:40px 22px;text-align:center}'
+        'h1{font-size:20px;margin:0 0 6px}p{color:#94a3b8;font-size:14px;line-height:1.5;max-width:420px;margin:10px auto}'
+        'a.btn{display:inline-block;margin-top:22px;background:#3b82f6;color:#fff;text-decoration:none;'
+        'font-weight:600;font-size:16px;padding:14px 26px;border-radius:10px}'
+        'code{background:#1e2736;padding:2px 7px;border-radius:5px;color:#cbd5e1}</style></head>'
+        '<body><h1>infra-TAK setup</h1>'
+        '<p>You are connected to this box&#39;s setup network. Open the console to choose a WiFi network for it to join.</p>'
+        '<a class=btn href=\"%s\">Open setup console</a>'
+        '<p>If the button does nothing, open your browser and go to <code>%s</code> — accept the security warning (it is this box&#39;s own certificate).</p>'
+        '</body></html>') % (URL, URL)
+BODY = PAGE.encode()
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(s):
-        s.send_response(302); s.send_header('Location', LOC); s.end_headers()
+        # Apple/Android/MS captive probes and everything else all get the landing
+        # page with 200 so the OS shows a captive popup (a 200 'Success' body would
+        # instead make the OS think there's real internet and suppress the popup).
+        s.send_response(200)
+        s.send_header('Content-Type', 'text/html; charset=utf-8')
+        s.send_header('Content-Length', str(len(BODY)))
+        s.send_header('Cache-Control', 'no-store')
+        s.end_headers()
+        s.wfile.write(BODY)
     def log_message(s, *a): pass
 socketserver.TCPServer.allow_reuse_address = True
 # Bind the AP address only — never 0.0.0.0 (finding E).
-socketserver.TCPServer((os.environ.get('CAP_AP_IP', '10.42.0.1'), PORT), H).serve_forever()
+socketserver.TCPServer((IP, PORT), H).serve_forever()
 PY" >>"$LOG" 2>&1 &
 }
 
@@ -243,8 +276,12 @@ no-hosts
 EOF
         chmod 600 "$DNSMASQ_CONF"
 
-        dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file=/tmp/takwerx-dnsmasq-ap.pid
+        # hostapd FIRST (brings the radio into AP mode + starts beaconing), give it
+        # a moment to settle, THEN dnsmasq binds DHCP/DNS to the now-live AP
+        # interface. Starting dnsmasq before the AP was a latent ordering bug.
         hostapd -B "$HOSTAPD_CONF" >>"$LOG" 2>&1
+        sleep 2
+        dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file=/tmp/takwerx-dnsmasq-ap.pid
         set +e
     fi
 
