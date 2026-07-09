@@ -68444,21 +68444,38 @@ def _startup_migrations():
         # FQDN box reached the console's loopback-trust and got an admin session with NO
         # password (confirmed exploitable). Only FQDN boxes have a Caddy-fronted console
         # (self-signed/no-FQDN boxes hit 5001 directly, no Caddy path → not exposed).
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1') and not (fh_cfg.get('deployed')):
-            try:
-                generate_caddyfile(s)
-                _r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        #
+        # RETRY-UNTIL-APPLIED (field 2026-07-09, tak-10): generate_caddyfile writes via the
+        # broker, which on a non-root box may not be ready this early in startup — the
+        # broker `mkdir /etc/caddy` returned 125, generate threw, and the box was left
+        # VULNERABLE with the flag unset. For a security fix that is not acceptable. So:
+        # retry with a short backoff, VERIFY the strip is actually in generate's returned
+        # content (a successful return means the file write succeeded too — generate raises
+        # if the broker write fails), and only stamp the flag on a confirmed application.
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
+            _applied = False
+            _last_err = None
+            for _xs_attempt in range(6):
+                try:
+                    _cf = generate_caddyfile(s)
+                    if _cf and 'request_header -X-Authentik' in _cf:
+                        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                        _applied = True
+                        break
+                    _last_err = 'strip absent from generated Caddyfile'
+                except Exception as _xs_e:
+                    _last_err = str(_xs_e)[:160]
+                time.sleep(4)
+            if _applied:
                 s['caddy_xauth_strip_v1'] = True
                 save_settings(s)
                 s = load_settings()
                 print("Startup migration: Caddyfile regenerated to strip client X-Authentik-* (auth-bypass fix)")
-            except Exception as _xs_e:
-                print(f"Startup migration: caddy X-Authentik-strip regen error (non-fatal): {_xs_e}", flush=True)
-        elif fh_cfg.get('deployed') and (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
-            # Fed Hub path already regenerated above with the strip — just record it.
-            s['caddy_xauth_strip_v1'] = True
-            save_settings(s)
-            s = load_settings()
+            else:
+                # Flag intentionally NOT set → retries on the next restart. Loud, so the
+                # box being left exposed is visible in the journal.
+                print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
+                      f"(box may be exposed until next restart): {_last_err}", flush=True)
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
