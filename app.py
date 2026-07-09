@@ -59,6 +59,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress
+import hmac
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
@@ -1963,6 +1964,46 @@ def _takserver_running_local():
     except Exception:
         return False
 
+# v10.1.1 S1 (defense-in-depth for the v10.1.0 X-Authentik header bypass): a
+# shared secret that Caddy injects as X-Infratak-Proxy-Auth ONLY on requests
+# that passed the console vhost's forward_auth. Once `enforce` is armed (by the
+# caddy_proxy_auth_gate_v1 startup migration, after verifying the Caddyfile
+# actually injects it), loopback + X-Authentik-Username alone is never enough
+# to mint a session — the secret proves the identity header came from
+# forward_auth, not a forged client/local-process request. State lives in
+# .config/proxy_auth.json (0600): {'secret': hex, 'enforce': bool}.
+_PROXY_AUTH_FILE = os.path.join(CONFIG_DIR, 'proxy_auth.json')
+_proxy_auth_cache = {'mtime': None, 'state': {}}
+
+def _save_proxy_auth_state(state):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = _PROXY_AUTH_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, _PROXY_AUTH_FILE)
+    _proxy_auth_cache['mtime'] = None
+
+def _proxy_auth_state(create=False):
+    """Return the proxy-auth state dict, cached by file mtime (read per request
+    from login_required — must stay cheap). create=True mints the secret if
+    absent (called from generate_caddyfile, NOT armed here — enforce stays off
+    until the startup migration verifies Caddy injects it)."""
+    try:
+        st = os.stat(_PROXY_AUTH_FILE)
+        if _proxy_auth_cache['mtime'] != st.st_mtime:
+            with open(_PROXY_AUTH_FILE) as f:
+                _proxy_auth_cache['state'] = json.load(f) or {}
+            _proxy_auth_cache['mtime'] = st.st_mtime
+        state = dict(_proxy_auth_cache['state'])
+    except Exception:
+        state = {}
+    if create and not (state.get('secret') or '').strip():
+        state['secret'] = secrets.token_hex(32)
+        state.setdefault('enforce', False)
+        _save_proxy_auth_state(state)
+    return state
+
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
     # Trust Authentik headers only when request came from local reverse proxy.
@@ -1970,11 +2011,20 @@ def _apply_authentik_session():
     if request.remote_addr not in ('127.0.0.1', '::1'):
         return False
     uname = request.headers.get('X-Authentik-Username')
-    if uname:
-        session['authenticated'] = True
-        session['authentik_username'] = uname
-        return True
-    return False
+    if not uname:
+        return False
+    # v10.1.1 S1: once armed, require the Caddy-injected proxy-auth secret too.
+    # Loopback alone is forgeable by any local process (and was the v10.1.0
+    # remote bypass when the client-header strip was missing) — the secret is
+    # only ever attached by Caddy AFTER forward_auth passed.
+    pa = _proxy_auth_state()
+    if pa.get('enforce'):
+        if not hmac.compare_digest(request.headers.get('X-Infratak-Proxy-Auth') or '',
+                                   pa.get('secret') or ''):
+            return False
+    session['authenticated'] = True
+    session['authentik_username'] = uname
+    return True
 
 def login_required(f):
     @wraps(f)
@@ -19614,6 +19664,13 @@ def generate_caddyfile(settings=None):
     lines.append(f"    route /api/guarddog/send-sms* {{")
     lines.append(f"        respond 404")
     lines.append(f"    }}")
+    # v10.1.1 S2: same class — restart-safe is a loopback-only readiness probe for
+    # the console-restart timer (calls 127.0.0.1:5001 directly, never via Caddy).
+    # Through Caddy it would pass the loopback gate and leak deploy-in-flight
+    # state to unauthenticated clients. No legitimate edge caller exists → 404.
+    lines.append(f"    route /api/console/restart-safe* {{")
+    lines.append(f"        respond 404")
+    lines.append(f"    }}")
     # SECURITY (v10.1.0, CVE-class): the console trusts X-Authentik-Username from any
     # 127.0.0.1 caller (that is how forward_auth logs the SSO user in). Caddy does NOT
     # strip client-supplied X-Authentik-* by default, and the plain reverse_proxy paths
@@ -19624,8 +19681,10 @@ def generate_caddyfile(settings=None):
     # directive order) so it runs BEFORE forward_auth re-injects the AUTHENTIC value
     # from the auth response. Non-forward_auth paths then get nothing → bypass closed;
     # the SSO path is unchanged (forward_auth adds the real header after the strip).
+    # v10.1.1 S1: X-Infratak-Proxy-Auth is stripped from clients here too — only
+    # Caddy itself may attach it (below, after forward_auth passes).
     _AK_FWD_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
-                       'X-Authentik-Name', 'X-Authentik-Uid')
+                       'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')
     def _emit_ak_header_strip(indent):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
@@ -19662,6 +19721,15 @@ def generate_caddyfile(settings=None):
         lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
         lines.append(f"            trusted_proxies private_ranges")
         lines.append(f"        }}")
+        # v10.1.1 S1: attach the proxy-auth secret AFTER forward_auth, on the same
+        # matcher — so it is present exactly when forward_auth passed (a 302'd
+        # request never reaches this directive; /api/* skips both). The console
+        # requires it alongside X-Authentik-Username once the gate is armed, so a
+        # forged identity header alone is dead even if the client strip above ever
+        # regresses on a future plain-proxy path.
+        _pa_secret = (_proxy_auth_state(create=True).get('secret') or '').strip()
+        if _pa_secret:
+            lines.append(f"        request_header @needs_sso X-Infratak-Proxy-Auth {_pa_secret}")
         lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
         lines.append(f"            transport http {{")
         lines.append(f"                tls")
@@ -68413,6 +68481,31 @@ def _selfheal_takserver_half_configured(plog=None):
 
 def _startup_migrations():
     try:
+        # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
+        # socket can come up AFTER the console (field 2026-07-09, tak-10: the
+        # X-Authentik strip migration lost this race — broker mkdir returned 125,
+        # generate_caddyfile threw, the box stayed exposed with the flag unset).
+        # Rather than every broker-dependent migration carrying its own retry
+        # loop, block here until the broker ANSWERS (op:ping, not just socket
+        # presence). gunicorn --timeout is 300s, so a 60s worst-case wait is safe.
+        if _broker_should_route():
+            _bk_t0 = time.time()
+            _bk_ok = False
+            while time.time() - _bk_t0 < 60:
+                try:
+                    if _broker_available() and _broker_request({'op': 'ping'}, timeout=5).get('ok'):
+                        _bk_ok = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(2)
+            _bk_waited = time.time() - _bk_t0
+            if _bk_ok and _bk_waited >= 2:
+                print(f"Startup migrations: broker ready after {_bk_waited:.0f}s wait", flush=True)
+            elif not _bk_ok:
+                print("Startup migration: ⚠ broker NOT answering after 60s — broker-dependent "
+                      "migrations may fail and will retry on the next console restart", flush=True)
+
         s = load_settings()
         settings_dirty = False
 
@@ -68495,6 +68588,58 @@ def _startup_migrations():
                 # box being left exposed is visible in the journal.
                 print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
                       f"(box may be exposed until next restart): {_last_err}", flush=True)
+
+        # v10.1.1 S1: arm the proxy-auth gate (belt-and-suspenders for the bypass
+        # class above). Regenerate the Caddyfile so forward_auth-passed requests
+        # carry the X-Infratak-Proxy-Auth secret, VERIFY the generated content,
+        # reload Caddy, and only then flip enforce on — so SSO never breaks from
+        # the console requiring a header Caddy isn't injecting yet.
+        if not s.get('caddy_proxy_auth_gate_v1'):
+            if not (s.get('fqdn') or '').strip():
+                # No FQDN → no Caddy-fronted console → no legitimate forward_auth
+                # source for X-Authentik-* headers. Arm immediately: any loopback
+                # request bearing that header on this box is forged.
+                _pa = _proxy_auth_state(create=True)
+                _pa['enforce'] = True
+                _save_proxy_auth_state(_pa)
+                s['caddy_proxy_auth_gate_v1'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: proxy-auth gate armed (no FQDN — header SSO requires Caddy)", flush=True)
+            else:
+                _pa_applied = False
+                _pa_err = None
+                for _pa_try in range(6):
+                    try:
+                        _cf = generate_caddyfile(s)
+                        # Console forward_auth is uniquely 'forward_auth @needs_sso';
+                        # if it is emitted, the secret injection must be too. The
+                        # client strip must be present in every posture.
+                        _pa_ok = bool(_cf) and 'request_header -X-Infratak-Proxy-Auth' in _cf and \
+                            ('forward_auth @needs_sso' not in _cf
+                             or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
+                            'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
+                        if _pa_ok:
+                            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                            _pa_applied = True
+                            break
+                        _pa_err = 'proxy-auth directives absent from generated Caddyfile'
+                    except Exception as _pa_e:
+                        _pa_err = str(_pa_e)[:160]
+                    time.sleep(4)
+                if _pa_applied:
+                    _pa = _proxy_auth_state(create=True)
+                    _pa['enforce'] = True
+                    _save_proxy_auth_state(_pa)
+                    s['caddy_proxy_auth_gate_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: proxy-auth gate armed (Caddy injects X-Infratak-Proxy-Auth on forward_auth)", flush=True)
+                else:
+                    # Not armed → the 10.1.0 client-header strip remains the (sole)
+                    # defense; retry on the next restart. Loud on purpose.
+                    print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
+                          f"(strip-only defense until next restart): {_pa_err}", flush=True)
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
