@@ -11037,6 +11037,78 @@ def _remotedb_host_port_from_tak_settings():
     return h, p
 
 
+def _tak_db_topology(settings=None):
+    """v10.1.1 (F7): ground truth for WHERE TAK's CoT database actually lives —
+    read from CoreConfig.xml's `<connection url="jdbc:postgresql://HOST:PORT/cot">`
+    (what TAK Server itself connects to), NOT from settings alone. NE-TAK is a
+    split box whose CoreConfig points at a remote DB (172.93.50.224) but whose
+    console settings never recorded two-server mode, so the GD monitors checked a
+    nonexistent LOCAL postgres and showed permanent false-red — while a REAL
+    remote-DB outage was invisible.
+
+    Returns (mode, host, port):
+      'container' — TAK runs its own DB container (host is the container name)
+      'remote'    — CoreConfig url host is not loopback/localhost
+      'local'     — loopback DB (native single-server), or CoreConfig unreadable
+    """
+    import re as _re_topo
+    # Container TAK: its DB is the takserver-db container regardless of the url.
+    if _tak_is_container():
+        return 'container', TAK_DB_CONTAINER, 5432
+    # Parse the live CoreConfig connection url (may be root-owned → broker read).
+    url_host, url_port = '', 5432
+    try:
+        content = ''
+        try:
+            with open('/opt/tak/CoreConfig.xml') as _f:
+                content = _f.read()
+        except (PermissionError, FileNotFoundError):
+            try:
+                content = _read_priv('/opt/tak/CoreConfig.xml') or ''
+            except Exception:
+                content = ''
+        m = _re_topo.search(r'jdbc:postgresql://([^:/]+)(?::(\d+))?/cot', content)
+        if m:
+            url_host = (m.group(1) or '').strip()
+            if m.group(2):
+                url_port = int(m.group(2))
+    except Exception:
+        pass
+    if url_host and url_host not in ('127.0.0.1', 'localhost', '::1'):
+        return 'remote', url_host, url_port
+    # Fall back to saved two-server settings (post-migration source of truth).
+    _sh, _sp = _remotedb_host_port_from_tak_settings()
+    if _sh:
+        return 'remote', _sh, (_sp or 5432)
+    return 'local', '127.0.0.1', url_port
+
+
+def _read_martiuser_password_from_local_coreconfig():
+    """Return (password, source) for TAK's martiuser DB user from the LOCAL
+    CoreConfig.xml — what TAK Server actually authenticates with. XML-unescaped
+    (TAK's JDBC decodes &amp; etc.; we must match). ('', reason) if not found."""
+    try:
+        try:
+            cc = _read_priv('/opt/tak/CoreConfig.xml')  # v10.0.5 non-root: read via broker
+        except Exception:
+            try:
+                with open('/opt/tak/CoreConfig.xml') as _f:
+                    cc = _f.read()
+            except Exception:
+                cc = ''
+        for pat in (
+            r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+            r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+            r'<connection[^>]*password\s*=\s*["\']([^"\']*)["\']',
+        ):
+            m = re.search(pat, cc)
+            if m and (m.group(1) or '').strip():
+                return html.unescape(m.group(1).strip()), 'CoreConfig.xml'
+    except Exception:
+        pass
+    return '', 'martiuser password not found in local CoreConfig.xml'
+
+
 @app.route('/api/guarddog/deploy-health-agent', methods=['POST'])
 @login_required
 def guarddog_deploy_health_agent_api():
@@ -13498,10 +13570,22 @@ def _monitor_health_check(monitor_id):
                     continue
             return False
         if monitor_id == 'postgresql':
+            # v10.1.1 (F7): key off TAK's real DB topology (CoreConfig ground truth),
+            # not a hardcoded local assumption. A split box whose CoreConfig points at
+            # a remote DB was checking a nonexistent local postgres → permanent false-red.
+            _db_mode, _db_host, _db_port = _tak_db_topology()
+            if _db_mode == 'remote':
+                # Remote DB: TCP-connect to the CoreConfig host:port (no SSH). A real
+                # outage of the remote DB now turns this dot red instead of hiding it.
+                try:
+                    with socket.create_connection((_db_host, _db_port), timeout=2):
+                        return True
+                except OSError:
+                    return False
             # v10.0.1: container TAK runs PostgreSQL in the takserver-db container,
             # not a host postgresql.service — check the container's running state
             # there (native is byte-identical: systemctl is-active postgresql).
-            if _tak_is_container():
+            if _db_mode == 'container' or _tak_is_container():
                 r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER]),
                                    capture_output=True, text=True, timeout=5)
                 return r.returncode == 0 and r.stdout.strip() == 'true'
@@ -13513,6 +13597,26 @@ def _monitor_health_check(monitor_id):
                     return True
             return False
         if monitor_id == 'cotdb':
+            # v10.1.1 (F7): remote DB → psql over TCP with CoreConfig's martiuser creds;
+            # fall back to TCP-reachable-only if auth fails (so the dot reflects "DB up"
+            # even when the console can't read the size). Split boxes no longer false-red.
+            _db_mode, _db_host, _db_port = _tak_db_topology()
+            if _db_mode == 'remote':
+                _pw, _ = _read_martiuser_password_from_local_coreconfig()
+                if _pw:
+                    _env = dict(os.environ, PGPASSWORD=_pw, PGCONNECT_TIMEOUT='4')
+                    r = subprocess.run(
+                        ['psql', '-h', _db_host, '-p', str(_db_port), '-U', 'martiuser',
+                         '-d', 'cot', '-tAc', "SELECT pg_database_size('cot')"],
+                        capture_output=True, text=True, timeout=8, env=_env)
+                    if r.returncode == 0 and r.stdout.strip().isdigit():
+                        return True
+                # Auth failed or no password — degrade to TCP reachability.
+                try:
+                    with socket.create_connection((_db_host, _db_port), timeout=3):
+                        return True
+                except OSError:
+                    return False
             # v10.0.1: container → docker exec -u postgres (peer auth); native →
             # sudo -u postgres psql. Both query the same cot database size.
             if _tak_is_container():
@@ -13626,27 +13730,10 @@ def _monitor_health_check(monitor_id):
             if tak_cfg.get('mode') != 'two_server':
                 return None
             s1_cfg = tak_cfg.get('server_one', {})
-            # Read password from LOCAL CoreConfig.xml (what TAK Server actually uses)
-            local_pw = ''
-            try:
-                try:
-                    cc = _read_priv('/opt/tak/CoreConfig.xml')   # v10.0.5 non-root: read via broker
-                except Exception:
-                    cc = ''
-                for pat in (
-                    r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
-                    r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
-                    r'<connection[^>]*password\s*=\s*["\']([^"\']*)["\']',
-                ):
-                    m = re.search(pat, cc)
-                    if m and (m.group(1) or '').strip():
-                        # v0.9.46: CoreConfig stores the password XML-escaped (e.g. & -> &amp;).
-                        # TAK's JDBC decodes it; we must too, or a regenerated password with an
-                        # XML-special char (&,<,>,",') auths in TAK but false-fails this check.
-                        local_pw = html.unescape(m.group(1).strip())
-                        break
-            except Exception:
-                pass
+            # Read password from LOCAL CoreConfig.xml (what TAK Server actually uses).
+            # v0.9.46: CoreConfig stores it XML-escaped; the helper unescapes so a
+            # regenerated password with an XML-special char doesn't false-fail.
+            local_pw, _ = _read_martiuser_password_from_local_coreconfig()
             if not local_pw:
                 return False
             ok, _ = _verify_server_one_db_password(s1_cfg, local_pw)
