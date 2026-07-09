@@ -37600,6 +37600,9 @@ async function scanWifi(){
       + esc(n.ssid) + (n.signal ? ' <span style="color:var(--text-dim)">· ' + esc(n.signal) + '</span>' : '') + '</button>').join('');
   }catch(e){ st.textContent = 'Scan failed.'; }
   btn.disabled = false; btn.textContent = 'Scan for networks';
+  // The active scan just refreshed the radio's cache — update the known-networks
+  // in-range badges from it (so a network you just turned on now shows in range).
+  refreshWifiSaved();
 }
 let savedWifiSet = [];
 function pickWifi(ssid){
