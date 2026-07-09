@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.0-alpha)**
+**Current release: [v10.1.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.1-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.1-alpha — 2026-07-09 — Stability & disk protection: stops runaway database growth, fixes downloads and video on standard installs, and quiets false alerts
+
+**Headline: a reliability release that closes a disk-fill risk, restores certificate and video downloads on the standard console, and stops noisy false alarms. Updating is recommended — healthy boxes are left untouched.** The big one: a background Authentik table could quietly grow without bound and fill the disk on long-running boxes; the console now watches its real size, cleans it automatically, reclaims the space, and Guard Dog raises it on the monitoring board with an alert if notifications aren't set up — so a box can never silently fill up this way again. On the standard (non-root) console, **downloading certificate files** (`.p12`/`.key` for client-cert admin/user login) and **watching video streams** in the browser both work again — two things that regressed when the console moved off root. For two-server deployments, Guard Dog no longer sends **false "database not healthy" emails** when the database is actually fine (it now only acts on a real outage, never restarts a healthy database, and caps repeat alerts), and its **database-maintenance timers now actually run** to keep the CoT database from bloating. Also included: **defense-in-depth hardening** on top of the v10.1.0 login-security fix, and an access-point fix so a headless box's hotspot comes up cleanly. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.1-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.1-alpha).
 
 ### v10.1.0-alpha — 2026-07-09 — Connectivity Wizard: get any box online and reachable from the browser — plus security patches
 
