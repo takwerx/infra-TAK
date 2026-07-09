@@ -515,8 +515,9 @@ def inject_cloudtak_icon():
         _settings = load_settings()
         _banner = render_custom_banner(_settings)
         _cert_pw_nag = render_default_cert_password_warning(_settings)
+        _gd_gap = render_gd_delivery_gap_banner(_settings)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
-        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _sidebar)
+        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _gd_gap + _sidebar)
         # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
         # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
         d['service_domain'] = lambda key: _get_service_domain(_settings, key)
@@ -2513,6 +2514,35 @@ def render_custom_banner(settings):
 def render_default_cert_password_warning(settings):
     """Removed in v0.9.35 — the atakatak default-password nag was too alarmist for operators who know what they're doing."""
     return ''
+
+
+def render_gd_delivery_gap_banner(settings):
+    """v10.1.1 (F5): show a dismissible-by-fixing banner when Guard Dog is deployed
+    but has NO notification email configured — the gap that let NE-TAK's disk
+    warnings land in a UI nobody had open while the disk filled to 97%. Turns
+    "monitoring existed" into "a human finds out". Settings-only (no subprocess),
+    so it's cheap on every page load. Links to the Guard Dog settings."""
+    try:
+        s = settings or {}
+        # Only meaningful once Guard Dog has actually been deployed on this box.
+        if not (s.get('guarddog_deployed_version') or '').strip():
+            return ''
+        has_email = bool((s.get('guarddog_alert_email') or '').strip()
+                         or (s.get('guarddog_deployed_email') or '').strip())
+        has_sms = bool((s.get('guarddog_sms') or {}).get('provider'))
+        if has_email or has_sms:
+            return ''
+    except Exception:
+        return ''
+    return (
+        '<div style="position:relative;z-index:40;background:rgba(234,179,8,.12);'
+        'border-bottom:1px solid rgba(234,179,8,.4);color:#eab308;'
+        'padding:8px 16px;font-size:13px;text-align:center;font-weight:600">'
+        '⚠ Guard Dog is monitoring this box but no notification email is configured — '
+        'alerts (disk full, DB bloat, cert expiry) have nowhere to go. '
+        '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure it →</a>'
+        '</div>'
+    )
 
 
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
@@ -10679,7 +10709,10 @@ def guarddog_page():
             {'name': 'Root CA / Intermediate CA', 'id': 'fedhub_intca', 'interval': 'Escalating', 'desc': f'Monitors Root CA and Intermediate CA expiry on {fh_host} (same 90-day escalation as TAK Server intca).'},
         ]})
     guarddog_services.extend([
-        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [
+            {'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'},
+            {'name': 'Channels table', 'id': 'authentik_channels', 'interval': '10 min', 'desc': 'Size of the django_channels_postgres_message table (websocket message backlog). Green under 1GB; red at 1GB+ means the in-process reaper is failing and the table is bloating toward a disk-fill (the NE-TAK 605GB incident). Size-based check — never count(*).'},
+        ]},
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -13218,7 +13251,7 @@ def _guarddog_service_monitor_ids(settings):
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
         'federation_hub': ['fedhub_svc', 'fedhub_port', 'fedhub_mongo', 'fedhub_disk', 'fedhub_cert', 'fedhub_intca'],
-        'authentik': ['authentik_http'],
+        'authentik': ['authentik_http', 'authentik_channels'],
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'tak_video_restreamer': ['tvr_http'],
@@ -13624,6 +13657,29 @@ def _monitor_health_check(monitor_id):
             req = urllib.request.Request(ak_url + '/', method='GET')
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return resp.status in (200, 302, 301)
+        if monitor_id == 'authentik_channels':
+            # v10.1.1 (F5): django_channels_postgres_message size, size-based (never
+            # count(*) — that can't complete on a ballooned table, the NE-TAK 605GB
+            # blind spot). Green < 1GB, red >= 1GB (the in-process reaper (F1–F4)
+            # should keep it KB-range; a red dot means the reaper is failing and the
+            # disk is at risk). None when Authentik isn't installed / PG not up.
+            if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                return None
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-tA', '-c',
+                 "SELECT COALESCE(pg_total_relation_size(to_regclass("
+                 "'django_channels_postgres_message')),-1)"]),
+                capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return None
+            try:
+                _sz = int((r.stdout or '-1').strip())
+            except ValueError:
+                return None
+            if _sz < 0:
+                return None  # table absent (older Authentik)
+            return _sz < 1024 * 1024 * 1024  # red at >= 1GB
         if monitor_id == 'mediamtx_svc':
             settings = load_settings()
             mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
