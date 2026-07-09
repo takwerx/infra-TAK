@@ -258,6 +258,16 @@ EOF
     else
         command -v hostapd  >/dev/null 2>&1 || { log "start: installing hostapd";  DEBIAN_FRONTEND=noninteractive apt-get install -y hostapd  >>"$LOG" 2>&1; }
         command -v dnsmasq  >/dev/null 2>&1 || { log "start: installing dnsmasq";  DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq  >>"$LOG" 2>&1; }
+        # Mask the packaged units so they never auto-start on boot and fight our
+        # script-managed instances. Debian ENABLES dnsmasq.service on install — on
+        # the next reboot it would bind :53 on all interfaces before/against our
+        # AP dnsmasq (bind-interfaces would then fail), and a stray hostapd.service
+        # could seize the radio. We drive both by hand (hostapd -B / dnsmasq
+        # --conf-file), so the distro units must stay inert. Idempotent; masking a
+        # running unit also stops it. `mask --now` is systemd-native (Ubuntu/RHEL).
+        systemctl disable --now dnsmasq.service 2>/dev/null || true
+        systemctl disable --now hostapd.service 2>/dev/null || true
+        systemctl mask dnsmasq.service hostapd.service 2>/dev/null || true
         set -e
         # release the client so hostapd can own the radio
         systemctl stop "wpa_supplicant@${IFACE}.service" 2>/dev/null || true
