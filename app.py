@@ -9067,8 +9067,12 @@ def _conn_wifi_add(ssid, psk):
 @app.route('/api/connectivity/wifi/list')
 @login_required
 def connectivity_wifi_list_api():
+    ap_active = _conn_setup_ap_active()
+    # In AP mode the radio can't scan, so skip the (stale/empty) visible probe.
     return jsonify({'iface': _conn_wifi_iface(), 'saved': _conn_wifi_saved(),
-                    'current': _conn_wifi_current(), 'visible': _conn_wifi_visible()})
+                    'current': _conn_wifi_current(),
+                    'visible': [] if ap_active else _conn_wifi_visible(),
+                    'ap_active': ap_active})
 
 
 @app.route('/api/connectivity/wifi/scan')
@@ -37171,7 +37175,10 @@ textarea.form-input{resize:vertical}
       joins it automatically when you get there. Adding a network never disconnects the one you're on.
     </p>
     <div id="wifi-saved" style="font-size:12px;color:var(--text-dim);margin-bottom:14px"></div>
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+    <div id="wifi-ap-note" style="display:none;margin-bottom:14px;padding:11px 13px;background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:12px;color:var(--text-secondary)">
+      <b style="color:var(--accent)">Setup mode:</b> this box is broadcasting its own WiFi right now, so it can&#39;t scan for other networks. Just <b>type the network name and password</b> below and Add it — the box will join that network and turn the setup WiFi off.
+    </div>
+    <div id="wifi-scan-row" style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
       <button class="control-btn" id="wifi-scan-btn" onclick="scanWifi()">Scan for networks</button>
       <span id="wifi-scan-status" style="font-size:11px;color:var(--text-dim)"></span>
     </div>
@@ -37565,6 +37572,12 @@ async function refreshWifiSaved(){
     const d = await r.json();
     const el = document.getElementById('wifi-saved');
     savedWifiSet = d.saved || [];
+    // Setup-AP mode: the radio can't scan (it's the AP). Hide the scan row, show the
+    // "type the name" note, and don't gate Use buttons on in-range (we can't know it).
+    const apMode = !!d.ap_active;
+    document.getElementById('wifi-ap-note').style.display = apMode ? 'block' : 'none';
+    document.getElementById('wifi-scan-row').style.display = apMode ? 'none' : 'flex';
+    if(apMode){ document.getElementById('wifi-scan-list').innerHTML = ''; }
     if(d.saved && d.saved.length){
       const cur = d.current || '';
       // Connected network first, then the rest alphabetically.
@@ -37573,13 +37586,17 @@ async function refreshWifiSaved(){
       let html = '<div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Known networks</div>';
       html += ordered.map(s => {
         const isCur = (s === cur);
-        const inRange = isCur || visible.indexOf(s) !== -1;
+        // In AP mode we can't scan, so treat all as usable (unknown range) rather
+        // than greying out every Use button.
+        const inRange = isCur || apMode || visible.indexOf(s) !== -1;
         const j = JSON.stringify(s).replace(/"/g,'&quot;');
         const badge = isCur
           ? '<span style="color:var(--text-dim);font-size:11px">— connected now</span>'
-          : (inRange
-              ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
-              : '<span style="color:var(--text-dim);font-size:11px">not in range</span>');
+          : (apMode
+              ? ''
+              : (inRange
+                  ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
+                  : '<span style="color:var(--text-dim);font-size:11px">not in range</span>'));
         return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:#0a0e1a;border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
           + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : (inRange ? 'var(--green)' : 'var(--text-dim)')) + ';flex-shrink:0"></span>'
           + '<span style="flex:1;min-width:0;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px;overflow:hidden;text-overflow:ellipsis">' + esc(s) + ' ' + badge + '</span>'
