@@ -13605,13 +13605,16 @@ def _monitor_health_check(monitor_id):
                 _pw, _ = _read_martiuser_password_from_local_coreconfig()
                 if _pw:
                     _env = dict(os.environ, PGPASSWORD=_pw, PGCONNECT_TIMEOUT='4')
-                    r = subprocess.run(
-                        ['psql', '-h', _db_host, '-p', str(_db_port), '-U', 'martiuser',
-                         '-d', 'cot', '-tAc', "SELECT pg_database_size('cot')"],
-                        capture_output=True, text=True, timeout=8, env=_env)
-                    if r.returncode == 0 and r.stdout.strip().isdigit():
-                        return True
-                # Auth failed or no password — degrade to TCP reachability.
+                    try:
+                        r = subprocess.run(
+                            ['psql', '-h', _db_host, '-p', str(_db_port), '-U', 'martiuser',
+                             '-d', 'cot', '-tAc', "SELECT pg_database_size('cot')"],
+                            capture_output=True, text=True, timeout=8, env=_env)
+                        if r.returncode == 0 and r.stdout.strip().isdigit():
+                            return True
+                    except FileNotFoundError:
+                        pass  # no psql client on this box — fall through to TCP reachability
+                # Auth failed / no password / no psql client — degrade to TCP reachability.
                 try:
                     with socket.create_connection((_db_host, _db_port), timeout=3):
                         return True
