@@ -61798,19 +61798,41 @@ def run_takserver_deploy(config):
         log_step(f"✗ FATAL ERROR: {str(e)}")
         deploy_status.update({'error': True, 'running': False})
 
+def _send_cert_file_priv(cert_dir, filename):
+    """Stream a cert file to the browser, reading 0600 tak:tak files via the
+    broker (GH #52). TAK Server writes private-key material (.p12/.key) 0600
+    tak:tak; the non-root takwerx console can't open() them, so raw
+    send_from_directory hit PermissionError → HTTP 500. Plain open() stays the
+    fast path for world-readable files and root-era consoles. Do NOT loosen the
+    key perms instead — the privileged read is the fix.
+    """
+    from flask import send_file
+    import io
+    fp = os.path.join(cert_dir, filename)
+    if not os.path.isfile(fp):
+        return jsonify({'error': f'{filename} not found'}), 404
+    try:
+        with open(fp, 'rb') as f:
+            data = f.read()
+    except PermissionError:
+        try:
+            r = subprocess.run(_sudo_wrap(['cat', fp]), capture_output=True, timeout=15)
+            data = r.stdout if r.returncode == 0 else b''
+        except Exception:
+            data = b''
+        if not data:
+            return jsonify({'error': f'Could not read {filename}: permission denied for the console user and the privileged read failed'}), 500
+    return send_file(io.BytesIO(data), as_attachment=True, download_name=filename)
+
 @app.route('/api/download/admin-cert')
 @login_required
 def download_admin_cert():
-    p = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(p, 'admin.p12')): return send_from_directory(p, 'admin.p12', as_attachment=True)
-    return jsonify({'error': 'admin.p12 not found'}), 404
+    return _send_cert_file_priv('/opt/tak/certs/files', 'admin.p12')
 
 @app.route('/api/download/user-cert')
 @login_required
 def download_user_cert():
-    p = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(p, 'user.p12')): return send_from_directory(p, 'user.p12', as_attachment=True)
-    return jsonify({'error': 'user.p12 not found'}), 404
+    return _send_cert_file_priv('/opt/tak/certs/files', 'user.p12')
 
 @app.route('/api/download/truststore')
 @login_required
@@ -61819,7 +61841,8 @@ def download_truststore():
     if os.path.exists(p):
         for f in os.listdir(p):
             if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f:
-                return send_from_directory(p, f, as_attachment=True)
+                # truststore-*.p12 is 0600 tak:tak too (GH #52) — same privileged read.
+                return _send_cert_file_priv(p, f)
     return jsonify({'error': 'truststore not found'}), 404
 
 
@@ -62069,11 +62092,7 @@ def download_cert_file(filename):
     import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
-    cert_path = '/opt/tak/certs/files'
-    fp = os.path.join(cert_path, filename)
-    if os.path.exists(fp) and os.path.isfile(fp):
-        return send_from_directory(cert_path, filename, as_attachment=True)
-    return jsonify({'error': 'File not found'}), 404
+    return _send_cert_file_priv('/opt/tak/certs/files', filename)
 
 @app.route('/api/deploy/log')
 @login_required
