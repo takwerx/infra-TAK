@@ -50110,6 +50110,21 @@ def _authentik_spiral_monitor():
                       "(avoids concurrent docker compose on the authentik project)", flush=True)
                 continue
 
+            # v10.1.1 (F4): PERIODIC channels reaper — the boot-only self-heal let
+            # NE-TAK grow a 605GB table for a month between console restarts. Run the
+            # same F1-gated purge every cycle. A healthy tick logs nothing (the purge
+            # returns silently below the size gate) except one liveness line per 24h,
+            # so the journal isn't spammed but we can prove the reaper is alive.
+            try:
+                _now = _t.time()
+                _last_live = getattr(_authentik_spiral_monitor, '_ch_last_liveness', 0)
+                if _now - _last_live >= 86400:
+                    print("[spiral monitor] channels reaper: healthy (liveness)", flush=True)
+                    _authentik_spiral_monitor._ch_last_liveness = _now
+                _auto_authentik_channel_purge(lambda m: print(f"[spiral monitor] {m}", flush=True))
+            except Exception as _ch_e:
+                print(f"[spiral monitor] channels reaper error (non-fatal): {_ch_e}", flush=True)
+
             # PROACTIVE pass first: if outpost is on internal routing and all preconditions
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
             # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
@@ -54198,21 +54213,36 @@ def _ensure_authentik_tasklog_purge_script(plog=None):
         _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
 
 
+_CHANNELS_TBL = 'django_channels_postgres_message'
+# v10.1.1 (F1) size/row gates — catalog lookups, O(1) at ANY table size. The old
+# count(*) gate could never complete on a ballooned table (NE-TAK 605GB: count
+# timed out → None → silent return → the self-heal failed exactly when needed).
+_CH_SIZE_TRIGGER = 200 * 1024 * 1024        # >200MB → act
+_CH_RELTUPLES_TRIGGER = 100_000             # OR planner-estimated >100k rows → act
+_CH_TRUNCATE_PUREBLOAT = 1024 * 1024 * 1024  # >1GB + 0 live rows → TRUNCATE (F3)
+_CH_TRUNCATE_TRAFFIC = 5 * 1024 * 1024 * 1024  # >5GB + reltuples<100k → TRUNCATE (F3)
+
+def _mb(_bytes):
+    try:
+        return int(_bytes) // (1024 * 1024)
+    except Exception:
+        return -1
+
 def _auto_authentik_channel_purge(plog=None):
-    """v0.9.57 (B2): inline self-heal for the Authentik Channels-over-Postgres backlog
-    (django_channels_postgres_message).
+    """v0.9.57 (B2) / v10.1.1 (F1–F3): inline self-heal for the Authentik
+    Channels-over-Postgres backlog (django_channels_postgres_message).
 
-    On a healthy 2026.5.3 worker this table stays small (~hundreds of rows). During a
-    pre-2026.5.3 conn_max_age spin it balloons to MILLIONS of EXPIRED rows, and
-    Authentik's own clean_expired_models() then times out trying to delete them in one
-    transaction (upstream #20644) → authentik-worker-1 pegs ~150% forever. This catches a
-    ballooned table on every console boot and clears it in BATCHES (which the worker's
-    one-shot delete can't), so a box that already spun self-heals WITHOUT SSH. Pairs with
-    the 2026.5.3 pin (prevents new ballooning) and W8 (event retention).
+    On a healthy 2026.5.3 worker this table stays small (~hundreds of rows). The
+    #20714 producer leak (or a pre-2026.5.3 conn_max_age spin) balloons it to
+    HUNDREDS OF MILLIONS of expired rows — NE-TAK reached 605GB / a full disk in
+    ~32 days, undetected, because every prior defense gated on `count(*)`, which
+    can NEVER complete once the table is huge. This version gates on catalog size
+    (O(1)), reclaims disk with TRUNCATE fast-paths, and logs EVERY exit so a
+    skipped self-heal is greppable.
 
-    Deletes ONLY expired messages (`expires < now()`) — never live ones; never blocks
-    login; idempotent; non-raising. Runs on every console boot via _startup_migrations
-    (no version/Update gate). See memory authentik-worker-channels-dramatiq-uuid-crashloop.
+    Idempotent; non-raising; never blocks login. Runs on console boot via
+    _startup_migrations AND every ~10 min via the spiral monitor (F4). See memory
+    authentik-channels-605gb-netak-incident.
     """
     def _log(m):
         if plog:
@@ -54221,11 +54251,11 @@ def _auto_authentik_channel_purge(plog=None):
             print(m, flush=True)
 
     if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-        return  # Authentik not installed on this host
+        return  # Authentik not installed on this host — silent (nothing to greppably report)
 
-    # statement_timeout=0 for the mutating ops: Authentik sets a statement_timeout that
-    # cancels a long DELETE/VACUUM mid-flight (seen live on test8). Reads use the default.
     _PG = ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
+    # statement_timeout=0 for the mutating ops (Authentik sets a statement_timeout
+    # that cancels a long DELETE/VACUUM mid-flight, seen live on test8).
     _PG_NT = ['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=0',
               'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
     try:
@@ -54234,37 +54264,101 @@ def _auto_authentik_channel_purge(plog=None):
             capture_output=True, text=True, timeout=10
         )
         if _up.returncode != 0 or _up.stdout.strip() != 'true':
+            _log("Authentik channels: authentik-postgresql-1 not running — skipping")
             return
 
-        def _count():
+        # F1: single O(1) catalog probe → (total_size_bytes, reltuples). Both -1 if
+        # the table is absent (older Authentik). to_regclass avoids an error when
+        # the relation doesn't exist. Never count(*).
+        _gate_sql = (
+            f"SELECT COALESCE(pg_total_relation_size(to_regclass('{_CHANNELS_TBL}')), -1), "
+            f"COALESCE((SELECT reltuples::bigint FROM pg_class WHERE relname='{_CHANNELS_TBL}'), -1)"
+        )
+        _g = subprocess.run(_PG + ['-tAF,', '-c', _gate_sql], capture_output=True, text=True, timeout=15)
+        if _g.returncode != 0:
+            _log(f"Authentik channels: size query failed: {(_g.stderr or '').strip()[:200]}")
+            return
+        try:
+            _size_b, _reltup = (int(x) for x in (_g.stdout or '').strip().split(','))
+        except Exception:
+            _log(f"Authentik channels: could not parse size query output: {(_g.stdout or '').strip()[:120]}")
+            return
+        if _size_b < 0:
+            _log("Authentik channels: table absent (older Authentik) — skipping")
+            return
+
+        if _size_b <= _CH_SIZE_TRIGGER and _reltup < _CH_RELTUPLES_TRIGGER:
+            # Healthy. Caller decides whether to log (boot logs it; the periodic
+            # reaper stays silent to avoid journal spam — see F4).
+            return
+
+        _log(f"Authentik channels: size={_mb(_size_b)}MB reltuples~{_reltup} "
+             f"(gate: >{_mb(_CH_SIZE_TRIGGER)}MB or >{_CH_RELTUPLES_TRIGGER} rows) — acting")
+
+        # F3: TRUNCATE fast-paths reclaim disk that a DELETE+VACUUM leaves allocated.
+        def _has_live_rows():
+            # Uses the `expires` index (10s cap). '1' → a live row exists; '' → none;
+            # None → probe timed out/failed (treat as "unknown, don't pure-bloat truncate").
             r = subprocess.run(
-                _PG + ['-t', '-A', '-c', 'SELECT count(*) FROM django_channels_postgres_message'],
-                capture_output=True, text=True, timeout=30
+                ['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=10000',
+                 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik',
+                 '-tA', '-c', f"SELECT 1 FROM {_CHANNELS_TBL} WHERE expires >= now() LIMIT 1"],
+                capture_output=True, text=True, timeout=15
             )
             if r.returncode != 0:
                 return None
-            try:
-                return int((r.stdout or '0').strip())
-            except ValueError:
-                return None
+            return (r.stdout or '').strip() == '1'
 
-        _n0 = _count()
-        if _n0 is None:
-            return  # table absent (older Authentik) or query failed — leave alone
-        _THRESHOLD = 100000  # healthy ~hundreds; only act on a genuine balloon
-        if _n0 < _THRESHOLD:
-            return  # Healthy — silent no-op
+        def _truncate(reason):
+            # lock_timeout=30s + one retry: TRUNCATE needs an ACCESS EXCLUSIVE lock;
+            # under live websocket traffic it may wait. Fail fast rather than hang.
+            for _try in range(2):
+                r = subprocess.run(
+                    ['docker', 'exec', '-e', 'PGOPTIONS=-c lock_timeout=30000 -c statement_timeout=0',
+                     'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik',
+                     '-c', f'TRUNCATE {_CHANNELS_TBL}'],
+                    capture_output=True, text=True, timeout=60
+                )
+                if r.returncode == 0:
+                    # CHECKPOINT so the freed space is returned promptly (mirrors the
+                    # NE-TAK field remediation).
+                    subprocess.run(_PG_NT + ['-c', 'CHECKPOINT'], capture_output=True, text=True, timeout=120)
+                    _g2 = subprocess.run(_PG + ['-tA', '-c',
+                        f"SELECT COALESCE(pg_total_relation_size(to_regclass('{_CHANNELS_TBL}')),-1)"],
+                        capture_output=True, text=True, timeout=15)
+                    _after = _mb(_g2.stdout.strip()) if _g2.returncode == 0 else -1
+                    _log(f"Authentik channels: TRUNCATE ({reason}) — {_mb(_size_b)}MB -> {_after}MB reclaimed")
+                    return True
+                _log(f"Authentik channels: TRUNCATE attempt {_try+1} non-zero: {(r.stderr or '').strip()[:160]}")
+                time.sleep(2)
+            return False
 
-        _log(f"Authentik channels: {_n0} rows (>= {_THRESHOLD}) — batched purge of EXPIRED messages (v0.9.57 B2)")
+        _live = _has_live_rows()
+        if _size_b > _CH_TRUNCATE_PUREBLOAT and _live is False:
+            # Pure bloat: >1GB and not a single live row — nothing to lose. Heals
+            # test8 (6.2GB/~62 rows) and test12 (1.5GB/~1.1k rows).
+            if _truncate('pure bloat, 0 live rows'):
+                return
+            # fall through to DELETE if the truncate couldn't get its lock
+        elif _size_b > _CH_TRUNCATE_TRAFFIC and _reltup < _CH_RELTUPLES_TRIGGER:
+            # Ballooned with traffic: >5GB but the planner sees <100k rows → the mass
+            # is expired bloat. Drops seconds-old ephemeral websocket messages;
+            # Authentik reconnects (same surgical call made on NE-TAK).
+            if _truncate('ballooned bloat >5GB'):
+                return
 
+        # Otherwise (or if TRUNCATE couldn't lock): batched DELETE of expired rows,
+        # then VACUUM. PARALLEL 0 — the container /dev/shm (64MB) is too small for
+        # parallel-vacuum workers ("could not resize shared memory segment", test8).
+        _log(f"Authentik channels: batched DELETE of expired rows (live rows present or below TRUNCATE size)")
         _BATCH = 500000
-        _MAX_ITERS = 80  # cap = 40M rows; backstop against a runaway loop
+        _MAX_ITERS = 80  # cap = 40M rows/pass; backstop against a runaway loop
         _deleted = 0
         for _i in range(_MAX_ITERS):
             r = subprocess.run(
                 _PG_NT + ['-t', '-A', '-c',
-                          "WITH d AS (DELETE FROM django_channels_postgres_message "
-                          "WHERE id IN (SELECT id FROM django_channels_postgres_message "
+                          f"WITH d AS (DELETE FROM {_CHANNELS_TBL} "
+                          f"WHERE id IN (SELECT id FROM {_CHANNELS_TBL} "
                           f"WHERE expires < now() LIMIT {_BATCH}) RETURNING 1) SELECT count(*) FROM d"],
                 capture_output=True, text=True, timeout=300
             )
@@ -54279,20 +54373,19 @@ def _auto_authentik_channel_purge(plog=None):
             if _b == 0:
                 break
 
-        # VACUUM with PARALLEL 0 — REQUIRED: the container /dev/shm (64 MB) is too small
-        # for parallel-vacuum workers ("could not resize shared memory segment … No space
-        # left on device", hit live on test8). Reclaim failure is non-fatal — the DELETE
-        # already frees the rows (un-pegs the worker); autovacuum finishes the reclaim.
         _vac = subprocess.run(
-            _PG_NT + ['-c', 'VACUUM (ANALYZE, PARALLEL 0) django_channels_postgres_message;'],
+            _PG_NT + ['-c', f'VACUUM (ANALYZE, PARALLEL 0) {_CHANNELS_TBL};'],
             capture_output=True, text=True, timeout=900
         )
         if _vac.returncode != 0:
             _log(f"Authentik channels: VACUUM non-zero (non-fatal): {(_vac.stderr or '')[:160]}")
 
-        _n1 = _count()
-        _log(f"Authentik channels: purged {_deleted} expired rows ({_n0} -> {_n1}); "
-             f"clean_expired_models will stop timing out on the next cycle")
+        _g3 = subprocess.run(_PG + ['-tA', '-c',
+            f"SELECT COALESCE(pg_total_relation_size(to_regclass('{_CHANNELS_TBL}')),-1)"],
+            capture_output=True, text=True, timeout=15)
+        _after = _mb(_g3.stdout.strip()) if _g3.returncode == 0 else -1
+        _log(f"Authentik channels: purged {_deleted} expired rows, {_mb(_size_b)}MB -> {_after}MB "
+             f"(VACUUM keeps the file allocated — autovacuum/TRUNCATE reclaims fully)")
     except Exception as _e:
         _log(f"Authentik channels purge: skipped ({str(_e)[:120]})")
 
@@ -68951,12 +69044,27 @@ def _startup_migrations():
             _auto_authentik_tasklog_purge(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _atl_e:
             print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
-        # v0.9.57 (B2): self-heal a ballooned Channels-over-Postgres backlog
-        # (django_channels_postgres_message). Silent no-op when healthy (< 100k rows).
+        # v0.9.57 (B2) / v10.1.1 (F1–F3): self-heal a ballooned Channels-over-Postgres
+        # backlog (django_channels_postgres_message). Size-gated (O(1)), TRUNCATE
+        # fast-paths reclaim disk, every exit logs. Silent no-op when healthy.
         try:
             _auto_authentik_channel_purge(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _ach_e:
             print(f"Startup migration: channel purge error (non-fatal): {_ach_e}", flush=True)
+
+        # v10.1.1 (F6): remove the NE-TAK temporary channels-reaper cron. The
+        # 2026-07-08 field remediation installed /etc/cron.d/authentik-channels-reaper
+        # (every 5 min) to stop-gap the disk fill. The in-process reaper (F4) now owns
+        # this on every box, so the cron is redundant — and a plain-VACUUM cron can't
+        # reclaim the disk the way the TRUNCATE path does. Idempotent; broker-routed
+        # remove so it works on the non-root fleet too.
+        try:
+            _ntc = '/etc/cron.d/authentik-channels-reaper'
+            if os.path.exists(_ntc):
+                subprocess.run(_sudo_wrap(['rm', '-f', _ntc]), capture_output=True, timeout=15)
+                print("Startup migration: channels reaper: legacy temp cron removed — in-process reaper active", flush=True)
+        except Exception as _ntc_e:
+            print(f"Startup migration: temp channels cron removal error (non-fatal): {_ntc_e}", flush=True)
 
         # v0.9.31: Clear stale `failed` state on takauthentiktasklogpurge.service
         # when the on-disk script is already the v0.9.26+ fixed version.
