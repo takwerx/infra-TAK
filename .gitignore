@@ -43,3 +43,6 @@ pull-dev-and-restart.sh
 
 # Claude Code project guidance — local only, full copy mirrored in private infra-TAK-notes
 CLAUDE.md
+
+# Claude Code project skills/hooks — local only, mirrored in private infra-TAK-notes
+.claude/
