@@ -14067,6 +14067,7 @@ def _guarddog_timer_list():
             'takwerxsetupapwatch.timer',
             'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
+            'takdbrepack.timer', 'takretentionguard.timer',
             'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
@@ -14311,6 +14312,12 @@ def guarddog_update():
             new_timers.append('takcotdbguard.timer')
         if os.path.isfile(rp_tmr_path):
             new_timers.append('takdbrepack.timer')
+        # v10.1.1 (F8): takretentionguard.timer was WRITTEN by run_guarddog_deploy but
+        # never added to the enable list, so every full deploy left it loaded/disabled
+        # and it never ran once (test6: cot_router bloated to 53GB / 2.9k live rows —
+        # the "deletes don't return disk" pathology the online repack is meant to cure).
+        if os.path.isfile(rg_tmr_path):
+            new_timers.append('takretentionguard.timer')
         if os.path.isfile(bc_tmr_path):
             new_timers.append('takbuildcachereclaim.timer')
         if os.path.isfile(tp_tmr_path):
@@ -69065,6 +69072,25 @@ def _startup_migrations():
                 print("Startup migration: channels reaper: legacy temp cron removed — in-process reaper active", flush=True)
         except Exception as _ntc_e:
             print(f"Startup migration: temp channels cron removal error (non-fatal): {_ntc_e}", flush=True)
+
+        # v10.1.1 (F8): enable the DB-repack + retention-guard timers on the existing
+        # fleet without a Guard Dog redeploy. Their unit files were written by
+        # run_guarddog_deploy but takretentionguard.timer was never in the enable list,
+        # and takdbrepack was only enabled by clicking Update on the GD page. Any box
+        # with the unit present but not enabled → enable --now (Update Now path heals
+        # the whole fleet; test6's 53GB cot_router bloat gets its weekly online repack).
+        try:
+            for _gd_t in ('takdbrepack.timer', 'takretentionguard.timer'):
+                if not os.path.exists(f'/etc/systemd/system/{_gd_t}'):
+                    continue
+                _en = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', _gd_t]),
+                                     capture_output=True, text=True, timeout=5)
+                if (_en.stdout or '').strip() != 'enabled':
+                    subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', _gd_t]),
+                                   capture_output=True, timeout=10)
+                    print(f"Startup migration: enabled {_gd_t} (was {(_en.stdout or 'disabled').strip()})", flush=True)
+        except Exception as _gdt_e:
+            print(f"Startup migration: GD maintenance-timer enable error (non-fatal): {_gdt_e}", flush=True)
 
         # v0.9.31: Clear stale `failed` state on takauthentiktasklogpurge.service
         # when the on-disk script is already the v0.9.26+ fixed version.
