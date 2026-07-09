@@ -50227,7 +50227,20 @@ def _authentik_spiral_monitor():
     where Authentik isn't installed.
     """
     import time as _t
-    lock_path = '/tmp/takwerx-spiral-monitor.lock'
+    # v10.1.1: namespace the lockfile by uid. On a root→non-root-flipped box
+    # (v10.0.5+), the old fixed-path `/tmp/takwerx-spiral-monitor.lock` is left
+    # 0644 root:root from the root era; the takwerx console can neither overwrite
+    # it (EPERM) nor delete it (/tmp sticky bit) → the monitor stood down forever
+    # → the periodic channels reaper (F4) never ran (found live on test12/tak-10,
+    # lock dated Jun 29 root:root). The uid suffix gives the console a path it
+    # owns, so the stale root file is simply irrelevant. Best-effort clean it up.
+    lock_path = f'/tmp/takwerx-spiral-monitor-{os.getuid()}.lock'
+    _legacy_lock = '/tmp/takwerx-spiral-monitor.lock'
+    if os.path.exists(_legacy_lock):
+        try:
+            os.unlink(_legacy_lock)  # succeeds only if we own it; harmless if not
+        except OSError:
+            pass
 
     # Try to acquire the singleton lock. If another worker already holds it AND that PID
     # is alive, this worker exits the function (no monitor here, the other worker has it).
