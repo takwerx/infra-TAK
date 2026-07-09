@@ -9121,6 +9121,62 @@ def _conn_wifi_forget(ssid):
     return True, ''
 
 
+def _conn_wifi_use(ssid):
+    """Switch the box onto an already-SAVED network now, using the stored
+    credentials (no re-typing the password). Returns (ok, error).
+      nmcli   — `nmcli connection up <ssid>` (activates the saved profile).
+      netplan — wpa_cli: find the saved network id, select it (associates now),
+                then re-enable all others so roaming/fallback still works after.
+    The switch is runtime; netplan config (all networks enabled) is authoritative
+    again on the next apply/reboot."""
+    ssid = (ssid or '').strip()
+    if not ssid:
+        return False, 'No network specified.'
+    if ssid not in _conn_wifi_saved():
+        return False, 'That network is not saved yet — add it first (with its password).'
+    if shutil.which('nmcli'):
+        r = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', ssid]),
+                           capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or 'switch failed').strip()[:200]
+        return True, ''
+    iface = _conn_wifi_iface()
+    if not iface:
+        return False, 'No wireless interface detected.'
+    try:
+        lst = subprocess.run(_sudo_wrap(['wpa_cli', '-i', iface, 'list_networks']),
+                             capture_output=True, text=True, timeout=10)
+        net_id = None
+        for ln in (lst.stdout or '').splitlines():
+            parts = ln.split('\t')
+            if len(parts) >= 2 and parts[1] == ssid:
+                net_id = parts[0].strip()
+                break
+        if net_id is None or not net_id.isdigit():
+            return False, 'Saved network not found in the WiFi supplicant — try re-adding it.'
+        sel = subprocess.run(_sudo_wrap(['wpa_cli', '-i', iface, 'select_network', net_id]),
+                             capture_output=True, text=True, timeout=15)
+        if 'OK' not in (sel.stdout or ''):
+            return False, 'Switch command was not accepted: %s' % (sel.stdout or sel.stderr or '')[:120]
+        # Re-enable the others so the box can still roam/fall back later.
+        subprocess.run(_sudo_wrap(['wpa_cli', '-i', iface, 'enable_network', 'all']),
+                       capture_output=True, text=True, timeout=10)
+        return True, ''
+    except Exception as ex:
+        return False, 'Could not switch network: %s' % str(ex)[:160]
+
+
+@app.route('/api/connectivity/wifi/use', methods=['POST'])
+@login_required
+def connectivity_wifi_use_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    ok, err = _conn_wifi_use(ssid)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True})
+
+
 @app.route('/api/connectivity/wifi/forget', methods=['POST'])
 @login_required
 def connectivity_wifi_forget_api():
@@ -37447,14 +37503,17 @@ async function refreshWifiSaved(){
     const r = await fetch('/api/connectivity/wifi/list');
     const d = await r.json();
     const el = document.getElementById('wifi-saved');
+    savedWifiSet = d.saved || [];
     if(d.saved && d.saved.length){
       const cur = d.current || '';
       el.innerHTML = 'Known networks: ' + d.saved.map(s => {
         const isCur = (s === cur);
-        return '<span style="display:inline-flex;align-items:center;gap:4px;margin-right:10px;white-space:nowrap">'
+        const j = JSON.stringify(s).replace(/"/g,'&quot;');
+        return '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:12px;white-space:nowrap">'
           + (isCur ? '<span class="dot" style="background:var(--green);width:7px;height:7px"></span>' : '')
           + '<span style="color:' + (isCur ? 'var(--green)' : 'var(--text-secondary)') + '">' + esc(s) + (isCur ? ' (connected now)' : '') + '</span>'
-          + ' <span onclick="forgetWifi(' + JSON.stringify(s).replace(/"/g,'&quot;') + ',' + isCur + ')" title="Forget this network" style="cursor:pointer;color:var(--text-dim);font-size:14px;line-height:1">&times;</span>'
+          + (isCur ? '' : ' <a href="#" onclick="event.preventDefault();useWifi(' + j + ')" title="Switch to this network now" style="color:var(--accent);text-decoration:none;font-size:11px">use</a>')
+          + ' <span onclick="forgetWifi(' + j + ',' + isCur + ')" title="Forget this network" style="cursor:pointer;color:var(--text-dim);font-size:14px;line-height:1">&times;</span>'
           + '</span>';
       }).join('');
     } else {
@@ -37496,7 +37555,29 @@ async function scanWifi(){
   }catch(e){ st.textContent = 'Scan failed.'; }
   btn.disabled = false; btn.textContent = 'Scan for networks';
 }
-function pickWifi(ssid){ document.getElementById('wifi-ssid').value = ssid; document.getElementById('wifi-psk').focus(); }
+let savedWifiSet = [];
+function pickWifi(ssid){
+  // If the box already knows this network, switch to it with the stored password
+  // (no re-typing). Otherwise prefill the add form so the operator enters the key.
+  if(savedWifiSet.indexOf(ssid) !== -1){
+    useWifi(ssid);
+    return;
+  }
+  document.getElementById('wifi-ssid').value = ssid;
+  document.getElementById('wifi-psk').focus();
+}
+async function useWifi(ssid){
+  const st = document.getElementById('wifi-add-status');
+  st.style.color = 'var(--text-dim)';
+  st.textContent = 'Switching to “' + ssid + '”…';
+  try{
+    const r = await fetch('/api/connectivity/wifi/use', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid: ssid})});
+    const d = await r.json();
+    if(d.success){ st.style.color = 'var(--green)'; st.textContent = 'Switching to “' + ssid + '” — it may take a few seconds to connect.'; }
+    else { st.style.color = 'var(--red)'; st.textContent = d.error || 'Switch failed'; }
+  }catch(e){ st.style.color='var(--red)'; st.textContent='Switch failed'; }
+  setTimeout(refreshWifiSaved, 4000);
+}
 async function addWifi(){
   const btn = document.getElementById('wifi-add-btn');
   const st = document.getElementById('wifi-add-status');
