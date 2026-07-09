@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.0.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.0.9-alpha)**
+**Current release: [v10.1.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.0-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.0-alpha — 2026-07-09 — Connectivity Wizard: get any box online and reachable from the browser — plus security patches
+
+**Headline: a new Connectivity Wizard that takes a fresh mini-PC from "just plugged in" to "reachable by TAK clients" entirely from the browser — plus important security and stability fixes. Updating is strongly recommended.** The **Connectivity Wizard** (Connectivity page) detects your network situation, then walks you through the right path: set up a **relay** so friends and clients reach your box from anywhere with **no VPN** (one button — you create a free VPS, upload its key, the console does the rest), or the direct **DDNS + port-forward** path for a home connection with a public IP. It manages **WiFi** the way a phone does — scan and join, *pre-provision a network you're not on yet* so a portable box connects the moment it arrives, switch between known networks, and forget old ones. New **Setup WiFi** mode turns a headless box into its own access point when it has no connection, so you can walk up in a new location, join it from a laptop, and pick a network — no screen, no keyboard, no cable. **Verify Reachability** proves clients can actually reach every TAK port from the public internet (green/red per port, so you stop guessing), and your **relay's health now shows on the Guard Dog board**. Also in this release: **security patches — updating is recommended** — and a fix so **TAK Server LDAP login self-heals on a fresh deploy** (no more manual "Resync LDAP" after installing a new box). **Upgrade:** applied automatically on the next console update; healthy boxes are left untouched.
+
+Full notes: [v10.1.0-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.0-alpha).
 
 ### v10.0.9-alpha — 2026-07-06 — Self-healing cleanup: user management, streaming, and safer module updates
 
