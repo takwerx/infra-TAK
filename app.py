@@ -18287,16 +18287,40 @@ def _get_mediamtx_upstream(settings):
 
 
 def _get_mediamtx_hls_upstream(settings):
-    """Return (upstream, hls_encrypted) for MediaMTX HLS in Caddy."""
-    mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
-    cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
-    hls_encrypted = bool(mtx_domain and os.path.exists(f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'))
+    """Return (upstream, hls_encrypted) for MediaMTX HLS in Caddy.
+
+    hls_encrypted MUST reflect MediaMTX's ACTUAL `hlsEncryption` (source of truth
+    in mediamtx.yml), NOT the presence of a Caddy-managed LE cert file. The old
+    cert-path heuristic lived under /var/lib/caddy (0750 caddy:caddy), which the
+    non-root takwerx console CANNOT traverse → os.path.exists → False on every
+    non-root box → the plain-HTTP /hls-proxy upstream → MediaMTX's TLS listener
+    answers 400 "HTTP request to an HTTPS server" → HLS playback broken fleet-wide
+    on non-root (v10.0.5+ regression; same class as the GH #52 cert-download bug).
+    Read the encryption flag from the config MediaMTX itself uses."""
+    def _hls_encrypted_from_yml(path='/usr/local/etc/mediamtx.yml'):
+        try:
+            try:
+                with open(path) as f:
+                    txt = f.read()
+            except (PermissionError, FileNotFoundError):
+                txt = _read_priv(path) or ''  # root-owned → broker read
+            m = re.search(r'(?m)^\s*hlsEncryption:\s*(\S+)', txt)
+            return bool(m and m.group(1).strip().strip('"\'').lower() in ('yes', 'true'))
+        except Exception:
+            return False
     cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if cfg.get('target_mode') == 'remote':
         host = (cfg.get('remote', {}).get('host') or '').strip()
         if host:
-            return f'{host}:8888', hls_encrypted
-    return '127.0.0.1:8888', hls_encrypted
+            # Remote MediaMTX: the yml lives on the remote host (too heavy to read
+            # here every regen). Preserve the prior cert-existence signal as a
+            # best-effort for the remote case — the non-root traversal problem is
+            # local-console-only, so this path is unaffected by the fleet bug.
+            mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
+            cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+            enc = bool(mtx_domain and os.path.exists(f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'))
+            return f'{host}:8888', enc
+    return '127.0.0.1:8888', _hls_encrypted_from_yml()
 
 
 def _get_nodered_upstream(settings):
@@ -68830,6 +68854,28 @@ def _startup_migrations():
             generate_caddyfile(s)
             subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # v10.1.1 (one-time per box): heal the /hls-proxy TLS upstream fleet-wide.
+        # The non-root console computed hls_encrypted=False (it can't traverse
+        # caddy's 0750 cert dir to stat the LE cert) and emitted a PLAIN-HTTP
+        # /hls-proxy block → MediaMTX's TLS listener answered 400 → HLS playback
+        # broken on every non-root FQDN box with hlsEncryption:yes. The template
+        # now reads hlsEncryption from mediamtx.yml; regen the Caddyfile once so the
+        # LIVE file picks up the https:// upstream (Update Now / dev-pull heals the
+        # fleet without a MediaMTX redeploy). Idempotent; flag-gated.
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_hls_encfix_v1'):
+            try:
+                if detect_modules().get('mediamtx', {}).get('installed'):
+                    _hcf = generate_caddyfile(s)
+                    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                    _hls_https = ('reverse_proxy https://' in (_hcf or '') and 'tls_server_name' in (_hcf or ''))
+                    print(f"Startup migration: Caddyfile regenerated for /hls-proxy TLS upstream "
+                          f"(HLS encfix; https_upstream={_hls_https})", flush=True)
+                s['caddy_hls_encfix_v1'] = True
+                save_settings(s)
+                s = load_settings()
+            except Exception as _hls_e:
+                print(f"Startup migration: HLS encfix regen error (non-fatal, will retry): {_hls_e}", flush=True)
 
         # v10.1.0 SECURITY (critical, one-time per box): regenerate the Caddyfile so the
         # console vhost strips client-supplied X-Authentik-* headers. Without this, a
