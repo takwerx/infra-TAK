@@ -571,6 +571,18 @@ docker exec "$CONTAINER" node -e "
   });
   console.log('    Synced ' + nSync + ' function nodes in dynamic engine tabs');
 
+  // Load nodes embed the feed name so they can't template-sync — patch the legacy
+  // hard-fail serverUrl guard to the host.docker.internal fallback (parity with TC/PP).
+  var guardRe = /if \(!tak\.serverUrl\) \{ node\.warn\('[^']*'\); return null; \}/;
+  var guardFix = \"if (!tak.serverUrl) { tak = Object.assign({}, tak, { serverUrl: tak.takHost || 'host.docker.internal' }); }\";
+  var nGuard = 0;
+  preserved.forEach(function(n) {
+    if (n.type !== 'function' || typeof n.func !== 'string' || !guardRe.test(n.func)) return;
+    n.func = n.func.replace(guardRe, guardFix);
+    nGuard++;
+  });
+  if (nGuard) console.log('    Patched serverUrl fallback into ' + nGuard + ' engine load nodes');
+
   // Merge: new infra-TAK nodes + preserved existing nodes
   var merged = upd.concat(preserved);
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(merged, null, 2));
