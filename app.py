@@ -9307,13 +9307,28 @@ def _conn_setup_ap_read_conf():
 def _conn_setup_ap_write_conf(ssid, password, auto):
     """Write the root-600 engine conf via a temp file + privileged install."""
     ssid = (ssid or '').strip() or _conn_setup_ap_default_ssid()
+    _console_url = ''
     try:
-        _console_port = int(load_settings().get('console_port') or 5001)
+        _st = load_settings()
+        _console_port = int(_st.get('console_port') or 5001)
+        # If the box has a real cert (LE via Caddy, or a custom cert), the setup AP
+        # can send the laptop to the console's Caddy vhost by NAME — the AP's wildcard
+        # DNS resolves it to the box, Caddy presents the TRUSTED cert (no warning), and
+        # Caddy is the sanctioned auth proxy (it strips client X-Authentik-* — no
+        # bypass). Fresh/self-signed boxes have no trusted cert, so the engine falls
+        # back to the box's own self-signed https (accept-the-warning floor).
+        _ssl_mode = (_st.get('ssl_mode') or '').strip().lower()
+        _fqdn = (_st.get('fqdn') or '').split(':')[0].strip()
+        if _fqdn and _ssl_mode in ('fqdn', 'custom'):
+            _ihost = _get_all_service_domains(_st).get('infratak')
+            if _ihost:
+                _console_url = 'https://%s/' % _ihost
     except Exception:
         _console_port = 5001
     lines = ['# infra-TAK Setup AP config (managed by the console)\n',
              'SETUP_AP_SSID=%s\n' % ssid,
              'SETUP_AP_CONSOLE_PORT=%d\n' % _console_port,
+             'SETUP_AP_CONSOLE_URL=%s\n' % _console_url,
              'SETUP_AP_AUTO=%s\n' % ('1' if auto else '0')]
     if password:
         lines.append('SETUP_AP_PASS=%s\n' % password)
@@ -19587,12 +19602,28 @@ def generate_caddyfile(settings=None):
     lines.append(f"    route /health* {{")
     lines.append(f"        reverse_proxy 127.0.0.1:8080")
     lines.append(f"    }}")
+    # SECURITY (v10.1.0, CVE-class): the console trusts X-Authentik-Username from any
+    # 127.0.0.1 caller (that is how forward_auth logs the SSO user in). Caddy does NOT
+    # strip client-supplied X-Authentik-* by default, and the plain reverse_proxy paths
+    # (/login, and /api/* which is EXCLUDED from forward_auth) pass it straight through
+    # to the console → a public request `X-Authentik-Username: admin` got a full admin
+    # session with no password (confirmed exploitable). Strip every X-Authentik-* from
+    # the CLIENT at the top of each console route, inside `route {}` (which preserves
+    # directive order) so it runs BEFORE forward_auth re-injects the AUTHENTIC value
+    # from the auth response. Non-forward_auth paths then get nothing → bypass closed;
+    # the SSO path is unchanged (forward_auth adds the real header after the strip).
+    _AK_FWD_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
+                       'X-Authentik-Name', 'X-Authentik-Uid')
+    def _emit_ak_header_strip(indent):
+        for _h in _AK_FWD_HEADERS:
+            lines.append(f"{indent}request_header -{_h}")
     if ak.get('installed'):
         # W1 (Hardened posture): drop the unauthenticated /login bypass so the
         # shared-password page is no longer a network ingress — SSO+MFA only.
         # Standard posture keeps it so password login works without Authentik.
         if not _w1_console_locked():
             lines.append(f"    route /login* {{")
+            _emit_ak_header_strip("        ")
             lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
             lines.append(f"            transport http {{")
             lines.append(f"                tls")
@@ -19603,6 +19634,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        }}")
             lines.append(f"    }}")
         lines.append(f"    route {{")
+        _emit_ak_header_strip("        ")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         # v0.9.58: background /api XHR must NOT go through forward_auth. An unauthenticated
         # XHR gets 302-redirected to the cross-origin Authentik OAuth URL (tak.<fqdn>), which
@@ -19628,12 +19660,17 @@ def generate_caddyfile(settings=None):
         lines.append(f"        }}")
         lines.append(f"    }}")
     else:
-        lines.append(f"    reverse_proxy 127.0.0.1:5001 {{")
-        lines.append(f"        transport http {{")
-        lines.append(f"            tls")
-        lines.append(f"            tls_insecure_skip_verify")
-        lines.append(f"            read_timeout 1h")
-        lines.append(f"            write_timeout 1h")
+        # No Authentik: the whole vhost is a plain proxy — strip client X-Authentik-*
+        # so a forged header can't reach the console's loopback-trust (same bypass).
+        lines.append(f"    route {{")
+        _emit_ak_header_strip("        ")
+        lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
+        lines.append(f"            transport http {{")
+        lines.append(f"                tls")
+        lines.append(f"                tls_insecure_skip_verify")
+        lines.append(f"                read_timeout 1h")
+        lines.append(f"                write_timeout 1h")
+        lines.append(f"            }}")
         lines.append(f"        }}")
         lines.append(f"    }}")
     lines.append(f"}}")
@@ -68388,6 +68425,28 @@ def _startup_migrations():
             generate_caddyfile(s)
             subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # v10.1.0 SECURITY (critical, one-time per box): regenerate the Caddyfile so the
+        # console vhost strips client-supplied X-Authentik-* headers. Without this, a
+        # public request `X-Authentik-Username: admin` to any /api/* or /login on an
+        # FQDN box reached the console's loopback-trust and got an admin session with NO
+        # password (confirmed exploitable). Only FQDN boxes have a Caddy-fronted console
+        # (self-signed/no-FQDN boxes hit 5001 directly, no Caddy path → not exposed).
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1') and not (fh_cfg.get('deployed')):
+            try:
+                generate_caddyfile(s)
+                _r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                s['caddy_xauth_strip_v1'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: Caddyfile regenerated to strip client X-Authentik-* (auth-bypass fix)")
+            except Exception as _xs_e:
+                print(f"Startup migration: caddy X-Authentik-strip regen error (non-fatal): {_xs_e}", flush=True)
+        elif fh_cfg.get('deployed') and (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
+            # Fed Hub path already regenerated above with the strip — just record it.
+            s['caddy_xauth_strip_v1'] = True
+            save_settings(s)
+            s = load_settings()
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console

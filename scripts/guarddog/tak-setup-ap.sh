@@ -51,6 +51,19 @@ if [ -r "$CONF" ]; then
     _p="$(conf_get SETUP_AP_PASS)"; [ -n "$_p" ] && AP_PASS="$_p"
     _cp="$(conf_get SETUP_AP_CONSOLE_PORT)"
     case "$_cp" in ''|*[!0-9]*) : ;; *) CONSOLE_PORT="$_cp" ;; esac
+    CONSOLE_URL="$(conf_get SETUP_AP_CONSOLE_URL)"
+fi
+# Where the captive page sends the laptop. If the box has a trusted cert, this is
+# the console's Caddy vhost by NAME (the AP wildcard DNS resolves it to the box →
+# Caddy serves the real cert → no warning). Otherwise the box's own self-signed
+# https (accept-the-warning floor for fresh/no-domain boxes).
+CONSOLE_URL="${CONSOLE_URL:-}"
+if [ -n "$CONSOLE_URL" ]; then
+    OPEN_URL="$CONSOLE_URL"
+    OPEN_TRUSTED=1
+else
+    OPEN_URL="https://${AP_IP}:${CONSOLE_PORT}/"
+    OPEN_TRUSTED=0
 fi
 # WPA2 requires 8..63 chars. If unset/short, generate a RANDOM PSK once and persist
 # it (root-600) — NEVER derive it from the hostname (finding B: the hostname is
@@ -132,7 +145,8 @@ apply_isolation(){
     iptables -A takwerx_setupap -p tcp --dport 53 -j ACCEPT
     iptables -A takwerx_setupap -p tcp --dport 80 -j ACCEPT               # → REDIRECT :8088
     iptables -A takwerx_setupap -p tcp --dport 8088 -j ACCEPT             # captive responder
-    iptables -A takwerx_setupap -p tcp --dport "$CONSOLE_PORT" -j ACCEPT  # console login
+    iptables -A takwerx_setupap -p tcp --dport "$CONSOLE_PORT" -j ACCEPT  # console login (self-signed fallback)
+    iptables -A takwerx_setupap -p tcp --dport 443 -j ACCEPT             # Caddy (trusted-cert console vhost)
     iptables -A takwerx_setupap -p icmp -j ACCEPT
     iptables -A takwerx_setupap -j DROP                                   # everything else
     iptables -I INPUT -i "$IFACE" -j takwerx_setupap
@@ -142,22 +156,27 @@ apply_isolation(){
     # sanctioned hook and is consulted before the per-container ACCEPTs. No-op if absent.
     iptables -I DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null || true
 
-    # captive :80 responder on :8088; redirect AP :80 to it.
-    #
-    # Serve a real HTML LANDING PAGE (HTTP 200), NOT a 302 to the console's
-    # self-signed HTTPS. Field-tested 2026-07-08: Windows followed the 302 fine,
-    # but macOS's Captive Network Assistant refuses the auto-redirect to a
-    # self-signed HTTPS origin and silently does nothing. A self-contained 200
-    # page with a big tap-through link works on macOS (and stays fine on Windows/
-    # Android): the CNA popup shows the page, the user taps "Open setup", which
-    # hands off to the real browser where the cert warning can be accepted.
+    # captive :80 responder on :8088; redirect AP :80 to it. Serves a real HTML
+    # landing page (200, tap-through button) — macOS's Captive Network Assistant
+    # renders it (it silently ignores a 302 to self-signed HTTPS). The button points
+    # at OPEN_URL: the trusted Caddy vhost by name when the box has a real cert (no
+    # warning), else the box's self-signed https (accept-the-warning floor).
     iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-ports 8088
-    CAP_AP_IP="$AP_IP" CAP_PORT="$CONSOLE_PORT" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
+    CAP_AP_IP="$AP_IP" CAP_URL="$OPEN_URL" CAP_IPURL="https://${AP_IP}:${CONSOLE_PORT}/" CAP_TRUSTED="$OPEN_TRUSTED" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
 import os, http.server, socketserver
 PORT = 8088
 IP = os.environ.get('CAP_AP_IP', '10.42.0.1')
-CP = os.environ.get('CAP_PORT', '5001')
-URL = 'https://%s:%s/' % (IP, CP)
+URL = os.environ.get('CAP_URL', 'https://%s:5001/' % IP)
+IPURL = os.environ.get('CAP_IPURL', 'https://%s:5001/' % IP)
+TRUSTED = os.environ.get('CAP_TRUSTED', '0') == '1'
+if TRUSTED:
+    # Primary is the trusted Caddy URL (no warning); keep the self-signed IP as a
+    # secondary fallback in case Caddy is momentarily unavailable.
+    NOTE = ('<p>If the button doesn&#39;t load, try <code>%s</code> and accept the '
+            'security warning.</p>' % IPURL)
+else:
+    NOTE = ('<p>If the button does nothing, open your browser and go to <code>%s</code> — '
+            'accept the security warning (it is this box&#39;s own certificate).</p>' % URL)
 PAGE = ('<!doctype html><html><head><meta charset=utf-8>'
         '<meta name=viewport content=\"width=device-width,initial-scale=1\">'
         '<title>infra-TAK setup</title>'
@@ -169,9 +188,8 @@ PAGE = ('<!doctype html><html><head><meta charset=utf-8>'
         'code{background:#1e2736;padding:2px 7px;border-radius:5px;color:#cbd5e1}</style></head>'
         '<body><h1>infra-TAK setup</h1>'
         '<p>You are connected to this box&#39;s setup network. Open the console to choose a WiFi network for it to join.</p>'
-        '<a class=btn href=\"%s\">Open setup console</a>'
-        '<p>If the button does nothing, open your browser and go to <code>%s</code> — accept the security warning (it is this box&#39;s own certificate).</p>'
-        '</body></html>') % (URL, URL)
+        '<a class=btn href=\"%s\">Open setup console</a>%s'
+        '</body></html>') % (URL, NOTE)
 BODY = PAGE.encode()
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(s):
