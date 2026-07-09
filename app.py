@@ -19602,6 +19602,18 @@ def generate_caddyfile(settings=None):
     lines.append(f"    route /health* {{")
     lines.append(f"        reverse_proxy 127.0.0.1:8080")
     lines.append(f"    }}")
+    # SECURITY (v10.1.0): the send-alert-email / send-sms endpoints have NO @login_required
+    # and gate on loopback IP only — meant for the box's own Guard Dog scripts, which POST
+    # to 127.0.0.1:5001 DIRECTLY (never via Caddy). Reached through Caddy 443 they'd let an
+    # unauthenticated internet client send arbitrary email/SMS from the box. Block them at
+    # the public edge (404). Internal loopback callers are unaffected (they don't traverse
+    # Caddy). Ordered before the proxy routes so it wins.
+    lines.append(f"    route /api/guarddog/send-alert-email* {{")
+    lines.append(f"        respond 404")
+    lines.append(f"    }}")
+    lines.append(f"    route /api/guarddog/send-sms* {{")
+    lines.append(f"        respond 404")
+    lines.append(f"    }}")
     # SECURITY (v10.1.0, CVE-class): the console trusts X-Authentik-Username from any
     # 127.0.0.1 caller (that is how forward_auth logs the SSO user in). Caddy does NOT
     # strip client-supplied X-Authentik-* by default, and the plain reverse_proxy paths
