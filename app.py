@@ -2019,8 +2019,11 @@ def _apply_authentik_session():
     # only ever attached by Caddy AFTER forward_auth passed.
     pa = _proxy_auth_state()
     if pa.get('enforce'):
-        if not hmac.compare_digest(request.headers.get('X-Infratak-Proxy-Auth') or '',
-                                   pa.get('secret') or ''):
+        _pa_secret = (pa.get('secret') or '').strip()
+        # An empty secret must never authenticate — compare_digest('','') is True,
+        # which would silently degrade back to header-only trust. Fail closed.
+        if not _pa_secret or not hmac.compare_digest(
+                request.headers.get('X-Infratak-Proxy-Auth') or '', _pa_secret):
             return False
     session['authenticated'] = True
     session['authentik_username'] = uname
