@@ -37506,16 +37506,20 @@ async function refreshWifiSaved(){
     savedWifiSet = d.saved || [];
     if(d.saved && d.saved.length){
       const cur = d.current || '';
-      el.innerHTML = 'Known networks: ' + d.saved.map(s => {
+      // Connected network first, then the rest alphabetically.
+      const ordered = d.saved.slice().sort((a,b) => (a===cur?-1:b===cur?1:a.localeCompare(b)));
+      let html = '<div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Known networks</div>';
+      html += ordered.map(s => {
         const isCur = (s === cur);
         const j = JSON.stringify(s).replace(/"/g,'&quot;');
-        return '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:12px;white-space:nowrap">'
-          + (isCur ? '<span class="dot" style="background:var(--green);width:7px;height:7px"></span>' : '')
-          + '<span style="color:' + (isCur ? 'var(--green)' : 'var(--text-secondary)') + '">' + esc(s) + (isCur ? ' (connected now)' : '') + '</span>'
-          + (isCur ? '' : ' <a href="#" onclick="event.preventDefault();useWifi(' + j + ')" title="Switch to this network now" style="color:var(--accent);text-decoration:none;font-size:11px">use</a>')
-          + ' <span onclick="forgetWifi(' + j + ',' + isCur + ')" title="Forget this network" style="cursor:pointer;color:var(--text-dim);font-size:14px;line-height:1">&times;</span>'
-          + '</span>';
+        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:#0a0e1a;border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+          + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : 'var(--text-dim)') + ';flex-shrink:0"></span>'
+          + '<span style="flex:1;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px">' + esc(s) + (isCur ? ' <span style="color:var(--text-dim);font-size:11px">— connected now</span>' : '') + '</span>'
+          + (isCur ? '' : '<button type="button" onclick="useWifi(' + j + ')" title="Switch the box to this network now" style="background:rgba(59,130,246,.12);color:var(--accent);border:1px solid rgba(59,130,246,.3);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer">Use</button>')
+          + '<button type="button" onclick="forgetWifi(' + j + ',' + isCur + ')" title="Remove this saved network" style="background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">Remove</button>'
+          + '</div>';
       }).join('');
+      el.innerHTML = html;
     } else {
       el.textContent = 'No saved WiFi networks yet.';
     }
