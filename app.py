@@ -8944,6 +8944,11 @@ def _conn_wifi_visible():
     return list(seen)
 
 
+def _conn_setup_ap_active():
+    """True if the Setup AP is currently broadcasting (flag written by the engine)."""
+    return os.path.exists('/var/lib/takguard/setup-ap.active')
+
+
 def _conn_wifi_add(ssid, psk):
     """Add a wifi network ADDITIVELY and bring config up. Returns (ok, error).
     netplan path validates-before-apply with backup/restore; never strands."""
@@ -8975,6 +8980,11 @@ def _conn_wifi_add(ssid, psk):
         r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
         if r.returncode != 0:
             return False, (r.stderr or r.stdout or 'nmcli profile add failed').strip()[:200]
+        # Provisioning from the Setup AP: stop it so NM autoconnects to the new
+        # profile (the AP owns the radio until then).
+        if _conn_setup_ap_active():
+            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                           capture_output=True, text=True, timeout=60)
         return True, ''
     # netplan path (Ubuntu).
     f = _conn_wifi_netplan_file()
@@ -9032,7 +9042,16 @@ def _conn_wifi_add(ssid, psk):
                 _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
             return False, 'New network config failed validation — reverted, nothing changed. (%s)' \
                 % ((gen.stderr if gen else '') or '')[:140]
-        # Apply is additive (adds the SSID; does not drop the current connection).
+        # If the Setup AP is broadcasting (the operator is provisioning FROM it),
+        # the radio is busy being the AP — a raw `netplan apply` would fight
+        # hostapd. Instead stop the AP: its teardown restores the client and runs
+        # netplan apply, so the box joins the just-added network (in range at the
+        # new location) and drops the AP in one step. Otherwise apply directly
+        # (additive — doesn't drop the current connection).
+        if _conn_setup_ap_active():
+            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                           capture_output=True, text=True, timeout=60)
+            return True, ''
         appl = _run_priv_chain([['netplan', 'apply']], mode='and')
         if not appl or appl.returncode != 0:
             return False, 'Config validated but apply failed: %s' % ((appl.stderr if appl else '') or '')[:140]
@@ -9169,6 +9188,13 @@ def _conn_wifi_use(ssid):
         return False, 'No network specified.'
     if ssid not in _conn_wifi_saved():
         return False, 'That network is not saved yet — add it first (with its password).'
+    # If provisioning FROM the Setup AP, the radio is the AP — wpa_cli/nmcli-up
+    # can't take effect. Stop the AP so the box reconnects to its known networks
+    # (the target, being saved + in range, is what it lands on).
+    if _conn_setup_ap_active():
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                       capture_output=True, text=True, timeout=60)
+        return True, ''
     if shutil.which('nmcli'):
         r = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', ssid]),
                            capture_output=True, text=True, timeout=45)
