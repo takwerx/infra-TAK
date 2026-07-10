@@ -670,7 +670,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.1-alpha"
+VERSION = "10.1.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -8887,6 +8887,44 @@ def _ensure_iw():
     return any(os.path.exists(p) for p in ('/usr/sbin/iw', '/sbin/iw', '/usr/bin/iw')) or bool(shutil.which('iw'))
 
 
+def _ensure_nm_wifi():
+    """Ensure NetworkManager's WiFi plugin is present on RHEL-family boxes.
+
+    RHEL/Rocky/Alma — minimal AND server installs — DO NOT ship
+    `NetworkManager-wifi` (it is a separate package), so a fresh box shows the
+    WiFi device as 'unmanaged' and every nmcli WiFi op (scan/add/connect) fails
+    silently. Field-hit 2026-07-09 (Rocky NUC, first RHEL Leg-6 test); confirmed
+    documented Rocky behaviour. Ubuntu ships WiFi support by default, so this is
+    a RHEL-only gap — no-op on debian. Mirrors _ensure_iw: tiny package,
+    installed on demand through the apt↔dnf shim (the existing nmcli code path
+    then handles scan/add/persist). Restarts NetworkManager once after install
+    so the radio flips 'managed'. Cheap once installed (glob short-circuits).
+    Returns True when the plugin is present."""
+    if _distro_family() != 'rhel':
+        return True  # Ubuntu/debian ship WiFi support with NetworkManager.
+    if not shutil.which('nmcli'):
+        return False  # no NetworkManager — WiFi is not driven via nmcli here.
+    import glob as _glob
+
+    def _have_plugin():
+        for pat in ('/usr/lib64/NetworkManager/*/libnm-device-plugin-wifi.so',
+                    '/usr/lib64/NetworkManager/libnm-device-plugin-wifi.so',
+                    '/usr/lib/NetworkManager/*/libnm-device-plugin-wifi.so',
+                    '/usr/lib/NetworkManager/libnm-device-plugin-wifi.so'):
+            if _glob.glob(pat):
+                return True
+        return False
+    if _have_plugin():
+        return True
+    try:
+        _pkg_install('NetworkManager-wifi', timeout=300)
+        # Reload NM so it loads the new plugin and flips the WiFi device managed.
+        _run_priv_chain([['systemctl', 'restart', 'NetworkManager']], mode='and', timeout=60)
+    except Exception:
+        pass
+    return _have_plugin()
+
+
 def _conn_wifi_iface():
     """Detect the wireless interface name (e.g. wlp1s0). Empty if none."""
     try:
@@ -8966,6 +9004,7 @@ def _conn_wifi_saved():
 
 def _conn_wifi_scan():
     """Best-effort list of visible SSIDs (+ signal where available)."""
+    _ensure_nm_wifi()  # RHEL: pull NetworkManager-wifi so the radio is manageable
     nets, seen = [], set()
 
     def _add(ssid, signal=''):
@@ -9046,6 +9085,7 @@ def _conn_wifi_add(ssid, psk):
         return False, 'Network name must be 1–32 characters.'
     if psk and not (8 <= len(psk) <= 63):
         return False, 'WiFi password must be 8–63 characters (WPA requirement).'
+    _ensure_nm_wifi()  # RHEL: pull NetworkManager-wifi so nmcli can manage the radio
     # NetworkManager path (RHEL / any box with nmcli).
     # v10.1.0 parity fix: use `connection add` (create the PROFILE, activate
     # nothing), NOT `dev wifi connect` — connect ACTIVATES, i.e. it switches
