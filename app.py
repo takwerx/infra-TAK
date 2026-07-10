@@ -9225,6 +9225,57 @@ def connectivity_wifi_add_api():
     return jsonify({'success': True})
 
 
+# ── Reaching This Box — every LAN address the console (:port) answers on now ──
+def _conn_reach_addresses():
+    """Every LAN address this box's console (:port) is reachable at right now —
+    the data behind the 'Reaching This Box' card (v10.1.2). Lists each real
+    Ethernet/WiFi interface with its IP + a ready console URL, flags the one the
+    current request arrived on ('you're here now'), and marks the WiFi ones so
+    the UI can say 'use this after you unplug Ethernet' (the exact friction of a
+    portable box hopping Ethernet→WiFi). Internal bridges (docker/veth/virbr/
+    br-/cni/flannel) are excluded — they are not a reach path. No mDNS: this
+    reads the box's OWN addresses inside the authenticated console, adds no
+    listener and broadcasts nothing (deliberate — mDNS/Avahi was rejected on
+    STIG/attack-surface grounds)."""
+    try:
+        port = str(load_settings().get('console_port') or 5001)
+    except Exception:
+        port = '5001'
+    wifi_if = _conn_wifi_iface()
+    here = ''
+    try:
+        here = (request.host or '').rsplit(':', 1)[0].strip('[]')
+    except Exception:
+        here = ''
+    addrs = []
+    info = _conn_local_network(lambda *_a, **_k: None)
+    for i in info.get('interfaces', []):
+        name = (i.get('iface') or '').strip()
+        ip = (i.get('ip') or '').strip()
+        if not name or not ip or name == 'lo':
+            continue
+        if name.startswith(('docker', 'veth', 'virbr', 'br-', 'cni', 'flannel', 'tailscale', 'wg')):
+            continue  # internal / overlay bridges — not a LAN reach path
+        addrs.append({
+            'iface': name,
+            'kind': 'wifi' if name == wifi_if else 'ethernet',
+            'ip': ip,
+            'url': 'https://%s:%s' % (ip, port),
+            'current': bool(here) and ip == here,
+        })
+    # Ethernet first, then WiFi (mirrors the "unplug Ethernet → fall to WiFi" story).
+    addrs.sort(key=lambda a: (a['kind'] != 'ethernet', a['iface']))
+    return {'port': port, 'addresses': addrs,
+            'has_wifi': any(a['kind'] == 'wifi' for a in addrs),
+            'has_ethernet': any(a['kind'] == 'ethernet' for a in addrs)}
+
+
+@app.route('/api/connectivity/addresses')
+@login_required
+def connectivity_addresses_api():
+    return jsonify(_conn_reach_addresses())
+
+
 # ── Leg 6c — CURRENT + FORGET (which network the box is on; drop a saved one) ──
 def _conn_wifi_current():
     """SSID the box is CURRENTLY associated to (''=not connected). Reads `iw dev`
@@ -9548,6 +9599,7 @@ def connectivity_setup_ap_config_api():
 def connectivity_setup_ap_start_api():
     if not _conn_wifi_iface():
         return jsonify({'success': False, 'error': 'No wireless interface on this box — cannot broadcast a setup network.'}), 400
+    _ensure_nm_wifi()  # RHEL: the NM hotspot (mode=ap) path needs NetworkManager-wifi installed
     # Start the root service through the broker. This SEVERS any wifi uplink (the
     # radio becomes the AP), so the HTTP response is sent before the switch lands;
     # the operator reconnects locally to the setup wifi.
@@ -37512,6 +37564,15 @@ textarea.form-input{resize:vertical}
     <div id="verify-vantage" style="margin-top:12px;font-size:11px;color:var(--text-dim)"></div>
   </div>
 
+  <div class="card" id="reach-card">
+    <div class="card-title">Reaching This Box</div>
+    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px">
+      The console (<b>:<span id="reach-port">5001</span></b>) answers at every address below right now. <b>Copy the WiFi one before you unplug Ethernet</b> — that is where you reconnect once the box is wireless. Nothing here is broadcast; it just reads this box&#39;s own addresses.
+    </div>
+    <div id="reach-list" style="font-size:12px;color:var(--text-dim)">Loading…</div>
+    <div style="margin-top:10px"><button class="control-btn" onclick="loadReach()">Refresh</button></div>
+  </div>
+
   <div class="card" id="wifi-card">
     <div class="card-title">WiFi Networks</div>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
@@ -37954,6 +38015,35 @@ async function refreshWifiSaved(){
     }
   }catch(e){}
 }
+async function loadReach(){
+  try{
+    const r = await fetch('/api/connectivity/addresses');
+    const d = await r.json();
+    const el = document.getElementById('reach-list');
+    const pe = document.getElementById('reach-port'); if(pe && d.port){ pe.textContent = d.port; }
+    const a = d.addresses || [];
+    if(!a.length){ el.textContent = 'No LAN addresses detected yet.'; return; }
+    el.innerHTML = a.map(function(x){
+      const isWifi = x.kind === 'wifi';
+      const label = (isWifi ? 'WiFi · ' : 'Ethernet · ') + esc(x.iface);
+      const here = x.current ? '<span style="color:var(--green);font-size:11px;margin-left:8px">← you are here</span>' : '';
+      const hint = (isWifi && !x.current) ? '<div style="font-size:11px;color:var(--text-dim);margin-top:3px">↳ use this after you unplug Ethernet</div>' : '';
+      const jurl = JSON.stringify(x.url).replace(/"/g,'&quot;');
+      return '<div style="padding:10px 12px;background:#0a0e1a;border:1px solid ' + (x.current ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+        + '<div style="display:flex;align-items:center;gap:10px">'
+        + '<span class="dot" style="background:' + (isWifi ? 'var(--accent)' : 'var(--green)') + ';flex-shrink:0"></span>'
+        + '<span style="flex:1;min-width:0;color:var(--text-primary);font-size:13px">' + label + '<span style="color:var(--text-dim);font-family:monospace;margin-left:8px">' + esc(x.ip) + '</span>' + here + '</span>'
+        + '<button type="button" onclick="copyReach(' + jurl + ',this)" title="Copy the console URL" style="background:rgba(59,130,246,.12);color:var(--accent);border:1px solid rgba(59,130,246,.3);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;white-space:nowrap">Copy URL</button>'
+        + '</div>'
+        + '<div style="font-size:11px;color:var(--text-dim);font-family:monospace;margin-top:5px;word-break:break-all">' + esc(x.url) + '</div>'
+        + hint
+        + '</div>';
+    }).join('');
+  }catch(e){ const el=document.getElementById('reach-list'); if(el){ el.textContent='Could not read addresses.'; } }
+}
+function copyReach(url, btn){
+  try{ navigator.clipboard.writeText(url); const t=btn.textContent; btn.textContent='Copied'; setTimeout(function(){ btn.textContent=t; }, 1200); }catch(e){}
+}
 async function forgetWifi(ssid, isCurrent){
   let msg = 'Forget “' + ssid + '”? The box will no longer join it automatically.';
   if(isCurrent){ msg = 'Forget “' + ssid + '” — the network the box is using RIGHT NOW?\\n\\nThis disconnects the box. If you are managing it remotely you will lose access unless the Setup WiFi is set up to catch it. Only do this if you are near the box.'; }
@@ -38038,6 +38128,8 @@ setInterval(function(){ if(document.getElementById('anchor-card').style.display 
 refreshAnchorStatus();
 refreshWifiSaved();
 refreshSetupAp();
+loadReach();
+setInterval(loadReach, 15000);
 setInterval(refreshSetupAp, 7000);
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
