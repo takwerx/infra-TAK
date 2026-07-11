@@ -9757,6 +9757,19 @@ def _conn_join_best_saved():
             rr = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', name]),
                                 capture_output=True, text=True, timeout=40)
             if rr.returncode == 0:
+                # Uplink changed interface/address — bounce the relay tunnel.
+                # Kernel WireGuard caches the peer's source address; after moving
+                # from ethernet to wifi it can keep stamping the OLD source and
+                # never complete a handshake (field 2026-07-11: OXFORD joined,
+                # default route correct via wlp1s0, tunnel stayed dead until the
+                # cable returned). A wg-quick restart resets the socket; the
+                # relay reconnects in ~2s. No-op when no relay is provisioned.
+                if os.path.exists('/etc/wireguard/%s.conf' % _CONN_WG_IF):
+                    try:
+                        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'wg-quick@%s' % _CONN_WG_IF]),
+                                       capture_output=True, text=True, timeout=30)
+                    except Exception:
+                        pass
                 return
         except Exception:
             continue

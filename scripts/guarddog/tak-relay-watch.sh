@@ -90,6 +90,19 @@ else
 fi
 echo "$FAIL_COUNT" > "$FAIL_COUNT_FILE"
 
+# Self-heal BEFORE alerting: exactly once per outage, at the sustained threshold,
+# bounce the tunnel. Kernel WireGuard caches the peer's source address — after an
+# uplink move (ethernet -> wifi) it can keep stamping the old source and never
+# handshake again (field 2026-07-11: correct wifi route, dead tunnel until the
+# cable returned). A wg-quick restart resets the socket and reconnects in ~2s;
+# it also cures a wedged tunnel after relay-side restarts. Harmless if the real
+# cause is elsewhere (relay down, no egress) — the alert below still fires on
+# the next stale check.
+if [ "$FAIL_COUNT" -eq "$SUSTAINED_FAILS" ] && [ -f "/etc/wireguard/${WG_IF:-wg0}.conf" ]; then
+  systemctl restart "wg-quick@${WG_IF:-wg0}" >/dev/null 2>&1 || true
+  echo "$(date): Relay tunnel stale ${FAIL_COUNT} checks — self-heal: restarted wg-quick@${WG_IF:-wg0}" >> /var/log/takguard/restarts.log
+fi
+
 if [ "$FAIL_COUNT" -ge "$SUSTAINED_FAILS" ]; then
   if [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find $ALERT_SENT_FILE -mmin +60 2>/dev/null)" ]; then
     touch "$ALERT_SENT_FILE"
