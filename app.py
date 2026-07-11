@@ -67667,7 +67667,44 @@ def _startup_ensure_hardening_posture():
     except Exception as _e:
         print('[startup-posture] skipped (non-fatal): %s' % str(_e)[:160], flush=True)
 
+
+def _startup_ensure_console_ports():
+    """Self-heal the console/Caddy firewall ports on every console start (= every
+    boot). RHEL field-hit 2026-07-11: after a reboot, 80/443/5001 were GONE from
+    firewalld — SSH + the TAK ports survived (those are --permanent) but the console
+    (5001) AND the FQDN-via-Caddy (80/443) were firewall-dead, locking the operator
+    out both ways. RHEL-ONLY: firewalld drops any rule that isn't --permanent on
+    reboot; Ubuntu's ufw persists rules, so this never bites there (hence VPS boxes
+    'never lose ports'). _fw_allow adds --permanent, so re-asserting here makes the
+    ports durable across every future reboot. Idempotent (re-adding an open port is a
+    no-op). The INVERSE of _startup_ensure_hardening_posture (which re-CLOSES 5001 on
+    a Hardened box): here we keep 5001 open on Standard boxes, and always keep Caddy's
+    80/443 open when the box fronts an FQDN so the reachable-by-name path survives
+    reboots too."""
+    try:
+        if _fw_backend() != 'firewalld':
+            return  # ufw persists rules across reboots — only firewalld loses runtime-only
+        try:
+            hardened = (load_hardening().get('posture') or 'standard') == 'hardened'
+        except Exception:
+            hardened = False
+        # 5001: the console's own port — open on a Standard box. A Hardened box
+        # deliberately closes it (_startup_ensure_hardening_posture owns that).
+        if not hardened:
+            try:
+                _fw_allow(int(load_settings().get('console_port') or 5001), 'tcp')
+            except Exception:
+                _fw_allow(5001, 'tcp')
+        # 80 + 443: Caddy fronts the FQDN/console vhost whenever ssl is fqdn/custom —
+        # needed on BOTH postures (a Hardened box reaches the console via Caddy 443).
+        if (load_settings().get('ssl_mode') or '') in ('fqdn', 'custom'):
+            _fw_allow(80, 'tcp')
+            _fw_allow(443, 'tcp')
+    except Exception as _e:
+        print('[startup-ports] console-ports ensure warning (non-fatal): %s' % str(_e)[:160], flush=True)
+
 _startup_ensure_hardening_posture()
+_startup_ensure_console_ports()
 
 
 def _startup_ensure_server_one_ssh_key():
