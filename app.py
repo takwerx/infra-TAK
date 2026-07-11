@@ -9332,12 +9332,28 @@ def connectivity_addresses_api():
 
 # ── Leg 6c — CURRENT + FORGET (which network the box is on; drop a saved one) ──
 def _conn_wifi_current():
-    """SSID the box is CURRENTLY associated to (''=not connected). Reads `iw dev`
-    (broker-gated, cross-platform) — the associated interface prints an `ssid`
-    line. No nmcli-specific shape needed."""
+    """SSID the box is CURRENTLY associated to (''=not connected). Prefers nmcli's
+    active-connection view — reliable on RHEL and works even when the radio can't
+    scan (associated + on Ethernet). Falls back to `iw dev`. Field-hit 2026-07-11:
+    on a box connected to OXFORD, `iw dev` printed NO `ssid` line (driver quirk), so
+    the console wrongly showed the live network as 'not in range' instead of
+    'connected now'. Our added profiles use con-name==SSID, so the active connection
+    name IS the SSID."""
     iface = _conn_wifi_iface()
     if not iface:
         return ''
+    if shutil.which('nmcli'):
+        try:
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status']),
+                               capture_output=True, text=True, timeout=8)
+            for ln in (r.stdout or '').splitlines():
+                p = ln.split(':')
+                if len(p) >= 4 and p[0] == iface and p[1] == 'wifi' and p[2] == 'connected':
+                    name = ':'.join(p[3:]).strip()
+                    if name and name != '--':
+                        return name
+        except Exception:
+            pass
     try:
         _ensure_iw()
         r = subprocess.run(_sudo_wrap(['iw', 'dev']), capture_output=True, text=True, timeout=8)
@@ -38095,16 +38111,19 @@ async function refreshWifiSaved(){
       // Connected network first, then the rest alphabetically.
       const ordered = d.saved.slice().sort((a,b) => (a===cur?-1:b===cur?1:a.localeCompare(b)));
       const visible = d.visible || [];
+      // Empty visible = the radio couldn't scan (AP mode, OR associated + on Ethernet
+      // where the driver won't background-scan) — we do NOT actually know range, so
+      // don't label it or grey out Use (field-hit 2026-07-11: a box connected to
+      // OXFORD wrongly showed every network, including OXFORD, as "not in range").
+      const scanEmpty = visible.length === 0;
       let html = '<div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Known networks</div>';
       html += ordered.map(s => {
         const isCur = (s === cur);
-        // In AP mode we can't scan, so treat all as usable (unknown range) rather
-        // than greying out every Use button.
-        const inRange = isCur || apMode || visible.indexOf(s) !== -1;
+        const inRange = isCur || apMode || scanEmpty || visible.indexOf(s) !== -1;
         const j = JSON.stringify(s).replace(/"/g,'&quot;');
         const badge = isCur
           ? '<span style="color:var(--text-dim);font-size:11px">— connected now</span>'
-          : (apMode
+          : ((apMode || scanEmpty)
               ? ''
               : (inRange
                   ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
