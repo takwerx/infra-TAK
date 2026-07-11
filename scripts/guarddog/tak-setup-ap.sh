@@ -243,9 +243,33 @@ PAGE = ('<!doctype html><html><head><meta charset=utf-8>'
 BODY = PAGE.encode()
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(s):
-        # Apple/Android/MS captive probes and everything else all get the landing
-        # page with 200 so the OS shows a captive popup (a 200 'Success' body would
-        # instead make the OS think there's real internet and suppress the popup).
+        # Standard captive-portal contract: any request that is not for the portal
+        # itself gets a 302 to the plain-http portal URL; only the portal URL serves
+        # the landing page. Android needs the redirect as its portal signal — a
+        # direct 200-with-body on its probe (Samsung sends plain 'GET /', not
+        # generate_204) is classified as broken internet, NOT a portal, and no
+        # sign-in flow appears (field-hit 2026-07-11, Galaxy Tab S8). iOS follows
+        # the 302 to plain http and renders the landing page in CNA — only a 302
+        # to self-signed httpS would suppress the popup.
+        # Match the portal host:port EXACTLY. Samsung/Android-15 probes the bare
+        # gateway (Host: 10.42.0.1, no port) and must be 302d like any foreign
+        # host — a 200 there reads as broken-network, not portal (field-hit
+        # 2026-07-11, Galaxy Tab S8: startswith(IP) served it the landing page and
+        # no sign-in flow ever appeared). The redirect Location carries :8088, so
+        # the follow-up request Hosts as portal and gets the page.
+        # NOTE this python lives inside a double-quoted bash -c string: NO double
+        # quotes, backticks, or dollar signs anywhere in this heredoc.
+        host = s.headers.get('Host', '')
+        if host != '%s:%d' % (IP, PORT):
+            s.send_response(302)
+            s.send_header('Location', 'http://%s:%d/' % (IP, PORT))
+            s.send_header('Content-Length', '0')
+            s.send_header('Cache-Control', 'no-store')
+            s.end_headers()
+            return
+        # Request addressed to the portal itself: serve the landing page with 200
+        # (a 200 'Success' body on the probe host would instead make the OS think
+        # there's real internet and suppress the popup).
         s.send_response(200)
         s.send_header('Content-Type', 'text/html; charset=utf-8')
         s.send_header('Content-Length', str(len(BODY)))
@@ -289,10 +313,23 @@ autoconnect=false
 [wifi]
 mode=ap
 band=bg
+# Pin a universally-legal 2.4GHz channel. Left unpinned, NM can pick ch 12/13
+# (EU-only) and US-domain phones/tablets can't even SEE the setup SSID
+# (field-hit 2026-07-11: Android tablet blind to the AP on ch 13). The hostapd
+# path below already pins channel=6; keep the NM path identical.
+channel=6
 ssid=$AP_SSID
 
 [wifi-security]
 key-mgmt=wpa-psk
+# pmf=1 (disable) keeps NM from advertising WPA3-SAE transition mode (it
+# expands key-mgmt to 'WPA-PSK WPA-PSK-SHA256 SAE' otherwise). Older Android
+# EUDs refuse to associate to transition-mode APs entirely (field-hit
+# 2026-07-11: Android tablet 'tries' then drops back, zero frames reaching
+# the AP). Pure WPA2-PSK is the compatibility floor every EUD speaks; fine
+# for a short-lived, client-isolated provisioning AP. Matches the hostapd
+# path (wpa=2, WPA-PSK, no ieee80211w).
+pmf=1
 psk=$AP_PASS
 
 [ipv4]
