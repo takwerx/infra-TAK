@@ -135,6 +135,7 @@ restore_client(){
             for _p in 80 443 8088 "$CONSOLE_PORT"; do
                 firewall-cmd --zone="$FWZONE" --remove-port="${_p}/tcp" >>"$LOG" 2>/dev/null || true
             done
+            firewall-cmd --zone="$FWZONE" --remove-forward-port="port=80:proto=tcp:toport=8088:toaddr=${AP_IP}" >>"$LOG" 2>/dev/null || true
         fi
         ip addr flush dev "$IFACE" 2>/dev/null
         ip link set "$IFACE" down 2>/dev/null
@@ -194,7 +195,15 @@ apply_isolation(){
         for _p in 80 443 8088 "$CONSOLE_PORT"; do
             firewall-cmd --zone="$FWZONE" --add-port="${_p}/tcp" >>"$LOG" 2>&1 || true
         done
-        log "apply_isolation: opened captive/console ports on firewalld zone $FWZONE"
+        # Captive redirect, RHEL/nftables equivalent of the raw `iptables REDIRECT`
+        # below (which is a no-op under firewalld): DNAT AP-client :80 -> the captive
+        # responder :8088 so the OS captive-check (captive.apple.com etc., pointed at us
+        # by the dnsmasq wildcard) lands on the dumb 200 page and the "join" popup fires.
+        # Without it, :80 is Caddy, which answers with a redirect and SUPPRESSES the
+        # popup (field gap 2026-07-11 vs cfd2474's hostapd+iptables DNAT that pops
+        # reliably on Debian). Scoped to nm-shared so only AP clients are affected.
+        firewall-cmd --zone="$FWZONE" --add-forward-port="port=80:proto=tcp:toport=8088:toaddr=${AP_IP}" >>"$LOG" 2>&1 || true
+        log "apply_isolation: opened captive/console ports + :80->:8088 captive DNAT on firewalld zone $FWZONE"
     fi
 
     # captive :80 responder on :8088; redirect AP :80 to it. Serves a real HTML

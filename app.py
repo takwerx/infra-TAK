@@ -9158,21 +9158,13 @@ def _conn_wifi_add(ssid, psk):
         r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
         if r.returncode != 0:
             return False, (r.stderr or r.stdout or 'nmcli profile add failed').strip()[:200]
-        # Provisioning from the Setup AP: stop it AND explicitly activate the profile
-        # we just added. RHEL gap (field-hit 2026-07-11 home test): coming OUT of AP
-        # mode NM does NOT reliably auto-rejoin — the radio comes up idle, the box stays
-        # offline, and the watcher re-broadcasts the AP, so the add-wifi-from-AP switch
-        # never completes (loop). A manual `nmcli connection up <ssid>` works, so make
-        # the handoff explicit here. Detached so this API returns before the AP drops
-        # (the browser is ON the AP and loses it regardless); the switch finishes
-        # server-side and the box lands on the new network.
-        if _conn_setup_ap_active():
-            def _switch_from_ap(_ssid):
-                subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
-                               capture_output=True, text=True, timeout=60)
-                subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', _ssid]),
-                               capture_output=True, text=True, timeout=60)
-            threading.Thread(target=_switch_from_ap, args=(ssid,), daemon=True).start()
+        # ADDITIVE-ONLY, even from the Setup AP (2026-07-11 redesign). Honor the card's
+        # promise "Adding a network never disconnects the one you're on": just save the
+        # profile (autoconnect=yes) and leave the AP broadcasting, so the operator can
+        # pre-provision several networks before committing. The SWITCH to a saved network
+        # happens ONLY when they explicitly hit "Stop Setup WiFi" (setup-ap/stop ->
+        # _conn_join_best_saved), which is where the deterministic join-out-of-AP-mode
+        # now lives (NM autoconnect coming out of AP mode is unreliable on RHEL).
         return True, ''
     # netplan path (Ubuntu).
     f = _conn_wifi_netplan_file()
@@ -9236,9 +9228,13 @@ def _conn_wifi_add(ssid, psk):
         # netplan apply, so the box joins the just-added network (in range at the
         # new location) and drops the AP in one step. Otherwise apply directly
         # (additive — doesn't drop the current connection).
+        # ADDITIVE-ONLY on the Setup AP (2026-07-11 redesign): the netplan config is
+        # written + validated above but deliberately NOT applied here — leave the AP
+        # broadcasting and the radio untouched so the operator can pre-provision more
+        # networks. The switch happens only on the explicit "Stop Setup WiFi", whose
+        # teardown (restore_client) runs `netplan apply` and joins the saved network.
+        # Off the AP, apply now (additive — doesn't drop the current connection).
         if _conn_setup_ap_active():
-            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
-                           capture_output=True, text=True, timeout=60)
             return True, ''
         appl = _run_priv_chain([['netplan', 'apply']], mode='and')
         if not appl or appl.returncode != 0:
@@ -9680,6 +9676,43 @@ def connectivity_setup_ap_start_api():
     return jsonify({'success': True})
 
 
+def _conn_join_best_saved():
+    """After the Setup AP stops (the explicit 'done — switch now' action; add is
+    additive), join the best saved CLIENT wifi. NM's autoconnect coming out of AP mode
+    is unreliable on RHEL (radio comes up idle -> box offline -> watcher re-broadcasts
+    the AP), so do it explicitly. Prefers in-range saved SSIDs (skips a slow 'up'
+    timeout on out-of-range profiles), never touches the takwerx-hotspot AP profile.
+    Best-effort; runs detached from the stop API."""
+    if not shutil.which('nmcli'):
+        return
+    time.sleep(2)  # let the AP teardown (restore_client) free + re-enable the radio
+    try:
+        r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']),
+                           capture_output=True, text=True, timeout=10)
+        saved = []
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.rsplit(':', 1)
+            if len(parts) == 2 and 'wireless' in parts[1] and parts[0] != 'takwerx-hotspot':
+                saved.append(parts[0])
+    except Exception:
+        saved = []
+    if not saved:
+        return
+    try:
+        visible = set(_conn_wifi_visible())
+    except Exception:
+        visible = set()
+    ordered = [n for n in saved if n in visible] + [n for n in saved if n not in visible]
+    for name in ordered:
+        try:
+            rr = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', name]),
+                                capture_output=True, text=True, timeout=40)
+            if rr.returncode == 0:
+                return
+        except Exception:
+            continue
+
+
 @app.route('/api/connectivity/setup-ap/stop', methods=['POST'])
 @login_required
 def connectivity_setup_ap_stop_api():
@@ -9687,6 +9720,10 @@ def connectivity_setup_ap_stop_api():
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'stop failed').strip()[:200]}), 500
+    # Stopping the AP is now the explicit "done provisioning — switch to a saved
+    # network" step (add is additive). Deterministically join the best saved client
+    # wifi in a detached thread (NM autoconnect out of AP mode is unreliable on RHEL).
+    threading.Thread(target=_conn_join_best_saved, daemon=True).start()
     return jsonify({'success': True})
 
 
@@ -38186,7 +38223,7 @@ async function addWifi(){
       body: JSON.stringify({ssid: ssid, password: psk})});
     const d = await r.json();
     if(d.success){
-      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '”.</span> The box will join it automatically when in range.';
+      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '” to this box’s WiFi list.</span> Nothing else disconnects. It joins automatically when in range — or, if you’re on the Setup WiFi, turn it off below to switch to it now.';
       document.getElementById('wifi-psk').value = '';
       refreshWifiSaved();
     } else { st.textContent = d.error || 'Could not add network.'; }
