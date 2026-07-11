@@ -127,8 +127,11 @@ restore_client(){
         # RHEL/firewalld: remove the runtime captive/console port opens added in
         # apply_isolation (the iface is still in its zone here — nmcli down is below).
         if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-            FWZONE="$(firewall-cmd --get-zone-of-interface="$IFACE" 2>/dev/null)"
-            [ -n "$FWZONE" ] || FWZONE=nm-shared
+            # HARDCODED nm-shared — never --get-zone-of-interface here: on teardown it
+            # can resolve to 'public' and this --remove-port would then strip the
+            # console's legit 80/443/5001 off the PUBLIC zone (field-hit 2026-07-11,
+            # bricked console/FQDN access). The AP's ports only ever live in nm-shared.
+            FWZONE=nm-shared
             for _p in 80 443 8088 "$CONSOLE_PORT"; do
                 firewall-cmd --zone="$FWZONE" --remove-port="${_p}/tcp" >>"$LOG" 2>/dev/null || true
             done
@@ -182,8 +185,12 @@ apply_isolation(){
     # — the firewalld equivalent of the iptables allowlist above. Isolation still
     # holds: only these ports are opened, and the zone's default-reject stands.
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-        FWZONE="$(firewall-cmd --get-zone-of-interface="$IFACE" 2>/dev/null)"
-        [ -n "$FWZONE" ] || FWZONE=nm-shared
+        # HARDCODED nm-shared — the NM method=shared AP interface lives in firewalld's
+        # nm-shared zone. Do NOT derive the zone from the interface: during teardown
+        # `--get-zone-of-interface` can resolve to 'public', and then restore_client's
+        # `--remove-port` strips the console's legit 80/443/5001 off the PUBLIC zone —
+        # bricking console + FQDN access mid AP cycle (field-hit 2026-07-11).
+        FWZONE=nm-shared
         for _p in 80 443 8088 "$CONSOLE_PORT"; do
             firewall-cmd --zone="$FWZONE" --add-port="${_p}/tcp" >>"$LOG" 2>&1 || true
         done
