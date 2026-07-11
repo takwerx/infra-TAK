@@ -9158,11 +9158,21 @@ def _conn_wifi_add(ssid, psk):
         r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
         if r.returncode != 0:
             return False, (r.stderr or r.stdout or 'nmcli profile add failed').strip()[:200]
-        # Provisioning from the Setup AP: stop it so NM autoconnects to the new
-        # profile (the AP owns the radio until then).
+        # Provisioning from the Setup AP: stop it AND explicitly activate the profile
+        # we just added. RHEL gap (field-hit 2026-07-11 home test): coming OUT of AP
+        # mode NM does NOT reliably auto-rejoin — the radio comes up idle, the box stays
+        # offline, and the watcher re-broadcasts the AP, so the add-wifi-from-AP switch
+        # never completes (loop). A manual `nmcli connection up <ssid>` works, so make
+        # the handoff explicit here. Detached so this API returns before the AP drops
+        # (the browser is ON the AP and loses it regardless); the switch finishes
+        # server-side and the box lands on the new network.
         if _conn_setup_ap_active():
-            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
-                           capture_output=True, text=True, timeout=60)
+            def _switch_from_ap(_ssid):
+                subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                               capture_output=True, text=True, timeout=60)
+                subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', _ssid]),
+                               capture_output=True, text=True, timeout=60)
+            threading.Thread(target=_switch_from_ap, args=(ssid,), daemon=True).start()
         return True, ''
     # netplan path (Ubuntu).
     f = _conn_wifi_netplan_file()
