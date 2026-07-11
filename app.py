@@ -3374,6 +3374,18 @@ def _login_logo_url():
         return url_for('static', filename=LOGIN_LOGO_FILENAME)
     return None
 
+def _safe_next_path():
+    """A validated SAME-SITE path from ?next= (or the posted form) for the post-login
+    redirect. Used by the setup-AP captive to deep-link straight to the light
+    /connectivity page on the offline AP (the heavy dashboard crawls with no internet).
+    Local absolute paths only — never an off-site URL (open-redirect guard). Empty if
+    absent/unsafe → caller falls back to the normal console page. The login form has no
+    action= so it POSTs to the current URL, preserving ?next through the round-trip."""
+    nxt = (request.args.get('next') or request.form.get('next') or '').strip()
+    if nxt.startswith('/') and not nxt.startswith('//') and '://' not in nxt and '\\' not in nxt:
+        return nxt
+    return ''
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'GET' and _apply_authentik_session():
@@ -3391,7 +3403,7 @@ def login():
             session['authenticated'] = True
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
-            return redirect(url_for('console_page'))
+            return redirect(_safe_next_path() or url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     return render_template_string(LOGIN_TEMPLATE, error=None, version=VERSION, login_logo_url=logo_url)
 
@@ -3417,7 +3429,7 @@ def index():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['authenticated'] = True
             audit('auth:login-password', 'console password / break-glass')
-            return redirect(url_for('console_page'))
+            return redirect(_safe_next_path() or url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
         return render_template_string(LOGIN_TEMPLATE, error=None, version=VERSION, login_logo_url=logo_url)

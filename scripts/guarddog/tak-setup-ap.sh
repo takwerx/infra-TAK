@@ -58,13 +58,21 @@ fi
 # Caddy serves the real cert → no warning). Otherwise the box's own self-signed
 # https (accept-the-warning floor for fresh/no-domain boxes).
 CONSOLE_URL="${CONSOLE_URL:-}"
+# The OFFLINE setup AP cannot do SSO (Caddy :443 -> Authentik forward_auth hangs with
+# no internet) and the full dashboard crawls offline (dozens of subprocess probes). So
+# send the laptop STRAIGHT to the light /connectivity page on the console's OWN port
+# (bypasses Caddy/Authentik), addressed by the FQDN by name when we have one (the AP
+# wildcard DNS resolves it to the box) so it is still "the domain name". Self-signed
+# cert on :CONSOLE_PORT -> accept-the-warning floor (a valid-cert + no-SSO path would
+# need a Caddy setup-vhost, tracked separately). Field-hit 2026-07-10 home AP test.
+NEXT_PATH="/login?next=/connectivity"
 if [ -n "$CONSOLE_URL" ]; then
-    OPEN_URL="$CONSOLE_URL"
-    OPEN_TRUSTED=1
+    _fqdn_host="${CONSOLE_URL#*://}"; _fqdn_host="${_fqdn_host%%/*}"; _fqdn_host="${_fqdn_host%%:*}"
+    OPEN_URL="https://${_fqdn_host}:${CONSOLE_PORT}${NEXT_PATH}"
 else
-    OPEN_URL="https://${AP_IP}:${CONSOLE_PORT}/"
-    OPEN_TRUSTED=0
+    OPEN_URL="https://${AP_IP}:${CONSOLE_PORT}${NEXT_PATH}"
 fi
+OPEN_TRUSTED=0
 # WPA2 requires 8..63 chars. If unset/short, generate a RANDOM PSK once and persist
 # it (root-600) — NEVER derive it from the hostname (finding B: the hostname is
 # advertised in the SSID, so a host-derived key is effectively public). The console
@@ -188,7 +196,7 @@ apply_isolation(){
     # at OPEN_URL: the trusted Caddy vhost by name when the box has a real cert (no
     # warning), else the box's self-signed https (accept-the-warning floor).
     iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-ports 8088
-    CAP_AP_IP="$AP_IP" CAP_URL="$OPEN_URL" CAP_IPURL="https://${AP_IP}:${CONSOLE_PORT}/" CAP_TRUSTED="$OPEN_TRUSTED" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
+    CAP_AP_IP="$AP_IP" CAP_URL="$OPEN_URL" CAP_IPURL="https://${AP_IP}:${CONSOLE_PORT}${NEXT_PATH}" CAP_TRUSTED="$OPEN_TRUSTED" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
 import os, http.server, socketserver
 PORT = 8088
 IP = os.environ.get('CAP_AP_IP', '10.42.0.1')
