@@ -252,6 +252,15 @@ method=shared
 method=ignore
 EOF
         chmod 600 "$NMCONN"
+        # NM method=shared serves DHCP + DNS via its own dnsmasq (the package is
+        # pulled by the console before start, while the box was still online). Drop a
+        # shared-dnsmasq wildcard so EVERY name — including the box FQDN — resolves to
+        # the AP IP on the isolated setup net; that is what makes the captive/console
+        # reachable BY NAME here, mirroring the hostapd path's `address=/#/AP_IP`.
+        # NM includes /etc/NetworkManager/dnsmasq-shared.d/*.conf in the shared dnsmasq.
+        mkdir -p /etc/NetworkManager/dnsmasq-shared.d
+        printf 'address=/#/%s\n' "$AP_IP" > /etc/NetworkManager/dnsmasq-shared.d/50-takwerx-captive.conf
+        chmod 644 /etc/NetworkManager/dnsmasq-shared.d/50-takwerx-captive.conf
         nmcli connection reload
         nmcli connection up takwerx-hotspot
         set +e

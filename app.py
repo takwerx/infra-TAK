@@ -9636,6 +9636,18 @@ def connectivity_setup_ap_start_api():
     if not _conn_wifi_iface():
         return jsonify({'success': False, 'error': 'No wireless interface on this box — cannot broadcast a setup network.'}), 400
     _ensure_nm_wifi()  # RHEL: the NM hotspot (mode=ap) path needs NetworkManager-wifi installed
+    # RHEL: the NM hotspot uses method=shared, whose DHCP + captive DNS is served by
+    # dnsmasq — a fresh Rocky box lacks it, so a joined client gets NO IP (browser:
+    # ERR_INTERNET_DISCONNECTED) and the FQDN can't resolve on the isolated AP net.
+    # Pull it NOW while the box is still online (this endpoint is reached over the very
+    # uplink the AP is about to replace). The captive DNS wildcard that makes the FQDN
+    # resolve to the box is written root-side by the engine (tak-setup-ap.sh) — the
+    # console broker deliberately can't write /etc/NetworkManager (not in PATH_ALLOW).
+    if _distro_family() == 'rhel':
+        try:
+            _pkg_install('dnsmasq', timeout=300)
+        except Exception:
+            pass
     # Start the root service through the broker. This SEVERS any wifi uplink (the
     # radio becomes the AP), so the HTTP response is sent before the switch lands;
     # the operator reconnects locally to the setup wifi.
