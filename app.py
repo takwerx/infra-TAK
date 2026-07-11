@@ -315,6 +315,21 @@ def _detached_console_restart(delay=2):
     threading.Thread(target=_go, daemon=True).start()
 
 
+def _detached_power_action(verb, delay=2):
+    """Power the box off / reboot it after a short delay, detached, so the current
+    HTTP response returns before the box halts. Mirrors _detached_console_restart:
+    systemd owns the transition, so it completes even though this thread is killed.
+    `verb` is 'poweroff' or 'reboot' — both broker-allowed (verb-gated)."""
+    def _go():
+        time.sleep(delay)
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', verb]),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
@@ -5495,6 +5510,27 @@ def console_restart_safe():
             pass
 
     return jsonify({'safe': busy is None, 'reason': busy})
+
+
+@app.route('/api/console/power', methods=['POST'])
+@login_required
+def console_power_api():
+    """Power off / reboot the box from the console (no SSH). Destructive and
+    outward-facing — poweroff needs a physical power-on to return — so it
+    re-confirms the console password (mirrors the dev-channel-switch gate) ON TOP
+    of @login_required, so it can't be an accidental click. Runs the systemctl
+    verb through the broker (verb-gated: poweroff + reboot are allowlisted),
+    detached so the HTTP response returns before the box goes down."""
+    data = request.get_json(silent=True) or {}
+    action = (data.get('action') or '').strip()
+    password = data.get('password') or ''
+    if action not in ('poweroff', 'reboot'):
+        return jsonify({'success': False, 'error': 'action must be "poweroff" or "reboot".'}), 400
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'success': False, 'error': 'Incorrect console password.', 'need_password': True}), 403
+    _detached_power_action(action, delay=2)
+    return jsonify({'success': True, 'action': action})
 
 
 _CONSOLE_UNIT = '/etc/systemd/system/takwerx-console.service'
@@ -64273,7 +64309,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endfor %}
 </div>
 <div class="section-title">Console</div>
-<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button><a href="/firewall" id="exp-badge-console" title="Service exposure — click for detail" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;text-decoration:none;border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8"><span id="exp-badge-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8"></span><span id="exp-badge-text">exposure…</span></a></div>
+<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button><button type="button" onclick="promptPower('reboot')" title="Reboot this box (asks for your console password)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot</button><button type="button" onclick="promptPower('poweroff')" title="Power off this box (asks for your console password)" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Power Off</button><a href="/firewall" id="exp-badge-console" title="Service exposure — click for detail" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;text-decoration:none;border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8"><span id="exp-badge-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8"></span><span id="exp-badge-text">exposure…</span></a></div>
 <script>
 (function(){
   var a=document.getElementById('exp-badge-console');if(!a)return;
@@ -64299,6 +64335,19 @@ body{display:flex;flex-direction:row;min-height:100vh}
     <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
       <button onclick="closeDevModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
       <button onclick="confirmDevChannel()" style="padding:7px 16px;background:var(--yellow);color:#0f172a;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Switch to dev</button>
+    </div>
+  </div>
+</div>
+<div id="power-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:340px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div id="power-pw-title" style="font-size:13px;font-weight:700;color:var(--yellow);margin-bottom:6px">⚠ Power</div>
+    <div id="power-pw-msg" style="font-size:11px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">Enter your console password to confirm.</div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="power-pw-input" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmPower()">
+    <div id="power-pw-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button onclick="closePowerModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button id="power-pw-confirm" onclick="confirmPower()" style="padding:7px 16px;background:var(--yellow);color:#0f172a;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Confirm</button>
     </div>
   </div>
 </div>
@@ -64791,6 +64840,50 @@ async function confirmDevChannel(){
             setTimeout(function(){var s=document.getElementById('ch-status');if(s)s.textContent='';},3000);
         }else{if(err)err.textContent=d.error||'Incorrect password';}
     }catch(e){if(err)err.textContent='Error: '+e.message;}
+}
+var _powerAction='';
+function promptPower(action){
+    _powerAction=action;
+    var m=document.getElementById('power-pw-modal');
+    var inp=document.getElementById('power-pw-input');
+    var err=document.getElementById('power-pw-err');
+    var ttl=document.getElementById('power-pw-title');
+    var msg=document.getElementById('power-pw-msg');
+    var btn=document.getElementById('power-pw-confirm');
+    if(action==='poweroff'){
+      if(ttl)ttl.textContent='⚠ Power off this box';
+      if(msg)msg.textContent='The box shuts down completely — you will need physical access to power it back on. Enter your console password to confirm.';
+      if(btn){btn.textContent='Power Off';btn.style.background='var(--red)';btn.style.color='#fff';}
+    }else{
+      if(ttl)ttl.textContent='⚠ Reboot this box';
+      if(msg)msg.textContent='The box restarts — you will lose the console for about a minute while it comes back. Enter your console password to confirm.';
+      if(btn){btn.textContent='Reboot';btn.style.background='var(--yellow)';btn.style.color='#0f172a';}
+    }
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    if(btn)btn.disabled=false;
+    if(inp)inp.value='';
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closePowerModal(){
+    var m=document.getElementById('power-pw-modal');
+    if(m)m.style.display='none';
+}
+async function confirmPower(){
+    var inp=document.getElementById('power-pw-input');
+    var err=document.getElementById('power-pw-err');
+    var msg=document.getElementById('power-pw-msg');
+    var pw=(inp?inp.value:'').trim();
+    if(!pw){if(err){err.style.color='var(--red)';err.textContent='Password required';}return;}
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    try{
+        var r=await fetchRetry('/api/console/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:_powerAction,password:pw}),credentials:'same-origin'});
+        var d=await r.json();
+        if(d.success){
+            if(msg)msg.textContent=(_powerAction==='poweroff'?'Powering off now — this console will go offline in a moment.':'Rebooting now — the console will return in about a minute.');
+            if(err){err.style.color='var(--green)';err.textContent='Command sent.';}
+            var btn=document.getElementById('power-pw-confirm');if(btn)btn.disabled=true;
+        }else{if(err){err.style.color='var(--red)';err.textContent=d.error||'Incorrect password';}}
+    }catch(e){if(err){err.style.color='var(--red)';err.textContent='Error: '+e.message;}}
 }
 async function setUpdateChannel(ch){
     var st=document.getElementById('ch-status');

@@ -290,6 +290,7 @@ SYSTEMCTL_VERBS = {
     'is-failed', 'status', 'show', 'cat', 'daemon-reload', 'reset-failed',
     'list-units', 'list-timers', 'list-unit-files', 'kill',
     'reboot',                  # operator-gated reboot after a kernel patch
+    'poweroff',                # operator-gated power-off — console Power Off button, password-confirmed
 }
 
 # Coreutils whose path arguments MUST live inside PATH_ALLOW (and not PATH_DENY).
