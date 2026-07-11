@@ -116,6 +116,15 @@ restore_client(){
         while iptables -D DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null; do :; done
         iptables -F takwerx_setupap 2>/dev/null
         iptables -X takwerx_setupap 2>/dev/null
+        # RHEL/firewalld: remove the runtime captive/console port opens added in
+        # apply_isolation (the iface is still in its zone here — nmcli down is below).
+        if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+            FWZONE="$(firewall-cmd --get-zone-of-interface="$IFACE" 2>/dev/null)"
+            [ -n "$FWZONE" ] || FWZONE=nm-shared
+            for _p in 80 443 8088 "$CONSOLE_PORT"; do
+                firewall-cmd --zone="$FWZONE" --remove-port="${_p}/tcp" >>"$LOG" 2>/dev/null || true
+            done
+        fi
         ip addr flush dev "$IFACE" 2>/dev/null
         ip link set "$IFACE" down 2>/dev/null
     fi
@@ -155,6 +164,23 @@ apply_isolation(){
     # Docker publishes container ports via DNAT that bypasses INPUT; DOCKER-USER is the
     # sanctioned hook and is consulted before the per-container ACCEPTs. No-op if absent.
     iptables -I DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null || true
+
+    # RHEL/firewalld: the raw iptables above is a no-op under nftables, AND NM's
+    # method=shared drops the AP iface into the `nm-shared` zone (services: dhcp dns
+    # ssh + a priority-32767 reject) — so the captive + console HTTP ports are
+    # REJECTED and nothing HTTP is reachable on the AP (field-hit 2026-07-10, home
+    # Setup-AP test: DHCP worked, http/5001 refused). Open them on the AP iface's
+    # firewalld zone at runtime (cleared on reload/reboot; removed on AP stop below)
+    # — the firewalld equivalent of the iptables allowlist above. Isolation still
+    # holds: only these ports are opened, and the zone's default-reject stands.
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        FWZONE="$(firewall-cmd --get-zone-of-interface="$IFACE" 2>/dev/null)"
+        [ -n "$FWZONE" ] || FWZONE=nm-shared
+        for _p in 80 443 8088 "$CONSOLE_PORT"; do
+            firewall-cmd --zone="$FWZONE" --add-port="${_p}/tcp" >>"$LOG" 2>&1 || true
+        done
+        log "apply_isolation: opened captive/console ports on firewalld zone $FWZONE"
+    fi
 
     # captive :80 responder on :8088; redirect AP :80 to it. Serves a real HTML
     # landing page (200, tap-through button) — macOS's Captive Network Assistant
