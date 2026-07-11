@@ -895,6 +895,19 @@ generate_self_signed_cert
 # RHEL/SELinux: install the console policy module before the unit starts
 install_selinux_console_policy
 
+# RHEL ships journald with volatile storage (/run/log/journal) — every reboot
+# destroys the logs, which blinds post-incident diagnosis (field-hit 2026-07-11:
+# a power-cycle erased the entire failure window) and is a CJIS C3 audit gap.
+# Ubuntu defaults to auto/persistent already; assert it everywhere. Idempotent.
+if [ ! -f /etc/systemd/journald.conf.d/takwerx-persistent.conf ]; then
+    mkdir -p /var/log/journal /etc/systemd/journald.conf.d
+    printf '[Journal]\nStorage=persistent\n' > /etc/systemd/journald.conf.d/takwerx-persistent.conf
+    systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+    command -v restorecon >/dev/null 2>&1 && restorecon -R /var/log/journal >/dev/null 2>&1
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓ journald persistent storage enabled${NC}"
+fi
+
 # Privileged broker (v10.0.5): install + start the root mediation daemon BEFORE
 # the console, so the broker socket is live by the time the console comes up.
 # Additive — the console still runs as root; this just makes the broker path

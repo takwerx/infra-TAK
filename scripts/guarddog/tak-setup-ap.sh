@@ -293,6 +293,21 @@ start_ap(){
     trap 'log "start: FAILED — restoring client"; restore_client; echo "start-failed"; exit 9' ERR
 
     if have_nm; then
+        # Rocky/RHEL images ship NM with ignore-carrier=* — an unplugged NIC keeps
+        # its activation AND its metric-100 default route, blackholing all egress
+        # even after a successful wifi join (field-hit 2026-07-11: OXFORD leased in
+        # 2s post-Stop, tunnel dead until the cable returned). Assert carrier
+        # honoring for ethernet (wifi semantics untouched). Root-side here because
+        # the console broker deliberately cannot write /etc/NetworkManager. The
+        # console's join path ALSO explicitly disconnects cable-less ethernet
+        # (_conn_clear_dead_ethernet) — this conf is the boot-time belt.
+        NMCARRIER="/etc/NetworkManager/conf.d/99-takwerx-ethernet-carrier.conf"
+        if [ ! -f "$NMCARRIER" ]; then
+            printf '[device-takwerx-ethernet-carrier]\nmatch-device=type:ethernet\nignore-carrier=no\n' > "$NMCARRIER"
+            chmod 644 "$NMCARRIER"
+            systemctl reload NetworkManager 2>/dev/null || true
+            log "start: wrote $NMCARRIER (ethernet honors carrier loss)"
+        fi
         set -e
         nmcli radio wifi on
         nmcli device disconnect "$IFACE" 2>/dev/null || true

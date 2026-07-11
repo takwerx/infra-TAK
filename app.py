@@ -9692,6 +9692,35 @@ def connectivity_setup_ap_start_api():
     return jsonify({'success': True})
 
 
+def _conn_clear_dead_ethernet():
+    """Tear down ethernet connections whose cable is physically gone. Rocky/RHEL
+    images ship NetworkManager with ignore-carrier=* — an unplugged NIC KEEPS its
+    activation and its metric-100 default route, which blackholes all egress even
+    after a wifi join succeeds (field-hit 2026-07-11: OXFORD associated + leased in
+    2s after Stop, but the relay tunnel stayed dead until the cable came back —
+    every packet was routed into the dead wire). Only touches devices with
+    carrier=0; a NIC with a live cable is never disconnected. NM re-arms
+    autoconnect on the next carrier-up, so replugging the cable restores wired."""
+    try:
+        r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE', 'device', 'status']),
+                           capture_output=True, text=True, timeout=10)
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.split(':')
+            if len(parts) < 3 or parts[1] != 'ethernet' or not parts[2].startswith('connected'):
+                continue
+            dev = parts[0]
+            try:
+                with open('/sys/class/net/%s/carrier' % dev) as f:
+                    if f.read().strip() == '1':
+                        continue
+            except Exception:
+                continue  # cannot prove the cable is gone -> leave the device alone
+            subprocess.run(_sudo_wrap(['nmcli', 'device', 'disconnect', dev]),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+
 def _conn_join_best_saved():
     """After the Setup AP stops (the explicit 'done — switch now' action; add is
     additive), join the best saved CLIENT wifi. NM's autoconnect coming out of AP mode
@@ -9702,6 +9731,10 @@ def _conn_join_best_saved():
     if not shutil.which('nmcli'):
         return
     time.sleep(2)  # let the AP teardown (restore_client) free + re-enable the radio
+    # Kill any cable-less ethernet FIRST — its stale default route (RHEL
+    # ignore-carrier=*) outranks the wifi route and blackholes the box even after
+    # a perfect join.
+    _conn_clear_dead_ethernet()
     try:
         r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']),
                            capture_output=True, text=True, timeout=10)
