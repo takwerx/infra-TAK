@@ -4555,7 +4555,17 @@ def _w1_caddy_regen(log):
         val = subprocess.run('caddy validate --config %s --adapter caddyfile 2>&1' % CADDYFILE_PATH,
                              shell=True, capture_output=True, text=True, timeout=30)
         if val.returncode != 0:
-            log('W1: caddy validate FAILED: %s' % (val.stdout or val.stderr or '')[-200:]); return False
+            out = (val.stdout or val.stderr or '')
+            # On custom-cert (ssl_mode='custom') + non-root boxes this validate runs as
+            # takwerx, which can't traverse /var/lib/caddy (0750 caddy:caddy) to open the
+            # deployed cert copy — a FALSE fail (the caddy service reads it fine).
+            # Permission-denied is inconclusive, not a bad config: defer to the reload
+            # below, which validates as the caddy user and refuses a bad config anyway.
+            if 'permission denied' in out.lower():
+                log("W1: caddy pre-validate inconclusive (cert unreadable by console user); "
+                    "deferring to caddy's own reload validation")
+            else:
+                log('W1: caddy validate FAILED: %s' % out[-200:]); return False
     rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
     if rl.returncode != 0:
         log('W1: caddy reload error: %s' % (rl.stdout or rl.stderr or '')[-160:]); return False
