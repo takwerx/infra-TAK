@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.1-alpha)**
+**Current release: [v10.1.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.2-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.2-alpha — 2026-07-12 — Connectivity Wizard (beta): get any box online and reachable — homelab, on-prem, or in a truck
+
+**Headline: the Connectivity Wizard grows up into a field-ready (beta) tool for getting a box online and reachable anywhere — a permanent home rack, an on-prem server, or a portable kit on the move — plus power controls and platform fixes. Updating is recommended; healthy boxes are left untouched.** The wizard detects your network (clean public IP, carrier-grade NAT, double-NAT) and picks the right path. The big one for portable and CGNAT boxes: a **WireGuard relay on a free-tier cloud VM (e.g. Oracle Always-Free) gives your box the equivalent of a static public IP** — clients connect by name, no business ISP and no port-forwarding required. **Setup WiFi** turns a headless box with no connection into its own access point: strand it, walk up with a phone, join its network, and pick an uplink — it comes back reachable by name, proven end-to-end over cellular. **Reachability diagnostics are now honest** — instead of falsely reporting "not reachable" when a box simply can't probe its own public address (normal on cloud VMs and home routers), it says so plainly and points you to a quick phone-on-cellular check, and it self-installs a detection dependency that was missing after in-place updates. This release also adds **console Power Off / Reboot buttons** (password-confirmed), and a batch of platform reliability fixes for Rocky/RHEL and portable networking. Connectivity ships as **beta**. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.2-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.2-alpha).
 
 ### v10.1.1-alpha — 2026-07-09 — Stability & disk protection: stops runaway database growth, fixes downloads and video on standard installs, and quiets false alerts
 
