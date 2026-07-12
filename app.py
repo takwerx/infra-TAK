@@ -694,7 +694,7 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.3"   # v0.9.57.1: promoted dev→vetted — conn_max_age idle-CPU spin fix (#22580, fixed 2026.5.2); 2026.2.3→2026.5.3 jump validated live on CORAZ prod + test6/8/12 soak
-AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # under validation on dev channel — dramatiq broker race-condition + LDAP connection-reuse fixes (2026-07-12); CVE set already covered by 2026.5.1. Promote → VETTED once test12 soak is clean. Main stays gated at VETTED above.
+AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -21760,19 +21760,23 @@ def _get_authentik_latest_release_tag(use_cache=True):
 
 
 def _get_authentik_target_release(settings=None):
-    """Return the operator-approved Authentik version for this box's channel.
+    """Return the Authentik version this box's channel is allowed to update to.
 
-    Dev channel (update_channel='dev' in settings.json): AUTHENTIK_DEV_RELEASE — the
-    version currently under validation by the operator.
+    Dev channel (update_channel='dev'): whatever Authentik has shipped LATEST upstream.
+    Dev simply tracks the newest release — an update shows up the moment upstream ships
+    one, no pin editing required. Falls back to AUTHENTIK_DEV_RELEASE only if the GitHub
+    lookup is unavailable (offline / rate-limited).
 
     Main channel (default): AUTHENTIK_VETTED_RELEASE — the last fleet-validated release.
-    Customers on main are never offered an Authentik version that hasn't been explicitly
-    vetted and promoted by bumping AUTHENTIK_VETTED_RELEASE in a new infra-TAK release.
+    Customers on main are never offered a version that hasn't been explicitly vetted and
+    promoted by bumping AUTHENTIK_VETTED_RELEASE in a new infra-TAK release. This is the gate.
     """
     if settings is None:
         settings = load_settings()
     channel = (settings.get('update_channel') or 'main').strip().lower()
-    return AUTHENTIK_DEV_RELEASE if channel == 'dev' else AUTHENTIK_VETTED_RELEASE
+    if channel == 'dev':
+        return _get_authentik_latest_release_tag() or AUTHENTIK_DEV_RELEASE
+    return AUTHENTIK_VETTED_RELEASE
 
 
 def _get_authentik_version_info():
@@ -64691,7 +64695,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.get('upstream_newer') and v.get('upstream_latest') %} <span style="color:#f59e0b;font-size:10px" title="netbirdio shipped v{{ v.get('upstream_latest') }}, newer than the vetted pin — try on dev, promote to main if it passes">· ↑ v{{ v.get('upstream_latest') }} upstream</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.get('upstream_newer') and v.get('upstream_latest') %} <span style="color:#f59e0b;font-size:10px" title="netbirdio shipped v{{ v.get('upstream_latest') }}, newer than the vetted pin — try on dev, promote to main if it passes">· ↑ v{{ v.get('upstream_latest') }} upstream</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
