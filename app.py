@@ -37685,7 +37685,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
 .card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
 .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-item{background:var(--bg-deep);border-radius:8px;padding:12px 14px}
 .info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
 .info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
@@ -37694,11 +37694,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
 .control-btn:disabled{opacity:.5;cursor:default}
 .form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
-.form-input{width:100%;max-width:400px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;outline:none;transition:border-color .2s}
+.form-input{width:100%;max-width:400px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;outline:none;transition:border-color .2s}
 .form-input:focus{border-color:var(--accent)}
-.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#94a3b8;max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
 .intent-tiles{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.intent-tile{background:#0a0e1a;border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left;color:var(--text-primary);font-family:inherit}
+.intent-tile{background:var(--bg-deep);border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left;color:var(--text-primary);font-family:inherit}
 .intent-tile:hover{border-color:var(--border-hover)}
 .intent-tile.selected{border-color:var(--cyan);background:rgba(6,182,212,.06)}
 .intent-tile .t-emoji{font-size:26px}.intent-tile .t-title{font-size:14px;font-weight:700;margin:8px 0 4px;color:var(--text-primary)}
@@ -37714,7 +37714,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .hops .cgnat{color:var(--cyan);font-weight:700}.hops .private{color:var(--yellow)}.hops .public{color:var(--green)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
-.seg{display:inline-flex;background:#0a0e1a;border:1px solid var(--border);border-radius:9px;padding:3px;gap:3px;margin-bottom:20px}
+.seg{display:inline-flex;background:var(--bg-deep);border:1px solid var(--border);border-radius:9px;padding:3px;gap:3px;margin-bottom:20px}
 .seg-btn{padding:7px 20px;border:none;background:none;color:var(--text-dim);font-size:12px;font-weight:600;cursor:pointer;border-radius:6px;font-family:inherit;transition:all .15s}
 .seg-btn:hover{color:var(--text-secondary)}
 .seg-btn.active{background:var(--accent);color:#fff}
@@ -37818,7 +37818,7 @@ textarea.form-input{resize:vertical}
     <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
       <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
-      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls (anchor serves both)</span>
+      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls (anchor serves both)</span>
     </div>
     <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
@@ -38164,7 +38164,7 @@ function renderVerify(res){
     const green = v.state === 'green';
     const dotColor = green ? 'var(--green)' : (v.state === 'unverified' ? 'var(--yellow)' : (v.required ? 'var(--red)' : 'var(--yellow)'));
     let detail = green ? ('connected' + (v.ms != null ? ' · ' + v.ms + ' ms' : '')) : (v.hint || v.detail || 'no route');
-    rows.push('<div style="display:flex;align-items:center;gap:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
+    rows.push('<div style="display:flex;align-items:center;gap:12px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
       + '<span class="dot" style="background:' + dotColor + ';flex-shrink:0"></span>'
       + '<span style="font-family:\\'JetBrains Mono\\',monospace;font-size:13px;min-width:52px">' + esc(p) + '</span>'
       + '<span style="font-size:12px;color:var(--text-secondary);flex:1">' + esc(v.label || '') + (v.required ? '' : ' <span style="color:var(--text-dim)">(optional)</span>') + '</span>'
@@ -38302,7 +38302,7 @@ async function refreshWifiSaved(){
               : (inRange
                   ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
                   : '<span style="color:var(--text-dim);font-size:11px">not in range</span>'));
-        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:#0a0e1a;border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--bg-deep);border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
           + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : (inRange ? 'var(--green)' : 'var(--text-dim)')) + ';flex-shrink:0"></span>'
           + '<span style="flex:1;min-width:0;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px;overflow:hidden;text-overflow:ellipsis">' + esc(s) + ' ' + badge + '</span>'
           + (isCur ? '' : '<button type="button" onclick="useWifi(' + j + ')"' + (inRange ? '' : ' disabled') + ' title="' + (inRange ? 'Switch the box to this network now' : 'Not in range right now') + '" style="background:rgba(59,130,246,' + (inRange ? '.12' : '.04') + ');color:var(--accent);border:1px solid rgba(59,130,246,' + (inRange ? '.3' : '.12') + ');border-radius:6px;padding:4px 12px;font-size:12px;cursor:' + (inRange ? 'pointer' : 'default') + ';opacity:' + (inRange ? '1' : '.45') + '">Use</button>')
@@ -38329,7 +38329,7 @@ async function loadReach(){
       const here = x.current ? '<span style="color:var(--green);font-size:11px;margin-left:8px">← you are here</span>' : '';
       const hint = (isWifi && !x.current) ? '<div style="font-size:11px;color:var(--text-dim);margin-top:3px">↳ use this after you unplug Ethernet</div>' : '';
       const jurl = JSON.stringify(x.url).replace(/"/g,'&quot;');
-      return '<div style="padding:10px 12px;background:#0a0e1a;border:1px solid ' + (x.current ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+      return '<div style="padding:10px 12px;background:var(--bg-deep);border:1px solid ' + (x.current ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
         + '<div style="display:flex;align-items:center;gap:10px">'
         + '<span class="dot" style="background:' + (isWifi ? 'var(--accent)' : 'var(--green)') + ';flex-shrink:0"></span>'
         + '<span style="flex:1;min-width:0;color:var(--text-primary);font-size:13px">' + label + '<span style="color:var(--text-dim);font-family:monospace;margin-left:8px">' + esc(x.ip) + '</span>' + here + '</span>'
