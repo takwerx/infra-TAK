@@ -98,7 +98,12 @@ echo "$FAIL_COUNT" > "$FAIL_COUNT_FILE"
 # it also cures a wedged tunnel after relay-side restarts. Harmless if the real
 # cause is elsewhere (relay down, no egress) — the alert below still fires on
 # the next stale check.
-if [ "$FAIL_COUNT" -eq "$SUSTAINED_FAILS" ] && [ -f "/etc/wireguard/${WG_IF:-wg0}.conf" ]; then
+# Re-fire every 5 checks (~5 min) during a sustained outage, not just once: a
+# single bounce gets a single new NAT mapping, and carrier CGNATs can kill a
+# mapping's return direction while the forward side stays alive (field-hit
+# 2026-07-11 night: box initiations kept arriving at the relay on a mapping
+# whose replies AT&T no longer delivered; only a fresh socket recovers).
+if [ "$FAIL_COUNT" -ge "$SUSTAINED_FAILS" ] && [ $(( FAIL_COUNT % 5 )) -eq $(( SUSTAINED_FAILS % 5 )) ] && [ -f "/etc/wireguard/${WG_IF:-wg0}.conf" ]; then
   systemctl restart "wg-quick@${WG_IF:-wg0}" >/dev/null 2>&1 || true
   echo "$(date): Relay tunnel stale ${FAIL_COUNT} checks — self-heal: restarted wg-quick@${WG_IF:-wg0}" >> /var/log/takguard/restarts.log
 fi
