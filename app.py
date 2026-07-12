@@ -8629,7 +8629,7 @@ def connectivity_anchor_configure_api():
     data = request.get_json(silent=True) or {}
     anchor_ip = (data.get('anchor_ip') or '').strip()
     anchor_pubkey = (data.get('anchor_pubkey') or '').strip()
-    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, data.get('wg_port', 443))
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, data.get('wg_port', 51820))
     if not ok:
         return jsonify({'success': False, 'error': wg_port}), 400
     cfg_ok, pub, err = _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port)
@@ -8784,7 +8784,7 @@ def connectivity_anchor_provision_api():
     anchor_ip = (data.get('anchor_ip') or '').strip()
     ssh_user = (data.get('ssh_user') or 'ubuntu').strip()
     ssh_key = data.get('ssh_private_key') or ''
-    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, None, data.get('wg_port', 443))
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, None, data.get('wg_port', 51820))
     if not ok:
         return jsonify({'success': False, 'error': wg_port}), 400
     if not _CONN_SSH_USER_RE.fullmatch(ssh_user):
@@ -37735,7 +37735,7 @@ textarea.form-input{resize:vertical}
     <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
       <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
-      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="443" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 443 slips through restrictive networks</span>
+      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls (anchor serves both)</span>
     </div>
     <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
@@ -37959,7 +37959,7 @@ async function refreshAnchorStatus(){
       document.getElementById('anchor-card').style.display = 'block';
       showRelayForm(false);
       const detail = (connected ? 'Tunnel up · ' : 'Configured, waiting for handshake · ')
-        + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||443) : ''))
+        + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||51820) : ''))
         + (d.handshake_secs != null ? ' · last handshake ' + fmtAge(d.handshake_secs) : '');
       document.getElementById('anchor-connected-detail').textContent = detail;
     } else if(!d.configured && !anchorReconfiguring){
@@ -38000,7 +38000,7 @@ async function provisionAnchor(){
   const ip = document.getElementById('anchor-ip').value.trim();
   const user = document.getElementById('anchor-ssh-user').value.trim() || 'ubuntu';
   const key = document.getElementById('anchor-ssh-key').value;
-  const port = document.getElementById('anchor-port').value.trim() || '443';
+  const port = document.getElementById('anchor-port').value.trim() || '51820';
   if(!ip || !key.trim()){ log.style.display='block'; log.textContent = 'Enter the relay IP and paste the SSH key first.'; return; }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Setting up…';
   log.style.display = 'block'; log.textContent = 'Starting…';

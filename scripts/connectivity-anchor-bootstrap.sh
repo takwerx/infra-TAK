@@ -88,8 +88,18 @@ apply_forward_rules() {
     # Anchor-local inbound: WireGuard dial-in + prober (Oracle INPUT chain also ends in REJECT).
     ipt_ensure filter INPUT -p udp --dport "$WG_PORT" -j ACCEPT
     ipt_ensure filter INPUT -p tcp --dport "$PROBER_PORT" -j ACCEPT
+    # Serve WireGuard on BOTH udp/443 and udp/51820, whichever is primary: cellular
+    # carriers run QUIC-aware middleboxes that eat non-QUIC udp/443 return traffic
+    # (field-hit 2026-07-11: AT&T hotspot — box's initiations arrived, anchor's
+    # responses never delivered; the identical exchange works on udp/51820), while
+    # some restrictive venue firewalls allow ONLY 443. Redirect the alternate port
+    # to the primary so a box can use either endpoint port without reprovisioning.
+    WG_ALT_PORT=$([ "$WG_PORT" = "443" ] && echo 51820 || echo 443)
+    ipt_ensure filter INPUT -p udp --dport "$WG_ALT_PORT" -j ACCEPT
+    ipt_ensure nat PREROUTING -p udp --dport "$WG_ALT_PORT" -j REDIRECT --to-ports "$WG_PORT"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
         ufw allow "${WG_PORT}/udp" >/dev/null
+        ufw allow "${WG_ALT_PORT}/udp" >/dev/null
         ufw allow "${PROBER_PORT}/tcp" >/dev/null
         for p in $FWD_PORTS; do ufw allow "${p}/tcp" >/dev/null; done
     fi
@@ -213,7 +223,7 @@ EOF
     echo "  Forwarded ports      : ${FWD_PORTS} → ${BOX_WG_IP} (kernel DNAT, no TLS in path)"
     echo "  VERIFY prober        : http://${pub_ip}:${PROBER_PORT}/probe  token: $(cat "$PROBER_TOKEN_FILE")"
     echo ""
-    echo "NEXT: 1) open udp/${WG_PORT} AND tcp/{${FWD_PORTS// /,},${PROBER_PORT}} in the cloud"
+    echo "NEXT: 1) open udp/${WG_PORT} + udp/${WG_ALT_PORT} AND tcp/{${FWD_PORTS// /,},${PROBER_PORT}} in the cloud"
     echo "         provider firewall (OCI NSG / Security List) — the script cannot reach that."
     echo "         ⚠ udp/443 AND tcp/443 are BOTH needed — different protocols (tunnel vs HTTPS)."
     echo "         ⚠ OCI TRAP: put the port in DESTINATION Port Range, leave SOURCE blank."
