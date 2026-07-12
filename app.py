@@ -21776,12 +21776,28 @@ def _get_authentik_target_release(settings=None):
 
 
 def _get_authentik_version_info():
-    """Return {version: str, update_available: bool, latest: str|None} for Authentik."""
+    """Return {version: str, update_available: bool, latest: str|None} for Authentik.
+
+    'version' is what is ACTUALLY RUNNING — read from the live container's image tag.
+    The compose pin is only a FALLBACK (used when the container is down): the pin is
+    what's *configured*, which can lag the running container after an out-of-band
+    upgrade, so it must not be the primary source for "what am I on". """
     out = {'version': '', 'update_available': False, 'latest': None}
     import re
+    # Authoritative: the running authentik-server container's image tag.
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Image}}']),
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            _img = r.stdout.strip().split('\n')[0]
+            if ':' in _img:
+                out['version'] = _img.rsplit(':', 1)[1].strip()
+    except Exception:
+        pass
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
-    if os.path.isfile(compose_path):
+    if not out['version'] and os.path.isfile(compose_path):
         try:
             with open(compose_path) as f:
                 content = f.read()
@@ -21806,10 +21822,11 @@ def _get_authentik_version_info():
             settings = load_settings()
             ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
             if ak_cfg.get('target_mode') == 'remote' and ak_cfg.get('deployed') and (ak_cfg.get('remote', {}).get('host') or '').strip():
+                # Running container first (authoritative), same as the local path.
                 ok, remote_out = _ssh_probe(ak_cfg['remote'],
-                    'docker images ghcr.io/goauthentik/server --format "{{.Tag}}" 2>/dev/null | head -1', timeout=10)
-                if ok and remote_out and remote_out.strip():
-                    out['version'] = remote_out.strip()
+                    'docker ps --filter name=authentik-server --format "{{.Image}}" 2>/dev/null | head -1', timeout=10)
+                if ok and remote_out and ':' in remote_out:
+                    out['version'] = remote_out.strip().rsplit(':', 1)[1].strip()
                 if not out['version']:
                     ok, remote_out = _ssh_probe(ak_cfg['remote'],
                         'grep -m1 "AUTHENTIK_TAG" ~/authentik/docker-compose.yml 2>/dev/null', timeout=10)
