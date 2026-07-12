@@ -63003,6 +63003,48 @@ def api_host_resource_usage():
     return jsonify(_top_processes_local())
 
 
+# GH #53: the banner used to hardcode "patch now to fix CVE-2026-31431 (Copy Fail)"
+# for ANY pending kernel update, forever — a false exposure claim on every box already
+# running a fixed kernel (and on RHEL, where the fixed build was never tracked at all).
+# A CVE is only named while the RUNNING kernel is older than the version that fixed it
+# on a distro we have a table entry for; everything else gets the generic banner. New
+# one-time CVE pushes add a table row here and auto-expire once the fleet patches past.
+_KERNEL_CVE_FIXES = {
+    'CVE-2026-31431 (Copy Fail)': {
+        # distro codename (VERSION_CODENAME in /etc/os-release) -> first fixed kernel
+        'jammy': (5, 15, 0, 179),
+    },
+}
+
+
+def _running_kernel_tuple(release):
+    """'5.15.0-179-generic' or '5.14.0-503.14.1.el9_5' -> (5,15,0,179); None if unparseable."""
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)-(\d+)', release or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _kernel_cve_banner(running_kernel):
+    """CVE label the RUNNING kernel is still exposed to, or None. Unknown distro or
+    unparseable kernel -> None: never claim an exposure we can't verify."""
+    codename = ''
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('VERSION_CODENAME='):
+                    codename = line.split('=', 1)[1].strip().strip('"')
+                    break
+    except Exception:
+        pass
+    running = _running_kernel_tuple(running_kernel)
+    if not codename or not running:
+        return None
+    for cve, fixed_by in _KERNEL_CVE_FIXES.items():
+        fixed = fixed_by.get(codename)
+        if fixed and running < fixed:
+            return cve
+    return None
+
+
 _kernel_patch_cache = {'ts': 0, 'data': None}
 
 @app.route('/api/system/kernel-patch-status')
@@ -63046,6 +63088,9 @@ def kernel_patch_status_api():
         'running_kernel': running_kernel,
         'upgradable': upgradable_count > 0,
         'patched': upgradable_count == 0,
+        # Named only while the running kernel predates the fix (GH #53) — the
+        # banner text for a routine point-release must not claim CVE exposure.
+        'cve_banner': _kernel_cve_banner(running_kernel) if upgradable_count > 0 else None,
     }
     _kernel_patch_cache.update({'ts': now, 'data': data})
     return jsonify(data)
@@ -64475,7 +64520,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-<div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
+<div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now<span id="kpatch-cve"></span></div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
 <div style="display:flex;gap:8px">
 <button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
@@ -64888,6 +64933,8 @@ async function checkKernelPatch(){
         var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
         if(d.patched){localStorage.removeItem('kernel-patch-dismissed');banner.style.display='none';return;}
+        var cveEl=document.getElementById('kpatch-cve');
+        if(cveEl)cveEl.textContent=d.cve_banner?(' to fix '+d.cve_banner):'';
         if(!dismissed){banner.style.display='block';_kpatchShowState('idle');}
     }catch(e){}
 }
