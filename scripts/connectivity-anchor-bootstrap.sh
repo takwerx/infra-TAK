@@ -204,6 +204,7 @@ cmd_setup() {
 [Interface]
 Address = ${ANCHOR_WG_IP}/24
 ListenPort = ${WG_PORT}
+MTU = 1280
 PrivateKey = $(cat "$WG_DIR/anchor.key")
 EOF
         chmod 600 "$WG_DIR/$WG_IF.conf"

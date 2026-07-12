@@ -8590,6 +8590,13 @@ def _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port):
     conf = (
         '[Interface]\n'
         'Address = %s/24\n'
+        # MTU 1280 (IPv6 floor): wg-quick's auto MTU assumes a 1500 path; cellular
+        # carriers translate IPv4 into IPv6 (464XLAT, +20B) and the encapsulated
+        # packet silently exceeds the path — small packets (handshakes, pings,
+        # 302s) pass, the first full-size TCP segment dies forever (field-hit
+        # 2026-07-11 night: console 000 through the tunnel over AT&T while ping
+        # worked; relay SACKed every byte EXCEPT the first 1368-byte segment).
+        'MTU = 1280\n'
         'PrivateKey = %s\n\n'
         '[Peer]\n'
         'PublicKey = %s\n'
