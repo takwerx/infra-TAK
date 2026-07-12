@@ -11120,6 +11120,20 @@ def guarddog_page():
         ak_tasklog_installed=_ak_tasklog_installed,
         ak_tasklog_last=_ak_tasklog_last)
 
+# v10.1.3 (security residual from the 10.1.2 review): guarddog_alert_email is
+# string-substituted into root-executed script text (ALERT_EMAIL_PLACEHOLDER), so it
+# is allowlist-validated at every API entry point AND re-checked at each substitution
+# site — quotes/;/`/$/whitespace can never reach a shell. Fix lives at the source:
+# every placeholder consumer goes through _safe_alert_email().
+_ALERT_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+
+
+def _safe_alert_email(addr):
+    """The address if it matches the strict allowlist, else '' (alerts disabled)."""
+    addr = (addr or '').strip()
+    return addr if _ALERT_EMAIL_RE.match(addr) else ''
+
+
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
 def guarddog_deploy_api():
@@ -11127,9 +11141,11 @@ def guarddog_deploy_api():
         return jsonify({'error': 'Deployment already in progress'}), 409
     data = request.json or {}
     alert_email = (data.get('alert_email') or '').strip()
+    if alert_email and not _safe_alert_email(alert_email):
+        return jsonify({'error': 'Invalid alert email address'}), 400
     settings = load_settings()
     if not alert_email:
-        alert_email = (settings.get('guarddog_alert_email') or '').strip()
+        alert_email = _safe_alert_email(settings.get('guarddog_alert_email'))
     # Allow deploy with no email (monitors run; alerts only after user configures email)
     settings['guarddog_alert_email'] = alert_email
     nickname = (data.get('server_nickname') or '').strip()
@@ -11339,7 +11355,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         try:
             content = open(src, 'r', encoding='utf-8').read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
@@ -14978,6 +14994,8 @@ def guarddog_test_email():
     to_addr = data.get('to', '').strip() or (settings.get('guarddog_alert_email') or '').strip()
     if not to_addr:
         return jsonify({'success': False, 'error': 'No email address configured'}), 400
+    if not _safe_alert_email(to_addr):
+        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
     if data.get('save'):
         settings['guarddog_alert_email'] = to_addr
         save_settings(settings)
@@ -14997,6 +15015,8 @@ def guarddog_notifications_save():
     data = request.json or {}
     settings = load_settings()
     email = (data.get('alert_email') or '').strip()
+    if email and not _safe_alert_email(email):
+        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
     nickname = (data.get('server_nickname') or '').strip()
     settings['guarddog_alert_email'] = email
     settings['guarddog_server_nickname'] = nickname
@@ -15322,7 +15342,7 @@ def run_guarddog_deploy(alert_email):
             content = open(src, 'r').read()
             cert_pass = _get_tak_cert_password(settings)
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
@@ -67547,7 +67567,7 @@ def _auto_update_guarddog():
             with open(src) as f:
                 content = f.read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
