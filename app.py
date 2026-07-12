@@ -8702,8 +8702,17 @@ def connectivity_anchor_disconnect_api():
 # IP and uploads that key. The console SSHes in, runs the bootstrap, reads the WG
 # public key out of the output, configures the box tunnel, and authorizes the box on
 # the anchor with add-box — no terminal, no hand-copied keys.
+# v10.1.3 (security residual from the 10.1.2 review): the bootstrap is fetched from
+# an IMMUTABLE commit SHA (never a branch) and its bytes are verified against a known
+# SHA-256 before it runs as root on the operator's anchor — no curl|bash of mutable
+# remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
+# bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
+# below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '73857d0eefa5f26e19923456f1e1c340faa3e2e3'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'ce5c321f84617da2f35f5b0c3898e1e7bea99cc09e39b1fa76c90d1dd6d3e503'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
-                              'dev/scripts/connectivity-anchor-bootstrap.sh')
+                              + _CONN_ANCHOR_BOOTSTRAP_COMMIT
+                              + '/scripts/connectivity-anchor-bootstrap.sh')
 _CONN_ANCHOR_KEY_PATH = os.path.expanduser('~/.ssh/infratak_anchor')
 _CONN_SSH_USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}$')
 _connectivity_provision_status = {'running': False, 'complete': False, 'error': '', 'log': []}
@@ -8768,16 +8777,22 @@ def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
         if not ok:
             st.update({'running': False, 'complete': True, 'error': 'Cannot SSH to the relay: %s' % out[:200]})
             return
-        # Fetch + run the bootstrap on the anchor. WG_PORT is an int (validated); the
-        # URL is a fixed constant. Nothing operator-typed lands in this remote shell string.
+        # Fetch, VERIFY the pinned SHA-256, then run the bootstrap on the anchor. The
+        # URL is an immutable commit SHA + fixed digest (no branch); WG_PORT is a
+        # validated int. Nothing operator-typed lands in this remote shell string. A
+        # digest mismatch aborts BEFORE any sudo bash runs (supply-chain guard).
         _conn_prov_log('Running the relay setup (this installs WireGuard + forwards)…')
         setup_cmd = ("curl -fsSL '%s' -o ~/connectivity-anchor-bootstrap.sh && "
+                     "echo '%s  '$HOME'/connectivity-anchor-bootstrap.sh' | sha256sum -c - && "
                      "chmod +x ~/connectivity-anchor-bootstrap.sh && "
                      "sudo WG_PORT=%d bash ~/connectivity-anchor-bootstrap.sh setup"
-                     ) % (_CONN_ANCHOR_BOOTSTRAP_RAW, wg_port)
+                     ) % (_CONN_ANCHOR_BOOTSTRAP_RAW, _CONN_ANCHOR_BOOTSTRAP_SHA256, wg_port)
         ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, setup_cmd, timeout=240)
         if not ok:
-            st.update({'running': False, 'complete': True, 'error': 'Anchor bootstrap failed: %s' % out[:300]})
+            _err = out[:300]
+            if 'sha256sum' in out.lower() or 'FAILED' in out:
+                _err = 'Anchor bootstrap integrity check failed (unexpected script contents) — aborted before running. %s' % _err
+            st.update({'running': False, 'complete': True, 'error': 'Anchor bootstrap failed: %s' % _err})
             return
         m = re.search(r'WireGuard public key\s*:\s*([A-Za-z0-9+/]{43}=)', out)
         if not m:
