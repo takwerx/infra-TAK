@@ -694,7 +694,7 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.3"   # v0.9.57.1: promoted dev→vetted — conn_max_age idle-CPU spin fix (#22580, fixed 2026.5.2); 2026.2.3→2026.5.3 jump validated live on CORAZ prod + test6/8/12 soak
-AUTHENTIK_DEV_RELEASE    = "2026.5.3"   # under validation on dev channel — conn_max_age idle-CPU spin fix (#22580/#22679, in 2026.5.2+); 2026-06-13
+AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # under validation on dev channel — dramatiq broker race-condition + LDAP connection-reuse fixes (2026-07-12); CVE set already covered by 2026.5.1. Promote → VETTED once test12 soak is clean. Main stays gated at VETTED above.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
