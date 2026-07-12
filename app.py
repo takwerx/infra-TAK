@@ -8253,8 +8253,24 @@ def _conn_stun_probe(log):
     try:
         import stun
     except ImportError:
-        log('pystun3 is not installed — re-run `sudo ./start.sh` to pull new console dependencies')
-        return {'error': 'pystun3 not installed (re-run sudo ./start.sh)'}
+        # Boxes that took 10.1.x via Update Now (git pull + restart) never re-ran
+        # start.sh, so the new dependency is missing FLEET-WIDE on updated boxes
+        # (field-hit 2026-07-12, test12: whole detection card UNCLASSIFIED).
+        # Self-install into the console's own venv — same on-demand pattern as
+        # _ensure_iw/_ensure_nm_wifi; the venv is ours, no root needed.
+        log('pystun3 is not installed — installing into the console venv…')
+        try:
+            r = subprocess.run([_sys.executable, '-m', 'pip', 'install', '--quiet', 'pystun3'],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or 'pip failed').strip()[:160])
+            import importlib
+            importlib.invalidate_caches()
+            import stun
+            log('pystun3 installed')
+        except Exception as ex:
+            log('pystun3 auto-install failed (%s) — re-run `sudo ./start.sh`' % str(ex)[:120])
+            return {'error': 'pystun3 not installed (re-run sudo ./start.sh)'}
     for host, port in CONNECTIVITY_STUN_SERVERS:
         try:
             nat_type, ext_ip, ext_port = stun.get_ip_info(source_port=0, stun_host=host, stun_port=port)
@@ -8887,14 +8903,29 @@ def _run_connectivity_verify(settings):
                 # "deploy the module first" from "the path (router/NSG/forward) is blocked".
                 local = _conn_verify_tcp('127.0.0.1', port, timeout=2)
                 probe['local_listener'] = (local['state'] == 'green')
-                probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
-                                 + ('relay cloud firewall/NSG ingress + forwarded ports' if result['mode'] == 'relay'
-                                    else 'router port forward + ISP/CGNAT')) if probe['local_listener'] else \
-                                'nothing listening on this box yet — deploy the module that owns this port'
+                if not probe['local_listener']:
+                    probe['hint'] = 'nothing listening on this box yet — deploy the module that owns this port'
+                elif result['mode'] == 'relay':
+                    # Relay vantage is a REAL outside path (box -> relay public -> tunnel
+                    # -> back); a red here is trustworthy.
+                    probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
+                                     'relay cloud firewall/NSG ingress + forwarded ports')
+                else:
+                    # Direct mode probes the box's OWN public address — a self-probe that
+                    # fails on any network without NAT hairpin (home routers, 1:1-NAT
+                    # VPSes; field-hit 2026-07-12: test12 all-red while the operator was
+                    # browsing the console THROUGH port 443). A failed self-probe proves
+                    # nothing about outside reachability — never present it as red.
+                    probe['state'] = 'unverified'
+                    probe['hint'] = ('listening on this box, but the box cannot reach its own public '
+                                     'address on this network (no NAT hairpin) — outside clients may '
+                                     'connect fine; confirm from a phone on cellular')
             if probe['state'] == 'green' and required:
                 required_green += 1
             result['ports'][str(port)] = probe
         result['all_green'] = required_green == sum(1 for _, _, req in _CONN_VERIFY_PORTS if req)
+        result['required_red'] = sum(1 for p in result['ports'].values() if p.get('required') and p.get('state') == 'red')
+        result['unverified'] = sum(1 for p in result['ports'].values() if p.get('state') == 'unverified')
         st.update({'running': False, 'complete': True, 'error': '', 'result': result})
     except Exception as ex:
         st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
@@ -38081,6 +38112,10 @@ function renderVerify(res){
     banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:10px;padding:14px 16px">'
       + '<span class="dot" style="background:var(--green)"></span>'
       + '<div style="font-size:13px;font-weight:600;color:var(--green)">All green — clients on the public internet can reach this stack.</div></div>';
+  }else if(!res.required_red && res.unverified){
+    banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.25);border-radius:10px;padding:14px 16px">'
+      + '<span class="dot" style="background:var(--yellow)"></span>'
+      + '<div style="font-size:13px;color:var(--text-secondary)"><b style="color:var(--yellow)">Could not verify from inside.</b> Everything is listening, but this box cannot probe its own public address on this network (common on VPSes and home routers without NAT hairpin). Confirm from a phone on cellular — outside clients may already connect fine.</div></div>';
   }else{
     banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);border-radius:10px;padding:14px 16px">'
       + '<span class="dot" style="background:var(--red)"></span>'
@@ -38092,7 +38127,7 @@ function renderVerify(res){
     const v = (res.ports || {})[p];
     if(!v) continue;
     const green = v.state === 'green';
-    const dotColor = green ? 'var(--green)' : (v.required ? 'var(--red)' : 'var(--yellow)');
+    const dotColor = green ? 'var(--green)' : (v.state === 'unverified' ? 'var(--yellow)' : (v.required ? 'var(--red)' : 'var(--yellow)'));
     let detail = green ? ('connected' + (v.ms != null ? ' · ' + v.ms + ' ms' : '')) : (v.hint || v.detail || 'no route');
     rows.push('<div style="display:flex;align-items:center;gap:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
       + '<span class="dot" style="background:' + dotColor + ';flex-shrink:0"></span>'
