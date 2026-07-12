@@ -9150,9 +9150,13 @@ def _conn_wifi_add(ssid, psk):
             # Same SSID re-added with a (possibly new) password → update in place.
             cmd = ['nmcli', 'connection', 'modify', ssid, 'wifi-sec.psk', psk]
         else:
+            # ipv4.may-fail no: without it NM declares the connection 'activated'
+            # on IPv6 alone when DHCPv4 gets no answer (field-hit 2026-07-11,
+            # iPhone hotspot: 'dhcp4: no lease' but nmcli up rc=0) — a state with
+            # no usable IPv4, no tunnel, and a join loop that thinks it won.
             cmd = ['nmcli', 'connection', 'add', 'type', 'wifi',
                    'con-name', ssid, 'ifname', iface, 'ssid', ssid,
-                   'connection.autoconnect', 'yes']
+                   'connection.autoconnect', 'yes', 'ipv4.may-fail', 'no']
             if psk:
                 cmd += ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', psk]
         r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
@@ -9752,10 +9756,30 @@ def _conn_join_best_saved():
     except Exception:
         visible = set()
     ordered = [n for n in saved if n in visible] + [n for n in saved if n not in visible]
+
+    def _wifi_has_ipv4():
+        # nmcli up returns 0 even for an IPv6-only 'activated' state (older
+        # profiles without ipv4.may-fail=no; field-hit 2026-07-11) — a join with
+        # no usable IPv4 is a FAILURE here, not a success.
+        try:
+            iface = _conn_wifi_iface()
+            if not iface:
+                return True  # can't verify -> don't block the join on it
+            rc = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'IP4.ADDRESS', 'device', 'show', iface]),
+                                capture_output=True, text=True, timeout=10)
+            return 'IP4.ADDRESS' in (rc.stdout or '')
+        except Exception:
+            return True
+
     for name in ordered:
         try:
             rr = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', name]),
                                 capture_output=True, text=True, timeout=40)
+            if rr.returncode == 0 and not _wifi_has_ipv4():
+                # IPv6-only limbo: tear it down and let the next candidate try.
+                subprocess.run(_sudo_wrap(['nmcli', 'connection', 'down', name]),
+                               capture_output=True, text=True, timeout=15)
+                continue
             if rr.returncode == 0:
                 # Uplink changed interface/address — bounce the relay tunnel.
                 # Kernel WireGuard caches the peer's source address; after moving
@@ -38135,9 +38159,26 @@ async function startSetupAp(){
 async function stopSetupAp(){
   const s = document.getElementById('setupap-status');
   s.textContent = 'Stopping Setup WiFi and reconnecting…'; s.style.color = 'var(--text-dim)';
-  try{ const r = await fetch('/api/connectivity/setup-ap/stop', {method:'POST'}); const d = await r.json();
+  // Field-hit 2026-07-11 (twice): an expired session makes @login_required
+  // bounce this POST to the login page; r.json() then throws and the old empty
+  // catch swallowed it — the tap silently did NOTHING and the box stayed in AP
+  // mode until someone plugged ethernet back in. Surface every failure and give
+  // the operator a re-login path that returns here.
+  try{
+    const r = await fetch('/api/connectivity/setup-ap/stop', {method:'POST'});
+    if (r.redirected || (r.headers.get('content-type')||'').indexOf('json') === -1){
+      s.style.color = 'var(--red, #f87171)';
+      s.innerHTML = 'Your session expired — <a href="/login?next=/connectivity" style="color:var(--cyan)">log in again</a>, then press Stop once more.';
+      return;
+    }
+    const d = await r.json();
     s.textContent = d.success ? 'Reconnecting to your network…' : (d.error || 'Stop failed');
-  }catch(e){}
+    if (!d.success){ s.style.color = 'var(--red, #f87171)'; return; }
+  }catch(e){
+    s.style.color = 'var(--red, #f87171)';
+    s.textContent = 'Stop did not reach the box (' + e + ') — check you are still on the setup WiFi and try again.';
+    return;
+  }
   setTimeout(refreshSetupAp, 4000);
 }
 async function refreshWifiSaved(){
