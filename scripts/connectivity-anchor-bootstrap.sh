@@ -20,7 +20,7 @@
 #
 # Cloud-side reminder (the script cannot do this for you): open ingress in the
 # provider firewall (OCI Security List / NSG) for udp/51820, tcp/8089, tcp/8443,
-# tcp/8446, tcp/5099.
+# tcp/8446. (The :5099 prober is tunnel-only since v10.1.3 — no cloud ingress.)
 
 set -euo pipefail
 
@@ -85,9 +85,12 @@ apply_forward_rules() {
     done
     ipt_ensure nat POSTROUTING -o "$WG_IF" -d "$BOX_WG_IP" -j MASQUERADE
     ipt_ensure filter FORWARD -s "$BOX_WG_IP" -m state --state ESTABLISHED,RELATED -j ACCEPT
-    # Anchor-local inbound: WireGuard dial-in + prober (Oracle INPUT chain also ends in REJECT).
+    # Anchor-local inbound: WireGuard dial-in (Oracle INPUT chain also ends in REJECT).
     ipt_ensure filter INPUT -p udp --dport "$WG_PORT" -j ACCEPT
-    ipt_ensure filter INPUT -p tcp --dport "$PROBER_PORT" -j ACCEPT
+    # v10.1.3: the prober is reachable ONLY over the tunnel (it binds the wg0 overlay
+    # IP) — accept on wg0 and strip the public accept that earlier bootstraps added.
+    ipt_ensure filter INPUT -i "$WG_IF" -p tcp --dport "$PROBER_PORT" -j ACCEPT
+    iptables -t filter -D INPUT -p tcp --dport "$PROBER_PORT" -j ACCEPT 2>/dev/null || true
     # Serve WireGuard on BOTH udp/443 and udp/51820, whichever is primary: cellular
     # carriers run QUIC-aware middleboxes that eat non-QUIC udp/443 return traffic
     # (field-hit 2026-07-11: AT&T hotspot — box's initiations arrived, anchor's
@@ -100,7 +103,7 @@ apply_forward_rules() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
         ufw allow "${WG_PORT}/udp" >/dev/null
         ufw allow "${WG_ALT_PORT}/udp" >/dev/null
-        ufw allow "${PROBER_PORT}/tcp" >/dev/null
+        ufw delete allow "${PROBER_PORT}/tcp" >/dev/null 2>&1 || true
         for p in $FWD_PORTS; do ufw allow "${p}/tcp" >/dev/null; done
     fi
     persist_iptables
@@ -108,23 +111,46 @@ apply_forward_rules() {
 
 write_prober() {
     mkdir -p "$PROBER_DIR"
+    # v10.1.3: dedicated no-login system user — the prober never runs as root.
+    id -u takwerx-prober >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin takwerx-prober
     if [ ! -s "$PROBER_TOKEN_FILE" ]; then
         head -c 24 /dev/urandom | base64 | tr -d '=+/' > "$PROBER_TOKEN_FILE"
-        chmod 600 "$PROBER_TOKEN_FILE"
     fi
+    chown takwerx-prober "$PROBER_TOKEN_FILE"
+    chmod 400 "$PROBER_TOKEN_FILE"
     cat > "$PROBER_DIR/prober.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""takwerx VERIFY prober (v10.1.0 seed) — answers 'can the public internet TCP-connect
-to these ports on this host?' from the anchor's outside vantage point.
+"""takwerx VERIFY prober (v10.1.0 seed; v10.1.3 hardening) — answers 'can the public
+internet TCP-connect to these ports on this host?' from the anchor's outside vantage.
 GET /probe?host=<ip-or-fqdn>&ports=8089,8443,8446&token=<token>
-Token-gated; ports restricted to the TAK/console set to prevent use as a generic scanner."""
-import hmac, json, re, socket, time
+Token-gated; ports restricted to the TAK/console set; targets restricted to publicly
+routable addresses (a probe of metadata/RFC1918/overlay space answers a question the
+prober exists to answer only about the public internet — and is an SSRF oracle);
+binds the wg0 overlay IP, so only tunnel peers can reach it at all."""
+import hmac, ipaddress, json, os, re, socket, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 TOKEN = open('/etc/takwerx-prober.token').read().strip()
 ALLOWED_PORTS = {80, 443, 5001, 8089, 8443, 8446}
 HOST_RE = re.compile(r'^[A-Za-z0-9.\-]{1,253}$')
+
+def resolve_public(host):
+    """Resolve once and return the first address, or None unless EVERY resolved
+    address is publicly routable (kills 169.254.169.254, RFC1918, CGNAT, loopback,
+    the WG overlay — and multi-record rebinding tricks). Connect to the returned
+    IP, never re-resolve the name."""
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return None
+    addrs = [i[4][0] for i in infos]
+    if not addrs:
+        return None
+    for a in addrs:
+        if not ipaddress.ip_address(a).is_global:
+            return None
+    return addrs[0]
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -150,6 +176,9 @@ class H(BaseHTTPRequestHandler):
         host = (q.get('host') or [''])[0]
         if not HOST_RE.match(host):
             return self._send(400, {'error': 'bad host'})
+        target = resolve_public(host)
+        if not target:
+            return self._send(400, {'error': 'host not publicly routable'})
         try:
             ports = [int(p) for p in (q.get('ports') or [''])[0].split(',') if p][:8]
         except ValueError:
@@ -159,34 +188,40 @@ class H(BaseHTTPRequestHandler):
         results = {}
         for p in ports:
             try:
-                with socket.create_connection((host, p), timeout=4):
+                with socket.create_connection((target, p), timeout=4):
                     results[str(p)] = 'green'
             except OSError as ex:
                 results[str(p)] = 'red: %s' % getattr(ex, 'strerror', str(ex))
         self._send(200, {'host': host, 'results': results, 'vantage': 'anchor-public'})
 
 if __name__ == '__main__':
-    ThreadingHTTPServer(('0.0.0.0', 5099), H).serve_forever()
+    ThreadingHTTPServer((os.environ.get('PROBER_BIND', '127.0.0.1'), 5099), H).serve_forever()
 PYEOF
     chmod 755 "$PROBER_DIR/prober.py"
-    # Root-run v1 test harness (needs the 600 token file); the production Leg-5
-    # prober is its own later build with TLS + a dedicated user.
+    # v10.1.3: non-root, tunnel-only. Binds the wg0 overlay IP (After= the tunnel;
+    # Restart=always rides out a bind race at boot). TLS stays a future build.
     cat > /etc/systemd/system/takwerx-prober.service <<EOF
 [Unit]
 Description=takwerx VERIFY reachability prober
-After=network-online.target
+After=network-online.target wg-quick@${WG_IF}.service
 
 [Service]
+User=takwerx-prober
+Environment=PROBER_BIND=${ANCHOR_WG_IP}
 ExecStart=/usr/bin/python3 $PROBER_DIR/prober.py
 Restart=always
 RestartSec=3
 NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now takwerx-prober >/dev/null
+    systemctl restart takwerx-prober >/dev/null 2>&1 || true
 }
 
 cmd_setup() {
@@ -222,9 +257,9 @@ EOF
     echo "✓ Anchor is up.  Public IP: ${pub_ip}"
     echo "  WireGuard public key : $(cat "$WG_DIR/anchor.pub")"
     echo "  Forwarded ports      : ${FWD_PORTS} → ${BOX_WG_IP} (kernel DNAT, no TLS in path)"
-    echo "  VERIFY prober        : http://${pub_ip}:${PROBER_PORT}/probe  token: $(cat "$PROBER_TOKEN_FILE")"
+    echo "  VERIFY prober        : http://${ANCHOR_WG_IP}:${PROBER_PORT}/probe (tunnel-only)  token: $(cat "$PROBER_TOKEN_FILE")"
     echo ""
-    echo "NEXT: 1) open udp/${WG_PORT} + udp/${WG_ALT_PORT} AND tcp/{${FWD_PORTS// /,},${PROBER_PORT}} in the cloud"
+    echo "NEXT: 1) open udp/${WG_PORT} + udp/${WG_ALT_PORT} AND tcp/{${FWD_PORTS// /,}} in the cloud"
     echo "         provider firewall (OCI NSG / Security List) — the script cannot reach that."
     echo "         ⚠ udp/443 AND tcp/443 are BOTH needed — different protocols (tunnel vs HTTPS)."
     echo "         ⚠ OCI TRAP: put the port in DESTINATION Port Range, leave SOURCE blank."
