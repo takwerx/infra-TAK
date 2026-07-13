@@ -26897,9 +26897,17 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Step 4/6: Writing CloudTAK config on remote ━━━")
             import secrets as _secrets
+            # v10.1.3+: Preserve postgres password across redeploys (same as local deploy)
+            postgres_pass = settings.get('cloudtak_postgres_password', '').strip()
+            if not postgres_pass or len(postgres_pass) < 24:
+                postgres_pass = _secrets.token_hex(24)
+                settings['cloudtak_postgres_password'] = postgres_pass
+                try:
+                    save_settings(settings)
+                except Exception:
+                    pass
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
-            postgres_pass = _secrets.token_hex(24)
             env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
@@ -27159,9 +27167,27 @@ def run_cloudtak_deploy(cfg=None):
         plog("━━━ Step 3/7: Configuring .env ━━━")
         env_path = os.path.join(cloudtak_dir, '.env')
         import secrets as _secrets
+
+        # v10.1.3+: Preserve postgres password across redeploys to prevent password mismatch.
+        # If CloudTAK was already deployed, reuse the stored password instead of generating a new one.
+        # This prevents "password authentication failed" errors when existing volumes have the old password.
+        # On fresh installs or if password is lost, generate a new one.
+        postgres_pass = settings.get('cloudtak_postgres_password', '').strip()
+        if not postgres_pass or len(postgres_pass) < 24:
+            # Generate new password for fresh install or corrupted state
+            postgres_pass = _secrets.token_hex(24)
+            plog("  Generated new postgis password (fresh install)")
+            # Persist it so future redeploys use the same password
+            settings['cloudtak_postgres_password'] = postgres_pass
+            try:
+                save_settings(settings)
+            except Exception as e:
+                plog(f"  ⚠ Could not persist postgres password to settings: {e}")
+        else:
+            plog("  Reusing stored postgis password (existing install)")
+
         signing_secret = _secrets.token_hex(32)
         minio_pass = _secrets.token_hex(16)
-        postgres_pass = _secrets.token_hex(24)
 
         env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
         with open(env_path, 'w') as f:
