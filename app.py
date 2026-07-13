@@ -23284,6 +23284,13 @@ def run_takportal_deploy():
             plog("\u2713 Certificates copied to container data volume")
         else:
             plog(f"\u26a0 Certificate copy: {_certs_msg}")
+        # v10.1.x (PLAN-v10.1.4 item 2): enroll the portal's map bridge (admin cert) in
+        # every TAK channel so /map receives live CoT on installs where TAK honors
+        # UserAuthenticationFile.xml (else admin is capped at __ANON__ -> empty map).
+        try:
+            _takportal_sync_map_channels(plog=plog)
+        except Exception as _mce:
+            plog(f"\u26a0 Map-channel sync (non-fatal): {_mce}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -49541,6 +49548,43 @@ def _start_ldap_sa_bind_watchdog():
     _t.start()
 
 
+_takportal_mapsync_watchdog_started = False
+
+
+def _takportal_mapsync_watchdog_loop():
+    """v10.1.x (PLAN-v10.1.4 item 4). Daemon: every 10 min, re-assert the TAK Portal
+    map bridge (`admin` cert) TAK-channel membership via _takportal_sync_map_channels().
+    This is what picks up channels created later in the portal with no operator action,
+    and heals a UAF admin entry reset to __ANON__ by a TAK redeploy — within one tick.
+    Idempotent (no UAF write / no portal restart when membership already matches; never
+    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true."""
+    import time as _wt
+    _wt.sleep(150)  # let startup migrations + first cert sync settle
+    _ok_interval = 6  # ~1h between liveness lines
+    _ok_counter = 0
+    while True:
+        try:
+            if not load_settings().get('takportal_mapsync_disabled'):
+                _takportal_sync_map_channels()
+            _ok_counter += 1
+            if _ok_counter % _ok_interval == 0:
+                print("[takportal-map-sync] watchdog alive", flush=True)
+        except Exception as _e:
+            print(f"[takportal-map-sync] watchdog error (non-fatal): {_e}", flush=True)
+        _wt.sleep(600)
+
+
+def _start_takportal_mapsync_watchdog():
+    """Start the TAK Portal map-channel self-heal daemon (idempotent, once per process)."""
+    global _takportal_mapsync_watchdog_started
+    if _takportal_mapsync_watchdog_started:
+        return
+    _takportal_mapsync_watchdog_started = True
+    import threading as _thr
+    _thr.Thread(target=_takportal_mapsync_watchdog_loop, daemon=True,
+                name='takportal-mapsync-watchdog').start()
+
+
 # ---------------------------------------------------------------------------
 # v0.9.23 Phase 1 (FORENSIC): Authentik audit-log scraper
 # ---------------------------------------------------------------------------
@@ -62733,6 +62777,175 @@ def takserver_federation_firewall():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
+def _tak_admin_marti_get(url, timeout=12):
+    """GET a TAK Marti/user-management REST endpoint with the admin client cert.
+    Returns (parsed_json, None) on success or (None, error_str). Reuses the legacy-
+    PKCS12 extraction the cert workflows use: TAK emits RC2-40-CBC that OpenSSL 3
+    rejects without -legacy, and admin.p12 is 0600 tak:tak so it is cat'd via the
+    broker (raw openssl as takwerx -> empty PEM). REST is DB-agnostic — works whether
+    TAK's Postgres is local or remote (CORAZ's is Azure PG), unlike a direct DB query."""
+    import json as _json
+    cert_dir = '/opt/tak/certs/files'
+    admin_p12 = os.path.join(cert_dir, 'admin.p12')
+    if not os.path.exists(admin_p12):
+        for name in ('webadmin.p12', 'admin.p12'):
+            p = os.path.join(cert_dir, name)
+            if os.path.exists(p):
+                admin_p12 = p
+                break
+    if not os.path.exists(admin_p12):
+        return None, 'admin.p12 not found'
+    cert_pass = _get_tak_cert_password(load_settings())
+    _tmp_src = _pem = _key = None
+    try:
+        _cat = subprocess.run(_sudo_wrap(['cat', admin_p12]), capture_output=True, timeout=10)
+        if _cat.returncode != 0 or not _cat.stdout:
+            return None, 'admin.p12 unreadable via broker'
+        _fd, _tmp_src = tempfile.mkstemp(suffix='.p12', prefix='tak-marti-src-')
+        with os.fdopen(_fd, 'wb') as _f:
+            _f.write(_cat.stdout)
+        _fdp, _pem = tempfile.mkstemp(suffix='.pem', prefix='tak-marti-cert-')
+        os.close(_fdp)
+        _fdk, _key = tempfile.mkstemp(suffix='.key', prefix='tak-marti-key-')
+        os.close(_fdk)
+        subprocess.run(
+            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {shlex.quote(_pem)}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {shlex.quote(_key)}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
+            return None, 'PEM extraction failed'
+        r = subprocess.run(['curl', '-sk', '--max-time', '8', '--cert', _pem, '--key', _key, url],
+                           capture_output=True, text=True, timeout=timeout)
+        body = (r.stdout or '').strip()
+        if r.returncode != 0 or not body:
+            return None, f'curl_exit_{r.returncode}'
+        try:
+            return _json.loads(body), None
+        except _json.JSONDecodeError:
+            return None, 'invalid_json'
+    except Exception as e:
+        return None, str(e)[:120]
+    finally:
+        for _p in (_tmp_src, _pem, _key):
+            if _p:
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+
+
+# TAK's UserAuthenticationFile.xml uses this default namespace; every element tag
+# comes back from ElementTree namespaced ({ns}User, {ns}groupList).
+_TAK_UAF_NS = 'http://bbn.com/marti/xml/bindings'
+
+# Split-box park message is logged once per process (see item 6 in the sync below).
+_mapsync_splitbox_logged = False
+
+
+def _takportal_sync_map_channels(plog=None):
+    """Keep the TAK Portal map bridge user (the `admin` cert) enrolled in EVERY TAK
+    channel, so the portal /map's single server-side CoT bridge receives all feeds on
+    every box — not just where CoreConfig <File/> (no location) accidentally disables
+    file-auth group caps. Where TAK honors UserAuthenticationFile.xml (the <File
+    location=...> form newer installers write), admin is pinned to __ANON__ and the map
+    is connected-but-empty (CORAZ prod: 0/0 visible). See PLAN-v10.1.4.
+
+    Deterministic + fleet-uniform: target membership = the box's LIVE Marti channel
+    list (no operator knob, no max(cur,target)). NEVER shrinks on a failed/empty fetch.
+    Idempotent: rewrites the UAF and restarts tak-portal ONLY when the set actually
+    changes. No-ops cleanly when portal / TAK / UAF / admin-entry are absent. The UAF is
+    edited with ElementTree via the broker (never regex — malformed XML crashes TAK's
+    FileAuthenticator); nodered/webadmin entries and admin's fingerprint/role are left
+    untouched, and CoreConfig auth wiring is not touched at all."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(f"[takportal-map-sync] {m}", flush=True)
+    # Split-box (TAK on Server One): the UAF lives on the remote box, not here. Remote
+    # UAF read/write + Marti + portal restart is >20 lines — parked (PLAN-v10.1.4 item 6).
+    # Log ONCE per process (not every 10-min watchdog tick), never silently "succeed".
+    try:
+        if _get_tak_deployment_config(load_settings()).get('mode') == 'two_server':
+            global _mapsync_splitbox_logged
+            if not _mapsync_splitbox_logged:
+                _mapsync_splitbox_logged = True
+                _log("split-box (TAK on Server One): map-channel sync not supported yet — UAF is on the remote box; parked")
+            return
+    except Exception:
+        pass
+    uaf = '/opt/tak/UserAuthenticationFile.xml'
+    if not os.path.exists(uaf):
+        return
+    # Portal must be installed (container present, running or not) — else nothing to sync for.
+    if _priv_pipe(['docker', 'ps', '-a', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode != 0:
+        return
+    # 1. Live channel list from Marti (REST; DB-agnostic).
+    data, err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/all')
+    if data is None:
+        _log(f"Marti group fetch failed ({err}) — skipping, membership left as-is (never-shrink)")
+        return
+    items = data.get('data', data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        _log("Marti group response malformed — skipping (never-shrink)")
+        return
+    names = set()
+    for g in items:
+        n = ((g.get('name') if isinstance(g, dict) else str(g)) or '').strip()
+        if n and n != 'ROLE_ADMIN':
+            names.add(n)
+    target = set(names)
+    target.add('__ANON__')
+    # Never-shrink-on-error: TAK down / no real channels returned -> do not write.
+    if not (target - {'__ANON__'}):
+        _log("Marti returned no non-system channels — skipping (never-shrink)")
+        return
+    # 2. Parse the UAF and converge every admin entry's <groupList> to the target set.
+    try:
+        content = _read_priv(uaf)
+    except Exception:
+        content = ''
+    if not content or 'identifier="admin"' not in content:
+        return
+    import xml.etree.ElementTree as ET
+    ET.register_namespace('', _TAK_UAF_NS)  # emit unprefixed tags + xmlns default, matching the source
+    try:
+        root = ET.fromstring(content)
+    except Exception as e:
+        _log(f"UAF parse failed ({str(e)[:80]}) — skipping (never write malformed XML)")
+        return
+    ns = '{%s}' % _TAK_UAF_NS
+    admin_els = [u for u in root.iter()
+                 if u.tag in (ns + 'User', 'User') and u.get('identifier') == 'admin']
+    if not admin_els:
+        return
+    changed = False
+    old_count = 0
+    for admin_el in admin_els:
+        # Only plain <groupList> (bidirectional). Leave <groupListIN>/<groupListOUT> (nodered) alone.
+        existing = [c for c in list(admin_el) if c.tag in (ns + 'groupList', 'groupList')]
+        current = set((c.text or '').strip() for c in existing if (c.text or '').strip())
+        old_count = max(old_count, len(current))
+        if current == target:
+            continue
+        for c in existing:
+            admin_el.remove(c)
+        for name in sorted(target):
+            ET.SubElement(admin_el, ns + 'groupList').text = name
+        changed = True
+    if not changed:
+        _log(f"admin bridge already in {len(target)} channels — no change, no restart")
+        return
+    import io as _io
+    _buf = _io.StringIO()
+    ET.ElementTree(root).write(_buf, xml_declaration=True, encoding='unicode')
+    _write_priv(uaf, _buf.getvalue())
+    _log(f"admin bridge channel membership {old_count} -> {len(target)}; restarting tak-portal")
+    subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=90)
+
+
 def _takportal_sync_certs(plog=None, restart=False):
     """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
       - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
@@ -62861,6 +63074,15 @@ def _takportal_sync_certs(plog=None, restart=False):
         _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
     if restart and (ok_client or ok_ca):
         subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+        # v10.1.x (PLAN-v10.1.4 item 5): a restart-intent cert resync can follow a TAK
+        # redeploy that regenerated UserAuthenticationFile.xml (admin reset to __ANON__).
+        # Re-assert the map bridge's channel membership so /map isn't empty until the
+        # 10-min watchdog tick. (Deploy path calls with restart=False -> item 2 handles
+        # it explicitly -> no double-fire here.)
+        try:
+            _takportal_sync_map_channels(plog=plog)
+        except Exception as _mce:
+            _log(f"  ⚠ Map-channel sync (non-fatal): {_mce}")
     if ok_client and ok_ca:
         return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
     if ok_ca and not ok_client:
@@ -70384,6 +70606,13 @@ def _startup_migrations():
         except Exception as _tge:
             print(f"Startup migration: takportal admin guardrail error (non-fatal): {_tge}", flush=True)
 
+        # v10.1.x (PLAN-v10.1.4 item 3): assert the portal map bridge's TAK channel
+        # membership at boot so /map isn't empty for one watchdog cycle after a restart.
+        try:
+            _takportal_sync_map_channels(plog=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _mce:
+            print(f"Startup migration: takportal map-channel sync error (non-fatal): {_mce}", flush=True)
+
         # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
         # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,
         # or CoreConfig adminGroup attribute stripped — the class of drift that lands
@@ -70412,6 +70641,13 @@ def _startup_migrations():
                 print("Startup: LDAP SA bind watchdog started (interval=5min, checks SA bind + webadmin roles)", flush=True)
         except Exception as _lwe:
             print(f"Startup: LDAP SA bind watchdog start failed (non-fatal): {_lwe}", flush=True)
+
+        # v10.1.x (PLAN-v10.1.4 item 4): TAK Portal map-channel self-heal (10-min tick).
+        try:
+            _start_takportal_mapsync_watchdog()
+            print("Startup: TAK Portal map-channel watchdog started (interval=10min)", flush=True)
+        except Exception as _mwe:
+            print(f"Startup: TAK Portal map-channel watchdog start failed (non-fatal): {_mwe}", flush=True)
 
         # v0.9.23 Phase 1 (FORENSIC): seed the Authentik audit-log scraper. On
         # first-ever run per box this sets the high-water mark silently (no log
