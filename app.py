@@ -26328,12 +26328,27 @@ def _cloudtak_build_override_yml(settings):
     # `ports: !reset` is NOT used here because Docker Compose v5.x (shipped
     # with Docker Engine 27+) does not support the !reset YAML tag — it
     # resolves to null, silently dropping ALL port bindings.
+    # v10.1.3+: Mount console cert for CloudTAK API to trust the self-signed HTTPS endpoint.
+    # CloudTAK v13+ tries to reach TAKWERX Console at https://host.docker.internal:5001
+    # to fetch configuration. The docker api container needs to either trust the cert
+    # or skip validation. NODE_TLS_REJECT_UNAUTHORIZED=0 is the pragmatic dev workaround.
+    console_cert_src = os.path.join(os.path.expanduser('~'), '.config', 'ssl', 'console.crt')
+    cert_vol_block = f"""    volumes:
+      - "{console_cert_src}:/etc/ssl/certs/takwerx-console.crt:ro"
+""" if os.path.isfile(console_cert_src) else ""
+
     return f"""# TAKWERX: CloudTAK container overrides — v0.9.11+v0.9.12 security hardening
 # Port hardening applied directly to compose.yaml by _patch_cloudtak_compose_ports().
 services:
   api:
     extra_hosts:
 {hosts_block}
+    environment:
+      # v10.1.3+: CloudTAK needs HTTPS to reach TAKWERX Console on startup.
+      # NODE_TLS_REJECT_UNAUTHORIZED=0 trusts self-signed cert (dev workaround).
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      CONSOLE_URL: "https://host.docker.internal:5001"
+{cert_vol_block}
   events:
     extra_hosts:
 {hosts_block}
@@ -27223,32 +27238,109 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _te:
             plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
 
-        # Step 4: Build Docker images (stream output, 45 min timeout)
+        # Step 4: Build Docker images (stream output, 90 min timeout with retry + recovery)
         plog("")
         plog("━━━ Step 4/7: Building Docker Images ━━━")
-        plog("  This may take 5-10 minutes on first run...")
-        proc = subprocess.Popen(
-            _sudo_wrap(['docker', 'compose', 'build', '--no-cache']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
-        )
-        def _read_build():
-            for line in iter(proc.stdout.readline, ''):
-                line = line.rstrip()
-                if line:
-                    plog(f"  {line}")
-        reader = threading.Thread(target=_read_build, daemon=True)
-        reader.start()
+        plog("  This may take 10-45 minutes on first run (depends on VPS resources and network)")
+
+        # Pre-flight: check resources before attempting build
+        plog("  Checking system resources...")
         try:
-            proc.wait(timeout=2700)  # 45 min max
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            plog("✗ Docker build timed out after 45 minutes — try again or check server resources (RAM, disk)")
+            disk_result = subprocess.run(['df', '/'], capture_output=True, text=True, timeout=10)
+            for line in disk_result.stdout.strip().split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 5:
+                    plog(f"    Disk: {parts[-2]} used, {parts[-1]} mounted at /")
+                    break
+            mem_result = subprocess.run(['free', '-h'], capture_output=True, text=True, timeout=10)
+            for line in mem_result.stdout.strip().split('\n'):
+                if line.startswith('Mem:'):
+                    plog(f"    Memory: {line.split()[1]} total")
+                    break
+        except Exception as e:
+            plog(f"    ⚠ Could not check resources: {e}")
+
+        # Build with retry logic (up to 2 attempts)
+        MAX_BUILD_ATTEMPTS = 2
+        BUILD_TIMEOUT = 5400  # 90 min (increased from 45 min to account for slow VPS/network)
+        RETRY_WAIT = 60  # 1 min between retries
+
+        build_success = False
+        for build_attempt in range(MAX_BUILD_ATTEMPTS):
+            if build_attempt > 0:
+                plog("")
+                plog(f"━━━ Step 4/7 (Retry {build_attempt}/{MAX_BUILD_ATTEMPTS - 1}): Building Docker Images ━━━")
+                plog(f"  Waiting {RETRY_WAIT}s before retry...")
+                time.sleep(RETRY_WAIT)
+                # Clean up docker state from failed attempt (preserve volumes)
+                plog("  Cleaning up from previous build attempt...")
+                try:
+                    subprocess.run(
+                        _sudo_wrap(['docker', 'compose', 'down', '--remove-orphans']),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=120, cwd=cloudtak_dir
+                    )
+                    plog("  ✓ Cleaned up containers")
+                except Exception as cleanup_err:
+                    plog(f"  ⚠ Cleanup issue (continuing anyway): {str(cleanup_err)[:80]}")
+
+            plog(f"  Build attempt {build_attempt + 1}/{MAX_BUILD_ATTEMPTS}...")
+            proc = subprocess.Popen(
+                _sudo_wrap(['docker', 'compose', 'build', '--no-cache']),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                cwd=cloudtak_dir, bufsize=1
+            )
+
+            def _read_build():
+                for line in iter(proc.stdout.readline, ''):
+                    line = line.rstrip()
+                    if line:
+                        plog(f"    {line}")
+
+            reader = threading.Thread(target=_read_build, daemon=True)
+            reader.start()
+
+            try:
+                proc.wait(timeout=BUILD_TIMEOUT)
+                reader.join(timeout=5)
+                if proc.returncode == 0:
+                    plog("✓ Images built successfully")
+                    build_success = True
+                    break
+                else:
+                    plog(f"⚠ Build failed with exit code {proc.returncode}")
+                    if build_attempt < MAX_BUILD_ATTEMPTS - 1:
+                        plog("  Will retry...")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                reader.join(timeout=5)
+                plog(f"⚠ Build timed out after {BUILD_TIMEOUT // 60} minutes (attempt {build_attempt + 1}/{MAX_BUILD_ATTEMPTS})")
+                if build_attempt < MAX_BUILD_ATTEMPTS - 1:
+                    plog("  Retrying...")
+                else:
+                    plog("  All retries exhausted")
+
+        # Final failure handling
+        if not build_success:
+            plog("")
+            plog("✗ Docker build failed after all retry attempts")
+            plog("")
+            plog("RECOVERY STEPS:")
+            plog("1. Check system resources:")
+            plog("     df -h  # Ensure you have ≥20GB free disk")
+            plog("     free -h  # Ensure you have ≥8GB free RAM")
+            plog("2. Clean up docker state:")
+            plog(f"     cd {cloudtak_dir} && sudo docker compose down --remove-orphans")
+            plog("     sudo docker system prune -a --volumes  # WARNING: removes ALL unused images/volumes")
+            plog("3. Retry deploy from console, or manually:")
+            plog(f"     cd {cloudtak_dir} && sudo docker compose build --no-cache")
+            plog("4. If failure persists, you may need to re-clone CloudTAK:")
+            plog(f"     sudo rm -rf {cloudtak_dir}")
+            plog("     (then retry deploy from console)")
+            plog("")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
-        reader.join(timeout=5)
-        if proc.returncode != 0:
-            plog(f"✗ Docker build failed")
-            cloudtak_deploy_status.update({'running': False, 'error': True})
-            return
+
         plog("✓ Images built")
 
         # Step 5: Start containers including media on remapped ports
