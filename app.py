@@ -695,6 +695,9 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.3"   # v0.9.57.1: promoted dev→vetted — conn_max_age idle-CPU spin fix (#22580, fixed 2026.5.2); 2026.2.3→2026.5.3 jump validated live on CORAZ prod + test6/8/12 soak
 AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
+# CloudTAK version gate — v13.45+ introduced major hub/api split (stateful vs stateless modes).
+# This is a BREAKING CHANGE for plugin deployment. Gate to 13.44.0 until plugin compat verified.
+CLOUDTAK_VETTED_RELEASE = "13.44.0"     # v10.1.3+: pinned to 13.44.0 — v13.45+ requires plugin migration for hub/api split
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -22010,8 +22013,19 @@ def _get_cloudtak_version_info():
         if tag:
             latest_ver = tag.lstrip('vV')
             out['latest'] = latest_ver
-            if out['version'] != latest_ver:
-                out['update_available'] = True
+            # v10.1.3+: Gate to CLOUDTAK_VETTED_RELEASE — v13.45+ requires plugin compat review
+            # Suppress updates to 13.45+ until plugin authors (e.g. TAK-CAD) update for hub/api split
+            try:
+                latest_major_minor = '.'.join(latest_ver.split('.')[:2])
+                vetted_major_minor = '.'.join(CLOUDTAK_VETTED_RELEASE.split('.')[:2])
+                if latest_major_minor > vetted_major_minor:
+                    out['latest'] = CLOUDTAK_VETTED_RELEASE
+                    out['update_available'] = False
+                elif out['version'] != CLOUDTAK_VETTED_RELEASE:
+                    out['update_available'] = True
+            except Exception:
+                if out['version'] != latest_ver:
+                    out['update_available'] = True
     # v0.9.54: suppress a FALSE "update available" caused by the container's
     # api/package.json lagging the git release tag. dfpc-coe ships release tags
     # whose api/package.json trails the tag — and the lag now crosses a MINOR
