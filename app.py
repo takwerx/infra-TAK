@@ -15791,6 +15791,7 @@ def cloudtak_page():
         cloudtak_version=ct_version,
         cloudtak_update_available=ct_update_available,
         cloudtak_latest=ct_latest,
+        cloudtak_version_info=ct_vinfo,
         cloudtak_icon=CLOUDTAK_ICON,
         cloudtak_cfg=cloudtak_cfg,
         cloudtak_tak_suggest=cloudtak_tak_suggest,
@@ -21932,25 +21933,24 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
 
 
 def _get_cloudtak_version_info():
-    """Return {version: str, update_available: bool, latest: str|None} for CloudTAK.
+    """Return CloudTAK version info matching Authentik pattern.
 
-    Version resolution order:
-    0. The RUNNING cloudtak-api container's package.json — authoritative for what is
-       actually serving. The git source tree is NOT a reliable version signal: a
-       FAILED "Update Now" checks out the new tag BEFORE the (failed) image rebuild,
-       so the source sits at e.g. v13.10.0 while the container still runs v13.4.0.
-       Reading git first made the console report the un-built version (caught on
-       test12 2026-06-07: source v13.10.0, container v13.4.0). Prefer the container.
-    1. git describe --tags --exact-match: if HEAD is exactly at a release tag, use the
-       tag name (authoritative even when package.json lags — dfpc-coe sometimes tags
-       before bumping package.json). Used only when no container is running.
-    2. package.json (api/ or web/) in the source tree.
-    3. git describe --tags --always fallback for everything else.
+    Returns {version, update_available, latest, vetted_release, channel, upstream_latest, upstream_newer}.
+    Main channel: pinned to CLOUDTAK_VETTED_RELEASE (13.44.0).
+    Dev channel: can see upstream-latest but doesn't auto-update past vetted release.
     """
     import re
-    out = {'version': '', 'update_available': False, 'latest': None}
+    out = {'version': '', 'update_available': False, 'latest': None,
+           'vetted_release': CLOUDTAK_VETTED_RELEASE, 'channel': 'main',
+           'upstream_latest': None, 'upstream_newer': False}
     ct_dir = os.path.expanduser('~/CloudTAK')
-    # Step 0: prefer the RUNNING container's version (what's actually serving).
+
+    # Detect channel (main or dev)
+    _s = load_settings()
+    _channel = (_s.get('update_channel') or 'main').strip().lower()
+    out['channel'] = _channel
+
+    # Resolve running version: container first (authoritative), then git, then package.json
     try:
         rcid = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=cloudtak-api']), capture_output=True, text=True, timeout=5)
         _cid_lines = (rcid.stdout or '').strip().splitlines() if rcid.returncode == 0 else []
@@ -21963,7 +21963,7 @@ def _get_cloudtak_version_info():
                 out['version'] = ver
     except Exception:
         pass
-    # Step 1: prefer exact git tag — authoritative even when package.json lags
+
     if not out['version'] and os.path.isdir(os.path.join(ct_dir, '.git')):
         try:
             rv = subprocess.run(
@@ -21973,7 +21973,7 @@ def _get_cloudtak_version_info():
                 out['version'] = rv.stdout.strip().lstrip('vV')
         except Exception:
             pass
-    # Step 2: package.json when not at an exact tag
+
     if not out['version']:
         for pkg in ['package.json', 'api/package.json', 'web/package.json']:
             pkg_path = os.path.join(ct_dir, pkg)
@@ -21986,88 +21986,36 @@ def _get_cloudtak_version_info():
                         break
                 except Exception:
                     pass
-    # Step 3: git describe fallback
-    if not out['version'] and os.path.isdir(os.path.join(ct_dir, '.git')):
-        rv = subprocess.run(f'cd {ct_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
-        if rv.returncode == 0 and rv.stdout.strip():
-            out['version'] = rv.stdout.strip().lstrip('vV')
-    r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=cloudtak-api']), capture_output=True, text=True, timeout=5)
-    # Guard: docker ps -q returns empty (rc 0) when no container is running — e.g.
-    # the post-update recreate window. `''.splitlines()[0]` was an IndexError → 500
-    # on /api/modules/version while CloudTAK was being recreated (caught in v0.9.48 T&E).
-    _ct_lines = (r.stdout or '').strip().splitlines() if r.returncode == 0 else []
-    _ct_api_id = _ct_lines[0].strip() if _ct_lines else ''
-    if _ct_api_id:
-        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', _ct_api_id, '--tail', '150']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-        if log_r.stdout:
-            for line in reversed(log_r.stdout.strip().split('\n')):
-                if '[update-check]' in line:
-                    m = re.search(r'latest=([^\s]+)', line)
-                    if m:
-                        out['latest'] = m.group(1).strip()
-                    if 'update=true' in line:
-                        out['update_available'] = True
-                    break
-    if out['version'] and not out['latest']:
-        tag = _get_cloudtak_latest_release_tag()
-        if tag:
-            latest_ver = tag.lstrip('vV')
-            out['latest'] = latest_ver
-            # v10.1.3+: Gate to CLOUDTAK_VETTED_RELEASE — v13.45+ requires plugin compat review
-            # Suppress updates to 13.45+ until plugin authors (e.g. TAK-CAD) update for hub/api split
-            try:
-                latest_major_minor = '.'.join(latest_ver.split('.')[:2])
-                vetted_major_minor = '.'.join(CLOUDTAK_VETTED_RELEASE.split('.')[:2])
-                if latest_major_minor > vetted_major_minor:
-                    out['latest'] = CLOUDTAK_VETTED_RELEASE
-                    out['update_available'] = False
-                elif out['version'] != CLOUDTAK_VETTED_RELEASE:
-                    out['update_available'] = True
-            except Exception:
-                if out['version'] != latest_ver:
-                    out['update_available'] = True
-    # v0.9.54: suppress a FALSE "update available" caused by the container's
-    # api/package.json lagging the git release tag. dfpc-coe ships release tags
-    # whose api/package.json trails the tag — and the lag now crosses a MINOR
-    # boundary (the v13.14.0 tag carries api/package.json 13.13.0, root 13.14.0).
-    # The v0.9.49 gate compared the container's major.minor to the LATEST TAG's
-    # major.minor (13.13 vs 13.14) and so wrongly kept the badge lit on a fully
-    # up-to-date box, making every Update Now look like a no-op (caught on test12
-    # 2026-06-12: HEAD v13.14.0, container 13.13.0, badge stuck).
-    #
-    # Correct signal: the box is current iff ~/CloudTAK HEAD is checked out
-    # EXACTLY at the latest release tag AND the running container's version equals
-    # the version baked into THAT tag's api/package.json (what a correct rebuild
-    # produces — the container reads /home/etl/api/package.json, so compare against
-    # the source api/package.json, never the tag string or root package.json).
-    # If the container is behind the source api/package.json, the rebuild did not
-    # land (source moved, image didn't) — keep showing the update.
-    if out['update_available'] and out['version'] and out['latest']:
+
+    # Set 'latest' based on channel: main→vetted, dev→whatever upstream has (but compare to vetted)
+    out['latest'] = CLOUDTAK_VETTED_RELEASE
+
+    # Dev channel: check upstream for newer releases (awareness only, not auto-installed)
+    out['upstream_latest'] = None
+    out['upstream_newer'] = False
+    if _channel == 'dev':
         try:
-            _latest_norm = out['latest'].lstrip('vV')
-            _src = subprocess.run(
-                f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=5)
-            _src_tag = (_src.stdout or '').strip().lstrip('vV')
-            if _src_tag and _src_tag == _latest_norm:
-                _src_api_ver = ''
-                _api_pkg = os.path.join(ct_dir, 'api', 'package.json')
-                if os.path.isfile(_api_pkg):
-                    try:
-                        with open(_api_pkg) as _f:
-                            _src_api_ver = (json.load(_f).get('version') or '').strip()
-                    except Exception:
-                        _src_api_ver = ''
-                if _src_api_ver and out['version'] == _src_api_ver:
-                    out['update_available'] = False
-                    # Display the tag version (e.g. 13.14.0), NOT the lagging
-                    # container api/package.json string (13.13.0). The box runs
-                    # the latest tag's code — only dfpc's internal version field
-                    # lags (#1479) — so showing the stale number reads as "the
-                    # update didn't take" even though the box is fully current.
-                    out['version'] = _src_tag
+            _up = _get_cloudtak_latest_release_tag()
+            if _up:
+                out['upstream_latest'] = _up.lstrip('vV')
+                # Compare: is upstream newer than our vetted pin?
+                _pin = tuple(int(x) for x in re.findall(r'\d+', CLOUDTAK_VETTED_RELEASE))
+                _ut = tuple(int(x) for x in re.findall(r'\d+', out['upstream_latest']))
+                if _ut > _pin:
+                    out['upstream_newer'] = True
         except Exception:
             pass
+
+    # Compare installed vs target: only flag update_available if target > installed
+    if out['version'] and out['latest']:
+        try:
+            _installed = tuple(int(x) for x in re.findall(r'\d+', out['version']))
+            _target = tuple(int(x) for x in re.findall(r'\d+', out['latest']))
+            if _target > _installed:
+                out['update_available'] = True
+        except Exception:
+            pass
+
     return out
 
 
@@ -39779,7 +39727,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ cloudtak_version }}</span>{% endif %}{% if cloudtak_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">v{{ cloudtak_latest }} available</span>{% endif %}</h1>
+    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version_info and cloudtak_version_info.version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ cloudtak_version_info.version }}</span>{% if cloudtak_version_info.channel == 'dev' %} <span style="color:#f59e0b;font-size:10px;margin-left:4px" title="Main channel is pinned to v{{ cloudtak_version_info.vetted_release }} — v13.44.0 (plugin compat gate)">main: v{{ cloudtak_version_info.vetted_release }}</span>{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} <span style="color:var(--cyan);font-size:11px;margin-left:4px" title="Update to v{{ cloudtak_version_info.latest }}">v{{ cloudtak_version_info.latest }} available</span>{% elif cloudtak_version_info.upstream_newer %} <span style="color:var(--cyan);font-size:10px;margin-left:4px" title="Upstream CloudTAK v{{ cloudtak_version_info.upstream_latest }} is newer than main pin (13.44.0). v13.45+ requires plugin compat review. Not auto-installed.">↑ v{{ cloudtak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} <span style="color:var(--cyan);font-size:11px;margin-left:4px">v{{ cloudtak_version_info.latest }} available</span>{% elif not cloudtak_version_info.update_available %} <span style="color:var(--green);font-size:10px;margin-left:4px" title="Main channel vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}</h1>
     <p>Browser-based TAK client — in-browser map and situational awareness via TAK Server</p>
   </div>
 
