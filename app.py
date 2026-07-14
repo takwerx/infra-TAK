@@ -27163,23 +27163,37 @@ def run_cloudtak_deploy(cfg=None):
         env_path = os.path.join(cloudtak_dir, '.env')
         import secrets as _secrets
 
-        # v10.1.3+: Preserve postgres password across redeploys to prevent password mismatch.
-        # If CloudTAK was already deployed, reuse the stored password instead of generating a new one.
-        # This prevents "password authentication failed" errors when existing volumes have the old password.
-        # On fresh installs or if password is lost, generate a new one.
-        postgres_pass = settings.get('cloudtak_postgres_password', '').strip()
-        if not postgres_pass or len(postgres_pass) < 24:
-            # Generate new password for fresh install or corrupted state
-            postgres_pass = _secrets.token_hex(24)
-            plog("  Generated new postgis password (fresh install)")
-            # Persist it so future redeploys use the same password
+        # v10.1.3+: Preserve the postgis password across redeploys. Source order:
+        # settings.json → the existing .env → generate (fresh install only). Postgres
+        # bakes POSTGRES_PASSWORD into pg_authid at first initdb and ignores it after,
+        # so writing a fresh password over a live volume = 'password authentication
+        # failed' on every API boot. The .env fallback covers pre-v10.1.3 installs and
+        # settings.json loss; _cloudtak_sync_postgis_password() after `up -d` converges
+        # any box that already carries a mismatch.
+        postgres_pass = settings.get('cloudtak_postgres_password', '')
+        postgres_pass = postgres_pass.strip() if isinstance(postgres_pass, str) else ''
+        if postgres_pass:
+            plog("  Reusing stored postgis password (settings)")
+        else:
+            try:
+                with open(env_path) as _ef:
+                    for _l in _ef:
+                        if _l.strip().startswith('POSTGRES_PASSWORD='):
+                            postgres_pass = _l.strip().split('=', 1)[1].strip()
+                            break
+            except Exception:
+                pass
+            if postgres_pass:
+                plog("  Reusing postgis password from existing .env")
+            else:
+                postgres_pass = _secrets.token_hex(24)
+                plog("  Generated new postgis password (fresh install)")
+            # Persist so future redeploys use the same password
             settings['cloudtak_postgres_password'] = postgres_pass
             try:
                 save_settings(settings)
             except Exception as e:
                 plog(f"  ⚠ Could not persist postgres password to settings: {e}")
-        else:
-            plog("  Reusing stored postgis password (existing install)")
 
         signing_secret = _secrets.token_hex(32)
         minio_pass = _secrets.token_hex(16)
@@ -27380,6 +27394,9 @@ def run_cloudtak_deploy(cfg=None):
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Containers started")
+        # Converge the postgis role password to .env — repairs any pre-existing
+        # mismatch (e.g. a past deploy that regenerated .env over a live volume).
+        _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog)
         plog("✓ Restart complete.")
 
         # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used.
@@ -27686,6 +27703,8 @@ def run_cloudtak_redeploy(cfg=None):
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Containers restarted")
+        # Converge the postgis role password to .env (repairs latent mismatches).
+        _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog)
         time.sleep(3)
         # Restore /api proxy to 127.0.0.1:5001 (Node in container) if a previous patch sent it to the host
         api_container = None
@@ -27732,6 +27751,82 @@ def run_cloudtak_redeploy(cfg=None):
         cloudtak_deploy_status.update({'running': False, 'error': True})
     finally:
         cloudtak_deploy_status['running'] = False
+
+
+def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=None):
+    """Converge the postgis ROLE password onto the .env POSTGRES_PASSWORD value.
+
+    Postgres bakes POSTGRES_PASSWORD into pg_authid on the FIRST initdb of the data
+    volume and ignores the env var forever after. Any deploy that regenerated .env
+    over an existing volume left the two out of sync — latent until the next
+    container restart (e.g. an update rebuild), when the API dies with 'password
+    authentication failed for user "docker"' (test12/test6, 2026-07-13). Rather than
+    reconstruct how a box got here, make the DB match .env: unix-socket connections
+    inside the official postgres image are trust-authenticated, so ALTER USER works
+    regardless of the old password. Idempotent (no-op when already in sync);
+    best-effort, never raises. Returns True when verified in sync."""
+    _log = plog or (lambda m: None)
+    try:
+        if remote_cfg:
+            # One guarded pipeline on the remote box. Passwords are console-generated
+            # hex (or the legacy 'docker' literal) — no shell-quoting hazards.
+            script = (
+                "cd ~/CloudTAK 2>/dev/null && "
+                "PW=$(grep -E '^POSTGRES_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-) && "
+                "CID=$(docker ps -q -f name=postgis | head -1) && "
+                "[ -n \"$PW\" ] && [ -n \"$CID\" ] || { echo SKIP; exit 0; }; "
+                "for i in 1 2 3 4 5 6; do docker exec \"$CID\" pg_isready -U docker -q 2>/dev/null && break; sleep 5; done; "
+                "if docker exec -e PGPASSWORD=\"$PW\" \"$CID\" psql -h 127.0.0.1 -U docker -d gis -tAc 'SELECT 1' >/dev/null 2>&1; then echo INSYNC; "
+                "elif docker exec \"$CID\" psql -U docker -d gis -c \"ALTER USER docker WITH PASSWORD '$PW'\" >/dev/null 2>&1; then echo SYNCED; "
+                "else echo FAILED; fi"
+            )
+            ok, out = _ssh_probe(remote_cfg, script, timeout=90)
+            verdict = (out or '').strip().splitlines()[-1] if (out or '').strip() else ''
+            if verdict == 'INSYNC':
+                _log("  ✓ postgis password verified in sync with .env")
+                return True
+            if verdict == 'SYNCED':
+                _log("  ✓ postgis role password converged to .env value (was out of sync)")
+                return True
+            _log(f"  ⚠ postgis password sync inconclusive ({verdict or 'no output'})")
+            return False
+        cloudtak_dir = cloudtak_dir or os.path.expanduser('~/CloudTAK')
+        pw = ''
+        with open(os.path.join(cloudtak_dir, '.env')) as f:
+            for line in f:
+                if line.strip().startswith('POSTGRES_PASSWORD='):
+                    pw = line.strip().split('=', 1)[1].strip()
+                    break
+        if not pw or "'" in pw:
+            return False
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=postgis']),
+                           capture_output=True, text=True, timeout=10)
+        cid = (r.stdout or '').strip().splitlines()[0].strip() if (r.stdout or '').strip() else ''
+        if not cid:
+            return False
+        for _ in range(6):  # postgis can take a moment to accept connections after up -d
+            rdy = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'pg_isready', '-U', 'docker', '-q']),
+                                 capture_output=True, timeout=15)
+            if rdy.returncode == 0:
+                break
+            time.sleep(5)
+        t = subprocess.run(_sudo_wrap(['docker', 'exec', '-e', f'PGPASSWORD={pw}', cid,
+                                       'psql', '-h', '127.0.0.1', '-U', 'docker', '-d', 'gis', '-tAc', 'SELECT 1']),
+                           capture_output=True, text=True, timeout=20)
+        if t.returncode == 0:
+            _log("  ✓ postgis password verified in sync with .env")
+            return True
+        a = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'psql', '-U', 'docker', '-d', 'gis',
+                                       '-c', f"ALTER USER docker WITH PASSWORD '{pw}'"]),
+                           capture_output=True, text=True, timeout=20)
+        if a.returncode == 0:
+            _log("  ✓ postgis role password converged to .env value (was out of sync)")
+            return True
+        _log(f"  ⚠ postgis password sync failed: {(a.stderr or t.stderr or '').strip()[:160]}")
+        return False
+    except Exception as e:
+        _log(f"  ⚠ postgis password sync errored (non-fatal): {e}")
+        return False
 
 
 def run_cloudtak_update():
@@ -27943,6 +28038,11 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
+        # Converge the postgis role password to .env BEFORE declaring success — the
+        # rebuild restarts the API, which is exactly when a latent password mismatch
+        # (from any past .env regeneration over the live volume) surfaces as
+        # 'password authentication failed for user "docker"' (test12/test6 2026-07-13).
+        _cloudtak_sync_postgis_password(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
