@@ -452,8 +452,20 @@ generate_self_signed_cert() {
     CERT_DIR="$CONFIG_DIR/ssl"
     mkdir -p "$CERT_DIR"
 
-    if [ ! -f "$CERT_DIR/console.key" ]; then
-        echo -e "  Generating self-signed certificate..."
+    # v10.1.3: the console cert MUST carry DNS:host.docker.internal in its SAN — the
+    # CloudTAK api container reaches TAKWERX Console at https://host.docker.internal:5001
+    # for config, and with that name in the SAN CloudTAK can VALIDATE the cert
+    # (NODE_EXTRA_CA_CERTS) instead of disabling TLS verification wholesale. Regenerate
+    # here (before gunicorn binds, so the served cert always matches disk) whenever the
+    # cert is absent OR predates this SAN. Existing IP/localhost SANs are preserved.
+    CONSOLE_SAN_NEED="host.docker.internal"
+    if [ ! -f "$CERT_DIR/console.key" ] || \
+       ! openssl x509 -in "$CERT_DIR/console.crt" -noout -ext subjectAltName 2>/dev/null | grep -q "$CONSOLE_SAN_NEED"; then
+        if [ -f "$CERT_DIR/console.key" ]; then
+            echo -e "  Regenerating self-signed certificate (adding host.docker.internal SAN)..."
+        else
+            echo -e "  Generating self-signed certificate..."
+        fi
 
         # v0.9.29: use the same public-preferring detection so the cert SAN
         # matches the IP operators actually browse to on cloud VMs.
@@ -464,12 +476,12 @@ generate_self_signed_cert() {
             -out "$CERT_DIR/console.crt" \
             -sha256 -days 3650 -nodes \
             -subj "/C=US/ST=TAK/L=TAK/O=TAKWERX/CN=$SERVER_IP" \
-            -addext "subjectAltName=IP:$SERVER_IP,IP:127.0.0.1,DNS:localhost" \
+            -addext "subjectAltName=IP:$SERVER_IP,IP:127.0.0.1,DNS:localhost,DNS:host.docker.internal" \
             2>/dev/null
 
         chmod 600 "$CERT_DIR/console.key"
         chmod 644 "$CERT_DIR/console.crt"
-        
+
         echo -e "  ${GREEN}✓ Self-signed certificate generated${NC}"
     fi
 }

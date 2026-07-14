@@ -132,7 +132,9 @@ def save_settings_atomic(settings):
 
 def regen_self_signed_cert(ip):
     """Regenerate the console self-signed cert with `ip` in CN + SAN. Same openssl
-    invocation as start.sh generate_self_signed_cert()."""
+    invocation as start.sh generate_self_signed_cert() — including DNS:host.docker.internal
+    (v10.1.3) so the CloudTAK api container can validate the cert when it reaches the
+    console at https://host.docker.internal:5001, rather than disabling TLS verify."""
     os.makedirs(SSL_DIR, exist_ok=True)
     crt = os.path.join(SSL_DIR, 'console.crt')
     key = os.path.join(SSL_DIR, 'console.key')
@@ -140,7 +142,7 @@ def regen_self_signed_cert(ip):
         ['openssl', 'req', '-x509', '-newkey', 'rsa:4096',
          '-keyout', key, '-out', crt, '-sha256', '-days', '3650', '-nodes',
          '-subj', f'/C=US/ST=TAK/L=TAK/O=TAKWERX/CN={ip}',
-         '-addext', f'subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost'],
+         '-addext', f'subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost,DNS:host.docker.internal'],
         check=True, capture_output=True, timeout=60)
     os.chmod(key, 0o600)
     os.chmod(crt, 0o644)

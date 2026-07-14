@@ -26324,13 +26324,54 @@ def _cloudtak_build_override_yml(settings):
     # with Docker Engine 27+) does not support the !reset YAML tag — it
     # resolves to null, silently dropping ALL port bindings.
     # v10.1.3+: Mount console cert for CloudTAK API to trust the self-signed HTTPS endpoint.
-    # CloudTAK v13+ tries to reach TAKWERX Console at https://host.docker.internal:5001
-    # to fetch configuration. The docker api container needs to either trust the cert
-    # or skip validation. NODE_TLS_REJECT_UNAUTHORIZED=0 is the pragmatic dev workaround.
-    console_cert_src = os.path.join(os.path.expanduser('~'), '.config', 'ssl', 'console.crt')
-    cert_vol_block = f"""    volumes:
-      - "{console_cert_src}:/etc/ssl/certs/takwerx-console.crt:ro"
-""" if os.path.isfile(console_cert_src) else ""
+    # CloudTAK v13+ reaches TAKWERX Console at https://host.docker.internal:5001 to fetch
+    # config. The api container must trust the console's self-signed cert. v10.1.3 does this
+    # WITHOUT weakening TLS: the console cert now carries DNS:host.docker.internal in its SAN
+    # (start.sh / selfheal_ip regen), so mounting it and pointing NODE_EXTRA_CA_CERTS at it
+    # lets Node VALIDATE the console connection (CA-trust + hostname) while keeping cert
+    # verification ON for every OTHER outbound HTTPS (TAK Server, tile/feed sources).
+    # Fallback: a box whose cert predates the SAN (start.sh not re-run) or a REMOTE/split
+    # deploy (the mounted path is local; the console isn't on the remote host) keeps the old
+    # NODE_TLS_REJECT_UNAUTHORIZED=0 so CloudTAK still reaches the console — it self-upgrades
+    # to the validated path once start.sh regenerates the cert with the SAN.
+    console_cert_src = os.path.join(CONFIG_DIR, 'ssl', 'console.crt')
+    try:
+        _ct_is_remote = _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote'
+    except Exception:
+        _ct_is_remote = False
+    _cert_has_docker_san = False
+    if not _ct_is_remote and os.path.isfile(console_cert_src):
+        try:
+            _san = subprocess.run(
+                ['openssl', 'x509', '-in', console_cert_src, '-noout', '-ext', 'subjectAltName'],
+                capture_output=True, text=True, timeout=10)
+            _cert_has_docker_san = _san.returncode == 0 and 'host.docker.internal' in (_san.stdout or '')
+        except Exception:
+            _cert_has_docker_san = False
+
+    if _cert_has_docker_san:
+        # Validated path: trust the console cert as an extra CA, keep TLS verification on.
+        tls_env_block = (
+            '      # v10.1.3: validate the console cert (SAN carries host.docker.internal)\n'
+            '      # instead of disabling TLS — verification stays ON for all other egress.\n'
+            '      NODE_EXTRA_CA_CERTS: "/etc/ssl/certs/takwerx-console.crt"\n'
+            '      CONSOLE_URL: "https://host.docker.internal:5001"\n'
+        )
+        cert_vol_block = (
+            '    volumes:\n'
+            f'      - "{console_cert_src}:/etc/ssl/certs/takwerx-console.crt:ro"\n'
+        )
+    else:
+        # Fallback (remote deploy, or cert predates the SAN): reach the console without
+        # verifying its cert. Re-run `sudo ./start.sh` to regenerate the cert with the
+        # host.docker.internal SAN and this converges to the validated path above.
+        tls_env_block = (
+            '      # Fallback: console cert lacks the host.docker.internal SAN (run\n'
+            '      # `sudo ./start.sh` to regenerate it and enable NODE_EXTRA_CA_CERTS validation).\n'
+            '      NODE_TLS_REJECT_UNAUTHORIZED: "0"\n'
+            '      CONSOLE_URL: "https://host.docker.internal:5001"\n'
+        )
+        cert_vol_block = ""
 
     return f"""# TAKWERX: CloudTAK container overrides — v0.9.11+v0.9.12 security hardening
 # Port hardening applied directly to compose.yaml by _patch_cloudtak_compose_ports().
@@ -26339,11 +26380,7 @@ services:
     extra_hosts:
 {hosts_block}
     environment:
-      # v10.1.3+: CloudTAK needs HTTPS to reach TAKWERX Console on startup.
-      # NODE_TLS_REJECT_UNAUTHORIZED=0 trusts self-signed cert (dev workaround).
-      NODE_TLS_REJECT_UNAUTHORIZED: "0"
-      CONSOLE_URL: "https://host.docker.internal:5001"
-{cert_vol_block}
+{tls_env_block}{cert_vol_block}
   events:
     extra_hosts:
 {hosts_block}
