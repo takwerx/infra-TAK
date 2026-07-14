@@ -732,8 +732,8 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # newer, as AWARENESS only — Update always installs the channel target, never raw upstream.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.39.0"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.72.3"  # DEV candidate under validation (== vetted until a newer one is being tried)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.39.0"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.74.4"  # DEV candidate under validation (upstream latest pair 2026-07-14; promote to vetted after login + peer connect pass)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.90.4"
 
 
 def _get_netbird_target_images(settings=None):
@@ -21951,6 +21951,20 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
         return _cloudtak_release_cache.get('tag') or None
 
 
+def _get_cloudtak_target_release_tag(settings=None, use_cache=True):
+    """Channel-target CloudTAK release tag (e.g. 'v13.44.0') — mirrors
+    _get_authentik_target_release. Main → the vetted pin, always (deterministic, no
+    GitHub dependency). Dev → upstream latest, falling back to the pin if GitHub is
+    unreachable. Deploy AND update both install this tag — a main-channel box must
+    never receive raw upstream latest (13.45+ breaks plugin compatibility)."""
+    s = settings if settings is not None else load_settings()
+    if (s.get('update_channel') or 'main').strip().lower() == 'dev':
+        tag = _get_cloudtak_latest_release_tag(use_cache=use_cache)
+        if tag:
+            return tag
+    return 'v' + CLOUDTAK_VETTED_RELEASE
+
+
 def _get_cloudtak_version_info():
     """Return CloudTAK version info matching Authentik pattern.
 
@@ -26851,9 +26865,9 @@ def run_cloudtak_deploy(cfg=None):
 
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
-            remote_release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+            remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
-                plog(f"  Target: stable release {remote_release_tag}")
+                plog(f"  Target: stable release {remote_release_tag} (channel target)")
                 prep_cmd = (
                     f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
                     "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
@@ -27008,7 +27022,7 @@ def run_cloudtak_deploy(cfg=None):
         # Step 2: Clone or update repo
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
-        release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+        release_tag = _get_cloudtak_target_release_tag(use_cache=False)
         if os.path.exists(cloudtak_dir):
             # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
             # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
@@ -27080,7 +27094,7 @@ def run_cloudtak_deploy(cfg=None):
                     return
                 _cloudtak_git_prep(cloudtak_dir, plog)
         else:
-            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+            release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             tag_label = release_tag or 'main (latest release tag unavailable)'
             plog(f"  Cloning from GitHub (shallow, {tag_label})...")
             clone_timeout = 600  # 10 min — VPS→GitHub can be slow
@@ -27127,7 +27141,7 @@ def run_cloudtak_deploy(cfg=None):
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
-            _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_latest_release_tag()
+            _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_target_release_tag()
             _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
             r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
@@ -27739,16 +27753,8 @@ def run_cloudtak_update():
         # plugin compatibility). Dev installs upstream latest so new releases get
         # tested before the pin is bumped.
         _channel = (settings.get('update_channel') or 'main').strip().lower()
-        if _channel == 'dev':
-            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
-            if not release_tag:
-                release_tag = 'v' + CLOUDTAK_VETTED_RELEASE
-                plog(f"  ⚠ Could not fetch latest release from GitHub — falling back to vetted pin {release_tag}")
-            else:
-                plog(f"  Target: {release_tag} (dev channel — upstream latest)")
-        else:
-            release_tag = 'v' + CLOUDTAK_VETTED_RELEASE
-            plog(f"  Target: {release_tag} (main channel — fleet-vetted pin)")
+        release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False)
+        plog(f"  Target: {release_tag} ({'dev channel — upstream latest' if _channel == 'dev' else 'main channel — fleet-vetted pin'})")
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
