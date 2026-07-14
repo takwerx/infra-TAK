@@ -1151,7 +1151,17 @@ def _load_json_cached(p):
         return {}
 
 def load_settings():
-    return _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
+    s = _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
+    # Type guard: a core identity key persisted with a non-scalar type (e.g. server_ip
+    # written as [null, null] from an unpacked (ip, source) tuple) crashes every
+    # `(settings.get(...) or '').strip()` — including at module import, so the console
+    # can't even boot to self-heal. Drop the bad key so the '' fallbacks hold;
+    # _heal_settings_core_keys() re-derives and re-persists it on boot.
+    for _k in CORE_SETTINGS_KEYS:
+        _v = s.get(_k)
+        if _v is not None and not isinstance(_v, (str, int)):
+            del s[_k]
+    return s
 
 # v10.0.3 — settings.json is the box's identity (fqdn, ssl_mode, os_type, server_ip…)
 # and is written from 166 call sites across many background threads. The original
@@ -1184,7 +1194,11 @@ def save_settings(s):
             except Exception:
                 _disk = {}
             if isinstance(_disk, dict):
-                _refilled = [k for k in CORE_SETTINGS_KEYS if k not in s and k in _disk]
+                # Type guard mirrors load_settings: never refill a corrupted non-scalar
+                # value (e.g. server_ip=[null, null]) back into the outgoing dict.
+                _refilled = [k for k in CORE_SETTINGS_KEYS
+                             if k not in s and k in _disk
+                             and (_disk[k] is None or isinstance(_disk[k], (str, int)))]
                 for k in _refilled:
                     s[k] = _disk[k]
                 if _refilled:
@@ -1239,8 +1253,11 @@ def _detect_console_port():
 def _detect_server_ip_safe():
     """Best-effort public/host IP for self-heal only (never raises, time-boxed)."""
     try:
-        ip = _detect_cloud_public_ip()
-        if ip:
+        # _detect_cloud_public_ip returns (ip, source) — including (None, None) on
+        # failure, which is a TRUTHY tuple. Unpack it; returning the raw tuple here
+        # is what wrote server_ip=[null, null] into settings.json (test8, 2026-07-14).
+        ip, _src = _detect_cloud_public_ip()
+        if ip and isinstance(ip, str):
             return ip
     except Exception:
         pass
@@ -1284,8 +1301,10 @@ def _heal_settings_core_keys():
     except Exception:
         return
     _identity = ('os_type', 'os_name', 'pkg_mgr', 'arch', 'console_port', 'install_dir', 'ssl_mode')
-    # Fast no-op: identity intact AND (fqdn present OR genuinely no domain to recover).
-    if all(s.get(k) for k in _identity) and (s.get('fqdn') or _recover_fqdn() is None):
+    # Fast no-op: identity intact AND server_ip present AND (fqdn present OR genuinely
+    # no domain to recover). server_ip is included so a value dropped by the
+    # load_settings type guard (corrupted to a list on disk) gets re-derived here.
+    if all(s.get(k) for k in _identity) and s.get('server_ip') and (s.get('fqdn') or _recover_fqdn() is None):
         return
     healed = {}
     if not s.get('install_dir'):
