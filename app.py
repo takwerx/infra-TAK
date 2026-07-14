@@ -27902,8 +27902,9 @@ def run_cloudtak_update():
                 plog("✗ Neither `docker compose` nor `docker-compose` is available on the remote host")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
             build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache && {dcc} up -d"
-            ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=2700)
+            ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=5400)
             if not ok:
                 plog(f"✗ Build/restart failed on remote: {(out or '')[:600]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -27915,15 +27916,33 @@ def run_cloudtak_update():
                 plog("✗ Neither `docker compose` nor `docker-compose` is available")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            # Detected compose binary only — no fallback chain that would mask the real
-            # build error with a bogus 'docker-compose: not found'. Surface the tail of
-            # the combined output so an actual build failure is diagnosable.
-            r = subprocess.run(
-                f'{dcc} build --no-cache && {dcc} up -d 2>&1',
-                shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
-            if r.returncode != 0:
-                _tail = '\n'.join((r.stdout or r.stderr or 'unknown').strip().splitlines()[-20:])
-                plog(f"✗ Build/restart failed (via `{dcc}`):\n{_tail}")
+            # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
+            # capture_output=True with timeout=2700 causes broker to timeout at 10min.
+            # Stream output instead (same as deploy function).
+            plog("  Streaming build output...")
+            proc = subprocess.Popen(
+                f'{dcc} build --no-cache && {dcc} up -d',
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=cloudtak_dir, bufsize=1
+            )
+            def _read_update_output():
+                for line in iter(proc.stdout.readline, ''):
+                    line = line.rstrip()
+                    if line:
+                        plog(f"  {line}")
+            reader = threading.Thread(target=_read_update_output, daemon=True)
+            reader.start()
+            try:
+                proc.wait(timeout=5400)  # 90 min (same as deploy)
+                reader.join(timeout=5)
+                if proc.returncode != 0:
+                    plog(f"✗ Build/restart failed with exit code {proc.returncode}")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                reader.join(timeout=5)
+                plog("✗ Build timed out after 90 minutes")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
