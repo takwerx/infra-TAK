@@ -21955,8 +21955,8 @@ def _get_cloudtak_version_info():
     """Return CloudTAK version info matching Authentik pattern.
 
     Returns {version, update_available, latest, vetted_release, channel, upstream_latest, upstream_newer}.
-    Main channel: pinned to CLOUDTAK_VETTED_RELEASE (13.44.0).
-    Dev channel: can see upstream-latest but doesn't auto-update past vetted release.
+    Main channel: pinned to CLOUDTAK_VETTED_RELEASE — updates only to what we vet and authorize.
+    Dev channel: targets upstream latest — anything past the main pin shows (and installs) as an update.
     """
     import re
     out = {'version': '', 'update_available': False, 'latest': None,
@@ -22006,10 +22006,10 @@ def _get_cloudtak_version_info():
                 except Exception:
                     pass
 
-    # Set 'latest' based on channel: main→vetted, dev→whatever upstream has (but compare to vetted)
+    # Channel-appropriate target (same model as Authentik): main → CLOUDTAK_VETTED_RELEASE
+    # (only what we pin and authorize), dev → upstream latest (dev boxes exist to test
+    # what's coming — anything past the main pin surfaces as an installable update).
     out['latest'] = CLOUDTAK_VETTED_RELEASE
-
-    # Dev channel: check upstream for newer releases (awareness only, not auto-installed)
     out['upstream_latest'] = None
     out['upstream_newer'] = False
     if _channel == 'dev':
@@ -22017,11 +22017,11 @@ def _get_cloudtak_version_info():
             _up = _get_cloudtak_latest_release_tag()
             if _up:
                 out['upstream_latest'] = _up.lstrip('vV')
-                # Compare: is upstream newer than our vetted pin?
                 _pin = tuple(int(x) for x in re.findall(r'\d+', CLOUDTAK_VETTED_RELEASE))
                 _ut = tuple(int(x) for x in re.findall(r'\d+', out['upstream_latest']))
                 if _ut > _pin:
                     out['upstream_newer'] = True
+                    out['latest'] = out['upstream_latest']
         except Exception:
             pass
 
@@ -27733,12 +27733,22 @@ def run_cloudtak_update():
         remote_cfg = cfg.get('remote', {}) if is_remote else {}
         remote_host = (remote_cfg.get('host') or '').strip() if is_remote else ''
 
-        plog("━━━ Step 1/3: Fetching latest stable release ━━━")
-        release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
-        if not release_tag:
-            plog("  ⚠ Could not fetch release tag from GitHub (rate limit or network) — will pull latest HEAD instead")
+        plog("━━━ Step 1/3: Resolving target release ━━━")
+        # Channel model (same as Authentik): main installs ONLY the vetted pin —
+        # never raw upstream latest, which can be past the pin (e.g. 13.45+ breaks
+        # plugin compatibility). Dev installs upstream latest so new releases get
+        # tested before the pin is bumped.
+        _channel = (settings.get('update_channel') or 'main').strip().lower()
+        if _channel == 'dev':
+            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+            if not release_tag:
+                release_tag = 'v' + CLOUDTAK_VETTED_RELEASE
+                plog(f"  ⚠ Could not fetch latest release from GitHub — falling back to vetted pin {release_tag}")
+            else:
+                plog(f"  Target: {release_tag} (dev channel — upstream latest)")
         else:
-            plog(f"  Target: {release_tag}")
+            release_tag = 'v' + CLOUDTAK_VETTED_RELEASE
+            plog(f"  Target: {release_tag} (main channel — fleet-vetted pin)")
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
@@ -65035,7 +65045,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.get('upstream_newer') and v.get('upstream_latest') %} <span style="color:#f59e0b;font-size:10px" title="netbirdio shipped v{{ v.get('upstream_latest') }}, newer than the vetted pin — try on dev, promote to main if it passes">· ↑ v{{ v.get('upstream_latest') }} upstream</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.get('channel') == 'dev' and v.get('vetted_release') %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('channel') == 'dev' and v.get('upstream_newer') and v.get('upstream_latest') %} <span style="color:#f59e0b;font-size:10px" title="Upstream CloudTAK v{{ v.get('upstream_latest') }} is newer than the vetted pin — v13.45+ requires plugin migration (hub/api split). Not auto-installed.">· ↑ v{{ v.get('upstream_latest') }} upstream</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.get('channel') == 'dev' and v.get('vetted_release') %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
@@ -65197,15 +65207,11 @@ function refreshModuleVersions(){
                 if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
-                }else if(d.upstream_newer&&d.upstream_latest){
-                    s+=' <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v'+d.upstream_latest+' is newer than the dev pin — investigate">· ↑ v'+d.upstream_latest+' upstream</span>';
                 }
             }else if(key==='netbird'&&d.channel==='dev'){
                 if(d.vetted)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted+'">· main: v'+d.vetted+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
-                }else if(d.upstream_newer&&d.upstream_latest){
-                    s+=' <span style="color:#f59e0b;font-size:10px" title="netbirdio shipped v'+d.upstream_latest+', newer than the vetted pin — try on dev, promote to main if it passes">· ↑ v'+d.upstream_latest+' upstream</span>';
                 }
             }else if(key==='netbird'&&d.vetted&&!d.update_available){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
@@ -65213,8 +65219,6 @@ function refreshModuleVersions(){
                 if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
-                }else if(d.upstream_newer&&d.upstream_latest){
-                    s+=' <span style="color:#f59e0b;font-size:10px" title="Upstream CloudTAK v'+d.upstream_latest+' is newer than the vetted pin — v13.45+ requires plugin migration (hub/api split). Not auto-installed.">· ↑ v'+d.upstream_latest+' upstream</span>';
                 }
             }else if(key==='cloudtak'&&d.vetted_release&&!d.update_available){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
