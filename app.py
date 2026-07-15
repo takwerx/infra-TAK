@@ -26339,15 +26339,15 @@ def _cloudtak_build_override_yml(settings):
         _ct_is_remote = _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote'
     except Exception:
         _ct_is_remote = False
-    _cert_has_docker_san = False
-    if not _ct_is_remote and os.path.isfile(console_cert_src):
-        try:
-            _san = subprocess.run(
-                ['openssl', 'x509', '-in', console_cert_src, '-noout', '-ext', 'subjectAltName'],
-                capture_output=True, text=True, timeout=10)
-            _cert_has_docker_san = _san.returncode == 0 and 'host.docker.internal' in (_san.stdout or '')
-        except Exception:
-            _cert_has_docker_san = False
+    # Validated path only when the LIVE console is SERVING a cert with the
+    # host.docker.internal SAN. _startup_migrations sets console_cert_docker_san=True only
+    # on a boot where gunicorn actually loaded a SAN-carrying cert (and regenerates the cert
+    # on disk when it's missing, converging over the next restart). Gating on that flag —
+    # not the on-disk cert — avoids tripping CloudTAK into validating a cert the console
+    # hasn't reloaded yet (the regenerated-but-not-served race).
+    _cert_has_docker_san = (not _ct_is_remote
+                            and bool(settings.get('console_cert_docker_san'))
+                            and os.path.isfile(console_cert_src))
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -69862,6 +69862,64 @@ def _selfheal_takserver_half_configured(plog=None):
         pass
 
 
+def _ensure_console_cert_docker_san(settings):
+    """Converge the console self-signed cert onto a SAN that includes host.docker.internal,
+    so the CloudTAK api container can VALIDATE its https://host.docker.internal:5001 hop
+    (NODE_EXTRA_CA_CERTS) instead of disabling TLS verification for all its egress.
+
+    Runs on EVERY console boot — the same self-heal path every update triggers — so the
+    whole fleet converges without anyone re-running start.sh. gunicorn loads the cert once
+    at process start, so this is a two-step convergence tracked by
+    settings['console_cert_docker_san']:
+      - disk cert ALREADY carries the SAN → gunicorn is serving it → set flag True
+        (the override builder's validated NODE_EXTRA_CA_CERTS path turns on)
+      - disk cert LACKS the SAN → regenerate on disk (served after the next restart) and
+        keep the flag False, so CloudTAK stays on the reject-fallback until the SAN'd cert
+        is actually being served (no 'validate a cert we aren't serving yet' race)
+    The console serves console.crt on :5001 in every ssl_mode (Caddy fronts the public FQDN
+    separately; CloudTAK always hits :5001 directly), so the SAN is needed regardless of mode.
+    Returns a log string, or '' when nothing changed. Best-effort; never raises."""
+    try:
+        crt = os.path.join(CONFIG_DIR, 'ssl', 'console.crt')
+        if not os.path.isfile(crt):
+            return ''
+        try:
+            r = subprocess.run(['openssl', 'x509', '-in', crt, '-noout', '-ext', 'subjectAltName'],
+                               capture_output=True, text=True, timeout=10)
+            has_san = r.returncode == 0 and 'host.docker.internal' in (r.stdout or '')
+        except Exception:
+            return ''
+        cur_flag = bool(settings.get('console_cert_docker_san'))
+        if has_san:
+            if not cur_flag:
+                settings['console_cert_docker_san'] = True
+                try:
+                    save_settings(settings)
+                except Exception:
+                    pass
+                return "console cert: host.docker.internal SAN present — CloudTAK TLS validation enabled"
+            return ''
+        # Cert predates the SAN. Regenerate on disk (gunicorn serves it after the next
+        # restart); leave the flag False so CloudTAK holds the reject-fallback until then.
+        ip = (settings.get('server_ip') or '').strip()
+        if not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+            ip = '127.0.0.1'
+        try:
+            import selfheal_ip
+            selfheal_ip.regen_self_signed_cert(ip)
+        except Exception as e:
+            return f"console cert: SAN regen failed (non-fatal): {str(e)[:100]}"
+        if cur_flag:
+            settings['console_cert_docker_san'] = False
+            try:
+                save_settings(settings)
+            except Exception:
+                pass
+        return "console cert: regenerated with host.docker.internal SAN — active after next console restart"
+    except Exception as e:
+        return f"console cert SAN check error (non-fatal): {str(e)[:100]}"
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -69912,6 +69970,16 @@ def _startup_migrations():
                 print(f"Startup migration: {_crt_msg}", flush=True)
         except Exception as _crt_e:
             print(f"Startup migration: console-restart timer error: {_crt_e}", flush=True)
+
+        # v10.1.3 — converge the console cert onto a host.docker.internal SAN so CloudTAK
+        # validates (not disables) TLS to the console. Rides every update's restart; two-step
+        # (regenerate on disk → served + flagged on the next boot). See the helper's docstring.
+        try:
+            _certsan_msg = _ensure_console_cert_docker_san(s)
+            if _certsan_msg:
+                print(f"Startup migration: {_certsan_msg}", flush=True)
+        except Exception as _certsan_e:
+            print(f"Startup migration: console cert SAN error (non-fatal): {_certsan_e}", flush=True)
 
         # v10.0.1 (RHEL) — self-heal fail2ban jail configs written by a pre-RHEL-port
         # build (`action = ufw` → whole daemon won't start; sshd logpath auth.log →
