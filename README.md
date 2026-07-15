@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.2-alpha)**
+**Current release: [v10.1.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.3-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.3-alpha — 2026-07-15 — CloudTAK updates that actually finish, a database that repairs itself, and a version pin you can trust
+
+**Headline: CloudTAK updating is fixed end to end — updates complete on slow connections, a database-password mismatch that could leave CloudTAK dead after an update now repairs itself automatically, and CloudTAK is pinned to a tested release so an update can't jump you onto a version that breaks your browser plugins. Updating is recommended; healthy boxes are left untouched.** Three things went wrong when updating CloudTAK, and all three are closed. **Updates no longer time out** — a large rebuild on a slow VPS connection used to get killed partway through; the build now streams its progress and is given the time it actually needs. **CloudTAK no longer comes back dead with a database error** — PostgreSQL only accepts its password the first time a database is created and ignores it forever after, so any box whose configuration had drifted from its database would fail with *"password authentication failed"* the moment an update restarted it. The console now checks the two against each other after every start and **repairs the mismatch itself**, so affected boxes heal on their next update with no intervention. And **CloudTAK now follows the same tested-version track as the identity provider and NetBird**: the main channel installs only the release the fleet has validated, so a newer upstream version that hasn't been checked against browser plugins can't land on your box by surprise — including on brand-new installs, which previously pulled whatever was newest. Every module card now reads the same way: **your version · what main is pinned to · update (only if there's actually one to install)**. Also in this release: a box whose **public IP changed** (common after a cloud stop/start) could write bad data into its own settings and then **fail to start the console at all** — that's now prevented and self-healing; **CloudTAK now validates the console's certificate** instead of skipping verification, so its connections are properly checked; a **TAK Portal map fix** so the map isn't empty for admins; and a batch of **security hardening**. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.3-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.3-alpha).
 
 ### v10.1.2-alpha — 2026-07-12 — Connectivity Wizard (beta): get any box online and reachable — homelab, on-prem, or in a truck
 
