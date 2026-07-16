@@ -5469,8 +5469,13 @@ def update_apply():
 
         if _apply_dev:
             # Dev channel: fetch origin/dev HEAD and check it out directly.
+            # The leading '+' forces the tracking-ref update: without it, a box that fetched
+            # dev before a history rewrite (force-push) is permanently wedged with
+            # "[rejected] dev -> origin/dev (non-fast-forward)" — Update Now can never
+            # recover on its own (test12, 2026-07-16). Forcing mirrors the default refspec
+            # (+refs/heads/*) and is safe: the checkout below is already --force.
             fetch_dev = _git(
-                ['fetch', 'origin', 'dev:refs/remotes/origin/dev'], timeout=60, isolated_fetch=True
+                ['fetch', 'origin', '+dev:refs/remotes/origin/dev'], timeout=60, isolated_fetch=True
             )
             if fetch_dev.returncode != 0:
                 return jsonify(_error_payload(_git_err(fetch_dev)))
@@ -5495,7 +5500,7 @@ def update_apply():
             # Fallback: track origin/main if tag lookup fails.
             if not target_ref:
                 fetch_main = _git(
-                    ['fetch', 'origin', 'main:refs/remotes/origin/main'], timeout=30, isolated_fetch=True
+                    ['fetch', 'origin', '+main:refs/remotes/origin/main'], timeout=30, isolated_fetch=True
                 )
                 if fetch_main.returncode != 0:
                     return jsonify(_error_payload(_git_err(fetch_main)))
