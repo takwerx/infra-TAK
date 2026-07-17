@@ -27835,8 +27835,8 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
                 "CID=$(docker ps -q -f name=postgis | head -1) && "
                 "[ -n \"$PW\" ] && [ -n \"$CID\" ] || { echo SKIP; exit 0; }; "
                 "for i in 1 2 3 4 5 6; do docker exec \"$CID\" pg_isready -U docker -q 2>/dev/null && break; sleep 5; done; "
-                "if docker exec -e PGPASSWORD=\"$PW\" \"$CID\" psql -h 127.0.0.1 -U docker -d gis -tAc 'SELECT 1' >/dev/null 2>&1; then echo INSYNC; "
-                "elif docker exec \"$CID\" psql -U docker -d gis -c \"ALTER USER docker WITH PASSWORD '$PW'\" >/dev/null 2>&1; then echo SYNCED; "
+                "docker exec \"$CID\" psql -U docker -d gis -c \"ALTER USER docker WITH PASSWORD '$PW'\" >/dev/null 2>&1; "
+                "if docker exec -e PGPASSWORD=\"$PW\" \"$CID\" sh -c 'psql -h \"$(hostname -i)\" -U docker -d gis -tAc \"SELECT 1\"' >/dev/null 2>&1; then echo SYNCED; "
                 "else echo FAILED; fi"
             )
             ok, out = _ssh_probe(remote_cfg, script, timeout=90)
@@ -27869,19 +27869,24 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
             if rdy.returncode == 0:
                 break
             time.sleep(5)
-        t = subprocess.run(_sudo_wrap(['docker', 'exec', '-e', f'PGPASSWORD={pw}', cid,
-                                       'psql', '-h', '127.0.0.1', '-U', 'docker', '-d', 'gis', '-tAc', 'SELECT 1']),
-                           capture_output=True, text=True, timeout=20)
-        if t.returncode == 0:
-            _log("  ✓ postgis password verified in sync with .env")
-            return True
+        # v10.1.4 (WS10): ALWAYS converge, then verify over the path the api actually
+        # uses. The old check-then-fix tested `psql -h 127.0.0.1` INSIDE the postgis
+        # container — initdb's default pg_hba TRUSTS loopback, so that test passes with
+        # any password and the heal logged 'verified in sync' while the api (docker
+        # network → scram) kept dying with 28P01 (test12 2026-07-17, 17:56:12). ALTER
+        # over the trusted local socket is idempotent and works regardless of the old
+        # password; the verify below targets the container's own network IP, which
+        # pg_hba matches with `host all all all scram-sha-256` — a REAL password test.
         a = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'psql', '-U', 'docker', '-d', 'gis',
                                        '-c', f"ALTER USER docker WITH PASSWORD '{pw}'"]),
                            capture_output=True, text=True, timeout=20)
-        if a.returncode == 0:
-            _log("  ✓ postgis role password converged to .env value (was out of sync)")
+        v = subprocess.run(_sudo_wrap(['docker', 'exec', '-e', f'PGPASSWORD={pw}', cid, 'sh', '-c',
+                                       'psql -h "$(hostname -i)" -U docker -d gis -tAc "SELECT 1"']),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode == 0:
+            _log("  ✓ postgis role password converged to .env and verified over the network path")
             return True
-        _log(f"  ⚠ postgis password sync failed: {(a.stderr or t.stderr or '').strip()[:160]}")
+        _log(f"  ⚠ postgis password sync failed: {(v.stderr or a.stderr or '').strip()[:160]}")
         return False
     except Exception as e:
         _log(f"  ⚠ postgis password sync errored (non-fatal): {e}")
@@ -73120,6 +73125,24 @@ try:
     _threading_snap.Thread(target=_tak_snapshot_scheduler, daemon=True, name='tak-snapshot-scheduler').start()
 except Exception as _e:
     print(f"[startup] failed to start snapshot scheduler (non-fatal): {_e}", flush=True)
+
+# v10.1.4 (WS10): converge the CloudTAK postgis role password to .env once per boot.
+# The update-flow sync ran with a false in-sync check for a release (trust-loopback
+# test), so boxes exist where the api crash-loops on 28P01 with no CloudTAK update
+# pending to trigger the fixed sync — a console Update Now must be enough to heal
+# them (fleet rule). Idempotent no-op when already converged; background thread
+# (the sync waits up to 30s for pg_isready); skipped when CloudTAK isn't local.
+try:
+    import threading as _threading_pgsync
+    def _startup_postgis_sync():
+        try:
+            if os.path.isfile(os.path.expanduser('~/CloudTAK/.env')):
+                _cloudtak_sync_postgis_password(plog=lambda m: print(f"[startup-postgis]{m}", flush=True))
+        except Exception:
+            pass
+    _threading_pgsync.Thread(target=_startup_postgis_sync, daemon=True, name='cloudtak-postgis-sync').start()
+except Exception as _e:
+    print(f"[startup] failed to start postgis sync (non-fatal): {_e}", flush=True)
 
 # v10.1.4 WS6: warm the exposure-audit cache once in the background so the Console
 # header badge's first fetch after a restart hits a warm cache instead of racing the
