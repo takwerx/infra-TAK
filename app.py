@@ -1957,6 +1957,45 @@ def _docker_install_cmd():
         )
     return 'curl -fsSL https://get.docker.com | sh'
 
+
+def _docker_probe():
+    """Return (rc, version_string) for `docker --version` — a MISSING binary reports
+    rc!=0, it must never raise. As root, _sudo_wrap() returns ['docker', ...]
+    unchanged and subprocess.run raises FileNotFoundError when the binary doesn't
+    exist — which killed the Authentik deploy INSIDE its own 'Checking Docker' step,
+    before the install branch could run (GH issue #54: fresh Hyper-V Ubuntu VM,
+    'FATAL ERROR: [Errno 2] No such file or directory: docker'). Non-root boxes
+    never hit it (the broker/python indirection always exists), so the fleet's
+    flipped boxes masked the bug."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True, timeout=15)
+        return r.returncode, (r.stdout or '').strip()
+    except FileNotFoundError:
+        return 127, ''
+    except Exception:
+        return 1, ''
+
+
+def _install_docker_engine(plog=None):
+    """Install Docker Engine via _docker_install_cmd() and verify. Returns True when
+    `docker --version` works afterwards. Never raises: the old per-site calls used
+    timeout=300, and subprocess.run RAISES TimeoutExpired (it doesn't return rc) —
+    a slow fresh VM's get.docker.com run past 5 min would kill the deploy thread.
+    900s covers slow VMs; failure is reported via the return value."""
+    _log = plog or (lambda m: None)
+    try:
+        r = subprocess.run(_docker_install_cmd() + ' 2>&1', shell=True,
+                           capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            _log(f'  ⚠ Docker installer exited {r.returncode}: {(r.stdout or "")[-300:]}')
+    except Exception as e:
+        _log(f'  ⚠ Docker install error: {e}')
+    rc, out = _docker_probe()
+    if rc == 0:
+        _log(f'  ✓ Docker installed: {out}')
+        return True
+    return False
+
 def _ensure_tak_on_authentik_network():
     """v10.0.1 — when TAK runs as a container, join it to Authentik's docker
     network so it can reach the LDAP outpost by container name (the outpost only
@@ -10217,16 +10256,14 @@ def _run_remote_assist_deploy(settings):
             raise RuntimeError('FQDN required — configure Caddy SSL first (Marketplace needs a domain for OIDC).')
 
         plog('━━━ Step 1/6: Checking Docker ━━━')
-        r = _sp.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-        if r.returncode != 0:
+        _rc, _dv = _docker_probe()
+        if _rc != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
-                         shell=True, capture_output=True, text=True, timeout=300)
-            if r2.returncode != 0:
-                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
+            if not _install_docker_engine(plog):
+                raise RuntimeError('Docker install failed — see log above')
             plog('✓ Docker installed')
         else:
-            plog(f'✓ Docker present: {r.stdout.strip()}')
+            plog(f'✓ Docker present: {_dv}')
 
         plog('')
         plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
@@ -23115,19 +23152,16 @@ def run_takportal_deploy():
             wait_for_apt_lock(plog, takportal_deploy_log)
         # Step 1: Check Docker
         plog("\u2501\u2501\u2501 Step 1/6: Checking Docker \u2501\u2501\u2501")
-        r = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-        if r.returncode != 0:
+        _rc, _dv = _docker_probe()
+        if _rc != 0:
             plog("Docker not found. Installing...")
-            subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
-            r2 = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-            if r2.returncode != 0:
+            if not _install_docker_engine(plog):
                 plog("\u2717 Failed to install Docker")
                 takportal_deploy_status.update({'running': False, 'error': True})
                 return
-            plog(f"  {r2.stdout.strip()}")
             plog("\u2713 Docker installed")
         else:
-            plog(f"  {r.stdout.strip()}")
+            plog(f"  {_dv}")
             plog("\u2713 Docker available")
 
         _ensure_docker_log_limits(plog)
@@ -27105,18 +27139,15 @@ def run_cloudtak_deploy(cfg=None):
 
         # Step 1: Check Docker
         plog("━━━ Step 1/7: Checking Docker ━━━")
-        r = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-        if r.returncode != 0:
+        _rc, _dv = _docker_probe()
+        if _rc != 0:
             plog("  Docker not found — installing...")
-            subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
-            r2 = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-            if r2.returncode != 0:
+            if not _install_docker_engine(plog):
                 plog("✗ Failed to install Docker")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            plog(f"  {r2.stdout.strip()}")
         else:
-            plog(f"  {r.stdout.strip()}")
+            plog(f"  {_dv}")
         plog("✓ Docker available")
 
         _ensure_docker_log_limits(plog)
@@ -30630,16 +30661,14 @@ def _run_tvr_deploy(settings):
 
         # Step 1: Ensure Docker is present
         plog('━━━ Step 1/6: Checking Docker ━━━')
-        r = _sp.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-        if r.returncode != 0:
+        _rc, _dv = _docker_probe()
+        if _rc != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
-                         shell=True, capture_output=True, text=True, timeout=300)
-            if r2.returncode != 0:
-                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
+            if not _install_docker_engine(plog):
+                raise RuntimeError('Docker install failed — see log above')
             plog('✓ Docker installed')
         else:
-            plog(f'✓ Docker present: {r.stdout.strip()}')
+            plog(f'✓ Docker present: {_dv}')
 
         # Step 2: Clone or update repo
         plog('')
@@ -32720,16 +32749,14 @@ def _run_netbird_deploy(settings):
                 'CoTURN → install with port 3479 — the fleet default), then deploy NetBird.')
 
         plog('━━━ Step 1/6: Checking Docker ━━━')
-        r = _sp.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-        if r.returncode != 0:
+        _rc, _dv = _docker_probe()
+        if _rc != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
-                         shell=True, capture_output=True, text=True, timeout=300)
-            if r2.returncode != 0:
-                raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
+            if not _install_docker_engine(plog):
+                raise RuntimeError('Docker install failed — see log above')
             plog('✓ Docker installed')
         else:
-            plog(f'✓ Docker present: {r.stdout.strip()}')
+            plog(f'✓ Docker present: {_dv}')
 
         plog('')
         plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
@@ -51418,20 +51445,17 @@ def run_authentik_deploy(reconfigure=False):
             if settings.get('pkg_mgr', 'apt') == 'apt':
                 wait_for_apt_lock(plog, authentik_deploy_log)
 
-            # Step 1: Check Docker
+            # Step 1: Check Docker (GH #54: probe must not raise when the binary is absent)
             plog("\u2501\u2501\u2501 Step 1/10: Checking Docker \u2501\u2501\u2501")
-            r = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-            if r.returncode != 0:
+            _rc, _dv = _docker_probe()
+            if _rc != 0:
                 plog("Docker not found. Installing...")
-                subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
-                r2 = subprocess.run(_sudo_wrap(['docker', '--version']), capture_output=True, text=True)
-                if r2.returncode != 0:
+                if not _install_docker_engine(plog):
                     plog("\u2717 Failed to install Docker")
                     authentik_deploy_status.update({'running': False, 'error': True})
                     return
-                plog(f"  {r2.stdout.strip()}")
             else:
-                plog(f"  {r.stdout.strip()}")
+                plog(f"  {_dv}")
             plog("\u2713 Docker available")
 
             # Ensure container log limits so Node-RED / LDAP etc. cannot fill the disk
