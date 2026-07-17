@@ -52,6 +52,13 @@ AUDIT_DIR = '/var/log/takwerx-broker'
 AUDIT_LOG = os.path.join(AUDIT_DIR, 'audit.log')
 BROKER_USER = 'takwerx'                       # console runs as this once flipped
 MAX_MSG = 32 * 1024 * 1024                    # 32 MiB hard cap per request/response
+# Bump on EVERY behavioral change to this file. The daemon loads this script once at
+# start and never re-reads it; the console's startup migration compares the running
+# daemon's version (ping) against the on-disk file and self-restarts takwerx-broker on
+# mismatch — that is what makes a broker fix land through a normal console Update Now,
+# with no SSH step (fleet rule: operators never touch the CLI).
+BROKER_VERSION = 2
+
 DEFAULT_TIMEOUT = 600                         # seconds; default when caller sends no timeout
 MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requested timeouts.
                                               # CloudTAK `docker compose build --no-cache` runs
@@ -1820,7 +1827,7 @@ def _dispatch(req, peer):
     op = req.get('op')
     if op == 'ping':
         audit(peer, 'ping', '', 'ALLOW')
-        return {'ok': True, 'pong': True, 'enforce': ENFORCE,
+        return {'ok': True, 'pong': True, 'version': BROKER_VERSION, 'enforce': ENFORCE,
                 'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT,
                 'readiness': _enforce_readiness()}
     if op == 'enforce_enable':
