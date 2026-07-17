@@ -695,9 +695,12 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.3"   # v0.9.57.1: promoted dev→vetted — conn_max_age idle-CPU spin fix (#22580, fixed 2026.5.2); 2026.2.3→2026.5.3 jump validated live on CORAZ prod + test6/8/12 soak
 AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
-# CloudTAK version gate — v13.45+ introduced major hub/api split (stateful vs stateless modes).
-# This is a BREAKING CHANGE for plugin deployment. Gate to 13.44.0 until plugin compat verified.
-CLOUDTAK_VETTED_RELEASE = "13.44.0"     # v10.1.3+: pinned to 13.44.0 — v13.45+ requires plugin migration for hub/api split
+# CloudTAK version gate. v13.45 split the server into hub (stateful) / api (stateless) modes —
+# a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
+# ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
+# contract and validated 13.49.0 end-to-end on test12 (plugins built, routes loaded, Events
+# CRUD in browser) — un-gated per operator decision 2026-07-17.
+CLOUDTAK_VETTED_RELEASE = "13.49.0"     # v10.1.4: hub/api-split migration validated; pre-13.45 plugin installs refused
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
