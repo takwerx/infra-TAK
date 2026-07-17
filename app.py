@@ -25976,7 +25976,11 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         cmd_str = cmd if isinstance(cmd, str) else ' '.join(cmd)
         plog(f'$ {cmd_str}')
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, shell=shell)
+            # v10.1.4 WS8: forward the caller's timeout to the broker hop — on non-root
+            # boxes `docker` is the broker shim, and the api-image rebuild (timeout=1200)
+            # dies at the broker's 600s default otherwise.
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, shell=shell,
+                               env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(timeout)})
             for line in (r.stdout or '').splitlines():
                 if line.strip():
                     plog(line)
@@ -27377,7 +27381,8 @@ def run_cloudtak_deploy(cfg=None):
             proc = subprocess.Popen(
                 _sudo_wrap(['docker', 'compose', 'build', '--no-cache']),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                cwd=cloudtak_dir, bufsize=1
+                cwd=cloudtak_dir, bufsize=1,
+                env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(BUILD_TIMEOUT)}
             )
 
             def _read_build():
@@ -28066,10 +28071,15 @@ def run_cloudtak_update():
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
             plog("  Streaming build output...")
+            # v10.1.4 WS8: on non-root boxes `docker` here is the broker shim, which
+            # buffers and dies at the broker's 600s default — the streaming Popen alone
+            # can't help. TAKWERX_BROKER_TIMEOUT rides the env through the shim to the
+            # broker CLI so the request survives the full build (broker clamps to 2h).
             proc = subprocess.Popen(
                 f'{dcc} build --no-cache && {dcc} up -d',
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, cwd=cloudtak_dir, bufsize=1
+                text=True, cwd=cloudtak_dir, bufsize=1,
+                env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
             )
             def _read_update_output():
                 for line in iter(proc.stdout.readline, ''):

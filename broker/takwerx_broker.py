@@ -52,7 +52,12 @@ AUDIT_DIR = '/var/log/takwerx-broker'
 AUDIT_LOG = os.path.join(AUDIT_DIR, 'audit.log')
 BROKER_USER = 'takwerx'                       # console runs as this once flipped
 MAX_MSG = 32 * 1024 * 1024                    # 32 MiB hard cap per request/response
-DEFAULT_TIMEOUT = 600                         # seconds; broker-side ceiling
+DEFAULT_TIMEOUT = 600                         # seconds; default when caller sends no timeout
+MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requested timeouts.
+                                              # CloudTAK `docker compose build --no-cache` runs
+                                              # 20-60+ min; clamping requests to 600s killed every
+                                              # non-root CloudTAK rebuild at exactly 10 min
+                                              # (test12, 2026-07-17 — exit 125 mid-build).
 SELF_PATH = os.path.realpath(__file__)
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
 
@@ -1401,7 +1406,7 @@ def _do_exec(req):
         raise Denied(f'exec path not on trusted PATH: {argv[0]}')
     inp = req.get('input_b64')
     input_bytes = base64.b64decode(inp) if inp else None
-    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), MAX_TIMEOUT)
     cwd = req.get('cwd') or None
     if cwd and not (isinstance(cwd, str) and os.path.isdir(cwd)):
         cwd = None
@@ -2130,8 +2135,19 @@ def cli_exec(args):
         'cwd': os.getcwd(),
         'input_b64': base64.b64encode(stdin_data).decode() if stdin_data else None,
     }
+    # Long-command support: callers (app.py build paths) export TAKWERX_BROKER_TIMEOUT
+    # (seconds) so a CloudTAK --no-cache rebuild isn't killed at the 600s default. The
+    # value rides the request (daemon clamps to MAX_TIMEOUT) and stretches the client
+    # socket wait past the daemon-side subprocess deadline. Timeout-only — the daemon
+    # still ignores all caller env for the child process itself.
     try:
-        resp = client_send(req)
+        _env_t = int(os.environ.get('TAKWERX_BROKER_TIMEOUT') or 0)
+    except ValueError:
+        _env_t = 0
+    if _env_t > 0:
+        req['timeout'] = min(_env_t, MAX_TIMEOUT)
+    try:
+        resp = client_send(req, timeout=(req.get('timeout') or DEFAULT_TIMEOUT) + 60)
     except (OSError, socket.timeout) as e:
         sys.stderr.write(f'takwerx_broker: cannot reach broker: {e}\n')
         return 125
