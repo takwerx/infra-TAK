@@ -126,13 +126,16 @@ psql_exec() {
 
 # Two-server mode requires SSH to Server One
 if [ "$TWO_SERVER_MODE" = "1" ]; then
+  # v10.1.4 (WS5): both branches are clean skips, not failures — exit 0 so
+  # `systemctl --failed` doesn't list this unit forever on split boxes without a
+  # substituted key (test8, 10.1.3 T&E). The skip is logged for diagnosis.
   if [ -z "$SSH_TARGET" ]; then
-    log_line "Auto-VACUUM: two_server mode but db_host is empty, skipped"
-    exit 1
+    log_line "Auto-VACUUM: two_server mode but db_host is empty, skipped (clean)"
+    exit 0
   fi
   if [ ! -f "$SSH_KEY" ]; then
-    log_line "Auto-VACUUM: two_server mode but SSH key not found at ${SSH_KEY}, skipped"
-    exit 1
+    log_line "Auto-VACUUM: two_server mode but SSH key not found at ${SSH_KEY}, skipped (clean)"
+    exit 0
   fi
 fi
 

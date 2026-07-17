@@ -29745,6 +29745,11 @@ def tvr_set_password():
     new_password = (data.get('password') or '').strip()
     if len(new_password) < 6:
         return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    # v10.1.4 (WS4): the password is written verbatim into a root-run compose file —
+    # reject newlines/control chars outright (a newline in `.*` re.sub survives and
+    # injects an extra compose line; control chars have no business in a password).
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in new_password):
+        return jsonify({'error': 'Password must not contain newlines or control characters'}), 400
     s = load_settings()
     s['tak_video_restreamer_admin_password'] = new_password
     save_settings(s)
@@ -29755,7 +29760,10 @@ def tvr_set_password():
         try:
             content = _read_priv(compose_path)   # v10.0.5 non-root: broker (root-owned on flipped box)
             import re as _re
-            content = _re.sub(r'(- ADMIN_PASSWORD=).*', f'- ADMIN_PASSWORD={new_password}', content)
+            # Callable replacement — a plain f-string replacement lets re.sub interpret
+            # backslash escapes in the password (`\1`, `\g<0>` corrupt the write).
+            content = _re.sub(r'(- ADMIN_PASSWORD=).*',
+                              lambda m: m.group(1) + new_password, content)
             _write_priv(compose_path, content)
             _tvr_compose(tvr_dir, 'up -d', timeout=60)
         except Exception as e:

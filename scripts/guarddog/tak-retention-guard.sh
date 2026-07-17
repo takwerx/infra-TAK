@@ -106,8 +106,11 @@ psql_raw() {
 # Pre-flight
 if [ "$TWO_SERVER_MODE" = "1" ]; then
   if [ -z "$SSH_TARGET" ] || [ ! -f "$SSH_KEY" ]; then
-    log_line "RETENTION-GUARD: two_server mode but SSH target/key unavailable, skipped"
-    exit 1
+    # v10.1.4 (WS5): a clean skip, not a failure — exit 0 so `systemctl --failed`
+    # doesn't list this unit forever on split boxes without a substituted key
+    # (test8, 10.1.3 T&E). The skip is already logged above for diagnosis.
+    log_line "RETENTION-GUARD: two_server mode but SSH target/key unavailable, skipped (clean)"
+    exit 0
   fi
 fi
 
