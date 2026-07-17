@@ -65162,17 +65162,31 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button><button type="button" onclick="promptPower('reboot')" title="Reboot this box (asks for your console password)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot</button><button type="button" onclick="promptPower('poweroff')" title="Power off this box (asks for your console password)" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Power Off</button><a href="/firewall" id="exp-badge-console" title="Service exposure — click for detail" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;text-decoration:none;border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8"><span id="exp-badge-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8"></span><span id="exp-badge-text">exposure…</span></a></div>
 <script>
 (function(){
+  /* v10.1.4 WS6: the first exposure audit after a console restart can exceed a short
+     abort on busy boxes (test12: 61 sockets/42 rules > 6s) — the badge then showed a
+     scary 'n/a' while the Firewall page (no timeout) showed All Clear. 15s abort +
+     retry twice (audit is cached after it finishes, so a retry is instant) and only
+     admit 'n/a' after the last attempt fails. */
   var a=document.getElementById('exp-badge-console');if(!a)return;
   var dot=document.getElementById('exp-badge-dot'),txt=document.getElementById('exp-badge-text');
-  var ctl=new AbortController();var to=setTimeout(function(){try{ctl.abort();}catch(e){}},6000);
-  fetch('/api/firewall/exposure/summary',{signal:ctl.signal}).then(function(r){return r.json();}).then(function(s){
-    clearTimeout(to);
-    var st=s.status||'unknown',red=s.issue_count||0,yel=s.warn_count||0;
-    if(st==='ok'){dot.style.background='#10b981';a.style.color='#10b981';a.style.borderColor='rgba(16,185,129,.4)';txt.textContent='Exposure OK';}
-    else if(st==='warn'){dot.style.background='#eab308';a.style.color='#eab308';a.style.borderColor='rgba(234,179,8,.4)';txt.textContent='Exposure: '+yel+' to review';}
-    else if(st==='issue'){dot.style.background='#ef4444';a.style.color='#ef4444';a.style.borderColor='rgba(239,68,68,.5)';txt.textContent='Exposure: '+red+' exposed';}
+  var tries=0;
+  function fail(){
+    if(tries<3){setTimeout(attempt,5000);}
     else{txt.textContent='Exposure: n/a';}
-  }).catch(function(){clearTimeout(to);txt.textContent='Exposure: n/a';});
+  }
+  function attempt(){
+    tries++;
+    var ctl=new AbortController();var to=setTimeout(function(){try{ctl.abort();}catch(e){}},15000);
+    fetch('/api/firewall/exposure/summary',{signal:ctl.signal}).then(function(r){return r.json();}).then(function(s){
+      clearTimeout(to);
+      var st=s.status||'unknown',red=s.issue_count||0,yel=s.warn_count||0;
+      if(st==='ok'){dot.style.background='#10b981';a.style.color='#10b981';a.style.borderColor='rgba(16,185,129,.4)';txt.textContent='Exposure OK';}
+      else if(st==='warn'){dot.style.background='#eab308';a.style.color='#eab308';a.style.borderColor='rgba(234,179,8,.4)';txt.textContent='Exposure: '+yel+' to review';}
+      else if(st==='issue'){dot.style.background='#ef4444';a.style.color='#ef4444';a.style.borderColor='rgba(239,68,68,.5)';txt.textContent='Exposure: '+red+' exposed';}
+      else{fail();}
+    }).catch(function(){clearTimeout(to);fail();});
+  }
+  attempt();
 })();
 </script>
 <div id="dev-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
@@ -68435,6 +68449,30 @@ def _startup_ensure_broker():
             except OSError:
                 pass
             print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
+            # v10.1.4 (WS9): after the restart, BLOCK until the new daemon mediates a real
+            # exec. The restart tears down the socket, and the module-level migrations that
+            # run next (hardening posture re-assert, TAK Portal recreate, …) raced the new
+            # daemon and died with 'connection refused', losing their turn until the next
+            # console restart (test12 2026-07-17, 17:31:42-43 — 4s after the restart the
+            # daemon still wasn't accepting). Downstream "brief waits" existed but guessed
+            # too short under load; waiting HERE fixes every caller at once.
+            if _broker_should_route():
+                _rw_t0 = time.time()
+                _rw_ok = False
+                while time.time() - _rw_t0 < 30:
+                    try:
+                        if _broker_available():
+                            _rw = subprocess.run(_sudo_wrap(['systemctl', '--version']),
+                                                 capture_output=True, text=True, timeout=8)
+                            if _rw.returncode == 0 and 'systemd' in (_rw.stdout or ''):
+                                _rw_ok = True
+                                break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                if not _rw_ok:
+                    print('Startup migration: ⚠ broker not mediating within 30s of its restart — '
+                          'later migrations may fail and will retry next console restart', flush=True)
     except PermissionError:
         pass
     except Exception as _e:
@@ -73082,6 +73120,21 @@ try:
     _threading_snap.Thread(target=_tak_snapshot_scheduler, daemon=True, name='tak-snapshot-scheduler').start()
 except Exception as _e:
     print(f"[startup] failed to start snapshot scheduler (non-fatal): {_e}", flush=True)
+
+# v10.1.4 WS6: warm the exposure-audit cache once in the background so the Console
+# header badge's first fetch after a restart hits a warm cache instead of racing the
+# cold audit (busy boxes: 61 sockets/42 rules ran past the old 6s badge abort → 'n/a'
+# while the Firewall page said All Clear). Read-only, non-fatal, no boot delay.
+try:
+    import threading as _threading_exp
+    def _warm_exposure_cache():
+        try:
+            _exposure_report()
+        except Exception:
+            pass
+    _threading_exp.Thread(target=_warm_exposure_cache, daemon=True, name='exposure-cache-warm').start()
+except Exception as _e:
+    print(f"[startup] failed to warm exposure cache (non-fatal): {_e}", flush=True)
 
 # v10.0.4: server_ip self-heal (belt-and-braces). The primary path is the unit's
 # ExecStartPre=selfheal_ip.py (heals BEFORE gunicorn binds, so a regenerated cert is
