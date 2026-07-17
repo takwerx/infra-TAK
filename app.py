@@ -32295,6 +32295,87 @@ def _netbird_sync_compose_image_tags(nb_dir):
             return False
 
 
+def _netbird_store_key_needed(server_image):
+    """True when the given netbird-server image encrypts store PII (0.73+) and
+    therefore needs a PERSISTENT server.store.encryptionKey in config.yaml."""
+    try:
+        ver = server_image.rsplit(':', 1)[-1]
+        return _netbird_version_tuple(ver) >= (0, 73, 0)
+    except Exception:
+        return False
+
+
+def _ensure_netbird_store_key_setting(settings=None):
+    """Return this box's persistent NetBird store-encryption key, generating and
+    saving it to settings.json on first use. NetBird 0.73+ encrypts user PII in the
+    sqlite store; without server.store.encryptionKey in config.yaml the server
+    generates an EPHEMERAL key on EVERY start ('DataStoreEncryptionKey is not set,
+    generating a new key'), so any restart orphans every previously-encrypted row —
+    SSO then 401s 'token invalid' via 'decrypt email: cipher: message authentication
+    failed' (test12 2026-07-17, WS2 validation). Key format matches netbird's own
+    generator: 32 bytes base64."""
+    s = settings if settings is not None else load_settings()
+    k = (s.get('netbird_store_encryption_key') or '').strip()
+    if not k:
+        import base64 as _b64
+        k = _b64.b64encode(os.urandom(32)).decode()
+        s['netbird_store_encryption_key'] = k
+        save_settings(s)
+    return k
+
+
+def _ensure_netbird_store_key(plog=None):
+    """v10.1.4 (WS2): make sure config.yaml carries server.store.encryptionKey before
+    the box ever runs a 0.73+ netbird-server. Runs at console startup BEFORE
+    _heal_netbird_pinned_image, so on pin-promotion day the key is in place before
+    the image converge boots the new server (which would otherwise encrypt the
+    existing plaintext rows under an ephemeral key and orphan them on the next
+    restart). Gated on the channel target needing it — vetted-0.72.x boxes are left
+    untouched (their config schema tolerance for the store block is unverified).
+    Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        nb_dir = None
+        for d in (os.path.expanduser('~/netbird'), '/root/netbird'):
+            if os.path.isfile(os.path.join(d, 'config.yaml')):
+                nb_dir = d
+                break
+        if not nb_dir:
+            return False  # NetBird not installed
+        _srv_img, _ = _get_netbird_target_images()
+        if not _netbird_store_key_needed(_srv_img):
+            return False
+        cfg_path = os.path.join(nb_dir, 'config.yaml')
+        try:
+            with open(cfg_path) as f:
+                txt = f.read()
+        except Exception:
+            txt = _read_priv(cfg_path)
+        if 'encryptionKey' in txt or 'authSecret' not in txt:
+            return False  # already keyed, or config shape unexpected — don't guess
+        key = _ensure_netbird_store_key_setting()
+        out = []
+        for ln in txt.splitlines():
+            out.append(ln)
+            if ln.strip().startswith('authSecret:'):
+                out.append('  store:')
+                out.append(f'    encryptionKey: "{key}"')
+        new = '\n'.join(out) + '\n'
+        try:
+            with open(cfg_path, 'w') as f:
+                f.write(new)
+        except Exception:
+            _write_priv(cfg_path, new)
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'netbird-server']),
+                       capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        _log('  ✓ netbird: persisted store.encryptionKey in config.yaml + recreated server '
+             '(0.73+ generates an ephemeral key per start without it, orphaning user rows)')
+        return True
+    except Exception as e:
+        _log(f'  netbird store-key heal error (non-fatal): {e}')
+        return False
+
+
 def _heal_netbird_pinned_image(plog=None):
     """v10.0.9: roll a NetBird box back onto the vetted pin if its compose carries a different
     image tag — e.g. the briefly-shipped :latest that jumped server 0.72.3→"24.04" / dashboard
@@ -32608,7 +32689,7 @@ def _netbird_patch_authentik_idp_redirect(settings, callback_url, plog=None):
         _log(f'  ⚠ Authentik redirect URI patch: {str(ex)[:120]}')
 
 
-def _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True):
+def _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=None):
     """Write config.yaml and docker-compose.yml for embedded-IdP NetBird.
 
     Dashboard auth stays on https://<netbird>/oauth2 (same-origin token exchange).
@@ -32646,6 +32727,12 @@ server:
       - "https://{netbird_domain}/"
   dataDir: "/var/lib/netbird/"
   authSecret: "{auth_secret}"
+"""
+    if store_key:
+        # v10.1.4 (WS2): 0.73+ encrypts store PII — a persistent key is mandatory or
+        # every server restart orphans the previously-encrypted rows (SSO 401s).
+        config_content += f"""  store:
+    encryptionKey: "{store_key}"
 """
 
     _nb_srv_img, _nb_dash_img = _get_netbird_target_images()  # reads update_channel from settings
@@ -32776,7 +32863,9 @@ def _run_netbird_deploy(settings):
         auth_secret = _netbird_read_auth_secret(nb_dir) or _sec.token_hex(32)
 
         setup_pat = not settings.get('netbird_pat')
-        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat)
+        _nb_target_srv, _ = _get_netbird_target_images()
+        nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=setup_pat, store_key=nb_store_key)
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
 
         plog('  Pulling images...')
@@ -32793,7 +32882,7 @@ def _run_netbird_deploy(settings):
         plog('')
         plog('━━━ Step 5/6: Authentik External IDP + Finalize Config ━━━')
         auth_secret = _netbird_read_auth_secret(nb_dir) or auth_secret
-        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=False)
+        _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=False, store_key=nb_store_key)
         plog('  ✓ Embedded IdP config (AUTH_REDIRECT_URI=/#callback)')
         pat = settings.get('netbird_pat') or (pat if pat not in (None, '__already_done__') else '')
         if pat:
@@ -70991,6 +71080,17 @@ def _startup_migrations():
             )
         except Exception as tp_tok_err:
             print(f"Startup migration: takportal token heal error (non-fatal): {tp_tok_err}")
+
+        # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
+        # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key
+        # per start and orphans every encrypted user row on the next restart (SSO 401
+        # 'token invalid'; test12 2026-07-17). Must precede _heal_netbird_pinned_image.
+        try:
+            _ensure_netbird_store_key(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as nb_key_err:
+            print(f"Startup migration: netbird store-key heal error (non-fatal): {nb_key_err}")
 
         # v10.0.9 — roll NetBird back onto the vetted pin if a box drifted off it (the
         # briefly-shipped :latest broke auth fleet-wide with 401 'token invalid'). No-op on
