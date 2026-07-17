@@ -70021,45 +70021,6 @@ def _startup_migrations():
                 print("Startup migration: ⚠ broker not mediating exec after 30s — broker-dependent "
                       "migrations may fail and will retry on the next console restart", flush=True)
 
-        # v10.1.4 (WS8): converge the broker DAEMON to the checked-out broker code in the
-        # same Update Now pull — fleet rule: a fix must never require an SSH step. The
-        # daemon loads takwerx_broker.py once at start and never re-reads it, so a console
-        # update that changes broker code leaves a stale daemon running (test12 2026-07-17:
-        # the MAX_TIMEOUT fix was on disk while the old 600s clamp kept killing builds).
-        # Compare the running daemon's BROKER_VERSION (ping, short timeout — a hung ping
-        # means a stale daemon and earns the same restart) to the on-disk file's, and
-        # self-restart via the broker's own allowlisted `systemctl --no-block restart`
-        # (--no-block lets the daemon send its response before systemd swaps it).
-        if _broker_should_route() and _broker_available():
-            try:
-                import re as _re_bk
-                with open(_BROKER_SCRIPT) as _bf:
-                    _m = _re_bk.search(r"^BROKER_VERSION\s*=\s*(\d+)", _bf.read(), _re_bk.M)
-                _bk_want = int(_m.group(1)) if _m else 0
-                _bk_have = 0
-                if _bk_want:
-                    try:
-                        _bk_have = int((_broker_request({'op': 'ping'}, timeout=5) or {}).get('version') or 0)
-                    except Exception:
-                        _bk_have = 0  # unreachable/hung/pre-versioning daemon — restart it
-                if _bk_want and _bk_have < _bk_want:
-                    print(f"[startup] broker daemon v{_bk_have} < on-disk v{_bk_want} — "
-                          f"restarting takwerx-broker to load pulled code", flush=True)
-                    subprocess.run(_sudo_wrap(['systemctl', '--no-block', 'restart', 'takwerx-broker']),
-                                   capture_output=True, timeout=15)
-                    time.sleep(3)
-                    try:
-                        _bk_have = int((_broker_request({'op': 'ping'}, timeout=5) or {}).get('version') or 0)
-                    except Exception:
-                        _bk_have = 0
-                    if _bk_have >= _bk_want:
-                        print(f"[startup] broker daemon converged to v{_bk_have}", flush=True)
-                    else:
-                        print(f"[startup] ⚠ broker daemon still v{_bk_have} (want v{_bk_want}) — "
-                              f"will retry on next console restart", flush=True)
-            except Exception as _bke:
-                print(f"[startup] broker version converge skipped: {_bke}", flush=True)
-
         s = load_settings()
         settings_dirty = False
 
