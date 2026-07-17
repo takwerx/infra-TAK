@@ -25076,7 +25076,9 @@ CLOUDTAK_PLUGINS = [
         'plugin_subpath': 'plugin',
         'server_subpath': 'server',
         'install_dir': 'tak-dispatcher',
-        'requires': 'CloudTAK 13.2+',
+        # v10.1.4: server routes migrated to the 13.45 hub/api split contract
+        # (api/stateless/routes/, ConfigStateless) — the installer refuses pre-split trees.
+        'requires': 'CloudTAK 13.45+',
         'author': 'takwerx',
         'license': 'Proprietary',
     },
@@ -25858,19 +25860,35 @@ def _write_plugin_built_sha(ct_dir, install_dir, sha):
         pass
 
 
+def _cloudtak_server_routes_dir(ct_dir, require_split=False):
+    """Version-appropriate dir for plugin server-route files. CloudTAK 13.45+
+    (hub/api split) compiles and loads routes ONLY from api/stateless/routes/ —
+    files left in the pre-split api/routes/ are silently dead: not in tsconfig,
+    not linted, never loaded, no error anywhere (WS1 discovery, test12
+    2026-07-17: install "succeeded", /api/dispatcher/* 404'd). Returns the
+    stateless dir when the tree has it, else the legacy dir; with
+    require_split=True returns None on a pre-split tree (the dispatcher's route
+    files now target the 13.45+ contract — ConfigStateless, api/common imports —
+    and cannot compile on an older tree)."""
+    stateless = os.path.join(ct_dir, 'api', 'stateless', 'routes')
+    if os.path.isdir(stateless):
+        return stateless
+    return None if require_split else os.path.join(ct_dir, 'api', 'routes')
+
+
 def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
-    """v0.9.44: back up the CloudTAK files a plugin action mutates (api/routes + the web
-    plugin dir) so a failed rebuild can be rolled back — a broken plugin must never leave
-    CloudTAK in an unbuildable state."""
+    """v0.9.44: back up the CloudTAK files a plugin action mutates (the server
+    routes dir + the web plugin dir) so a failed rebuild can be rolled back — a
+    broken plugin must never leave CloudTAK in an unbuildable state."""
     import tempfile, shutil
     snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
-    routes = os.path.join(ct_dir, 'api', 'routes')
+    routes = _cloudtak_server_routes_dir(ct_dir)
     if os.path.isdir(routes):
         shutil.copytree(routes, os.path.join(snap, 'routes'), symlinks=True)
     web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
     if web_existed:
         shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
-    return {'snap': snap, 'web_existed': web_existed}
+    return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes}
 
 
 def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
@@ -25878,7 +25896,7 @@ def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
     if not snap_info or not snap_info.get('snap'):
         return
     snap = snap_info['snap']
-    routes = os.path.join(ct_dir, 'api', 'routes')
+    routes = snap_info.get('routes_dir') or _cloudtak_server_routes_dir(ct_dir)
     snap_routes = os.path.join(snap, 'routes')
     if os.path.isdir(snap_routes):
         shutil.rmtree(routes, ignore_errors=True)
@@ -25892,7 +25910,7 @@ def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
         shutil.move(snap_web, install_path)
     shutil.rmtree(snap, ignore_errors=True)
     if plog:
-        plog('  ↩ Restored CloudTAK api/routes + plugin dir to the pre-update state.')
+        plog('  ↩ Restored CloudTAK server routes + plugin dir to the pre-update state.')
 
 
 def _cleanup_snapshot(snap_info):
@@ -26008,7 +26026,8 @@ def _run_cloudtak_plugin_action(plugin_key, action):
     server_subpath = plugin.get('server_subpath')
     # Repo plugins that ship the web plugin and the server route in separate subdirs are
     # cloned to a cache dir, then plugin_subpath is copied into web/plugins and server_subpath
-    # into api/routes (server *.ts must NOT live under web/plugins or the web build breaks).
+    # into the version-appropriate routes dir — api/stateless/routes/ on 13.45+, api/routes/
+    # pre-split (server *.ts must NOT live under web/plugins or the web build breaks).
     use_subpaths = bool(repo and (plugin_subpath or server_subpath))
     cache_path = os.path.join(ct_dir, '.plugin-src', plugin['install_dir'])
 
@@ -26098,28 +26117,43 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 shutil.rmtree(install_path)
             plog(f'Removed {install_path}')
 
-        # Server-side route files: copied into api/routes/ so the browser plugin
-        # can reach TAK Server plugin APIs via CloudTAK's cert auth. CloudTAK
-        # auto-loads every file in api/routes/ (schema.load('./routes/')). For repo
-        # plugins the routes come from the cloned cache's server_subpath.
+        # Server-side route files: copied into the version-appropriate routes dir so
+        # the browser plugin can reach TAK Server plugin APIs via CloudTAK's cert
+        # auth. 13.45+ auto-loads api/stateless/routes/ (pre-split trees loaded
+        # api/routes/). For repo plugins the routes come from the cloned cache's
+        # server_subpath.
         server_path = plugin.get('server_path')
         if use_subpaths and server_subpath:
             server_path = os.path.join(cache_path, server_subpath)
         if server_path and os.path.isdir(server_path):
             import shutil
-            routes_base = os.path.join(ct_dir, 'api', 'routes')
+            legacy_base = os.path.join(ct_dir, 'api', 'routes')
+            routes_base = _cloudtak_server_routes_dir(ct_dir, require_split=(action != 'remove'))
+            if routes_base is None:
+                plog(f'✗ {plugin["name"]} server routes require CloudTAK >= 13.45 (hub/api '
+                     f'split) — this tree has no api/stateless/routes/. Update CloudTAK '
+                     f'first, then install the plugin.')
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
             os.makedirs(routes_base, exist_ok=True)
             for fname in sorted(os.listdir(server_path)):
                 if not fname.endswith('.ts'):
                     continue
                 dest = os.path.join(routes_base, fname)
                 if action == 'remove':
-                    if os.path.exists(dest):
-                        os.remove(dest)
-                        plog(f'Removed server route: api/routes/{fname}')
+                    # Sweep BOTH locations — upgraded trees can carry a dead pre-split copy.
+                    for _d in dict.fromkeys([routes_base, legacy_base]):
+                        _p = os.path.join(_d, fname)
+                        if os.path.exists(_p):
+                            os.remove(_p)
+                            plog(f'Removed server route: {os.path.relpath(_p, ct_dir)}')
                 else:
                     shutil.copy2(os.path.join(server_path, fname), dest)
-                    plog(f'Installed server route: api/routes/{fname}')
+                    plog(f'Installed server route: {os.path.relpath(dest, ct_dir)}')
+                    _stale = os.path.join(legacy_base, fname)
+                    if routes_base != legacy_base and os.path.exists(_stale):
+                        os.remove(_stale)
+                        plog(f'Removed stale pre-split copy: api/routes/{fname}')
 
         # On remove, drop the repo source cache too (kept until now so the server-route
         # removal above could list which files to delete).
@@ -27981,7 +28015,10 @@ def run_cloudtak_update():
                 return
             # Restore any catalog plugins that the checkout wiped.
             os.makedirs(plugins_base, exist_ok=True)
-            routes_base = os.path.join(cloudtak_dir, 'api', 'routes')
+            # Version-appropriate AFTER the checkout: a 13.44→13.45+ update must land
+            # server routes in api/stateless/routes/ (api/routes/ is dead there).
+            routes_base = _cloudtak_server_routes_dir(cloudtak_dir)
+            legacy_routes_base = os.path.join(cloudtak_dir, 'api', 'routes')
             for install_dir, p in pre_installed.items():
                 dest = os.path.join(plugins_base, install_dir)
                 local_path = p.get('local_path')
@@ -27998,6 +28035,13 @@ def run_cloudtak_update():
                         _shutil.rmtree(cache_path, ignore_errors=True)
                         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                         subprocess.run(['git', 'clone', repo, cache_path], capture_output=True, timeout=120)
+                    else:
+                        # Refresh the cache: an era-crossing CloudTAK update (13.44→13.45+)
+                        # must restore route files matching the NEW tree's contract — the
+                        # cached clone predates the update and would restore files whose
+                        # imports don't exist in the new tree (build break) or vice versa.
+                        subprocess.run(['git', '-c', f'safe.directory={cache_path}', '-C', cache_path,
+                                        'pull', '--ff-only'], capture_output=True, timeout=120)
                     server_path = os.path.join(cache_path, server_subpath) if server_subpath else None
                 if not os.path.exists(dest) and not os.path.islink(dest):
                     import shutil as _shutil
@@ -28017,15 +28061,20 @@ def run_cloudtak_update():
                         plog(f"  Restored plugin: {p['name']}")
                     else:
                         plog(f"  ⚠ Plugin '{p['name']}' was wiped — no repo or local_path to restore from")
-                # Server-side route files live in api/routes/ which the checkout
-                # also wipes — re-copy them whenever the plugin is installed.
+                # Server-side route files live in the routes dir the checkout also
+                # wipes — re-copy them whenever the plugin is installed, and sweep any
+                # dead pre-split copy so an upgraded tree doesn't carry duplicates.
                 if server_path and os.path.isdir(server_path):
                     import shutil as _shutil
                     os.makedirs(routes_base, exist_ok=True)
                     for fname in sorted(os.listdir(server_path)):
                         if fname.endswith('.ts'):
                             _shutil.copy2(os.path.join(server_path, fname), os.path.join(routes_base, fname))
-                            plog(f"  Restored server route: api/routes/{fname}")
+                            plog(f"  Restored server route: {os.path.relpath(os.path.join(routes_base, fname), cloudtak_dir)}")
+                            _stale = os.path.join(legacy_routes_base, fname)
+                            if routes_base != legacy_routes_base and os.path.exists(_stale):
+                                os.remove(_stale)
+                                plog(f"  Removed stale pre-split copy: api/routes/{fname}")
         plog(f"✓ Checked out {release_tag or 'latest HEAD'}")
 
         # v0.9.49: the checkout above reset the (tracked) compose file to upstream
