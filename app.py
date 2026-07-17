@@ -5433,6 +5433,18 @@ def update_apply():
             out['workaround'] = f'On the server run: sudo git config --global --add safe.directory {console_dir}'
         return out
 
+    def _fail_release_lock(payload):
+        # An error return must release the single-flight lock. Leaving it behind turns
+        # one failed attempt into a 20-minute outage: every retry 409s with "already in
+        # progress" until the TTL expires (test12, 2026-07-17 — a rejected fetch left the
+        # lock, so Update Now looked wedged even after the git issue itself was fixed).
+        # Success paths deliberately keep the lock; _post_update_auto_deploy clears it.
+        try:
+            os.remove(_update_lock)
+        except Exception:
+            pass
+        return jsonify(payload)
+
     # v0.9.3: Record current version for one-step rollback before updating
     try:
         _pre_update_version = VERSION
@@ -5478,7 +5490,7 @@ def update_apply():
                 ['fetch', 'origin', '+dev:refs/remotes/origin/dev'], timeout=60, isolated_fetch=True
             )
             if fetch_dev.returncode != 0:
-                return jsonify(_error_payload(_git_err(fetch_dev)))
+                return _fail_release_lock(_error_payload(_git_err(fetch_dev)))
             target_ref = 'refs/remotes/origin/dev'
             target_label = 'origin/dev'
         else:
@@ -5492,7 +5504,7 @@ def update_apply():
                 refspec = f'+refs/tags/{tag_name}:refs/tags/{tag_name}'
                 fetch_tag = _git(['fetch', 'origin', refspec], timeout=120, isolated_fetch=True)
                 if fetch_tag.returncode != 0:
-                    return jsonify(_error_payload(_git_err(fetch_tag)))
+                    return _fail_release_lock(_error_payload(_git_err(fetch_tag)))
                 verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
                 if verify_tag.returncode == 0:
                     target_ref = f'refs/tags/{tag_name}'
@@ -5503,13 +5515,13 @@ def update_apply():
                     ['fetch', 'origin', '+main:refs/remotes/origin/main'], timeout=30, isolated_fetch=True
                 )
                 if fetch_main.returncode != 0:
-                    return jsonify(_error_payload(_git_err(fetch_main)))
+                    return _fail_release_lock(_error_payload(_git_err(fetch_main)))
                 target_ref = 'refs/remotes/origin/main'
             target_label = tag_name or 'origin/main'
 
         checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0:
-            return jsonify(_error_payload(_git_err(checkout)))
+            return _fail_release_lock(_error_payload(_git_err(checkout)))
 
         update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
         _ensure_gunicorn_upgrade(console_dir)
@@ -5521,7 +5533,7 @@ def update_apply():
             'restart_message': 'Console is restarting. You may see 502 briefly — wait 10–15 seconds then refresh the page.'
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:200]})
+        return _fail_release_lock({'success': False, 'error': str(e)[:200]})
 
 @app.route('/api/console/restart-safe')
 def console_restart_safe():
