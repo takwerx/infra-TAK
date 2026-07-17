@@ -22051,8 +22051,15 @@ def _get_cloudtak_version_info():
                 _pin = tuple(int(x) for x in re.findall(r'\d+', CLOUDTAK_VETTED_RELEASE))
                 _ut = tuple(int(x) for x in re.findall(r'\d+', out['upstream_latest']))
                 if _ut > _pin:
-                    out['upstream_newer'] = True
                     out['latest'] = out['upstream_latest']
+                    # v10.1.4: badge only when upstream is beyond what's INSTALLED.
+                    # Unlike Authentik/NetBird (dev installs a pin, so vs-pin is right),
+                    # CloudTAK's dev channel installs upstream latest — after an update
+                    # installed == upstream and '↑ available upstream' was stale noise
+                    # (test12 2026-07-17: showed '↑ v13.49.0' while running 13.49.0).
+                    _iv = tuple(int(x) for x in re.findall(r'\d+', out['version'])) if out['version'] else ()
+                    if not _iv or _ut > _iv:
+                        out['upstream_newer'] = True
         except Exception:
             pass
 
