@@ -139,6 +139,19 @@ if [ "$TWO_SERVER_MODE" = "1" ]; then
   fi
 fi
 
+# v10.1.4 (WS5b): LOCAL mode is also a clean skip when this host has no postgres
+# at all (no unix user or no psql binary) — a box whose CoT DB lives elsewhere
+# but whose split config was lost (test8 2026-07-18: tak_deployment missing from
+# settings.json) otherwise fails this unit on every timer fire, forever. A box
+# that genuinely lost its local DB has louder alarms (db-watch, TAK itself); a
+# permanently failed vacuum unit is pure noise. The skip is logged for diagnosis.
+if [ "$TWO_SERVER_MODE" != "1" ]; then
+  if ! id -u postgres >/dev/null 2>&1 || ! command -v psql >/dev/null 2>&1; then
+    log_line "Auto-VACUUM: local mode but no local postgres on this host (CoT DB is remote or containerized), skipped (clean)"
+    exit 0
+  fi
+fi
+
 DEAD_RAW=$(psql_scalar "$DEAD_SQL")
 if [ -z "$DEAD_RAW" ]; then
   if [ "$TWO_SERVER_MODE" = "1" ]; then
