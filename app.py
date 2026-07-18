@@ -32421,12 +32421,19 @@ def _heal_netbird_orphaned_store(plog=None):
             return False  # healthy
         # PAT failed — the probe above just forced the server to log WHY. Only the
         # orphaned-store decrypt failure counts; an expired/revoked PAT does not.
-        r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', '2m', 'netbird-server']),
+        # The signature only appears when the USER-lookup path runs — i.e. after a real
+        # SSO login attempt (a failing PAT dies at hash-match, before any decrypt). The
+        # caller loops, so a user's failed login becomes the trigger that confirms the
+        # orphan on the next pass. 10m window gives the loop cadence plenty of overlap.
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', '10m', 'netbird-server']),
                            capture_output=True, text=True, timeout=20)
         _recent = (r.stdout or '') + (r.stderr or '')
         if 'message authentication failed' not in _recent:
-            _log('  netbird: stored PAT invalid but no orphaned-store signature — not resetting '
-                 '(PAT may be expired/revoked; re-run the NetBird deploy manually if needed)')
+            if not getattr(_heal_netbird_orphaned_store, '_ambig_logged', False):
+                _heal_netbird_orphaned_store._ambig_logged = True
+                _log('  netbird: stored PAT invalid but no orphaned-store signature yet — watching. '
+                     'If SSO login fails with 401, the failed attempt itself will confirm the '
+                     'orphaned store and trigger the automatic re-bootstrap within ~3 minutes.')
             return False
         _ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
         _log(f'  netbird: ORPHANED STORE confirmed (ephemeral-key era) — parking store.db aside '
@@ -71172,16 +71179,26 @@ def _startup_migrations():
         except Exception as nb_pin_err:
             print(f"Startup migration: netbird pin-restore error (non-fatal): {nb_pin_err}")
 
-        # v10.1.4 (WS2): orphaned-store recovery in a BACKGROUND thread — the confirmed
-        # case re-runs the full NetBird deploy (minutes), which must not block boot. The
-        # two-factor gate (invalid PAT + decrypt signature the probe itself generates)
-        # makes the no-op path cheap and the reset path unambiguous.
+        # v10.1.4 (WS2): orphaned-store recovery as a background WATCH, not a one-shot —
+        # the confirming decrypt signature only appears after a real SSO login attempt
+        # (a failing PAT dies at hash-match before any decrypt), so the loop turns a
+        # user's failed login into the trigger: attempt fails -> signature lands in the
+        # server log -> next pass (<=3 min) confirms the orphan and re-bootstraps. Gates
+        # are cheap no-ops on healthy boxes; the confirmed case re-runs the full NetBird
+        # deploy (minutes), which must never block boot — hence the daemon thread.
         try:
             import threading as _threading_nborphan
-            _threading_nborphan.Thread(
-                target=lambda: _heal_netbird_orphaned_store(
-                    lambda m: print(f"Startup migration: {m}", flush=True)),
-                daemon=True, name='netbird-orphan-heal').start()
+            def _netbird_orphan_watch():
+                while True:
+                    try:
+                        if _heal_netbird_orphaned_store(
+                                lambda m: print(f"Startup migration: {m}", flush=True)):
+                            return  # healed — done for this boot
+                    except Exception:
+                        pass
+                    time.sleep(180)
+            _threading_nborphan.Thread(target=_netbird_orphan_watch,
+                                       daemon=True, name='netbird-orphan-heal').start()
         except Exception as nb_orph_err:
             print(f"Startup migration: netbird orphan-heal spawn error (non-fatal): {nb_orph_err}")
 
