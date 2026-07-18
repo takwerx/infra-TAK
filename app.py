@@ -4562,9 +4562,15 @@ def _w1_apply_mfa(h, log):
         log('W1: recovery-flow login unbind failed — aborting (the reset-email bypass '
             'would defeat every app binding above)')
         return False
+    # WS3c: the reset must also END SIGNED OUT — without this the flow's exit shows
+    # whatever session the browser already held (accidental admin-session handoff).
+    if not _w1_bind_recovery_logout(h, log):
+        log('W1: recovery-flow logout bind failed — aborting (reset would land in a '
+            'pre-existing browser session)')
+        return False
 
     log('W1: MFA enforced on %d Authentik apps + force-enroll ON (%s); recovery flow '
-        'ends at sign-in' % (len(apps), ', '.join(s for s, _ in apps)))
+        'ends signed-out at sign-in' % (len(apps), ', '.join(s for s, _ in apps)))
     return True
 
 def _w1_revert_mfa(h, log):
@@ -4584,6 +4590,18 @@ def _w1_revert_mfa(h, log):
             log('W1: force-enroll restored to prior (%s)' % (fe.get('prior_not_configured_action') or 'skip'))
         except Exception as e:
             log('W1: force-enroll restore error: %s' % str(e)[:120])
+    # WS3c: remove the recovery flow's Session Logout binding — with the User Login
+    # binding restored below, the reset ends logged-in AS THE RESET USER again, and
+    # a trailing logout would immediately destroy that session.
+    for _lb in (w1.get('ak_recovery_logout') or []):
+        try:
+            if _lb.get('binding_pk'):
+                _ak_api_call(f'{ak_url}/api/v3/flows/bindings/{_lb["binding_pk"]}/',
+                             method='DELETE', headers=ak_headers)
+                log('W1: recovery-flow Session Logout binding removed')
+        except Exception as e:
+            log('W1: recovery logout-binding remove error: %s' % str(e)[:100])
+    w1.pop('ak_recovery_logout', None)
     # WS3: restore the recovery flow's User Login binding — non-hardened boxes keep
     # today's convenience behavior (reset ends logged-in).
     for _rb in (w1.get('ak_recovery_login') or []):
@@ -4695,6 +4713,80 @@ def _w1_unbind_recovery_login(h, log):
         return False
 
 
+def _w1_bind_recovery_logout(h, log):
+    """WS3c (v10.1.4): on a W1-hardened box the recovery flow must end SIGNED OUT.
+
+    Removing the User Login binding (WS3) stopped the reset from minting a session
+    for the RESET user — but the flow's exit is a bare redirect to the site root,
+    which then shows whatever session the browser ALREADY held. In the field the
+    reset link is routinely opened on an admin's machine (forgot-password IS the
+    de-facto onboarding path), so the person finishing a reset can land inside the
+    admin's live dashboard (test8 2026-07-18: operator finished test1cacor's reset
+    and landed in akadmin's session — accidental privilege handoff).
+
+    Fix: bind a `user_logout` stage ('Recovery Session Logout', order 110, i.e.
+    LAST) to every recovery flow. Finishing a reset flushes the browser's Authentik
+    session — admin or otherwise — and lands on sign-in, where W1's force-enroll
+    does its job. Harmless when no other session exists (flushes the anonymous flow
+    session). Hardened boxes only: non-hardened boxes keep the User Login binding,
+    where the flow ends as the RESET user and this hazard cannot arise. Records
+    binding pks in w1['ak_recovery_logout'] for revert; stage object is reused if
+    present. Idempotent; called from _w1_apply_mfa AND the startup re-assert."""
+    ak_url, ak_headers, _s = _w1_ak_ctx()
+    if not ak_url:
+        log('W1: no Authentik token — cannot bind recovery logout'); return False
+    w1 = (h.get('applied') or {}).get('W1_sso') or {}
+    if not w1.get('ak_apps'):
+        return True  # W1 not applied — nothing to enforce
+    try:
+        _rec_flows = _w1_ak_get(ak_url, 'flows/instances/?designation=recovery', ak_headers).get('results', [])
+        if not _rec_flows:
+            return True
+        _name = 'Recovery Session Logout'
+        _lo = _w1_ak_get(ak_url, 'stages/user_logout/?page_size=100', ak_headers).get('results', [])
+        _stage_pk = next((s.get('pk') for s in _lo if s.get('name') == _name), None)
+        if not _stage_pk:
+            _stage_pk = json.loads(_ak_api_call(
+                f'{ak_url}/api/v3/stages/user_logout/', data=json.dumps({'name': _name}).encode(),
+                method='POST', headers=ak_headers).read().decode()).get('pk')
+        _recorded = list(w1.get('ak_recovery_logout') or [])
+        _changed = False
+        for _rf in _rec_flows:
+            _binds = _w1_ak_get(ak_url, f'flows/bindings/?target={_rf["pk"]}&page_size=100',
+                                ak_headers).get('results', [])
+            # the flow__pk server filter has been unreliable — re-filter client-side
+            _binds = [b for b in _binds if str(b.get('target')) == str(_rf.get('pk'))]
+            if any(str(b.get('stage')) == str(_stage_pk) for b in _binds):
+                continue
+            _bpk = json.loads(_ak_api_call(
+                f'{ak_url}/api/v3/flows/bindings/',
+                data=json.dumps({'target': _rf['pk'], 'stage': _stage_pk, 'order': 110,
+                                 'evaluate_on_plan': True, 're_evaluate_policies': False,
+                                 'policy_engine_mode': 'any',
+                                 'invalid_response_action': 'retry'}).encode(),
+                method='POST', headers=ak_headers).read().decode()).get('pk')
+            _recorded.append({'flow_pk': _rf.get('pk'), 'stage_pk': _stage_pk, 'binding_pk': _bpk})
+            _changed = True
+            log('W1: recovery flow %s now ends with session logout (reset always lands '
+                'signed-out at sign-in)' % (_rf.get('slug') or _rf.get('pk')))
+        if _recorded != (w1.get('ak_recovery_logout') or []):
+            w1['ak_recovery_logout'] = _recorded
+            save_hardening(h)
+        if _changed:
+            for _rf in _rec_flows:
+                _binds = _w1_ak_get(ak_url, f'flows/bindings/?target={_rf["pk"]}&page_size=100',
+                                    ak_headers).get('results', [])
+                _binds = [b for b in _binds if str(b.get('target')) == str(_rf.get('pk'))]
+                if not any(str(b.get('stage')) == str(_stage_pk) for b in _binds):
+                    log('W1: VERIFY FAILED — recovery logout binding missing on flow %s'
+                        % (_rf.get('slug') or _rf.get('pk')))
+                    return False
+        return True
+    except Exception as e:
+        log('W1: recovery logout bind error: %s' % str(e)[:140])
+        return False
+
+
 def _w1_reassert_app_mfa(log=None):
     """WS3 Phase 1b (v10.1.4): Authentik apps registered AFTER W1 hardening ran ship
     WITHOUT the require-MFA binding — on test8 the freshly-added Remote Assist was the
@@ -4741,6 +4833,7 @@ def _w1_reassert_app_mfa(log=None):
         if changed:
             save_hardening(h)
         _w1_unbind_recovery_login(h, _log)
+        _w1_bind_recovery_logout(h, _log)
         return changed > 0
     except Exception as e:
         _log('W1 re-assert error (non-fatal): %s' % str(e)[:140])
