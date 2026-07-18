@@ -733,9 +733,13 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 #     NetBird, validate dashboard-login + a peer connect, then promote DEV → VETTED in a release.
 # The card shows the running version + (on dev) surfaces when upstream has shipped something
 # newer, as AWARENESS only — Update always installs the channel target, never raw upstream.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"      # VETTED (main) — field-validated working pair
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.39.0"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.74.4"  # DEV candidate under validation (upstream latest pair 2026-07-14; promote to vetted after login + peer connect pass)
+# v10.1.4 (WS2): 0.74.4/v2.90.4 promoted to VETTED after login + peer-connect validation on
+# test12 (2026-07-18). The promotion depended on two fixes shipped first: the persistent
+# server.store.encryptionKey (0.73+ minted an ephemeral key per start, orphaning users) and
+# the orphaned-store self-heal. Dev pins stay == vetted until a newer pair is under trial.
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.74.4"      # VETTED (main) — field-validated working pair
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.90.4"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.74.4"  # DEV == vetted (no newer candidate under trial)
 NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.90.4"
 
 
