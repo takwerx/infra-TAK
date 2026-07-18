@@ -60,6 +60,10 @@ MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requ
                                               # (test12, 2026-07-17 — exit 125 mid-build).
 SELF_PATH = os.path.realpath(__file__)
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
+# The console repo this broker ships inside (…/broker/takwerx_broker.py -> repo
+# root). Used by the v10.1.4 repo-ownership self-heal carve-out in _check_chown —
+# derived from SELF_PATH, never from client input.
+CONSOLE_REPO_DIR = os.path.dirname(os.path.dirname(SELF_PATH))
 
 # The console-owned TAK Server docker bundle is unzipped here (app.py
 # TAK_DOCKER_ROOT = ~/tak-docker) and bind-mounted into the TAK containers at
@@ -625,9 +629,38 @@ def check_exec(argv, cwd=None):
         _check_wg(argv)
     elif base == 'wpa_cli':
         _check_wpa_cli(argv)
+    elif base == 'chown':
+        _check_chown(argv, cwd)
     elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
+
+
+def _check_chown(argv, cwd=None):
+    """chown: path-checked like the other coreutils — plus ONE exact carve-out
+    for the v10.1.4 repo-ownership self-heal. Root-shell git operations leave
+    root-owned entries inside the takwerx-owned console repo; git-as-takwerx
+    then cannot unlink files under them and Update Now half-applies: HEAD moves
+    while the blocked files keep OLD content, and the box silently runs mixed
+    versions (test8 2026-07-18: broker + flows.json stayed 10.1.3 under a
+    10.1.4 HEAD). The console repairs that with exactly:
+
+        chown -R -h takwerx:takwerx <CONSOLE_REPO_DIR>
+
+    Safety: the target must equal the broker's OWN repo root (from SELF_PATH,
+    never client input, rejected if the root itself is a symlink), the owner is
+    pinned to BROKER_USER, and -h is REQUIRED so symlinks are re-owned, never
+    followed (the repo is console-writable — a followed link could re-own an
+    arbitrary root path). This grants nothing beyond re-asserting the design
+    invariant "the console owns its repo". Every other chown shape falls
+    through to the standard path allowlist."""
+    if (len(argv) == 5
+            and argv[1] == '-R' and argv[2] == '-h'
+            and argv[3] == f'{BROKER_USER}:{BROKER_USER}'
+            and os.path.normpath(argv[4]) == CONSOLE_REPO_DIR
+            and not os.path.islink(CONSOLE_REPO_DIR)):
+        return
+    _check_path_args('chown', argv, cwd)
 
 
 _IFACE_RE = re.compile(r'^[A-Za-z0-9_.:][A-Za-z0-9_.:-]{0,14}$')  # no leading '-' (option smuggling)

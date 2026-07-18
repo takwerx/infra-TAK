@@ -5519,6 +5519,70 @@ def _fetch_latest_tag_name():
         return None
 
 
+def _repo_ownership_selfheal(trigger=''):
+    """v10.1.4 WS13: heal foreign-owned entries inside the console repo.
+
+    Root-shell git operations (or root-era start.sh runs) leave files/dirs in
+    the takwerx-owned repo owned by root. git-as-takwerx then cannot unlink
+    files inside root-owned dirs, so Update Now HALF-APPLIES: HEAD moves, the
+    blocked files keep OLD content ("error: unable to unlink old '…':
+    Permission denied"), and the box silently runs mixed versions (test8
+    2026-07-18: broker/takwerx_broker.py + nodered/flows.json stayed at 10.1.3
+    under a 10.1.4 HEAD — with the WS8 broker fix in the stale file).
+
+    Detects entries whose owner differs from the console user (including
+    .git/ — root-era fetches leave root-owned pack files that break future
+    gc/fetch) and re-owns the whole install dir via the broker (`chown -R -h`,
+    exact shape carved out in the broker rulebook; permissive legacy daemons
+    execute it too, which is what un-wedges a box whose NEW broker source is
+    itself one of the blocked files). No-op as root — a root-owned repo is the
+    correct state on root-era boxes.
+
+    Returns the offending repo-relative paths found BEFORE the chown; the
+    startup caller uses them to restore torn file content afterwards."""
+    if os.getuid() == 0:
+        return []
+    repo = os.path.dirname(os.path.abspath(__file__))
+    uid = os.getuid()
+    offenders = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(repo):
+            for name in dirnames + filenames:
+                p = os.path.join(dirpath, name)
+                try:
+                    if os.lstat(p).st_uid != uid:
+                        offenders.append(os.path.relpath(p, repo))
+                except OSError:
+                    continue
+    except Exception as e:
+        print(f"repo ownership heal ({trigger}): scan failed (non-fatal): {e}", flush=True)
+        return []
+    if not offenders:
+        return []
+    import pwd as _pwd
+    import grp as _grp
+    try:
+        user = _pwd.getpwuid(uid).pw_name
+        group = _grp.getgrgid(os.getgid()).gr_name
+    except Exception:
+        user, group = str(uid), str(os.getgid())
+    print(f"repo ownership heal ({trigger}): {len(offenders)} foreign-owned entr(y/ies) "
+          f"(e.g. {', '.join(offenders[:4])}) — re-owning {repo} to {user}:{group}", flush=True)
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['chown', '-R', '-h', f'{user}:{group}', repo]),
+            capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            print(f"repo ownership heal ({trigger}): chown FAILED (rc={r.returncode}): "
+                  f"{(r.stderr or r.stdout or '').strip()[:300]}", flush=True)
+            return []
+        print(f"repo ownership heal ({trigger}): ✓ repo re-owned to {user}:{group}", flush=True)
+    except Exception as e:
+        print(f"repo ownership heal ({trigger}): chown error (non-fatal): {e}", flush=True)
+        return []
+    return offenders
+
+
 @app.route('/api/update/apply', methods=['POST'])
 @login_required
 def update_apply():
@@ -5700,6 +5764,12 @@ def update_apply():
                     return _fail_release_lock(_error_payload(_git_err(fetch_main)))
                 target_ref = 'refs/remotes/origin/main'
             target_label = tag_name or 'origin/main'
+
+        # v10.1.4 WS13: heal foreign-owned repo entries BEFORE the checkout — a
+        # past root-shell git op leaves root-owned dirs that make the checkout
+        # below half-apply ("unable to unlink old '…': Permission denied" while
+        # HEAD still moves → box runs mixed versions).
+        _repo_ownership_selfheal('update-apply')
 
         checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0:
@@ -68929,6 +68999,51 @@ def _startup_ensure_broker():
     except Exception as _e:
         print(f'Startup migration: broker ensure warning (non-fatal): {_e}', flush=True)
 
+
+def _startup_repo_ownership_heal():
+    """v10.1.4 WS13 (startup half): heal repo ownership AND restore any files a
+    prior half-applied Update Now left torn — tracked-modified AND foreign-owned
+    means git moved HEAD but could not unlink them, so their on-disk content is
+    the OLD release. Runs BEFORE _startup_ensure_broker so a restored
+    broker/takwerx_broker.py is hash-detected and the daemon restarts onto the
+    new source in the same boot. The chown itself goes through the RUNNING (old)
+    broker — permissive daemons execute it; enforcing daemons carry the exact
+    carve-out added to the rulebook in the same release. Recovery from a torn
+    box is therefore console-only: Update Now (stages new app.py despite the
+    unlink errors) → Reboot; this heal converges the rest. Only files that were
+    BOTH dirty and foreign-owned are restored — legitimate local modifications
+    on a dev box are never touched."""
+    try:
+        offenders = _repo_ownership_selfheal('startup')
+        if not offenders:
+            return
+        repo = os.path.dirname(os.path.abspath(__file__))
+        gitc = ['git', '-c', f'safe.directory={repo}']
+        st = subprocess.run(gitc + ['status', '--porcelain'],
+                            cwd=repo, capture_output=True, text=True, timeout=30)
+        if st.returncode != 0:
+            print(f"Startup migration: repo ownership heal: git status failed (non-fatal): "
+                  f"{(st.stderr or '').strip()[:200]}", flush=True)
+            return
+        dirty = [l[3:].strip() for l in st.stdout.splitlines()
+                 if len(l) > 3 and l[:2].strip() and not l.startswith('??')]
+        torn = [p for p in dirty if p in set(offenders)]
+        if not torn:
+            return
+        print(f"Startup migration: repo ownership heal: restoring {len(torn)} torn file(s) "
+              f"from HEAD: {', '.join(torn)}", flush=True)
+        co = subprocess.run(gitc + ['checkout', '--force', '--'] + torn,
+                            cwd=repo, capture_output=True, text=True, timeout=60)
+        if co.returncode != 0:
+            print(f"Startup migration: repo ownership heal: restore FAILED: "
+                  f"{(co.stderr or co.stdout or '').strip()[:300]}", flush=True)
+        else:
+            print("Startup migration: ✓ repo ownership heal: torn files restored to HEAD", flush=True)
+    except Exception as _e:
+        print(f"Startup migration: repo ownership heal error (non-fatal): {_e}", flush=True)
+
+
+_startup_repo_ownership_heal()
 _startup_ensure_broker()
 
 
