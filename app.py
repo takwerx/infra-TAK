@@ -32411,13 +32411,36 @@ def _heal_netbird_orphaned_store(plog=None):
         if 'encryptionKey' not in _cfg:
             return False  # key heal hasn't landed yet — a reset now would re-orphan
         settings = load_settings()
+        if _netbird_deploy_status.get('running'):
+            return False  # a real deploy is in flight — never race it
         pat = (settings.get('netbird_pat') or '').strip()
-        if not pat:
-            return False  # nothing to probe with — don't guess
         # Wait for the management API (the key heal may have just recreated the server).
         if not _netbird_wait_instance(_log, timeout_sec=60):
             return False
-        if _netbird_pat_is_valid(pat):
+        _torn = False
+        if not pat:
+            # Torn-bootstrap state (first heal generation parked store.db but not the
+            # embedded IdP's idp.db): mgmt store EMPTY while the instance claims setup
+            # is done — /api/setup refuses, no PAT can exist, SSO users can't map.
+            # Only this exact contradiction qualifies; a mid-deploy box is excluded
+            # by the running-deploy guard above.
+            try:
+                import sqlite3 as _sq
+                _db = _sq.connect(f'file:{os.path.join(nb_dir, "data", "store.db")}?mode=ro', uri=True)
+                _users = _db.execute('SELECT count(*) FROM users').fetchone()[0]
+                _db.close()
+            except Exception:
+                return False  # store unreadable — don't guess
+            try:
+                import urllib.request as _rq
+                _inst = json.loads(_rq.urlopen('http://localhost:33073/api/instance', timeout=8).read().decode())
+            except Exception:
+                return False
+            if _users == 0 and _inst.get('setup_required') is False and settings.get('netbird_enabled'):
+                _torn = True
+            else:
+                return False  # no PAT but nothing provably wrong — don't guess
+        elif _netbird_pat_is_valid(pat):
             return False  # healthy
         # PAT failed — the probe above just forced the server to log WHY. Only the
         # orphaned-store decrypt failure counts; an expired/revoked PAT does not.
@@ -32428,7 +32451,7 @@ def _heal_netbird_orphaned_store(plog=None):
         r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', '10m', 'netbird-server']),
                            capture_output=True, text=True, timeout=20)
         _recent = (r.stdout or '') + (r.stderr or '')
-        if 'message authentication failed' not in _recent:
+        if not _torn and 'message authentication failed' not in _recent:
             if not getattr(_heal_netbird_orphaned_store, '_ambig_logged', False):
                 _heal_netbird_orphaned_store._ambig_logged = True
                 _log('  netbird: stored PAT invalid but no orphaned-store signature yet — watching. '
@@ -32436,17 +32459,29 @@ def _heal_netbird_orphaned_store(plog=None):
                      'orphaned store and trigger the automatic re-bootstrap within ~3 minutes.')
             return False
         _ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
-        _log(f'  netbird: ORPHANED STORE confirmed (ephemeral-key era) — parking store.db aside '
-             f'as store.db.orphaned-{_ts} and re-bootstrapping under the persisted key')
+        _log(f'  netbird: ORPHANED STORE confirmed ({"torn bootstrap" if _torn else "ephemeral-key era"}) — '
+             f'parking store.db + idp.db aside (.orphaned-{_ts}) and re-bootstrapping under the persisted key')
+        # BOTH stores must go: store.db (management) AND idp.db (embedded IdP). Parking
+        # only store.db leaves the IdP claiming setup_required=false over an empty
+        # management store — /api/setup then refuses and the bootstrap is torn (exactly
+        # the state the _torn branch detects).
         subprocess.run(_sudo_wrap(['docker', 'exec', 'netbird-server', 'sh', '-c',
-                                   f'for f in store.db store.db-wal store.db-shm; do '
+                                   f'for f in store.db store.db-wal store.db-shm idp.db idp.db-wal idp.db-shm; do '
                                    f'[ -f /var/lib/netbird/$f ] && mv /var/lib/netbird/$f /var/lib/netbird/$f.orphaned-{_ts}; done; true']),
                        capture_output=True, text=True, timeout=20)
         settings.pop('netbird_pat', None)
         save_settings(settings)
         _run_netbird_deploy(settings)  # idempotent full bootstrap; logs to the NetBird deploy log
-        _log('  ✓ netbird: store re-initialized + re-bootstrapped — SSO login should work; '
-             'peers (if any) need re-enrollment')
+        # The deploy catches its own exceptions (it reports via _netbird_deploy_status),
+        # so VERIFY instead of trusting the return: a fresh working bootstrap leaves a
+        # valid PAT in settings.
+        _new_pat = (load_settings().get('netbird_pat') or '').strip()
+        if _new_pat and _netbird_pat_is_valid(_new_pat):
+            _log('  ✓ netbird: store re-initialized + re-bootstrapped, PAT verified — SSO login '
+                 'should work; peers (if any) need re-enrollment')
+        else:
+            _log('  ⚠ netbird: re-bootstrap ran but PAT verification failed — check the NetBird '
+                 'deploy log on the NetBird page; will not retry automatically this boot')
         return True
     except Exception as e:
         _log(f'  netbird orphaned-store heal error (non-fatal): {e}')
