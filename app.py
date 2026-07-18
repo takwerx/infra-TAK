@@ -32376,6 +32376,76 @@ def _ensure_netbird_store_key(plog=None):
         return False
 
 
+def _heal_netbird_orphaned_store(plog=None):
+    """v10.1.4 (WS2): recover a NetBird store orphaned by the 0.73+ ephemeral-key era
+    WITHOUT removing the module (operator rule: fixes ship via updates, never
+    remove/reinstall). Boxes that ran a 0.73+ server before server.store.encryptionKey
+    was persisted (2be29af) hold user rows encrypted under keys that no longer exist —
+    cryptographically unrecoverable; SSO 401s 'token invalid' forever.
+
+    Detection is deliberately two-factor so an expired/revoked PAT can never trigger a
+    reset: (1) the stored PAT fails validation, AND (2) the probe itself makes the
+    CURRENT server log the decrypt signature ('cipher: message authentication failed')
+    — only an orphaned store produces that. On confirmation: park store.db aside inside
+    the container (never delete), clear the dead PAT, and re-run the full idempotent
+    deploy (fresh store under the persisted key, /api/setup owner, Authentik IdP
+    registration, policy bind, finalize). Affects dev boxes only — the fleet's 0.72
+    plaintext stores never entered this state. Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        nb_dir = None
+        for d in (os.path.expanduser('~/netbird'), '/root/netbird'):
+            if os.path.isfile(os.path.join(d, 'config.yaml')) and os.path.isfile(os.path.join(d, 'docker-compose.yml')):
+                nb_dir = d
+                break
+        if not nb_dir:
+            return False  # NetBird not installed
+        _srv_img, _ = _get_netbird_target_images()
+        if not _netbird_store_key_needed(_srv_img):
+            return False  # pre-0.73 channel target — ephemeral-key era can't apply
+        try:
+            with open(os.path.join(nb_dir, 'config.yaml')) as f:
+                _cfg = f.read()
+        except Exception:
+            _cfg = _read_priv(os.path.join(nb_dir, 'config.yaml'))
+        if 'encryptionKey' not in _cfg:
+            return False  # key heal hasn't landed yet — a reset now would re-orphan
+        settings = load_settings()
+        pat = (settings.get('netbird_pat') or '').strip()
+        if not pat:
+            return False  # nothing to probe with — don't guess
+        # Wait for the management API (the key heal may have just recreated the server).
+        if not _netbird_wait_instance(_log, timeout_sec=60):
+            return False
+        if _netbird_pat_is_valid(pat):
+            return False  # healthy
+        # PAT failed — the probe above just forced the server to log WHY. Only the
+        # orphaned-store decrypt failure counts; an expired/revoked PAT does not.
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', '2m', 'netbird-server']),
+                           capture_output=True, text=True, timeout=20)
+        _recent = (r.stdout or '') + (r.stderr or '')
+        if 'message authentication failed' not in _recent:
+            _log('  netbird: stored PAT invalid but no orphaned-store signature — not resetting '
+                 '(PAT may be expired/revoked; re-run the NetBird deploy manually if needed)')
+            return False
+        _ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+        _log(f'  netbird: ORPHANED STORE confirmed (ephemeral-key era) — parking store.db aside '
+             f'as store.db.orphaned-{_ts} and re-bootstrapping under the persisted key')
+        subprocess.run(_sudo_wrap(['docker', 'exec', 'netbird-server', 'sh', '-c',
+                                   f'for f in store.db store.db-wal store.db-shm; do '
+                                   f'[ -f /var/lib/netbird/$f ] && mv /var/lib/netbird/$f /var/lib/netbird/$f.orphaned-{_ts}; done; true']),
+                       capture_output=True, text=True, timeout=20)
+        settings.pop('netbird_pat', None)
+        save_settings(settings)
+        _run_netbird_deploy(settings)  # idempotent full bootstrap; logs to the NetBird deploy log
+        _log('  ✓ netbird: store re-initialized + re-bootstrapped — SSO login should work; '
+             'peers (if any) need re-enrollment')
+        return True
+    except Exception as e:
+        _log(f'  netbird orphaned-store heal error (non-fatal): {e}')
+        return False
+
+
 def _heal_netbird_pinned_image(plog=None):
     """v10.0.9: roll a NetBird box back onto the vetted pin if its compose carries a different
     image tag — e.g. the briefly-shipped :latest that jumped server 0.72.3→"24.04" / dashboard
@@ -71101,6 +71171,19 @@ def _startup_migrations():
             )
         except Exception as nb_pin_err:
             print(f"Startup migration: netbird pin-restore error (non-fatal): {nb_pin_err}")
+
+        # v10.1.4 (WS2): orphaned-store recovery in a BACKGROUND thread — the confirmed
+        # case re-runs the full NetBird deploy (minutes), which must not block boot. The
+        # two-factor gate (invalid PAT + decrypt signature the probe itself generates)
+        # makes the no-op path cheap and the reset path unambiguous.
+        try:
+            import threading as _threading_nborphan
+            _threading_nborphan.Thread(
+                target=lambda: _heal_netbird_orphaned_store(
+                    lambda m: print(f"Startup migration: {m}", flush=True)),
+                daemon=True, name='netbird-orphan-heal').start()
+        except Exception as nb_orph_err:
+            print(f"Startup migration: netbird orphan-heal spawn error (non-fatal): {nb_orph_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
