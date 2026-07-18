@@ -4555,8 +4555,16 @@ def _w1_apply_mfa(h, log):
         if _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode') != 'all':
             log('W1: VERIFY FAILED — %s policy_engine_mode is not "all"' % slug); return False
     w1['ak_app_slug'] = 'infratak'  # console marker for W4 assertion compatibility
-    log('W1: MFA enforced on %d Authentik apps + force-enroll ON (%s)'
-        % (len(apps), ', '.join(s for s, _ in apps)))
+
+    # 3) WS3: kill the recovery-flow session bypass — without this, anyone holding a
+    # reset email gets a full MFA-less SSO session that force-enroll never sees.
+    if not _w1_unbind_recovery_login(h, log):
+        log('W1: recovery-flow login unbind failed — aborting (the reset-email bypass '
+            'would defeat every app binding above)')
+        return False
+
+    log('W1: MFA enforced on %d Authentik apps + force-enroll ON (%s); recovery flow '
+        'ends at sign-in' % (len(apps), ', '.join(s for s, _ in apps)))
     return True
 
 def _w1_revert_mfa(h, log):
@@ -4576,6 +4584,19 @@ def _w1_revert_mfa(h, log):
             log('W1: force-enroll restored to prior (%s)' % (fe.get('prior_not_configured_action') or 'skip'))
         except Exception as e:
             log('W1: force-enroll restore error: %s' % str(e)[:120])
+    # WS3: restore the recovery flow's User Login binding — non-hardened boxes keep
+    # today's convenience behavior (reset ends logged-in).
+    for _rb in (w1.get('ak_recovery_login') or []):
+        try:
+            _ak_api_call(f'{ak_url}/api/v3/flows/bindings/',
+                         data=json.dumps({'target': _rb.get('flow_pk'), 'stage': _rb.get('stage_pk'),
+                                          'order': _rb.get('order', 100), 'evaluate_on_plan': True,
+                                          're_evaluate_policies': False, 'policy_engine_mode': 'any',
+                                          'invalid_response_action': 'retry'}).encode(),
+                         method='POST', headers=ak_headers)
+            log('W1: recovery-flow User Login binding restored')
+        except Exception as e:
+            log('W1: recovery login-binding restore error: %s' % str(e)[:100])
     for slug, info in (w1.get('ak_apps') or {}).items():
         try:
             if info.get('binding_pk'):
@@ -4610,6 +4631,121 @@ def _w1_revert_mfa(h, log):
             log('W1: MFA-required policy deleted')
     except Exception as e:
         log('W1: policy delete error: %s' % str(e)[:120])
+
+def _w1_unbind_recovery_login(h, log):
+    """WS3 (v10.1.4): on a W1-hardened box a password reset must END at "password
+    changed — sign in", NOT at a logged-in session. The recovery flow's User Login
+    stage (order 100) issues the session INSIDE recovery, so default-authentication-flow
+    — the only flow W1's force-enroll patches — never runs: anyone holding a reset email
+    gets a full MFA-less SSO session (test8 2026-07-07, mepsteinparsons; and since
+    forgot-password is the de-facto onboarding path, EVERY new user started that way).
+    Deletes the user-login binding from every recovery flow, records it in
+    w1['ak_recovery_login'] for revert, verifies gone. Idempotent; gated on W1 applied.
+    Called from _w1_apply_mfa AND the startup re-assert (already-hardened boxes must be
+    fixed by a plain console update, not by re-running W1)."""
+    ak_url, ak_headers, _s = _w1_ak_ctx()
+    if not ak_url:
+        log('W1: no Authentik token — cannot unbind recovery login'); return False
+    w1 = (h.get('applied') or {}).get('W1_sso') or {}
+    if not w1.get('ak_apps'):
+        return True  # W1 not applied — nothing to enforce
+    try:
+        _ul = _w1_ak_get(ak_url, 'stages/user_login/?page_size=100', ak_headers).get('results', [])
+        _ul_stages = {str(s.get('pk')) for s in _ul}
+        _rec_flows = _w1_ak_get(ak_url, 'flows/instances/?designation=recovery', ak_headers).get('results', [])
+        if not _rec_flows:
+            return True  # no recovery flow — nothing to do
+        _removed = list(w1.get('ak_recovery_login') or [])
+
+        def _all_bindings():
+            out, page = [], 1
+            while True:
+                d = _w1_ak_get(ak_url, f'flows/bindings/?ordering=order&page_size=500&page={page}', ak_headers)
+                out.extend(d.get('results', []))
+                if not d.get('pagination', {}).get('next'):
+                    return out
+                page += 1
+
+        _did = False
+        for _b in _all_bindings():
+            for _rf in _rec_flows:
+                if str(_b.get('target')) == str(_rf.get('pk')) and str(_b.get('stage')) in _ul_stages:
+                    _ak_api_call(f'{ak_url}/api/v3/flows/bindings/{_b["pk"]}/',
+                                 method='DELETE', headers=ak_headers)
+                    if not any(r.get('flow_pk') == _rf.get('pk') and str(r.get('stage_pk')) == str(_b.get('stage'))
+                               for r in _removed):
+                        _removed.append({'flow_pk': _rf.get('pk'), 'stage_pk': _b.get('stage'),
+                                         'order': _b.get('order', 100)})
+                    _did = True
+                    log('W1: removed session-issuing User Login binding from recovery flow %s '
+                        '(password reset now ends at sign-in)' % (_rf.get('slug') or _rf.get('pk')))
+        if _removed != (w1.get('ak_recovery_login') or []):
+            w1['ak_recovery_login'] = _removed
+            save_hardening(h)
+        if _did:
+            # verify: no user-login binding remains on any recovery flow
+            for _b in _all_bindings():
+                if str(_b.get('stage')) in _ul_stages and any(
+                        str(_b.get('target')) == str(_rf.get('pk')) for _rf in _rec_flows):
+                    log('W1: VERIFY FAILED — recovery User Login binding still present')
+                    return False
+        return True
+    except Exception as e:
+        log('W1: recovery login unbind error: %s' % str(e)[:140])
+        return False
+
+
+def _w1_reassert_app_mfa(log=None):
+    """WS3 Phase 1b (v10.1.4): Authentik apps registered AFTER W1 hardening ran ship
+    WITHOUT the require-MFA binding — on test8 the freshly-added Remote Assist was the
+    only visible library tile precisely because it was the only unguarded app. When W1
+    is applied, sweep every current login app and bind the existing policy +
+    policy_engine_mode='all' on any that lack it (recorded for revert, same shape as
+    _w1_apply_mfa). Also re-runs the recovery-login unbind so already-hardened boxes
+    pick up the WS3 fix from a plain console update. Idempotent; cheap no-op when W1
+    is not applied. Never raises."""
+    _log = log or (lambda m: print(m, flush=True))
+    try:
+        h = load_hardening()
+        w1 = (h.get('applied') or {}).get('W1_sso') or {}
+        pol_pk = w1.get('ak_mfa_policy_pk')
+        if not pol_pk or not w1.get('ak_apps'):
+            return False  # W1 not applied
+        ak_url, ak_headers, _s = _w1_ak_ctx()
+        if not ak_url:
+            return False
+        rec = w1.setdefault('ak_apps', {})
+        changed = 0
+        for slug, app_pk in _w1_login_apps(ak_url, ak_headers):
+            binds = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100', ak_headers).get('results', [])
+            has = any(b.get('policy') == pol_pk and b.get('enabled') for b in binds)
+            mode = _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode')
+            if has and mode == 'all':
+                continue
+            prior_mode = mode or 'any'
+            if not has:
+                body = json.dumps({'policy': pol_pk, 'target': app_pk, 'enabled': True,
+                                   'order': 10, 'timeout': 30, 'failure_result': False}).encode()
+                bind_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/bindings/', data=body,
+                                     method='POST', headers=ak_headers).read().decode()).get('pk')
+            else:
+                bind_pk = next((b.get('pk') for b in binds if b.get('policy') == pol_pk), None)
+            if mode != 'all':
+                _ak_api_call(f'{ak_url}/api/v3/core/applications/{slug}/',
+                             data=json.dumps({'policy_engine_mode': 'all'}).encode(),
+                             method='PATCH', headers=ak_headers)
+            entry = rec.setdefault(slug, {'app_pk': app_pk, 'prior_engine_mode': prior_mode})
+            entry['binding_pk'] = bind_pk
+            changed += 1
+            _log('W1 re-assert: MFA gate bound to late-created app %s' % slug)
+        if changed:
+            save_hardening(h)
+        _w1_unbind_recovery_login(h, _log)
+        return changed > 0
+    except Exception as e:
+        _log('W1 re-assert error (non-fatal): %s' % str(e)[:140])
+        return False
+
 
 def _w1_caddy_regen(log):
     """Regenerate + validate + reload Caddy so the /login bypass state matches posture."""
@@ -10272,6 +10408,7 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
         client_id, client_secret = _ensure_authentik_remote_assist_app(settings, plog=plog)
+        _w1_reassert_app_mfa(plog)  # WS3 1b: late-created app must not ship without the MFA gate
         if not client_id:
             raise RuntimeError('Authentik OIDC provisioning failed — ensure Authentik is running.')
 
@@ -30374,6 +30511,18 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
         user_login_pk = _find_or_create_stage('stages/user_login/', 'Recovery User Login')
 
+        # v10.1.4 (WS3, load-bearing): when W1 hardening is applied, the recovery flow
+        # must NOT end in a session — drop the user_login stage from the desired set so
+        # step 4 below also DELETES any existing binding. Without this gate, every Email
+        # Relay deploy / "Configure Authentik" press re-created the binding and silently
+        # resurrected the reset-email MFA bypass on hardened boxes. Both local and
+        # split-box paths funnel through this function.
+        try:
+            if ((load_hardening().get('applied') or {}).get('W1_sso') or {}).get('ak_apps'):
+                user_login_pk = None
+        except Exception:
+            pass
+
         # 3) Fetch ALL bindings, filter client-side by target == recovery flow PK.
         #    The server-side flow__pk filter is unreliable and returns bindings from other flows.
         all_bindings = []
@@ -32964,6 +33113,7 @@ def _run_netbird_deploy(settings):
         plog('')
         plog('━━━ Step 2/6: Provisioning Authentik OIDC Application ━━━')
         client_id, client_secret = _ensure_authentik_netbird_app(settings, plog=plog)
+        _w1_reassert_app_mfa(plog)  # WS3 1b: late-created app must not ship without the MFA gate
         if not client_id or not client_secret:
             raise RuntimeError('Authentik OIDC provisioning failed — ensure Authentik is running.')
         plog(f'✓ Authentik provider ready (client_id={client_id[:12]}...)')
@@ -73473,6 +73623,17 @@ try:
     _threading_pgsync.Thread(target=_startup_postgis_sync, daemon=True, name='cloudtak-postgis-sync').start()
 except Exception as _e:
     print(f"[startup] failed to start postgis sync (non-fatal): {_e}", flush=True)
+
+# v10.1.4 (WS3): W1 MFA re-assert at boot — covers (a) already-hardened boxes picking up
+# the recovery-flow bypass fix from a plain console update, and (b) any Authentik app
+# registered since hardening ran that's missing the require-MFA binding. Cheap gated
+# no-op when W1 isn't applied; background thread (talks to the Authentik API).
+try:
+    import threading as _threading_w1r
+    _threading_w1r.Thread(target=lambda: _w1_reassert_app_mfa(),
+                          daemon=True, name='w1-app-mfa-reassert').start()
+except Exception as _e:
+    print(f"[startup] failed to start W1 MFA re-assert (non-fatal): {_e}", flush=True)
 
 # v10.1.4 (WS11): periodic MediaMTX cert-grant re-assert. The boot/ssl-flip heals
 # (v10.0.9) close two of the three fragility gaps, but a mid-cycle ~60-day LE renewal
