@@ -5772,8 +5772,27 @@ def update_apply():
         _repo_ownership_selfheal('update-apply')
 
         checkout = _git(['checkout', '--force', target_ref], timeout=30)
+        if checkout.returncode != 0 and 'unable to unlink' in _git_err(checkout).lower():
+            # Ownership poisoning surfaced mid-checkout (pre-checkout heal missed
+            # or could not complete — e.g. broker briefly unreachable). Heal and
+            # retry ONCE so a single Update Now click still converges.
+            _repo_ownership_selfheal('update-apply-retry')
+            checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0:
-            return _fail_release_lock(_error_payload(_git_err(checkout)))
+            err = _git_err(checkout)
+            payload = _error_payload(err)
+            if 'unable to unlink' in err.lower():
+                # WS13: never show a customer raw git stderr with no next step.
+                # HEAD has moved and the new app.py is staged; the startup heal
+                # completes the rest on the next boot — tell them exactly that.
+                payload['error'] = (
+                    'Update staged, but some files are still locked by root ownership '
+                    'from an earlier operation on this server. Click the Reboot button — '
+                    'the console repairs ownership and completes this update automatically '
+                    'during startup. No command line needed.'
+                )
+                payload['detail'] = err[:400]
+            return _fail_release_lock(payload)
 
         update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
         _ensure_gunicorn_upgrade(console_dir)
