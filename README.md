@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.3-alpha)**
+**Current release: [v10.1.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.4-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.4-alpha — 2026-07-18 — CloudTAK 13.49 with plugins that survive updates, a password reset that can't leave you in someone else's session, and installs/updates that heal themselves
+
+**Headline: CloudTAK moves to the tested 13.49 release and your browser plugins carry across the update automatically; the password-reset flow on hardened boxes now always ends at a fresh sign-in (never dropped into a session that was already open in that browser); and a batch of self-healing so updates and installs recover on their own instead of getting stuck. Updating is recommended; healthy boxes are left untouched.** **CloudTAK updates cleanly to 13.49** across Ubuntu, Rocky/RHEL, and ARM — the update carries your installed plugins (like Dispatcher) across CloudTAK's new internal layout and rebuilds them for you, and after an update the browser picks up the new version on the next reload instead of showing a blank map from a stale cache. **Password recovery is safer on hardened deployments**: finishing a reset now signs the browser out and returns you to the sign-in page, so a reset opened on a shared or admin machine can never leave the new user inside a session that was already open there — and completing a reset always walks you through multi-factor setup as intended. **Updates and installs heal themselves**: a box whose files had been left owned by the wrong user (from an earlier manual fix) could half-apply an update and quietly run two versions at once — the console now repairs ownership and completes the update on its own, telling you plainly to reboot if a step needs it, with no command line. Also in this release: **new-install reliability fixes** so a fresh server missing Docker or PostgreSQL is handled gracefully instead of failing mid-deploy; a Guard Dog maintenance job no longer shows a false failure on split-database boxes; and a security-hardening pass that keeps database credentials out of the audit log. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.4-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.4-alpha).
 
 ### v10.1.3-alpha — 2026-07-15 — CloudTAK updates that actually finish, a database that repairs itself, and a version pin you can trust
 
