@@ -1831,8 +1831,35 @@ def _summary(req):
         for i, a in enumerate(argv[:-1]):
             if a in ('password', 'wifi-sec.psk'):
                 argv[i + 1] = '***'
+        # In-token secrets (v10.1.4 WS15): the CloudTAK postgis sync rides the DB
+        # password INSIDE a single argv token, so the following-token rule above
+        # misses it — `psql ... -c "ALTER USER docker WITH PASSWORD 'secret'"` and
+        # the env-assignment `PGPASSWORD=secret`. Redact the secret substring in
+        # place (CJIS "secrets never logged"; the audit dir is root-only 0750, this
+        # closes the last plaintext-DB-password path into the log + journald).
+        argv = [_redact_inline_secrets(a) for a in argv]
         return ' '.join(argv)[:200]
     return str(req.get('path'))[:200]
+
+
+_INLINE_SECRET_RES = (
+    # PASSWORD '...' / PASSWORD "..." (SQL role DDL — quote style preserved, value masked)
+    re.compile(r"(?i)(PASSWORD\s+)('[^']*'|\"[^\"]*\"|\S+)"),
+    # PGPASSWORD=... / *_PASSWORD=... / *PASSWD=... / *TOKEN=... / *SECRET=... env assignments
+    re.compile(r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY)=)(\S+)"),
+)
+
+
+def _redact_inline_secrets(s):
+    """Mask secret values embedded inside a single argv token (SQL PASSWORD '…'
+    and NAME=value env assignments). Never raises."""
+    try:
+        out = s
+        for rx in _INLINE_SECRET_RES:
+            out = rx.sub(lambda m: m.group(1) + '***', out)
+        return out
+    except Exception:
+        return s
 
 
 def _summary_safe(req, field=None):
