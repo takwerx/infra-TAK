@@ -344,8 +344,18 @@ def _write_priv(path, content, mode='w', perm=None):
         if not resp.get('ok'):
             raise BrokerError(f"broker write denied ({path}): {resp.get('error')}")
         return
+    # v10.1.4 (GH #55): be bytes-safe on the root + legacy-sudo paths, matching the
+    # broker path above. Callers legitimately pass bytes (e.g. a curl'd PGDG GPG key
+    # with capture_output and no text=True). Previously the root path did
+    # open(path,'w').write(bytes) -> "write() argument must be str, not bytes", which
+    # crashed PostgreSQL-repo setup on ROOT installs of boxes without postgres (the
+    # common fresh-Ubuntu turn-key case) — the swallowed exception then left the PGDG
+    # repo unconfigured so postgresql-15 could not install. Non-root/broker installs
+    # were unaffected (broker path already handled bytes).
+    is_bytes = isinstance(content, (bytes, bytearray))
     if os.getuid() == 0:
-        with open(path, mode) as f:
+        fmode = mode + 'b' if is_bytes else mode
+        with open(path, fmode) as f:
             f.write(content)
         if perm is not None:
             os.chmod(path, int(perm))
@@ -354,7 +364,10 @@ def _write_priv(path, content, mode='w', perm=None):
         if mode == 'a':
             tee_cmd.append('--append')
         tee_cmd.append(path)
-        subprocess.run(tee_cmd, input=content, capture_output=True, text=True, check=True)
+        # text=True would re-introduce the bytes crash on the sudo path; drive the
+        # child in binary when content is bytes, text otherwise.
+        subprocess.run(tee_cmd, input=content, capture_output=True,
+                       text=not is_bytes, check=True)
         if perm is not None:
             subprocess.run(['sudo', '-n', 'chmod', oct(int(perm))[2:], path],
                            capture_output=True, text=True, check=False)
