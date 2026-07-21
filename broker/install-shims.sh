@@ -40,6 +40,14 @@ EOF
 done
 
 # --- docker: route + stage `cp container:->host` so dest is user-owned ---
+# v10.1.5 WS4: the staged copy's final `cp` MUST be the REAL binary. The shim dir
+# is first on PATH, so bare `cp` resolved back into the cp SHIM, which re-entered
+# the broker AS ROOT: enforcing brokers DENY console-repo destinations ("path not
+# in allow-list: .../nodered/flows.json", test6 flow sync exit 126), and
+# permissive brokers executed it as root — planting the root-owned files inside
+# the console tree that the ownership heal keeps having to fix. The whole point
+# of staging is that the CONSOLE USER writes the destination itself.
+_REALCP="$(PATH=/usr/bin:/bin command -v cp || echo /usr/bin/cp)"
 cat > "$SHIM_DIR/docker" <<EOF
 #!/bin/bash
 _real() { exec $(command -v docker 2>/dev/null || echo /usr/bin/docker) "\$@"; }
@@ -48,7 +56,7 @@ if [ "\${1:-}" = "cp" ]; then
   _a=( "\$@" ); _n=\${#_a[@]}; _src="\${_a[_n-2]}"; _dst="\${_a[_n-1]}"
   if [[ "\$_src" == *:* && "\$_dst" != *:* ]]; then
     _sd=\$(mktemp -d); _rc=0
-    if python3 "$BROKER" exec -- docker cp "\$_src" "\$_sd/f"; then cp -f "\$_sd/f" "\$_dst" || _rc=\$?; else _rc=1; fi
+    if python3 "$BROKER" exec -- docker cp "\$_src" "\$_sd/f"; then "$_REALCP" -f "\$_sd/f" "\$_dst" || _rc=\$?; else _rc=1; fi
     rm -rf "\$_sd"; exit \$_rc
   fi
 fi

@@ -69338,6 +69338,23 @@ def _startup_ensure_broker():
         pass
     except Exception as _e:
         print(f'Startup migration: broker ensure warning (non-fatal): {_e}', flush=True)
+    # v10.1.5 WS4: regenerate the PATH shims from the pulled installer on every
+    # boot. The T&E/update flow (`git pull` + console restart) never re-runs
+    # start.sh, so shim fixes otherwise NEVER reach a fielded box ("all fixes
+    # have to be done by updates from console"). .shims is console-owned — no
+    # root needed. PATH is pinned shim-free for the run so `command -v` inside
+    # the installer resolves REAL binaries, never the shims being replaced.
+    try:
+        _shim_installer = os.path.join(os.path.dirname(_BROKER_SCRIPT), 'install-shims.sh')
+        if os.path.isfile(_shim_installer):
+            _senv = dict(os.environ, PATH='/usr/sbin:/usr/bin:/sbin:/bin')
+            _sr = subprocess.run(['bash', _shim_installer, _BROKER_SHIM_DIR, _BROKER_SCRIPT],
+                                 capture_output=True, text=True, timeout=30, env=_senv)
+            if _sr.returncode != 0:
+                print(f'Startup migration: shim regen failed (non-fatal): '
+                      f'{(_sr.stderr or _sr.stdout or "").strip()[:200]}', flush=True)
+    except Exception as _se:
+        print(f'Startup migration: shim regen warning (non-fatal): {_se}', flush=True)
 
 
 def _startup_repo_ownership_heal():
