@@ -698,7 +698,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.4-alpha"
+VERSION = "10.1.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -23686,6 +23686,13 @@ def run_takportal_deploy():
             _takportal_sync_map_channels(plog=plog)
         except Exception as _mce:
             plog(f"\u26a0 Map-channel sync (non-fatal): {_mce}")
+        # v10.1.5 (PLAN W1): also converge the x509 group cache's active flags \u2014
+        # membership in the UAF is not enough where x509useGroupCache pins sessions
+        # to stale cached (inactive) channel selections.
+        try:
+            _tak_sync_admin_group_cache(plog=plog)
+        except Exception as _gce:
+            plog(f"\u26a0 Group-cache sync (non-fatal): {_gce}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -50516,6 +50523,10 @@ def _takportal_mapsync_watchdog_loop():
         try:
             if not load_settings().get('takportal_mapsync_disabled'):
                 _takportal_sync_map_channels()
+                # v10.1.5 (PLAN W1): keep the x509 group cache's active flags converged
+                # too — a channel created later reaches the cache as inactive
+                # (x509useGroupCacheDefaultUpdatesActive defaults false in TAK).
+                _tak_sync_admin_group_cache()
             _ok_counter += 1
             if _ok_counter % _ok_interval == 0:
                 print("[takportal-map-sync] watchdog alive", flush=True)
@@ -63724,9 +63735,11 @@ def takserver_federation_firewall():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
-def _tak_admin_marti_get(url, timeout=12):
-    """GET a TAK Marti/user-management REST endpoint with the admin client cert.
-    Returns (parsed_json, None) on success or (None, error_str). Reuses the legacy-
+def _tak_admin_marti_req(url, timeout=12, method='GET', json_body=None):
+    """GET/PUT a TAK Marti/user-management REST endpoint with the admin client cert.
+    Returns (parsed_json, None) on success or (None, error_str). For non-GET methods
+    a 2xx response with an empty/non-JSON body returns (True, None) — TAK's
+    groups/activeForce replies 200 with no body. Reuses the legacy-
     PKCS12 extraction the cert workflows use: TAK emits RC2-40-CBC that OpenSSL 3
     rejects without -legacy, and admin.p12 is 0600 tak:tak so it is cat'd via the
     broker (raw openssl as takwerx -> empty PEM). REST is DB-agnostic — works whether
@@ -63763,15 +63776,44 @@ def _tak_admin_marti_get(url, timeout=12):
             shell=True, capture_output=True, text=True, timeout=10)
         if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
             return None, 'PEM extraction failed'
-        r = subprocess.run(['curl', '-sk', '--max-time', '8', '--cert', _pem, '--key', _key, url],
-                           capture_output=True, text=True, timeout=timeout)
-        body = (r.stdout or '').strip()
-        if r.returncode != 0 or not body:
+        _body_file = None
+        cmd = ['curl', '-sk', '--max-time', '8', '--cert', _pem, '--key', _key,
+               '-w', '\n__HTTP_CODE:%{http_code}']
+        if method != 'GET':
+            cmd += ['-X', method]
+        if json_body is not None:
+            _fdb, _body_file = tempfile.mkstemp(suffix='.json', prefix='tak-marti-body-')
+            with os.fdopen(_fdb, 'w') as _f:
+                _json.dump(json_body, _f)
+            cmd += ['-H', 'Content-Type: application/json', '-d', '@' + _body_file]
+        cmd.append(url)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        finally:
+            if _body_file:
+                try:
+                    os.remove(_body_file)
+                except OSError:
+                    pass
+        raw = (r.stdout or '')
+        code = 0
+        if '__HTTP_CODE:' in raw:
+            raw, _, _code_s = raw.rpartition('__HTTP_CODE:')
+            try:
+                code = int(_code_s.strip())
+            except ValueError:
+                code = 0
+        body = raw.strip()
+        if r.returncode != 0:
             return None, f'curl_exit_{r.returncode}'
+        if not (200 <= code < 300):
+            return None, f'http_{code}'
+        if not body:
+            return (True, None) if method != 'GET' else (None, 'empty_body')
         try:
             return _json.loads(body), None
         except _json.JSONDecodeError:
-            return None, 'invalid_json'
+            return (True, None) if method != 'GET' else (None, 'invalid_json')
     except Exception as e:
         return None, str(e)[:120]
     finally:
@@ -63783,12 +63825,18 @@ def _tak_admin_marti_get(url, timeout=12):
                     pass
 
 
+def _tak_admin_marti_get(url, timeout=12):
+    """GET wrapper around _tak_admin_marti_req (kept for existing call sites)."""
+    return _tak_admin_marti_req(url, timeout=timeout)
+
+
 # TAK's UserAuthenticationFile.xml uses this default namespace; every element tag
 # comes back from ElementTree namespaced ({ns}User, {ns}groupList).
 _TAK_UAF_NS = 'http://bbn.com/marti/xml/bindings'
 
 # Split-box park message is logged once per process (see item 6 in the sync below).
 _mapsync_splitbox_logged = False
+_groupcache_splitbox_logged = False
 
 
 def _takportal_sync_map_channels(plog=None):
@@ -63891,6 +63939,88 @@ def _takportal_sync_map_channels(plog=None):
     _write_priv(uaf, _buf.getvalue())
     _log(f"admin bridge channel membership {old_count} -> {len(target)}; restarting tak-portal")
     subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=90)
+
+
+def _tak_sync_admin_group_cache(plog=None):
+    """v10.1.5 (PLAN W1): converge TAK's x509 ACTIVE GROUP CACHE for the `admin`
+    bridge cert so every cached channel entry is active.
+
+    Why the UAF sync above is not enough: with <auth x509useGroupCache="true">, group
+    MEMBERSHIP re-converges to UserAuthenticationFile.xml at every (re)authentication,
+    but each cached entry also carries a per-channel `active` flag — and entries added
+    to an EXISTING cache default to active=false (TAK's
+    x509useGroupCacheDefaultUpdatesActive defaults false; our CoreConfig only sets
+    x509useGroupCacheDefaultActive, which covers the first fill only). CORAZ prod
+    2026-07-20: admin's cache held all 9 channels active=false plus __ANON__
+    active=true from June 13, so every fresh admin session got __ANON__ only — portal
+    /map empty (B1) and admin-cert CoT broadcasts (W4 tombstone sweeps) reached
+    nobody, even though the 10.1.4 UAF sync had converged membership ("already in 9
+    channels").
+
+    The cache lives in an Ignite cache (runtime authority) + the active_group_cache
+    PG table; direct DB writes are INVISIBLE until a TAK restart (Ignite only loads
+    from PG at process start). The only safe converge is TAK's own REST primitive
+    (TAK 5.5+, admin cert on 8443):
+        GET /Marti/api/groups/user?username=admin        -> cached list + active flags
+        PUT /Marti/api/groups/activeForce?username=admin -> same list, all active=true
+    activeForce updates Ignite+PG atomically, re-authenticates admin's connected
+    clients (which also re-converges membership to the UAF) and pushes a
+    groups-updated notification. Proven live on test6 2026-07-20 (seeded the CORAZ
+    state via activeForce, converged, 19/19 active, PG mirrored).
+
+    Fleet-uniform + idempotent: no-op when TAK/cache absent, the cache is disabled,
+    the endpoints don't exist (TAK <=5.2), admin has no cached entry (nothing pins a
+    fresh session — membership comes straight from the UAF), or every entry is
+    already active. Only ever RAISES active flags; never deactivates or removes
+    entries (never-shrink). Loops (bounded) because activeForce's re-auth can pull
+    newly-created UAF channels into the cache as inactive. Honors the same
+    takportal_mapsync_disabled kill switch at the watchdog call site."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(f"[tak-groupcache-sync] {m}", flush=True)
+    try:
+        if _get_tak_deployment_config(load_settings()).get('mode') == 'two_server':
+            global _groupcache_splitbox_logged
+            if not _groupcache_splitbox_logged:
+                _groupcache_splitbox_logged = True
+                _log("split-box (TAK on Server One): group-cache sync not supported yet — Marti is on the remote box; parked")
+            return
+    except Exception:
+        pass
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return
+    enabled, err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/groupCacheEnabled')
+    if not (isinstance(enabled, dict) and enabled.get('data') is True):
+        return  # cache off, TAK down, or endpoint absent — nothing to converge
+    for _pass in range(3):
+        data, err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/user?username=admin')
+        if data is None:
+            _log(f"cached-group read failed ({err}) — skipping (TAK <=5.2 has no groups/user endpoint)")
+            return
+        entries = data.get('data') if isinstance(data, dict) else None
+        if not entries:
+            if _pass == 0:
+                _log("admin has no cached group entry — nothing pins a fresh session, no-op")
+            return
+        inactive = [e for e in entries if isinstance(e, dict) and not e.get('active')]
+        if not inactive:
+            _log(f"admin group cache: {len(entries)} entries all active — "
+                 + ("no change" if _pass == 0 else "converged"))
+            return
+        for e in entries:
+            if isinstance(e, dict):
+                e['active'] = True
+        ok, perr = _tak_admin_marti_req(
+            'https://127.0.0.1:8443/Marti/api/groups/activeForce?username=admin',
+            timeout=15, method='PUT', json_body=entries)
+        if ok is None:
+            _log(f"activeForce PUT failed ({perr}) — cache left as-is")
+            return
+        _log(f"activated {len(inactive)} inactive cached channel entr"
+             + ("y" if len(inactive) == 1 else "ies") + f" for admin (pass {_pass + 1})")
+    _log("cache still had inactive entries after 3 passes — will retry on next watchdog tick")
 
 
 def _takportal_sync_certs(plog=None, restart=False):
@@ -64030,6 +64160,10 @@ def _takportal_sync_certs(plog=None, restart=False):
             _takportal_sync_map_channels(plog=plog)
         except Exception as _mce:
             _log(f"  ⚠ Map-channel sync (non-fatal): {_mce}")
+        try:
+            _tak_sync_admin_group_cache(plog=plog)
+        except Exception as _gce:
+            _log(f"  ⚠ Group-cache sync (non-fatal): {_gce}")
     if ok_client and ok_ca:
         return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
     if ok_ca and not ok_client:
@@ -71782,6 +71916,14 @@ def _startup_migrations():
             _takportal_sync_map_channels(plog=lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _mce:
             print(f"Startup migration: takportal map-channel sync error (non-fatal): {_mce}", flush=True)
+
+        # v10.1.5 (PLAN W1): converge the x509 group cache's active flags at boot —
+        # UAF membership alone is defeated where x509useGroupCache pins sessions to
+        # stale cached (inactive) channel selections (CORAZ B1).
+        try:
+            _tak_sync_admin_group_cache(plog=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _gce:
+            print(f"Startup migration: TAK group-cache sync error (non-fatal): {_gce}", flush=True)
 
         # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
         # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,

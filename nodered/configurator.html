@@ -334,6 +334,11 @@
         <select id="dedupField"><option value="">(none — keep all features)</option></select>
       </div>
       <div>
+        <label for="entityIdField">Entity ID field <span class="badge badge-oid">stable UID per entity</span></label>
+        <select id="entityIdField"><option value="">(none — UID from row ID fields)</option></select>
+        <div style="font-size:0.75rem;color:#888;margin-top:0.3rem">For snapshot sources that post a NEW row per update (e.g. fire perimeters): the TAK UID follows this field's value (+ year), so devices update the same shape instead of orphaning the old one. Pair with "Deduplicate by".</div>
+      </div>
+      <div>
         <label>Detected geometry <span class="badge badge-geom" id="geomBadge"></span></label>
       </div>
     </div>
@@ -997,6 +1002,11 @@
       <div>
         <label for="kmlDedupField">Deduplicate by <span class="badge badge-oid">keep latest per value</span></label>
         <select id="kmlDedupField"><option value="">(none — keep all features)</option></select>
+      </div>
+      <div>
+        <label for="kmlEntityIdField">Entity ID field <span class="badge badge-oid">stable UID per entity</span></label>
+        <select id="kmlEntityIdField"><option value="">(none — UID from row ID fields)</option></select>
+        <div style="font-size:0.75rem;color:#888;margin-top:0.3rem">For snapshot sources that post a NEW placemark per update: the TAK UID follows this field's value (+ year), so devices update the same shape instead of orphaning the old one. Pair with "Deduplicate by".</div>
       </div>
     </div>
 
@@ -2173,6 +2183,7 @@ function importTemplate(event) {
         if (tmpl.mapping.timeField) document.getElementById('timeField').value = tmpl.mapping.timeField;
         if (tmpl.mapping.timeFieldEpochMs != null) document.getElementById('timeFieldEpochMs').checked = !!tmpl.mapping.timeFieldEpochMs;
         if (tmpl.mapping.dedupField) document.getElementById('dedupField').value = tmpl.mapping.dedupField;
+        if (tmpl.mapping.entityIdField) document.getElementById('entityIdField').value = tmpl.mapping.entityIdField;
       }
       if (tmpl.style) {
         if (tmpl.style.strokeColor) { document.getElementById('strokeColor').value = tmpl.style.strokeColor; document.getElementById('strokeColorPick').value = tmpl.style.strokeColor; updSwatch('swStroke', tmpl.style.strokeColor); }
@@ -2373,11 +2384,14 @@ async function fetchKmlFields(opts) {
     // Populate time field and dedup selects
     var tfSel = document.getElementById('kmlTimeField');
     var ddSel = document.getElementById('kmlDedupField');
+    var esSel = document.getElementById('kmlEntityIdField');
     tfSel.innerHTML = '<option value="">(none — no time filter)</option>';
     ddSel.innerHTML = '<option value="">(none — keep all features)</option>';
+    esSel.innerHTML = '<option value="">(none — UID from row ID fields)</option>';
     keys.forEach(function(k) {
       var o1 = document.createElement('option'); o1.value = k; o1.textContent = k; tfSel.appendChild(o1);
       var o2 = document.createElement('option'); o2.value = k; o2.textContent = k; ddSel.appendChild(o2);
+      var o3 = document.createElement('option'); o3.value = k; o3.textContent = k; esSel.appendChild(o3);
     });
     populateIdFieldsPicker();
     state.idFields = [];
@@ -2519,6 +2533,14 @@ async function fetchSelectedLayers() {
     state.fields.forEach(function(f) {
       var short = f.type.replace('esriFieldType', '');
       dedupSel.innerHTML += '<option value="' + f.name + '">'
+        + f.name + ' (' + short + ')' + '</option>';
+    });
+
+    var entitySel = document.getElementById('entityIdField');
+    entitySel.innerHTML = '<option value="">(none &mdash; UID from row ID fields)</option>';
+    state.fields.forEach(function(f) {
+      var short = f.type.replace('esriFieldType', '');
+      entitySel.innerHTML += '<option value="' + f.name + '">'
         + f.name + ' (' + short + ')' + '</option>';
     });
 
@@ -3034,7 +3056,8 @@ async function generateConfig() {
       idFields: state.idFields.slice(),
       timeField: document.getElementById('timeField').value || null,
       timeFieldEpochMs: document.getElementById('timeFieldEpochMs').checked || false,
-      dedupField: document.getElementById('dedupField').value || null
+      dedupField: document.getElementById('dedupField').value || null,
+      entityIdField: document.getElementById('entityIdField').value || null
     },
     filter: {
       field: filterField,
@@ -3370,6 +3393,10 @@ async function renderConfigList() {
     var purgeBtn = canPurge
       ? '<button class="btn-secondary" onclick="event.stopPropagation();purgeOrphans(' + i + ')" title="Remove orphan UIDs (from past config changes) from this mission on next poll">Purge</button>'
       : '';
+    var canGhost = c.missionName && c.sourceType !== 'faa_tfr' && c.dataSyncEnabled !== false;
+    var ghostBtn = canGhost
+      ? '<button class="btn-secondary" onclick="event.stopPropagation();seedGhostSweep(' + i + ')" title="Broadcast ForceDelete for every UID this mission ever removed — clears orphaned shapes off devices as they connect over the next 14 days">Clear Ghosts</button>'
+      : '';
     html += '<div class="config-card' + active + '" onclick="selectConfig(' + i + ')">' +
       '<div><div class="cc-name">' + name + '</div>' +
       '<div class="cc-detail">' + _esc(detail) + ' | ' + _esc(filters) +
@@ -3377,6 +3404,7 @@ async function renderConfigList() {
       '</div></div>' +
       '<div class="cc-actions">' +
       purgeBtn +
+      ghostBtn +
       '<button class="btn-secondary" onclick="event.stopPropagation();deleteConfig(' + i + ')">Delete</button>' +
       '</div></div>';
   });
@@ -4378,6 +4406,7 @@ function resetForm() {
   document.getElementById('timeField').innerHTML = '<option value="">(none)</option>';
   document.getElementById('timeFieldEpochMs').checked = false;
   document.getElementById('dedupField').innerHTML = '<option value="">(none — keep all features)</option>';
+  document.getElementById('entityIdField').innerHTML = '<option value="">(none — UID from row ID fields)</option>';
   state.uniformLabelFields = [];
   var ulc = document.getElementById('uniformLabelCustomText');
   if (ulc) ulc.value = '';
@@ -4486,6 +4515,7 @@ function resetForm() {
   document.getElementById('kmlTimeField').innerHTML = '<option value="">(none — no time filter)</option>';
   document.getElementById('kmlTimeFieldEpochMs').checked = false;
   document.getElementById('kmlDedupField').innerHTML = '<option value="">(none — keep all features)</option>';
+  document.getElementById('kmlEntityIdField').innerHTML = '<option value="">(none — UID from row ID fields)</option>';
   document.getElementById('kmlTtlValue').value = '0';
   document.getElementById('kmlTtlUnit').value = 'hours';
   document.getElementById('kmlConfigName').value = '';
@@ -4730,6 +4760,7 @@ async function selectConfig(idx) {
     if (c.mapping && c.mapping.timeField) kmlTfSel.value = c.mapping.timeField;
     document.getElementById('kmlTimeFieldEpochMs').checked = !!(c.mapping && c.mapping.timeFieldEpochMs);
     if (c.mapping && c.mapping.dedupField) kmlDdSel.value = c.mapping.dedupField;
+    if (c.mapping && c.mapping.entityIdField) document.getElementById('kmlEntityIdField').value = c.mapping.entityIdField;
     // Restore label
     if (c.style) applyUniformLabelStyleFromObject(c.style);
     else renderUniformLabelUI();
@@ -4778,6 +4809,7 @@ async function selectConfig(idx) {
     document.getElementById('timeField').value = c.mapping.timeField || '';
     document.getElementById('timeFieldEpochMs').checked = !!c.mapping.timeFieldEpochMs;
     document.getElementById('dedupField').value = c.mapping.dedupField || '';
+    document.getElementById('entityIdField').value = c.mapping.entityIdField || '';
   }
 
   if (c.filter && c.filter.field) {
@@ -4915,6 +4947,32 @@ async function purgeOrphans(idx) {
     }
   } catch (e) {
     status('saveStatus', 'Purge request failed: ' + e.message, false);
+  }
+}
+
+async function seedGhostSweep(idx) {
+  var c = _savedConfigs[idx];
+  var name = c.configName || '';
+  if (!name) { alert('Config has no name — cannot seed ghost sweep.'); return; }
+  if (!c.missionName) { alert('Ghost cleanup only applies to feeds with a TAK mission name.'); return; }
+  var confirmMsg = 'Clear ghost shapes for "' + name + '"?\n\n' +
+    'This reads the "' + c.missionName + '" mission change log and broadcasts a ForceDelete (t-x-d-d) for every UID the mission ever removed. Devices that connect during the next 14 days drop any orphaned shapes automatically — no per-device cleanup.\n\n' +
+    'Shapes currently live in the feed are never touched. Starts on the next poll cycle (hit Update Now to trigger immediately).';
+  if (!confirm(confirmMsg)) return;
+  try {
+    var r = await fetch('/arcgis-tak/tak/seed-ghost-sweep', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ configName: name })
+    });
+    var d = await r.json();
+    if (d && d.ok) {
+      status('saveStatus', 'Ghost cleanup queued for "' + name + '" — sweeping starts on next poll and runs for 14 days.', true);
+    } else {
+      status('saveStatus', 'Ghost cleanup failed: ' + ((d && d.error) || 'unknown error'), false);
+    }
+  } catch (e) {
+    status('saveStatus', 'Ghost cleanup request failed: ' + e.message, false);
   }
 }
 
@@ -5140,7 +5198,8 @@ function buildKmlConfigObject() {
       idFields: idFields.slice(),
       timeField: document.getElementById('kmlTimeField').value || null,
       timeFieldEpochMs: document.getElementById('kmlTimeFieldEpochMs').checked,
-      dedupField: document.getElementById('kmlDedupField').value || null
+      dedupField: document.getElementById('kmlDedupField').value || null,
+      entityIdField: document.getElementById('kmlEntityIdField').value || null
     },
     filter: { field: null, values: null },
     style: {
