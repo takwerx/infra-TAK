@@ -14,6 +14,13 @@ NEW_FLOWS="$SCRIPT_DIR/flows.json"
 # the in-tree flows.json) we stage via /tmp and copy it into place AS the console
 # user, so the tree file stays user-owned (git pull / Update Now keep working).
 _TKX_BROKER="${TAKWERX_BROKER:-$REPO_DIR/broker/takwerx_broker.py}"
+# v10.1.5 WS4b: the console prepends its .shims dir to PATH for every child
+# (app.py _install_global_shim_path), so a bare `cp` here resolves to the cp
+# SHIM, which re-enters the broker AS ROOT — enforcing brokers DENY the
+# console-repo destination (test6: flow sync exit 126) and permissive ones
+# plant root-owned files in the tree. The staging exists precisely so the
+# CONSOLE USER writes the destination itself: pin the real binary, shim-free.
+_TKX_REALCP="$(PATH=/usr/bin:/bin command -v cp || echo /usr/bin/cp)"
 if [ "$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$_TKX_BROKER" ]; then
   docker() {
     if [ "${1:-}" = "cp" ]; then
@@ -27,7 +34,7 @@ if [ "$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$_TKX_BROKER
       if [[ "$_src" == *:* && "$_dst" != *:* ]]; then
         local _sd _rc=0; _sd=$(mktemp -d)
         if python3 "$_TKX_BROKER" exec -- docker cp "$_src" "$_sd/f"; then
-          cp -f "$_sd/f" "$_dst" || _rc=$?
+          "$_TKX_REALCP" -f "$_sd/f" "$_dst" || _rc=$?
         else
           _rc=1
         fi
