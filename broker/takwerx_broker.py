@@ -266,6 +266,11 @@ PKGMGR_SUBCMDS = {
     # post-install scripts) is already gated by the `install` subcommand. The
     # `-o/--setopt` hook-command vector is still blocked below regardless.
     'copr',
+    # `dnf config-manager --add-repo <url>` — the RHEL analogue of the allowed
+    # /etc/apt/ repo-file writes (v10.1.5 WS2: non-root Docker Engine install).
+    # Same class as `copr`: repo-metadata only; install stays separately gated
+    # and `-o/--setopt` hook vectors stay blocked.
+    'config-manager',
     # `dnf config-manager --set-enabled crb/powertools` — enables the CRB/
     # PowerTools repo (RHEL deps live there). Repo enable/disable only; same
     # bucket as copr. The dangerous `--add-repo <url>` still installs a repo def

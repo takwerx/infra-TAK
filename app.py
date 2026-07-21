@@ -1993,18 +1993,96 @@ def _docker_probe():
         return 1, ''
 
 
+def _install_docker_nonroot(_log):
+    """v10.1.5 WS2 (Justin, fresh Ubuntu 22 install): Docker install for a NON-ROOT
+    console. The get.docker.com convenience script self-elevates with `sudo -E sh -c
+    'apt-get …'` — no TTY, no matching sudoers entry → "sudo: a password is required"
+    and the deploy dies at Step 1 on every born-non-root box without Docker. The
+    broker (rightly) refuses arbitrary `sh` as root, so instead add Docker's own apt
+    repo with broker-safe primitives (/etc/apt/ writes are allowlisted exactly for
+    repo adds) and install via the gated package manager:
+      Debian/Ubuntu: keyring + sources.list.d via _write_priv, apt-get update,
+                     apt-get install docker-ce… (postinst enables+starts docker)
+      RHEL family:   dnf install dnf-plugins-core, dnf config-manager --add-repo
+                     (broker: config-manager subcommand), dnf install docker-ce…
+    Same packages as get.docker.com installs, so root-era and non-root boxes stay
+    fleet-uniform (docker-ce, not distro docker.io)."""
+    if _distro_family() == 'rhel':
+        subprocess.run(_sudo_wrap(['dnf', '-y', 'install', 'dnf-plugins-core']),
+                       capture_output=True, text=True, timeout=300)
+        r = subprocess.run(_sudo_wrap(['dnf', 'config-manager', '--add-repo',
+                                       'https://download.docker.com/linux/centos/docker-ce.repo']),
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            _log(f'  ⚠ docker repo add failed: {((r.stderr or r.stdout) or "")[-200:]}')
+            return
+    else:
+        os_id, codename = 'ubuntu', ''
+        try:
+            osr = {}
+            with open('/etc/os-release') as f:
+                for line in f:
+                    if '=' in line:
+                        k, v = line.strip().split('=', 1)
+                        osr[k] = v.strip('"')
+            os_id = 'debian' if osr.get('ID') == 'debian' else 'ubuntu'
+            codename = osr.get('VERSION_CODENAME') or osr.get('UBUNTU_CODENAME') or ''
+        except Exception:
+            pass
+        if not codename:
+            _log('  ⚠ could not detect distro codename from /etc/os-release')
+            return
+        try:
+            arch = subprocess.run(['dpkg', '--print-architecture'], capture_output=True,
+                                  text=True, timeout=10).stdout.strip()
+        except Exception:
+            arch = ''
+        if not arch:
+            arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(os.uname().machine, 'amd64')
+        rk = subprocess.run(['curl', '-fsSL', f'https://download.docker.com/linux/{os_id}/gpg'],
+                            capture_output=True, text=True, timeout=60)
+        if rk.returncode != 0 or 'BEGIN PGP PUBLIC KEY' not in (rk.stdout or ''):
+            _log('  ⚠ could not download Docker apt signing key')
+            return
+        subprocess.run(_sudo_wrap(['mkdir', '-p', '/etc/apt/keyrings']),
+                       capture_output=True, text=True, timeout=30)
+        _write_priv('/etc/apt/keyrings/docker.asc', rk.stdout)
+        _write_priv('/etc/apt/sources.list.d/docker.list',
+                    f'deb [arch={arch} signed-by=/etc/apt/keyrings/docker.asc] '
+                    f'https://download.docker.com/linux/{os_id} {codename} stable\n')
+        ru = subprocess.run(_sudo_wrap(['apt-get', 'update']), capture_output=True,
+                            text=True, timeout=300)
+        if ru.returncode != 0:
+            _log(f'  ⚠ apt-get update failed after repo add: {((ru.stderr or ru.stdout) or "")[-200:]}')
+            return
+    ok, out = _pkg_install(['docker-ce', 'docker-ce-cli', 'containerd.io',
+                            'docker-buildx-plugin', 'docker-compose-plugin'],
+                           log_fn=_log, timeout=900)
+    if not ok:
+        _log(f'  ⚠ docker package install failed: {(out or "")[-300:]}')
+    # Debian postinst starts+enables docker; RHEL does not — belt-and-suspenders both.
+    subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'docker']),
+                   capture_output=True, text=True, timeout=60)
+
+
 def _install_docker_engine(plog=None):
-    """Install Docker Engine via _docker_install_cmd() and verify. Returns True when
-    `docker --version` works afterwards. Never raises: the old per-site calls used
-    timeout=300, and subprocess.run RAISES TimeoutExpired (it doesn't return rc) —
-    a slow fresh VM's get.docker.com run past 5 min would kill the deploy thread.
-    900s covers slow VMs; failure is reported via the return value."""
+    """Install Docker Engine and verify. Returns True when `docker --version` works
+    afterwards. As root: _docker_install_cmd() (get.docker.com / dnf), unchanged
+    legacy behavior. Non-root console: broker-safe repo + package path — the
+    convenience script's internal sudo cannot work without a TTY (v10.1.5 WS2).
+    Never raises: the old per-site calls used timeout=300, and subprocess.run
+    RAISES TimeoutExpired (it doesn't return rc) — a slow fresh VM's
+    get.docker.com run past 5 min would kill the deploy thread. 900s covers slow
+    VMs; failure is reported via the return value."""
     _log = plog or (lambda m: None)
     try:
-        r = subprocess.run(_docker_install_cmd() + ' 2>&1', shell=True,
-                           capture_output=True, text=True, timeout=900)
-        if r.returncode != 0:
-            _log(f'  ⚠ Docker installer exited {r.returncode}: {(r.stdout or "")[-300:]}')
+        if os.getuid() != 0:
+            _install_docker_nonroot(_log)
+        else:
+            r = subprocess.run(_docker_install_cmd() + ' 2>&1', shell=True,
+                               capture_output=True, text=True, timeout=900)
+            if r.returncode != 0:
+                _log(f'  ⚠ Docker installer exited {r.returncode}: {(r.stdout or "")[-300:]}')
     except Exception as e:
         _log(f'  ⚠ Docker install error: {e}')
     rc, out = _docker_probe()
