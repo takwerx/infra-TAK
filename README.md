@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.5-alpha)**
+**Current release: [v10.1.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.6-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.6-alpha — 2026-07-21 — Hardened deployments get map-engine updates again, and CloudTAK moves to the tested 13.50 release
+
+**Headline: On security-hardened deployments — the strictest lockdown posture, where certificate files are mounted read-only — the automatic Node-RED map-engine update could silently fail, leaving the box on the previous engine even though the console itself updated fine. That's fixed: the update now routes file delivery around the read-only mounts, so hardened boxes pick up new map-engine releases (including v10.1.5's Clear Ghosts and feed-lifecycle improvements) automatically like everyone else. Your saved Configurator feeds and settings are preserved through the update — this was validated end-to-end on the hardened posture, including configs surviving a full deploy cycle. Alongside that, CloudTAK moves to the tested 13.50 release** across Ubuntu, Rocky/RHEL, and ARM, with plugin compatibility and post-update self-checks carried forward. One known ARM-only caveat: CloudTAK's optional tiles service doesn't start on ARM64 due to an upstream dependency issue — the map, API, and everything else are unaffected. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.6-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.6-alpha).
 
 ### v10.1.5-alpha — 2026-07-21 — Fire perimeters and other snapshot map layers stop leaving dead shapes stuck on devices, plus fresh installs and updates that just work
 
