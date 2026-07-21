@@ -67,7 +67,13 @@ fi
 _cp_into() {   # $1 = host file   $2 = absolute dest path inside container
   docker cp "$1" "$CONTAINER:$2" 2>/dev/null && return 0
   echo "    (docker cp blocked by RO mount — writing $2 via exec pipe)"
-  docker exec -i "$CONTAINER" sh -c "cat > \"$2\"" < "$1"
+  # rm the existing target FIRST, then create fresh. The exec runs as the node-red
+  # user (uid 1000); a plain `cat >` cannot TRUNCATE a file a prior docker cp left
+  # root-owned ("can't create ...: Permission denied", aws-arm) — but node-red owns
+  # the target dirs (/tmp, /data) so it can unlink any file in them regardless of
+  # the file's owner, then write a fresh node-red-owned copy (which also keeps
+  # /data/flows.json writable by the editor's Deploy).
+  docker exec -i "$CONTAINER" sh -c "rm -f \"$2\" 2>/dev/null; cat > \"$2\"" < "$1"
 }
 _cp_outof() {  # $1 = absolute path inside container   $2 = host dest file
   # Copies OUT of a running container hit the same RO-mount failure as copies in.
