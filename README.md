@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.4-alpha)**
+**Current release: [v10.1.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.5-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.5-alpha — 2026-07-21 — Fire perimeters and other snapshot map layers stop leaving dead shapes stuck on devices, plus fresh installs and updates that just work
+
+**Headline: DataSync feeds built from snapshot sources — fire perimeters being the main one — no longer strand outdated shapes on tablets that were offline when the data changed, and a device that reconnects days later cleans itself up automatically. Feeds also stop the constant add/remove churn that used to flicker shapes on the map. Alongside that, several fresh-install and update paths that could stall are fixed. Updating is recommended; healthy boxes are left untouched.** **Snapshot map feeds get a real lifecycle.** Sources like the California fire-perimeter layer publish a brand-new record every time a fire grows, which used to mean each update was a delete-and-re-add — and any device that happened to be offline at that moment kept the old outline on its map forever. Feeds can now follow a stable identity per real-world entity (e.g. per fire) so a growing fire updates the same shape in place instead of piling up ghosts, the map stops flip-flopping between competing versions of the same feature, and a new one-tap **Clear Ghosts** action sweeps already-orphaned shapes off every device as it reconnects over the following two weeks — no per-device cleanup, no touching anyone's tablet. **The map bridge sees every channel again.** On deployments where the built-in map's server connection had gotten pinned to an empty channel set, live feeds now reliably reach it. **Fresh installs and updates are more robust:** a brand-new server that doesn't yet have Docker now installs it correctly on locked-down setups, the automatic post-update step that refreshes map feeds could silently skip on some servers and now runs every time, and an internal permissions issue that could make a feed refresh fail on the strictest security posture is resolved. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.5-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.5-alpha).
 
 ### v10.1.4-alpha — 2026-07-18 — CloudTAK 13.49 with plugins that survive updates, a password reset that can't leave you in someone else's session, and installs/updates that heal themselves
 
