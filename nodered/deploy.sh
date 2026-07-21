@@ -79,24 +79,6 @@ _cp_outof() {  # $1 = absolute path inside container   $2 = host dest file
   rm -f "$2" 2>/dev/null || true
   return 1
 }
-_cp_into_stopped() {  # $1 = host src file   $2 = path under /data (e.g. flows.json)
-  # For copies into a STOPPED container. docker cp resolves the RO cert bind mounts
-  # even when the container is stopped, so it fails the same way ("openat
-  # certs/admin.key: read-only file system") — and exec-pipe can't help (no running
-  # process). Write straight to the host's /data volume path instead. As root
-  # (_priv is a passthrough) this is a plain cp; the file is chowned to the
-  # node-red uid so the container reads it on start.
-  docker cp "$1" "$CONTAINER:/data/$2" 2>/dev/null && return 0
-  echo "    (docker cp blocked by RO mount — writing /data/$2 via host volume)"
-  local _vp
-  _vp=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)
-  if [ -z "$_vp" ]; then
-    echo "    ✗ cannot resolve /data volume host path — /data/$2 NOT written"
-    return 1
-  fi
-  _priv cp "$1" "$_vp/$2"
-  _priv chown 1000:1000 "$_vp/$2" 2>/dev/null || true
-}
 _cp_dir_into() {  # $1 = host dir   $2 = dest dir inside container (contents of $1 -> $2)
   docker exec "$CONTAINER" mkdir -p "$2" 2>/dev/null || true
   docker cp "$1/." "$CONTAINER:$2/" 2>/dev/null && return 0
@@ -873,16 +855,24 @@ if [ -f "$NR_CTX_FLOW_CFG" ]; then
   echo "    Context file: restored flow tab (legacy)"
 fi
 
-docker stop -t 30 "$CONTAINER"
-_cp_into_stopped "/tmp/flows_merged.json" flows.json
+# v10.1.6: write merged flows + creds via _cp_into (plain docker cp, or the
+# exec-pipe fallback on hardened /certs:ro boxes) to the RUNNING container as the
+# node-red user — correct ownership (no EACCES), broker-safe on non-root boxes,
+# and never trips the read-only cert mounts — then restart to load them. Replaces
+# the old `docker stop -> docker cp -> docker start`, whose docker cp aborts on
+# /certs/admin.key:ro boxes (CORAZ/aws) even with the container stopped, because
+# docker resolves the RO bind mounts regardless of run state. Node-RED only
+# rewrites flows.json on an explicit editor Deploy, never on shutdown, so writing
+# it live and restarting is safe.
+_cp_into "/tmp/flows_merged.json" /data/flows.json
 # Restore credentials file so TLS cert data survives the deploy
 if [ -f "/tmp/flows_cred_backup.json" ]; then
-  _cp_into_stopped "/tmp/flows_cred_backup.json" flows_cred.json
+  _cp_into "/tmp/flows_cred_backup.json" /data/flows_cred.json
   echo "    Credentials: restored"
 fi
 rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json
 
-docker start "$CONTAINER"
+docker restart -t 30 "$CONTAINER"
 # Belt-and-suspenders: fix any files that fell through to docker cp path (runs fast, before Node-RED opens files)
 VOLUME_PATH=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)
 if [ -n "$VOLUME_PATH" ] && [ -d "$VOLUME_PATH/context" ]; then
