@@ -51,6 +51,70 @@ else
   _priv() { "$@"; }
 fi
 
+# v10.1.6 (CORAZ fire hotfix): `docker cp <hostfile> <RUNNING container>:<path>`
+# fails with "Error response from daemon: openat certs/admin.key: read-only file
+# system" when the container has read-only INDIVIDUAL-FILE bind mounts — hardened
+# boxes (incl. CORAZ prod) mount /certs/admin.key:ro and /certs/admin.pem:ro.
+# docker cp pauses the container and its tar step trips on the RO file-mount
+# targets, regardless of the copy's actual destination. With `set -e` the very
+# first copy (build-flows.js) aborts the ENTIRE deploy before flows ever land —
+# so the box silently stays on the old engine (found on CORAZ 2026-07-21: 10.1.5
+# console, old Node-RED flows). Fall back to a stdin pipe via `docker exec -i`,
+# which writes through the running process and never touches the mount points.
+# Try plain docker cp first so boxes where it already works are byte-unchanged.
+# NB: only for copies INTO a RUNNING container. Copies OUT (container->host) and
+# copies to a STOPPED container are unaffected and keep using docker cp.
+_cp_into() {   # $1 = host file   $2 = absolute dest path inside container
+  docker cp "$1" "$CONTAINER:$2" 2>/dev/null && return 0
+  echo "    (docker cp blocked by RO mount — writing $2 via exec pipe)"
+  docker exec -i "$CONTAINER" sh -c "cat > \"$2\"" < "$1"
+}
+_cp_outof() {  # $1 = absolute path inside container   $2 = host dest file
+  # Copies OUT of a running container hit the same RO-mount failure as copies in.
+  # Fallback reads the file through the running process instead. Returns nonzero
+  # only when the file truly doesn't exist / isn't readable — callers keep their
+  # existing `|| true` / `|| <recovery>` semantics.
+  docker cp "$CONTAINER:$1" "$2" 2>/dev/null && return 0
+  docker exec "$CONTAINER" cat "$1" > "$2" 2>/dev/null && [ -s "$2" ] && return 0
+  rm -f "$2" 2>/dev/null || true
+  return 1
+}
+_cp_into_stopped() {  # $1 = host src file   $2 = path under /data (e.g. flows.json)
+  # For copies into a STOPPED container. docker cp resolves the RO cert bind mounts
+  # even when the container is stopped, so it fails the same way ("openat
+  # certs/admin.key: read-only file system") — and exec-pipe can't help (no running
+  # process). Write straight to the host's /data volume path instead. As root
+  # (_priv is a passthrough) this is a plain cp; the file is chowned to the
+  # node-red uid so the container reads it on start.
+  docker cp "$1" "$CONTAINER:/data/$2" 2>/dev/null && return 0
+  echo "    (docker cp blocked by RO mount — writing /data/$2 via host volume)"
+  local _vp
+  _vp=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)
+  if [ -z "$_vp" ]; then
+    echo "    ✗ cannot resolve /data volume host path — /data/$2 NOT written"
+    return 1
+  fi
+  _priv cp "$1" "$_vp/$2"
+  _priv chown 1000:1000 "$_vp/$2" 2>/dev/null || true
+}
+_cp_dir_into() {  # $1 = host dir   $2 = dest dir inside container (contents of $1 -> $2)
+  docker exec "$CONTAINER" mkdir -p "$2" 2>/dev/null || true
+  docker cp "$1/." "$CONTAINER:$2/" 2>/dev/null && return 0
+  echo "    (docker cp blocked by RO mount — writing $2/ via tar pipe)"
+  # BEST-EFFORT, never fatal. docker cp extracts at the DAEMON level (full privilege)
+  # so it could overwrite the root-owned files a prior docker cp left in $2; the
+  # in-container tar cannot — the hardened container runs cap_drop:ALL so even
+  # --user root lacks DAC_OVERRIDE and can't unlink them ("can't remove old file:
+  # Permission denied"). These are STATIC served assets (icons/logos) that don't
+  # change between releases, so leaving the existing copy is harmless. The deploy's
+  # critical path (build-flows.js -> regenerated flows) must NOT abort over this.
+  if ( cd "$1" && tar -cf - . ) | docker exec -i --user root "$CONTAINER" tar -xf - -C "$2" 2>/dev/null; then
+    return 0
+  fi
+  echo "    ⚠ static-asset refresh into $2/ skipped (existing files not overwritable on this hardened container); assets unchanged — continuing"
+  return 0
+}
+
 cd "$REPO_DIR"
 
 # Pull latest code (skip if called with --no-pull, e.g. from post-update auto-deploy)
@@ -63,13 +127,13 @@ fi
 
 # Rebuild flows.json using node inside the container
 echo "==> Rebuilding flows.json"
-docker cp "$SCRIPT_DIR/build-flows.js" "$CONTAINER:/tmp/build-flows.js"
-docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/tmp/configurator.html"
+_cp_into "$SCRIPT_DIR/build-flows.js" /tmp/build-flows.js
+_cp_into "$SCRIPT_DIR/configurator.html" /tmp/configurator.html
 # docker cp sets root ownership — chmod as root so the node process can write templates
 docker exec --user root "$CONTAINER" chmod 666 /tmp/build-flows.js /tmp/configurator.html 2>/dev/null || \
   docker exec "$CONTAINER" chmod 666 /tmp/build-flows.js /tmp/configurator.html 2>/dev/null || true
 if [ -f "$SCRIPT_DIR/icon-catalog.json" ]; then
-  docker cp "$SCRIPT_DIR/icon-catalog.json" "$CONTAINER:/data/icon-catalog.json"
+  _cp_into "$SCRIPT_DIR/icon-catalog.json" /data/icon-catalog.json
   echo "    Icon catalog: copied to /data/icon-catalog.json"
 fi
 
@@ -78,23 +142,23 @@ fi
 docker exec --user root "$CONTAINER" mkdir -p /data/public 2>/dev/null || \
   docker exec "$CONTAINER" mkdir -p /data/public
 if [ -d "$SCRIPT_DIR/static" ]; then
-  docker cp "$SCRIPT_DIR/static/." "$CONTAINER:/data/public/"
+  _cp_dir_into "$SCRIPT_DIR/static" /data/public
   echo "    Static assets: copied nodered/static/ → /data/public/"
 fi
 docker exec "$CONTAINER" node /tmp/build-flows.js
-docker cp "$CONTAINER:/tmp/flows.json" "$NEW_FLOWS"
-docker cp "$CONTAINER:/tmp/template-functions.json" "/tmp/template-functions.json" 2>/dev/null || true
+_cp_outof /tmp/flows.json "$NEW_FLOWS"
+_cp_outof /tmp/template-functions.json /tmp/template-functions.json || true
 # Copy template-injected configurator.html to the public directory Node-RED serves
 docker exec --user root "$CONTAINER" cp /tmp/configurator.html /data/public/configurator.html 2>/dev/null || \
-  docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/data/public/configurator.html"
+  _cp_into "$SCRIPT_DIR/configurator.html" /data/public/configurator.html
 echo "    Configurator: copied to /data/public/configurator.html"
 
 # Back up current flows + credentials from running container
 echo "==> Backing up current config from container"
 HAS_EXISTING=true
-docker cp "$CONTAINER:/data/flows.json" "/tmp/flows_current.json" 2>/dev/null || HAS_EXISTING=false
+_cp_outof /data/flows.json /tmp/flows_current.json || HAS_EXISTING=false
 # Preserve encrypted credentials file (TLS cert data lives here, not in flows.json)
-docker cp "$CONTAINER:/data/flows_cred.json" "/tmp/flows_cred_backup.json" 2>/dev/null || true
+_cp_outof /data/flows_cred.json /tmp/flows_cred_backup.json || true
 
 # Configurator configs + TAK settings live in Node-RED context files (global + legacy flow tab).
 # We re-apply these after replacing flows.json so a hot reload cannot persist an empty global state.
@@ -116,7 +180,7 @@ if [ -n "$NR_API_CTX" ] && [ "$NR_API_CTX" != "{}" ] && [ "$NR_API_CTX" != "null
   echo "    Context backup: REST API (live) — $(wc -c < "$NR_CTX_GLOBAL" | tr -d ' ') bytes"
 else
   # Fall back to file copy (localfilesystem storage)
-  docker cp "$CONTAINER:/data/context/global/global.json" "$NR_CTX_GLOBAL" 2>/dev/null || true
+  _cp_outof /data/context/global/global.json "$NR_CTX_GLOBAL" || true
   if [ -f "$NR_CTX_GLOBAL" ]; then
     echo "    Context backup: file — $(wc -c < "$NR_CTX_GLOBAL" | tr -d ' ') bytes"
   else
@@ -219,7 +283,7 @@ PYEOF
   fi
   rm -f /tmp/_nr_ctx_normalize.log
 fi
-docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
+_cp_outof /data/context/flow/flow_arcgis_cfg.json "$NR_CTX_FLOW_CFG" || true
 
 # ── SAFETY GATE ──────────────────────────────────────────────────────────────
 # Validate the backup has meaningful content: at least one config key as an
@@ -311,7 +375,7 @@ PYEOF
 # configs" — the bug that wiped Joe's Red Flag. Persistent (/opt/tak) is NOT in the
 # union (it is the stale source); it stays a last-resort fallback in the gate below.
 # (v0.9.50 — see CLAUDE.md "Node-RED config persistence is SACRED")
-docker cp "$CONTAINER:/data/config-backups/latest.json" /tmp/_nr_latest.json 2>/dev/null || rm -f /tmp/_nr_latest.json
+_cp_outof /data/config-backups/latest.json /tmp/_nr_latest.json || rm -f /tmp/_nr_latest.json
 if [ -f "$NR_CTX_GLOBAL" ] || [ -f /tmp/_nr_latest.json ]; then
   if python3 - "$NR_CTX_GLOBAL" /tmp/_nr_latest.json > /tmp/_nr_union.log 2>&1 <<'PYEOF'
 import json, sys, os
@@ -444,9 +508,9 @@ fi
 # ── END SAFETY GATE ──────────────────────────────────────────────────────────
 
 # Run merge inside the container (node is available there)
-docker cp "$NEW_FLOWS" "$CONTAINER:/tmp/flows_new.json"
+_cp_into "$NEW_FLOWS" /tmp/flows_new.json
 if [ "$HAS_EXISTING" = true ]; then
-  docker cp "/tmp/flows_current.json" "$CONTAINER:/tmp/flows_current.json"
+  _cp_into "/tmp/flows_current.json" /tmp/flows_current.json
 fi
 
 docker exec "$CONTAINER" node -e "
@@ -744,7 +808,7 @@ fi
 # Writing flows.json while NR is running can hot-reload; the migration inject may run before
 # global context is loaded from disk and empty state can be persisted — wiping Configurator saves.
 echo "==> Installing merged flows (stop → write → restore context → start)"
-docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
+_cp_outof /tmp/flows_merged.json /tmp/flows_merged.json
 
 # Pre-create context dirs and write context files BEFORE stopping — docker exec runs as the
 # container user (node-red) so files get correct ownership. docker cp to a stopped container
@@ -810,10 +874,10 @@ if [ -f "$NR_CTX_FLOW_CFG" ]; then
 fi
 
 docker stop -t 30 "$CONTAINER"
-docker cp "/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
+_cp_into_stopped "/tmp/flows_merged.json" flows.json
 # Restore credentials file so TLS cert data survives the deploy
 if [ -f "/tmp/flows_cred_backup.json" ]; then
-  docker cp "/tmp/flows_cred_backup.json" "$CONTAINER:/data/flows_cred.json"
+  _cp_into_stopped "/tmp/flows_cred_backup.json" flows_cred.json
   echo "    Credentials: restored"
 fi
 rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json
@@ -845,7 +909,8 @@ if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
   echo "==> Pushing context via REST API (/config/deploy-restore)..."
   # Copy the host backup to a temp path the container owns (Node-RED never writes here).
   # Then use -d @path inside the container — avoids all stdin/bash redirection issues.
-  docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/tmp/ctx_deploy_restore.json"
+  # v10.1.6: exec-pipe transport (RO-cert boxes fail docker-cp-into-running-container).
+  _cp_into "$NR_CTX_GLOBAL" /tmp/ctx_deploy_restore.json
   _RESTORE_RESP=$(docker exec "$CONTAINER" curl -sf --max-time 15 \
     -X POST http://localhost:1880/config/deploy-restore \
     -H 'Content-Type: application/json' \
