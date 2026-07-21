@@ -72286,11 +72286,25 @@ def _post_update_auto_deploy():
                         os.unlink(lock_path)
                     except FileNotFoundError:
                         pass
+                    except OSError:
+                        # v10.1.5: root-era stale lock on a non-root box. Pre-10.0.5
+                        # deploys wrote this lock as root; post-flip the takwerx
+                        # console cannot unlink a root-owned file in sticky /tmp, the
+                        # PermissionError fell into the catch-all below, and EVERY
+                        # post-update auto-deploy (Node-RED flow sync, compose
+                        # hardening, …) was silently skipped forever (found on
+                        # test12: lock dated Jun 29, dead PID). Remove via broker.
+                        subprocess.run(_sudo_wrap(['rm', '-f', lock_path]), capture_output=True, timeout=10)
+                    if os.path.exists(lock_path):
+                        print("Post-update: stale auto-deploy lock could not be removed — "
+                              "SKIPPING auto-deploy (manual fix: sudo rm -f " + lock_path + ")", flush=True)
+                        return
                 else:
                     return
             with open(lock_path, 'x') as _lf:
                 _lf.write(f"{os.getpid()} {VERSION}\n")
-        except (FileExistsError, OSError):
+        except (FileExistsError, OSError) as _lke:
+            print(f"Post-update: auto-deploy lock unavailable ({_lke}) — skipping this boot", flush=True)
             return
 
         if last_ver == '':
