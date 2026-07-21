@@ -26321,6 +26321,44 @@ def _write_plugin_built_sha(ct_dir, install_dir, sha):
         pass
 
 
+def _cloudtak_plugin_dev_branch(git_dir=None, repo=None):
+    """Universal dev switch: dev-channel boxes (settings update_channel='dev') track a
+    plugin repo's 'dev' branch when the remote has one. Returns 'dev' when that applies,
+    else None (= track the remote default branch). Main-channel boxes always get None,
+    and the install/update paths use checkout -B against the remote ref, so a
+    hand-flipped source cache can never keep feeding dev code to a stable box.
+
+    Pass git_dir when a local clone exists (checks origin/dev from the last fetch, no
+    network); pass repo to ask the remote directly (fresh installs, no clone yet)."""
+    if (load_settings().get('update_channel') or 'main').strip().lower() != 'dev':
+        return None
+    try:
+        if git_dir and os.path.isdir(os.path.join(git_dir, '.git')):
+            r = subprocess.run(['git', '-C', git_dir, 'rev-parse', '--verify', '--quiet', 'origin/dev'],
+                               capture_output=True, text=True, timeout=5)
+            return 'dev' if r.returncode == 0 else None
+        if repo:
+            r = subprocess.run(['git', 'ls-remote', '--heads', repo, 'dev'],
+                               capture_output=True, text=True, timeout=15)
+            return 'dev' if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        pass
+    return None
+
+
+def _cloudtak_plugin_default_branch(git_dir):
+    """Remote default branch of a plugin clone (from origin/HEAD, set at clone time)."""
+    try:
+        r = subprocess.run(['git', '-C', git_dir, 'rev-parse', '--abbrev-ref', 'origin/HEAD'],
+                           capture_output=True, text=True, timeout=5)
+        name = (r.stdout or '').strip()
+        if name.startswith('origin/'):
+            return name.split('/', 1)[1]
+    except Exception:
+        pass
+    return 'main'
+
+
 def _cloudtak_server_routes_dir(ct_dir, require_split=False):
     """Version-appropriate dir for plugin server-route files. CloudTAK 13.45+
     (hub/api split) compiles and loads routes ONLY from api/stateless/routes/ —
@@ -26391,6 +26429,7 @@ def _detect_cloudtak_plugins():
         is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
+        _dev_branch = None
         # Resolve which directory actually holds the plugin's git clone. For repo plugins that
         # ship the web/server halves in subdirs, install_path (under api/web/plugins/) is a
         # *copy* with no .git — the real clone lives in ~/CloudTAK/.plugin-src/<install_dir>.
@@ -26420,10 +26459,14 @@ def _detect_cloudtak_plugins():
                 pass
             # Built marker wins; fall back to cache HEAD for pre-0.9.44 installs (no marker).
             sha = built_sha or head_sha
-            # Remote HEAD — an update exists if nothing is built yet or built != upstream.
+            # Remote head of the CHANNEL branch (universal dev switch) — an update exists
+            # if nothing is built yet or built != upstream. Dev-channel boxes tracking the
+            # plugin's dev branch must badge against dev, not the default branch.
+            _dev_branch = _cloudtak_plugin_dev_branch(git_dir=git_dir)
             try:
+                _ref = f'refs/heads/{_dev_branch}' if _dev_branch else 'HEAD'
                 r2 = subprocess.run(
-                    ['git', '-C', git_dir, 'ls-remote', 'origin', 'HEAD'],
+                    ['git', '-C', git_dir, 'ls-remote', 'origin', _ref],
                     capture_output=True, text=True, timeout=5
                 )
                 if r2.returncode == 0 and r2.stdout.strip():
@@ -26432,7 +26475,8 @@ def _detect_cloudtak_plugins():
                         update_available = True
             except Exception:
                 pass
-        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available, 'local': is_local})
+        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available, 'local': is_local,
+                       'channel': 'dev' if _dev_branch else 'main'})
     return result
 
 
@@ -26498,10 +26542,22 @@ def _run_cloudtak_plugin_action(plugin_key, action):
     def _clone_or_pull_cache():
         import shutil
         if os.path.isdir(os.path.join(cache_path, '.git')):
-            return run_cmd(['git', '-C', cache_path, 'pull'])
-        shutil.rmtree(cache_path, ignore_errors=True)
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        return run_cmd(['git', 'clone', repo, cache_path])
+            if not run_cmd(['git', '-C', cache_path, 'fetch', '--prune', 'origin']):
+                return False
+        else:
+            shutil.rmtree(cache_path, ignore_errors=True)
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            if not run_cmd(['git', 'clone', repo, cache_path]):
+                return False
+        return _checkout_channel_branch(cache_path)
+
+    def _checkout_channel_branch(git_dir):
+        # Universal dev switch: pin the clone to the exact remote state of the channel's
+        # branch. checkout -B (not pull) so main-channel boxes also snap BACK to the
+        # default branch if the clone was ever hand-flipped to dev.
+        branch = _cloudtak_plugin_dev_branch(git_dir=git_dir) or _cloudtak_plugin_default_branch(git_dir)
+        plog(f'Plugin source channel: {branch}')
+        return run_cmd(['git', '-C', git_dir, 'checkout', '-B', branch, f'origin/{branch}'])
 
     built_ok = False
     snap = None
@@ -26531,7 +26587,8 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                 shutil.copytree(_web_src(), install_path)
             else:
                 plog('Cloning plugin repository...')
-                if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
+                if not run_cmd(['git', 'clone', plugin['repo'], install_path]) \
+                        or not _checkout_channel_branch(install_path):
                     cloudtak_plugin_status.update({'running': False, 'error': True})
                     return
 
@@ -26561,7 +26618,8 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                     os.unlink(install_path)
                 shutil.copytree(_web_src(), install_path)
             else:
-                if not run_cmd(['git', '-C', install_path, 'pull']):
+                if not run_cmd(['git', '-C', install_path, 'fetch', '--prune', 'origin']) \
+                        or not _checkout_channel_branch(install_path):
                     cloudtak_plugin_status.update({'running': False, 'error': True})
                     return
 
