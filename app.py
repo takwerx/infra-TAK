@@ -713,7 +713,7 @@ AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel 
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
 # contract and validated 13.49.0 end-to-end on test12 (plugins built, routes loaded, Events
 # CRUD in browser) — un-gated per operator decision 2026-07-17.
-CLOUDTAK_VETTED_RELEASE = "13.49.0"     # v10.1.4: hub/api-split migration validated; pre-13.45 plugin installs refused
+CLOUDTAK_VETTED_RELEASE = "13.50.0"     # v10.1.6: validated on 5-box fleet (Ubuntu/Rocky/ARM) 2026-07-21; pre-13.45 plugin installs refused
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
