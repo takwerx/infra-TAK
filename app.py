@@ -25705,6 +25705,23 @@ CLOUDTAK_PLUGINS = [
         'license': 'MIT',
     },
     {
+        'key': 'search-containment',
+        'name': 'Search Containment',
+        'description': (
+            'ATAK Chokepoint-style containment for SAR: pick a mission shape, line, '
+            'or manual point, offset a containment ring by a distance, and generate '
+            'numbered markers wherever the trail network (snapping tileset) crosses '
+            'the ring — posted into the active DataSync mission. Requires a '
+            'snapping-enabled vector basemap (e.g. snapping.pmtiles).'
+        ),
+        'repo': 'https://github.com/clptak/cloudtak-plugin-search-containment',
+        'install_dir': 'search-containment',
+        'requires': 'CloudTAK 13.45+',
+        'author': 'clptak',
+        # No LICENSE file in the repo yet (author's ping plugin is MIT) — asked to add one.
+        'license': 'Unlicensed',
+    },
+    {
         'key': 'tak-dispatcher',
         'name': 'CloudTAK Dispatcher',
         'description': (
