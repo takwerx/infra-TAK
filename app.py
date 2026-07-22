@@ -15397,6 +15397,191 @@ def _guarddog_send_alert_email_via_relay(to_addr, subject, body):
         s.sendmail(from_addr, [to_addr], msg.as_string())
 
 
+# ── v10.1.7 WS2: pending-update email notifications ──────────────────────────
+# Operator-requested (2026-07-22): nothing proactively said a CloudTAK plugin /
+# CloudTAK / console update exists — the badges are computed only on page open.
+# Rides the Guard Dog alert-email relay path. De-dup is one email per NEW target
+# identity (SHA/tag), never per poll; state in CONFIG_DIR/update_notify_state.json.
+UPDATE_NOTIFY_FIRST_DELAY_S = 900     # let the box settle after boot
+UPDATE_NOTIFY_INTERVAL_S = 21600      # 6 h between sweeps (fleet constant)
+
+
+def _update_notify_state_path():
+    return os.path.join(CONFIG_DIR, 'update_notify_state.json')
+
+
+def _update_notify_state_load():
+    try:
+        with open(_update_notify_state_path()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _update_notify_state_save(state):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.update-notify-', suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _update_notify_state_path())
+    except Exception:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def _console_pending_update(settings):
+    """Pending infra-TAK console update for this box's channel, or None.
+    Same comparisons as update_check(), compact and side-effect-free (no cache writes)."""
+    import urllib.request
+    gh_headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+    channel = (settings.get('update_channel') or 'main').strip().lower()
+    if channel == 'dev':
+        req = urllib.request.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=dev&per_page=1', headers=gh_headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        remote_full = (data[0].get('sha') or '') if data else ''
+        try:
+            local = subprocess.run(
+                ['git', f'--git-dir={os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")}',
+                 'rev-parse', '--short', 'HEAD'],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            local = ''
+        if remote_full and not remote_full.startswith(local or 'XXXXXXXX'):
+            return {'label': 'infra-TAK console', 'installed': f'v{VERSION} @ {local or "?"}',
+                    'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7]}
+        return None
+    req = urllib.request.Request(
+        f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', headers=gh_headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+    tag = (data.get('tag_name') or '').strip()
+
+    def _vt(v):
+        return tuple(int(p) for p in v.lstrip('vV').replace('-alpha', '').replace('-beta', '').split('.'))
+    try:
+        if tag and _vt(tag) > _vt(VERSION):
+            return {'label': 'infra-TAK console', 'installed': f'v{VERSION}',
+                    'target': tag, 'identity': tag}
+    except Exception:
+        pass
+    return None
+
+
+def _collect_pending_updates(settings):
+    """All currently-pending updates as [{key,label,installed,target,identity}].
+    Read-only; each source shielded so one failure never hides the rest."""
+    pending = []
+    try:
+        c = _console_pending_update(settings)
+        if c:
+            pending.append({**c, 'key': 'console'})
+    except Exception as e:
+        print(f"[update-notify] console check failed: {e}", flush=True)
+    try:
+        if os.path.isdir(os.path.expanduser('~/CloudTAK')):
+            info = _get_cloudtak_version_info()
+            if info.get('version') and info.get('update_available') and info.get('latest'):
+                pending.append({'key': 'cloudtak', 'label': 'CloudTAK',
+                                'installed': f"v{info['version']}", 'target': f"v{info['latest']}",
+                                'identity': str(info['latest'])})
+    except Exception as e:
+        print(f"[update-notify] CloudTAK check failed: {e}", flush=True)
+    try:
+        for p in _detect_cloudtak_plugins():
+            if p.get('installed') and p.get('update_available') and not p.get('local'):
+                ident = p.get('remote_sha') or 'unknown'
+                pending.append({'key': f"plugin:{p['key']}",
+                                'label': f"CloudTAK plugin “{p['name']}”",
+                                'installed': p.get('sha') or '(not built)',
+                                'target': f"{ident} ({p.get('channel') or 'main'} channel)",
+                                'identity': ident})
+    except Exception as e:
+        print(f"[update-notify] plugin check failed: {e}", flush=True)
+    return pending
+
+
+def _update_notify_check_once():
+    """One pending-update sweep. Emails the Guard Dog alert address only when at least
+    one pending item's identity has not been mailed before (one email per new SHA/tag,
+    never per poll). Returns {'pending': [...], 'emailed': bool} for the trigger route."""
+    settings = load_settings()
+    to_addr = _safe_alert_email(settings.get('guarddog_alert_email'))
+    if not to_addr:
+        return {'pending': [], 'emailed': False, 'skipped': 'no alert email configured'}
+    if settings.get('guarddog_update_email_enabled') is False:
+        return {'pending': [], 'emailed': False, 'skipped': 'update emails disabled'}
+    pending = _collect_pending_updates(settings)
+    state = _update_notify_state_load()
+    new_items = [p for p in pending if state.get(p['key']) != p['identity']]
+    emailed = False
+    if new_items:
+        server_id = _guarddog_server_identifier(settings) or socket.gethostname()
+        lines = [f"The following updates are pending on {server_id}:", '']
+        for p in pending:
+            lines.append(f"  • {p['label']}: {p['installed']} → {p['target']}")
+        fqdn = (settings.get('fqdn') or '').split(':')[0].strip() or (settings.get('server_ip') or '').strip()
+        port = settings.get('console_port') or 5001
+        lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
+                  f"Update channel: {(settings.get('update_channel') or 'main').strip().lower()}",
+                  '', 'You get one email per new pending version — not a reminder per sweep.']
+        subj = (f"⬆ Update pending on {server_id}" if len(pending) == 1
+                else f"⬆ {len(pending)} updates pending on {server_id}")
+        try:
+            _guarddog_send_alert_email_via_relay(to_addr, subj, '\n'.join(lines))
+            emailed = True
+            print(f"[update-notify] emailed {len(pending)} pending update(s) to {to_addr} "
+                  f"({len(new_items)} new)", flush=True)
+        except Exception as e:
+            print(f"[update-notify] email send failed: {e}", flush=True)
+    # Persist ONLY what was successfully mailed (a failed send retries next sweep);
+    # prune entries no longer pending so the same target re-mails if it reappears.
+    new_state = {p['key']: p['identity'] for p in pending}
+    if (emailed or not new_items) and new_state != state:
+        _update_notify_state_save(new_state)
+    return {'pending': pending, 'emailed': emailed}
+
+
+def _update_notify_loop():
+    time.sleep(UPDATE_NOTIFY_FIRST_DELAY_S)
+    while True:
+        try:
+            _update_notify_check_once()
+        except Exception as e:
+            try:
+                print(f"[update-notify] sweep failed: {e}", flush=True)
+            except Exception:
+                pass
+        time.sleep(UPDATE_NOTIFY_INTERVAL_S)
+
+
+# Start the sweep thread once (daemon; idle-cheap — first sweep 15 min after boot).
+try:
+    threading.Thread(target=_update_notify_loop, daemon=True, name='update-notify').start()
+except Exception:
+    pass
+
+
+@app.route('/api/guarddog/update-notify-check', methods=['POST'])
+@login_required
+def guarddog_update_notify_check():
+    """Run one pending-update sweep now (T&E / support — nobody waits 6 h)."""
+    try:
+        return jsonify({'success': True, **_update_notify_check_once()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 _GUARDDOG_SPIRAL_CORR_SENTINEL = '/var/lib/takguard/spiral_correlation_alert_sent'
 
 
@@ -26430,6 +26615,7 @@ def _detect_cloudtak_plugins():
         sha = None
         update_available = False
         _dev_branch = None
+        remote_sha = None
         # Resolve which directory actually holds the plugin's git clone. For repo plugins that
         # ship the web/server halves in subdirs, install_path (under api/web/plugins/) is a
         # *copy* with no .git — the real clone lives in ~/CloudTAK/.plugin-src/<install_dir>.
@@ -26471,12 +26657,14 @@ def _detect_cloudtak_plugins():
                 )
                 if r2.returncode == 0 and r2.stdout.strip():
                     remote_short = r2.stdout.split()[0][:7]
-                    if remote_short and (not sha or sha != remote_short):
-                        update_available = True
+                    if remote_short:
+                        remote_sha = remote_short
+                        if not sha or sha != remote_short:
+                            update_available = True
             except Exception:
                 pass
         result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available, 'local': is_local,
-                       'channel': 'dev' if _dev_branch else 'main'})
+                       'channel': 'dev' if _dev_branch else 'main', 'remote_sha': remote_sha})
     return result
 
 
@@ -40899,7 +41087,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
             </div>
             {% if p.repo %}<a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>{% elif p.local %}<span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">local dev (dev branch only)</span>{% endif %}
             {% if p.installed and p.sha %}
-            <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.sha }}{% if p.update_available %} <span style="color:var(--cyan);margin-left:6px">update available</span>{% endif %}</div>
+            <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.sha }}{% if p.channel == 'dev' %} <span style="color:#eab308;border:1px solid rgba(234,179,8,.4);border-radius:4px;padding:0 5px;margin-left:6px;font-size:10px;font-weight:600" title="This box tracks the plugin's dev branch (dev update channel)">dev</span>{% endif %}{% if p.update_available %} <span style="color:var(--cyan);margin-left:6px">update available</span>{% endif %}</div>
             {% endif %}
           </div>
           <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex-shrink:0">
