@@ -26888,8 +26888,12 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
         # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).
         plog('')
-        plog('Rebuilding CloudTAK API image — this takes 5–15 minutes...')
-        if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=1200):
+        plog('Rebuilding CloudTAK API image — this takes 5–15 minutes (slow disks can take much longer)...')
+        # 90-min ceiling, matching the CloudTAK update path (v10.1.3): a --no-cache api
+        # build on a slow-disk box legitimately runs past 20 min — the old timeout=1200
+        # killed a SUCCEEDING build and rolled back (test12, 2026-07-22: image landed at
+        # +14min, compose still finalizing at +20min → spurious "Rebuild failed").
+        if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=5400):
             plog('✗ Rebuild failed — rolling back so CloudTAK stays buildable...')
             _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
             snap = None
