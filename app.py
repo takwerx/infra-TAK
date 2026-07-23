@@ -69471,6 +69471,53 @@ def _startup_ensure_console_gunicorn_threads():
 _startup_ensure_console_gunicorn_threads()
 
 
+# v10.1.7 WS6: startup migration — Caddy reboot-race hardening from the CONSOLE
+# update path. start.sh installs the same two files, but fleet boxes update via
+# the console (git pull + service restart) and never re-run start.sh — without
+# this migration the fix would need SSH, which is the opposite of the product.
+# Field failure: caddy.service boots before DHCP assigns the address behind the
+# Caddyfile's specific-IP :9997 bind (required — 0.0.0.0:9997 collides with the
+# cloudtak-media 127.0.0.1:9997 publish); the bind is fatal and the stock unit
+# never retries, so every vhost stays dark until a manual start.
+def _startup_harden_caddy_boot():
+    dropin_dir = '/etc/systemd/system/caddy.service.d'
+    dropin = f'{dropin_dir}/10-takwerx-boot.conf'
+    dropin_content = (
+        '[Unit]\n'
+        'After=network-online.target\n'
+        'Wants=network-online.target\n'
+        '\n'
+        '[Service]\n'
+        'Restart=on-failure\n'
+        'RestartSec=5s\n'
+    )
+    sysctl_path = '/etc/sysctl.d/99-takwerx-nonlocal-bind.conf'
+    sysctl_content = 'net.ipv4.ip_nonlocal_bind = 1\n'
+
+    def _read(path):
+        try:
+            with open(path) as f:
+                return f.read()
+        except Exception:
+            return ''
+
+    try:
+        import shutil as _sh
+        if _sh.which('caddy') and _read(dropin).strip() != dropin_content.strip():
+            subprocess.run(_sudo_wrap(['mkdir', '-p', dropin_dir]), capture_output=True, timeout=10)
+            _write_priv(dropin, dropin_content)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+            print('Startup migration: Caddy boot drop-in installed (network-online ordering + Restart=on-failure; v10.1.7 WS6)')
+        if _read(sysctl_path).strip() != sysctl_content.strip():
+            _write_priv(sysctl_path, sysctl_content)
+            subprocess.run(_sudo_wrap(['sysctl', '-p', sysctl_path]), capture_output=True, timeout=10)
+            print('Startup migration: nonlocal-bind sysctl applied (Caddy reboot-race hardening; v10.1.7 WS6)')
+    except Exception as _e:
+        print(f'Startup migration: Caddy boot hardening warning (non-fatal): {_e}')
+
+_startup_harden_caddy_boot()
+
+
 def _startup_ensure_broker():
     """v10.0.5: ensure the privileged broker (takwerx-broker.service) is installed
     + running on every console start. The T&E flow is `git pull + systemctl
