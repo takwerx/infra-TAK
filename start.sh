@@ -719,6 +719,42 @@ ensure_docker_nonroot() {
 }
 
 # ==========================================
+# Caddy reboot-race hardening (v10.1.7)
+# ==========================================
+# On boot, the packaged caddy.service can start before NetworkManager/DHCP has
+# assigned the address that the Caddyfile's specific-IP :9997 bind needs (the
+# CloudTAK video listener MUST bind a specific IP — 0.0.0.0:9997 collides with
+# the cloudtak-media container's 127.0.0.1:9997 publish). The bind failure is
+# fatal and the stock unit never retries, leaving every vhost dark until a human
+# runs `systemctl start caddy` (field-observed on a Rocky 9.8 NUC, 2026-07-22).
+# Mirror the ordering + restart the takserver/console units already get, and
+# allow nonlocal binds so a momentarily-absent (or DHCP-changed) IP can never be
+# fatal. Idempotent; runs on every start.sh so existing boxes converge on update.
+harden_caddy_boot() {
+    if command -v caddy >/dev/null 2>&1; then
+        mkdir -p /etc/systemd/system/caddy.service.d
+        cat > /etc/systemd/system/caddy.service.d/10-takwerx-boot.conf << 'EOF'
+[Unit]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
+        systemctl daemon-reload
+        echo -e "  ${GREEN}✓ Caddy boot hardening: waits for network-online, auto-restarts on failure${NC}"
+    fi
+    # Defense-in-depth: a specific-IP bind succeeds even when the address isn't
+    # (yet, or any longer) assigned to an interface. Written unconditionally so a
+    # box that installs Caddy later is already covered.
+    cat > /etc/sysctl.d/99-takwerx-nonlocal-bind.conf << 'EOF'
+net.ipv4.ip_nonlocal_bind = 1
+EOF
+    sysctl -p /etc/sysctl.d/99-takwerx-nonlocal-bind.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+}
+
+# ==========================================
 # Create systemd Service
 # ==========================================
 # If the service already exists and points to a directory that has .config/auth.json,
@@ -929,6 +965,11 @@ install_broker
 # Born-non-root: provision Docker as root up front (the non-root console can't
 # install it later); no-op unless TAKWERX_NONROOT=1.
 ensure_docker_nonroot
+
+# Caddy reboot-race hardening (v10.1.7): boot-ordering/restart drop-in (when Caddy
+# is installed) + nonlocal-bind sysctl. Safe no-op ordering-wise on a fresh box —
+# the sysctl lands now, the drop-in on the next start.sh after Caddy arrives.
+harden_caddy_boot
 
 # Born-non-root: now that venv, .config and cert exist, hand the whole install to
 # takwerx (no-op unless TAKWERX_NONROOT=1).
