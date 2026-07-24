@@ -1201,12 +1201,19 @@ def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     p = os.path.join(CONFIG_DIR, 'settings.json')
     with _settings_write_lock:
-        # (3) Never-drop-core-keys guard. Fast path: when the caller carries every core
-        # key (the overwhelming common case — callers do load→modify→save) we skip the
-        # disk read entirely. A core key is only ever MISSING from the incoming dict on
-        # the torn-read {} bug, never from a legit caller (which sets keys, e.g. fqdn='',
-        # rather than deleting them) — so refilling from the last-good on-disk copy is
-        # always correct and can never resurrect an intentionally-cleared value.
+        # (3) Never-drop guard. Fast path: when the caller carries every core key (the
+        # overwhelming common case — callers do load→modify→save) we skip the disk read
+        # entirely. A core key is only ever MISSING from the incoming dict on the
+        # torn-read {} bug (_load_json_cached returns {} on a parse error), never from a
+        # legit caller — so a missing core key is the torn-read signature. v10.1.8: when
+        # that signature fires, refill ALL disk keys the incoming dict is missing, not
+        # just the core 9 — the 2026-07-22 incident (test6/test8) refilled core identity
+        # but silently dropped tak_deployment, email_relay, guarddog_alert_email and
+        # webadmin_password on the same torn save. Intentional deletes (uninstall flows
+        # pop email_relay, netbird_pat, remote_assist_*, …) always start from a FULL
+        # load_settings() dict, so all core keys are present, this branch never runs,
+        # and deletes are honored — the trigger, not an allowlist, is what keeps the
+        # guard from resurrecting removed keys.
         if not all(k in s for k in CORE_SETTINGS_KEYS):
             try:
                 with open(p) as _f:
@@ -1214,16 +1221,19 @@ def save_settings(s):
             except Exception:
                 _disk = {}
             if isinstance(_disk, dict):
-                # Type guard mirrors load_settings: never refill a corrupted non-scalar
-                # value (e.g. server_ip=[null, null]) back into the outgoing dict.
-                _refilled = [k for k in CORE_SETTINGS_KEYS
-                             if k not in s and k in _disk
-                             and (_disk[k] is None or isinstance(_disk[k], (str, int)))]
+                # Core keys keep the scalar type guard from load_settings: never refill
+                # a corrupted non-scalar value (e.g. server_ip=[null, null]). Non-core
+                # keys are arbitrary JSON (tak_deployment/email_relay are dicts) — they
+                # parsed from the last-good file, so refill them as-is.
+                _refilled = [k for k in _disk
+                             if k not in s
+                             and (k not in CORE_SETTINGS_KEYS
+                                  or _disk[k] is None or isinstance(_disk[k], (str, int)))]
                 for k in _refilled:
                     s[k] = _disk[k]
                 if _refilled:
-                    print(f"[save_settings] GUARD: refilled missing core keys from disk "
-                          f"{_refilled} — caller dropped them (torn-read race?)", flush=True)
+                    print(f"[save_settings] GUARD: refilled missing keys from disk "
+                          f"{sorted(_refilled)} — caller dropped them (torn-read race?)", flush=True)
         # (1) Atomic write: write a sibling temp file, fsync, then rename over the target
         # so a reader always sees the old or new COMPLETE file, never a half-written one.
         tmp = None
