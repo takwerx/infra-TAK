@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.7-alpha)**
+**Current release: [v10.1.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.8-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.8-alpha — 2026-07-24 — CloudTAK video playback fixed end-to-end, settings can no longer silently lose module config, and RHEL installs fail loudly instead of mysteriously
+
+**Headline: Video in the CloudTAK web map actually plays now — external camera feeds and live phone/drone streams both — and two classes of silent failure are gone.** **CloudTAK video, fixed at every layer.** Clicking play on a map marker with a public camera feed (state DOT traffic cams, any public HLS URL) failed with a 404 on every deployment — the web player's requests were routed to the wrong internal service. Live RTSP streams (phones running TAK ICU, drones) were separately broken by an outdated media component CloudTAK still pins, which couldn't handle non-HTTP sources. Both are fixed: routing corrected with an automatic self-heal for existing deployments (manual Caddy patches are superseded, not fought), the media component updated to the current upstream release with its kernel requirements applied automatically, and the streaming ingest ports actually opened in the firewall — publishes into CloudTAK leases used to be silently dropped. Validated live end-to-end: phone → restreamer → CloudTAK web player, seconds behind live. ARM note: upstream ships no ARM build of the newer media component, so ARM boxes keep the current one (external feeds play; RTSP-lease browser playback remains unavailable there — upstream ask filed). **Settings hardening.** A rare write-race could silently drop module settings (mail relay, database config, admin credentials) while preserving core identity — recovery required manual repair. The guard now restores *every* setting from the last good copy, not just the core keys. **RHEL 9 installs fail loudly.** On genuine RHEL 9, a repository step could fail silently and surface three steps later as a baffling PostGIS dependency error (GH #56). The installer now uses the correct RHEL path automatically, verifies it, and stops with the exact fix if it can't — no more misleading errors. **Plus** plugin update failures can no longer leave a half-updated image behind. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.8-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.8-alpha).
 
 ### v10.1.7-alpha — 2026-07-24 — Caddy always comes back after a reboot, proactive update emails, and a new SAR containment plugin
 
