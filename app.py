@@ -27241,6 +27241,11 @@ def _cloudtak_build_override_yml(settings):
                             and bool(settings.get('console_cert_docker_san'))
                             and os.path.isfile(console_cert_src))
 
+    # W5/W5e media-infra pin — arch-conditional, see the comment in the template below.
+    media_image = ('ghcr.io/dfpc-coe/media-infra:v9.1.1'
+                   if (settings.get('arch') or '').lower() in ('arm64', 'aarch64')
+                   else 'ghcr.io/dfpc-coe/media-infra:v9.7.0')
+
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
         tls_env_block = (
@@ -27284,9 +27289,16 @@ services:
     # undici "unknown scheme" → every RTSP-lease playback 500s once /stream is
     # correctly routed to media-infra (W1). ≥v9.5 routes non-HLS proxies to
     # MediaMTX's internal HLS instead. v9.7.0 = MediaMTX 1.19.2 (needs the
-    # net.core.rmem_max sysctl — see _startup_media_kernel_bufs). amd64-only,
-    # same as the v9.1.1 it replaces. Field-proven test6 2026-07-24.
-    image: ghcr.io/dfpc-coe/media-infra:v9.7.0
+    # net.core.rmem_max sysctl — see _startup_media_kernel_bufs). Field-proven
+    # test6 2026-07-24.
+    # W5e: ≥v9.2 ships amd64-ONLY — v9.1.1 is upstream's last arm64 build
+    # (verified against ghcr manifests 2026-07-24; an unconditional v9.7.0 pin
+    # crash-looped cloudtak-media on aws-arm: 'exec format error'). ARM stays
+    # pinned to v9.1.1: external-HLS leases work; RTSP-lease playback there
+    # remains the pre-existing 10.1.7 behavior — documented ARM caveat (same
+    # class as pmtiles). settings['arch'] is the LOCAL box arch; a REMOTE ARM
+    # CloudTAK target is out of the pin's scope (parked in PLAN-v10.1.8).
+    image: {media_image}
     extra_hosts:
 {hosts_block}
     environment:
