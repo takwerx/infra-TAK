@@ -7247,9 +7247,16 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         'sudo dnf -qy module disable postgresql 2>&1 || true; '
         'sudo dnf -y install dnf-plugins-core 2>&1 || true; '
         '(sudo dnf config-manager --set-enabled crb 2>/dev/null || sudo dnf config-manager --set-enabled powertools 2>/dev/null || true); '
+        # GH #56: verify EPEL actually landed — the DB rpm's postgis deps (hdf5,
+        # xerces-c) come from EPEL and fail with a misleading error without it.
+        '(rpm -q epel-release >/dev/null 2>&1 && echo EPEL_OK || echo EPEL_MISSING); '
         'echo REPO_DONE'
     )
     _, rout = _ssh_probe(s1, repo_cmd, timeout=240)
+    if 'EPEL_MISSING' in (rout or ''):
+        log.append('⚠ EPEL repo NOT installed on Server One — the takserver-database rpm\'s '
+                   'postgis dependencies (hdf5, xerces-c) will fail to resolve. On genuine RHEL run: '
+                   f'sudo dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-{el_ver}.noarch.rpm')
     log.append('Repos (EPEL/PGDG/CRB): ' + ('configured.' if 'REPO_DONE' in (rout or '') else ('warnings — ' + (rout or '')[:300])))
 
     # Step 2: install the takserver-database .noarch.rpm (the DB installer), unless already set up.
@@ -7891,6 +7898,9 @@ def takserver_two_server_deploy_server_two():
     if _distro_family() == 'rhel':
         _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
         run_cmd('dnf install -y epel-release 2>&1', check=False, quiet=True)
+        # GH #56: genuine RHEL has no `epel-release` in its enabled repos — fall back
+        # to the Fedora EPEL rpm URL (no-op when the package name resolved above).
+        run_cmd('rpm -q epel-release > /dev/null 2>&1 || dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm 2>&1', check=False, quiet=True)
         run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', check=False, quiet=True)
         run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
         run_cmd('dnf install -y java-17-openjdk-devel 2>&1', check=False, quiet=True)
@@ -25016,6 +25026,18 @@ def run_mediamtx_deploy():
         if _distro_family() == 'rhel':
             subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'epel-release', 'dnf-plugins-core']),
                            capture_output=True, text=True, timeout=300)
+            # GH #56: genuine RHEL has no `epel-release` package, and dnf aborts the
+            # WHOLE transaction above on the unmatched name — so dnf-plugins-core is
+            # lost too. Fall back to the Fedora EPEL rpm URL and re-install the
+            # plugins on their own (both no-ops on clones where the name resolved).
+            if subprocess.run(['rpm', '-q', 'epel-release'], capture_output=True).returncode != 0:
+                _el = ((_read_os_release()[0] or '').split('-', 1) + [''])[1].split('.')[0] or '9'
+                subprocess.run(_sudo_wrap(['dnf', 'install', '-y', f'https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el}.noarch.rpm']),
+                               capture_output=True, text=True, timeout=300)
+                subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'dnf-plugins-core']),
+                               capture_output=True, text=True, timeout=300)
+                if subprocess.run(['rpm', '-q', 'epel-release'], capture_output=True).returncode != 0:
+                    plog("⚠ EPEL repo could not be installed — some dependencies may fail to resolve.")
             _run_priv_chain([['dnf', 'config-manager', '--set-enabled', 'crb'], ['dnf', 'config-manager', '--set-enabled', 'powertools']], 'or', timeout=120)
             # Core deps (required). The MediaMTX binary is pure Go and doesn't need
             # ffmpeg, so install core deps strictly, then ffmpeg separately.
@@ -63353,8 +63375,34 @@ def run_takserver_deploy(config):
             # fresh box; here other modules are already installed and a full update mid-deploy is
             # an unnecessary fleet risk) — the rpm install resolves its deps from these repos.
             _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            # GH #56: genuine RHEL (subscription-manager) doesn't carry `epel-release`
+            # in any enabled repo — only the clones (Rocky/Alma/Stream) do. The bare
+            # install fails "No match for argument: epel-release", Step 2 used to print
+            # its ✓ anyway, and the failure surfaced two steps later as an unrelated-
+            # looking postgis33_15 → hdf5/xerces-c dependency wall (EPEL packages).
+            # Chain repo-name → Fedora URL rpm, enable CRB the subscription-manager way
+            # on genuine RHEL, then VERIFY epel-release actually landed and hard-stop
+            # naming EPEL as the cause if it didn't — Step 4 cannot succeed without it.
+            _os_id = (_read_os_release()[0] or '')          # e.g. 'rhel-9.4', 'rocky-9'
+            _el_ver = (_os_id.split('-', 1) + [''])[1].split('.')[0] or '9'
+            def _epel_installed():
+                return subprocess.run('rpm -q epel-release', shell=True, capture_output=True,
+                                      timeout=30, env=_broker_shim_env()).returncode == 0
             run_cmd('dnf install -y epel-release 2>&1', "Installing EPEL...", check=False)
-            run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
+            if not _epel_installed():
+                run_cmd(f'dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el_ver}.noarch.rpm 2>&1',
+                        "EPEL not in enabled repos (genuine RHEL?) — installing from the Fedora EPEL rpm URL...", check=False)
+            if _os_id.startswith('rhel'):
+                run_cmd(f'subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms 2>&1',
+                        "Enabling CodeReady Builder (subscription-manager)...", check=False, quiet=True)
+            if not _epel_installed():
+                log_step("✗ FATAL: the EPEL repo could not be installed. TAK Server's PostGIS dependencies")
+                log_step("  (hdf5, xerces-c, …) come from EPEL — Step 4 WILL fail without it.")
+                log_step("  Fix manually, then retry the deploy:")
+                log_step(f"    dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el_ver}.noarch.rpm")
+                log_step(f"    subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms   # genuine RHEL only")
+                deploy_status.update({'error': True, 'running': False}); return
+            run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-{_el_ver}-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
             run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
             run_cmd('dnf install -y java-17-openjdk-devel 2>&1', "Installing Java 17 (OpenJDK)...", check=False)
             run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
