@@ -69510,8 +69510,18 @@ def _startup_harden_caddy_boot():
             print('Startup migration: Caddy boot drop-in installed (network-online ordering + Restart=on-failure; v10.1.7 WS6)')
         if _read(sysctl_path).strip() != sysctl_content.strip():
             _write_priv(sysctl_path, sysctl_content)
-            subprocess.run(_sudo_wrap(['sysctl', '-p', sysctl_path]), capture_output=True, timeout=10)
-            print('Startup migration: nonlocal-bind sysctl applied (Caddy reboot-race hardening; v10.1.7 WS6)')
+            # Apply the runtime value with `sysctl -w <param>=<val>`, NOT `-p <file>`:
+            # the broker gates sysctl on the PARAMETER namespace (vm./fs./net.), so
+            # `-p <path>` (a file arg) is denied on non-root boxes and the knob would
+            # stay 0 until the next reboot (when systemd-sysctl applies the file).
+            # The file write above still provides boot persistence.
+            _sr = subprocess.run(_sudo_wrap(['sysctl', '-w', 'net.ipv4.ip_nonlocal_bind=1']),
+                                 capture_output=True, timeout=10)
+            if _sr.returncode == 0:
+                print('Startup migration: nonlocal-bind sysctl applied (Caddy reboot-race hardening; v10.1.7 WS6)')
+            else:
+                print('Startup migration: nonlocal-bind sysctl file written; runtime apply deferred to next boot '
+                      f'({(_sr.stderr or b"").decode(errors="replace").strip()[:120]})')
     except Exception as _e:
         print(f'Startup migration: Caddy boot hardening warning (non-fatal): {_e}')
 
