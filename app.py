@@ -26647,7 +26647,14 @@ def _cloudtak_server_routes_dir(ct_dir, require_split=False):
 def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     """v0.9.44: back up the CloudTAK files a plugin action mutates (the server
     routes dir + the web plugin dir) so a failed rebuild can be rolled back — a
-    broken plugin must never leave CloudTAK in an unbuildable state."""
+    broken plugin must never leave CloudTAK in an unbuildable state.
+
+    v10.1.8: also record the api image tag + ID the RUNNING container uses. A
+    rebuild that fails AFTER the image already built (timeout finalizing, etc.)
+    leaves the tag pointing at the new image even though the source gets rolled
+    back — the next unrelated `compose up -d` then silently ships the
+    rolled-back plugin. The running container still references the pre-build
+    image, so capture both here and retag on rollback."""
     import tempfile, shutil
     snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
     routes = _cloudtak_server_routes_dir(ct_dir)
@@ -26656,7 +26663,19 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
     if web_existed:
         shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
-    return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes}
+    api_image_tag = api_image_id = ''
+    try:
+        cid = subprocess.run(['docker', 'compose', 'ps', '-q', 'api'], cwd=ct_dir,
+                             capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
+        if cid:
+            insp = subprocess.run(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}', cid[0]],
+                                  capture_output=True, text=True, timeout=30).stdout.split()
+            if len(insp) == 2:
+                api_image_tag, api_image_id = insp[0], insp[1]
+    except Exception:
+        pass
+    return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes,
+            'api_image_tag': api_image_tag, 'api_image_id': api_image_id}
 
 
 def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
@@ -26679,6 +26698,22 @@ def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
     shutil.rmtree(snap, ignore_errors=True)
     if plog:
         plog('  ↩ Restored CloudTAK server routes + plugin dir to the pre-update state.')
+    # v10.1.8: if the failed rebuild already advanced the image tag, point it back
+    # at the pre-build image so the next `compose up -d` can't ship the rolled-back
+    # plugin. The old image is still referenced by the running container (and by
+    # this retag), so it can't have been pruned out from under us.
+    tag, old_id = snap_info.get('api_image_tag'), snap_info.get('api_image_id')
+    if tag and old_id:
+        try:
+            cur = subprocess.run(['docker', 'image', 'inspect', '-f', '{{.Id}}', tag],
+                                 capture_output=True, text=True, timeout=30).stdout.strip()
+            if cur and cur != old_id:
+                subprocess.run(['docker', 'tag', old_id, tag],
+                               capture_output=True, text=True, timeout=30)
+                if plog:
+                    plog(f'  ↩ Re-pointed image tag {tag} back at the pre-build image.')
+        except Exception:
+            pass
 
 
 def _cleanup_snapshot(snap_info):
