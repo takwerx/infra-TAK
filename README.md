@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.6-alpha)**
+**Current release: [v10.1.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.7-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.7-alpha — 2026-07-24 — Caddy always comes back after a reboot, proactive update emails, and a new SAR containment plugin
+
+**Headline: Servers reliably restore all their web services after a power loss or reboot, you get an email when an update is waiting, and search-and-rescue teams get a new CloudTAK containment tool.** **Caddy reboot resilience.** On some servers — particularly small edge boxes on DHCP — the web front end (Caddy) could fail to come back after a reboot because it started before the network was fully up, taking down every site behind it (the map, TAK admin, SSO, portal) until someone manually restarted it. That's fixed: Caddy now waits for the network and self-recovers if it still loses the race, so a server returns to full service on its own after a power loss or reboot — no console, no SSH. Validated across Ubuntu, Rocky/RHEL, and ARM. **Proactive update emails.** The console now emails you (through the same alerting path Guard Dog uses) when an update is pending — a CloudTAK plugin, CloudTAK itself, or the console — so you find out without having to open the page. You get one email per new version, not a reminder every hour. **New plugin: Search Containment.** An ATAK Chokepoint-style tool for SAR is now installable from the CloudTAK plugins panel: pick a shape, line, or point, set a containment distance, and it drops numbered markers wherever the trail network crosses the ring, posted straight into the active mission. **Plus** a clear "dev" marker on plugin cards for boxes tracking a plugin's test channel. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.7-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.7-alpha).
 
 ### v10.1.6-alpha — 2026-07-21 — Hardened deployments get map-engine updates again, and CloudTAK moves to the tested 13.50 release
 
