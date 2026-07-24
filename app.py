@@ -19123,7 +19123,12 @@ _register_module_remote_routes('fedhub', 'fedhub_deployment', get_config_fn=_get
 
 
 def _get_cloudtak_upstreams(settings):
-    """Return CloudTAK upstream endpoints for Caddy and readiness checks."""
+    """Return CloudTAK upstream endpoints for Caddy and readiness checks.
+
+    video_hls (raw MediaMTX HLS, 18888) is NOT routed by Caddy anymore — all
+    video.<fqdn> traffic (incl. /stream/*) must go to video_api (media-infra,
+    9997): media-infra alone can serve external http(s) proxy leases. Kept here
+    only for readiness checks / diagnostics."""
     cfg = _get_cloudtak_deployment_config(settings)
     if cfg.get('target_mode') == 'remote':
         host = (cfg.get('remote', {}).get('host') or '').strip()
@@ -21118,14 +21123,16 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_tiles'), ct_tiles)
-        lines.append(f"# CloudTAK Media (video) — /stream/* → HLS, rest → MediaMTX API")
+        lines.append(f"# CloudTAK Media (video) — EVERYTHING → media-infra proxy (video_api).")
+        lines.append(f"# /stream/* must NOT go to raw MediaMTX HLS (18888): media-infra's hls.ts is the")
+        lines.append(f"# only component that can serve external http(s) proxy leases (it fetches the")
+        lines.append(f"# upstream manifest itself — MediaMTX never has those paths), and it expects the")
+        lines.append(f"# full /stream/... prefix. media-infra also proxies MediaMTX's internal HLS for")
+        lines.append(f"# native/RTSP lease paths, so this routing is correct for BOTH lease types —")
+        lines.append(f"# do NOT split /stream/* back out to 18888 (that 404'd every external-HLS video")
+        lines.append(f"# in CloudTAK while RTSP leases worked by accident; TN box, 2026-07-10).")
         lines.append(f"{ct_video} {{")
-        lines.append(f"    handle_path /stream/* {{")
-        lines.append(f"        reverse_proxy {ct_up['video_hls']}")
-        lines.append(f"    }}")
-        lines.append(f"    handle {{")
-        lines.append(f"        reverse_proxy {ct_up['video_api']}")
-        lines.append(f"    }}")
+        lines.append(f"    reverse_proxy {ct_up['video_api']}")
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_video'), ct_video)
@@ -21149,15 +21156,11 @@ def generate_caddyfile(settings=None):
             ct_bind_ip = _primary_local_ipv4()
         if ct_bind_ip:
             ct_video_host = ct_video.split()[0].strip()  # hostname only (drop any TLS/options)
-            lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs")
+            lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs.")
+            lines.append(f"# Same routing rule as the 443 vhost: everything → media-infra (video_api).")
             lines.append(f"{ct_video_host}:9997 {{")
             lines.append(f"    bind {ct_bind_ip}")
-            lines.append(f"    handle_path /stream/* {{")
-            lines.append(f"        reverse_proxy {ct_up['video_hls']}")
-            lines.append(f"    }}")
-            lines.append(f"    handle {{")
-            lines.append(f"        reverse_proxy {ct_up['video_api']}")
-            lines.append(f"    }}")
+            lines.append(f"    reverse_proxy {ct_up['video_api']}")
             lines.append(f"}}")
             lines.append("")
 
@@ -21482,6 +21485,38 @@ def _caddy_regenerate_if_fqdn():
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
     except Exception:
         pass
+
+
+def _selfheal_cloudtak_stream_route(log):
+    """
+    v10.1.8 — fix CloudTAK video /stream/* routing on already-deployed boxes.
+    The old template sent video.<fqdn> /stream/* to raw MediaMTX HLS (18888) via
+    handle_path; the correct backend is media-infra (video_api :9997), which is
+    the only component able to serve external http(s) proxy leases — so every
+    external-HLS video 404'd in CloudTAK (TN box field incident 2026-07-10).
+    First landed as feb6757 (10.1.3-dev), test-reverted in 805fdce over an RTSP
+    concern that turned out unfounded (media-infra's hls.ts proxies MediaMTX's
+    internal HLS for native/RTSP lease paths too) — the revert shipped in
+    10.1.3–10.1.7, so this heals boxes from that whole range.
+    Detection: 'handle_path /stream/*' in the GENERATED section of the live
+    Caddyfile (user blocks below the marker are ignored so a hand-written stanza
+    can't loop this). The fixed template never emits that string → idempotent.
+    """
+    if not os.path.exists(CADDYFILE_PATH):
+        return False
+    try:
+        with open(CADDYFILE_PATH) as f:
+            live = f.read()
+    except Exception:
+        return False
+    generated = live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    if 'handle_path /stream/*' not in generated:
+        return False
+    log("CloudTAK video: stale /stream/* route (handle_path → MediaMTX 18888) detected — regenerating Caddyfile")
+    generate_caddyfile()
+    _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=60)
+    log("CloudTAK video: /stream/* now routed to media-infra (:9997) and Caddy reloaded")
+    return True
 
 
 def wait_for_apt_lock(log_fn, log_list):
@@ -72080,6 +72115,20 @@ def _startup_migrations():
                 print(f"Startup migration: relabeled {_ct_labeled} Caddy port(s) for SELinux and reloaded Caddy", flush=True)
         except Exception as caddy_selinux_err:
             print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")
+
+        # v10.1.8 — re-route CloudTAK video /stream/* to media-infra (:9997). The old
+        # Caddy template sent it to raw MediaMTX HLS (18888), which 404'd every
+        # external-HLS proxy lease (RTSP leases worked by accident). Deployed boxes
+        # (incl. everything that installed on 10.1.3–10.1.7) keep the stale Caddyfile
+        # until something regenerates it — do it here. Idempotent: fires only while
+        # the stale pattern exists in the generated section. See
+        # `_selfheal_cloudtak_stream_route`. Field: TN box 2026-07-10, CloudTAK#1570.
+        try:
+            _selfheal_cloudtak_stream_route(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ct_stream_err:
+            print(f"Startup migration: CloudTAK /stream route self-heal error (non-fatal): {ct_stream_err}")
 
         # v0.9.44 — silently clear a `takserver` dpkg half-configured state left by the
         # non-idempotent 5.7 .deb postinstall. TAK Server keeps running fine, but the
