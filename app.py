@@ -27279,6 +27279,14 @@ services:
     environment:
       API_URL: "http://api:5000"
   media:
+    # v10.1.8 W5: pin media-infra PAST upstream CloudTAK's v9.1.1 pin. v9.1.1's
+    # hls route fetch()es whatever the lease proxy URL is — an rtsp:// proxy hits
+    # undici "unknown scheme" → every RTSP-lease playback 500s once /stream is
+    # correctly routed to media-infra (W1). ≥v9.5 routes non-HLS proxies to
+    # MediaMTX's internal HLS instead. v9.7.0 = MediaMTX 1.19.2 (needs the
+    # net.core.rmem_max sysctl — see _startup_media_kernel_bufs). amd64-only,
+    # same as the v9.1.1 it replaces. Field-proven test6 2026-07-24.
+    image: ghcr.io/dfpc-coe/media-infra:v9.7.0
     extra_hosts:
 {hosts_block}
     environment:
@@ -27335,29 +27343,57 @@ services:
 # builds → treated as not-applicable, never an error. Drift only happens on a container
 # RECREATE (every edit survives a plain `docker restart`). The converger is
 # check-before-apply → a no-op (no restart, no video drop) on an already-correct box.
+# v10.1.8 W5: ported to media-infra v9.7.0 — that image ships NO yq (grep the raw
+# yaml instead; accept `no|false` so files healed by the old yq path don't re-trip),
+# and runs COMPILED js from /dist (the v9.6.0 TS build rewrite): patch BOTH the old
+# .ts source paths (≤v9.1.1 runs them directly) and the new /dist/lib/*.js.
 _CT_MEDIA_CHECK_SH = r'''
-if [ "$(yq -r '.hlsVariant' /mediamtx.yml 2>/dev/null)" = mpegts ] \
- && [ "$(yq -r '.hlsAlwaysRemux' /mediamtx.yml 2>/dev/null)" = false ] \
- && [ "$(yq -r '.hlsSegmentCount' /mediamtx.yml 2>/dev/null)" = 3 ] \
- && [ "$(yq -r '.hlsSegmentDuration' /mediamtx.yml 2>/dev/null)" = 500ms ] \
- && [ "$(yq -r '.hlsPartDuration' /mediamtx.yml 2>/dev/null)" = 200ms ]; then H=ok; else H=drift; fi
-if [ ! -f /lib/persist.ts ]; then R=na
-elif grep -qF "'ephemeral', 'all'" /lib/persist.ts; then R=ok
-else R=drift; fi
-if [ ! -f /lib/payload.ts ]; then P=na
-elif grep -qF "replace(/#/g, '%23')" /lib/payload.ts; then P=ok
-else P=drift; fi
+if grep -q "^hlsVariant: mpegts" /mediamtx.yml 2>/dev/null \
+ && grep -qE "^hlsAlwaysRemux: (no|false)" /mediamtx.yml 2>/dev/null \
+ && grep -q "^hlsSegmentCount: 3" /mediamtx.yml 2>/dev/null \
+ && grep -q "^hlsSegmentDuration: 500ms" /mediamtx.yml 2>/dev/null \
+ && grep -q "^hlsPartDuration: 200ms" /mediamtx.yml 2>/dev/null; then H=ok; else H=drift; fi
+R=na
+for f in /lib/persist.ts /dist/lib/persist.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "'ephemeral', 'all'" "$f"; then [ "$R" = drift ] || R=ok; else R=drift; fi
+done
+P=na
+for f in /lib/payload.ts /dist/lib/payload.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "replace(/#/g, '%23')" "$f"; then [ "$P" = drift ] || P=ok; else P=drift; fi
+done
 printf '%s %s %s\n' "$H" "$R" "$P"
 '''
 _CT_MEDIA_APPLY_SH = r'''
-yq -i '.hlsVariant = "mpegts" | .hlsAlwaysRemux = false | .hlsSegmentCount = 3 | .hlsSegmentDuration = "500ms" | .hlsPartDuration = "200ms"' /mediamtx.yml
-if [ -f /lib/persist.ts ]; then
-  sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" /lib/persist.ts
-fi
-if [ -f /lib/payload.ts ]; then
-  sed -i "s|source: path.proxy,|source: path.proxy.startsWith('srt://') ? path.proxy.replace(/#/g, '%23') : path.proxy,|" /lib/payload.ts
-fi
+sed -i "/^hlsVariant:/d; /^hlsAlwaysRemux:/d; /^hlsSegmentCount:/d; /^hlsSegmentDuration:/d; /^hlsPartDuration:/d" /mediamtx.yml
+printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> /mediamtx.yml
+for f in /lib/persist.ts /dist/lib/persist.js; do
+  [ -f "$f" ] && sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" "$f"
+done
+for f in /lib/payload.ts /dist/lib/payload.js; do
+  [ -f "$f" ] && sed -i "s|source: path.proxy,|source: path.proxy.startsWith('srt://') ? path.proxy.replace(/#/g, '%23') : path.proxy,|" "$f"
+done
+true
 '''
+
+
+def _cloudtak_open_stream_ports(log=None):
+    """v10.1.8 W5: explicitly ALLOW CloudTAK's direct-streaming host ports. The
+    port policy always classed RTSP 18554 / RTMP 11935 / SRT 18890 as Tier 1
+    (public streaming endpoints) and merely refrained from denying them — but on
+    a default-deny firewall "not denied" is still CLOSED, so EUD/TAK-ICU
+    publishes into CloudTAK leases were silently dropped (test6, 2026-07-24).
+    Idempotent; ufw↔firewalld via the shim. SRT is UDP; RTSP also gets UDP for
+    clients that negotiate RTP over UDP."""
+    _log = log or (lambda m: print(m, flush=True))
+    opened = []
+    for port, proto in ((18554, 'tcp'), (18554, 'udp'), (11935, 'tcp'), (18890, 'udp')):
+        ok, _msg = _fw_allow(port, proto)
+        if ok:
+            opened.append(f'{port}/{proto}')
+    if opened:
+        _log(f"  CloudTAK streaming ports allowed: {', '.join(opened)}")
 
 
 def _ct_media_converged(check_out):
@@ -27402,7 +27438,10 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
                 "if [ -z \"$m\" ]; then echo NOCONTAINER; exit 0; fi; "
                 "out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
                 "set -- $out; "
-                "if [ \"$1\" = mpegts ] && [ \"$2\" = true ] && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
+                # v10.1.8: compare against the check script's ACTUAL output ("ok ok na").
+                # The old comparison ("mpegts"/"true") never matched → every remote heal
+                # re-applied + restarted the media container needlessly.
+                "if [ \"$1\" = ok ] && { [ \"$2\" = ok ] || [ \"$2\" = na ]; } && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
                 "echo %s | base64 -d | docker exec -i \"$m\" sh && docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL"
             ) % (tries, chk_b64, apply_b64)
             ok, out = _ssh_probe(remote_cfg, cmd, timeout=120)
@@ -69656,6 +69695,39 @@ def _startup_harden_caddy_boot():
 _startup_harden_caddy_boot()
 
 
+def _startup_media_kernel_bufs():
+    """v10.1.8 W5: MediaMTX ≥1.19 (media-infra v9.7.0) requires a ≥4MB kernel UDP
+    read buffer and treats failure as FATAL — the cloudtak-media container
+    crash-loops on the default net.core.rmem_max (~208KB). net.core is a HOST
+    sysctl (not per-container). Fleet constant, harmless on boxes without
+    CloudTAK, so applied unconditionally. Same broker pattern as WS6b: persist
+    via /etc/sysctl.d + apply runtime with `sysctl -w <param>=<val>` (the broker
+    gates sysctl on the parameter namespace, so `-p <file>` is denied non-root)."""
+    sysctl_path = '/etc/sysctl.d/99-takwerx-media-bufs.conf'
+    sysctl_content = 'net.core.rmem_max = 4194304\nnet.core.wmem_max = 4194304\n'
+    try:
+        cur = ''
+        try:
+            with open(sysctl_path) as f:
+                cur = f.read()
+        except Exception:
+            pass
+        if cur.strip() != sysctl_content.strip():
+            _write_priv(sysctl_path, sysctl_content)
+            ok = True
+            for knob in ('net.core.rmem_max=4194304', 'net.core.wmem_max=4194304'):
+                _sr = subprocess.run(_sudo_wrap(['sysctl', '-w', knob]), capture_output=True, timeout=10)
+                ok = ok and _sr.returncode == 0
+            if ok:
+                print('Startup migration: media kernel buffers applied (net.core.rmem/wmem_max=4MB; MediaMTX 1.19 requirement; v10.1.8 W5)')
+            else:
+                print('Startup migration: media kernel buffer file written; runtime apply deferred to next boot')
+    except Exception as _e:
+        print(f'Startup migration: media kernel buffer warning (non-fatal): {_e}')
+
+_startup_media_kernel_bufs()
+
+
 def _startup_ensure_broker():
     """v10.0.5: ensure the privileged broker (takwerx-broker.service) is installed
     + running on every console start. The T&E flow is `git pull + systemctl
@@ -70319,6 +70391,9 @@ def _startup_harden_cloudtak_ports():
                 _cloudtak_media_hls_heal(wait=True)
             else:
                 print(f"Startup migration: CloudTAK recreate warning: {(r.stdout or '')[:200]}")
+        # v10.1.8 W5: Tier-1 streaming ports were never explicitly ALLOWED — on a
+        # default-deny firewall, EUD publishes into CloudTAK leases were dropped.
+        _cloudtak_open_stream_ports()
     except Exception as _e:
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
@@ -74243,6 +74318,7 @@ def _post_update_auto_deploy():
                             _sudo_wrap(['ufw', 'allow', '9997/tcp']), capture_output=True, timeout=10
                         )
                         print("  CloudTAK UFW rules applied (deny 5000,5002,5003,5433,9000,9002,18888; allow 9997 for Caddy video)")
+                        _cloudtak_open_stream_ports()
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
 
