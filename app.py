@@ -7611,10 +7611,15 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         # broader rules (test8's Server One had `host all martiuser 0.0.0.0/0 md5`)
         # that would otherwise match the core box first and make our line dead
         # code. Insert before the FIRST host/hostssl/local rule in the file.
-        f'if ! sudo grep -Eq "^hostssl[[:space:]]+all[[:space:]]+all[[:space:]]+{ip_sed}/32" "$HBA"; then '
+        # Delete-then-insert, ALWAYS. An existing hostssl line is not good enough —
+        # a line appended at the BOTTOM (what earlier code did, and what test8 was
+        # left carrying) sits below broader rules and is never consulted. Removing
+        # ours first and re-inserting at the top makes placement correct on every
+        # run, not just the first.
+        f'sudo sed -i -E "/^hostssl[[:space:]]+all[[:space:]]+all[[:space:]]+{ip_sed}\\/32/d" "$HBA"; '
         f'if sudo grep -Eq "^(host|hostssl|hostnossl|local)[[:space:]]" "$HBA"; then '
         f'sudo sed -i "0,/^\\(host\\|hostssl\\|hostnossl\\|local\\)[[:space:]]/s//hostssl all all {core_ip}\\/32 scram-sha-256\\n&/" "$HBA"; '
-        f'else printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$HBA" >/dev/null; fi; fi; '
+        f'else printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$HBA" >/dev/null; fi; '
         'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
         'echo "SSL=$(sudo -u postgres psql -tAc "show ssl" 2>/dev/null)"'
     )
@@ -7654,9 +7659,13 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         rm_cmd = (
             'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
             '[ -z "$HBA" ] && { echo NO_PG; exit 0; }; '
+            # Count what we actually delete — claiming "plaintext removed" when the
+            # sed matched nothing is a false success report (test8: there was never
+            # a /32 line, yet the migration announced it had removed one).
+            f'N=$(sudo grep -cE "^host[[:space:]]+.*{ip_sed}/32" "$HBA" || true); '
             f'sudo sed -i -E "/^host[[:space:]]+.*{ip_sed}\\/32/d" "$HBA"; '
             'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
-            'echo PLAINTEXT_REMOVED; '
+            'echo "PLAINTEXT_REMOVED=$N"; '
             # Anything still `host` (not hostssl) that isn't loopback-only is a
             # residual cleartext path to this database.
             'echo RESIDUAL_START; '
@@ -7665,8 +7674,11 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         )
         rok, rout = _ssh_probe(s1, rm_cmd, timeout=30)
         out_s = rout or ''
-        if rok and 'PLAINTEXT_REMOVED' in out_s:
-            log.append('DB TLS: plaintext pg_hba line for %s removed.' % core_ip)
+        if rok and 'PLAINTEXT_REMOVED=' in out_s:
+            nrem = out_s.split('PLAINTEXT_REMOVED=', 1)[1].split('\n', 1)[0].strip()
+            log.append('DB TLS: removed %s plaintext pg_hba line(s) for %s.' % (nrem or '0', core_ip)
+                       if nrem not in ('', '0') else
+                       'DB TLS: no dedicated plaintext pg_hba line for %s existed to remove.' % core_ip)
             try:
                 residual = out_s.split('RESIDUAL_START', 1)[1].split('RESIDUAL_END', 1)[0].strip()
             except IndexError:
@@ -7780,6 +7792,32 @@ def _coreconfig_db_tls_converge(cc, settings=None):
         return cc
 
 
+def _split_db_tls_state(value=None):
+    """Read/write the retrofit's completion marker.
+
+    Deliberately a SEPARATE file, not a key in settings.json: the console has many
+    background threads doing load→modify→save on settings, and one of them clobbered
+    this flag on test8 (2026-07-25 — migration wrote it at 02:03:21, an unrelated
+    thread that had loaded earlier re-saved at 02:10:52 and the key vanished). A
+    lost marker means the migration re-runs forever. This file has exactly one
+    writer, so it cannot lose a race."""
+    path = os.path.join(CONFIG_DIR, 'split-db-tls.state')
+    if value is None:
+        try:
+            with open(path) as f:
+                return (f.read() or '').strip()
+        except OSError:
+            return ''
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(str(value).strip())
+        os.chmod(path, 0o600)
+    except OSError as e:
+        print(f"Split DB TLS retrofit: could not persist state marker ({e})", flush=True)
+    return str(value).strip()
+
+
 def _migrate_split_db_tls():
     """v10.1.9 W1 retrofit: encrypt an EXISTING split-box core↔DB link via the normal console
     update path (no operator SSH/start.sh — console-path delivery rule). Runs in a background
@@ -7795,9 +7833,12 @@ def _migrate_split_db_tls():
         time.sleep(90)  # let boot settle: broker, takserver autostart, network
         s = load_settings()
         cfg = _get_tak_deployment_config(s)
-        if cfg.get('mode') != 'two_server' or s.get('split_db_tls_state') == 'enabled':
+        if cfg.get('mode') != 'two_server':
             return
-        attempts = int(s.get('split_db_tls_attempts') or 0)
+        _state = _split_db_tls_state()
+        if _state.startswith('enabled'):
+            return
+        attempts = int(_state.split(':', 1)[1]) if _state.startswith('attempts:') else 0
         if attempts >= 3:
             _p("held after 3 failed attempts — investigate, then clear split_db_tls_attempts in settings to re-arm")
             return
@@ -7872,19 +7913,19 @@ def _migrate_split_db_tls():
                                                              remove_plaintext=True)
             for line in rm_log:
                 _p(line)
-            s = load_settings()
-            s['split_db_tls_state'] = 'enabled'
-            s.pop('split_db_tls_attempts', None)
-            save_settings(s)
-            _p("✓ COMPLETE — core↔DB link is TLS (verify-full pinned), plaintext pg_hba line removed")
+            _split_db_tls_state('enabled')
+            if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log):
+                _p("✓ DONE — the core↔DB link is now TLS (verify-full pinned). NOTE: Server One "
+                   "still accepts non-TLS connections from other clients (listed above) — that "
+                   "residual path is the operator's to close.")
+            else:
+                _p("✓ COMPLETE — core↔DB link is TLS (verify-full pinned) and no cleartext path remains")
             return
         _p("✗ TLS link did NOT verify (%s) — rolling CoreConfig back to the plaintext path"
            % ("connections still plaintext" if saw_plain else "no martiuser connection observed"))
         _write_priv('/opt/tak/CoreConfig.xml', cc_orig)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, timeout=180)
-        s = load_settings()
-        s['split_db_tls_attempts'] = attempts + 1
-        save_settings(s)
+        _split_db_tls_state(f'attempts:{attempts + 1}')
         _p(f"rolled back and takserver restarted; attempt {attempts + 1}/3 recorded — will retry next boot")
     except Exception as e:
         _p(f"error (non-fatal, will retry next boot): {e}")
@@ -72098,7 +72139,7 @@ def _startup_migrations():
         # existing splits (test8, NE-TAK class) get TLS from a normal update, no SSH needed.
         try:
             _sdt_cfg = _get_tak_deployment_config(s)
-            if _sdt_cfg.get('mode') == 'two_server' and s.get('split_db_tls_state') != 'enabled':
+            if _sdt_cfg.get('mode') == 'two_server' and not _split_db_tls_state().startswith('enabled'):
                 threading.Thread(target=_migrate_split_db_tls, daemon=True).start()
                 print("Startup migration: split DB TLS retrofit launched in background", flush=True)
         except Exception as _sdt_e:
