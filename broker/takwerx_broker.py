@@ -1875,6 +1875,56 @@ def _grow_root_fs(root_dev, root_fs, log):
     return ok
 
 
+def _restore_fstab(log):
+    """Undo the fold-in's /home comment-out. EVERY failure path after the fstab
+    edit must call this: a box left with /home commented out does not remount it
+    on the next boot, which is a broken box even though nothing was destroyed."""
+    try:
+        with open('/etc/fstab.takwerx-bak') as f:
+            orig = f.read()
+        with open('/etc/fstab', 'w') as f:
+            f.write(orig)
+        log.append('/etc/fstab restored from backup.')
+        return True
+    except OSError as e:
+        log.append(f'/etc/fstab restore FAILED ({e}) — restore it by hand from /etc/fstab.takwerx-bak.')
+        return False
+
+
+def _home_holders():
+    """Processes holding a cwd / root / exe / open fd under /home.
+
+    A busy /home makes umount fail, and escalating to `umount -l` there is worse
+    than refusing: lazy-detach hides the mount from findmnt while the device stays
+    open, so the lvremove that follows fails with /home ALREADY unmounted and
+    fstab ALREADY rewritten. Enumerate the holders up front instead and refuse
+    while the box is still completely untouched. An operator SSH session sitting
+    in /home/<user> is the usual culprit."""
+    holders = []
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        links = [f'/proc/{pid}/cwd', f'/proc/{pid}/root', f'/proc/{pid}/exe']
+        try:
+            links += [f'/proc/{pid}/fd/{fd}' for fd in os.listdir(f'/proc/{pid}/fd')]
+        except OSError:
+            pass
+        for link in links:
+            try:
+                tgt = os.readlink(link)
+            except OSError:
+                continue
+            if tgt == '/home' or tgt.startswith('/home/'):
+                try:
+                    with open(f'/proc/{pid}/comm') as f:
+                        comm = f.read().strip()
+                except OSError:
+                    comm = '?'
+                holders.append(f'{comm} (pid {pid})')
+                break
+    return sorted(set(holders))
+
+
 def _do_disk_reclaim(req):
     """Execute the reclaim. Returns {'ok':bool,'log':[...],'df_after':str}."""
     mode = req.get('mode')
@@ -1963,6 +2013,30 @@ def _do_disk_reclaim(req):
     os.chmod(backup, 0o600)   # re-assert: tar may recreate the file
     log.append(f'/home staged to {stage} and archived to {backup} (both root-only, 0600).')
 
+    # Running containers pin /home in their mount namespaces — a host umount alone
+    # does NOT release it (field-proven 2026-07-22, needed a reboot). Stop docker
+    # BEFORE looking for holders, so container pins are already gone by then, and
+    # before touching /etc/fstab, so a refusal leaves the box wholly unmodified.
+    docker_was_active = subprocess.run(['systemctl', 'is-active', 'docker'],
+                                       capture_output=True, text=True, timeout=20).stdout.strip() == 'active'
+    if docker_was_active:
+        subprocess.run(['systemctl', 'stop', 'docker'], capture_output=True, timeout=300)
+        subprocess.run(['systemctl', 'stop', 'docker.socket'], capture_output=True, timeout=120)
+        log.append('Docker stopped to release /home mount pins.')
+
+    def _restore_docker():
+        if docker_was_active:
+            subprocess.run(['systemctl', 'start', 'docker'], capture_output=True, timeout=300)
+            log.append('Docker restarted.')
+
+    holders = _home_holders()
+    if holders:
+        _restore_docker()
+        return {'ok': False, 'error': '/home is in use by ' + ', '.join(holders[:8]) +
+                                      ('' if len(holders) <= 8 else f' (+{len(holders) - 8} more)') +
+                                      ' — close them and retry. An SSH session sitting in /home is the '
+                                      'usual one; `cd /` in it is enough. Nothing was changed.', 'log': log}
+
     # fstab: back up, then comment out the /home line.
     try:
         with open('/etc/fstab') as f:
@@ -1980,41 +2054,23 @@ def _do_disk_reclaim(req):
             f.writelines(new)
         log.append('/etc/fstab updated (backup at /etc/fstab.takwerx-bak).')
     except OSError as e:
+        _restore_fstab(log)     # the write itself may have half-landed
+        _restore_docker()
         return {'ok': False, 'error': f'fstab update failed: {e}', 'log': log}
 
-    # Running containers pin /home in their mount namespaces — a host umount alone
-    # does NOT release it (field-proven 2026-07-22, needed a reboot). Stop docker.
-    docker_was_active = subprocess.run(['systemctl', 'is-active', 'docker'],
-                                       capture_output=True, text=True, timeout=20).stdout.strip() == 'active'
-    if docker_was_active:
-        subprocess.run(['systemctl', 'stop', 'docker'], capture_output=True, timeout=300)
-        subprocess.run(['systemctl', 'stop', 'docker.socket'], capture_output=True, timeout=120)
-        log.append('Docker stopped to release /home mount pins.')
-
-    def _restore_docker():
-        if docker_was_active:
-            subprocess.run(['systemctl', 'start', 'docker'], capture_output=True, timeout=300)
-            log.append('Docker restarted.')
-
+    # Plain umount only. If it fails the box is put back exactly as it was — see
+    # _home_holders() for why lazy-detach must never lead into the lvremove below.
     um = subprocess.run(['umount', '/home'], capture_output=True, text=True, timeout=120)
     if um.returncode != 0:
-        subprocess.run(['umount', '-l', '/home'], capture_output=True, timeout=120)
-        still = subprocess.run(['findmnt', '-no', 'SOURCE', '/home'], capture_output=True, text=True, timeout=20)
-        if (still.stdout or '').strip():
-            try:
-                with open('/etc/fstab.takwerx-bak') as f:
-                    orig = f.read()
-                with open('/etc/fstab', 'w') as f:
-                    f.write(orig)
-            except OSError:
-                pass
-            _restore_docker()
-            return {'ok': False, 'error': '/home is still mounted (pinned by a process) — fstab restored, '
-                                          'nothing destroyed. Reboot and retry.', 'log': log}
+        _restore_fstab(log)
+        _restore_docker()
+        return {'ok': False, 'error': '/home would not unmount: ' + (um.stderr or '').strip()[:200] +
+                                      ' — fstab restored, nothing destroyed.', 'log': log}
     log.append('/home unmounted.')
 
     rm = subprocess.run(['lvremove', '-f', lv_path], capture_output=True, text=True, timeout=300)
     if rm.returncode != 0:
+        _restore_fstab(log)     # MUST precede the remount — `mount /home` reads fstab
         subprocess.run(['mount', '/home'], capture_output=True, timeout=60)
         _restore_docker()
         return {'ok': False, 'error': 'lvremove failed: ' + (rm.stderr or '')[:200] +
