@@ -7585,7 +7585,48 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         return False, ['DB TLS: Server One host failed validation, refusing shell interpolation.'], ''
     is_ip = bool(re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', s1_host))
     san = f'IP:{s1_host}' if is_ip else f'DNS:{s1_host}'
-    ip_sed = core_ip.replace('.', r'\.')
+
+    # v10.1.9 W1 FIX (found on the first fresh two-server DEPLOY, AWS 2026-07-25):
+    # the hostssl rule must name the address Server One ACTUALLY sees the core
+    # arrive from — which is NOT necessarily settings['server_ip'].
+    #
+    # `_resolve_core_ip()` returns the box's PUBLIC address. That is right when the
+    # split is addressed publicly (SSD Nodes class, where the two boxes talk over
+    # the internet), and WRONG whenever Server One is addressed privately: on AWS
+    # with Server One at 172.31.41.4 the core arrives from 172.31.43.128, so a
+    # `hostssl <public>/32` rule never matches and the connection silently falls
+    # through to TAK's own stock `host all martiuser 0.0.0.0/0 md5`. Traffic still
+    # ended up encrypted (the JDBC side pins verify-full), but ONLY client-side —
+    # the server was not requiring it, so a CoreConfig reset by a TAK upgrade would
+    # silently downgrade the link to cleartext with nothing to notice.
+    #
+    # Server One already knows the answer: sshd sets $SSH_CLIENT on the session the
+    # console is driving, and that is the source address AFTER any NAT. Union it
+    # with core_ip so both the private and public routes are covered. Same
+    # `$SSH_CLIENT ∪ server_ip` shape that fixed the Guard Dog health agent.
+    core_ips = []
+    src_ok, src_out = _ssh_probe(s1, 'echo "SRC=${SSH_CLIENT%% *}"', timeout=20)
+    if src_ok:
+        for _line in (src_out or '').splitlines():
+            if _line.startswith('SRC='):
+                _cand = _line.split('=', 1)[1].strip()
+                if _valid_core_ip(_cand):
+                    core_ips.append(_cand)
+                break
+    if core_ip not in core_ips:
+        core_ips.append(core_ip)          # always keep the configured/public route
+
+    # Delete-then-insert each, ALWAYS, so placement is corrected on every run and
+    # never left below a broader rule (pg_hba is first-match-wins).
+    hba_cmd = ''
+    for _ip in core_ips:
+        _ip_sed = _ip.replace('.', r'\.')
+        hba_cmd += (
+            f'sudo sed -i -E "/^hostssl[[:space:]]+all[[:space:]]+all[[:space:]]+{_ip_sed}\\/32/d" "$HBA"; '
+            f'if sudo grep -Eq "^(host|hostssl|hostnossl|local)[[:space:]]" "$HBA"; then '
+            f'sudo sed -i "0,/^\\(host\\|hostssl\\|hostnossl\\|local\\)[[:space:]]/s//hostssl all all {_ip}\\/32 scram-sha-256\\n&/" "$HBA"; '
+            f'else printf "\\nhostssl all all {_ip}/32 scram-sha-256\\n" | sudo tee -a "$HBA" >/dev/null; fi; '
+        )
 
     cfg_cmd = (
         'DATA=$(sudo -u postgres psql -tAc "show data_directory" 2>/dev/null); '
@@ -7616,10 +7657,7 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         # left carrying) sits below broader rules and is never consulted. Removing
         # ours first and re-inserting at the top makes placement correct on every
         # run, not just the first.
-        f'sudo sed -i -E "/^hostssl[[:space:]]+all[[:space:]]+all[[:space:]]+{ip_sed}\\/32/d" "$HBA"; '
-        f'if sudo grep -Eq "^(host|hostssl|hostnossl|local)[[:space:]]" "$HBA"; then '
-        f'sudo sed -i "0,/^\\(host\\|hostssl\\|hostnossl\\|local\\)[[:space:]]/s//hostssl all all {core_ip}\\/32 scram-sha-256\\n&/" "$HBA"; '
-        f'else printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$HBA" >/dev/null; fi; '
+        + hba_cmd +
         'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
         'echo "SSL=$(sudo -u postgres psql -tAc "show ssl" 2>/dev/null)"'
     )
@@ -7631,8 +7669,12 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         return False, ['DB TLS: certificate generation failed on Server One: ' + out[:300]], ''
     if 'SSL=on' not in out:
         return False, ['DB TLS: ssl did not report on after reload: ' + out[:300]], ''
-    log.append('DB TLS: cert %s, ssl=on, hostssl %s/32 scram-sha-256 in pg_hba.'
-               % ('generated' if 'CERT_GENERATED' in out else 'already present', core_ip))
+    log.append('DB TLS: cert %s, ssl=on, hostssl %s scram-sha-256 in pg_hba.'
+               % ('generated' if 'CERT_GENERATED' in out else 'already present',
+                  ', '.join(f'{_i}/32' for _i in core_ips)))
+    if len(core_ips) > 1:
+        log.append('DB TLS: Server One sees the core arrive from %s; %s (configured) also allowed.'
+                   % (core_ips[0], core_ips[-1]))
 
     if db_password:
         sql = "ALTER USER martiuser WITH PASSWORD '" + db_password.replace("'", "''") + "'"
@@ -7656,16 +7698,39 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         # silently deleting an operator's ACL could take them down. Instead we DETECT
         # any remaining non-TLS rule that still admits the core box and surface it
         # loudly, because while one exists the plaintext path is not actually closed.
+        # v10.1.9 W1 FIX: ALSO drop TAK Server's own stock permissive rule.
+        # `host all martiuser 0.0.0.0/0 md5` appeared on a BRAND-NEW Server One
+        # minutes after a fresh deploy, with no human ever touching its pg_hba
+        # (AWS two-server validation, 2026-07-25) — and `git log -S'0.0.0.0/0'`
+        # proves infra-TAK has never written one. So it is TAK's own db-setup
+        # artifact present on every split box, NOT an operator ACL, which is what
+        # makes removing it safe. Anything we do NOT recognise is still left alone
+        # and reported. Only ever reached with remove_plaintext=True, which the
+        # retrofit sets solely AFTER verifying a live TLS connection.
+        stock = r'^host[[:space:]]+all[[:space:]]+(martiuser|all)[[:space:]]+0\.0\.0\.0/0[[:space:]]'
+        # The pattern contains a literal '/' (0.0.0.0/0), which would terminate a
+        # sed /addr/ delimiter — escape it for sed, leave it plain for grep.
+        stock_sed = stock.replace('/', r'\/')
+        _sed_ips = [ip.replace('.', r'\.') for ip in core_ips]
+        dels = ''.join(
+            f'sudo sed -i -E "/^host[[:space:]]+.*{s}\\/32/d" "$HBA"; ' for s in _sed_ips)
+        counts = ' + '.join(
+            f'$(sudo grep -cE "^host[[:space:]]+.*{s}/32" "$HBA" || true)' for s in _sed_ips)
         rm_cmd = (
             'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
             '[ -z "$HBA" ] && { echo NO_PG; exit 0; }; '
+            # Back up before ANY edit — this file is the box's access control.
+            'sudo cp -a "$HBA" "$HBA.takwerx-bak" 2>/dev/null; '
             # Count what we actually delete — claiming "plaintext removed" when the
             # sed matched nothing is a false success report (test8: there was never
             # a /32 line, yet the migration announced it had removed one).
-            f'N=$(sudo grep -cE "^host[[:space:]]+.*{ip_sed}/32" "$HBA" || true); '
-            f'sudo sed -i -E "/^host[[:space:]]+.*{ip_sed}\\/32/d" "$HBA"; '
+            f'N=$(( {counts} )); '
+            f'S=$(sudo grep -cE \'{stock}\' "$HBA" || true); '
+            + dels +
+            f'sudo sed -i -E "/{stock_sed}/d" "$HBA"; '
             'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
             'echo "PLAINTEXT_REMOVED=$N"; '
+            'echo "STOCK_REMOVED=$S"; '
             # Anything still `host` (not hostssl) that isn't loopback-only is a
             # residual cleartext path to this database.
             'echo RESIDUAL_START; '
@@ -7676,9 +7741,16 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         out_s = rout or ''
         if rok and 'PLAINTEXT_REMOVED=' in out_s:
             nrem = out_s.split('PLAINTEXT_REMOVED=', 1)[1].split('\n', 1)[0].strip()
-            log.append('DB TLS: removed %s plaintext pg_hba line(s) for %s.' % (nrem or '0', core_ip)
+            _ips_txt = ', '.join(core_ips)
+            log.append('DB TLS: removed %s plaintext pg_hba line(s) for %s.' % (nrem, _ips_txt)
                        if nrem not in ('', '0') else
-                       'DB TLS: no dedicated plaintext pg_hba line for %s existed to remove.' % core_ip)
+                       'DB TLS: no dedicated plaintext pg_hba line for %s existed to remove.' % _ips_txt)
+            srem = (out_s.split('STOCK_REMOVED=', 1)[1].split('\n', 1)[0].strip()
+                    if 'STOCK_REMOVED=' in out_s else '')
+            if srem not in ('', '0'):
+                log.append("DB TLS: removed %s of TAK Server's own stock `host all <user> 0.0.0.0/0` "
+                           'rule(s) — the cleartext-from-anywhere path is now closed '
+                           '(pg_hba backed up alongside itself as .takwerx-bak).' % srem)
             try:
                 residual = out_s.split('RESIDUAL_START', 1)[1].split('RESIDUAL_END', 1)[0].strip()
             except IndexError:
