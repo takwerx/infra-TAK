@@ -7606,10 +7606,14 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         'ssl_key_file = \'%s/infratak-db.key\' # infra-TAK-dbtls\\n'
         'password_encryption = scram-sha-256 # infra-TAK-dbtls\\n" "$DATA" "$DATA" '
         '| sudo tee -a "$CONF" >/dev/null; '
-        # hostssl above any plaintext host line for core_ip (pg_hba is first-match-wins).
-        f'if ! sudo grep -Eq "^hostssl[[:space:]].*{ip_sed}/32" "$HBA"; then '
-        f'if sudo grep -Eq "^host[[:space:]].*{ip_sed}/32" "$HBA"; then '
-        f'sudo sed -i "0,/^host[[:space:]].*{ip_sed}\\/32.*/s//hostssl all all {core_ip}\\/32 scram-sha-256\\n&/" "$HBA"; '
+        # hostssl must go ABOVE **every** existing host rule, not just an exact
+        # <core_ip>/32 match. pg_hba is first-match-wins, and real boxes carry
+        # broader rules (test8's Server One had `host all martiuser 0.0.0.0/0 md5`)
+        # that would otherwise match the core box first and make our line dead
+        # code. Insert before the FIRST host/hostssl/local rule in the file.
+        f'if ! sudo grep -Eq "^hostssl[[:space:]]+all[[:space:]]+all[[:space:]]+{ip_sed}/32" "$HBA"; then '
+        f'if sudo grep -Eq "^(host|hostssl|hostnossl|local)[[:space:]]" "$HBA"; then '
+        f'sudo sed -i "0,/^\\(host\\|hostssl\\|hostnossl\\|local\\)[[:space:]]/s//hostssl all all {core_ip}\\/32 scram-sha-256\\n&/" "$HBA"; '
         f'else printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$HBA" >/dev/null; fi; fi; '
         'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
         'echo "SSL=$(sudo -u postgres psql -tAc "show ssl" 2>/dev/null)"'
@@ -7640,17 +7644,42 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
 
     if remove_plaintext:
         # Only the retrofit calls this, and only after verifying a live TLS connection.
+        #
+        # We remove ONLY the exact `<core_ip>/32` line infra-TAK itself wrote. We do
+        # NOT touch broader operator rules (e.g. `host all martiuser 0.0.0.0/0 md5`,
+        # found live on test8's Server One) — other consumers may depend on them and
+        # silently deleting an operator's ACL could take them down. Instead we DETECT
+        # any remaining non-TLS rule that still admits the core box and surface it
+        # loudly, because while one exists the plaintext path is not actually closed.
         rm_cmd = (
             'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
             '[ -z "$HBA" ] && { echo NO_PG; exit 0; }; '
             f'sudo sed -i -E "/^host[[:space:]]+.*{ip_sed}\\/32/d" "$HBA"; '
-            'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; echo PLAINTEXT_REMOVED'
+            'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
+            'echo PLAINTEXT_REMOVED; '
+            # Anything still `host` (not hostssl) that isn't loopback-only is a
+            # residual cleartext path to this database.
+            'echo RESIDUAL_START; '
+            'sudo grep -E "^host[[:space:]]" "$HBA" | grep -vE "127\\.0\\.0\\.1/32|::1/128" || true; '
+            'echo RESIDUAL_END'
         )
         rok, rout = _ssh_probe(s1, rm_cmd, timeout=30)
-        if rok and 'PLAINTEXT_REMOVED' in (rout or ''):
+        out_s = rout or ''
+        if rok and 'PLAINTEXT_REMOVED' in out_s:
             log.append('DB TLS: plaintext pg_hba line for %s removed.' % core_ip)
+            try:
+                residual = out_s.split('RESIDUAL_START', 1)[1].split('RESIDUAL_END', 1)[0].strip()
+            except IndexError:
+                residual = ''
+            if residual:
+                log.append('DB TLS ⚠ RESIDUAL CLEARTEXT PATH — Server One still has non-TLS '
+                           'pg_hba rule(s) that admit remote clients. The core↔DB link is now '
+                           'encrypted, but these leave another way in and are NOT ours to delete '
+                           '(other consumers may rely on them). Operator review required:')
+                for line in residual.splitlines()[:6]:
+                    log.append('    ' + line.strip())
         else:
-            log.append('DB TLS warning: could not remove plaintext pg_hba line — ' + (rout or '')[:200])
+            log.append('DB TLS warning: could not remove plaintext pg_hba line — ' + out_s[:200])
 
     pok, pem = _ssh_probe(s1, 'DATA=$(sudo -u postgres psql -tAc "show data_directory" 2>/dev/null); sudo cat "$DATA/infratak-db.crt"', timeout=20)
     pem = (pem or '').strip()
@@ -7711,14 +7740,25 @@ def _coreconfig_db_tls_converge(cc, settings=None):
         stamp_ok = pem.startswith('-----BEGIN CERTIFICATE-----')
         if stamp_ok:
             # Materialize the pinned root cert (idempotent, tak-readable).
-            existing = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip()
+            # NB: _read_priv RAISES (BrokerError / CalledProcessError) when the path
+            # doesn't exist — which is ALWAYS true on the first run. Treat "cannot
+            # read" as "not present yet", never as a reason to abort: swallowing it
+            # here is what made the stamp a silent no-op on every non-root box
+            # (caught live on test8 2026-07-25, first real run of this code).
+            try:
+                existing = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip()
+            except Exception:
+                existing = ''
             if existing != pem:
-                subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.dirname(TAK_DB_TLS_ROOTCERT_PATH)]),
-                               capture_output=True, timeout=15)
+                _makedirs_priv(os.path.dirname(TAK_DB_TLS_ROOTCERT_PATH))
                 _write_priv(TAK_DB_TLS_ROOTCERT_PATH, pem + '\n')
                 subprocess.run(_sudo_wrap(['chown', 'tak:tak', TAK_DB_TLS_ROOTCERT_PATH]), capture_output=True, timeout=15)
                 subprocess.run(_sudo_wrap(['chmod', '644', TAK_DB_TLS_ROOTCERT_PATH]), capture_output=True, timeout=15)
-                stamp_ok = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip() == pem
+                try:
+                    stamp_ok = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip() == pem
+                except Exception as _ce:
+                    print(f"DB TLS converge: pinned cert unreadable after write ({_ce}) — not stamping", flush=True)
+                    stamp_ok = False
 
         def _stamp(m):
             attrs, close = m.group(1), m.group(2)
@@ -7733,7 +7773,10 @@ def _coreconfig_db_tls_converge(cc, settings=None):
             return (attrs + ' sslEnabled="true" sslMode="verify-full" sslRootCert="'
                     + TAK_DB_TLS_ROOTCERT_PATH + '"' + close)
         return re.sub(r'(<connection\b[^>]*?)(\s*/?>)', _stamp, cc)
-    except Exception:
+    except Exception as e:
+        # Return the input unchanged (never corrupt CoreConfig) but SAY SO — a
+        # silent return here hid a total failure behind "no CoreConfig change".
+        print(f"DB TLS converge: skipped, returning CoreConfig unchanged ({e})", flush=True)
         return cc
 
 
