@@ -7933,6 +7933,33 @@ def _harden_sensitive_permissions(plog=None):
     return fixed
 
 
+# v10.1.9 W1: bump whenever the retrofit's BEHAVIOUR changes, so boxes that
+# already recorded completion under an older build get the new pass exactly once.
+# 1 = original. 2 = $SSH_CLIENT-scoped hostssl + removal of TAK's stock
+#     `host all <user> 0.0.0.0/0` rule.
+SPLIT_DB_TLS_FIX_VERSION = 2
+
+
+def _split_db_tls_complete(state=None):
+    """True only when the retrofit has run AND at the CURRENT fix version.
+
+    Without this, a marker written by an older build locks the box out of every
+    later fix forever — test8 recorded plain 'enabled' before the stock-rule
+    removal existed, so it would have kept its cleartext path with the migration
+    permanently skipped. Legacy 'enabled' parses as v1 and therefore re-runs once.
+    Uses '@v' rather than ':' so it cannot collide with the 'attempts:N' form."""
+    s = (state if state is not None else _split_db_tls_state()) or ''
+    if not s.startswith('enabled'):
+        return False
+    ver = 1
+    if '@v' in s:
+        try:
+            ver = int(s.split('@v', 1)[1])
+        except ValueError:
+            ver = 1
+    return ver >= SPLIT_DB_TLS_FIX_VERSION
+
+
 def _split_db_tls_state(value=None):
     """Read/write the retrofit's completion marker.
 
@@ -7977,8 +8004,11 @@ def _migrate_split_db_tls():
         if cfg.get('mode') != 'two_server':
             return
         _state = _split_db_tls_state()
-        if _state.startswith('enabled'):
+        if _split_db_tls_complete(_state):
             return
+        if _state.startswith('enabled'):
+            _p(f"re-running: marker is {_state or 'enabled'} (fix v1), current fix version is "
+               f"v{SPLIT_DB_TLS_FIX_VERSION} — applying the newer pass once")
         attempts = int(_state.split(':', 1)[1]) if _state.startswith('attempts:') else 0
         if attempts >= 3:
             _p("held after 3 failed attempts — investigate, then clear split_db_tls_attempts in settings to re-arm")
@@ -8058,10 +8088,12 @@ def _migrate_split_db_tls():
             # is then skipped forever, so a residual cleartext rule we deliberately
             # chose not to delete would be announced in a single journal line and
             # never mentioned again — the operator's cue to close it disappears.
-            # 'enabled-residual' still satisfies the startswith('enabled') skip, so
-            # the migration stays one-shot; it just keeps re-warning on every boot.
-            _split_db_tls_state('enabled-residual'
-                                if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log) else 'enabled')
+            # 'enabled-residual' still counts as complete, so the migration stays
+            # one-shot; it just keeps re-warning on every boot. The @v suffix is
+            # what lets a LATER fix reach this box exactly once (see
+            # _split_db_tls_complete) instead of being skipped forever.
+            _split_db_tls_state(('enabled-residual' if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log)
+                                 else 'enabled') + f'@v{SPLIT_DB_TLS_FIX_VERSION}')
             if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log):
                 _p("✓ DONE — the core↔DB link is now TLS (verify-full pinned). NOTE: Server One "
                    "still accepts non-TLS connections from other clients (listed above) — that "
@@ -64849,6 +64881,25 @@ def run_takserver_deploy(config):
         log_step(f"  Admin cert: /opt/tak/certs/files/admin.p12")
         deploy_status.update({'complete': True, 'running': False})
 
+        # v10.1.9 W1: close the split-deploy cleartext window immediately.
+        # TAK Server's OWN db setup writes `host all martiuser 0.0.0.0/0 md5` into
+        # Server One's pg_hba while this deploy runs, and the deploy's TLS step
+        # deliberately does NOT remove it (removal is only safe AFTER a live TLS
+        # connection is verified, and TAK has not connected yet at that point). So
+        # a freshly deployed split box carried that cleartext rule until the next
+        # console restart — could be days. TAK is up and connected by here, so kick
+        # the retrofit now: it verifies TLS live, then removes the rule. It is
+        # idempotent and self-skipping, so this is safe even if nothing needs doing.
+        try:
+            if (_get_tak_deployment_config(load_settings()).get('mode') == 'two_server'
+                    and not _split_db_tls_complete()):
+                threading.Thread(target=_migrate_split_db_tls, daemon=True).start()
+                log_step("Split DB TLS: verifying the core↔DB link and closing any cleartext path "
+                         "(runs in the background; see the console log).")
+        except Exception as _sdt_e:
+            log_step(f"Split DB TLS: could not start the post-deploy pass ({_sdt_e}) — "
+                     "it will run on the next console restart.")
+
         # Auto-deploy Guard Dog so it runs from the start (user can disable or configure notifications later)
         if not os.path.exists('/opt/tak-guarddog'):
             log_step("")
@@ -72477,10 +72528,10 @@ def _startup_migrations():
         try:
             _sdt_cfg = _get_tak_deployment_config(s)
             _sdt_state = _split_db_tls_state() if _sdt_cfg.get('mode') == 'two_server' else 'n/a'
-            if _sdt_cfg.get('mode') == 'two_server' and not _sdt_state.startswith('enabled'):
+            if _sdt_cfg.get('mode') == 'two_server' and not _split_db_tls_complete(_sdt_state):
                 threading.Thread(target=_migrate_split_db_tls, daemon=True).start()
                 print("Startup migration: split DB TLS retrofit launched in background", flush=True)
-            elif _sdt_state == 'enabled-residual':
+            elif _sdt_state.startswith('enabled-residual'):
                 # Re-assert every boot. The core<->DB link IS encrypted; what remains
                 # is a broader non-TLS pg_hba rule that is not ours to delete. Saying
                 # it once and going quiet reads as "handled" when it is not.
