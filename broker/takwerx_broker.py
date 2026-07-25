@@ -199,6 +199,12 @@ EXEC_ALLOW = {
     'getenforce', 'getsebool', 'restorecon', 'semanage', 'semodule', 'chcon',
     # read-only inspection (routed for a single audit point)
     'ss', 'ip', 'getent', 'getcap',
+    # v10.1.9 W2: LVM/mount REPORTING tools — pure read-only (they have no write
+    # subcommand at all), same class as `ss`/`ip`. Needed by the disk-layout
+    # detector to see stranded space. The MUTATING LVM ops (lvextend/lvremove/
+    # xfs_growfs/resize2fs) are deliberately NOT here — they are reachable only
+    # through the fixed-shape `disk_reclaim` op below, never as free-form argv.
+    'lvs', 'vgs', 'pvs', 'findmnt', 'lsblk',
     # v10.1.0: `wg show …` is read-only WireGuard inspection (relay tunnel status /
     # handshake age for the connectivity anchor + Guard Dog relay health). Gated to
     # the `show` subcommand only — `wg set`/`setconf`/`genkey` are denied (see
@@ -1801,6 +1807,209 @@ def _check_openssl_cnf_write(req):
                      '— this file can load code, so only the one known edit is allowed)')
 
 
+#
+# v10.1.9 W2/WI-3 — disk reclaim (fixed-shape op, NOT free-form argv)
+#
+# Fresh installs strand most of the disk away from TAK: RHEL/Anaconda parks it in
+# a separate /home LV, Ubuntu leaves unallocated VG extents. Reclaiming it needs
+# lvextend/lvremove/xfs_growfs/resize2fs — a set that, as free-form argv, is an
+# arbitrary data-destruction primitive (`lvremove vg/root`). So it is exposed ONLY
+# as this one op, whose entire argument surface is {mode, confirm_lv}: the broker
+# resolves every device itself and enforces its own pre-flight.
+#
+# Two modes:
+#   grow_free  — non-destructive: extend root into FREE extents + grow the FS.
+#   fold_home  — DESTRUCTIVE: back up /home, unmount it, lvremove it, absorb into
+#                root. Guarded by: /home must be a separate LV in root's VG, its
+#                used bytes must be under FOLD_HOME_MAX_USED, and the caller must
+#                echo back the exact LV path it means to destroy (confirm_lv).
+# The console layers its own operator password re-confirm on top (WI-3 route).
+FOLD_HOME_MAX_USED = 2 * 1024 ** 3      # 2 GiB — refuse to fold a /home in real use
+_DISK_RECLAIM_MODES = ('grow_free', 'fold_home')
+
+
+def _check_disk_reclaim(req):
+    mode = req.get('mode')
+    if mode not in _DISK_RECLAIM_MODES:
+        raise Denied(f'disk_reclaim: mode must be one of {_DISK_RECLAIM_MODES}')
+    if mode == 'fold_home':
+        cl = req.get('confirm_lv')
+        if not isinstance(cl, str) or not cl.strip():
+            raise Denied('disk_reclaim fold_home: confirm_lv (the exact LV to destroy) is required')
+        # Never let the confirmation name root/swap even if the caller insists.
+        if re.search(r'/(root|swap)$', cl.strip()):
+            raise Denied(f'disk_reclaim: refusing to remove {cl} — only a /home LV may be folded in')
+
+
+def _lvm_root_info():
+    """Resolve (root_dev, root_fstype, vg, root_lv) from the live system. Returns
+    None for any piece we cannot determine; callers must treat that as 'refuse'."""
+    def _run(argv):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+    root_dev = _run(['findmnt', '-no', 'SOURCE', '/'])
+    root_fs = _run(['findmnt', '-no', 'FSTYPE', '/'])
+    vg = _run(['lvs', '--noheadings', '-o', 'vg_name', root_dev]).strip() if root_dev else ''
+    lv = _run(['lvs', '--noheadings', '-o', 'lv_name', root_dev]).strip() if root_dev else ''
+    return root_dev, root_fs, vg, lv
+
+
+def _grow_root_fs(root_dev, root_fs, log):
+    if root_fs == 'xfs':
+        r = subprocess.run(['xfs_growfs', '/'], capture_output=True, text=True, timeout=300)
+    elif root_fs in ('ext2', 'ext3', 'ext4'):
+        r = subprocess.run(['resize2fs', root_dev], capture_output=True, text=True, timeout=600)
+    else:
+        log.append(f'Unknown root filesystem {root_fs!r} — LV grown but filesystem NOT resized.')
+        return False
+    ok = r.returncode == 0
+    log.append(('Filesystem grown.' if ok else 'Filesystem grow FAILED: ' + (r.stderr or '')[:200]))
+    return ok
+
+
+def _do_disk_reclaim(req):
+    """Execute the reclaim. Returns {'ok':bool,'log':[...],'df_after':str}."""
+    mode = req.get('mode')
+    log = []
+    root_dev, root_fs, vg, root_lv = _lvm_root_info()
+    if not (root_dev and vg and root_lv):
+        return {'ok': False, 'error': 'root is not an LVM logical volume — nothing to reclaim', 'log': log}
+
+    if mode == 'grow_free':
+        r = subprocess.run(['vgs', '--noheadings', '-o', 'vg_free', '--units', 'b', vg],
+                           capture_output=True, text=True, timeout=20)
+        free_b = int(re.sub(r'\D', '', r.stdout or '0') or 0)
+        if free_b < 1024 ** 3:
+            return {'ok': False, 'error': 'no free extents to reclaim (need ≥1 GiB)', 'log': log}
+        e = subprocess.run(['lvextend', '-l', '+100%FREE', f'{vg}/{root_lv}'],
+                           capture_output=True, text=True, timeout=300)
+        if e.returncode != 0:
+            return {'ok': False, 'error': 'lvextend failed: ' + (e.stderr or '')[:200], 'log': log}
+        log.append(f'Root LV extended into {free_b // 1024 ** 3} GB of free extents.')
+        _grow_root_fs(root_dev, root_fs, log)
+        df = subprocess.run(['df', '-h', '/'], capture_output=True, text=True, timeout=15)
+        return {'ok': True, 'log': log, 'df_after': (df.stdout or '').strip()}
+
+    # ---- fold_home: DESTRUCTIVE ----
+    home_dev = subprocess.run(['findmnt', '-no', 'SOURCE', '/home'],
+                              capture_output=True, text=True, timeout=20)
+    home_dev = (home_dev.stdout or '').strip()
+    if not home_dev:
+        return {'ok': False, 'error': '/home is not a separate mount — nothing to fold', 'log': log}
+    hv = subprocess.run(['lvs', '--noheadings', '-o', 'vg_name,lv_name', home_dev],
+                        capture_output=True, text=True, timeout=20)
+    parts = (hv.stdout or '').split()
+    if hv.returncode != 0 or len(parts) < 2:
+        return {'ok': False, 'error': '/home is not an LVM volume — refusing', 'log': log}
+    home_vg, home_lv = parts[0], parts[1]
+    if home_vg != vg:
+        return {'ok': False, 'error': f'/home LV is in VG {home_vg}, root is in {vg} — refusing', 'log': log}
+    lv_path = f'{home_vg}/{home_lv}'
+    if (req.get('confirm_lv') or '').strip() not in (lv_path, f'/dev/{lv_path}', home_dev):
+        return {'ok': False, 'error': f'confirm_lv does not match the resolved /home LV ({lv_path})', 'log': log}
+
+    used = subprocess.run(['df', '-B1', '--output=used', '/home'], capture_output=True, text=True, timeout=20)
+    used_b = int(re.sub(r'\D', '', (used.stdout or '').splitlines()[-1]) or 0) if used.returncode == 0 else -1
+    if used_b < 0:
+        return {'ok': False, 'error': 'could not measure /home usage — refusing', 'log': log}
+    if used_b > FOLD_HOME_MAX_USED:
+        return {'ok': False, 'error': f'/home holds {used_b // 1024 ** 2} MB (limit '
+                                      f'{FOLD_HOME_MAX_USED // 1024 ** 2} MB) — refusing to fold a /home in real use',
+                'log': log}
+    log.append(f'/home is {lv_path}, {used_b // 1024 ** 2} MB used — within the fold-in limit.')
+
+    stage = '/var/tmp/takwerx-home-fold'
+    backup = '/var/tmp/takwerx-home-backup.tar.gz'
+    subprocess.run(['rm', '-rf', stage], capture_output=True, timeout=60)
+    os.makedirs(stage, exist_ok=True)
+    rs = subprocess.run(['rsync', '-aXS', '/home/', stage + '/'], capture_output=True, text=True, timeout=1800)
+    if rs.returncode != 0:
+        return {'ok': False, 'error': 'rsync of /home failed: ' + (rs.stderr or '')[:200], 'log': log}
+    tb = subprocess.run(['tar', 'czf', backup, '-C', stage, '.'], capture_output=True, text=True, timeout=1800)
+    if tb.returncode != 0:
+        return {'ok': False, 'error': 'tar backup of /home failed: ' + (tb.stderr or '')[:200], 'log': log}
+    log.append(f'/home staged to {stage} and archived to {backup}.')
+
+    # fstab: back up, then comment out the /home line.
+    try:
+        with open('/etc/fstab') as f:
+            fstab = f.read()
+        with open('/etc/fstab.takwerx-bak', 'w') as f:
+            f.write(fstab)
+        new = []
+        for line in fstab.splitlines(True):
+            fields = line.split()
+            if not line.lstrip().startswith('#') and len(fields) > 1 and fields[1] == '/home':
+                new.append('#' + line)      # v10.1.9 fold-in
+            else:
+                new.append(line)
+        with open('/etc/fstab', 'w') as f:
+            f.writelines(new)
+        log.append('/etc/fstab updated (backup at /etc/fstab.takwerx-bak).')
+    except OSError as e:
+        return {'ok': False, 'error': f'fstab update failed: {e}', 'log': log}
+
+    # Running containers pin /home in their mount namespaces — a host umount alone
+    # does NOT release it (field-proven 2026-07-22, needed a reboot). Stop docker.
+    docker_was_active = subprocess.run(['systemctl', 'is-active', 'docker'],
+                                       capture_output=True, text=True, timeout=20).stdout.strip() == 'active'
+    if docker_was_active:
+        subprocess.run(['systemctl', 'stop', 'docker'], capture_output=True, timeout=300)
+        subprocess.run(['systemctl', 'stop', 'docker.socket'], capture_output=True, timeout=120)
+        log.append('Docker stopped to release /home mount pins.')
+
+    def _restore_docker():
+        if docker_was_active:
+            subprocess.run(['systemctl', 'start', 'docker'], capture_output=True, timeout=300)
+            log.append('Docker restarted.')
+
+    um = subprocess.run(['umount', '/home'], capture_output=True, text=True, timeout=120)
+    if um.returncode != 0:
+        subprocess.run(['umount', '-l', '/home'], capture_output=True, timeout=120)
+        still = subprocess.run(['findmnt', '-no', 'SOURCE', '/home'], capture_output=True, text=True, timeout=20)
+        if (still.stdout or '').strip():
+            try:
+                with open('/etc/fstab.takwerx-bak') as f:
+                    orig = f.read()
+                with open('/etc/fstab', 'w') as f:
+                    f.write(orig)
+            except OSError:
+                pass
+            _restore_docker()
+            return {'ok': False, 'error': '/home is still mounted (pinned by a process) — fstab restored, '
+                                          'nothing destroyed. Reboot and retry.', 'log': log}
+    log.append('/home unmounted.')
+
+    rm = subprocess.run(['lvremove', '-f', lv_path], capture_output=True, text=True, timeout=300)
+    if rm.returncode != 0:
+        subprocess.run(['mount', '/home'], capture_output=True, timeout=60)
+        _restore_docker()
+        return {'ok': False, 'error': 'lvremove failed: ' + (rm.stderr or '')[:200] +
+                                      ' — /home remounted, nothing destroyed.', 'log': log}
+    log.append(f'{lv_path} removed.')
+
+    ex = subprocess.run(['lvextend', '-l', '+100%FREE', f'{vg}/{root_lv}'],
+                        capture_output=True, text=True, timeout=300)
+    if ex.returncode != 0:
+        _restore_docker()
+        return {'ok': False, 'error': 'lvextend failed after removing /home: ' + (ex.stderr or '')[:200] +
+                                      f' — data is safe in {backup}.', 'log': log}
+    _grow_root_fs(root_dev, root_fs, log)
+
+    # Restore the dotfiles into the now-plain /home directory.
+    os.makedirs('/home', exist_ok=True)
+    subprocess.run(['rsync', '-aXS', stage + '/', '/home/'], capture_output=True, timeout=1800)
+    subprocess.run(['restorecon', '-R', '/home'], capture_output=True, timeout=300)
+    log.append(f'/home contents restored (archive kept at {backup}).')
+    _restore_docker()
+
+    df = subprocess.run(['df', '-h', '/'], capture_output=True, text=True, timeout=15)
+    return {'ok': True, 'log': log, 'df_after': (df.stdout or '').strip(), 'backup': backup}
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -1818,6 +2027,8 @@ def _evaluate(req):
             _check_pg_restore(req)
         elif op == 'pgminer_scan':
             _check_pgminer_scan(req)
+        elif op == 'disk_reclaim':
+            _check_disk_reclaim(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -1898,9 +2109,14 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore', 'pgminer_scan'):
+    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim'):
         verdict, reason = _evaluate(req)
-        summary = req.get('container', '') if op == 'pgminer_scan' else _summary(req)
+        if op == 'pgminer_scan':
+            summary = req.get('container', '')
+        elif op == 'disk_reclaim':
+            summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
+        else:
+            summary = _summary(req)
         if verdict == 'DENY':
             # fail-closed in BOTH modes — new ops, nothing legacy to preserve
             audit(peer, op, summary, 'DENY', reason)
@@ -1910,6 +2126,8 @@ def _dispatch(req, peer):
             return _do_pg_dump(req)
         if op == 'pg_restore':
             return _do_pg_restore(req)
+        if op == 'disk_reclaim':
+            return _do_disk_reclaim(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)

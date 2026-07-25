@@ -698,7 +698,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.8-alpha"
+VERSION = "10.1.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -767,7 +767,9 @@ def _get_netbird_target_images(settings=None):
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
-MEDIAMTX_EDITOR_REF = "main"  # set to release tag (e.g. v1.1.9) for deterministic editor deploys
+MEDIAMTX_EDITOR_REF = "main"  # PIN to "v2.1.0" when the editor ships it (10.1.9 W3: Public-toggle
+                              # fix + embedded hls.js are on installer dev awaiting tag) — an
+                              # unpinned ref is a supply-chain gap our own /module-scan rule bans.
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
 MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
@@ -7304,8 +7306,10 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         'sudo sed -i "/^[[:space:]]*#*[[:space:]]*listen_addresses[[:space:]]*=/d" "$PGDATA/postgresql.conf"; '
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PGDATA/postgresql.conf\" >/dev/null; "
         'sudo sed -i "s/md5host/md5\\nhost/g" "$PGDATA/pg_hba.conf"; '
+        # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
+        # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
         f'grep -q "^host.*{core_ip}/32" "$PGDATA/pg_hba.conf" 2>/dev/null || '
-        f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$PGDATA/pg_hba.conf" >/dev/null; '
+        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PGDATA/pg_hba.conf" >/dev/null; '
         'sudo systemctl restart "$PGSVC" 2>&1; echo "ACTIVE=$(systemctl is-active "$PGSVC" 2>/dev/null)"'
     )
     _, cout = _ssh_probe(s1, cfg_cmd, timeout=40)
@@ -7363,7 +7367,9 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         else:
             log.append('WARNING: TAK schema build did not confirm — the cot DB may have no tables '
                        '(8446 login will 500). Output: ' + (scout or '')[:400])
-    return True, log, db_password
+    # Step 8 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
+    tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+    return True, log, db_password, tls_pem
 
 
 def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
@@ -7482,8 +7488,10 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         "sudo sed -i '/^\\s*#*\\s*listen_addresses\\s*=/d' \"$PG_MAIN/postgresql.conf\" && "
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
         'sudo sed -i "s/md5host/md5\\nhost/g" "$PG_MAIN/pg_hba.conf" && '
+        # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
+        # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
         f'(grep -q "^host.*{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
+        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
         '(sudo pg_ctlcluster 15 main restart 2>/dev/null || sudo systemctl restart postgresql 2>/dev/null || true)'
     )
     ok, out = _ssh_probe(s1, pg_config_cmd, timeout=30)
@@ -7535,7 +7543,289 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     else:
         log.append('Warning: could not read DB password from Server One — CoreConfig may need manual password fix.')
 
-    return True, log, db_password
+    # Step 5 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
+    tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+    return True, log, db_password, tls_pem
+
+
+def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=False):
+    """Enable PostgreSQL native TLS + SCRAM on Server One (the split-deploy DB box) over SSH.
+    Idempotent — safe to re-run on every deploy/retrofit pass. Pairs with the CoreConfig
+    sslEnabled/sslMode/sslRootCert attributes per TAK Server Config Guide Appendix D:
+      1. self-signed 10y cert in the PG data dir, SAN = the exact host the core box dials
+         (sslMode=verify-full on the JDBC side pins it)
+      2. postgresql.conf managed lines (# infra-TAK-dbtls): ssl=on, cert paths,
+         password_encryption=scram-sha-256
+      3. pg_hba: hostssl <core_ip>/32 scram-sha-256 inserted ABOVE any plaintext host line;
+         the plaintext line is dropped only when remove_plaintext=True — the retrofit path
+         removes it only AFTER verifying the TLS connection live, never before
+      4. re-hash martiuser to SCRAM (needs db_password; PG15 default hashing is already
+         SCRAM on both families, this converges pre-15-era md5 stragglers)
+    Returns (ok, log_lines, cert_pem). cert_pem='' on failure — callers MUST treat that as
+    'leave CoreConfig untouched'; pointing TAK at a cert we failed to capture kills the DB link."""
+    log = []
+    if not _valid_core_ip(core_ip):
+        return False, ['DB TLS: core IP failed validation, refusing shell interpolation.'], ''
+    s1_host = (s1.get('host') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9.\-]{1,253}', s1_host or ''):
+        return False, ['DB TLS: Server One host failed validation, refusing shell interpolation.'], ''
+    is_ip = bool(re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', s1_host))
+    san = f'IP:{s1_host}' if is_ip else f'DNS:{s1_host}'
+    ip_sed = core_ip.replace('.', r'\.')
+
+    cfg_cmd = (
+        'DATA=$(sudo -u postgres psql -tAc "show data_directory" 2>/dev/null); '
+        'CONF=$(sudo -u postgres psql -tAc "show config_file" 2>/dev/null); '
+        'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
+        '{ [ -z "$DATA" ] || [ -z "$CONF" ] || [ -z "$HBA" ]; } && { echo NO_PG; exit 0; }; '
+        'if ! sudo test -s "$DATA/infratak-db.crt"; then '
+        'sudo openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes '
+        '-keyout "$DATA/infratak-db.key" -out "$DATA/infratak-db.crt" '
+        f'-subj "/CN={s1_host}" -addext "subjectAltName={san}" >/dev/null 2>&1 '
+        '&& sudo chown postgres:postgres "$DATA/infratak-db.key" "$DATA/infratak-db.crt" '
+        '&& sudo chmod 600 "$DATA/infratak-db.key" && sudo chmod 644 "$DATA/infratak-db.crt" '
+        '&& echo CERT_GENERATED || echo CERT_FAILED; else echo CERT_EXISTS; fi; '
+        # Managed config lines: delete-then-append keeps this idempotent across re-runs.
+        'sudo sed -i "/# infra-TAK-dbtls$/d" "$CONF"; '
+        'printf "ssl = on # infra-TAK-dbtls\\n'
+        'ssl_cert_file = \'%s/infratak-db.crt\' # infra-TAK-dbtls\\n'
+        'ssl_key_file = \'%s/infratak-db.key\' # infra-TAK-dbtls\\n'
+        'password_encryption = scram-sha-256 # infra-TAK-dbtls\\n" "$DATA" "$DATA" '
+        '| sudo tee -a "$CONF" >/dev/null; '
+        # hostssl above any plaintext host line for core_ip (pg_hba is first-match-wins).
+        f'if ! sudo grep -Eq "^hostssl[[:space:]].*{ip_sed}/32" "$HBA"; then '
+        f'if sudo grep -Eq "^host[[:space:]].*{ip_sed}/32" "$HBA"; then '
+        f'sudo sed -i "0,/^host[[:space:]].*{ip_sed}\\/32.*/s//hostssl all all {core_ip}\\/32 scram-sha-256\\n&/" "$HBA"; '
+        f'else printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$HBA" >/dev/null; fi; fi; '
+        'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
+        'echo "SSL=$(sudo -u postgres psql -tAc "show ssl" 2>/dev/null)"'
+    )
+    ok, out = _ssh_probe(s1, cfg_cmd, timeout=90)
+    out = out or ''
+    if 'NO_PG' in out:
+        return False, ['DB TLS: PostgreSQL not reachable on Server One (could not resolve data dir).'], ''
+    if 'CERT_FAILED' in out:
+        return False, ['DB TLS: certificate generation failed on Server One: ' + out[:300]], ''
+    if 'SSL=on' not in out:
+        return False, ['DB TLS: ssl did not report on after reload: ' + out[:300]], ''
+    log.append('DB TLS: cert %s, ssl=on, hostssl %s/32 scram-sha-256 in pg_hba.'
+               % ('generated' if 'CERT_GENERATED' in out else 'already present', core_ip))
+
+    if db_password:
+        sql = "ALTER USER martiuser WITH PASSWORD '" + db_password.replace("'", "''") + "'"
+        rok, rout = _ssh_probe(s1, 'sudo -u postgres psql -qc ' + shlex.quote(sql) + ' && echo REHASHED', timeout=30)
+        if rok and 'REHASHED' in (rout or ''):
+            log.append('DB TLS: martiuser re-hashed to SCRAM.')
+        else:
+            log.append('DB TLS warning: martiuser SCRAM re-hash did not confirm — ' + (rout or '')[:200])
+
+    if remove_plaintext:
+        # Only the retrofit calls this, and only after verifying a live TLS connection.
+        rm_cmd = (
+            'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
+            '[ -z "$HBA" ] && { echo NO_PG; exit 0; }; '
+            f'sudo sed -i -E "/^host[[:space:]]+.*{ip_sed}\\/32/d" "$HBA"; '
+            'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; echo PLAINTEXT_REMOVED'
+        )
+        rok, rout = _ssh_probe(s1, rm_cmd, timeout=30)
+        if rok and 'PLAINTEXT_REMOVED' in (rout or ''):
+            log.append('DB TLS: plaintext pg_hba line for %s removed.' % core_ip)
+        else:
+            log.append('DB TLS warning: could not remove plaintext pg_hba line — ' + (rout or '')[:200])
+
+    pok, pem = _ssh_probe(s1, 'DATA=$(sudo -u postgres psql -tAc "show data_directory" 2>/dev/null); sudo cat "$DATA/infratak-db.crt"', timeout=20)
+    pem = (pem or '').strip()
+    if not (pok and pem.startswith('-----BEGIN CERTIFICATE-----')):
+        return False, log + ['DB TLS: could not read back the server cert — CoreConfig will NOT be switched to TLS.'], ''
+    log.append('DB TLS: server cert captured for JDBC verify-full pinning.')
+    return True, log, pem
+
+
+def _server_one_tls_step(s1, core_ip, db_password, log):
+    """Deploy-tail TLS step shared by the Debian and RHEL Server One paths. Returns cert_pem
+    ('' on failure). On failure also fail-opens a firewalled plaintext pg_hba line — a fresh
+    split only wrote hostssl, which never matches non-TLS connections, so without this a TLS
+    hiccup would leave the core box with no matching pg_hba entry at all."""
+    tls_ok, tls_log, tls_pem = _enable_server_one_db_tls(s1, core_ip, db_password=db_password)
+    log.extend(tls_log)
+    if tls_ok:
+        return tls_pem
+    log.append('WARNING: DB TLS enable failed — falling back to the firewalled plaintext path; '
+               'CoreConfig stays non-TLS until a later pass succeeds.')
+    if _valid_core_ip(core_ip):
+        ip_sed = core_ip.replace('.', r'\.')
+        _ssh_probe(s1, (
+            'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
+            '[ -z "$HBA" ] && exit 0; '
+            f'sudo grep -Eq "^host[[:space:]].*{ip_sed}/32" "$HBA" || '
+            f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$HBA" >/dev/null; '
+            'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; true'
+        ), timeout=30)
+    return ''
+
+
+TAK_DB_TLS_ROOTCERT_PATH = '/opt/tak/certs/files/takdb-root.crt'
+
+
+def _coreconfig_db_tls_converge(cc, settings=None):
+    """v10.1.9 W1: stamp the TAK-documented ssl attributes (CoreConfig.xsd <connection>:
+    sslEnabled/sslMode/sslRootCert — TAK Server Config Guide Appendix D) onto the DB
+    <connection> element when this box is a two_server core with a captured Server One cert.
+    Pure string transform — callers write the result via their own privileged write path.
+    Guards, in order of importance:
+      - only touches a <connection> whose jdbc host EQUALS the saved Server One host, so
+        single-box (127.0.0.1) and external-DB configs are never stamped with our cert
+      - returns cc unchanged unless the pinned root cert is verifiably on disk (pointing
+        TAK at a missing sslRootCert kills the DB link at boot)
+      - never raises; any failure returns the input unchanged."""
+    try:
+        if '<connection' not in (cc or ''):
+            return cc
+        s = settings if settings is not None else load_settings()
+        cfg = _get_tak_deployment_config(s)
+        if cfg.get('mode') != 'two_server':
+            return cc
+        s1_host = (cfg.get('server_one', {}).get('host') or '').strip()
+        if not s1_host:
+            return cc
+        pem = (cfg.get('database', {}).get('ssl_root_cert_pem') or '').strip()
+        stamp_ok = pem.startswith('-----BEGIN CERTIFICATE-----')
+        if stamp_ok:
+            # Materialize the pinned root cert (idempotent, tak-readable).
+            existing = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip()
+            if existing != pem:
+                subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.dirname(TAK_DB_TLS_ROOTCERT_PATH)]),
+                               capture_output=True, timeout=15)
+                _write_priv(TAK_DB_TLS_ROOTCERT_PATH, pem + '\n')
+                subprocess.run(_sudo_wrap(['chown', 'tak:tak', TAK_DB_TLS_ROOTCERT_PATH]), capture_output=True, timeout=15)
+                subprocess.run(_sudo_wrap(['chmod', '644', TAK_DB_TLS_ROOTCERT_PATH]), capture_output=True, timeout=15)
+                stamp_ok = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip() == pem
+
+        def _stamp(m):
+            attrs, close = m.group(1), m.group(2)
+            um = re.search(r'jdbc:postgresql://([^:/"]+)', attrs)
+            if not um or um.group(1) != s1_host:
+                return m.group(0)
+            # Strip first: stale attrs pinning a previous host's cert fail verify-full and
+            # kill the DB link (e.g. after a Server One migration to a new box).
+            attrs = re.sub(r'\s+ssl(Enabled|Mode|RootCert|Cert|Key)="[^"]*"', '', attrs)
+            if not stamp_ok:
+                return attrs + close
+            return (attrs + ' sslEnabled="true" sslMode="verify-full" sslRootCert="'
+                    + TAK_DB_TLS_ROOTCERT_PATH + '"' + close)
+        return re.sub(r'(<connection\b[^>]*?)(\s*/?>)', _stamp, cc)
+    except Exception:
+        return cc
+
+
+def _migrate_split_db_tls():
+    """v10.1.9 W1 retrofit: encrypt an EXISTING split-box core↔DB link via the normal console
+    update path (no operator SSH/start.sh — console-path delivery rule). Runs in a background
+    thread from _startup_migrations. Ordered so a failure can never sever a working DB link:
+      1. enable TLS server-side (hostssl inserted ABOVE the existing plaintext line)
+      2. stamp CoreConfig ssl attrs, restart takserver
+      3. VERIFY live: pg_stat_ssl shows the martiuser connection encrypted
+      4. only then remove the plaintext pg_hba line and mark split_db_tls_state=enabled
+    On verify failure: CoreConfig rolled back, takserver restarted on the plaintext path,
+    attempt recorded (held after 3 — clear split_db_tls_attempts in settings to re-arm)."""
+    _p = lambda m: print(f"Split DB TLS retrofit: {m}", flush=True)
+    try:
+        time.sleep(90)  # let boot settle: broker, takserver autostart, network
+        s = load_settings()
+        cfg = _get_tak_deployment_config(s)
+        if cfg.get('mode') != 'two_server' or s.get('split_db_tls_state') == 'enabled':
+            return
+        attempts = int(s.get('split_db_tls_attempts') or 0)
+        if attempts >= 3:
+            _p("held after 3 failed attempts — investigate, then clear split_db_tls_attempts in settings to re-arm")
+            return
+        s1 = cfg.get('server_one', {})
+        if not (s1.get('host') or '').strip() or not os.path.exists('/opt/tak/CoreConfig.xml'):
+            return
+        core_ip = _resolve_core_ip(s, cfg)
+        if not core_ip:
+            _p("core IP unresolved — will retry next boot")
+            return
+        ok, out = _ssh_probe(s1, 'echo SSH_OK', timeout=20)
+        if not ok or 'SSH_OK' not in (out or ''):
+            _p("Server One SSH unreachable — will retry next boot: " + (out or '')[:200])
+            return
+
+        db_password = (cfg.get('database', {}).get('password') or '').strip()
+        tls_ok, tls_log, pem = _enable_server_one_db_tls(s1, core_ip, db_password=db_password)
+        for line in tls_log:
+            _p(line)
+        if not tls_ok or not pem:
+            _p("server-side TLS enable failed — plaintext path untouched; will retry next boot")
+            return
+        s = load_settings()
+        cfg = _get_tak_deployment_config(s)
+        cfg.setdefault('database', {})['ssl_root_cert_pem'] = pem
+        s['tak_deployment'] = cfg
+        save_settings(s)
+
+        cc_orig = _read_priv('/opt/tak/CoreConfig.xml') or ''
+        if not cc_orig.strip():
+            _p("could not read CoreConfig — will retry next boot")
+            return
+        cc_new = _coreconfig_db_tls_converge(cc_orig, s)
+        r_act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
+                               capture_output=True, text=True, timeout=15)
+        was_active = (r_act.stdout or '').strip() == 'active'
+        if not was_active:
+            # Never juggle the link while the operator has TAK down — stamp and defer.
+            if cc_new != cc_orig:
+                _write_priv('/opt/tak/CoreConfig.xml', cc_new)
+                _p("CoreConfig stamped; takserver not active — TLS verify + plaintext removal deferred")
+            else:
+                _p("takserver not active — TLS verify deferred to a boot where it runs")
+            return
+        if cc_new != cc_orig:
+            _write_priv('/opt/tak/CoreConfig.xml', cc_new)
+            _p("CoreConfig stamped (sslEnabled, sslMode=verify-full) — restarting takserver")
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, timeout=180)
+        elif 'sslEnabled="true"' not in cc_orig:
+            _p("no CoreConfig change and no ssl attrs present — will retry next boot")
+            return
+
+        # Verify the live link is actually TLS (TAK's pool comes up over ~1-3 min).
+        q = ('sudo -u postgres psql -tAc "SELECT (bool_or(s.ssl))::text || \'/\' || count(*)::text '
+             'FROM pg_stat_ssl s JOIN pg_stat_activity a USING(pid) '
+             'WHERE a.usename=\'martiuser\' AND a.client_addr IS NOT NULL"')
+        verified = False
+        saw_plain = False
+        for _ in range(24):  # ~4 min
+            time.sleep(10)
+            vok, vout = _ssh_probe(s1, q, timeout=25)
+            vout = (vout or '').strip()
+            if vok and '/' in vout:
+                flag, cnt = vout.split('/', 1)
+                if cnt.strip().isdigit() and int(cnt.strip()) > 0:
+                    if flag.strip() == 'true':
+                        verified = True
+                        break
+                    saw_plain = True
+        if verified:
+            rm_ok, rm_log, _pem2 = _enable_server_one_db_tls(s1, core_ip, db_password=db_password,
+                                                             remove_plaintext=True)
+            for line in rm_log:
+                _p(line)
+            s = load_settings()
+            s['split_db_tls_state'] = 'enabled'
+            s.pop('split_db_tls_attempts', None)
+            save_settings(s)
+            _p("✓ COMPLETE — core↔DB link is TLS (verify-full pinned), plaintext pg_hba line removed")
+            return
+        _p("✗ TLS link did NOT verify (%s) — rolling CoreConfig back to the plaintext path"
+           % ("connections still plaintext" if saw_plain else "no martiuser connection observed"))
+        _write_priv('/opt/tak/CoreConfig.xml', cc_orig)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, timeout=180)
+        s = load_settings()
+        s['split_db_tls_attempts'] = attempts + 1
+        save_settings(s)
+        _p(f"rolled back and takserver restarted; attempt {attempts + 1}/3 recorded — will retry next boot")
+    except Exception as e:
+        _p(f"error (non-fatal, will retry next boot): {e}")
 
 
 def _fetch_db_password_from_server_one(s1_cfg):
@@ -7642,10 +7932,16 @@ def takserver_two_server_open_db_firewall():
     if db_pkg_path and not os.path.isfile(db_pkg_path):
         db_pkg_path = None
 
-    ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
-                                              db_pkg_path=db_pkg_path, db_pkg_name=db_pkg if db_pkg_path else None)
+    res = _setup_server_one(s1, core_ip, db_port,
+                            db_pkg_path=db_pkg_path, db_pkg_name=db_pkg if db_pkg_path else None)
+    # Failure paths return 3-tuples; success returns a 4th element: the DB TLS root cert PEM.
+    ok, log, db_password = res[0], res[1], res[2]
+    tls_pem = res[3] if len(res) > 3 else ''
     if db_password:
         cfg['database']['password'] = db_password
+    if tls_pem:
+        cfg['database']['ssl_root_cert_pem'] = tls_pem
+    if db_password or tls_pem:
         settings['tak_deployment'] = cfg
         save_settings(settings)
 
@@ -7695,12 +7991,24 @@ def takserver_two_server_runbook():
         f'sudo ufw delete allow {db_port}/tcp || true',
         f'sudo ufw deny {db_port}/tcp',
         'sudo ufw --force enable',
+        '# v10.1.9: encrypt the core↔DB wire (TLS + SCRAM) — TAK Server Config Guide Appendix D',
+        'PGDATA=$(sudo -u postgres psql -tAc "show data_directory")',
+        f'sudo openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes -keyout "$PGDATA/infratak-db.key" -out "$PGDATA/infratak-db.crt" -subj "/CN={db_host}" -addext "subjectAltName=IP:{db_host}"',
+        'sudo chown postgres:postgres "$PGDATA"/infratak-db.* && sudo chmod 600 "$PGDATA/infratak-db.key" && sudo chmod 644 "$PGDATA/infratak-db.crt"',
+        'CONF=$(sudo -u postgres psql -tAc "show config_file")',
+        'printf "ssl = on\\nssl_cert_file = \'%s/infratak-db.crt\'\\nssl_key_file = \'%s/infratak-db.key\'\\npassword_encryption = scram-sha-256\\n" "$PGDATA" "$PGDATA" | sudo tee -a "$CONF"',
+        f'echo "hostssl all all {core_host_for_db_acl}/32 scram-sha-256" | sudo tee -a "$(sudo -u postgres psql -tAc \'show hba_file\')"   # replaces any plaintext host line for {core_host_for_db_acl}',
+        'sudo -u postgres psql -c "select pg_reload_conf();"',
     ]
     server_two_steps = [
         '# Server Two: Core Server',
         'sudo apt-get update && sudo apt-get install -y lsb-release',
         f'sudo apt install -y ./{core_pkg}' if core_pkg else 'sudo apt install -y ./takserver-core_x.x-RELEASExx_all.deb',
         f'sudo sed -i \'s|jdbc:postgresql://127.0.0.1:5432/cot|jdbc:postgresql://{db_host}:{db_port}/cot|g\' /opt/tak/CoreConfig.xml',
+        '# v10.1.9: pin + encrypt the DB link — copy the server cert from Server One, then add',
+        f'#   sslEnabled="true" sslMode="verify-full" sslRootCert="/opt/tak/certs/files/takdb-root.crt"',
+        '#   to the <connection …> element in /opt/tak/CoreConfig.xml (Config Guide Appendix D)',
+        f'sudo scp <user>@{db_host}:"$(ssh <user>@{db_host} sudo -u postgres psql -tAc \'show data_directory\')/infratak-db.crt" /opt/tak/certs/files/takdb-root.crt && sudo chown tak:tak /opt/tak/certs/files/takdb-root.crt',
         'sudo systemctl daemon-reload',
         'sudo systemctl enable takserver',
         'sudo systemctl restart takserver',
@@ -7709,7 +8017,9 @@ def takserver_two_server_runbook():
     notes = [
         'Manual naming/order preserved: Server One (Database Server) first, then Server Two (Core Server).',
         'Database password is generated by the TAK installer; confirm the value in /opt/tak/CoreConfig.example.xml on Server One and ensure Server Two CoreConfig.xml matches it.',
-        'For production, enable PostgreSQL TLS per Appendix D and use sslEnabled/sslMode fields in CoreConfig.xml.',
+        'PostgreSQL TLS per Appendix D is included above (v10.1.9): server cert + hostssl/SCRAM on '
+        'Server One, sslEnabled/sslMode=verify-full/sslRootCert on the CoreConfig <connection>. '
+        'The console-driven deploy does all of this automatically.',
     ]
     return jsonify({
         'success': True,
@@ -7791,11 +8101,16 @@ def takserver_two_server_deploy_server_one():
         if not ok_ver:
             return jsonify({'success': False, 'error': ver_err}), 400
 
-    ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
-                                              db_pkg_path=local_deb, db_pkg_name=db_pkg)
+    res = _setup_server_one(s1, core_ip, db_port,
+                            db_pkg_path=local_deb, db_pkg_name=db_pkg)
+    # Failure paths return 3-tuples; success returns a 4th element: the DB TLS root cert PEM.
+    ok, log, db_password = res[0], res[1], res[2]
+    tls_pem = res[3] if len(res) > 3 else ''
     if db_password:
         if preserve_saved_host:
             # Do not persist alternate host — migration still needs saved Server One = current DB source.
+            # Same for the TLS cert: storing the ALTERNATE box's cert against the saved host would
+            # break verify-full pinning on the still-live link; migration stores it on cutover.
             settings = load_settings()
             cfg_save = _get_tak_deployment_config(settings)
             cfg_save.setdefault('database', {})['password'] = db_password
@@ -7804,6 +8119,8 @@ def takserver_two_server_deploy_server_one():
             log.append('Note: Saved Server One host unchanged (alternate deploy). Use Start migration when ready.')
         else:
             cfg['database']['password'] = db_password
+            if tls_pem:
+                cfg['database']['ssl_root_cert_pem'] = tls_pem
             settings['tak_deployment'] = cfg
             save_settings(settings)
 
@@ -7956,6 +8273,9 @@ def takserver_two_server_deploy_server_two():
                     lambda m: m.group(1) + db_password + m.group(2),
                     content
                 )
+
+            # v10.1.9 W1: stamp the documented ssl attrs when Server One captured a TLS cert.
+            content = _coreconfig_db_tls_converge(content)
 
             _write_priv(core_config, content)
 
@@ -14270,6 +14590,142 @@ def _guarddog_run_one_service(sid, monitor_ids):
     if val is not None:
         return (sid, 'ok' if val else 'fail')
     return (sid, None)
+
+
+def _detect_disk_layout():
+    """v10.1.9 W2/WI-2 — is TAK boxed into a fraction of this disk?
+
+    Fresh installs strand space away from root, where ALL of TAK lives (Docker,
+    /opt/tak, Postgres, Authentik, CloudTAK): RHEL/Anaconda parks the remainder in
+    a separate /home LV; Ubuntu/subiquity leaves unallocated VG extents. Read-only.
+
+    Returns {mode, root_gb, root_pct_of_vg, vg_free_gb, home_lv_gb, home_used_mb,
+             reclaimable_gb, vg, root_lv, home_lv, fold_safe}
+    with mode ∈ {'ok','free_extents','idle_home','both'}; mode 'ok' also covers
+    'not on LVM / nothing to reclaim'."""
+    out = {'mode': 'ok', 'root_gb': 0, 'root_pct_of_vg': 100, 'vg_free_gb': 0,
+           'home_lv_gb': 0, 'home_used_mb': 0, 'reclaimable_gb': 0,
+           'vg': '', 'root_lv': '', 'home_lv': '', 'fold_safe': False}
+
+    def _run(argv, timeout=20):
+        # lvs/vgs read PV metadata → privileged, so these route through the broker.
+        try:
+            r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
+    def _run_plain(argv, timeout=20):
+        # df/findmnt report on mounted filesystems unprivileged — running them
+        # unwrapped avoids a needless broker deny on an enforcing box.
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
+    try:
+        root_dev = _run_plain(['findmnt', '-no', 'SOURCE', '/'])
+        if not root_dev:
+            return out
+        vg = _run(['lvs', '--noheadings', '-o', 'vg_name', root_dev])
+        root_lv = _run(['lvs', '--noheadings', '-o', 'lv_name', root_dev])
+        if not vg or not root_lv:
+            return out              # not on LVM — nothing this feature can do
+        out['vg'], out['root_lv'] = vg, root_lv
+
+        def _bytes(s):
+            return int(re.sub(r'\D', '', s or '0') or 0)
+
+        vg_size_b = _bytes(_run(['vgs', '--noheadings', '-o', 'vg_size', '--units', 'b', vg]))
+        vg_free_b = _bytes(_run(['vgs', '--noheadings', '-o', 'vg_free', '--units', 'b', vg]))
+        root_size_b = _bytes(_run(['lvs', '--noheadings', '-o', 'lv_size', '--units', 'b', root_dev]))
+        out['root_gb'] = round(root_size_b / 1024 ** 3, 1)
+        out['vg_free_gb'] = round(vg_free_b / 1024 ** 3, 1)
+        if vg_size_b:
+            out['root_pct_of_vg'] = int(root_size_b * 100 / vg_size_b)
+
+        home_dev = _run_plain(['findmnt', '-no', 'SOURCE', '/home'])
+        home_size_b = home_used_b = 0
+        if home_dev:
+            home_vg = _run(['lvs', '--noheadings', '-o', 'vg_name', home_dev])
+            home_lv = _run(['lvs', '--noheadings', '-o', 'lv_name', home_dev])
+            if home_vg == vg and home_lv:
+                out['home_lv'] = f'{home_vg}/{home_lv}'
+                home_size_b = _bytes(_run(['lvs', '--noheadings', '-o', 'lv_size', '--units', 'b', home_dev]))
+                du = _run_plain(['df', '-B1', '--output=used', '/home'])
+                lines = [l for l in du.splitlines() if l.strip()]
+                home_used_b = _bytes(lines[-1]) if len(lines) > 1 else 0
+                out['home_lv_gb'] = round(home_size_b / 1024 ** 3, 1)
+                out['home_used_mb'] = round(home_used_b / 1024 ** 2, 1)
+                # Same 2 GiB ceiling the broker enforces — keep the UI honest about
+                # whether the fold-in would actually be accepted.
+                out['fold_safe'] = home_used_b <= 2 * 1024 ** 3
+
+        has_free = vg_free_b >= 1024 ** 3
+        has_home = bool(out['home_lv']) and out['fold_safe'] and home_size_b >= 1024 ** 3
+        out['mode'] = ('both' if (has_free and has_home) else
+                       'free_extents' if has_free else
+                       'idle_home' if has_home else 'ok')
+        reclaimable_b = (vg_free_b if has_free else 0) + (home_size_b if has_home else 0)
+        out['reclaimable_gb'] = round(reclaimable_b / 1024 ** 3, 1)
+        return out
+    except Exception:
+        return out
+
+
+@app.route('/api/guarddog/disk-layout')
+@login_required
+def guarddog_disk_layout_api():
+    """Read-only disk-layout report (WI-2). Drives the 'X GB reclaimable' card."""
+    return jsonify({'success': True, 'layout': _detect_disk_layout()})
+
+
+@app.route('/api/console/disk/reclaim', methods=['POST'])
+@login_required
+def console_disk_reclaim_api():
+    """v10.1.9 W2/WI-3 — reclaim stranded disk for TAK.
+
+    mode='grow_free' is non-destructive (extend root into free extents).
+    mode='fold_home' DESTROYS the /home LV after backing it up, so — like the
+    Power Off control — it re-confirms the console password on top of
+    @login_required and makes the caller echo the exact LV being destroyed.
+    All privileged work happens inside the broker's fixed-shape `disk_reclaim`
+    op; the console never composes LVM argv itself."""
+    data = request.get_json(silent=True) or {}
+    mode = (data.get('mode') or '').strip()
+    if mode not in ('grow_free', 'fold_home'):
+        return jsonify({'success': False, 'error': 'mode must be "grow_free" or "fold_home".'}), 400
+
+    req = {'op': 'disk_reclaim', 'mode': mode}
+    if mode == 'fold_home':
+        password = data.get('password') or ''
+        auth = load_auth()
+        if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+            return jsonify({'success': False, 'error': 'Incorrect console password.', 'need_password': True}), 403
+        layout = _detect_disk_layout()
+        if not layout.get('home_lv'):
+            return jsonify({'success': False, 'error': 'No separate /home LV found — nothing to fold in.'}), 400
+        if not layout.get('fold_safe'):
+            return jsonify({'success': False, 'error': f"/home holds {layout.get('home_used_mb')} MB — "
+                                                       "too much to fold in safely. Move the data off first."}), 400
+        confirm = (data.get('confirm_lv') or '').strip()
+        if confirm != layout['home_lv']:
+            return jsonify({'success': False, 'error': f"confirm_lv must be exactly '{layout['home_lv']}'.",
+                            'expected_lv': layout['home_lv']}), 400
+        req['confirm_lv'] = confirm
+
+    try:
+        # The fold-in rsyncs/tars /home and stops docker — allow a long window.
+        res = _broker_request(req, timeout=2400)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Broker request failed: {e}'}), 500
+    if not res.get('ok'):
+        return jsonify({'success': False, 'error': res.get('error') or 'Reclaim failed.',
+                        'log': res.get('log') or []}), 400
+    return jsonify({'success': True, 'mode': mode, 'log': res.get('log') or [],
+                    'df_after': res.get('df_after', ''), 'backup': res.get('backup', ''),
+                    'layout': _detect_disk_layout()})
 
 
 @app.route('/api/guarddog/health')
@@ -62168,6 +62624,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                     cc = _re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                     if db_password:
                         cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_password + m.group(2), cc)
+                    cc = _coreconfig_db_tls_converge(cc)  # v10.1.9 W1: re-stamp ssl attrs the upgrade reset
                     _write_priv('/opt/tak/CoreConfig.xml', cc)
                     ulog(f"✓ CoreConfig.xml JDBC restored to {db_host}:{db_port}")
                 else:
@@ -62403,6 +62860,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
                     cc = _re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                     if db_password:
                         cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_password + m.group(2), cc)
+                    cc = _coreconfig_db_tls_converge(cc)  # v10.1.9 W1: re-stamp ssl attrs the upgrade reset
                     _write_priv('/opt/tak/CoreConfig.xml', cc)
                     ulog(f"✓ CoreConfig.xml JDBC restored to {s1_host}:{db_port}")
                 else:
@@ -62662,7 +63120,10 @@ def run_takserver_two_server_db_migrate(
 
         mlog('')
         mlog('━━━ PostgreSQL remote access on new Server One ━━━')
-        ok_pg, log_lines, _pw_unused = _setup_server_one(new_s1_cfg, core_ip, db_port, None, None)
+        res_pg = _setup_server_one(new_s1_cfg, core_ip, db_port, None, None)
+        # Failure paths return 3-tuples; success returns a 4th element: the DB TLS root cert PEM.
+        ok_pg, log_lines = res_pg[0], res_pg[1]
+        new_tls_pem = res_pg[3] if len(res_pg) > 3 else ''
         for line in log_lines:
             mlog(line)
         if not ok_pg:
@@ -62704,9 +63165,25 @@ def run_takserver_two_server_db_migrate(
         cfg = _get_tak_deployment_config(settings)
         cfg['server_one'] = dict(new_s1_cfg)
         cfg.setdefault('database', {})['password'] = pw_verify
+        # v10.1.9 W1: the pinned DB cert follows the host — store the NEW box's cert, or drop
+        # the key entirely if its TLS enable failed (a stale cert would fail verify-full).
+        if new_tls_pem:
+            cfg['database']['ssl_root_cert_pem'] = new_tls_pem
+        else:
+            cfg['database'].pop('ssl_root_cert_pem', None)
         settings['tak_deployment'] = cfg
         save_settings(settings)
         mlog('✓ Server One host updated in settings')
+        # (Re)stamp or strip the DB TLS attrs for the NEW host before TAK starts.
+        try:
+            cc2 = _read_priv('/opt/tak/CoreConfig.xml') or ''
+            cc2n = _coreconfig_db_tls_converge(cc2, settings)
+            if cc2n != cc2:
+                _write_priv('/opt/tak/CoreConfig.xml', cc2n)
+                mlog('✓ DB TLS attributes converged for new Server One' if new_tls_pem
+                     else '✓ Stale DB TLS attributes stripped (new host not TLS yet)')
+        except Exception as _e:
+            mlog(f'⚠ DB TLS converge skipped: {_e}')
         sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(settings)
         mlog(f'{"✓" if sg_ok else "⚠"} Guard Dog remote DB config: {sg_msg}')
 
@@ -63905,6 +64382,7 @@ def run_takserver_deploy(config):
                         if db_pass:
                             db_pass_xml = html.escape(db_pass, quote=True)
                             cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass_xml + m.group(2), cc)
+                        cc = _coreconfig_db_tls_converge(cc)  # v10.1.9 W1: stamp ssl attrs on the split link
                         subprocess.run(_sudo_wrap(['tee', '/opt/tak/CoreConfig.xml']), input=cc, capture_output=True, text=True, timeout=5)
                         log_step(f"✓ JDBC URL and password set for {db_host}:{db_port}")
                     else:
@@ -71551,6 +72029,18 @@ def _startup_migrations():
             _f2b_selfheal_rhel_jails(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e:
             print(f"Startup migration: fail2ban self-heal error (non-fatal): {_f2b_e}", flush=True)
+
+        # v10.1.9 W1 — retrofit: encrypt an existing split-box core↔DB link (TLS + SCRAM).
+        # One-shot per box; involves a takserver restart + live verification (minutes), so it
+        # runs in a background thread and never delays console startup. Console-path delivery:
+        # existing splits (test8, NE-TAK class) get TLS from a normal update, no SSH needed.
+        try:
+            _sdt_cfg = _get_tak_deployment_config(s)
+            if _sdt_cfg.get('mode') == 'two_server' and s.get('split_db_tls_state') != 'enabled':
+                threading.Thread(target=_migrate_split_db_tls, daemon=True).start()
+                print("Startup migration: split DB TLS retrofit launched in background", flush=True)
+        except Exception as _sdt_e:
+            print(f"Startup migration: split DB TLS launch error (non-fatal): {_sdt_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
         fh_raw = s.get('fedhub_deployment', {})

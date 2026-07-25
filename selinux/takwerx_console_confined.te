@@ -1,4 +1,4 @@
-module takwerx_console_confined 0.2;
+module takwerx_console_confined 0.3;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v10.0.5 hardening)
@@ -25,6 +25,8 @@ module takwerx_console_confined 0.2;
 
 require {
 	type init_t;
+	type unconfined_service_t;
+	type fs_t;
 	type user_home_t;
 	type user_home_dir_t;
 	type bin_t;
@@ -67,6 +69,7 @@ require {
 	class file entrypoint;
 	class sock_file write;
 	class unix_stream_socket connectto;
+	class filesystem getattr;
 }
 
 type takwerx_console_t;
@@ -88,6 +91,10 @@ allow init_t user_home_t:lnk_file read;
 # single privilege path: connect to it + write the request.
 allow takwerx_console_t var_run_t:sock_file write;
 allow takwerx_console_t init_t:unix_stream_socket connectto;
+# v0.3 (10.1.9 W5): the broker daemon itself runs unconfined_service_t — connectto
+# resolves against the LISTENER's domain, not the socket file. Harvested live on
+# the NUC (Rocky 9, permissive churn: 4312 hits on this one rule).
+allow takwerx_console_t unconfined_service_t:unix_stream_socket connectto;
 
 # --- health-monitor: read /proc state of EVERY process. Collapsed from ~25
 # per-service rules into the `domain` attribute — covers all process domains
@@ -142,10 +149,16 @@ allow takwerx_console_t systemd_unit_file_t:dir search;
 allow takwerx_console_t systemd_unit_file_t:file { getattr ioctl open read };
 allow takwerx_console_t tmp_t:dir { add_name remove_name write };
 allow takwerx_console_t tmp_t:file { create open setattr unlink write };
-allow takwerx_console_t user_home_dir_t:dir search;
-allow takwerx_console_t user_home_t:dir { getattr search };
+allow takwerx_console_t user_home_dir_t:dir { getattr search };
+allow takwerx_console_t user_home_t:dir { getattr open read search };
 allow takwerx_console_t user_home_t:file { getattr ioctl open read };
 allow takwerx_console_t usr_t:dir { add_name remove_name write };
-allow takwerx_console_t usr_t:file { create entrypoint execute relabelfrom relabelto rename setattr unlink write };
+allow takwerx_console_t usr_t:file { create entrypoint execute execute_no_trans relabelfrom relabelto rename setattr unlink write };
 allow takwerx_console_t var_run_t:sock_file getattr;
 allow takwerx_console_t websm_port_t:tcp_socket name_connect;
+# v0.3 (10.1.9 W5) — remaining NUC-harvest gaps that flooded setroubleshoot:
+#   ~/.local site-packages imports (dir open/read above), statfs on / (df calls),
+#   `which`-style stat/read of bin_t helpers, and exec of the /opt/infratak/.shims
+#   wrappers via bash (usr_t execute_no_trans above).
+allow takwerx_console_t fs_t:filesystem getattr;
+allow takwerx_console_t bin_t:file { getattr open read };

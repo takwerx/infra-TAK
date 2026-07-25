@@ -166,6 +166,66 @@ check_disk_io() {
 }
 
 # ==========================================
+# v10.1.9 W2/WI-1 — reclaim stranded disk for TAK (SAFE, automatic)
+#
+# Fresh installs routinely box TAK into a small root LV while the rest of the
+# disk sits idle: Ubuntu/subiquity leaves unallocated VG extents, RHEL/Anaconda
+# caps root ~70G. TAK (Docker, /opt/tak, Postgres, Authentik, CloudTAK) all live
+# under / — so the box runs on a fraction of its drive.
+#
+# This grows root into FREE VG EXTENTS ONLY. It is non-destructive, needs no
+# reboot, and is idempotent (no free extents → no-op). It deliberately NEVER
+# touches a separate /home LV — deleting an LV is destructive and stays behind
+# the console's operator-confirmed reclaim action (WI-3).
+#
+# Multiplatform: lvs/vgs/lvextend/xfs_growfs/resize2fs/findmnt are identical on
+# Ubuntu, RHEL and ARM. Non-LVM roots (plain partition, cloud images, many ARM
+# boards) no-op cleanly.
+# ==========================================
+expand_root_lvm() {
+    command -v lvs >/dev/null 2>&1 && command -v vgs >/dev/null 2>&1 || return 0
+    command -v lvextend >/dev/null 2>&1 || return 0
+
+    local root_src root_fstype vg lv vg_free_b vg_free_g
+    root_src=$(findmnt -no SOURCE / 2>/dev/null)
+    [ -n "$root_src" ] || return 0
+    # Only proceed if root really is an LV (lvs resolves the device).
+    vg=$(lvs --noheadings -o vg_name "$root_src" 2>/dev/null | awk '{$1=$1};1')
+    lv=$(lvs --noheadings -o lv_name "$root_src" 2>/dev/null | awk '{$1=$1};1')
+    if [ -z "$vg" ] || [ -z "$lv" ]; then
+        return 0   # root not on LVM — nothing to do
+    fi
+
+    vg_free_b=$(vgs --noheadings -o vg_free --units b "$vg" 2>/dev/null | tr -dc '0-9')
+    [ -n "$vg_free_b" ] || return 0
+    # Threshold: 1 GiB. Below that the grow isn't worth a filesystem operation.
+    if [ "$vg_free_b" -lt 1073741824 ] 2>/dev/null; then
+        return 0   # no meaningful free extents — silent no-op (the common case)
+    fi
+    vg_free_g=$((vg_free_b / 1073741824))
+
+    echo -e "  ${BOLD}Reclaiming stranded disk for TAK...${NC}"
+    echo "  Found ${vg_free_g} GB of unallocated space in volume group '${vg}' — growing root."
+    if ! lvextend -l +100%FREE "${vg}/${lv}" >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}⚠ lvextend failed — leaving disk layout unchanged${NC}"
+        return 0
+    fi
+
+    root_fstype=$(findmnt -no FSTYPE / 2>/dev/null)
+    case "$root_fstype" in
+        xfs)
+            xfs_growfs / >/dev/null 2>&1 || echo -e "  ${YELLOW}⚠ xfs_growfs failed${NC}" ;;
+        ext4|ext3|ext2)
+            resize2fs "$root_src" >/dev/null 2>&1 || echo -e "  ${YELLOW}⚠ resize2fs failed${NC}" ;;
+        *)
+            echo -e "  ${YELLOW}⚠ Unknown root filesystem '${root_fstype}' — LV grown, filesystem NOT resized${NC}"
+            return 0 ;;
+    esac
+    echo -e "  ${GREEN}✓ Root grew to $(df -h / | awk 'NR==2{print $2}') ($(df -h / | awk 'NR==2{print $4}') free)${NC}"
+    echo ""
+}
+
+# ==========================================
 # Detect Operating System
 # ==========================================
 detect_os() {
@@ -877,8 +937,16 @@ EOF
 _install_selinux_module() {
     local name="$1" te="$2"
     [ -f "$te" ] || return 1
+    # v10.1.9: version-aware reinstall. RHEL9 semodule -l no longer prints module
+    # versions, so track the shipped .te version in a stamp file — an updated .te
+    # (e.g. confined 0.2→0.3) reinstalls instead of being skipped forever.
+    local te_ver stamp
+    te_ver=$(grep -oE "^module[[:space:]]+$name[[:space:]]+[0-9.]+" "$te" | awk '{print $3}')
+    stamp="/etc/selinux/.takwerx-${name}.ver"
     if semodule -l 2>/dev/null | grep -qx "$name"; then
-        return 0   # already installed (idempotent re-run)
+        if [ -n "$te_ver" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$te_ver" ]; then
+            return 0   # installed and current (idempotent re-run)
+        fi
     fi
     command -v checkmodule >/dev/null 2>&1 || dnf install -y checkpolicy >/dev/null 2>&1 || true
     command -v checkmodule >/dev/null 2>&1 && command -v semodule_package >/dev/null 2>&1 || return 1
@@ -887,6 +955,7 @@ _install_selinux_module() {
        && semodule_package -o "$tmp/$name.pp" -m "$tmp/$name.mod" >/dev/null 2>&1 \
        && semodule -i "$tmp/$name.pp" >/dev/null 2>&1; then
         rc=0
+        [ -n "$te_ver" ] && echo "$te_ver" > "$stamp" 2>/dev/null
     fi
     rm -rf "$tmp"
     return $rc
@@ -922,6 +991,7 @@ install_selinux_console_policy() {
 # Main
 # ==========================================
 detect_os
+expand_root_lvm
 check_disk_io
 wait_for_upgrades
 

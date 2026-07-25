@@ -209,7 +209,7 @@ def apply_ldap_overlay(app):
 #err{{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.95);
 z-index:100;justify-content:center;align-items:center;flex-direction:column;text-align:center;color:#fff}}
 #err h2{{font-size:1.4rem;margin-bottom:8px}}#err p{{color:#999;font-size:.9rem}}</style>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script></head><body>
+<script src="/static/hls.min.js"></script></head><body>
 <video id="v" controls autoplay muted playsinline></video>
 <div id="err"><h2>Stream Offline</h2><p>Waiting for stream\u2026 auto-reconnecting.</p></div>
 <script>
@@ -668,7 +668,7 @@ function watchStream(name){
     +'background:rgba(0,0,0,.95);z-index:100;justify-content:center;align-items:center;'
     +'flex-direction:column;text-align:center;color:#fff;font-family:sans-serif}'
     +'#err h2{font-size:1.4rem;margin-bottom:8px}#err p{color:#999;font-size:.9rem}</style>'
-    +'<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"><\/script></head><body>'
+    +'<script src="/static/hls.min.js"><\/script></head><body>'
     +'<video id="v" controls autoplay muted playsinline></video>'
     +'<div id="err"><h2>Stream Offline</h2><p>Waiting for stream\u2026 auto-reconnecting.</p></div>'
     +'<script>'
