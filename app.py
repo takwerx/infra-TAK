@@ -7548,6 +7548,20 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     return True, log, db_password, tls_pem
 
 
+def _redact_db_secret(text, secret=None):
+    """Strip DB passwords out of captured command output before it reaches a log
+    or an API response. psql echoes the offending statement on error, so a failed
+    `ALTER USER … PASSWORD 'x'` would otherwise leak the credential into journald
+    and into the deploy log the browser receives."""
+    out = text or ''
+    if secret:
+        out = out.replace(secret, '***')
+    # Belt and braces: redact any PASSWORD '…' / PGPASSWORD=… shape we didn't expect.
+    out = re.sub(r"(?i)(password\s+')[^']*(')", r'\1***\2', out)
+    out = re.sub(r'(?i)(PGPASSWORD=)\S+', r'\1***', out)
+    return out
+
+
 def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=False):
     """Enable PostgreSQL native TLS + SCRAM on Server One (the split-deploy DB box) over SSH.
     Idempotent — safe to re-run on every deploy/retrofit pass. Pairs with the CoreConfig
@@ -7617,7 +7631,12 @@ def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=Fa
         if rok and 'REHASHED' in (rout or ''):
             log.append('DB TLS: martiuser re-hashed to SCRAM.')
         else:
-            log.append('DB TLS warning: martiuser SCRAM re-hash did not confirm — ' + (rout or '')[:200])
+            # NEVER echo psql's output raw: on a syntax error psql quotes the failing
+            # statement back ("LINE 1: ALTER USER … PASSWORD 'secret'"), and this log
+            # goes to journald AND into the deploy's JSON response. CJIS: secrets are
+            # never logged (same rule the broker's _summary redaction enforces).
+            log.append('DB TLS warning: martiuser SCRAM re-hash did not confirm — '
+                       + _redact_db_secret(rout or '', db_password)[:200])
 
     if remove_plaintext:
         # Only the retrofit calls this, and only after verifying a live TLS connection.

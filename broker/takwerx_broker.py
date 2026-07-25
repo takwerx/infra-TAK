@@ -1924,14 +1924,26 @@ def _do_disk_reclaim(req):
     stage = '/var/tmp/takwerx-home-fold'
     backup = '/var/tmp/takwerx-home-backup.tar.gz'
     subprocess.run(['rm', '-rf', stage], capture_output=True, timeout=60)
-    os.makedirs(stage, exist_ok=True)
+    # /home holds users' SSH PRIVATE KEYS. The staging dir and the tarball must be
+    # root-only: a default-umask tar lands 0644 in a world-readable /var/tmp, which
+    # would hand every local account a copy of every private key on the box. Mode is
+    # set BEFORE any data is written, never after (no readable window).
+    os.makedirs(stage, mode=0o700, exist_ok=True)
+    os.chmod(stage, 0o700)
     rs = subprocess.run(['rsync', '-aXS', '/home/', stage + '/'], capture_output=True, text=True, timeout=1800)
     if rs.returncode != 0:
         return {'ok': False, 'error': 'rsync of /home failed: ' + (rs.stderr or '')[:200], 'log': log}
+    try:
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(fd)
+        os.chmod(backup, 0o600)
+    except OSError as e:
+        return {'ok': False, 'error': f'could not create the backup archive securely: {e}', 'log': log}
     tb = subprocess.run(['tar', 'czf', backup, '-C', stage, '.'], capture_output=True, text=True, timeout=1800)
     if tb.returncode != 0:
         return {'ok': False, 'error': 'tar backup of /home failed: ' + (tb.stderr or '')[:200], 'log': log}
-    log.append(f'/home staged to {stage} and archived to {backup}.')
+    os.chmod(backup, 0o600)   # re-assert: tar may recreate the file
+    log.append(f'/home staged to {stage} and archived to {backup} (both root-only, 0600).')
 
     # fstab: back up, then comment out the /home line.
     try:
