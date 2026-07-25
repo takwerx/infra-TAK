@@ -7819,15 +7819,19 @@ def _harden_sensitive_permissions(plog=None):
         (plog or (lambda x: print(f"Permissions hardening: {x}", flush=True)))(m)
 
     targets = []
-    # TAK private key material (cert scripts leave .key at 644).
-    for pat in ('*.key', '*.p12', '*.jks'):
-        try:
-            r = subprocess.run(_sudo_wrap(['find', '/opt/tak/certs', '-maxdepth', '3',
-                                           '-type', 'f', '-name', pat]),
-                               capture_output=True, text=True, timeout=30)
-            targets += [(p.strip(), '600') for p in (r.stdout or '').splitlines() if p.strip()]
-        except Exception:
-            pass
+    # ── /opt/tak/certs is DELIBERATELY NOT hardened ───────────────────────────
+    # It is a SHARED directory by design: bind-mounted into the Node-RED
+    # container (`/opt/tak/certs/files -> /certs`) which runs as uid 1000, while
+    # the files are owned by `tak` (uid 1491). Tightening them to 600 locked
+    # Node-RED out and killed its TAK feeds fleet-wide —
+    #   [tls-config:TAK Mission API TLS] Error: EACCES: permission denied,
+    #   open '/certs/admin.key'
+    # — on test8/test6/test12/NUC the moment this shipped (2026-07-25). The
+    # loose mode on admin.key IS a real weakness, but it cannot be fixed by
+    # chmod alone: a legitimate consumer needs cross-uid read. The fix is a
+    # separate, narrower cert path for Node-RED (or a shared group), tracked on
+    # the roadmap — NOT a blanket chmod. Do not re-add this without solving that.
+    #
     # Module .env files (we generate these). Cover both the non-root home and the
     # root-era layout that pre-flip boxes still carry.
     for home in ('/home/takwerx', '/root'):
