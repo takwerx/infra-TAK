@@ -36,6 +36,7 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import socket
 import socketserver
 import struct
@@ -1891,6 +1892,12 @@ def _restore_fstab(log):
         return False
 
 
+# Interactive shells are disposable: signing one out costs the operator a
+# re-login and nothing else. Everything ELSE holding /home (a database, a
+# container, a service) is never force-killed — it gets a named refusal.
+_CLOSABLE_SHELLS = frozenset(('bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'login'))
+
+
 def _home_holders():
     """Processes holding a cwd / root / exe / open fd under /home.
 
@@ -1898,9 +1905,16 @@ def _home_holders():
     than refusing: lazy-detach hides the mount from findmnt while the device stays
     open, so the lvremove that follows fails with /home ALREADY unmounted and
     fstab ALREADY rewritten. Enumerate the holders up front instead and refuse
-    while the box is still completely untouched. An operator SSH session sitting
-    in /home/<user> is the usual culprit."""
+    while the box is still completely untouched.
+
+    Returns dicts {pid, comm, tty, path, closable}. `closable` marks a plain
+    interactive shell — on a fresh box there is ALWAYS one, because whoever
+    installed the machine is logged in at its console sitting in their own home
+    directory (field-proven on the Rocky NUC, 2026-07-24: `login -- takwerx` on
+    tty1). Refusing on that alone would make the fold-in unreachable for exactly
+    the box it exists to fix."""
     holders = []
+    mine = {os.getpid(), os.getppid()}
     for pid in os.listdir('/proc'):
         if not pid.isdigit():
             continue
@@ -1914,15 +1928,57 @@ def _home_holders():
                 tgt = os.readlink(link)
             except OSError:
                 continue
-            if tgt == '/home' or tgt.startswith('/home/'):
-                try:
-                    with open(f'/proc/{pid}/comm') as f:
-                        comm = f.read().strip()
-                except OSError:
-                    comm = '?'
-                holders.append(f'{comm} (pid {pid})')
-                break
-    return sorted(set(holders))
+            if tgt != '/home' and not tgt.startswith('/home/'):
+                continue
+            try:
+                with open(f'/proc/{pid}/comm') as f:
+                    comm = f.read().strip()
+            except OSError:
+                comm = '?'
+            try:
+                tty = os.readlink(f'/proc/{pid}/fd/0')
+                tty = tty if tty.startswith('/dev/') else ''
+            except OSError:
+                tty = ''
+            ipid = int(pid)
+            holders.append({
+                'pid': ipid, 'comm': comm, 'tty': tty, 'path': tgt,
+                # A shell holding /home ONLY as its working directory is safe to
+                # sign out. One with a file open under /home is doing real work
+                # (an editor, a running script) and is treated as unsafe.
+                'closable': (comm.lstrip('-') in _CLOSABLE_SHELLS
+                             and ipid not in mine and ipid != 1
+                             and link.endswith('/cwd')),
+            })
+            break
+    return sorted(holders, key=lambda h: h['pid'])
+
+
+def _describe_holder(h):
+    return f"{h['comm']} (pid {h['pid']}{', ' + h['tty'] if h['tty'] else ''})"
+
+
+def _close_home_shells(holders, log):
+    """SIGTERM then SIGKILL the closable shells. Returns the still-live holders."""
+    for h in holders:
+        try:
+            os.kill(h['pid'], signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(10):                      # up to ~5s for a clean exit
+        time.sleep(0.5)
+        if not _home_holders():
+            break
+    for h in _home_holders():
+        if h['closable']:
+            try:
+                os.kill(h['pid'], signal.SIGKILL)
+            except OSError:
+                pass
+    time.sleep(1)
+    if holders:
+        log.append('Signed out of /home: ' + ', '.join(_describe_holder(h) for h in holders) + '.')
+    return _home_holders()
 
 
 def _do_disk_reclaim(req):
@@ -2029,13 +2085,24 @@ def _do_disk_reclaim(req):
             subprocess.run(['systemctl', 'start', 'docker'], capture_output=True, timeout=300)
             log.append('Docker restarted.')
 
+    def _refuse_holders(hs):
+        _restore_docker()
+        names = ', '.join(_describe_holder(h) for h in hs[:8])
+        more = '' if len(hs) <= 8 else f' (+{len(hs) - 8} more)'
+        return {'ok': False, 'error': f'/home is in use by {names}{more} — close it and retry. '
+                                      'Nothing was changed.', 'log': log}
+
     holders = _home_holders()
     if holders:
-        _restore_docker()
-        return {'ok': False, 'error': '/home is in use by ' + ', '.join(holders[:8]) +
-                                      ('' if len(holders) <= 8 else f' (+{len(holders) - 8} more)') +
-                                      ' — close them and retry. An SSH session sitting in /home is the '
-                                      'usual one; `cd /` in it is enough. Nothing was changed.', 'log': log}
+        stubborn = [h for h in holders if not h['closable']]
+        if stubborn:
+            # Something real is using /home. Never force it — name it and stop.
+            return _refuse_holders(stubborn)
+        if not req.get('close_shells'):
+            return _refuse_holders(holders)
+        holders = _close_home_shells(holders, log)
+        if holders:
+            return _refuse_holders(holders)
 
     # fstab: back up, then comment out the /home line.
     try:

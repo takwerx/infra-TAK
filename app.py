@@ -14886,6 +14886,11 @@ def console_disk_reclaim_api():
             return jsonify({'success': False, 'error': f"confirm_lv must be exactly '{layout['home_lv']}'.",
                             'expected_lv': layout['home_lv']}), 400
         req['confirm_lv'] = confirm
+        # On a fresh box there is ALWAYS a login shell sitting in /home — the
+        # person who installed it. The modal states that shells get signed out,
+        # so grant the broker leave to close them; it still hard-refuses on any
+        # holder that is not a plain interactive shell.
+        req['close_shells'] = True
 
     try:
         # The fold-in rsyncs/tars /home and stops docker — allow a long window.
@@ -67106,7 +67111,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="disk-fold-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw;font-family:'JetBrains Mono',monospace">
     <div style="font-size:13px;font-weight:700;color:var(--red);margin-bottom:6px">&#9888; Destroy the /home volume</div>
-    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;line-height:1.5">This <b>permanently removes</b> the logical volume below and gives its space to root. Its contents are archived to <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/var/lib/takwerx-broker/home-fold/</code> (root-only) and restored into a plain <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/home</code> directory first. <b>Docker is stopped</b> for the duration &mdash; every container goes down and comes back.</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;line-height:1.5">This <b>permanently removes</b> the logical volume below and gives its space to root. Its contents are archived to <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/var/lib/takwerx-broker/home-fold/</code> (root-only) and restored into a plain <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/home</code> directory first. <b>Docker is stopped</b> for the duration &mdash; every container goes down and comes back, and <b>any shell logged in under /home is signed out</b> (log back in after). If anything other than a shell is using /home, this stops and changes nothing.</div>
     <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 12px;margin-bottom:14px">
       <div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">Volume to be destroyed</div>
       <div id="disk-fold-lv" style="font-size:15px;font-weight:700;color:var(--red);word-break:break-all">-</div>
