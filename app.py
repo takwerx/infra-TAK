@@ -64243,9 +64243,34 @@ def run_takserver_deploy(config):
             if not _epel_installed():
                 run_cmd(f'dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el_ver}.noarch.rpm 2>&1',
                         "EPEL not in enabled repos (genuine RHEL?) — installing from the Fedora EPEL rpm URL...", check=False)
+            # GH #56, second half (found on a genuine RHEL 9.8 AWS box, 2026-07-25):
+            # CodeReady Builder ships libqhull_r and friends that PostGIS needs, but
+            # its repo id is NOT the same everywhere:
+            #   registered RHEL  codeready-builder-for-rhel-9-<arch>-rpms
+            #   AWS RHUI RHEL    codeready-builder-for-rhel-9-rhui-rpms
+            #   clones           crb
+            # Both commands we used before FAIL on RHUI — `subscription-manager repos
+            # --enable` returns "Repositories disabled by configuration" (the box is
+            # not registered; AWS licenses it through RHUI), and `--set-enabled crb`
+            # returns "Unable to read consumer identity". CRB was therefore left
+            # disabled on every AWS RHEL box. Ask dnf which repo actually exists
+            # instead of guessing, and enable that one.
             if _os_id.startswith('rhel'):
                 run_cmd(f'subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms 2>&1',
                         "Enabling CodeReady Builder (subscription-manager)...", check=False, quiet=True)
+            _crb_id = ''
+            try:
+                _crb_id = subprocess.run(
+                    "dnf repolist --all 2>/dev/null | awk '{print $1}' | "
+                    "grep -E '^(codeready-builder[A-Za-z0-9._-]*-rpms|crb)$' | "
+                    "grep -vE 'source|debug' | head -1",
+                    shell=True, capture_output=True, text=True, timeout=120,
+                    env=_broker_shim_env()).stdout.strip()
+            except Exception:
+                _crb_id = ''
+            if _crb_id:
+                run_cmd(f'dnf config-manager --set-enabled {shlex.quote(_crb_id)} 2>&1',
+                        f"Enabling CodeReady Builder ({_crb_id})...", check=False)
             if not _epel_installed():
                 log_step("✗ FATAL: the EPEL repo could not be installed. TAK Server's PostGIS dependencies")
                 log_step("  (hdf5, xerces-c, …) come from EPEL — Step 4 WILL fail without it.")
@@ -64256,7 +64281,8 @@ def run_takserver_deploy(config):
             run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-{_el_ver}-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
             run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
             run_cmd('dnf install -y java-17-openjdk-devel 2>&1', "Installing Java 17 (OpenJDK)...", check=False)
-            run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
+            # (the old blanket `--set-enabled crb` lived here; the discovery above
+            #  already covers the clone case, and on RHUI it only ever errored)
             run_cmd('dnf makecache 2>&1', "Refreshing package metadata...", check=False, quiet=True)
             log_step("✓ EPEL + PostgreSQL (PGDG) repo + Java 17 + CRB configured")
         else:
