@@ -67087,6 +67087,42 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
 </div>
+<!-- v10.1.9 W8 — disk-reclaim card. Hidden unless /api/guarddog/disk-layout reports
+     mode != 'ok'. Backend (WI-1/2/3) already exists and is NOT touched by this card. -->
+<div id="disk-reclaim-card" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:280px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow)">&#128190; <span id="disk-reclaim-headline">Disk layout</span></div>
+<div id="disk-reclaim-detail" style="font-size:11px;color:var(--text-dim);margin-top:4px;line-height:1.5"></div>
+</div>
+<div id="disk-reclaim-actions" style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" id="disk-grow-btn" onclick="diskReclaimGrow()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reclaim free space</button>
+<button type="button" id="disk-fold-btn" onclick="promptDiskFold()" style="display:none;padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reclaim /home &mdash; destructive</button>
+</div>
+</div>
+<div id="disk-reclaim-status" style="display:none;font-size:11px;margin-top:10px"></div>
+<pre id="disk-reclaim-log" style="display:none;margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="disk-fold-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div style="font-size:13px;font-weight:700;color:var(--red);margin-bottom:6px">&#9888; Destroy the /home volume</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;line-height:1.5">This <b>permanently removes</b> the logical volume below and gives its space to root. Its contents are archived to <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/var/tmp/takwerx-home-backup.tar.gz</code> and restored into a plain <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/home</code> directory first. <b>Docker is stopped</b> for the duration &mdash; every container goes down and comes back.</div>
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 12px;margin-bottom:14px">
+      <div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">Volume to be destroyed</div>
+      <div id="disk-fold-lv" style="font-size:15px;font-weight:700;color:var(--red);word-break:break-all">-</div>
+      <div id="disk-fold-lv-meta" style="font-size:10px;color:var(--text-dim);margin-top:4px"></div>
+    </div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Type the volume name to confirm</label>
+    <input id="disk-fold-lv-input" type="text" autocomplete="off" spellcheck="false" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;margin-bottom:12px" placeholder="vg/home">
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="disk-fold-pw" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmDiskFold()">
+    <div id="disk-fold-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button id="disk-fold-cancel" onclick="closeDiskFoldModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button id="disk-fold-confirm" onclick="confirmDiskFold()" style="padding:7px 16px;background:var(--red);color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Destroy and reclaim</button>
+    </div>
+  </div>
+</div>
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
@@ -67300,6 +67336,147 @@ async function fetchRetry(url,opts,tries){
   }
   throw lastErr;
 }
+/* ---- v10.1.9 W8: disk-reclaim card ----------------------------------------
+   Frontend for the WI-1/2/3 backend that already exists (_detect_disk_layout,
+   GET /api/guarddog/disk-layout, POST /api/console/disk/reclaim). The card is
+   invisible on a healthy box (mode 'ok', which also covers "not on LVM").
+   grow_free is non-destructive -> one confirm. fold_home DESTROYS an LV -> the
+   Power-Off treatment: password re-confirm plus the operator types the exact LV,
+   which is what the API's confirm_lv echo is for. */
+var _diskLayout=null,_diskBusy=false;
+function _diskEsc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function _diskEl(id){return document.getElementById(id);}
+function diskLayoutRefresh(){
+    if(_diskBusy)return;
+    var card=_diskEl('disk-reclaim-card');if(!card)return;
+    /* Every /api/guarddog* URL inherits a 12s global abort (see __fetchTO). The
+       layout probe shells out to lvs/vgs through the broker and can outrun that on
+       a loaded box, so it supplies its own longer signal to opt out. */
+    var ctl=new AbortController();var to=setTimeout(function(){try{ctl.abort();}catch(e){}},30000);
+    fetch('/api/guarddog/disk-layout',{credentials:'same-origin',signal:ctl.signal}).then(function(r){return r.json();}).then(function(d){
+        clearTimeout(to);
+        if(!d||!d.success||!d.layout)return;
+        _diskLayout=d.layout;
+        _diskRenderCard(d.layout);
+    }).catch(function(){clearTimeout(to);});
+}
+function _diskRenderCard(L){
+    var card=_diskEl('disk-reclaim-card');if(!card)return;
+    if(!L||L.mode==='ok'){card.style.display='none';return;}
+    card.style.display='block';
+    var head=_diskEl('disk-reclaim-headline');
+    if(head)head.textContent='Root is only '+L.root_pct_of_vg+'% of this disk — '+L.reclaimable_gb+' GB is reclaimable for TAK';
+    var bits=[];
+    if(L.mode==='free_extents'||L.mode==='both')
+        bits.push('<b>'+_diskEsc(L.vg_free_gb)+' GB</b> of volume group <b>'+_diskEsc(L.vg)+'</b> is unallocated. Growing <b>'+_diskEsc(L.root_lv)+'</b> into it is non-destructive, needs no reboot, and nothing has to stop.');
+    if(L.mode==='idle_home'||L.mode==='both')
+        bits.push('<b>'+_diskEsc(L.home_lv)+'</b> is a separate <b>'+_diskEsc(L.home_lv_gb)+' GB</b> volume holding only '+_diskEsc(L.home_used_mb)+' MB. Folding it into root hands that space to TAK — <b>this destroys the volume</b> and stops Docker while it runs.');
+    bits.push('TAK Server, Docker, Postgres, Authentik and CloudTAK all live on root ('+_diskEsc(L.root_gb)+' GB), so space parked anywhere else is unusable.');
+    var det=_diskEl('disk-reclaim-detail');
+    if(det)det.innerHTML=bits.join('<br>');
+    var grow=_diskEl('disk-grow-btn'),fold=_diskEl('disk-fold-btn');
+    if(grow){
+        var showGrow=(L.mode==='free_extents'||L.mode==='both');
+        grow.style.display=showGrow?'':'none';
+        grow.textContent='Reclaim '+L.vg_free_gb+' GB';
+    }
+    if(fold)fold.style.display=(L.mode==='idle_home'||L.mode==='both')?'':'none';
+}
+function _diskSetBusy(on,text){
+    _diskBusy=on;
+    var grow=_diskEl('disk-grow-btn'),fold=_diskEl('disk-fold-btn'),st=_diskEl('disk-reclaim-status');
+    if(grow)grow.disabled=on;
+    if(fold)fold.disabled=on;
+    if(st&&text){st.style.display='block';st.style.color='var(--cyan)';st.textContent=text;}
+}
+function _diskShowResult(ok,msg,d){
+    var st=_diskEl('disk-reclaim-status'),lg=_diskEl('disk-reclaim-log');
+    if(st){st.style.display='block';st.style.color=ok?'var(--green)':'var(--red)';st.textContent=(ok?'✓ ':'✗ ')+msg;}
+    var lines=(d&&d.log)?d.log.slice():[];
+    if(d&&d.df_after)lines.push('','',d.df_after);
+    if(d&&d.backup)lines.push('','Backup archive kept at '+d.backup+' (root-only, 0600).');
+    if(lg){
+        if(lines.length){lg.style.display='block';lg.textContent=lines.join('\\n');}
+        else{lg.style.display='none';lg.textContent='';}
+    }
+}
+async function diskReclaimGrow(){
+    var L=_diskLayout;if(!L)return;
+    if(!confirm('Grow '+L.root_lv+' into '+L.vg_free_gb+' GB of unallocated space?\\n\\nNon-destructive: no data is touched, no reboot, nothing stops. The filesystem is grown online.'))return;
+    _diskSetBusy(true,'Growing root — this takes a few seconds…');
+    try{
+        var r=await fetch('/api/console/disk/reclaim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'grow_free'}),credentials:'same-origin'});
+        var d=await r.json();
+        _diskSetBusy(false,'');
+        if(d.success){
+            _diskShowResult(true,'Root grew into the free extents.',d);
+            if(d.layout){_diskLayout=d.layout;_diskRenderCard(d.layout);}
+        }else{
+            _diskShowResult(false,d.error||'Reclaim failed.',d);
+        }
+    }catch(e){
+        _diskSetBusy(false,'');
+        _diskShowResult(false,'Request failed: '+(e.message||'unknown'),null);
+    }
+}
+function promptDiskFold(){
+    var L=_diskLayout;if(!L||!L.home_lv)return;
+    var m=_diskEl('disk-fold-modal');
+    var lv=_diskEl('disk-fold-lv'),meta=_diskEl('disk-fold-lv-meta');
+    var inp=_diskEl('disk-fold-lv-input'),pw=_diskEl('disk-fold-pw'),err=_diskEl('disk-fold-err');
+    if(lv)lv.textContent=L.home_lv;
+    if(meta)meta.textContent=L.home_lv_gb+' GB volume, '+L.home_used_mb+' MB in use — root gains the whole '+L.home_lv_gb+' GB.';
+    if(inp){inp.value='';inp.placeholder=L.home_lv;}
+    if(pw)pw.value='';
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    var btn=_diskEl('disk-fold-confirm');if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+    var cancel=_diskEl('disk-fold-cancel');if(cancel)cancel.disabled=false;
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closeDiskFoldModal(){
+    if(_diskBusy)return;      /* never let the operator lose sight of a running fold-in */
+    var m=_diskEl('disk-fold-modal');
+    if(m)m.style.display='none';
+}
+async function confirmDiskFold(){
+    var L=_diskLayout;if(!L||!L.home_lv)return;
+    var inp=_diskEl('disk-fold-lv-input'),pw=_diskEl('disk-fold-pw'),err=_diskEl('disk-fold-err');
+    var typed=(inp?inp.value:'').trim(),pass=(pw?pw.value:'');
+    function fail(msg){if(err){err.style.color='var(--red)';err.textContent=msg;}}
+    if(typed!==L.home_lv){fail('Type the volume name exactly: '+L.home_lv);return;}
+    if(!pass){fail('Console password required');return;}
+    fail('');
+    var btn=_diskEl('disk-fold-confirm'),cancel=_diskEl('disk-fold-cancel');
+    if(btn){btn.disabled=true;btn.textContent='Working…';}
+    if(cancel)cancel.disabled=true;
+    _diskSetBusy(true,'Folding '+L.home_lv+' into root — Docker is stopped for this. Can take several minutes on a large /home. Do not close this tab.');
+    if(err){err.style.color='var(--cyan)';err.textContent='Archiving /home, then removing the volume… this window stays open until it finishes.';}
+    /* Deliberately no client-side timeout: the broker allows up to 40 min for the
+       rsync + tar + lvremove + filesystem grow. */
+    try{
+        var r=await fetch('/api/console/disk/reclaim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'fold_home',password:pass,confirm_lv:L.home_lv}),credentials:'same-origin'});
+        var d=await r.json();
+        _diskSetBusy(false,'');
+        if(d.success){
+            var m=_diskEl('disk-fold-modal');if(m)m.style.display='none';
+            _diskShowResult(true,L.home_lv+' folded into root.',d);
+            if(d.layout){_diskLayout=d.layout;_diskRenderCard(d.layout);}
+        }else{
+            if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+            if(cancel)cancel.disabled=false;
+            fail(d.error||'Reclaim failed.');
+            /* Broker failure paths roll back (fstab restored, /home remounted, Docker
+               restarted) and return their log — show it rather than swallow it. */
+            if(d.log&&d.log.length)_diskShowResult(false,d.error||'Reclaim failed.',d);
+        }
+    }catch(e){
+        _diskSetBusy(false,'');
+        if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+        if(cancel)cancel.disabled=false;
+        fail('Connection lost: '+(e.message||'unknown')+'. The fold-in may still be running on the box — wait a few minutes, reload this page, and check the card before retrying.');
+    }
+}
+diskLayoutRefresh();
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
