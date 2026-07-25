@@ -1926,20 +1926,33 @@ def _do_disk_reclaim(req):
                 'log': log}
     log.append(f'/home is {lv_path}, {used_b // 1024 ** 2} MB used — within the fold-in limit.')
 
-    stage = '/var/tmp/takwerx-home-fold'
-    backup = '/var/tmp/takwerx-home-backup.tar.gz'
+    # /home holds every user's SSH PRIVATE KEYS, so neither the staging copy nor the
+    # archive may live in world-writable /var/tmp. Mode 0600/0700 is not enough there:
+    # the paths are fixed and predictable, so ANY local account — including the
+    # non-root console user this broker exists to contain — can pre-plant a symlink
+    # and have root follow it, truncating an arbitrary root-owned file and landing the
+    # whole key archive somewhere the attacker owns and can read. Both now live under
+    # the broker's own root-only state dir (nobody but root can create a path there),
+    # and the archive is opened O_EXCL|O_NOFOLLOW so a link at that path is a hard
+    # error rather than a target. Mode is still set BEFORE any data is written.
+    fold_dir = '/var/lib/takwerx-broker/home-fold'
+    stage = fold_dir + '/stage'
+    backup = fold_dir + '/takwerx-home-backup.tar.gz'
+    try:
+        os.makedirs(fold_dir, exist_ok=True)
+        os.chmod(fold_dir, 0o700)
+    except OSError as e:
+        return {'ok': False, 'error': f'could not create the fold-in work directory: {e}', 'log': log}
     subprocess.run(['rm', '-rf', stage], capture_output=True, timeout=60)
-    # /home holds users' SSH PRIVATE KEYS. The staging dir and the tarball must be
-    # root-only: a default-umask tar lands 0644 in a world-readable /var/tmp, which
-    # would hand every local account a copy of every private key on the box. Mode is
-    # set BEFORE any data is written, never after (no readable window).
     os.makedirs(stage, mode=0o700, exist_ok=True)
     os.chmod(stage, 0o700)
     rs = subprocess.run(['rsync', '-aXS', '/home/', stage + '/'], capture_output=True, text=True, timeout=1800)
     if rs.returncode != 0:
         return {'ok': False, 'error': 'rsync of /home failed: ' + (rs.stderr or '')[:200], 'log': log}
     try:
-        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        if os.path.lexists(backup):
+            os.unlink(backup)       # lexists+unlink: never follow, always replace
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         os.close(fd)
         os.chmod(backup, 0o600)
     except OSError as e:
