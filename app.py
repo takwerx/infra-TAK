@@ -7982,7 +7982,14 @@ def _migrate_split_db_tls():
                                                              remove_plaintext=True)
             for line in rm_log:
                 _p(line)
-            _split_db_tls_state('enabled')
+            # Record WHICH kind of done this was. The retrofit runs exactly once and
+            # is then skipped forever, so a residual cleartext rule we deliberately
+            # chose not to delete would be announced in a single journal line and
+            # never mentioned again — the operator's cue to close it disappears.
+            # 'enabled-residual' still satisfies the startswith('enabled') skip, so
+            # the migration stays one-shot; it just keeps re-warning on every boot.
+            _split_db_tls_state('enabled-residual'
+                                if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log) else 'enabled')
             if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log):
                 _p("✓ DONE — the core↔DB link is now TLS (verify-full pinned). NOTE: Server One "
                    "still accepts non-TLS connections from other clients (listed above) — that "
@@ -72397,9 +72404,17 @@ def _startup_migrations():
         # existing splits (test8, NE-TAK class) get TLS from a normal update, no SSH needed.
         try:
             _sdt_cfg = _get_tak_deployment_config(s)
-            if _sdt_cfg.get('mode') == 'two_server' and not _split_db_tls_state().startswith('enabled'):
+            _sdt_state = _split_db_tls_state() if _sdt_cfg.get('mode') == 'two_server' else 'n/a'
+            if _sdt_cfg.get('mode') == 'two_server' and not _sdt_state.startswith('enabled'):
                 threading.Thread(target=_migrate_split_db_tls, daemon=True).start()
                 print("Startup migration: split DB TLS retrofit launched in background", flush=True)
+            elif _sdt_state == 'enabled-residual':
+                # Re-assert every boot. The core<->DB link IS encrypted; what remains
+                # is a broader non-TLS pg_hba rule that is not ours to delete. Saying
+                # it once and going quiet reads as "handled" when it is not.
+                print("Split DB TLS: ⚠ core<->DB link is encrypted (verify-full pinned), but Server One "
+                      "still accepts NON-TLS connections from other clients. Review its pg_hba.conf and "
+                      "remove any remaining `host ...` rule that is not loopback-only.", flush=True)
         except Exception as _sdt_e:
             print(f"Startup migration: split DB TLS launch error (non-fatal): {_sdt_e}", flush=True)
 
