@@ -232,6 +232,11 @@ EXEC_ALLOW = {
     # takwerx cannot stat. Unrestricted args are acceptable for a no-side-effect
     # binary.
     'test',
+    # v10.1.9 W7: `stat` is read-only metadata (mode/owner/size) — it cannot write,
+    # exec, or read file CONTENTS, so it is the same no-side-effect class as `test`
+    # above. The permissions-hardening pass needs it to check a mode BEFORE
+    # chmod'ing, so it only ever narrows and never widens a deliberately-tight file.
+    'stat',
     # v10.0.8 harvest: git for root-era module repos (TVR/WebODM stay at /root on
     # a flipped box). Tightly gated — see _check_git: -C <root-era module dir>
     # only; home-resident repos run git DIRECTLY as the console user, never here.

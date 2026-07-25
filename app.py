@@ -7792,6 +7792,71 @@ def _coreconfig_db_tls_converge(cc, settings=None):
         return cc
 
 
+def _harden_sensitive_permissions(plog=None):
+    """v10.1.9 W7 — tighten world-readable secrets left behind by default umasks.
+
+    Found live on test8 2026-07-25 while auditing after an operator report:
+      - /opt/tak/certs/files/admin.key was 644 (tak:tak). The TAK ADMIN client
+        private key, readable by `takwerx` — i.e. a console compromise could
+        impersonate the TAK administrator, which is exactly what running the
+        console non-root is supposed to prevent. Written by TAK's own cert
+        scripts under a default umask, not by us.
+      - authentik/.env, CloudTAK/.env, TAK-Portal/.env were 644, each carrying
+        DB passwords + signing keys. These we generate, so this one IS ours.
+      - /opt/tak/CoreConfig.xml was 674 — the DB password in plaintext, world
+        readable.
+
+    None of these are network-reachable; they are local privilege-escalation
+    stepping stones. Idempotent and cheap, so it runs on every console boot via
+    _startup_migrations (console-path delivery — existing boxes get it from a
+    normal update, no SSH). Ownership is never changed, only the mode, so a
+    service that already reads its own file keeps working:
+      *.key / *.p12 / *.jks → 600      (owner-only; TAK runs as their owner)
+      module .env           → 600      (owner-only; compose runs as that user)
+      CoreConfig.xml        → 640      (tak group keeps read; world loses it)
+    """
+    def _say(m):
+        (plog or (lambda x: print(f"Permissions hardening: {x}", flush=True)))(m)
+
+    targets = []
+    # TAK private key material (cert scripts leave .key at 644).
+    for pat in ('*.key', '*.p12', '*.jks'):
+        try:
+            r = subprocess.run(_sudo_wrap(['find', '/opt/tak/certs', '-maxdepth', '3',
+                                           '-type', 'f', '-name', pat]),
+                               capture_output=True, text=True, timeout=30)
+            targets += [(p.strip(), '600') for p in (r.stdout or '').splitlines() if p.strip()]
+        except Exception:
+            pass
+    # Module .env files (we generate these). Cover both the non-root home and the
+    # root-era layout that pre-flip boxes still carry.
+    for home in ('/home/takwerx', '/root'):
+        for mod in ('authentik', 'CloudTAK', 'TAK-Portal', 'node-red', 'nodered',
+                    'netbird', 'eud-remote-assist', 'webodm', 'emailrelay'):
+            targets.append((f'{home}/{mod}/.env', '600'))
+    targets.append(('/opt/tak/CoreConfig.xml', '640'))
+
+    fixed = []
+    for path, want in targets:
+        try:
+            r = subprocess.run(_sudo_wrap(['stat', '-c', '%a', path]),
+                               capture_output=True, text=True, timeout=15)
+            cur = (r.stdout or '').strip()
+            if not cur or r.returncode != 0:
+                continue                      # not present on this box
+            # Only tighten. Never widen a mode an operator deliberately narrowed.
+            if int(cur, 8) & ~int(want, 8):
+                c = subprocess.run(_sudo_wrap(['chmod', want, path]), capture_output=True, timeout=15)
+                if c.returncode == 0:
+                    fixed.append(f'{path} {cur}->{want}')
+        except Exception:
+            continue
+    if fixed:
+        _say(f'tightened {len(fixed)} file(s): ' + '; '.join(fixed[:8])
+             + (f' (+{len(fixed) - 8} more)' if len(fixed) > 8 else ''))
+    return fixed
+
+
 def _split_db_tls_state(value=None):
     """Read/write the retrofit's completion marker.
 
@@ -72132,6 +72197,13 @@ def _startup_migrations():
             _f2b_selfheal_rhel_jails(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e:
             print(f"Startup migration: fail2ban self-heal error (non-fatal): {_f2b_e}", flush=True)
+
+        # v10.1.9 W7 — tighten world-readable secrets (TAK private keys, module
+        # .env files, CoreConfig). Idempotent, only ever narrows a mode.
+        try:
+            _harden_sensitive_permissions()
+        except Exception as _hp_e:
+            print(f"Startup migration: permissions hardening error (non-fatal): {_hp_e}", flush=True)
 
         # v10.1.9 W1 — retrofit: encrypt an existing split-box core↔DB link (TLS + SCRAM).
         # One-shot per box; involves a takserver restart + live verification (minutes), so it
