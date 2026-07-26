@@ -119,17 +119,16 @@ flushes.
 All three MediaMTX streaming options work through a relay and are forwarded automatically — **RTSP**
 (8554), **RTSPS** (8322) and **SRT** (8890). Add the matching NSG rules for the ones you use.
 
-**One setting matters for SRT.** The tunnel runs at an MTU of 1280 bytes, deliberately — cellular
-carriers translate IPv4 into IPv6 and add overhead, and anything larger silently breaks big packets
-on those networks. SRT's default packet size is 1316 bytes, which is over that budget, so send at
-**1200** instead:
+**If an SRT stream stutters, try a smaller packet size.** The tunnel runs at an MTU of 1280 bytes
+(deliberate — cellular carriers add IPv6 translation overhead, and anything larger silently breaks
+big packets on those networks), while SRT defaults to 1316. Streams generally play fine as-is on a
+clean connection; if yours breaks up over cellular or a lossy link, send at 1200:
 
 ```
 srt://<relay-ip>:8890?streamid=<stream>&pkt_size=1200
 ```
 
-Encoders expose this as *packet size*, *payload size* or `pkt_size`. Symptom if you skip it: the
-stream connects and reports healthy, then delivers stuttering or broken video.
+Encoders expose this as *packet size*, *payload size* or `pkt_size`.
 
 RTSP needs nothing special — our MediaMTX ships `rtspTransports: [tcp]`, which is what a relay
 carries cleanly, and players negotiate it automatically.
