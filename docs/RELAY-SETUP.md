@@ -198,6 +198,33 @@ The console SSHes into the relay, installs and configures everything, and brings
 the status line reads **● Tunnel UP**, your box is reachable through the relay from anywhere — no
 further steps, and it re-connects on its own every time your box changes networks.
 
+## Free Tier vs Pay As You Go — read this before you rely on a relay
+
+Oracle reclaims **idle** Always Free compute instances. An instance counts as idle if, over a 7-day
+period, its CPU sits below 20% at the 95th percentile (plus network, and memory on A1 shapes).
+
+**A relay is idle almost by definition.** It forwards packets and runs nothing else — a WireGuard
+tunnel with a handful of TAK clients on it will not come close to 20% CPU on a 1-OCPU machine. So a
+relay on a pure Free Tier account is exactly the workload that policy is written to catch, and the
+consequence lands badly: if the relay goes away, the box behind it is unreachable from the internet
+until you rebuild and re-provision.
+
+**The fix is to upgrade the account to Pay As You Go.** Always Free resources are not reclaimed on a
+paid account, and Oracle does not charge for resources that stay inside the Always Free limits — a
+relay on an A1.Flex 1 OCPU / 6 GB or an E2.1.Micro stays inside them. You put a card on file and keep
+paying nothing. That is the whole difference.
+
+You'll see people keep Free Tier instances busy with artificial load to dodge this. Don't — it burns
+the box's CPU continuously to defeat a policy that a payment method removes outright.
+
+> **Watch your billing if you upgrade.** Pay As You Go means resources *outside* the Always Free
+> limits do bill. Adding a second relay, a bigger shape, or extra block storage can put you over the
+> line. The Always Free allowance is per tenancy, not per instance — 4 OCPUs and 24 GB of Ampere
+> capacity total, so two 1-OCPU relays still fit.
+
+Either way, Guard Dog monitors the relay tunnel and will alert you if it drops, so a reclaimed or
+stopped relay surfaces as an alert rather than a silent outage.
+
 ## Notes
 
 - **Cost:** Oracle's Always Free tier covers this VM and a reserved IP at no charge.
