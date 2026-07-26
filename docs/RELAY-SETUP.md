@@ -98,8 +98,12 @@ These two are worth adding, and each needs both halves. SSH to the relay
 
 | Port | Gives you | On the relay |
 |---|---|---|
-| TCP **2222** | SSH to the box behind the relay, on 2222 → the box's 22 | `sudo iptables -t nat -A PREROUTING -p tcp --dport 2222 -j DNAT --to-destination 172.31.99.2:22` then `sudo iptables -A FORWARD -d 172.31.99.2 -p tcp --dport 22 -j ACCEPT` |
+| TCP **2222** | SSH to the box behind the relay, on 2222 → the box's 22 | `sudo iptables -t nat -I PREROUTING -p tcp --dport 2222 -j DNAT --to-destination 172.31.99.2:22` then `sudo iptables -I FORWARD -d 172.31.99.2 -p tcp --dport 22 -j ACCEPT` |
 | TCP **5001** | The infra-TAK console on the relay's public IP — see the warning below | same two commands with `5001` in place of both `2222` and `22` |
+
+Both commands use `-I` (insert), not `-A` (append) — that matters. Oracle's images ship a FORWARD
+chain that ends in a blanket REJECT, so an appended ACCEPT lands *after* the REJECT and never
+matches. The rule looks present in `iptables -S` and does nothing.
 
 Run `sudo netfilter-persistent save` afterwards so the rules survive a reboot. Re-running **Set Up
 Relay** from the console will not remove them — the setup script only ever adds rules, it never
@@ -130,8 +134,8 @@ stream connects and reports healthy, then delivers stuttering or broken video.
 RTSP needs nothing special — our MediaMTX ships `rtspTransports: [tcp]`, which is what a relay
 carries cleanly, and players negotiate it automatically.
 
-**Remote Assist screen sharing is the one thing still outside this** — CoTURN needs UDP 3478 plus a
-wide UDP media range, which isn't forwarded.
+**Remote Assist screen sharing is the one thing still outside this** — CoTURN needs UDP 3479 plus a
+wide range of media ports, which isn't forwarded.
 
 Watching a stream *inside* the CloudTAK or MediaMTX web player works regardless of any of the above,
 because that's HTTPS on 443 rather than a raw video port.
@@ -158,5 +162,9 @@ further steps, and it re-connects on its own every time your box changes network
   some hotel and guest Wi-Fi permits *only* 443. The relay listens on whichever you picked and
   redirects the other to it, so you can switch in the console without touching Oracle again — as
   long as both UDP rules are open.
-- **Privacy:** the relay forwards encrypted packets only. TAK's own mutual-TLS runs end-to-end
-  between the client and your box — the relay can't read it.
+- **Privacy:** the relay is a packet forwarder with no TLS stack in the path, so it never terminates
+  or decrypts a connection. TAK's mutual-TLS, HTTPS, and RTSPS all run end-to-end between the client
+  and your box — the relay can't read any of it. Note that this cuts both ways: traffic that isn't
+  encrypted to begin with, such as plain **RTSP** on 8554 or **SRT** without a passphrase, crosses
+  the relay in the clear exactly as it would over any other network path. Use RTSPS, or set an SRT
+  passphrase, if that matters for your streams.
