@@ -783,7 +783,15 @@ AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel 
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
 # contract and validated 13.49.0 end-to-end on test12 (plugins built, routes loaded, Events
 # CRUD in browser) — un-gated per operator decision 2026-07-17.
-CLOUDTAK_VETTED_RELEASE = "13.50.0"     # v10.1.6: validated on 5-box fleet (Ubuntu/Rocky/ARM) 2026-07-21; pre-13.45 plugin installs refused
+CLOUDTAK_VETTED_RELEASE = "13.54.3"     # v10.1.9: 13.50.0 -> 13.54.3, validated 2026-07-26 on Ubuntu/Rocky/ARM64; pre-13.45 plugin installs refused
+                                        # The GATE STAYS. Operator decision 2026-07-26: keep gating CloudTAK
+                                        # and bump the vetted number deliberately. dfpc-coe ships fast (six
+                                        # releases 13.53.1 -> 13.54.3 in three days, 24-26 Jul) and 13.45's
+                                        # hub/api split already broke plugin server routes once — this pin is
+                                        # what keeps a customer clicking Update from landing on whatever
+                                        # merged that morning. Dev-channel boxes still track upstream latest,
+                                        # so the fleet runs ahead of the pin by design; bumping is a one-line
+                                        # change once it has been watched.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
