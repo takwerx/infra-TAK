@@ -26224,7 +26224,9 @@ paths:
     # DENIED here so a regressed bind can't leak the admin surface. Browsers
     # reach the webedit + HLS through Caddy on 443.
     _module_run(deploy_cfg,
-        "ufw allow 8554/tcp 2>/dev/null; ufw allow 8322/tcp 2>/dev/null; ufw allow 8890/tcp 2>/dev/null; "
+        # 8890 is SRT — UDP. This opened 8890/tcp until v10.1.10, which held a hole
+        # open on a port nothing listens on while leaving SRT's real port closed.
+        "ufw allow 8554/tcp 2>/dev/null; ufw allow 8322/tcp 2>/dev/null; ufw allow 8890/udp 2>/dev/null; "
         "ufw deny 8888/tcp 2>/dev/null; ufw deny 5080/tcp 2>/dev/null; ufw deny 9898/tcp 2>/dev/null; true",
         timeout=15)
     plog("✓ Ports opened (RTSP/RTSPS/SRT public; webedit/API/HLS loopback only)")
