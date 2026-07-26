@@ -55,6 +55,8 @@ Rules**. Add these ingress rules, each with **Source `0.0.0.0/0`**:
 | **TCP** | **8089** | ATAK / iTAK / WinTAK client connections (mutual-TLS) |
 | **TCP** | **8443** | TAK admin WebGUI (client-cert auth) |
 | **TCP** | **8446** | TAK admin WebGUI (Let's Encrypt cert / LDAP login) |
+| TCP | 8554 | MediaMTX **RTSP** video — only if you stream |
+| TCP | 8322 | MediaMTX **RTSPS** video — only if you stream |
 
 Those seven are what **Set Up Relay** configures automatically — the relay is forwarding exactly
 these the moment the tunnel comes up. Optional extras are in *Going beyond the defaults* below.
@@ -88,12 +90,11 @@ your box. Adding an NSG rule for a port the relay doesn't forward is harmless bu
 packet arrives and is dropped. This catches people out, because the NSG page then *looks* like the
 port is open.
 
-These three are worth adding, and each needs both halves. SSH to the relay
+These two are worth adding, and each needs both halves. SSH to the relay
 (`ssh -i <your.key> ubuntu@<relay-ip>`) and run the matching command, then add the NSG rule:
 
 | Port | Gives you | On the relay |
 |---|---|---|
-| TCP **8554** | RTSP video straight to a player (`rtsp://<relay-ip>:8554/...`) | `sudo bash ~/connectivity-anchor-bootstrap.sh setup` with `TAK_PORTS="8089 8443 8446 8554"` prefixed |
 | TCP **2222** | SSH to the box behind the relay, on 2222 → the box's 22 | `sudo iptables -t nat -A PREROUTING -p tcp --dport 2222 -j DNAT --to-destination 172.31.99.2:22` then `sudo iptables -A FORWARD -d 172.31.99.2 -p tcp --dport 22 -j ACCEPT` |
 | TCP **5001** | The infra-TAK console on the relay's public IP — see the warning below | same two commands with `5001` in place of both `2222` and `22` |
 
@@ -106,10 +107,25 @@ flushes.
 > different proposition on a public Oracle address where anyone can reach the login page. The
 > supported path to the console from outside is HTTPS on 443 through Caddy, with Authentik in front.
 
-**What still won't work through a relay, whatever you open:** the forwarding is TCP-only, so
-anything UDP is out — MediaMTX SRT (8890) and RTP (8000/8001), and Remote Assist screen sharing
-(CoTURN needs UDP 3478 plus a UDP relay range). Streaming *inside* the CloudTAK or MediaMTX web UI
-works regardless, because that's HTTPS on 443.
+### Video through a relay: RTSP yes, SRT no
+
+The relay carries traffic as TCP. That is a hard limit, not a setting — so of the streaming options
+in the MediaMTX configurator:
+
+- **RTSP (8554) and RTSPS (8322) work.** Both are TCP and both are forwarded automatically. One
+  catch: the player must use **RTSP over TCP** (sometimes labelled *TCP* or *interleaved* transport).
+  RTSP's UDP transport carries the actual video on ports 8000/8001, which can't cross the relay — the
+  stream will connect and then show nothing. VLC: *Input/Codecs → Use RTP over RTSP (TCP)*. ffmpeg:
+  `-rtsp_transport tcp`.
+- **SRT (8890) does not work through a relay, and can't be made to.** SRT is built on UDP by design;
+  there is no TCP mode to switch on. If you need SRT from outside, the box needs real public inbound
+  rather than a relay.
+
+Same reason, same answer for **Remote Assist screen sharing** — CoTURN needs UDP 3478 plus a UDP
+media range.
+
+Watching a stream *inside* the CloudTAK or MediaMTX web player works either way, because that is
+HTTPS on 443 rather than a raw video port.
 
 ## 5. Finish in the console — automatically
 
