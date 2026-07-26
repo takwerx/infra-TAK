@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.9-alpha)**
+**Current release: [v10.1.10-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.10-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.10-alpha — 2026-07-26 — Relays now maintain themselves, carry video, and the setup guide no longer sends you down a dead end
+
+**Headline: a relay used to be set up once and never updated again — so any improvement we made only ever reached brand-new relays. The console now keeps your relay current on its own, and that channel immediately delivers a security fix plus full video support.** **Relays update themselves.** If your relay was built by an older version of infra-TAK, the console detects it and re-applies the current configuration by itself on the next restart — no terminal, no SSH, nothing to type. The tunnel stays up throughout and nothing you added by hand is removed. An **Update Relay** button on the Connectivity page does the same on demand. **Security fix delivered through it.** Relays built before mid-2026 left their reachability helper listening to the open internet instead of only inside the tunnel. It was password-protected, so nothing was exposed, but it had no business being reachable — and until now there was no way to fix an already-built relay. Updating infra-TAK corrects it automatically. **Video through a relay.** RTSP, RTSPS and SRT streaming are now carried by default. SRT in particular never worked before, and could not have — the relay only ever forwarded TCP, and SRT is UDP. **Setup guide rewritten.** Followed literally, the old guide produced a relay that could never connect: it named the wrong tunnel port. It has been rewritten against the current Oracle console — which is now a four-page wizard — and gained sections on adding a second relay, what Free Tier's idle-reclamation policy means for a relay (which is idle by nature), and which ports actually matter. **Upgrade:** applied automatically on the next console update; if your relay is unreachable at that moment, the console shows a button to finish it later.
+
+Full notes: [v10.1.10-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.10-alpha).
 
 ### v10.1.9-alpha — 2026-07-26 — Two-server database links are encrypted, fail2ban stops locking you out of your own server, and wasted disk gets reclaimed
 
