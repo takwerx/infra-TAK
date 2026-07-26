@@ -36,7 +36,13 @@ TAK_PORTS="${TAK_PORTS:-8089 8443 8446}"   # streaming / Marti+WebTAK / cert enr
 WEB_PORTS="${WEB_PORTS:-80 443}"           # Caddy: Let's Encrypt ACME challenge + all web UIs
                                            # (Portal, Authentik, CloudTAK, console). Without these a
                                            # relayed box can never get a cert or serve the web side.
-FWD_PORTS="$WEB_PORTS $TAK_PORTS"          # everything the relay forwards to the box
+# v10.1.10: MediaMTX video. The configurator offers RTSP, RTSPS and SRT, so a relayed
+# box should carry every one of those a relay CAN carry — both TCP ones. SRT (8890) and
+# RTSP's UDP transport (8000/8001) are deliberately absent and can never be added here:
+# this forward is kernel TCP DNAT, so UDP has no path. RTSP clients behind a relay must
+# use TCP/interleaved transport; UDP transport negotiates and then plays nothing.
+MEDIA_PORTS="${MEDIA_PORTS:-8554 8322}"    # 8554 RTSP · 8322 RTSPS
+FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS"   # everything the relay forwards to the box
 PROBER_PORT="5099"
 PROBER_DIR="/opt/takwerx-prober"
 PROBER_TOKEN_FILE="/etc/takwerx-prober.token"
