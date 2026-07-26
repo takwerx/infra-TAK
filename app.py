@@ -428,6 +428,36 @@ def _read_priv(path):
     return proc.stdout
 
 
+def _read_coreconfig(path=CORECONFIG_PATH):
+    """Read CoreConfig.xml as text — the ONE way the console is allowed to read it.
+
+    v10.1.9: W7 hardening tightened /opt/tak/CoreConfig.xml to 640 tak:tak (it
+    carries the martiuser DB password in plaintext and had been world-readable).
+    The console runs as `takwerx`, which is deliberately NOT in group `tak` — see
+    [[broker-privilege-boundary]] and GH #52 — so a plain open() started raising
+    PermissionError on every non-root box. Sixteen call sites read CoreConfig
+    with a bare `except`, so instead of erroring they returned a WRONG ANSWER:
+    _coreconfig_has_ldap() said "no LDAP", and the TAK Server page offered
+    "Connect TAK Server to LDAP" on boxes that were already connected. Silent
+    misdetection also reached cert-enrollment patching, group-cache/webadmin
+    sync and the split-DB TLS converge checks.
+
+    Direct read first (root installs, and cheaper than a socket round trip), then
+    the broker. Raises the ORIGINAL OSError when neither route works, so callers
+    keep their existing FileNotFoundError / 'coreconfig_unreadable' semantics —
+    an unreadable CoreConfig must surface as an error, never as "no LDAP".
+    Writes already go through _write_priv(); this is the read half of that pair.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except OSError as direct_err:
+        try:
+            return _read_priv(path)
+        except Exception:
+            raise direct_err
+
+
 def _makedirs_priv(path, mode=None, exist_ok=True):
     """Create a directory on a privileged path. Routes through the broker (mkdir
     -p) when non-root; otherwise native os.makedirs. Raw os.makedirs(/etc/...) by
@@ -7973,9 +8003,39 @@ def _harden_sensitive_permissions(plog=None):
       *.key / *.p12 / *.jks → 600      (owner-only; TAK runs as their owner)
       module .env           → 600      (owner-only; compose runs as that user)
       CoreConfig.xml        → 640      (tak group keeps read; world loses it)
+
+    GUARD (added after W7 broke CoreConfig reads): every tightening is verified —
+    if the console could get the bytes of a file before the chmod and cannot after
+    it, the mode is REVERTED and reported. See _console_can_read() below.
     """
     def _say(m):
         (plog or (lambda x: print(f"Permissions hardening: {x}", flush=True)))(m)
+
+    def _console_can_read(path):
+        """Can THIS console process actually obtain the contents of `path`?
+
+        Direct read first, then the privileged route (broker / sudo cat) — a
+        broker-routed read counts, because that is how the console is SUPPOSED
+        to reach hardened files (CoreConfig.xml since v10.1.9). Only False when
+        neither route yields bytes. Always True as root, so the guard is a no-op
+        on root installs — which is correct: root never lost a read.
+
+        Deliberately a REAL read, not os.access(): the broker enforces a path
+        allowlist, so 'the mode allows it' and 'the console can get it' are
+        different questions and only the read answers the second one. Contents
+        are discarded immediately — these are secret files, nothing is logged.
+        """
+        try:
+            with open(path, 'rb') as f:
+                f.read(1)
+            return True
+        except OSError:
+            pass
+        try:
+            _read_priv(path)
+            return True
+        except Exception:
+            return False
 
     targets = []
     # ── /opt/tak/certs is DELIBERATELY NOT hardened ───────────────────────────
@@ -7999,7 +8059,7 @@ def _harden_sensitive_permissions(plog=None):
             targets.append((f'{home}/{mod}/.env', '600'))
     targets.append(('/opt/tak/CoreConfig.xml', '640'))
 
-    fixed = []
+    fixed, blocked = [], []
     for path, want in targets:
         try:
             r = subprocess.run(_sudo_wrap(['stat', '-c', '%a', path]),
@@ -8009,14 +8069,36 @@ def _harden_sensitive_permissions(plog=None):
                 continue                      # not present on this box
             # Only tighten. Never widen a mode an operator deliberately narrowed.
             if int(cur, 8) & ~int(want, 8):
+                could_read = _console_can_read(path)
                 c = subprocess.run(_sudo_wrap(['chmod', want, path]), capture_output=True, timeout=15)
-                if c.returncode == 0:
-                    fixed.append(f'{path} {cur}->{want}')
+                if c.returncode != 0:
+                    continue
+                # ── The guard ────────────────────────────────────────────────
+                # W7 has now twice tightened a path something legitimately reads:
+                # /opt/tak/certs killed Node-RED's TAK feeds fleet-wide, and
+                # CoreConfig.xml 640 locked `takwerx` out of the file that 16
+                # call sites read — where a bare `except` turned "cannot read"
+                # into a confidently WRONG answer ("LDAP not connected" on a
+                # connected box). Both were caught in the field, not here.
+                # So: never leave a mode we cannot read through. If the console
+                # could get the bytes before and cannot now, put the mode back
+                # and say so — a hardening step that breaks the console is a
+                # bug to surface, not a security win to keep.
+                if could_read and not _console_can_read(path):
+                    subprocess.run(_sudo_wrap(['chmod', cur, path]), capture_output=True, timeout=15)
+                    blocked.append(f'{path} ({cur}->{want} REVERTED)')
+                    continue
+                fixed.append(f'{path} {cur}->{want}')
         except Exception:
             continue
     if fixed:
         _say(f'tightened {len(fixed)} file(s): ' + '; '.join(fixed[:8])
              + (f' (+{len(fixed) - 8} more)' if len(fixed) > 8 else ''))
+    if blocked:
+        _say('⚠ NOT hardened — the console can no longer read these after the chmod, '
+             'so the old mode was restored. Route the reader through the broker '
+             '(_read_priv / _read_coreconfig) before tightening again: '
+             + '; '.join(blocked))
     return fixed
 
 
@@ -12629,18 +12711,13 @@ def _tak_db_topology(settings=None):
     # Container TAK: its DB is the takserver-db container regardless of the url.
     if _tak_is_container():
         return 'container', TAK_DB_CONTAINER, 5432
-    # Parse the live CoreConfig connection url (may be root-owned → broker read).
+    # Parse the live CoreConfig connection url (root-owned + 640 → broker read).
     url_host, url_port = '', 5432
     try:
-        content = ''
         try:
-            with open('/opt/tak/CoreConfig.xml') as _f:
-                content = _f.read()
-        except (PermissionError, FileNotFoundError):
-            try:
-                content = _read_priv('/opt/tak/CoreConfig.xml') or ''
-            except Exception:
-                content = ''
+            content = _read_coreconfig() or ''
+        except Exception:
+            content = ''
         m = _re_topo.search(r'jdbc:postgresql://([^:/]+)(?::(\d+))?/cot', content)
         if m:
             url_host = (m.group(1) or '').strip()
@@ -12663,13 +12740,9 @@ def _read_martiuser_password_from_local_coreconfig():
     (TAK's JDBC decodes &amp; etc.; we must match). ('', reason) if not found."""
     try:
         try:
-            cc = _read_priv('/opt/tak/CoreConfig.xml')  # v10.0.5 non-root: read via broker
+            cc = _read_coreconfig()   # v10.0.5 non-root / v10.1.9 W7 640: via broker
         except Exception:
-            try:
-                with open('/opt/tak/CoreConfig.xml') as _f:
-                    cc = _f.read()
-            except Exception:
-                cc = ''
+            cc = ''
         for pat in (
             r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
             r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
@@ -21013,13 +21086,14 @@ def _patch_coreconfig_cert_enrollment(coreconfig_path, int_ca, cert_pass, config
     except (TypeError, ValueError):
         issued_days = '730'
     try:
-        with open(coreconfig_path, 'r', encoding='utf-8') as f:
-            raw = f.read()
+        # v10.1.9: read via _read_coreconfig() and parse the STRING — ET.parse()
+        # opens the path itself, which the non-root console cannot do at 640 tak:tak.
+        raw = _read_coreconfig(coreconfig_path)
         m = _re_ce.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', raw)
         ns_uri = m.group(1) if m else 'http://bbn.com/marti/xml/config'
         ET.register_namespace('', ns_uri)
-        tree = ET.parse(coreconfig_path)
-        root = tree.getroot()
+        root = ET.fromstring(raw)
+        tree = ET.ElementTree(root)
     except Exception as e:
         if log_fn:
             log_fn(f"  ⚠ cert-enrollment patch: CoreConfig parse failed ({str(e)[:120]}) — patch manually")
@@ -21159,8 +21233,7 @@ def _sanitize_coreconfig_name_entries():
     if not os.path.exists(coreconfig):
         return False, 'no_coreconfig'
     try:
-        with open(coreconfig, 'r') as f:
-            content = f.read()
+        content = _read_coreconfig(coreconfig)
     except Exception:
         return False, 'coreconfig_unreadable'
     if '<nameEntry' not in content:
@@ -45393,10 +45466,10 @@ networks:
                 subprocess.run(_sudo_wrap(['cp', coreconfig_path, backup_path]), capture_output=True, timeout=10)
                 plog("  Backed up CoreConfig.xml")
 
-            with open(coreconfig_path, 'r') as f:
-                config_content = f.read()
-
             # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
+            # (v10.1.9: the dead `config_content = open(...).read()` that sat here is gone —
+            # nothing consumed it since the text patcher was replaced, and at 640 tak:tak it
+            # was one more non-root PermissionError waiting to happen.)
             _et_ok, _et_msg = _apply_coreconfig_ldap_auth_et(coreconfig_path, host, ldap_svc_pass, plog)
             if _et_ok:
                 if 'idempotent' in _et_msg:
@@ -51855,8 +51928,7 @@ def _authentik_webadmin_role_check_and_heal(plog_fn=None):
         try:
             _cc_path = '/opt/tak/CoreConfig.xml'
             if os.path.exists(_cc_path):
-                with open(_cc_path, 'r', encoding='utf-8') as _f:
-                    _cc = _f.read()
+                _cc = _read_coreconfig(_cc_path)
                 if 'adm_ldapservice' in _cc and 'adminGroup="ROLE_ADMIN"' not in _cc:
                     _log("CoreConfig.xml adminGroup attribute MISSING — calling _resync_ldap_credential_to_coreconfig")
                     try:
@@ -54218,11 +54290,9 @@ entries:
                     subprocess.run(_sudo_wrap(['cp', coreconfig_path, backup_path]), capture_output=True, timeout=10)
                     plog(f"  Backed up CoreConfig.xml")
 
-                # Read current config
-                with open(coreconfig_path, 'r') as f:
-                    config_content = f.read()
-
                 # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
+                # (v10.1.9: dead `config_content` read removed — see the same spot in the
+                # remote-LDAP path; unused since the text patcher was replaced.)
                 _et_ok, _et_msg = _apply_coreconfig_ldap_auth_et(coreconfig_path, '127.0.0.1', ldap_pass, plog)
                 if _et_ok:
                     if 'idempotent' in _et_msg:
@@ -56087,8 +56157,7 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     # self-heals on the next LDAP sync (Update Now path on existing installs).
     import re as _re_ns
     try:
-        with open(coreconfig_path, 'r', encoding='utf-8') as _f:
-            _cc_raw = _f.read()
+        _cc_raw = _read_coreconfig(coreconfig_path)
         # Detect the TAK config namespace URI from the root xmlns declaration
         _m_ns = _re_ns.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', _cc_raw)
         _ns_uri = _m_ns.group(1) if _m_ns else 'http://bbn.com/marti/xml/config'
@@ -56109,8 +56178,11 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
                 plog("  ✓ CoreConfig.xml: stripped legacy ns0: prefixes (was breaking LDAP auth)")
         # Register the namespace URI to the empty prefix so ET.write() emits clean XML
         ET.register_namespace('', _ns_uri)
-        tree = ET.parse(coreconfig_path)
-        root = tree.getroot()
+        # v10.1.9: parse the STRING we already hold — ET.parse() would re-open the
+        # path itself, which the non-root console cannot do at 640 tak:tak. Parse the
+        # ns0-stripped text when we just rewrote it, so this run sees its own fix.
+        root = ET.fromstring(_cc_clean if _had_ns0 else _cc_raw)
+        tree = ET.ElementTree(root)
     except ET.ParseError as e:
         if plog:
             plog(f"  ⚠ CoreConfig.xml parse error ({e}) — falling back to text-based patcher")
@@ -56250,8 +56322,7 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         '    </auth>'
     )
     try:
-        with open(coreconfig_path, 'r') as f:
-            content = f.read()
+        content = _read_coreconfig(coreconfig_path)
         new_content = _re.sub(
             r'<(?:[A-Za-z][\w-]*:)?auth[^>]*>.*?</(?:[A-Za-z][\w-]*:)?auth\s*>',
             auth_block, content, flags=_re.DOTALL | _re.IGNORECASE,
@@ -56278,8 +56349,11 @@ def _coreconfig_has_ldap():
     if not os.path.exists(path):
         return False
     try:
-        with open(path, 'r') as f:
-            content = f.read()
+        # v10.1.9: MUST go through _read_coreconfig(). This is the function W7's
+        # 640 broke: a plain open() raised PermissionError as `takwerx`, the
+        # except below swallowed it, and the TAK Server page then offered
+        # "Connect TAK Server to LDAP" on an already-connected box.
+        content = _read_coreconfig(path)
         m_start = re.search(r'<(?:[A-Za-z][\w-]*:)?auth\b', content, re.IGNORECASE)
         if not m_start:
             return False
@@ -56328,8 +56402,7 @@ def _resync_ldap_credential_to_coreconfig():
     if not os.path.exists(coreconfig):
         return False, 'no_coreconfig'
     try:
-        with open(coreconfig, 'r') as f:
-            cc = f.read()
+        cc = _read_coreconfig(coreconfig)
     except Exception:
         return False, 'coreconfig_unreadable'
     if 'adm_ldapservice' not in cc:
@@ -59416,9 +59489,8 @@ def takserver_connect_ldap():
         import re as _re
         cc_pass = ''
         if os.path.exists('/opt/tak/CoreConfig.xml'):
-            with open('/opt/tak/CoreConfig.xml') as f:
-                m = _re.search(r'serviceAccountCredential="([^"]*)"', f.read())
-                cc_pass = m.group(1) if m else ''
+            m = _re.search(r'serviceAccountCredential="([^"]*)"', _read_coreconfig())
+            cc_pass = m.group(1) if m else ''
         if ldap_pass and cc_pass:
             diag.append(f'Password match: {"YES" if ldap_pass == cc_pass else "NO (MISMATCH!)"}')
         elif not cc_pass:
@@ -59535,8 +59607,7 @@ def takserver_ldap_drift_check():
     if not os.path.exists(coreconfig):
         return jsonify({'match': True, 'detail': 'no_coreconfig'})
     try:
-        with open(coreconfig, 'r') as f:
-            cc = f.read()
+        cc = _read_coreconfig(coreconfig)
     except Exception:
         return jsonify({'match': True, 'detail': 'coreconfig_unreadable'})
     if 'adm_ldapservice' not in cc:
@@ -63355,8 +63426,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         if db_host:
             import re as _re
             try:
-                with open('/opt/tak/CoreConfig.xml', 'r') as f:
-                    cc = f.read()
+                cc = _read_coreconfig()
                 jdbc_url = f'jdbc:postgresql://{db_host}:{db_port}/cot'
                 if '127.0.0.1' in cc and db_host not in cc:
                     cc = _re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
@@ -63412,8 +63482,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
             if pw_ok:
                 ulog("⚠ DB password changed during upgrade — re-patching CoreConfig.xml")
                 try:
-                    with open('/opt/tak/CoreConfig.xml', 'r') as f:
-                        cc = f.read()
+                    cc = _read_coreconfig()
                     cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + fresh_pw + m.group(2), cc)
                     _write_priv('/opt/tak/CoreConfig.xml', cc)
                     db_password = fresh_pw
@@ -64919,8 +64988,7 @@ def run_takserver_deploy(config):
                 log_step(f"External DB: pre-patching CoreConfig JDBC → {_edb_host_early}:{_edb_port_early} (before first start)...")
                 try:
                     import re as _re_early
-                    with open('/opt/tak/CoreConfig.xml', 'r') as _f:
-                        _cc = _f.read()
+                    _cc = _read_coreconfig()
                     _jdbc_early = f'jdbc:postgresql://{_edb_host_early}:{_edb_port_early}/cot'
                     _cc = _re_early.sub(r'jdbc:postgresql://[^"]*', _jdbc_early, _cc)
                     _cc = _re_early.sub(r'(<connection[^>]*username=")[^"]*(")', lambda m: m.group(1) + _edb_user_early + m.group(2), _cc)
