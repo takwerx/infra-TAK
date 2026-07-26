@@ -62,16 +62,32 @@ Then **Review** → **Create**, and wait for the instance to show **Running**.
 
 Your VM already has a public address — it's on the instance's **Networking** tab as **Public IPv4
 address**. That address is *ephemeral*: it survives reboots and stop/start, and is only released if
-you terminate the instance. Converting it to a **Reserved** address means you keep the same address
-even if you rebuild the VM later, so the box never has to be repointed.
+you terminate the instance.
 
 - On the instance page → **Networking** tab. If you see a **"Connect public subnet to internet"**
   quick action, click **Connect** and apply it (this adds the internet gateway).
   - **Skip this if you reused an existing relay's subnet** — it already has a gateway, and clicking
     it creates a second NSG and rewrites the route table for nothing.
+- **Note the address down — this is your relay's IP.**
+
+### Should you reserve it?
+
+**Running one box? Yes — do it.** A *reserved* address survives rebuilding the VM, and Oracle
+doesn't charge for it (your tenancy includes one). It costs a few clicks now and saves you a mess
+later, because a relay's address ends up inside enrollment packages and data packages you've already
+handed to clients.
+
 - Click your VNIC name → **IP administration** tab → the primary IP row → **⋮ → Edit**.
 - Set **Public IP type: Reserved public IP** → create a new one → **Update**.
-- **Note the address down — this is your relay's IP.**
+
+**Running several relays, or just testing? Don't bother.** The included allowance is one address, and
+relays don't get rebuilt in normal operation. If you ever do rebuild one, changing a DNS A record
+takes ten seconds.
+
+> **Either way, hand clients a domain name, not the raw IP.** Point an A record at the relay and use
+> that name in enrollment and data packages. Then a rebuilt relay is one DNS edit instead of
+> re-issuing configuration to every client in the field. You need that A record anyway — it's how
+> Let's Encrypt reaches port 80 to issue your certificate.
 
 ## 3. Open the ports
 
