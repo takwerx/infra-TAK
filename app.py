@@ -330,10 +330,50 @@ def _detached_power_action(verb, delay=2):
     threading.Thread(target=_go, daemon=True).start()
 
 
+CORECONFIG_PATH = '/opt/tak/CoreConfig.xml'
+CORECONFIG_BACKUP = CORECONFIG_PATH + '.infratak-prev'
+
+
+def _backup_coreconfig_before_write(path, content, mode):
+    """Keep the previous CoreConfig.xml as `.infratak-prev` before we overwrite it.
+
+    CoreConfig is the one file TAK Server will not start without, and roughly a
+    dozen code paths rewrite it (deploy, LDAP connect/resync, webadmin sync, LE
+    cert install on 8446, TAK upgrade re-stamp, domain change, split-DB TLS
+    converge, several startup migrations). Until now NONE of them kept a copy —
+    and the container deploy actively deleted `CoreConfig.xml.backup`. A bad
+    write left no way back.
+
+    Deliberately ONE rolling copy, not a timestamped history: it is the
+    last-known-good, it is trivially restorable by hand, and it cannot fill a
+    disk. Only fires for full-file writes of CoreConfig itself, only when the
+    content actually differs (so a no-op converge does not churn the backup away),
+    and NEVER raises — a backup problem must not block the write that TAK needs."""
+    try:
+        if path != CORECONFIG_PATH or 'a' in mode:
+            return
+        try:
+            cur = _read_priv(CORECONFIG_PATH)
+        except Exception:
+            return                      # nothing there yet (first write) — nothing to save
+        if isinstance(cur, (bytes, bytearray)):
+            cur = cur.decode('utf-8', 'replace')
+        new = content.decode('utf-8', 'replace') if isinstance(content, (bytes, bytearray)) else str(content)
+        if not (cur or '').strip() or cur == new:
+            return                      # empty, or an identical rewrite — keep the older copy
+        _write_priv(CORECONFIG_BACKUP, cur, perm=0o640)
+    except Exception:
+        pass
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
-    given (octal int), the file is chmod'd to it after the write."""
+    given (octal int), the file is chmod'd to it after the write.
+
+    Full-file writes of CoreConfig.xml first stash the previous version as
+    `.infratak-prev` — see _backup_coreconfig_before_write()."""
+    _backup_coreconfig_before_write(path, content, mode)
     if _broker_should_route() and _broker_available():
         data = content if isinstance(content, (bytes, bytearray)) else str(content).encode()
         req = {'op': 'write', 'path': path, 'mode': mode,
@@ -1821,6 +1861,53 @@ def _fw_install_shim(log=None):
         _log(f"  ⚠ ufw shim install failed: {((r.stderr or '') + (r.stdout or ''))[:120]}")
     except Exception as e:
         _log(f"  ⚠ ufw shim install error: {str(e)[:120]}")
+    return False
+
+
+def _fw_port_source_scoped(port, proto='tcp'):
+    """True when this port is allowed ONLY from specific sources, not from Anywhere.
+
+    Lets the startup re-assert tell "firewalld lost its runtime rules on reboot"
+    (re-open it) apart from "the operator narrowed this on purpose" (leave it
+    alone). Without the distinction, restricting the console port to one address
+    on a firewalld box was silently widened back to Anywhere on the next console
+    start — and UFW boxes behaved differently, because the re-assert returns early
+    for ufw. Conservative: any doubt returns False, i.e. keep today's behaviour."""
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    try:
+        port = int(port)
+    except Exception:
+        return False
+    be = _fw_backend()
+    try:
+        if be == 'firewalld':
+            # A blanket `--add-port=` beats any rich rule — if it is present the
+            # port IS open to Anywhere, whatever else is configured.
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-ports']),
+                               capture_output=True, text=True, timeout=20)
+            if f'{port}/{proto}' in (r.stdout or '').split():
+                return False
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-rich-rules']),
+                               capture_output=True, text=True, timeout=20)
+            for line in (r.stdout or '').splitlines():
+                if (f'port="{port}"' in line and 'source' in line
+                        and 'accept' in line and f'protocol="{proto}"' in line):
+                    return True
+            return False
+        if be == 'ufw':
+            # `ufw status` renders a scoped rule as `5001/tcp   ALLOW IN   1.2.3.4`
+            # and an open one as `... ALLOW IN   Anywhere`.
+            r = subprocess.run(_sudo_wrap(['ufw', 'status']), capture_output=True, text=True, timeout=20)
+            scoped = False
+            for line in (r.stdout or '').splitlines():
+                if f'{port}/{proto}' not in line or 'ALLOW' not in line:
+                    continue
+                if 'Anywhere' in line:
+                    return False        # an open rule exists — not scoped
+                scoped = True
+            return scoped
+    except Exception:
+        pass
     return False
 
 
@@ -71359,11 +71446,25 @@ def _startup_ensure_console_ports():
             hardened = False
         # 5001: the console's own port — open on a Standard box. A Hardened box
         # deliberately closes it (_startup_ensure_hardening_posture owns that).
+        #
+        # BUT do not clobber an operator who has deliberately source-scoped it.
+        # This re-assert exists because firewalld loses runtime-only rules across a
+        # reboot — not to force the port world-open. An operator who replaced the
+        # blanket allow with `rule family=ipv4 source address=X port port=5001
+        # accept` had it silently widened back to Anywhere on the next console
+        # start, with nothing said. UFW boxes never had this problem (the whole
+        # function returns early for ufw), so the behaviour differed by platform
+        # for no reason the operator could see.
         if not hardened:
             try:
-                _fw_allow(int(load_settings().get('console_port') or 5001), 'tcp')
+                _cport = int(load_settings().get('console_port') or 5001)
             except Exception:
-                _fw_allow(5001, 'tcp')
+                _cport = 5001
+            if _fw_port_source_scoped(_cport, 'tcp'):
+                print('[startup-ports] :%d is source-scoped by the operator — leaving it alone '
+                      '(not re-adding the blanket allow)' % _cport, flush=True)
+            else:
+                _fw_allow(_cport, 'tcp')
         # 80 + 443: Caddy fronts the FQDN/console vhost whenever ssl is fqdn/custom —
         # needed on BOTH postures (a Hardened box reaches the console via Caddy 443).
         if (load_settings().get('ssl_mode') or '') in ('fqdn', 'custom'):
