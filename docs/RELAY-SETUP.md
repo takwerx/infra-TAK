@@ -12,9 +12,14 @@ relay's IP and upload the key file.
 
 ## 1. Create the VM
 
-In the [Oracle Cloud console](https://cloud.oracle.com) → **Compute → Instances → Create instance**:
+In the [Oracle Cloud console](https://cloud.oracle.com) → **Compute → Instances → Create instance**.
+Oracle's wizard runs across four pages — *Basics → Security → Networking → Storage* — with a **Next**
+button at the bottom of each. Only two pages need anything from you.
+
+**Page 1 — Basics** (name, placement, image, shape)
 
 - **Name:** anything (e.g. `tak-relay`).
+- **Placement:** leave the availability domain Oracle picked.
 - **Image:** click *Change image* → **Canonical Ubuntu 22.04** (the plain one, not "Minimal").
 - **Shape:** click *Change shape* → **Ampere → VM.Standard.A1.Flex**, 1 OCPU / 6 GB (Always Free).
   - *If Oracle says "out of capacity"* for A1: either try a different Availability Domain, or pick
@@ -23,12 +28,35 @@ In the [Oracle Cloud console](https://cloud.oracle.com) → **Compute → Instan
     is identical on both — it installs only WireGuard and standard Linux packet forwarding, which
     ship for both architectures. Take whichever Oracle has capacity for. A1 is the better pick when
     it's available (more free network bandwidth), not a required one.
-- **Networking:** *Create new virtual cloud network* + *Create new public subnet* (accept the
-  defaults).
-- **SSH keys:** choose **Generate a key pair for me**, then click **Download private key** and save
-  the `.key` file somewhere safe. ⚠️ This is the only time Oracle offers the key — if you have to
-  re-create the VM, download the key again on the attempt that actually launches.
-- Click **Create**. Wait for the instance to show **Running**.
+
+**Page 2 — Security:** nothing here applies to a relay. Click **Next**.
+
+**Page 3 — Networking.** This is the page that matters.
+
+- **Primary network:** *Create new virtual cloud network*, and **Subnet:** *Create new public
+  subnet*. Accept the generated names.
+  - *Already have a relay in this account?* Pick **Select existing virtual cloud network** and choose
+    the VCN and public subnet from your first one instead — see *Adding a second relay* below.
+- **Public IPv4 address assignment:** leave **Automatically assign public IPv4 address** ON. (Step 2
+  converts it to a permanent address.)
+- **IPv6:** leave off. If the page warns that the subnet doesn't support IPv6, ignore it.
+- **Advanced options → Use network security groups to control traffic:** leave this OFF on a first
+  relay — you'll create the NSG in step 3, after the VM exists. On a second relay, turn it ON and
+  select your existing NSG.
+- Everything else on the page — DNS record, hostname, launch options — stays default.
+
+**Also on the Networking page — SSH keys.** Keep **Generate a key pair for me** and click **Download
+private key**. Save that `.key` file somewhere you'll find it: it is the only thing the console needs
+to set the relay up, and you never have to open it yourself. You don't need the public key.
+
+> ⚠️ **This is the only time Oracle offers the key.** If this launch attempt fails and you retry,
+> download again on the attempt that actually succeeds — each attempt generates a different key.
+
+**Page 4 — Storage:** accept the defaults (46.6 GB boot volume, in-transit encryption on). A relay
+forwards packets and stores nothing, so the default volume is far more than it needs. Don't attach a
+block volume.
+
+Then **Review** → **Create**, and wait for the instance to show **Running**.
 
 ## 2. Give it a public IP
 
@@ -84,6 +112,19 @@ Guard Dog — and it's fair to expect a long list here. There isn't one, because
 them on TCP 443.** Authentik (9000/9443), TAK Portal (3000), Node-RED (1880), CloudTAK (5000/5002),
 the MediaMTX HLS player and web editor (8888/5080) never listen to the public internet even on a
 normal box — they're reached through 443 with SSO in front. One rule covers the lot.
+
+### Adding a second relay
+
+If this account already runs a relay, don't build a second network for it. On the **Networking**
+page choose **Select existing virtual cloud network**, pick the VCN and public subnet from your first
+relay, then under **Advanced options** turn on **Use network security groups to control traffic** and
+select the NSG you already made (`ig-quick-action-NSG`).
+
+That reuses the internet gateway and every port rule you already entered, so **you can skip steps 2
+and 3 entirely** — apart from giving the new VM its own Reserved public IP.
+
+Two relays in one VCN don't interfere: each gets its own private and public address, and each one's
+WireGuard overlay (`172.31.99.x`) exists only on its own machine.
 
 ## 4. Going beyond the defaults (optional)
 
