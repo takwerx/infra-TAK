@@ -2719,12 +2719,35 @@ def detect_modules():
 
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
+# Height of the fixed identification bar. Any OTHER fixed top bar must stack below
+# it and add this to its own offset — see _custom_banner_height().
+CUSTOM_BANNER_H = 84
+
+
+def _custom_banner_height(settings):
+    """Vertical space the fixed identification banner occupies, or 0 when it is not
+    rendered. Mirrors render_custom_banner()'s own render/skip conditions exactly —
+    a second fixed bar that guesses this wrong either overlaps the banner or leaves
+    a gap. Keep the two in step."""
+    try:
+        cust = (settings or {}).get('customization', {}) or {}
+        if not cust.get('banner_enabled'):
+            return 0
+        if not html.escape((cust.get('banner_text') or '')[:120]).strip():
+            return 0
+        return CUSTOM_BANNER_H
+    except Exception:
+        return 0
+
+
 def render_custom_banner(settings):
     """Return HTML (style + fixed div) for the custom identification banner, or '' if disabled.
 
     Uses position:fixed so it overlays the top of every page without touching individual
     templates. The accompanying <style> block pushes body content down by the banner height
-    so nothing is obscured.
+    so nothing is obscured. NOTE: position:fixed is load-bearing, not cosmetic — every page
+    has `body{display:flex;flex-direction:row}`, so an in-flow banner here would become a
+    flex COLUMN instead of a top bar (see render_gd_delivery_gap_banner).
     """
     import re as _re_banner
     cust = settings.get('customization', {}) if settings else {}
@@ -2736,7 +2759,7 @@ def render_custom_banner(settings):
 
     logo_b64 = cust.get('agency_logo_b64') or ''
     logo_h = 68  # doubled from original 34px
-    banner_h = 84  # tall enough to frame the larger logo with padding
+    banner_h = CUSTOM_BANNER_H  # tall enough to frame the larger logo with padding
 
     # Font — map friendly names to CSS font-family stacks
     _font_map = {
@@ -2827,7 +2850,17 @@ def render_gd_delivery_gap_banner(settings):
     per-page nag banner (render_default_cert_password_warning) for being too
     alarmist. This fires only when there is genuinely something to deliver and
     nowhere to deliver it. Reads the in-memory GD monitor cache (no subprocess);
-    stays quiet on a healthy box or before the cache is warm."""
+    stays quiet on a healthy box or before the cache is warm.
+
+    v10.1.9: this banner is `position:fixed`, NOT in flow. It is concatenated onto
+    the front of `sidebar_html`, which every template renders as a direct child of
+    `body{display:flex;flex-direction:row}` — so as an in-flow div it became a flex
+    ITEM, i.e. a ~800px COLUMN sized to its one long line of text, shoving the
+    sidebar and the whole page right and leaving its faint rgba(...,.12) background
+    looking like dead black space. Found on aws-ubuntu 2026-07-26, the only box
+    meeting the render condition (a monitor down AND no email/SMS), which is why it
+    survived since v10.1.1. Same fixed-bar treatment as render_custom_banner, and it
+    stacks BELOW that banner when both are showing."""
     try:
         s = settings or {}
         if not (s.get('guarddog_deployed_version') or '').strip():
@@ -2844,10 +2877,23 @@ def render_gd_delivery_gap_banner(settings):
             return ''
     except Exception:
         return ''
+    _top = _custom_banner_height(s)      # sit under the identification bar when it is up
+    _h = 34
     return (
-        '<div style="position:relative;z-index:40;background:rgba(234,179,8,.12);'
-        'border-bottom:1px solid rgba(234,179,8,.4);color:#eab308;'
-        'padding:8px 16px;font-size:13px;text-align:center;font-weight:600">'
+        '<style>'
+        # Wins over render_custom_banner's own padding-top rule: both are !important
+        # and this <style> is emitted after it (see the inject_cloudtak_icon
+        # concatenation order), so the later declaration applies. Covers BOTH bars.
+        f'body{{padding-top:{_top + _h}px!important}}'
+        '.gd-gap-banner{'
+        f'position:fixed;top:{_top}px;left:0;right:0;height:{_h}px;z-index:205;'
+        'display:flex;align-items:center;justify-content:center;gap:6px;'
+        'box-sizing:border-box;padding:0 16px;overflow:hidden;'
+        'background:rgba(234,179,8,.12);border-bottom:1px solid rgba(234,179,8,.4);'
+        'color:#eab308;font-size:13px;font-weight:600;line-height:1.2;text-align:center'
+        '}'
+        '</style>'
+        '<div class="gd-gap-banner">'
         '⚠ Guard Dog has an active alert but no notification email is configured — '
         'this alert has nowhere to go. '
         '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure notifications →</a>'
