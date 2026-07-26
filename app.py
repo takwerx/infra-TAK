@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.9-alpha"
+VERSION = "10.1.10-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -9888,6 +9888,14 @@ def _conn_anchor_status():
         out['anchor_ip'] = anchor.get('anchor_ip')
         out['wg_port'] = anchor.get('wg_port')
         out['box_pubkey'] = anchor.get('box_pubkey', '')
+        # v10.1.10: is the relay running the bootstrap we currently ship? Relays
+        # provisioned by an older console keep whatever that version wrote — e.g.
+        # the pre-hardening prober that bound 0.0.0.0 instead of the tunnel IP
+        # (found in the field 2026-07-26). Stamp mismatch drives both the console
+        # banner and the boot-time auto re-assert below.
+        out['bootstrap_sha'] = anchor.get('bootstrap_sha', '')
+        out['bootstrap_current'] = (anchor.get('bootstrap_sha') == _CONN_ANCHOR_BOOTSTRAP_SHA256)
+        out['can_reassert'] = os.path.exists(_CONN_ANCHOR_KEY_PATH)
     try:
         r = subprocess.run(_sudo_wrap(['wg', 'show', _CONN_WG_IF, 'dump']),
                            capture_output=True, text=True, timeout=8)
@@ -10155,6 +10163,10 @@ def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
         settings['connectivity_anchor'] = {
             'anchor_ip': anchor_ip, 'anchor_pubkey': anchor_pubkey,
             'wg_port': wg_port, 'box_pubkey': box_pub, 'provisioned': True,
+            'bootstrap_sha': _CONN_ANCHOR_BOOTSTRAP_SHA256,
+            # Kept so a later re-assert reaches the relay without asking again —
+            # Oracle's Ubuntu images use 'ubuntu', the RHEL ones 'opc'.
+            'ssh_user': ssh_user,
         }
         save_settings(settings)
         _conn_prov_log('Done. The tunnel is dialing — status will show connected shortly.')
@@ -10191,6 +10203,96 @@ def connectivity_anchor_provision_status_api():
     st = _connectivity_provision_status
     return jsonify({'running': st.get('running', False), 'complete': st.get('complete', False),
                     'error': st.get('error', ''), 'log': st.get('log', [])})
+
+
+# ── v10.1.10 — relay re-assert (console-path delivery for relay-side fixes) ────
+# A relay is provisioned once and then never touched again, so any fix we make to
+# connectivity-anchor-bootstrap.sh only ever reaches NEW relays — existing ones
+# keep whatever the console that built them wrote. Field 2026-07-26: a relay built
+# before the prober hardening was still running it bound to 0.0.0.0 with a public
+# INPUT accept, months after the fix shipped. The operator can't be the delivery
+# mechanism (that means SSH, and the whole product promise is "no more SSH"), so
+# the console re-runs the bootstrap itself whenever the relay's stamped SHA is not
+# the one we ship. The box already holds the relay key at _CONN_ANCHOR_KEY_PATH.
+#
+# Safe to re-run: cmd_setup only generates the WireGuard key / writes wg0.conf when
+# ABSENT (so the tunnel identity and every added peer survive), the forward rules
+# go through ipt_ensure (additive, deduped), and write_prober rewrites the unit and
+# restarts it — which is precisely the fix. It never flushes.
+def _conn_reassert_relay(log_fn=None):
+    """Re-run the pinned bootstrap on a provisioned relay. Returns (ok, message)."""
+    def _log(m):
+        if log_fn:
+            try:
+                log_fn(m)
+            except Exception:
+                pass
+    settings = load_settings()
+    anchor = settings.get('connectivity_anchor') or {}
+    if not anchor.get('anchor_ip'):
+        return False, 'No relay is configured on this box.'
+    if not os.path.exists(_CONN_ANCHOR_KEY_PATH):
+        return False, ('The relay SSH key is no longer on this box — re-run Set Up Relay '
+                       'with the .key file to refresh it.')
+    ok, wg_port = _conn_validate_anchor_inputs(anchor.get('anchor_ip'), None,
+                                               anchor.get('wg_port', 51820))
+    if not ok:
+        return False, 'Stored relay settings are invalid: %s' % wg_port
+    anchor_ip = anchor.get('anchor_ip')
+    ssh_user = anchor.get('ssh_user') or 'ubuntu'
+    if not _CONN_SSH_USER_RE.fullmatch(ssh_user):
+        ssh_user = 'ubuntu'
+    # Same pinned-URL + digest-verify path as first provisioning — a relay re-assert
+    # must not become a softer way to run unverified remote code as root.
+    cmd = ("curl -fsSL '%s' -o ~/connectivity-anchor-bootstrap.sh && "
+           "echo '%s  '$HOME'/connectivity-anchor-bootstrap.sh' | sha256sum -c - && "
+           "chmod +x ~/connectivity-anchor-bootstrap.sh && "
+           "sudo WG_PORT=%d bash ~/connectivity-anchor-bootstrap.sh setup"
+           ) % (_CONN_ANCHOR_BOOTSTRAP_RAW, _CONN_ANCHOR_BOOTSTRAP_SHA256, wg_port)
+    _log('Re-asserting relay %s…' % anchor_ip)
+    ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, cmd, timeout=240)
+    if not ok:
+        if 'sha256sum' in (out or '').lower() or 'FAILED' in (out or ''):
+            return False, ('Relay bootstrap integrity check failed (unexpected script contents) — '
+                           'nothing was run on the relay.')
+        return False, 'Could not re-assert the relay: %s' % (out or '')[:200]
+    s2 = load_settings()
+    a2 = s2.get('connectivity_anchor') or {}
+    a2['bootstrap_sha'] = _CONN_ANCHOR_BOOTSTRAP_SHA256
+    s2['connectivity_anchor'] = a2
+    save_settings(s2)
+    _log('Relay re-asserted and up to date.')
+    return True, 'Relay updated.'
+
+
+def _startup_reassert_relay():
+    """Boot-time: bring a stale relay up to the bootstrap we ship. Never raises.
+
+    Runs in a thread — an unreachable relay must never delay console startup. Only
+    acts on a SHA mismatch, so it is a no-op on every boot after the first."""
+    try:
+        anchor = (load_settings().get('connectivity_anchor') or {})
+        # Gate on the KEY, not the 'provisioned' flag: a box adopted from the manual
+        # configure path still has a relay worth healing, and the key is what decides
+        # whether we can actually reach it.
+        if not anchor.get('anchor_ip') or not os.path.exists(_CONN_ANCHOR_KEY_PATH):
+            return
+        if anchor.get('bootstrap_sha') == _CONN_ANCHOR_BOOTSTRAP_SHA256:
+            return
+        print("Startup migration: relay is running an older bootstrap — re-asserting "
+              "(fixes the prober bind + forward rules)", flush=True)
+        ok, msg = _conn_reassert_relay()
+        print("Startup migration: relay re-assert %s — %s"
+              % ('OK' if ok else 'SKIPPED', msg), flush=True)
+    except Exception as e:
+        print("Startup migration: relay re-assert error (non-fatal): %s" % e, flush=True)
+
+
+@app.route('/api/connectivity/anchor/reassert', methods=['POST'])
+@login_required
+def connectivity_anchor_reassert_api():
+    ok, msg = _conn_reassert_relay()
+    return jsonify({'success': ok, 'message' if ok else 'error': msg}), (200 if ok else 400)
 
 
 # ── Leg 5 — VERIFY (green/red reachability matrix) ─────────────────────────────
@@ -40592,6 +40694,18 @@ textarea.form-input{resize:vertical}
           <div id="anchor-connected-detail" style="font-size:12px;color:var(--text-secondary);margin-top:3px;font-family:'JetBrains Mono',monospace"></div>
         </div>
       </div>
+      <div id="relay-stale-banner" style="display:none;margin-top:12px;background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.25);border-radius:10px;padding:14px 16px">
+        <div style="display:flex;align-items:center;gap:12px">
+          <span class="dot" style="background:var(--yellow)"></span>
+          <div style="flex:1;font-size:13px;color:var(--text-secondary)">
+            <b style="color:var(--yellow)">Relay needs updating.</b> It was set up by an older version of
+            infra-TAK and is still running that setup. Updating re-applies the current configuration —
+            the tunnel stays up and nothing is removed.
+          </div>
+          <button class="btn btn-secondary" id="relay-reassert-btn" onclick="reassertRelay()" style="flex-shrink:0">Update Relay</button>
+        </div>
+        <div id="relay-reassert-msg" style="display:none;font-size:12px;color:var(--text-secondary);margin-top:10px"></div>
+      </div>
       <div style="margin-top:14px;display:flex;gap:16px;align-items:center">
         <a href="#" onclick="reconfigureRelay(event)" style="font-size:12px;color:var(--accent);text-decoration:none">Reconfigure / use a different relay</a>
         <a href="#" onclick="disconnectRelay(event)" style="font-size:12px;color:var(--red);text-decoration:none">Disconnect</a>
@@ -40849,6 +40963,11 @@ async function refreshAnchorStatus(){
         + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||51820) : ''))
         + (d.handshake_secs != null ? ' · last handshake ' + fmtAge(d.handshake_secs) : '');
       document.getElementById('anchor-connected-detail').textContent = detail;
+      // v10.1.10: relays built by an older console keep that version's setup. The
+      // boot-time re-assert normally clears this before the operator ever sees it;
+      // the banner is the fallback for a relay that was unreachable at startup.
+      const stale = document.getElementById('relay-stale-banner');
+      if(stale) stale.style.display = (d.can_reassert && !d.bootstrap_current) ? 'block' : 'none';
     } else if(!d.configured && !anchorReconfiguring){
       showRelayForm(true);
     }
@@ -40861,6 +40980,25 @@ async function refreshAnchorStatus(){
       el.innerHTML = '<span style="color:var(--text-dim)">Not connected to a relay yet.</span>';
     }
   }catch(e){}
+}
+async function reassertRelay(){
+  const btn = document.getElementById('relay-reassert-btn');
+  const msg = document.getElementById('relay-reassert-msg');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Updating…';
+  msg.style.display = 'block'; msg.textContent = 'Connecting to the relay — this takes about a minute.';
+  try{
+    const r = await fetch('/api/connectivity/anchor/reassert', {method:'POST'});
+    const d = await r.json();
+    if(d.success){
+      msg.innerHTML = '<span style="color:var(--green)">✓ Relay updated.</span>';
+      setTimeout(refreshAnchorStatus, 1500);
+    } else {
+      msg.innerHTML = '<span style="color:var(--red)">' + esc(d.error || 'Update failed.') + '</span>';
+    }
+  }catch(e){
+    msg.innerHTML = '<span style="color:var(--red)">Update failed: ' + esc(String(e)) + '</span>';
+  }
+  btn.disabled = false; btn.textContent = 'Update Relay';
 }
 function loadKeyFile(ev){
   const f = ev.target.files && ev.target.files[0];
@@ -74272,6 +74410,16 @@ def _startup_migrations():
             _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _snap_err:
             print(f"Startup migration: snapshot schedule error (non-fatal): {_snap_err}")
+
+        # v10.1.10: bring a stale relay up to the bootstrap this console ships
+        # (console-path delivery — relay-side fixes can't require the operator to
+        # SSH). Threaded: an unreachable relay must not delay startup. No-op once
+        # the stamped SHA matches, so this is one SSH on the upgrade boot only.
+        try:
+            threading.Thread(target=_startup_reassert_relay, daemon=True,
+                             name='relay-reassert').start()
+        except Exception as _rl_err:
+            print(f"Startup migration: relay re-assert start error (non-fatal): {_rl_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
