@@ -56,8 +56,8 @@ Rules**. Add these ingress rules, each with **Source `0.0.0.0/0`**:
 | **TCP** | **8443** | TAK admin WebGUI (client-cert auth) |
 | **TCP** | **8446** | TAK admin WebGUI (Let's Encrypt cert / LDAP login) |
 
-That is the complete list. Seven rules — nothing else needs to be opened, and adding more does
-nothing (see *What about all the other ports?* below).
+Those seven are what **Set Up Relay** configures automatically — the relay is forwarding exactly
+these the moment the tunnel comes up. Optional extras are in *Going beyond the defaults* below.
 
 > **⚠️ Add BOTH UDP rows, even though you only picked one port.** The relay listens on the port you
 > chose in the console and redirects the other one to it, so the tunnel survives networks that block
@@ -80,24 +80,38 @@ them on TCP 443.** Authentik (9000/9443), TAK Portal (3000), Node-RED (1880), Cl
 the MediaMTX HLS player and web editor (8888/5080) never listen to the public internet even on a
 normal box — they're reached through 443 with SSO in front. One rule covers the lot.
 
-The relay forwards exactly the seven rules above and nothing else, so opening extra ports on the NSG
-has no effect — the relay has no forwarding rule to match them.
+## 4. Going beyond the defaults (optional)
 
-**Two things therefore do NOT work through a relay today:**
+**A rule in the NSG is only half of a forward.** Oracle's NSG decides what reaches the relay's
+network card; the relay's own forwarding table decides what actually gets carried down the tunnel to
+your box. Adding an NSG rule for a port the relay doesn't forward is harmless but does nothing — the
+packet arrives and is dropped. This catches people out, because the NSG page then *looks* like the
+port is open.
 
-- **Raw streaming ports** — MediaMTX RTSP (8554), SRT/RTMP, and the CloudTAK media ports
-  (18554/11935/18890). Watching a stream in the CloudTAK or MediaMTX *web* UI works fine (that's
-  HTTPS on 443); pointing a player straight at `rtsp://<relay-ip>:8554` does not.
-- **Remote Assist screen sharing** — CoTURN needs UDP 3478 plus a UDP relay range, and the relay's
-  forwarding is TCP-only.
+These three are worth adding, and each needs both halves. SSH to the relay
+(`ssh -i <your.key> ubuntu@<relay-ip>`) and run the matching command, then add the NSG rule:
 
-If you need those, give the box real public inbound (port-forward or a public-IP VPS) rather than a
-relay. *Advanced:* an operator comfortable at a terminal can widen the forward by re-running the
-bootstrap on the relay with extra TCP ports — `sudo TAK_PORTS="8089 8443 8446 8554" bash
-~/connectivity-anchor-bootstrap.sh setup` — and adding matching NSG rules. It stays TCP-only, and the
-console will reset it to the default set the next time you run **Set Up Relay**.
+| Port | Gives you | On the relay |
+|---|---|---|
+| TCP **8554** | RTSP video straight to a player (`rtsp://<relay-ip>:8554/...`) | `sudo bash ~/connectivity-anchor-bootstrap.sh setup` with `TAK_PORTS="8089 8443 8446 8554"` prefixed |
+| TCP **2222** | SSH to the box behind the relay, on 2222 → the box's 22 | `sudo iptables -t nat -A PREROUTING -p tcp --dport 2222 -j DNAT --to-destination 172.31.99.2:22` then `sudo iptables -A FORWARD -d 172.31.99.2 -p tcp --dport 22 -j ACCEPT` |
+| TCP **5001** | The infra-TAK console on the relay's public IP — see the warning below | same two commands with `5001` in place of both `2222` and `22` |
 
-## 4. Finish in the console — automatically
+Run `sudo netfilter-persistent save` afterwards so the rules survive a reboot. Re-running **Set Up
+Relay** from the console will not remove them — the setup script only ever adds rules, it never
+flushes.
+
+> **⚠️ Think before forwarding 5001.** That is the admin console, and it is deliberately a
+> direct-IP backdoor with no Caddy and no SSO in front of it — that design is fine on a LAN, and a
+> different proposition on a public Oracle address where anyone can reach the login page. The
+> supported path to the console from outside is HTTPS on 443 through Caddy, with Authentik in front.
+
+**What still won't work through a relay, whatever you open:** the forwarding is TCP-only, so
+anything UDP is out — MediaMTX SRT (8890) and RTP (8000/8001), and Remote Assist screen sharing
+(CoTURN needs UDP 3478 plus a UDP relay range). Streaming *inside* the CloudTAK or MediaMTX web UI
+works regardless, because that's HTTPS on 443.
+
+## 5. Finish in the console — automatically
 
 That's all the manual work. Back in infra-TAK → **Connectivity → Connect a Relay**:
 
