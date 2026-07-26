@@ -60,14 +60,18 @@ Then **Review** → **Create**, and wait for the instance to show **Running**.
 
 ## 2. Give it a public IP
 
-Fresh VMs often launch without one.
+Your VM already has a public address — it's on the instance's **Networking** tab as **Public IPv4
+address**. That address is *ephemeral*: it survives reboots and stop/start, and is only released if
+you terminate the instance. Converting it to a **Reserved** address means you keep the same address
+even if you rebuild the VM later, so the box never has to be repointed.
 
 - On the instance page → **Networking** tab. If you see a **"Connect public subnet to internet"**
   quick action, click **Connect** and apply it (this adds the internet gateway).
+  - **Skip this if you reused an existing relay's subnet** — it already has a gateway, and clicking
+    it creates a second NSG and rewrites the route table for nothing.
 - Click your VNIC name → **IP administration** tab → the primary IP row → **⋮ → Edit**.
-- Set **Public IP type: Reserved public IP** → create a new one → **Update**. (Reserved means the
-  address stays the same for good, even across reboots.)
-- The row now shows a public IP — **this is your relay's address.** Note it down.
+- Set **Public IP type: Reserved public IP** → create a new one → **Update**.
+- **Note the address down — this is your relay's IP.**
 
 ## 3. Open the ports
 
