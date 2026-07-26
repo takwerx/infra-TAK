@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.8-alpha)**
+**Current release: [v10.1.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.9-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.9-alpha — 2026-07-26 — Two-server database links are encrypted, fail2ban stops locking you out of your own server, and wasted disk gets reclaimed
+
+**Headline: the connection between a split TAK Server and its database is now encrypted, three ways fail2ban could lock you out or quietly stop protecting you are fixed, and servers built with unusable disk space get it back.** **Encrypted split-server database link.** When TAK Server and PostgreSQL run on two separate machines, traffic between them — including credentials — was crossing the network unencrypted. It is now encrypted, on existing deployments as well as new ones, and the change only completes after a live encrypted connection is verified. **fail2ban, three field-reported failures.** On some server images fail2ban was crashing at startup, which silently stopped *every* jail — the server looked protected and wasn't. It could also ban the very connection used to manage the server, taking a remote box offline with no way back in; management tunnels are now permanently exempt and any existing ban on one is released. And the never-ban list is now visible in plain English instead of one opaque string, with a warning when the address *you* are connected from isn't covered — the case that strands someone on a server they can't walk up to. **Reclaims stranded disk.** Servers provisioned with a large, unusable partition (common on Rocky/RHEL images) can now hand that space back to TAK, with the existing data verified byte-for-byte before anything is removed. **Red Hat installs (GH #56).** A repository step could fail silently on Red Hat in the cloud and resurface three steps later as a baffling PostGIS dependency error. The installer now asks the system which repository actually exists instead of guessing. **Config safety.** TAK Server's main configuration file is rewritten by roughly a dozen operations and none of them kept a copy — the previous version is now always saved first. **Firewall.** If you had restricted the console to specific addresses, restarting it quietly reopened the port to the entire internet; it now leaves a deliberate restriction alone. **Plus** tighter permissions on files holding passwords and keys, and CloudTAK's approved version moves to 13.54.3. **Upgrade:** applied automatically on the next console update.
+
+Full notes: [v10.1.9-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.9-alpha).
 
 ### v10.1.8-alpha — 2026-07-24 — CloudTAK video playback fixed end-to-end, settings can no longer silently lose module config, and RHEL installs fail loudly instead of mysteriously
 
