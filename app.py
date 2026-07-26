@@ -13260,6 +13260,60 @@ def _f2b_local_subnets():
         pass
     return subnets
 
+
+# Overlay interfaces infra-TAK ITSELF brings up to manage a box: the WireGuard
+# relay/anchor from the Connectivity Wizard, and NetBird. These are EXCLUDED from
+# _f2b_local_subnets() above (they match _F2B_VIRTUAL_IFACE_PREFIXES), which is
+# right for docker/CNI noise and WRONG here — see _f2b_mgmt_tunnel_subnets().
+_F2B_MGMT_TUNNEL_PREFIXES = ('wg', 'nb-', 'netbird')
+# NetBird hands out 100.64.0.0/10 (RFC 6598 shared space). Python's is_private is
+# False for it, so the RFC1918 test in _f2b_local_subnets() would reject it twice
+# over — once on the interface name, once on the address.
+_F2B_CGNAT = ipaddress.ip_network('100.64.0.0/10')
+
+
+def _f2b_mgmt_tunnel_subnets():
+    """Subnets of the management tunnels infra-TAK itself creates — never bannable.
+
+    A box behind CGNAT or without a static IP is reached ONLY through its tunnel
+    (the Oracle-relay strategy). fail2ban's `iptables-allports` action blocks EVERY
+    port from a banned address, so one ban on the tunnel gateway locks the operator
+    out of a machine they cannot walk up to — and `recidive` escalates repeats from
+    an hour to far longer. Field-hit 2026-07-26: the sshd jail banned the relay's
+    172.31.99.1 and the box went dark to the relay while still answering ping.
+
+    This became reachable because the no-rsyslog fix (469f2a2) made the sshd jail
+    actually run on boxes where it had been dead — the jail working is the point,
+    but it must not eat the road in.
+
+    Scope is deliberately narrow: ONLY interfaces we bring up ourselves. A
+    third-party VPN (tailscale/zt/tun/tap) may carry users we do not vouch for, so
+    those stay excluded and the operator can add them via `fail2ban_ignore_cidrs`.
+    Accepts RFC1918 or CGNAT. Best-effort; [] on any failure."""
+    subnets = []
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            if not ifname.startswith(_F2B_MGMT_TUNNEL_PREFIXES):
+                continue
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        net = ipaddress.ip_network(parts[i + 1], strict=False)
+                    except Exception:
+                        continue
+                    if (net.is_private or net.subnet_of(_F2B_CGNAT)) and str(net) not in subnets:
+                        subnets.append(str(net))
+    except Exception:
+        pass
+    return subnets
+
+
 def _f2b_fleet_ignore_cidrs():
     """Operator-configured fleet-wide trusted CIDRs (settings 'fail2ban_ignore_cidrs').
     Use this for an upstream gateway/proxy/LB that does NOT share the box's attached
@@ -13279,6 +13333,7 @@ def _f2b_trusted_ignoreip(extra=''):
     parts, seen = [], set()
     candidates = ['127.0.0.1/8', '::1']
     candidates += _f2b_local_subnets()
+    candidates += _f2b_mgmt_tunnel_subnets()   # never ban the road in
     candidates += _f2b_fleet_ignore_cidrs()
     candidates += str(extra or '').replace(',', ' ').split()
     for c in candidates:
@@ -13295,6 +13350,7 @@ def _f2b_operator_extra(stored):
     actually propagates out of every jail instead of staying baked into the stored line."""
     fleet = {'127.0.0.1/8', '::1'}
     fleet.update(_f2b_local_subnets())
+    fleet.update(_f2b_mgmt_tunnel_subnets())
     fleet.update(_f2b_fleet_ignore_cidrs())
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
@@ -13418,6 +13474,102 @@ def _f2b_selfheal_sshd_backend(plog=None):
         _log(f'fail2ban: restarted after self-heal — now {st}')
     except Exception as e:
         _log(f'fail2ban: restart after self-heal failed ({e}) — check `systemctl status fail2ban`')
+    return True
+
+
+def _f2b_selfheal_tunnel_ignoreip(plog=None):
+    """Add the management-tunnel subnets to every infra-TAK jail's ignoreip, and
+    release anything already banned inside one.
+
+    Boxes deployed before this fix carry an ignoreip with no tunnel subnet, so the
+    relay/NetBird gateway stays bannable — and on a CGNAT box that tunnel is the
+    only way in. Console-path delivery: this runs at startup so a normal update
+    fixes it with no SSH. Idempotent; no-op when there is no tunnel or nothing to
+    change. See _f2b_mgmt_tunnel_subnets() for why this is narrow by design."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    tun = _f2b_mgmt_tunnel_subnets()
+    if not tun:
+        return False                      # no tunnel on this box — nothing to trust
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return False
+    import glob as _glob
+    changed = []
+    for path in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf'))):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        out, hit = [], False
+        for line in text.splitlines(True):
+            m = re.match(r'^\s*ignoreip\s*=\s*(.*?)\s*$', line)
+            if not m:
+                out.append(line)
+                continue
+            cur = m.group(1)
+            new = _f2b_trusted_ignoreip(_f2b_operator_extra(cur))
+            if set(new.split()) != set(cur.split()):
+                out.append(f'ignoreip = {new}\n')
+                hit = True
+            else:
+                out.append(line)
+        if hit:
+            try:
+                _write_priv(path, ''.join(out))
+                changed.append(os.path.basename(path))
+            except Exception as e:
+                _log(f'fail2ban: could not update ignoreip in {path}: {e}')
+
+    # Release anything already banned inside a tunnel — the operator may be locked
+    # out RIGHT NOW, and a config rewrite alone does not lift a live ban.
+    nets = []
+    for c in tun:
+        try:
+            nets.append(ipaddress.ip_network(c))
+        except Exception:
+            pass
+    unbanned = []
+    try:
+        st = subprocess.run(_sudo_wrap(['fail2ban-client', 'status']),
+                            capture_output=True, text=True, timeout=30)
+        jails = []
+        for line in (st.stdout or '').splitlines():
+            if 'Jail list:' in line:
+                jails = [j.strip() for j in line.split(':', 1)[1].replace(',', ' ').split()]
+        for j in jails:
+            js = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', j]),
+                                capture_output=True, text=True, timeout=30)
+            for line in (js.stdout or '').splitlines():
+                if 'Banned IP list:' not in line:
+                    continue
+                for ip in line.split(':', 1)[1].split():
+                    try:
+                        addr = ipaddress.ip_address(ip.strip())
+                    except ValueError:
+                        continue
+                    if any(addr in n for n in nets):
+                        subprocess.run(_sudo_wrap(['fail2ban-client', 'set', j, 'unbanip', str(addr)]),
+                                       capture_output=True, timeout=30)
+                        unbanned.append(f'{addr} ({j})')
+    except Exception as e:
+        _log(f'fail2ban: tunnel unban sweep failed (non-fatal): {e}')
+
+    if not changed and not unbanned:
+        return False
+    if changed:
+        _log('fail2ban: management tunnel ' + ', '.join(tun) +
+             ' added to ignoreip in ' + ', '.join(changed) +
+             ' — the relay/NetBird path can no longer be banned.')
+        try:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+        except Exception:
+            pass
+    if unbanned:
+        _log('fail2ban: released ' + ', '.join(unbanned) +
+             ' — a management-tunnel address was banned, which blocks EVERY port from it.')
     return True
 
 
@@ -72639,6 +72791,15 @@ def _startup_migrations():
             _f2b_selfheal_sshd_backend(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e2:
             print(f"Startup migration: fail2ban sshd-backend self-heal error (non-fatal): {_f2b_e2}", flush=True)
+
+        # v10.1.9 — never let fail2ban ban the road in. Adds the WireGuard/NetBird
+        # management subnets to every jail's ignoreip and releases any tunnel address
+        # already banned. Field-hit 2026-07-26: the sshd jail banned the relay and the
+        # box went dark to it. Runs AFTER the backend self-heal so the jail is sane first.
+        try:
+            _f2b_selfheal_tunnel_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e3:
+            print(f"Startup migration: fail2ban tunnel-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
 
         # v10.1.9 W7 — tighten world-readable secrets (TAK private keys, module
         # .env files, CoreConfig). Idempotent, only ever narrows a mode.
