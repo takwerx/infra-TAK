@@ -13330,8 +13330,92 @@ def _f2b_banaction():
 
 
 def _f2b_sshd_logpath():
-    """sshd auth log path: Debian → /var/log/auth.log; RHEL → /var/log/secure."""
-    return '/var/log/secure' if _distro_family() == 'rhel' else '/var/log/auth.log'
+    """sshd auth log path, or '' when this box has no syslog file to tail.
+
+    Debian → /var/log/auth.log; RHEL → /var/log/secure. BUT a growing number of
+    minimal and cloud images ship WITHOUT rsyslog (Ubuntu 24.04 dropped it from
+    the default install), so neither file exists and sshd logs only to the
+    systemd journal.
+
+    Pointing a jail at a logpath that does not exist makes fail2ban fail during
+    CONFIG PARSING, which takes down the ENTIRE daemon — every jail, not just
+    sshd, so the box silently ends up with no protection at all:
+        ERROR Failed during configuration: Have not found any log file for sshd jail
+        ERROR Async configuration of server failed
+    Field-reported on a fresh install by an operator (Josh, VA — 2026-07-25),
+    who root-caused it correctly and worked around it with `backend = systemd`.
+    Our own fleet never hit it because every box happens to run rsyslog.
+
+    Returning '' tells the caller to write `backend = systemd` and NO logpath.
+    Checks the other family's path too — the box's reality beats our guess."""
+    preferred = '/var/log/secure' if _distro_family() == 'rhel' else '/var/log/auth.log'
+    for p in (preferred, '/var/log/auth.log', '/var/log/secure'):
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return ''
+
+
+def _f2b_selfheal_sshd_backend(plog=None):
+    """Repair an sshd jail pointing at a syslog file this box does not have.
+
+    Field-reported 2026-07-25: on images without rsyslog (Ubuntu 24.04 dropped
+    it; minimal cloud images generally lack it) neither /var/log/auth.log nor
+    /var/log/secure exists, sshd logs only to the journal, and a jail carrying
+    `logpath = /var/log/auth.log` makes fail2ban abort while PARSING config:
+        ERROR Failed during configuration: Have not found any log file for sshd jail
+    That kills the whole daemon, so EVERY jail stops — the box looks protected
+    and is not. Swap the dead logpath for `backend = systemd`.
+
+    Deliberately narrow: only `[sshd]` jails, and only when the referenced file
+    is genuinely missing. Other jails (authentik, takserver) tail real files that
+    may legitimately be absent until that module is deployed, and rewriting them
+    to the journal would be wrong. Both families, idempotent, no-op when healthy.
+    """
+    _log = plog or (lambda m: None)
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild) or not _f2b_is_available():
+        return False
+    import glob as _glob
+    changed = []
+    for path in sorted(_glob.glob(os.path.join(jaild, '*.conf'))):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        if '[sshd]' not in text:
+            continue
+        out, hit = [], False
+        for line in text.splitlines(True):
+            m = re.match(r'^\s*logpath\s*=\s*(\S+)\s*$', line)
+            if m and not os.path.exists(m.group(1)):
+                out.append('backend  = systemd\n')   # journal instead of a dead file
+                hit = True
+            else:
+                out.append(line)
+        if hit:
+            try:
+                _write_priv(path, ''.join(out))
+                changed.append(os.path.basename(path))
+            except Exception as e:
+                _log(f"fail2ban self-heal: could not rewrite {path}: {e}")
+    if not changed:
+        return False
+    _log('fail2ban: sshd jail pointed at a syslog file this box does not have '
+         '(no rsyslog) — switched to the systemd journal in ' + ', '.join(changed) +
+         '. That misconfiguration stops the WHOLE daemon, so no jail was running.')
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']),
+                       capture_output=True, timeout=60)
+        st = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+                            capture_output=True, text=True, timeout=15).stdout.strip()
+        _log(f'fail2ban: restarted after self-heal — now {st}')
+    except Exception as e:
+        _log(f'fail2ban: restart after self-heal failed ({e}) — check `systemctl status fail2ban`')
+    return True
 
 
 def _f2b_selfheal_rhel_jails(plog=None):
@@ -13487,11 +13571,16 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
     ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
+    # No syslog file on this box (no rsyslog) → read sshd auth events straight
+    # from the journal. Writing a logpath that does not exist would kill the
+    # whole fail2ban daemon at config-parse time — see _f2b_sshd_logpath().
+    _lp = _f2b_sshd_logpath()
+    _source_line = f"logpath  = {_lp}\n" if _lp else "backend  = systemd\n"
     jail_conf = (
         "[sshd]\n"
         "enabled  = true\n"
         "filter   = sshd\n"
-        f"logpath  = {_f2b_sshd_logpath()}\n"
+        f"{_source_line}"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -72539,6 +72628,14 @@ def _startup_migrations():
             _f2b_selfheal_rhel_jails(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e:
             print(f"Startup migration: fail2ban self-heal error (non-fatal): {_f2b_e}", flush=True)
+
+        # v10.1.9 — field report (2026-07-25): on an image with no rsyslog the sshd
+        # jail's logpath points at a file that does not exist, fail2ban dies during
+        # config parse, and EVERY jail stops. Repair it to the systemd journal.
+        try:
+            _f2b_selfheal_sshd_backend(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e2:
+            print(f"Startup migration: fail2ban sshd-backend self-heal error (non-fatal): {_f2b_e2}", flush=True)
 
         # v10.1.9 W7 — tighten world-readable secrets (TAK private keys, module
         # .env files, CoreConfig). Idempotent, only ever narrows a mode.
