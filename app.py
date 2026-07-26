@@ -13332,10 +13332,13 @@ def _f2b_banaction():
 def _f2b_sshd_logpath():
     """sshd auth log path, or '' when this box has no syslog file to tail.
 
-    Debian → /var/log/auth.log; RHEL → /var/log/secure. BUT a growing number of
-    minimal and cloud images ship WITHOUT rsyslog (Ubuntu 24.04 dropped it from
-    the default install), so neither file exists and sshd logs only to the
-    systemd journal.
+    Debian → /var/log/auth.log; RHEL → /var/log/secure. BUT plenty of real
+    installs have no rsyslog at all — minimal/on-prem install profiles, images
+    that strip it, or rsyslog present but disabled — and then neither file
+    exists and sshd logs only to the systemd journal. Do NOT assume this is a
+    new-distro problem: the field report came from Ubuntu 22.04.5 LTS on-prem,
+    which ships rsyslog by default. Never infer the log file from the OS
+    version; check whether it is actually there.
 
     Pointing a jail at a logpath that does not exist makes fail2ban fail during
     CONFIG PARSING, which takes down the ENTIRE daemon — every jail, not just
@@ -13361,9 +13364,9 @@ def _f2b_sshd_logpath():
 def _f2b_selfheal_sshd_backend(plog=None):
     """Repair an sshd jail pointing at a syslog file this box does not have.
 
-    Field-reported 2026-07-25: on images without rsyslog (Ubuntu 24.04 dropped
-    it; minimal cloud images generally lack it) neither /var/log/auth.log nor
-    /var/log/secure exists, sshd logs only to the journal, and a jail carrying
+    Field-reported 2026-07-25 on Ubuntu 22.04.5 LTS on-prem: where rsyslog is
+    absent or disabled, neither /var/log/auth.log nor /var/log/secure exists,
+    sshd logs only to the journal, and a jail carrying
     `logpath = /var/log/auth.log` makes fail2ban abort while PARSING config:
         ERROR Failed during configuration: Have not found any log file for sshd jail
     That kills the whole daemon, so EVERY jail stops — the box looks protected
