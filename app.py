@@ -14087,6 +14087,75 @@ def _f2b_get_available_version():
         pass
     return None
 
+def _f2b_console_client_ip():
+    """The address the operator is actually reaching the console from.
+
+    `request.remote_addr` is the PROXY when the console sits behind Caddy (which is
+    the normal deployment), so it would report 127.0.0.1 and we would tell every
+    operator they are safe. Prefer the forwarded chain's first hop."""
+    try:
+        xff = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+        if xff:
+            ipaddress.ip_address(xff)
+            return xff
+    except Exception:
+        pass
+    try:
+        ra = (request.remote_addr or '').strip()
+        ipaddress.ip_address(ra)
+        return ra
+    except Exception:
+        return ''
+
+
+def _f2b_ignoreip_explained():
+    """ignoreip broken into labelled groups, plus whether the CALLER's own address
+    is covered.
+
+    `ignoreip` is one opaque space-separated string, so nobody can tell what is
+    protected or why — and the one entry that matters most (the management tunnel)
+    is invisible. Worse, an operator reaching the box by a path we do NOT
+    auto-detect (a jump host, a third-party VPN we deliberately do not trust) has
+    no way to know they are one ban away from losing the box. Say it plainly."""
+    groups = []
+
+    def add(label, cidrs, why):
+        cidrs = [c for c in (cidrs or []) if c]
+        if cidrs:
+            groups.append({'label': label, 'cidrs': cidrs, 'why': why})
+
+    add('Localhost', ['127.0.0.1/8', '::1'], 'this box talking to itself')
+    add("This box's network", _f2b_local_subnets(),
+        'the LAN or VNet this box sits on — stops an upstream gateway or load balancer being banned')
+    add('Management tunnel', _f2b_mgmt_tunnel_subnets(),
+        'the WireGuard / NetBird link this box is managed through — a ban here blocks every port '
+        'and locks you out of a box you may not be able to reach any other way')
+    add('Added by you', _f2b_fleet_ignore_cidrs(),
+        "from 'fail2ban_ignore_cidrs' in settings")
+
+    client = _f2b_console_client_ip()
+    covered, matched = None, ''
+    if client:
+        try:
+            addr = ipaddress.ip_address(client)
+            for g in groups:
+                for c in g['cidrs']:
+                    try:
+                        if addr in ipaddress.ip_network(c, strict=False):
+                            covered, matched = True, f"{c} ({g['label']})"
+                            break
+                    except (ValueError, TypeError):
+                        continue      # v4/v6 mismatch or malformed entry
+                if covered:
+                    break
+            if covered is None:
+                covered = False
+        except ValueError:
+            covered = None
+    return {'groups': groups, 'client_ip': client, 'client_covered': covered,
+            'client_matched': matched}
+
+
 @app.route('/api/fail2ban/ssh/status')
 @login_required
 def fail2ban_ssh_status_api():
@@ -14103,6 +14172,7 @@ def fail2ban_ssh_status_api():
             capture_output=True, text=True).stdout.strip() == 'active')
         status['jail_enabled']   = _f2b_ssh_jail_enabled()
         status['jail_config']    = _f2b_read_ssh_jail_config()
+        status['ignoreip']       = _f2b_ignoreip_explained()
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
@@ -37040,7 +37110,7 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors <code>/var/log/auth.log</code> for failed SSH login attempts. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Watches failed SSH logins &mdash; from the system auth log, or the systemd journal on boxes without rsyslog. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
 
 <div id="ssh-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
@@ -37053,6 +37123,14 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 <div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="ssh-watching-caret">▼ details</span></div>
 </div>
 <div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="ssh-safety-banner" style="display:none;margin-bottom:14px;border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.5"></div>
+
+<div id="ssh-neverban-panel" style="margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Never Banned</div>
+<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Addresses fail2ban will never lock out, and why. A ban blocks <b>every port</b> from an address &mdash; not just SSH.</div>
+<div id="ssh-neverban-list"><div style="color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace">Loading…</div></div>
 </div>
 
 <div id="ssh-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
@@ -37824,6 +37902,46 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   var sshCard = document.getElementById(\'ssh-jail-card\');
   if (!sshCard) return;
 
+  function renderNeverBan(info) {
+    var list = document.getElementById(\'ssh-neverban-list\');
+    var banner = document.getElementById(\'ssh-safety-banner\');
+    if (!list) return;
+    if (!info || !info.groups) { list.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Unavailable.</div>\'; return; }
+    var esc = function(s){ var d=document.createElement(\'div\'); d.textContent=(s===undefined||s===null)?\'\':String(s); return d.innerHTML; };
+    var html = \'\';
+    info.groups.forEach(function(g){
+      var chips = g.cidrs.map(function(c){
+        return \'<code style="background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:4px;padding:1px 6px;margin-right:6px;font-size:11px">\' + esc(c) + \'</code>\';
+      }).join(\'\');
+      html += \'<div style="margin-bottom:10px">\'
+           +  \'<div style="font-size:12px;color:var(--text-primary);font-weight:600;margin-bottom:3px">\' + esc(g.label) + \'</div>\'
+           +  \'<div style="margin-bottom:3px">\' + chips + \'</div>\'
+           +  \'<div style="font-size:11px;color:var(--text-dim)">\' + esc(g.why) + \'</div>\'
+           +  \'</div>\';
+    });
+    list.innerHTML = html || \'<div style="color:var(--text-dim);font-size:12px">Nothing whitelisted.</div>\';
+
+    if (!banner) return;
+    if (info.client_covered === true) {
+      banner.style.display = \'block\';
+      banner.style.background = \'rgba(34,197,94,0.08)\';
+      banner.style.border = \'1px solid rgba(34,197,94,0.35)\';
+      banner.style.color = \'var(--text-secondary)\';
+      banner.innerHTML = \'\\u2713 You are connected from <code>\' + esc(info.client_ip) + \'</code>, covered by \'
+                       + \'<code>\' + esc(info.client_matched) + \'</code>. fail2ban cannot lock you out from here.\';
+    } else if (info.client_covered === false) {
+      banner.style.display = \'block\';
+      banner.style.background = \'rgba(234,179,8,0.10)\';
+      banner.style.border = \'1px solid rgba(234,179,8,0.45)\';
+      banner.style.color = \'var(--text-secondary)\';
+      banner.innerHTML = \'\\u26a0 You are connected from <code>\' + esc(info.client_ip) + \'</code>, which is <b>not</b> on the never-ban list. \'
+                       + \'If fail2ban bans it, <b>every port</b> from that address is blocked and you lose access to this box. \'
+                       + \'Add it below if this is how you normally reach it.\';
+    } else {
+      banner.style.display = \'none\';
+    }
+  }
+
   function loadSshStatus() {
     fetch(\'/api/fail2ban/ssh/status\').then(function(r){ return r.json(); }).then(function(d){
       if (!d.available) return;
@@ -37850,6 +37968,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (cfg.bantime)  document.getElementById(\'ssh-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
         var ipEl = document.getElementById(\'ssh-cfg-ignoreip\');
         if (ipEl) { ipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim(); renderChips(\'ssh-cfg-ignoreip\', \'ssh-cfg-ignoreip-chips\'); }
+        renderNeverBan(d.ignoreip);
         var ips = d.banned_ips || [];
         window._sshBannedIps = ips;
         renderSshBanList(ips);
