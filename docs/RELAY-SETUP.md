@@ -57,9 +57,12 @@ Rules**. Add these ingress rules, each with **Source `0.0.0.0/0`**:
 | **TCP** | **8446** | TAK admin WebGUI (Let's Encrypt cert / LDAP login) |
 | TCP | 8554 | MediaMTX **RTSP** video — only if you stream |
 | TCP | 8322 | MediaMTX **RTSPS** video — only if you stream |
+| UDP | 8890 | MediaMTX **SRT** video — only if you stream |
 
-Those seven are what **Set Up Relay** configures automatically — the relay is forwarding exactly
-these the moment the tunnel comes up. Optional extras are in *Going beyond the defaults* below.
+**Set Up Relay** configures all of these automatically on the relay itself — the moment the tunnel
+comes up they're already being forwarded, so the NSG rules above are the only part you do by hand.
+The three video rows are only needed if you stream. Optional extras are in *Going beyond the
+defaults* below.
 
 > **⚠️ Add BOTH UDP rows, even though you only picked one port.** The relay listens on the port you
 > chose in the console and redirects the other one to it, so the tunnel survives networks that block
@@ -107,25 +110,31 @@ flushes.
 > different proposition on a public Oracle address where anyone can reach the login page. The
 > supported path to the console from outside is HTTPS on 443 through Caddy, with Authentik in front.
 
-### Video through a relay: RTSP yes, SRT no
+### Video through a relay
 
-The relay carries traffic as TCP. That is a hard limit, not a setting — so of the streaming options
-in the MediaMTX configurator:
+All three MediaMTX streaming options work through a relay and are forwarded automatically — **RTSP**
+(8554), **RTSPS** (8322) and **SRT** (8890). Add the matching NSG rules for the ones you use.
 
-- **RTSP (8554) and RTSPS (8322) work.** Both are TCP and both are forwarded automatically. One
-  catch: the player must use **RTSP over TCP** (sometimes labelled *TCP* or *interleaved* transport).
-  RTSP's UDP transport carries the actual video on ports 8000/8001, which can't cross the relay — the
-  stream will connect and then show nothing. VLC: *Input/Codecs → Use RTP over RTSP (TCP)*. ffmpeg:
-  `-rtsp_transport tcp`.
-- **SRT (8890) does not work through a relay, and can't be made to.** SRT is built on UDP by design;
-  there is no TCP mode to switch on. If you need SRT from outside, the box needs real public inbound
-  rather than a relay.
+**One setting matters for SRT.** The tunnel runs at an MTU of 1280 bytes, deliberately — cellular
+carriers translate IPv4 into IPv6 and add overhead, and anything larger silently breaks big packets
+on those networks. SRT's default packet size is 1316 bytes, which is over that budget, so send at
+**1200** instead:
 
-Same reason, same answer for **Remote Assist screen sharing** — CoTURN needs UDP 3478 plus a UDP
-media range.
+```
+srt://<relay-ip>:8890?streamid=<stream>&pkt_size=1200
+```
 
-Watching a stream *inside* the CloudTAK or MediaMTX web player works either way, because that is
-HTTPS on 443 rather than a raw video port.
+Encoders expose this as *packet size*, *payload size* or `pkt_size`. Symptom if you skip it: the
+stream connects and reports healthy, then delivers stuttering or broken video.
+
+RTSP needs nothing special — our MediaMTX ships `rtspTransports: [tcp]`, which is what a relay
+carries cleanly, and players negotiate it automatically.
+
+**Remote Assist screen sharing is the one thing still outside this** — CoTURN needs UDP 3478 plus a
+wide UDP media range, which isn't forwarded.
+
+Watching a stream *inside* the CloudTAK or MediaMTX web player works regardless of any of the above,
+because that's HTTPS on 443 rather than a raw video port.
 
 ## 5. Finish in the console — automatically
 
