@@ -40741,7 +40741,7 @@ textarea.form-input{resize:vertical}
     <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
       <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
-      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls (anchor serves both)</span>
+      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls. The relay serves both — but your cloud firewall must allow BOTH udp/51820 and udp/443, or switching strands the tunnel.</span>
     </div>
     <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>

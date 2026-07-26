@@ -2,7 +2,7 @@
 # connectivity-anchor-bootstrap.sh — Connectivity Wizard (v10.1.0) anchor VPS bootstrap
 #
 # Stands up the public "mailbox" that a CGNAT or portable infra-TAK box dials OUT to:
-#   internet client ──tcp──▶ anchor public IP :8089/:8443/:8446 ──kernel DNAT──▶ WireGuard ──▶ box
+#   internet client ──▶ anchor public IP :80/:443/:8089/:8443/:8446 (+ video) ──kernel DNAT──▶ WireGuard ──▶ box
 #
 # The forward is PURE L4 (kernel PREROUTING DNAT over a WireGuard p2p tunnel).
 # The anchor has no TLS stack in the path at all — TAK's mutual-TLS handshake
@@ -19,8 +19,11 @@
 #   ./connectivity-anchor-bootstrap.sh status
 #
 # Cloud-side reminder (the script cannot do this for you): open ingress in the
-# provider firewall (OCI Security List / NSG) for udp/51820, tcp/8089, tcp/8443,
-# tcp/8446. (The :5099 prober is tunnel-only since v10.1.3 — no cloud ingress.)
+# provider firewall (OCI Security List / NSG) for BOTH udp/51820 and udp/443 (the
+# tunnel and its alternate — the box dials the one it was configured with, so the
+# other being closed strands it), plus tcp/{80,443,8089,8443,8446} and, if you
+# stream, tcp/{8554,8322} + udp/8890. The setup run prints the exact list at the
+# end. (The :5099 prober is tunnel-only since v10.1.3 — no cloud ingress.)
 
 set -euo pipefail
 
