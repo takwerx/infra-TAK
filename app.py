@@ -13893,9 +13893,20 @@ _F2B_OWNED_FILTERS = {
     ),
     'takportal': (
         "[Definition]\n"
-        "# Ban on FAILED public-form attempts only (result=ok is never matched), so\n"
-        "# legitimate repeat use of /lookup is never punished. Real client IP = ip=<HOST>.\n"
-        "failregex = ^.*\\bip=<HOST>\\b.*\\bresult=(bad_domain|bad_user|captcha_fail)\\b.*$\n"
+        "# Reads CADDY's access log for the TAK Portal host (v10.1.11). The Portal's\n"
+        "# public, unauthenticated /lookup and /request-access forms are enumerable;\n"
+        "# this bans an IP that keeps getting REJECTED on them. Caddy is the edge, so\n"
+        "# client_ip is the true client with no X-Forwarded-For trust required.\n"
+        "#\n"
+        "# Scoped to those two paths ONLY — a 4xx anywhere else on the Portal (an\n"
+        "# authenticated page, a missing asset) must never ban anyone. Success (2xx)\n"
+        "# and redirects (3xx) are never matched, so normal use cannot accumulate\n"
+        "# strikes. 429 is deliberately EXCLUDED: rate-limited callers behind one NAT\n"
+        "# would punish a whole site for one noisy user.\n"
+        "# \\s* after each colon: Go's encoder emits compact JSON, but tolerating a\n"
+        "# space costs nothing and stops a formatting change from silently disarming\n"
+        "# this jail — which is exactly how the last two died.\n"
+        "failregex = \"client_ip\":\\s*\"<HOST>\".*\"uri\":\\s*\"/(?:lookup|request-access)[^\"]*\".*\"status\":\\s*(?:400|401|403)\\b\n"
         "ignoreregex =\n"
     ),
     'mediamtx-rtsp': (
@@ -14091,6 +14102,79 @@ def _f2b_selfheal_ak_forwarder(plog=None):
          '/dev/null, which is where Authentik writes every auth event, so the Authentik '
          'jail had never seen a failed login.')
     return True
+
+
+def _f2b_selfheal_portal_caddy_log(plog=None):
+    """Repoint the takportal jail at Caddy's access log, and make Caddy emit it.
+
+    The jail shipped in 2026-06 reading /var/log/tak-portal/lookup.log, a file the
+    TAK Portal was meant to write and never did — so it has sat loaded and starving
+    ever since while /lookup and /request-access stayed public. TAK-Portal is a
+    third-party repo, so we feed the jail from the log Caddy already produces.
+
+    Two halves, both idempotent:
+      1. Caddyfile — regenerate so the Portal site block gains its `log` block.
+         Only when the Portal is installed AND the block is absent. Reload (not
+         restart) so a bad config is REFUSED and the running Caddy is untouched.
+      2. Jail — rewrite logpath/maxretry, preserving operator thresholds.
+
+    Deliberately does nothing on a box with no TAK Portal."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    if not _f2b_portal_jail_enabled():
+        return False                      # no portal jail on this box — nothing to do
+    changed = False
+
+    # ── 1. Make Caddy emit the log ────────────────────────────────────────────
+    try:
+        if os.path.exists(CADDYFILE_PATH):
+            with open(CADDYFILE_PATH) as f:
+                live = f.read()
+            generated = live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+            if TAKPORTAL_CADDY_LOG not in generated:
+                generate_caddyfile()
+                # reload validates internally and refuses a bad config, leaving the
+                # running server on its previous one — never `restart` here.
+                rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                                    capture_output=True, text=True, timeout=60)
+                if rl.returncode == 0:
+                    _log('fail2ban: Caddy now writes %s — the takportal jail finally has '
+                         'something to read.' % TAKPORTAL_CADDY_LOG)
+                    changed = True
+                else:
+                    _log('fail2ban: Caddy reload REFUSED the regenerated config (%s) — '
+                         'the previous config is still serving; portal jail left as-is.'
+                         % (rl.stdout or rl.stderr or '')[-160:].strip())
+                    return False          # do NOT repoint the jail at a log nothing writes
+    except Exception as e:
+        _log(f'fail2ban: portal access-log setup failed (non-fatal): {e}')
+        return False
+
+    # ── 2. Repoint the jail ───────────────────────────────────────────────────
+    try:
+        jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
+        with open(jail_path) as f:
+            cur = f.read()
+        if TAKPORTAL_CADDY_LOG in cur:
+            return changed                # already repointed
+        cfg = _f2b_read_portal_jail_config()
+        # The old default (5) was tuned for the per-result contract. HTTP status is a
+        # blunter signal, so lift a still-default jail to the new floor; an operator
+        # who deliberately chose a higher number keeps it.
+        maxretry = cfg.get('maxretry', 5)
+        if maxretry <= 5:
+            maxretry = TAKPORTAL_F2B_MAXRETRY
+        _f2b_write_portal_jail(maxretry, cfg.get('findtime', 600),
+                               cfg.get('bantime', 3600),
+                               _f2b_operator_extra(cfg.get('ignoreip', '')))
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+        _log('fail2ban: takportal jail repointed to Caddy\'s access log (maxretry=%d) — '
+             'it had been watching a file nothing writes since 2026-06-12.' % maxretry)
+        return True
+    except Exception as e:
+        _log(f'fail2ban: could not repoint the takportal jail (non-fatal): {e}')
+        return changed
 
 
 def _f2b_selfheal_trusted_ignoreip(plog=None):
@@ -15112,6 +15196,15 @@ def fail2ban_mediamtx_unban_api():
 #   <ts> ip=<CLIENT_IP> page=<lookup|request-access> result=<ok|bad_domain|bad_user|captcha_fail|rate_limited> email=<x> rig=<y>
 # The IP MUST be the real client (Caddy X-Forwarded-For), or fail2ban bans Caddy.
 TAKPORTAL_F2B_LOG = '/var/log/tak-portal/lookup.log'
+# v10.1.11 — what the jail ACTUALLY reads. The native log above was never written
+# (see generate_caddyfile()'s TAK Portal block), so the jail is fed from Caddy's
+# access log for the Portal host instead. Caddy owns /var/log/caddy and rolls this
+# file itself (10MiB x5), so it needs no logrotate rule of ours.
+TAKPORTAL_CADDY_LOG = '/var/log/caddy/takportal-access.log'
+# Blunter signal than the original per-result contract (HTTP status can't tell a
+# fat-fingered domain from a scripted probe), so the threshold is raised: a human
+# will not fail these two forms 15 times in 10 minutes; an enumerator does hundreds.
+TAKPORTAL_F2B_MAXRETRY = 15
 
 def _f2b_portal_jail_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-takportal.conf')
@@ -15143,11 +15236,11 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
     # Ensure the logpath exists (empty is fine) — fail2ban refuses a missing logpath.
-    # v10.0.5 non-root: /var/log/tak-portal is root-owned — create + touch via broker.
+    # Caddy creates this itself on its next reload, but the jail may be written first.
     try:
-        _makedirs_priv(os.path.dirname(TAKPORTAL_F2B_LOG))
-        subprocess.run(_sudo_wrap(['touch', TAKPORTAL_F2B_LOG]), capture_output=True)
-        _chmod_priv(TAKPORTAL_F2B_LOG, 0o664)
+        _makedirs_priv(os.path.dirname(TAKPORTAL_CADDY_LOG))
+        subprocess.run(_sudo_wrap(['touch', TAKPORTAL_CADDY_LOG]), capture_output=True)
+        _chmod_priv(TAKPORTAL_CADDY_LOG, 0o644)
     except Exception:
         pass
 
@@ -15163,7 +15256,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         "[takportal]\n"
         "enabled  = true\n"
         "filter   = takportal\n"
-        f"logpath  = {TAKPORTAL_F2B_LOG}\n"
+        f"logpath  = {TAKPORTAL_CADDY_LOG}\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -22742,6 +22835,20 @@ def generate_caddyfile(settings=None):
         portal_host = sd['takportal']
         lines.append(f"# TAK Portal")
         lines.append(f"{portal_host} {{")
+        # v10.1.11 — access log that FEEDS the takportal fail2ban jail. /lookup and
+        # /request-access are public and unauthenticated (see @public below), so they
+        # are enumerable. The jail was written in 2026-06 against a log the Portal was
+        # supposed to emit; the Portal never shipped that writer and the container has
+        # no mount for the path, so the jail sat armed and starving. TAK-Portal is a
+        # third-party repo, so rather than wait on it, ban from the log Caddy already
+        # has — it is the edge, so it sees the real client IP with no XFF trust needed.
+        lines.append(f"    log {{")
+        lines.append(f"        output file {TAKPORTAL_CADDY_LOG} {{")
+        lines.append(f"            roll_size 10MiB")
+        lines.append(f"            roll_keep 5")
+        lines.append(f"            roll_keep_for 720h")
+        lines.append(f"        }}")
+        lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route {{")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
@@ -73552,6 +73659,10 @@ def _startup_migrations():
             _f2b_selfheal_ak_forwarder(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e5:
             print(f"Startup migration: Authentik log-forwarder self-heal error (non-fatal): {_f2b_e5}", flush=True)
+        try:
+            _f2b_selfheal_portal_caddy_log(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e7:
+            print(f"Startup migration: takportal Caddy-log self-heal error (non-fatal): {_f2b_e7}", flush=True)
 
         # ...then say so loudly if anything is STILL dead. This is the check that
         # would have caught test6's month of unprotected Authentik.
