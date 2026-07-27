@@ -15282,6 +15282,20 @@ def _f2b_prepare_portal_caddy_log():
         _chmod_priv(TAKPORTAL_CADDY_LOG, 0o644)   # fail2ban reads as root; 644 is ample
     except Exception:
         pass
+
+    # RHEL/SELinux delta — ownership alone is NOT enough. A directory we create under
+    # /var/log inherits `var_log_t`, but the policy labels Caddy's log tree
+    # `httpd_log_t`, so a confined Caddy is denied the write no matter who owns it and
+    # rejects the whole config with a bare "permission denied". Ownership looked
+    # correct on nuc while Caddy still refused (2026-07-27); only the label was wrong.
+    # restorecon applies the policy's OWN label — never chcon (which hardcodes a type
+    # the policy may change), and never a boolean or a permissive flip.
+    try:
+        if subprocess.run(['selinuxenabled'], capture_output=True, timeout=10).returncode == 0:
+            subprocess.run(_sudo_wrap(['restorecon', '-R', logdir]),
+                           capture_output=True, timeout=60)
+    except Exception:
+        pass                              # not an SELinux box (selinuxenabled absent)
     return owner
 
 def _f2b_portal_jail_enabled():
