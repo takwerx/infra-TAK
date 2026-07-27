@@ -13691,6 +13691,58 @@ def _f2b_container_subnets():
     return subnets
 
 
+def _f2b_own_addresses():
+    """The box's OWN addresses — never bannable. A machine must not ban itself.
+
+    Hit for real on test8, 2026-07-27: five failed logins driven from the box itself
+    made the Authentik jail ban 63.250.55.132 — the box's own public IP — and ufw
+    duly installed rules dropping it on EVERY port. Anything that reaches the box via
+    its own public address is then severed: a service dialling its own FQDN, a
+    health check, a loopback-through-the-edge path. Nothing in the ignore list
+    prevented it, because _f2b_local_subnets() is RFC1918-only by design and a public
+    address is not private.
+
+    Two sources, because neither alone is complete:
+      - addresses actually on the physical NICs (covers bare metal / direct-public),
+      - settings['server_ip'], which on AWS/Azure is the NAT'd public address that
+        never appears in `ip addr` at all.
+    Emitted as bare host addresses, deliberately NOT the surrounding subnet — on a
+    direct-public box that would whitelist unrelated neighbours."""
+    out = []
+
+    def _add(a):
+        if a and a not in out:
+            out.append(a)
+
+    try:
+        r = subprocess.run(['ip', '-o', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            if ifname.startswith(_F2B_VIRTUAL_IFACE_PREFIXES):
+                continue                  # container/VPN bridges are trusted as subnets
+            for i, tok in enumerate(parts):
+                if tok in ('inet', 'inet6') and i + 1 < len(parts):
+                    try:
+                        _add(str(ipaddress.ip_interface(parts[i + 1]).ip))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    try:
+        sip = (load_settings().get('server_ip') or '')
+        sip = sip.strip() if isinstance(sip, str) else ''
+        if sip:
+            _add(str(ipaddress.ip_address(sip)))
+    except Exception:
+        pass
+    return out
+
+
 def _f2b_fleet_ignore_cidrs():
     """Operator-configured fleet-wide trusted CIDRs (settings 'fail2ban_ignore_cidrs').
     Use this for an upstream gateway/proxy/LB that does NOT share the box's attached
@@ -13713,6 +13765,7 @@ def _f2b_trusted_ignoreip(extra=''):
     candidates += _f2b_local_subnets()
     candidates += _f2b_mgmt_tunnel_subnets()   # never ban the road in
     candidates += _f2b_container_subnets()     # never ban our own services
+    candidates += _f2b_own_addresses()         # never ban ourselves
     candidates += _f2b_fleet_ignore_cidrs()
     candidates += str(extra or '').replace(',', ' ').split()
     for c in candidates:
@@ -13731,6 +13784,7 @@ def _f2b_operator_extra(stored):
     fleet.update(_f2b_local_subnets())
     fleet.update(_f2b_mgmt_tunnel_subnets())
     fleet.update(_f2b_container_subnets())
+    fleet.update(_f2b_own_addresses())
     fleet.update(_f2b_fleet_ignore_cidrs())
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
@@ -14420,7 +14474,7 @@ def _f2b_selfheal_trusted_ignoreip(plog=None):
     _log = plog or (lambda m: None)
     if not _f2b_is_available():
         return False
-    tun = _f2b_mgmt_tunnel_subnets() + _f2b_container_subnets()
+    tun = _f2b_mgmt_tunnel_subnets() + _f2b_container_subnets() + _f2b_own_addresses()
     if not tun:
         return False                      # no tunnel and no containers — nothing to trust
     jaild = '/etc/fail2ban/jail.d'
