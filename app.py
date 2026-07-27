@@ -13950,21 +13950,49 @@ def _f2b_loaded_jails():
 
 
 def _f2b_dead_jails():
-    """Jails that are enabled on disk but NOT running — i.e. dead security controls.
+    """Jails that are configured but protecting nothing. [(jail, filter, reason)].
 
-    Returns [(jail, filter, reason)]. A jail here is doing NOTHING while every
-    surface that only reads config files reports it as configured and healthy."""
+    TWO failure modes, because fixing only the first still leaves a green console
+    over a control that cannot fire:
+
+    1. NOT LOADED — enabled on disk but absent from the running daemon, usually a
+       missing filter file. (test6/authentik, ≥2026-06-29.)
+    2. STARVING — loaded and healthy-looking, but its logpath is 0 bytes, so it has
+       never been fed a single line and never can be. (takportal, since 2026-06-12:
+       the jail shipped ahead of the TAK Portal writer that was meant to emit the
+       log, and the container has no mount for that path either.) A 0-byte file is
+       used as the signal rather than staleness — a quiet box legitimately has quiet
+       logs, but a log that has never received one byte is unambiguous."""
     dead = []
     loaded = _f2b_loaded_jails()
     if not loaded:
         return dead                       # daemon unreachable — cannot judge, don't guess
-    for name, filt, _path in _f2b_enabled_jail_files():
-        if name in loaded:
+    for name, filt, path in _f2b_enabled_jail_files():
+        if name not in loaded:
+            reason = ('filter file /etc/fail2ban/filter.d/%s.conf is missing' % filt
+                      if not os.path.exists('/etc/fail2ban/filter.d/%s.conf' % filt)
+                      else 'enabled on disk but not loaded by fail2ban')
+            dead.append((name, filt, reason))
             continue
-        reason = ('filter file /etc/fail2ban/filter.d/%s.conf is missing' % filt
-                  if not os.path.exists('/etc/fail2ban/filter.d/%s.conf' % filt)
-                  else 'enabled on disk but not loaded by fail2ban')
-        dead.append((name, filt, reason))
+        # Loaded — but is anything actually reaching it?
+        try:
+            with open(path) as f:
+                jt = f.read()
+        except OSError:
+            continue
+        if re.search(r'^\s*backend\s*=\s*systemd', jt, re.M):
+            continue                      # journal-fed, no logpath to size-check
+        lm = re.search(r'^\s*logpath\s*=\s*(\S+)', jt, re.M)
+        if not lm:
+            continue
+        lp = lm.group(1)
+        try:
+            if os.path.getsize(lp) == 0:
+                dead.append((name, filt,
+                             'loaded, but its log %s is 0 bytes — nothing has ever '
+                             'written to it, so this jail can never fire' % lp))
+        except OSError:
+            dead.append((name, filt, 'loaded, but its log %s cannot be read' % lp))
     return dead
 
 
