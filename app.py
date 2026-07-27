@@ -8121,6 +8121,28 @@ def _harden_sensitive_permissions(plog=None):
             cur = (r.stdout or '').strip()
             if not cur or r.returncode != 0:
                 continue                      # not present on this box
+            # Before tightening: a file inside a user's home must be OWNED by that
+            # user. Pre-flip boxes carry root-owned .env files under /home/takwerx
+            # (written when the console still ran as root). Combine that with the
+            # 600 below and the owner of the home — the console, and the user that
+            # runs `docker compose` — cannot read its own config at all. That is
+            # what killed the TAK Portal console page on test12: PermissionError on
+            # /home/takwerx/TAK-Portal/.env, 500 on every load, silent since the
+            # mode changed on 2026-07-25. Fixing ownership keeps the security goal
+            # (nobody but the owner can read it) while restoring the owner's access,
+            # and is the reason 600 was safe to assume in the first place.
+            try:
+                home_dir = os.path.dirname(os.path.dirname(path))
+                if home_dir.startswith('/home/') or home_dir == '/root':
+                    import pwd as _pwd2
+                    want_uid = os.stat(home_dir).st_uid
+                    if os.stat(path).st_uid != want_uid:
+                        nm = _pwd2.getpwuid(want_uid).pw_name
+                        subprocess.run(_sudo_wrap(['chown', f'{nm}:{nm}', path]),
+                                       capture_output=True, timeout=15)
+                        fixed.append(f'{path} owner->{nm}')
+            except Exception:
+                pass
             # Only tighten. Never widen a mode an operator deliberately narrowed.
             if int(cur, 8) & ~int(want, 8):
                 could_read = _console_can_read(path)
@@ -25375,14 +25397,24 @@ def takportal_page():
                     containers.append({'name': parts[0] if len(parts) > 0 else 'tak-portal', 'status': parts[1] if len(parts) > 1 else ''})
             container_info['containers'] = containers
             container_info['status'] = containers[0]['status'] if containers else ''
-    # Get portal port from .env if exists
+    # Get portal port from .env if exists.
+    # _read_priv, not open(): v10.1.9 W7 hardened module .env files to 600 and they are
+    # root-owned, so a non-root console gets PermissionError and this whole page 500s
+    # (test12, 2026-07-27 — the file's mode changed 2026-07-25 02:37 and the page has
+    # been dead since). W7's own guard did not catch it because _console_can_read()
+    # accepts a BROKER-routed read as success, which is correct policy — but only if
+    # the caller actually uses the broker. This one used a bare open().
+    # A missing/unreadable .env must never take the page down: the port falls back.
     portal_port = '3000'
     env_path = os.path.expanduser('~/TAK-Portal/.env')
     if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
+        try:
+            for line in (_read_priv(env_path) or '').splitlines():
                 if line.strip().startswith('WEB_UI_PORT='):
                     portal_port = line.strip().split('=', 1)[1].strip() or '3000'
+        except Exception as _pp_e:
+            print(f"takportal_page: could not read {env_path} ({_pp_e}) — "
+                  f"falling back to port {portal_port}", flush=True)
     # Real version (package.json) and update-available (from container logs)
     vinfo = _get_takportal_version_info()
     portal_version = vinfo['version'] or ''
