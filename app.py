@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.10-alpha"
+VERSION = "10.1.11-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -13537,12 +13537,15 @@ def _f2b_parse_status(raw):
             result['banned_ips'] = [ip.strip() for ip in ips_raw.split() if ip.strip()]
     return result
 
-# Virtual / container / overlay interface prefixes whose subnets must NOT be auto-trusted:
-# docker bridges (172.17-31/16), libvirt, k8s CNIs, VPN/mesh links. These are RFC1918 but
-# are NOT the LAN/VNet a real upstream gateway lives on — auto-trusting them just bloats
-# ignoreip with noise (a box can have ~10 docker /16s). Only the physical NIC's subnet is
-# the one a proxy/gateway shares. (Found during v0.9.58 #6 field test: the test fleet's
-# jails would have picked up 9 docker bridges each.)
+# Virtual / container / overlay interface prefixes that are NOT a gateway LAN: docker
+# bridges (172.17-31/16), libvirt, k8s CNIs, VPN/mesh links. These are RFC1918 but are NOT
+# the LAN/VNet a real upstream gateway lives on, so _f2b_local_subnets() skips them — only
+# the physical NIC's subnet is the one a proxy/gateway shares. (Found during v0.9.58 #6
+# field test: the test fleet's jails would have picked up 9 docker bridges each.)
+#
+# v10.1.11: skipping them HERE is still right, but they are no longer untrusted overall —
+# our own containers live on the docker bridges and _f2b_container_subnets() trusts those
+# deliberately. See that function for why the "just noise" reasoning was wrong.
 _F2B_VIRTUAL_IFACE_PREFIXES = ('lo', 'docker', 'br-', 'br0', 'veth', 'virbr', 'vnet',
                                'flannel', 'cni', 'cali', 'kube', 'tailscale', 'nb-',
                                'wg', 'zt', 'tun', 'tap', 'cilium', 'ovs', 'weave')
@@ -13633,6 +13636,61 @@ def _f2b_mgmt_tunnel_subnets():
     return subnets
 
 
+# Bridges that carry OUR OWN containers. Deliberately narrow: docker0, docker's
+# user-defined networks (`br-<12 hex>` — note this does NOT match a host bridge named
+# `br0`), and podman's equivalents. A third-party CNI/VPN bridge is NOT in here.
+_F2B_CONTAINER_IFACE_PREFIXES = ('docker', 'br-', 'podman', 'cni-podman')
+
+
+def _f2b_container_subnets():
+    """Subnets of the container bridges infra-TAK itself brings up — never bannable.
+
+    TAK Portal, Node-RED and CloudTAK all run as containers and reach TAK Server at
+    its PUBLIC FQDN (`TAK_URL = https://takserver.<fqdn>:8443/Marti`), so TAK logs
+    their docker-bridge address as the remote peer. The takserver jail bans on ANY
+    TLS handshake rejection (`NioNettyServerHandler error ... Remote address: <HOST>`)
+    at 20 hits / 300 s — and the portal's dashboard poll runs every 15 s, i.e. exactly
+    20 attempts per 300 s. One handshake fault (expired client cert, rotated CA, TAK
+    restarting) therefore bans our own service in ~5 minutes, deterministically. The
+    ban is `iptables-allports`/`ufw`, so it severs that container from the host on
+    EVERY port, and `recidive` (bantime -1) escalates a repeat to permanent.
+
+    Field-hit 2026-07-25: the takserver jail banned 172.21.0.2 — the nodered container
+    — on test8 and test12 within two seconds of each other, with recidive already
+    counting. Operators were "fixing" the resulting API failures by disabling fail2ban
+    outright, which is a far worse trade than trusting our own bridges.
+
+    This reverses the v0.9.58 judgement that docker bridges are "just noise" in
+    ignoreip. That call weighed a ~10-token-longer ignoreip against nothing, because
+    the ban-our-own-services failure mode had not been seen yet. The residual risk is
+    narrow: these bridges are host-local and not routable from off-box, so an external
+    attacker cannot source an address into them; and fail2ban was never the control
+    containing a compromised container. Best-effort; [] on any failure."""
+    subnets = []
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            if not ifname.startswith(_F2B_CONTAINER_IFACE_PREFIXES):
+                continue
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        net = ipaddress.ip_network(parts[i + 1], strict=False)
+                    except Exception:
+                        continue
+                    # RFC1918 only — never whitelist a public range off a bridge name.
+                    if net.is_private and str(net) not in subnets:
+                        subnets.append(str(net))
+    except Exception:
+        pass
+    return subnets
+
+
 def _f2b_fleet_ignore_cidrs():
     """Operator-configured fleet-wide trusted CIDRs (settings 'fail2ban_ignore_cidrs').
     Use this for an upstream gateway/proxy/LB that does NOT share the box's attached
@@ -13646,13 +13704,15 @@ def _f2b_fleet_ignore_cidrs():
 
 def _f2b_trusted_ignoreip(extra=''):
     """Build the full ignoreip whitelist for ANY infra-TAK jail, fleet-uniform:
-    localhost + the box's attached private subnet(s) + operator fleet CIDRs + the
-    per-jail operator whitelist (extra). Identical code path on every box; dedups so
-    it is idempotent even if `extra` still carries the localhost tokens."""
+    localhost + the box's attached private subnet(s) + our own container bridges +
+    operator fleet CIDRs + the per-jail operator whitelist (extra). Identical code
+    path on every box; dedups so it is idempotent even if `extra` still carries the
+    localhost tokens."""
     parts, seen = [], set()
     candidates = ['127.0.0.1/8', '::1']
     candidates += _f2b_local_subnets()
     candidates += _f2b_mgmt_tunnel_subnets()   # never ban the road in
+    candidates += _f2b_container_subnets()     # never ban our own services
     candidates += _f2b_fleet_ignore_cidrs()
     candidates += str(extra or '').replace(',', ' ').split()
     for c in candidates:
@@ -13670,6 +13730,7 @@ def _f2b_operator_extra(stored):
     fleet = {'127.0.0.1/8', '::1'}
     fleet.update(_f2b_local_subnets())
     fleet.update(_f2b_mgmt_tunnel_subnets())
+    fleet.update(_f2b_container_subnets())
     fleet.update(_f2b_fleet_ignore_cidrs())
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
@@ -13796,21 +13857,27 @@ def _f2b_selfheal_sshd_backend(plog=None):
     return True
 
 
-def _f2b_selfheal_tunnel_ignoreip(plog=None):
-    """Add the management-tunnel subnets to every infra-TAK jail's ignoreip, and
-    release anything already banned inside one.
+def _f2b_selfheal_trusted_ignoreip(plog=None):
+    """Add the never-bannable subnets to every infra-TAK jail's ignoreip, and release
+    anything already banned inside one.
 
-    Boxes deployed before this fix carry an ignoreip with no tunnel subnet, so the
-    relay/NetBird gateway stays bannable — and on a CGNAT box that tunnel is the
-    only way in. Console-path delivery: this runs at startup so a normal update
-    fixes it with no SSH. Idempotent; no-op when there is no tunnel or nothing to
-    change. See _f2b_mgmt_tunnel_subnets() for why this is narrow by design."""
+    Two classes, both of which fail2ban must never cut:
+      - management tunnels (WireGuard relay / NetBird) — the road IN. On a CGNAT box
+        that tunnel is the only way to reach the machine.
+      - our own container bridges — the road BETWEEN our services. See
+        _f2b_container_subnets(): the takserver jail banned the nodered container on
+        test8/test12 on 2026-07-25, and TAK Portal polls TAK on a 15 s timer that hits
+        the jail's 20-per-300 s threshold exactly.
+
+    Boxes deployed before each fix carry an ignoreip missing those subnets. Console-path
+    delivery: this runs at startup so a normal update fixes it with no SSH. Idempotent;
+    no-op when there is nothing to trust or nothing to change."""
     _log = plog or (lambda m: None)
     if not _f2b_is_available():
         return False
-    tun = _f2b_mgmt_tunnel_subnets()
+    tun = _f2b_mgmt_tunnel_subnets() + _f2b_container_subnets()
     if not tun:
-        return False                      # no tunnel on this box — nothing to trust
+        return False                      # no tunnel and no containers — nothing to trust
     jaild = '/etc/fail2ban/jail.d'
     if not os.path.isdir(jaild):
         return False
@@ -13842,8 +13909,9 @@ def _f2b_selfheal_tunnel_ignoreip(plog=None):
             except Exception as e:
                 _log(f'fail2ban: could not update ignoreip in {path}: {e}')
 
-    # Release anything already banned inside a tunnel — the operator may be locked
-    # out RIGHT NOW, and a config rewrite alone does not lift a live ban.
+    # Release anything already banned inside a trusted subnet — the operator may be
+    # locked out RIGHT NOW, or TAK Portal may be severed from TAK Server RIGHT NOW,
+    # and a config rewrite alone does not lift a live ban.
     nets = []
     for c in tun:
         try:
@@ -13874,21 +13942,21 @@ def _f2b_selfheal_tunnel_ignoreip(plog=None):
                                        capture_output=True, timeout=30)
                         unbanned.append(f'{addr} ({j})')
     except Exception as e:
-        _log(f'fail2ban: tunnel unban sweep failed (non-fatal): {e}')
+        _log(f'fail2ban: trusted-subnet unban sweep failed (non-fatal): {e}')
 
     if not changed and not unbanned:
         return False
     if changed:
-        _log('fail2ban: management tunnel ' + ', '.join(tun) +
+        _log('fail2ban: trusted subnets ' + ', '.join(tun) +
              ' added to ignoreip in ' + ', '.join(changed) +
-             ' — the relay/NetBird path can no longer be banned.')
+             ' — the management tunnel and our own containers can no longer be banned.')
         try:
             subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
         except Exception:
             pass
     if unbanned:
         _log('fail2ban: released ' + ', '.join(unbanned) +
-             ' — a management-tunnel address was banned, which blocks EVERY port from it.')
+             ' — a management-tunnel or container address was banned, which blocks EVERY port from it.')
     return True
 
 
@@ -73277,14 +73345,17 @@ def _startup_migrations():
         except Exception as _f2b_e2:
             print(f"Startup migration: fail2ban sshd-backend self-heal error (non-fatal): {_f2b_e2}", flush=True)
 
-        # v10.1.9 — never let fail2ban ban the road in. Adds the WireGuard/NetBird
-        # management subnets to every jail's ignoreip and releases any tunnel address
-        # already banned. Field-hit 2026-07-26: the sshd jail banned the relay and the
-        # box went dark to it. Runs AFTER the backend self-heal so the jail is sane first.
+        # v10.1.9 — never let fail2ban ban the road in. v10.1.11 — nor the road between
+        # our own services. Adds the WireGuard/NetBird management subnets AND the docker
+        # container bridges to every jail's ignoreip, and releases any address inside
+        # them that is already banned. Field-hits: the sshd jail banned the relay and the
+        # box went dark (2026-07-26); the takserver jail banned the nodered container on
+        # test8/test12 (2026-07-25), the same way it bans TAK Portal and breaks its Marti
+        # API calls. Runs AFTER the backend self-heal so the jail is sane first.
         try:
-            _f2b_selfheal_tunnel_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
+            _f2b_selfheal_trusted_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e3:
-            print(f"Startup migration: fail2ban tunnel-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
+            print(f"Startup migration: fail2ban trusted-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
 
         # v10.1.9 W7 — tighten world-readable secrets (TAK private keys, module
         # .env files, CoreConfig). Idempotent, only ever narrows a mode.
