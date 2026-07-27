@@ -13857,6 +13857,214 @@ def _f2b_selfheal_sshd_backend(plog=None):
     return True
 
 
+# ── Filters infra-TAK owns ────────────────────────────────────────────────────
+# SINGLE SOURCE OF TRUTH. Every writer below pulls from here, and
+# _f2b_selfheal_filters() repairs a box that is missing one. Distro-shipped
+# filters (sshd, recidive) are deliberately absent — we never overwrite those.
+#
+# Why this exists (found 2026-07-27): jail configs were self-healed at startup
+# but filter files were NOT — the only code that wrote them was the one-shot
+# Marketplace install path. So a box could end up with `enabled = true` and no
+# filter, which makes fail2ban skip the jail on EVERY reload and fail
+# `fail2ban-client -t` outright. test6 sat like that from ≥2026-06-29 with
+# Authentik brute-force protection silently absent, while the console showed
+# the jail as configured. A security control that cannot fire must never be
+# reachable by a code path that leaves no trace.
+_F2B_OWNED_FILTERS = {
+    'authentik': (
+        "[Definition]\n"
+        "# Match Authentik JSON log lines containing login_failed events.\n"
+        "# Authentik emits structured JSON; client_ip contains the real IP since v0.8.9\n"
+        "# fixed AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS.\n"
+        "failregex = \"action\": \"login_failed\".*\"client_ip\": \"<HOST>\"\n"
+        "            \"client_ip\": \"<HOST>\".*\"action\": \"login_failed\"\n"
+        "ignoreregex =\n"
+    ),
+    'takserver': (
+        "[Definition]\n"
+        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
+        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
+        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
+        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
+        "ignoreregex =\n"
+        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
+        "              {^LN-BEG}\n"
+    ),
+    'takportal': (
+        "[Definition]\n"
+        "# Ban on FAILED public-form attempts only (result=ok is never matched), so\n"
+        "# legitimate repeat use of /lookup is never punished. Real client IP = ip=<HOST>.\n"
+        "failregex = ^.*\\bip=<HOST>\\b.*\\bresult=(bad_domain|bad_user|captcha_fail)\\b.*$\n"
+        "ignoreregex =\n"
+    ),
+    'mediamtx-rtsp': (
+        "[Definition]\n"
+        "# Match RTSP connection opens per source IP.\n"
+        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
+        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
+        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "ignoreregex =\n"
+    ),
+}
+
+
+def _f2b_enabled_jail_files():
+    """[(jail_name, filter_name, path)] for every enabled infratak-*.conf jail."""
+    out = []
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return out
+    import glob as _glob
+    for path in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf'))):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r'^\s*\[([^\]]+)\]', text, re.M)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        en = re.search(r'^\s*enabled\s*=\s*(\S+)', text, re.M)
+        if not en or en.group(1).strip().lower() not in ('true', 'yes', '1'):
+            continue
+        fm = re.search(r'^\s*filter\s*=\s*(\S+)', text, re.M)
+        out.append((name, fm.group(1).strip() if fm else name, path))
+    return out
+
+
+def _f2b_loaded_jails():
+    """Jail names the RUNNING fail2ban actually has. [] if it cannot be asked.
+
+    NOT the same as the jails on disk — that gap is the whole point."""
+    try:
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status']),
+                           capture_output=True, text=True, timeout=30)
+        for line in (r.stdout or '').splitlines():
+            if 'Jail list:' in line:
+                return [j.strip() for j in line.split(':', 1)[1].replace(',', ' ').split() if j.strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _f2b_dead_jails():
+    """Jails that are enabled on disk but NOT running — i.e. dead security controls.
+
+    Returns [(jail, filter, reason)]. A jail here is doing NOTHING while every
+    surface that only reads config files reports it as configured and healthy."""
+    dead = []
+    loaded = _f2b_loaded_jails()
+    if not loaded:
+        return dead                       # daemon unreachable — cannot judge, don't guess
+    for name, filt, _path in _f2b_enabled_jail_files():
+        if name in loaded:
+            continue
+        reason = ('filter file /etc/fail2ban/filter.d/%s.conf is missing' % filt
+                  if not os.path.exists('/etc/fail2ban/filter.d/%s.conf' % filt)
+                  else 'enabled on disk but not loaded by fail2ban')
+        dead.append((name, filt, reason))
+    return dead
+
+
+def _f2b_selfheal_filters(plog=None):
+    """Write any MISSING filter file for an enabled jail whose filter we own.
+
+    A jail with no filter is skipped by fail2ban on every reload and makes
+    `fail2ban-client -t` fail for the whole daemon. Console-path delivery: runs at
+    startup so a normal update repairs it with no SSH. Only ever CREATES a missing
+    file — never overwrites an existing one, so operator edits survive."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+    wrote = []
+    for name, filt, _path in _f2b_enabled_jail_files():
+        if filt not in _F2B_OWNED_FILTERS:
+            continue                      # distro filter (sshd/recidive) — not ours to write
+        fpath = '/etc/fail2ban/filter.d/%s.conf' % filt
+        if os.path.exists(fpath):
+            continue
+        try:
+            _write_priv(fpath, _F2B_OWNED_FILTERS[filt])
+            wrote.append(f'{filt} (jail {name})')
+        except Exception as e:
+            _log(f'fail2ban: could not write missing filter {fpath}: {e}')
+    if not wrote:
+        return False
+    _log('fail2ban: wrote MISSING filter(s) ' + ', '.join(wrote) +
+         ' — those jails were enabled but skipped on every reload, so they were '
+         'protecting nothing.')
+    try:
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+    except Exception:
+        pass
+    return True
+
+
+# The forwarder that feeds the Authentik jail. `docker logs -f X 2>&1 >> FILE` is
+# WRONG: bash applies redirections left to right, so `2>&1` points stderr at the
+# CURRENT stdout (systemd's StandardOutput=null) and only then does `>>` move stdout
+# to the file. Net effect: stderr is discarded. Authentik writes its structured JSON
+# — including every auth event — to stderr, so the jail was fed nothing but the
+# entrypoint's stdout chatter (Django migration output). Measured on test8
+# 2026-07-27: 192 of the last 200 stderr lines were JSON; stdout was
+# "No migrations to apply." Correct order is `>> FILE 2>&1`.
+_AK_FORWARDER_EXEC = ("ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 "
+                      ">> /var/log/authentik/auth.log 2>&1'\n")
+
+_AK_FORWARDER_UNIT = (
+    "[Unit]\n"
+    "Description=Authentik Docker Log Forwarder for fail2ban\n"
+    "After=docker.service\n"
+    "Requires=docker.service\n\n"
+    "[Service]\n"
+    "Type=simple\n"
+    "Restart=always\n"
+    "RestartSec=10\n"
+    + _AK_FORWARDER_EXEC +
+    "StandardOutput=null\n"
+    "StandardError=null\n\n"
+    "[Install]\n"
+    "WantedBy=multi-user.target\n"
+)
+
+
+def _f2b_selfheal_ak_forwarder(plog=None):
+    """Repair the Authentik log forwarder's backwards redirection on existing boxes.
+
+    The old unit was only ever written when it did not already exist, so a box that
+    got the broken one keeps it forever and the Authentik jail can never see an auth
+    event. Rewrites ONLY when the broken `2>&1 >>` ordering is present."""
+    _log = plog or (lambda m: None)
+    svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
+    if not os.path.exists(svc_path):
+        return False
+    try:
+        with open(svc_path) as f:
+            cur = f.read()
+    except OSError:
+        return False
+    if '2>&1 >>' not in cur:
+        return False                      # already correct (or hand-edited) — leave it
+    try:
+        _write_priv(svc_path, _AK_FORWARDER_UNIT)
+    except Exception as e:
+        _log(f'fail2ban: could not repair the Authentik log forwarder: {e}')
+        return False
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'authentik-log-forwarder']),
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
+    _log('fail2ban: repaired the Authentik log forwarder — it was redirecting stderr to '
+         '/dev/null, which is where Authentik writes every auth event, so the Authentik '
+         'jail had never seen a failed login.')
+    return True
+
+
 def _f2b_selfheal_trusted_ignoreip(plog=None):
     """Add the never-bannable subnets to every infra-TAK jail's ignoreip, and release
     anything already banned inside one.
@@ -14156,6 +14364,11 @@ def fail2ban_status_api():
             ['systemctl', 'is-active', 'authentik-log-forwarder'],
             capture_output=True, text=True).stdout.strip() == 'active')
         status['version'] = _f2b_get_version()
+        # v10.1.11 — report jails that are enabled on disk but NOT running. Without
+        # this the page reads config files and calls a dead jail healthy, which is
+        # exactly how Authentik went a month with no brute-force protection.
+        status['dead_jails'] = [{'jail': j, 'filter': f, 'reason': r}
+                                for j, f, r in _f2b_dead_jails()]
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
@@ -14189,21 +14402,7 @@ def fail2ban_authentik_toggle_api():
         # (e.g. servers that installed Fail2ban before this service was introduced).
         svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
         if not os.path.exists(svc_path):
-            forwarder_service = (
-                "[Unit]\n"
-                "Description=Authentik Docker Log Forwarder for fail2ban\n"
-                "After=docker.service\n"
-                "Requires=docker.service\n\n"
-                "[Service]\n"
-                "Type=simple\n"
-                "Restart=always\n"
-                "RestartSec=10\n"
-                "ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 >> /var/log/authentik/auth.log'\n"
-                "StandardOutput=null\n"
-                "StandardError=null\n\n"
-                "[Install]\n"
-                "WantedBy=multi-user.target\n"
-            )
+            forwarder_service = _AK_FORWARDER_UNIT
             _makedirs_priv('/var/log/authentik', exist_ok=True)
             _write_priv(svc_path, forwarder_service)
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -14712,14 +14911,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
     filter_path = '/etc/fail2ban/filter.d/mediamtx-rtsp.conf'
-    filter_conf = (
-        "[Definition]\n"
-        "# Match RTSP connection opens per source IP.\n"
-        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
-        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
-        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
-        "ignoreregex =\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['mediamtx-rtsp']
     _write_priv(filter_path, filter_conf)
 
     guarddog_action = ""
@@ -14932,13 +15124,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         pass
 
     filter_path = '/etc/fail2ban/filter.d/takportal.conf'
-    filter_conf = (
-        "[Definition]\n"
-        "# Ban on FAILED public-form attempts only (result=ok is never matched), so\n"
-        "# legitimate repeat use of /lookup is never punished. Real client IP = ip=<HOST>.\n"
-        "failregex = ^.*\\bip=<HOST>\\b.*\\bresult=(bad_domain|bad_user|captcha_fail)\\b.*$\n"
-        "ignoreregex =\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['takportal']
     _write_priv(filter_path, filter_conf)
 
     guarddog_action = ""
@@ -72629,36 +72815,14 @@ def _fail2ban_install_and_configure(plog):
     plog("fail2ban migration: created /var/log/authentik/")
 
     # Step 3: Write log forwarder systemd service
-    forwarder_service = (
-        "[Unit]\n"
-        "Description=Authentik Docker Log Forwarder for fail2ban\n"
-        "After=docker.service\n"
-        "Requires=docker.service\n\n"
-        "[Service]\n"
-        "Type=simple\n"
-        "Restart=always\n"
-        "RestartSec=10\n"
-        "ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 >> /var/log/authentik/auth.log'\n"
-        "StandardOutput=null\n"
-        "StandardError=null\n\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
+    forwarder_service = _AK_FORWARDER_UNIT
     svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
     _write_priv(svc_path, forwarder_service)
     plog(f"fail2ban migration: wrote {svc_path}")
 
     # Step 4: Write fail2ban filter (matches Authentik JSON log lines)
     _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
-    filter_conf = (
-        "[Definition]\n"
-        "# Match Authentik JSON log lines containing login_failed events.\n"
-        "# Authentik emits structured JSON; client_ip contains the real IP since v0.8.9\n"
-        "# fixed AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS.\n"
-        "failregex = \"action\": \"login_failed\".*\"client_ip\": \"<HOST>\"\n"
-        "            \"client_ip\": \"<HOST>\".*\"action\": \"login_failed\"\n"
-        "ignoreregex =\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['authentik']
     filter_path = '/etc/fail2ban/filter.d/authentik.conf'
     _write_priv(filter_path, filter_conf)
     plog(f"fail2ban migration: wrote {filter_path}")
@@ -72920,17 +73084,7 @@ def _fail2ban_takserver_filter(plog):
     #             ... Remote address: 1.2.3.4; ... Certificate error: peer not verified;
     # %% in ini = literal % after ConfigParser → shell sees %Y, etc.
     _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
-    filter_conf = (
-        "[Definition]\n"
-        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
-        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
-        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
-        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
-        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
-        "ignoreregex =\n"
-        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
-        "              {^LN-BEG}\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['takserver']
     filter_path = '/etc/fail2ban/filter.d/takserver.conf'
     _write_priv(filter_path, filter_conf)
     plog(f"fail2ban takserver filter: wrote {filter_path}")
@@ -73356,6 +73510,30 @@ def _startup_migrations():
             _f2b_selfheal_trusted_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e3:
             print(f"Startup migration: fail2ban trusted-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
+
+        # v10.1.11 — a jail that cannot fire is worse than no jail, because every
+        # surface reports it as configured. Repair the two ways we shipped one:
+        # a missing filter file (jail skipped on every reload, and the whole daemon
+        # fails `fail2ban-client -t`), and the Authentik log forwarder redirecting
+        # stderr — where Authentik writes every auth event — to /dev/null.
+        try:
+            _f2b_selfheal_filters(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e4:
+            print(f"Startup migration: fail2ban filter self-heal error (non-fatal): {_f2b_e4}", flush=True)
+        try:
+            _f2b_selfheal_ak_forwarder(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e5:
+            print(f"Startup migration: Authentik log-forwarder self-heal error (non-fatal): {_f2b_e5}", flush=True)
+
+        # ...then say so loudly if anything is STILL dead. This is the check that
+        # would have caught test6's month of unprotected Authentik.
+        try:
+            _dead = _f2b_dead_jails()
+            for _jn, _jf, _jr in _dead:
+                print(f"Startup migration: fail2ban WARNING — jail '{_jn}' is enabled but NOT "
+                      f"running ({_jr}). It is protecting NOTHING.", flush=True)
+        except Exception as _f2b_e6:
+            print(f"Startup migration: fail2ban dead-jail check error (non-fatal): {_f2b_e6}", flush=True)
 
         # v10.1.9 W7 — tighten world-readable secrets (TAK private keys, module
         # .env files, CoreConfig). Idempotent, only ever narrows a mode.
