@@ -15230,22 +15230,50 @@ def _f2b_prepare_portal_caddy_log():
     restarts Caddy (a reboot) and it cannot load the on-disk Caddyfile at all, taking
     every proxied service down with it. Hit on the v10.1.11 rollout, 2026-07-27.
 
-    Ownership is taken from /var/log/caddy itself rather than assuming the user is
-    called 'caddy' — the package name differs across distros. Idempotent; also repairs
-    a file already created root-owned by an earlier build."""
+    The owner comes from Caddy's OWN systemd unit (`User=`/`Group=`), not from the
+    log directory — deriving it from the directory looked clever and was wrong: on
+    RHEL the caddy package leaves /var/log/caddy as root:root, so a box there just
+    chowned root to root and stayed broken while Debian boxes healed (nuc,
+    2026-07-27). The unit is authoritative and readable even when Caddy is stopped.
+
+    Both the directory AND the file are chowned: Caddy writes rolled siblings
+    (<name>-<ts>.log) into the same directory, so a root-owned directory fails
+    rotation the same way a root-owned file fails the initial open.
+
+    Idempotent; repairs files/dirs left root-owned by an earlier build."""
     logdir = os.path.dirname(TAKPORTAL_CADDY_LOG)
     try:
         _makedirs_priv(logdir, exist_ok=True)
     except Exception:
         pass
-    owner = 'caddy'
-    try:
-        import pwd, grp
-        st = os.stat(logdir)
-        owner = '%s:%s' % (pwd.getpwuid(st.st_uid).pw_name, grp.getgrgid(st.st_gid).gr_name)
+
+    def _unit_val(prop):
+        try:
+            r = subprocess.run(['systemctl', 'show', 'caddy', '-p', prop, '--value'],
+                               capture_output=True, text=True, timeout=10)
+            return (r.stdout or '').strip()
+        except Exception:
+            return ''
+    user = _unit_val('User') or ''
+    if not user:
+        try:                              # fall back to the running process
+            r = subprocess.run(['ps', '-o', 'user=', '-C', 'caddy'],
+                               capture_output=True, text=True, timeout=10)
+            user = (r.stdout or '').split('\n')[0].strip()
+        except Exception:
+            user = ''
+    if not user:
+        user = 'caddy'
+    try:                                  # never chown to a user that does not exist
+        import pwd as _pwd
+        _pwd.getpwnam(user)
     except Exception:
-        pass
+        return ''                         # unknown Caddy user — leave everything alone
+    group = _unit_val('Group') or user
+    owner = f'{user}:{group}'
+
     try:
+        subprocess.run(_sudo_wrap(['chown', owner, logdir]), capture_output=True, timeout=15)
         if not os.path.exists(TAKPORTAL_CADDY_LOG):
             subprocess.run(_sudo_wrap(['touch', TAKPORTAL_CADDY_LOG]), capture_output=True, timeout=15)
         # Always re-assert: the file may already exist root-owned from an earlier build.
@@ -15254,8 +15282,6 @@ def _f2b_prepare_portal_caddy_log():
         _chmod_priv(TAKPORTAL_CADDY_LOG, 0o644)   # fail2ban reads as root; 644 is ample
     except Exception:
         pass
-    # Caddy also rolls to <name>-<ts>.log siblings in the same dir; the dir must stay
-    # caddy-writable or rotation fails the same way.
     return owner
 
 def _f2b_portal_jail_enabled():
