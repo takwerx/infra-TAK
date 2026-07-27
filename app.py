@@ -13901,6 +13901,13 @@ _F2B_OWNED_FILTERS = {
         "failregex = \"event\":\\s*\"invalid_login\".*\"client_ip\":\\s*\"<HOST>\"\n"
         "            \"client_ip\":\\s*\"<HOST>\".*\"event\":\\s*\"invalid_login\"\n"
         "ignoreregex =\n"
+        # datepattern is MANDATORY here, not tidiness. Without it fail2ban runs its
+        # auto date-detector over Authentik's JSON, which mixes ISO strings with float
+        # epochs, and dies with IndexError('string index out of range') on EVERY line
+        # — logged as "Failed to process line", so the jail reads the file, matches
+        # nothing, and looks perfectly healthy. Confirmed on test8 2026-07-27: auto
+        # detect = IndexError and 0 processed; explicit pattern = 13/40 matched.
+        "datepattern = \"timestamp\":\\s*\"%%Y-%%m-%%dT%%H:%%M:%%S\n"
     ),
     'takserver': (
         "[Definition]\n"
@@ -13963,6 +13970,10 @@ _F2B_LEGACY_FILTERS = {
         'failregex = "action": "login_failed".*"client_ip": "<HOST>"\n'
         '            "client_ip": "<HOST>".*"action": "login_failed"\n'
         'ignoreregex =\n',
+        # v10.1.11 first cut: correct event name, but NO datepattern — fail2ban's auto
+        # date-detector threw IndexError on every Authentik JSON line, so it matched
+        # nothing while appearing healthy.
+        '[Definition]\n# Read from Authentik\'s OWN source, 2026-07-27 (authentik 2026.5.x,\n# authentik/stages/identification/stage.py):\n#     self.stage.logger.info(\n#         "invalid_login", identifier=uid_field, client_ip=client_ip,\n#         action="invalid_identifier", ...)\n# structlog renders the first positional arg as "event", so the line is\n#     {... "event":"invalid_login" ... "client_ip":"1.2.3.4" ...}\n#\n# The previous filter matched "action": "login_failed" and never fired once on\n# any box: that string does not appear in the log at all. `login_failed` is a\n# Django SIGNAL name (authentik/core/signals.py), not a logged field — it feeds\n# Authentik\'s own reputation scoring, not this file.\n#\n# REQUIRES AUTHENTIK_LOG_LEVEL=info — the call above is logger.info(), so at\n# `warning` the line is never emitted and this jail cannot fire.\n#\n# Field order is not guaranteed by structlog, so match client_ip in EITHER\n# direction relative to the event. Both alternatives cannot match the same line\n# (each requires the other token on the opposite side), so no double-counting.\n#\n# SCOPE, deliberately: this catches an unknown/invalid IDENTIFIER — credential\n# stuffing and username enumeration, the dominant attack. A wrong PASSWORD on a\n# valid username logs "Invalid credentials" with NO client_ip\n# (stages/password/stage.py), so it is not bannable from the log in this\n# version. Authentik\'s built-in reputation policy covers that case natively.\nfailregex = "event":\\s*"invalid_login".*"client_ip":\\s*"<HOST>"\n            "client_ip":\\s*"<HOST>".*"event":\\s*"invalid_login"\nignoreregex =\n',
     ],
 }
 
@@ -14116,8 +14127,23 @@ def _f2b_selfheal_filters(plog=None):
 # entrypoint's stdout chatter (Django migration output). Measured on test8
 # 2026-07-27: 192 of the last 200 stderr lines were JSON; stdout was
 # "No migrations to apply." Correct order is `>> FILE 2>&1`.
-_AK_FORWARDER_EXEC = ("ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 "
-                      ">> /var/log/authentik/auth.log 2>&1'\n")
+# `2>&1 |` (before the pipe) sends BOTH streams to grep — Authentik's JSON is on stderr.
+#
+# The grep is not an optimisation, it is what makes the jail work at all. auth.log's only
+# consumer is this jail, and feeding it the full firehose broke fail2ban outright: its
+# auto date-detector hits Authentik's mixed timestamp formats (ISO strings, float epochs,
+# and bare text from the Django entrypoint) and throws
+# IndexError('string index out of range') on EVERY line — logged as "Failed to process
+# line", so the jail tails the file, matches nothing, and looks perfectly healthy.
+# Confirmed on test8 2026-07-27: full log = IndexError and nothing processed; a file of
+# only invalid_login lines = 5/5 matched, clean.
+#
+# Narrowing here also fixes the second problem it caused: auth.log had grown to 21MB of
+# migration chatter with no rotation. Nothing is lost — `docker logs` still holds the
+# complete stream for humans.
+_AK_FORWARDER_EXEC = ("ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 "
+                      "| grep --line-buffered -F invalid_login "
+                      ">> /var/log/authentik/auth.log'\n")
 
 _AK_FORWARDER_UNIT = (
     "[Unit]\n"
@@ -14238,11 +14264,22 @@ def _f2b_ensure_authentik_logrotate(plog=None):
 
 
 def _f2b_selfheal_ak_forwarder(plog=None):
-    """Repair the Authentik log forwarder's backwards redirection on existing boxes.
+    """Bring the Authentik log forwarder up to the current, working definition.
 
-    The old unit was only ever written when it did not already exist, so a box that
-    got the broken one keeps it forever and the Authentik jail can never see an auth
-    event. Rewrites ONLY when the broken `2>&1 >>` ordering is present."""
+    Two generations of this unit were broken and BOTH are still out there, because the
+    unit was only ever written when absent — a box that received a broken one kept it
+    forever:
+      1. `docker logs -f X 2>&1 >> FILE` with StandardError=null. Bash applies
+         redirections left to right, so stderr went to null — and stderr is exactly
+         where Authentik writes its JSON. The jail was fed stdout chatter only.
+      2. The un-narrowed fix for (1): correct streams, but the whole firehose. That
+         crashes fail2ban's date detector on every line (see _AK_FORWARDER_EXEC), so
+         the jail still matched nothing while looking healthy.
+
+    Trigger is the absence of the `invalid_login` grep, which only the current
+    definition has — that identifies both broken generations without trying to
+    enumerate them, and leaves a genuinely hand-edited unit that already narrows the
+    stream alone."""
     _log = plog or (lambda m: None)
     svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
     if not os.path.exists(svc_path):
@@ -14252,22 +14289,33 @@ def _f2b_selfheal_ak_forwarder(plog=None):
             cur = f.read()
     except OSError:
         return False
-    if '2>&1 >>' not in cur:
-        return False                      # already correct (or hand-edited) — leave it
+    if 'invalid_login' in cur:
+        return False                      # already current (or a hand-rolled narrowing)
     try:
         _write_priv(svc_path, _AK_FORWARDER_UNIT)
     except Exception as e:
         _log(f'fail2ban: could not repair the Authentik log forwarder: {e}')
         return False
+    # The old unit appended the firehose; leftover chatter would keep crashing the date
+    # detector on the lines already in the file. Truncate so the jail starts clean —
+    # safe because this file is the jail's private feed, not an audit record, and the
+    # full stream remains in `docker logs`.
+    try:
+        subprocess.run(_sudo_wrap(['truncate', '-s', '0', '/var/log/authentik/auth.log']),
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
     try:
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'authentik-log-forwarder']),
                        capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
     except Exception:
         pass
-    _log('fail2ban: repaired the Authentik log forwarder — it was redirecting stderr to '
-         '/dev/null, which is where Authentik writes every auth event, so the Authentik '
-         'jail had never seen a failed login.')
+    _log('fail2ban: rebuilt the Authentik log forwarder — it now captures stderr (where '
+         'Authentik logs auth events) and forwards ONLY invalid_login lines. The full '
+         'stream was crashing fail2ban\'s date detector on every line, so the jail read '
+         'the file and matched nothing.')
     return True
 
 
