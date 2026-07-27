@@ -8131,16 +8131,23 @@ def _harden_sensitive_permissions(plog=None):
             # mode changed on 2026-07-25. Fixing ownership keeps the security goal
             # (nobody but the owner can read it) while restoring the owner's access,
             # and is the reason 600 was safe to assume in the first place.
+            # Scoped to THIS console's own home, deliberately. The targets list also
+            # covers /root/<mod>/.env for pre-flip boxes, and on a flipped box those
+            # are stale copies that the non-root migration left owned by takwerx —
+            # "owner should match the home" would chown them back to root and undo
+            # that migration. Narrowing to the running console's home fixes the file
+            # that is actually read and leaves the leftovers alone. (Without this it
+            # only worked by accident: os.stat('/root') raises for takwerx, so the
+            # chown was skipped by exception rather than by intent.)
             try:
-                home_dir = os.path.dirname(os.path.dirname(path))
-                if home_dir.startswith('/home/') or home_dir == '/root':
-                    import pwd as _pwd2
-                    want_uid = os.stat(home_dir).st_uid
-                    if os.stat(path).st_uid != want_uid:
-                        nm = _pwd2.getpwuid(want_uid).pw_name
-                        subprocess.run(_sudo_wrap(['chown', f'{nm}:{nm}', path]),
-                                       capture_output=True, timeout=15)
-                        fixed.append(f'{path} owner->{nm}')
+                import pwd as _pwd2
+                _me = _pwd2.getpwuid(os.getuid())
+                my_home = os.path.realpath(_me.pw_dir)
+                if os.path.realpath(path).startswith(my_home + os.sep) \
+                        and os.stat(path).st_uid != _me.pw_uid:
+                    subprocess.run(_sudo_wrap(['chown', f'{_me.pw_name}:{_me.pw_name}', path]),
+                                   capture_output=True, timeout=15)
+                    fixed.append(f'{path} owner->{_me.pw_name}')
             except Exception:
                 pass
             # Only tighten. Never widen a mode an operator deliberately narrowed.
