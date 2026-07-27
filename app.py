@@ -13873,11 +13873,33 @@ def _f2b_selfheal_sshd_backend(plog=None):
 _F2B_OWNED_FILTERS = {
     'authentik': (
         "[Definition]\n"
-        "# Match Authentik JSON log lines containing login_failed events.\n"
-        "# Authentik emits structured JSON; client_ip contains the real IP since v0.8.9\n"
-        "# fixed AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS.\n"
-        "failregex = \"action\": \"login_failed\".*\"client_ip\": \"<HOST>\"\n"
-        "            \"client_ip\": \"<HOST>\".*\"action\": \"login_failed\"\n"
+        "# Read from Authentik's OWN source, 2026-07-27 (authentik 2026.5.x,\n"
+        "# authentik/stages/identification/stage.py):\n"
+        "#     self.stage.logger.info(\n"
+        "#         \"invalid_login\", identifier=uid_field, client_ip=client_ip,\n"
+        "#         action=\"invalid_identifier\", ...)\n"
+        "# structlog renders the first positional arg as \"event\", so the line is\n"
+        "#     {... \"event\":\"invalid_login\" ... \"client_ip\":\"1.2.3.4\" ...}\n"
+        "#\n"
+        "# The previous filter matched \"action\": \"login_failed\" and never fired once on\n"
+        "# any box: that string does not appear in the log at all. `login_failed` is a\n"
+        "# Django SIGNAL name (authentik/core/signals.py), not a logged field — it feeds\n"
+        "# Authentik's own reputation scoring, not this file.\n"
+        "#\n"
+        "# REQUIRES AUTHENTIK_LOG_LEVEL=info — the call above is logger.info(), so at\n"
+        "# `warning` the line is never emitted and this jail cannot fire.\n"
+        "#\n"
+        "# Field order is not guaranteed by structlog, so match client_ip in EITHER\n"
+        "# direction relative to the event. Both alternatives cannot match the same line\n"
+        "# (each requires the other token on the opposite side), so no double-counting.\n"
+        "#\n"
+        "# SCOPE, deliberately: this catches an unknown/invalid IDENTIFIER — credential\n"
+        "# stuffing and username enumeration, the dominant attack. A wrong PASSWORD on a\n"
+        "# valid username logs \"Invalid credentials\" with NO client_ip\n"
+        "# (stages/password/stage.py), so it is not bannable from the log in this\n"
+        "# version. Authentik's built-in reputation policy covers that case natively.\n"
+        "failregex = \"event\":\\s*\"invalid_login\".*\"client_ip\":\\s*\"<HOST>\"\n"
+        "            \"client_ip\":\\s*\"<HOST>\".*\"event\":\\s*\"invalid_login\"\n"
         "ignoreregex =\n"
     ),
     'takserver': (
@@ -14068,6 +14090,107 @@ _AK_FORWARDER_UNIT = (
     "[Install]\n"
     "WantedBy=multi-user.target\n"
 )
+
+
+def _f2b_selfheal_authentik_log_level(plog=None):
+    """Flip AUTHENTIK_LOG_LEVEL warning -> info so the Authentik jail can actually fire.
+
+    The only failed-login line carrying a client IP is
+    `logger.info("invalid_login", ..., client_ip=...)`
+    (authentik/stages/identification/stage.py). We set `warning` in v0.8.7 to trim log
+    volume, not realising it silently disabled the whole jail — which is why that jail
+    has never banned anything on any box. `info` is upstream's OWN default, and volume
+    is now bounded by _f2b_ensure_authentik_logrotate().
+
+    Narrow on purpose:
+      - only when the Authentik jail is actually enabled (no jail, no reason to touch
+        a working Authentik),
+      - only when the value is exactly `warning`, i.e. OUR old default. An operator who
+        deliberately chose `debug`/`error` keeps it,
+      - recreates Authentik so the change takes effect. Skipping that would leave the
+        setting written and the jail still dead, which is the exact failure this whole
+        release is about. Costs one brief SSO interruption, ONCE."""
+    _log = plog or (lambda m: None)
+    if not _f2b_authentik_jail_enabled():
+        return False
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    if not os.path.exists(env_path):
+        return False
+    try:
+        with open(env_path) as f:
+            content = f.read()
+    except OSError:
+        return False
+    m = re.search(r'^AUTHENTIK_LOG_LEVEL\s*=\s*(\S*)\s*$', content, re.M)
+    if not m or m.group(1).strip().lower() != 'warning':
+        return False                      # absent, already info, or operator's own choice
+    new = re.sub(r'^AUTHENTIK_LOG_LEVEL\s*=.*$', 'AUTHENTIK_LOG_LEVEL=info', content, count=1, flags=re.M)
+    try:
+        _write_priv(env_path, new)
+    except Exception as e:
+        _log(f'fail2ban: could not raise AUTHENTIK_LOG_LEVEL (non-fatal): {e}')
+        return False
+    _log('fail2ban: AUTHENTIK_LOG_LEVEL warning -> info. The Authentik brute-force jail '
+         'matches logger.info("invalid_login"), so at `warning` it could never fire — '
+         'and never had. Recreating Authentik to apply; brief SSO interruption, once.')
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            _log('fail2ban: Authentik recreate returned %s — the new log level applies at '
+                 'its next restart; jail stays dormant until then.'
+                 % (r.stderr or r.stdout or '')[-160:].strip())
+    except Exception as e:
+        _log(f'fail2ban: Authentik recreate failed ({e}) — new log level applies on next restart.')
+    return True
+
+
+def _f2b_ensure_authentik_logrotate(plog=None):
+    """Bound /var/log/authentik/auth.log. It has NEVER been rotated.
+
+    Found at 21MB and growing on test8 (2026-07-27) with no logrotate rule anywhere
+    — and the stderr-redirect fix in this same release makes it grow FASTER, because
+    the file now receives the JSON stream it was always supposed to. Unbounded is a
+    disk-exhaustion path on a long-lived box, so the fix ships with its own brake.
+
+    `copytruncate` is REQUIRED, not stylistic: the writer is
+    `docker logs -f ... >> auth.log`, a long-lived process holding an open fd. A
+    rename-and-create rotation would leave it writing to the unlinked inode forever
+    and the jail would silently starve — the exact class of bug this release is
+    about. copytruncate keeps the fd valid; fail2ban handles truncation natively."""
+    _log = plog or (lambda m: None)
+    if not os.path.isdir('/etc/logrotate.d'):
+        return False
+    path = '/etc/logrotate.d/infratak-authentik'
+    conf = (
+        "# infra-TAK v10.1.11 — auth.log feeds the Authentik fail2ban jail and was\n"
+        "# previously unrotated. copytruncate: the docker-logs forwarder holds the fd.\n"
+        "/var/log/authentik/auth.log {\n"
+        "    daily\n"
+        "    rotate 7\n"
+        "    maxsize 50M\n"
+        "    copytruncate\n"
+        "    compress\n"
+        "    delaycompress\n"
+        "    missingok\n"
+        "    notifempty\n"
+        "    su root root\n"
+        "}\n"
+    )
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                if f.read() == conf:
+                    return False          # already correct
+        _write_priv(path, conf)
+        _chmod_priv(path, 0o644)          # logrotate refuses group/world-writable files
+        _log('fail2ban: added logrotate for /var/log/authentik/auth.log — it had no '
+             'rotation at all and was growing without bound.')
+        return True
+    except Exception as e:
+        _log(f'fail2ban: could not write the Authentik logrotate rule (non-fatal): {e}')
+        return False
 
 
 def _f2b_selfheal_ak_forwarder(plog=None):
@@ -48855,7 +48978,15 @@ def _authentik_apply_official_tunings(plog):
         ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '50', 'jitter ±50 so workers do not recycle in lockstep'),
         ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
-        ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
+        # v10.1.11: back to upstream's own default (info). `warning` was set in v0.8.7
+        # purely to trim log volume, before we knew it silently disables the Authentik
+        # brute-force jail: the only failed-login line carrying a client IP is
+        # `logger.info("invalid_login", ..., client_ip=...)` in
+        # authentik/stages/identification/stage.py, so at `warning` it is never emitted
+        # and the jail cannot fire. It never had, on any box. The log-volume concern is
+        # now handled properly by _f2b_ensure_authentik_logrotate() rather than by
+        # throwing away the security events.
+        ('AUTHENTIK_LOG_LEVEL', 'info', 'log level info (upstream default) — REQUIRED: the Authentik fail2ban jail matches logger.info("invalid_login"); at warning it can never fire'),
     ]
     for key, value, description in target_settings:
         existing = next((ln for ln in new_lines if re.match(rf'^{re.escape(key)}\s*=', ln)), None)
@@ -73748,6 +73879,16 @@ def _startup_migrations():
             _f2b_selfheal_portal_caddy_log(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e7:
             print(f"Startup migration: takportal Caddy-log self-heal error (non-fatal): {_f2b_e7}", flush=True)
+        # Rotation BEFORE raising the log level — auth.log has never been rotated and
+        # the level bump increases its rate. Never turn up the tap before fitting the drain.
+        try:
+            _f2b_ensure_authentik_logrotate(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e8:
+            print(f"Startup migration: Authentik logrotate error (non-fatal): {_f2b_e8}", flush=True)
+        try:
+            _f2b_selfheal_authentik_log_level(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e9:
+            print(f"Startup migration: Authentik log-level self-heal error (non-fatal): {_f2b_e9}", flush=True)
 
         # ...then say so loudly if anything is STILL dead. This is the check that
         # would have caught test6's month of unprotected Authentik.
