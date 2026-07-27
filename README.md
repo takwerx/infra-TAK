@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.10-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.10-alpha)**
+**Current release: [v10.1.11-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.11-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.11-alpha — 2026-07-27 — The brute-force protection was blocking your own services and, in two places, protecting nothing at all
+
+**Headline: fail2ban was banning infra-TAK's own containers — cutting TAK Portal off from TAK Server — and an audit prompted by that found two more jails that had never once worked, while the console reported all of them healthy.** **Your own services were being banned.** TAK Portal, Node-RED and CloudTAK reach TAK Server over its public address, so TAK logs their container address as the caller. The TAK Server jail bans any address that fails a TLS handshake 20 times in 5 minutes — and TAK Portal's dashboard polls every 15 seconds, which is exactly that rate. One transient certificate fault and the jail banned Portal on every port for an hour, with repeat offences escalating to permanent. Operators were working around it by turning fail2ban off entirely. Container networks are now trusted, and any address already banned in one is released automatically on update. **Authentik brute-force protection had never worked.** It matched a phrase Authentik does not log, at a log level that suppressed the events, reading a file fed by a command that discarded the only stream containing them — and fail2ban was crashing on every line of that file before it reached any of it. All four faults are fixed and the log is now rotated instead of growing without limit. **The TAK Portal lookup jail had never worked either.** It watched a file nothing wrote. It now reads Caddy's access log, so the public lookup and self-enrolment forms are genuinely protected. **A dead jail can no longer hide.** Any jail that is switched on but not running — or running but never receiving anything — is now reported instead of appearing healthy. That check is what found the two above. **A server can no longer ban itself**, and the TAK Portal page in the console no longer errors when its configuration file is owner-restricted. **Upgrade:** everything applies automatically on the next console update; no SSH, no manual steps.
+
+Full notes: [v10.1.11-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.11-alpha).
 
 ### v10.1.10-alpha — 2026-07-26 — Relays now maintain themselves, carry video, and the setup guide no longer sends you down a dead end
 
