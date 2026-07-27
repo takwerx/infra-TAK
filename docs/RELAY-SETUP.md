@@ -146,7 +146,44 @@ and 3 entirely** — apart from giving the new VM its own Reserved public IP.
 Two relays in one VCN don't interfere: each gets its own private and public address, and each one's
 WireGuard overlay (`172.31.99.x`) exists only on its own machine.
 
-## 4. Going beyond the defaults (optional)
+## 4. Point your domain at the relay
+
+**Do this before you deploy Caddy.** Everything with a web UI is reached by name, not by address, and
+Let's Encrypt issues a certificate by connecting back to that name on port 80. If DNS isn't in place
+first, Caddy has nothing to validate against and cert issuance fails.
+
+At your registrar or DNS host, create these records pointing at the relay's public IP from step 2:
+
+| Type | Name | Value |
+|---|---|---|
+| **A** | `tak.example.com` (your FQDN) | the relay's public IP |
+| **A** | `*.tak.example.com` (wildcard) | the relay's public IP |
+
+The **wildcard is the easy answer to a real problem**: modules put themselves on their own hostname —
+`portal.`, `cloudtak.`, `nodered.`, `stream.`, `webodm.` — and each one needs to resolve before Caddy
+can get a certificate for it. One wildcard record covers every module you'll ever add. Without it,
+you're back at the registrar adding another A record every time you deploy something, and the symptom
+when you forget is a module that installs cleanly and then won't load in a browser.
+
+**Set the TTL low (300 seconds) while you're setting up.** If you get a record wrong, a long TTL means
+waiting hours for the mistake to expire. Raise it once everything works.
+
+**Verify before moving on** — from your laptop, not from the relay:
+
+```
+dig +short tak.example.com          # must return the relay's public IP
+dig +short portal.tak.example.com   # must return the same IP (proves the wildcard works)
+```
+
+If those come back empty or with the wrong address, stop and fix DNS. Nothing downstream works until
+they're right, and a Caddy failure caused by DNS looks exactly like a Caddy failure caused by
+anything else.
+
+> **Using the relay's raw IP instead?** Don't. A relay's address ends up inside enrollment packages
+> and data packages you've already handed to clients, so rebuilding the relay means re-issuing
+> configuration to every device in the field. With a domain name it's one DNS edit.
+
+## 5. Going beyond the defaults (optional)
 
 **A rule in the NSG is only half of a forward.** Oracle's NSG decides what reaches the relay's
 network card; the relay's own forwarding table decides what actually gets carried down the tunnel to
@@ -200,7 +237,7 @@ wide range of media ports, which isn't forwarded.
 Watching a stream *inside* the CloudTAK or MediaMTX web player works regardless of any of the above,
 because that's HTTPS on 443 rather than a raw video port.
 
-## 5. Finish in the console — automatically
+## 6. Finish in the console — automatically
 
 That's all the manual work. Back in infra-TAK → **Connectivity → Connect a Relay**:
 
