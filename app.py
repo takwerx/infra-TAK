@@ -13942,6 +13942,31 @@ _F2B_OWNED_FILTERS = {
 }
 
 
+# Filter contents we have SHIPPED in the past and now know to be wrong. A file whose
+# bytes exactly match one of these is ours and stale, so it is safe to upgrade. A file
+# matching NONE of them has been hand-edited and is never touched.
+#
+# Why this exists: _f2b_selfheal_filters() originally only created MISSING filters, so
+# a corrected filter could never reach a box that already had the broken one — it
+# healed test6 (no file) and silently skipped every other box (stale file). Found while
+# verifying the Authentik jail end-to-end on test8, 2026-07-27: the jail was loaded,
+# fed, and logging invalid_login, and still matched 0 lines because the on-disk filter
+# was the old login_failed one.
+_F2B_LEGACY_FILTERS = {
+    'authentik': [
+        # v0.9.0–v10.1.11: matched "action": "login_failed", a string Authentik never
+        # logs. login_failed is a Django signal name, not a log field. Never matched once.
+        '[Definition]\n'
+        '# Match Authentik JSON log lines containing login_failed events.\n'
+        '# Authentik emits structured JSON; client_ip contains the real IP since v0.8.9\n'
+        '# fixed AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS.\n'
+        'failregex = "action": "login_failed".*"client_ip": "<HOST>"\n'
+        '            "client_ip": "<HOST>".*"action": "login_failed"\n'
+        'ignoreregex =\n',
+    ],
+}
+
+
 def _f2b_enabled_jail_files():
     """[(jail_name, filter_name, path)] for every enabled infratak-*.conf jail."""
     out = []
@@ -14034,29 +14059,48 @@ def _f2b_selfheal_filters(plog=None):
 
     A jail with no filter is skipped by fail2ban on every reload and makes
     `fail2ban-client -t` fail for the whole daemon. Console-path delivery: runs at
-    startup so a normal update repairs it with no SSH. Only ever CREATES a missing
-    file — never overwrites an existing one, so operator edits survive."""
+    startup so a normal update repairs it with no SSH.
+
+    Writes in exactly two cases: the file is MISSING, or its bytes exactly match a
+    version WE shipped and have since corrected (_F2B_LEGACY_FILTERS). Anything else
+    is operator-modified and is left alone. Creating-only was not enough — a corrected
+    filter then never reached any box that already had the broken one."""
     _log = plog or (lambda m: None)
     if not _f2b_is_available():
         return False
     _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
-    wrote = []
+    wrote, upgraded = [], []
     for name, filt, _path in _f2b_enabled_jail_files():
         if filt not in _F2B_OWNED_FILTERS:
             continue                      # distro filter (sshd/recidive) — not ours to write
         fpath = '/etc/fail2ban/filter.d/%s.conf' % filt
+        want = _F2B_OWNED_FILTERS[filt]
+        cur = None
         if os.path.exists(fpath):
-            continue
+            try:
+                with open(fpath) as f:
+                    cur = f.read()
+            except OSError:
+                continue
+            if cur == want:
+                continue                  # already current
+            if cur not in _F2B_LEGACY_FILTERS.get(filt, []):
+                continue                  # operator-modified — never clobber
         try:
-            _write_priv(fpath, _F2B_OWNED_FILTERS[filt])
-            wrote.append(f'{filt} (jail {name})')
+            _write_priv(fpath, want)
+            (upgraded if cur is not None else wrote).append(f'{filt} (jail {name})')
         except Exception as e:
-            _log(f'fail2ban: could not write missing filter {fpath}: {e}')
-    if not wrote:
+            _log(f'fail2ban: could not write filter {fpath}: {e}')
+    if not wrote and not upgraded:
         return False
-    _log('fail2ban: wrote MISSING filter(s) ' + ', '.join(wrote) +
-         ' — those jails were enabled but skipped on every reload, so they were '
-         'protecting nothing.')
+    if wrote:
+        _log('fail2ban: wrote MISSING filter(s) ' + ', '.join(wrote) +
+             ' — those jails were enabled but skipped on every reload, so they were '
+             'protecting nothing.')
+    if upgraded:
+        _log('fail2ban: UPGRADED stale filter(s) ' + ', '.join(upgraded) +
+             ' — the shipped pattern could never match a real log line, so those jails '
+             'were loaded and healthy-looking while banning nobody.')
     try:
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
     except Exception:
