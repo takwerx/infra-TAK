@@ -14127,6 +14127,14 @@ def _f2b_selfheal_portal_caddy_log(plog=None):
     changed = False
 
     # ── 1. Make Caddy emit the log ────────────────────────────────────────────
+    # Ownership FIRST, unconditionally: a root-owned logfile makes Caddy reject the
+    # entire config, which only shows up as a dead Caddy at the next restart. Repair
+    # it even when the Caddyfile already looks right — "the file says so" is not
+    # evidence Caddy accepted it, and on the 2026-07-27 rollout it had not.
+    try:
+        _f2b_prepare_portal_caddy_log()
+    except Exception:
+        pass
     try:
         if os.path.exists(CADDYFILE_PATH):
             with open(CADDYFILE_PATH) as f:
@@ -14134,19 +14142,21 @@ def _f2b_selfheal_portal_caddy_log(plog=None):
             generated = live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
             if TAKPORTAL_CADDY_LOG not in generated:
                 generate_caddyfile()
-                # reload validates internally and refuses a bad config, leaving the
-                # running server on its previous one — never `restart` here.
-                rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
-                                    capture_output=True, text=True, timeout=60)
-                if rl.returncode == 0:
-                    _log('fail2ban: Caddy now writes %s — the takportal jail finally has '
-                         'something to read.' % TAKPORTAL_CADDY_LOG)
-                    changed = True
-                else:
-                    _log('fail2ban: Caddy reload REFUSED the regenerated config (%s) — '
-                         'the previous config is still serving; portal jail left as-is.'
-                         % (rl.stdout or rl.stderr or '')[-160:].strip())
-                    return False          # do NOT repoint the jail at a log nothing writes
+            # Always reload and CHECK, even if the block was already on disk — the
+            # running Caddy may have refused it. reload (never restart) leaves the
+            # previous config serving if it is refused again.
+            rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                                capture_output=True, text=True, timeout=60)
+            if rl.returncode != 0:
+                _log('fail2ban: Caddy REFUSED the config carrying the portal access log '
+                     '(%s). The running config is untouched, but the ON-DISK Caddyfile is '
+                     'now unloadable — Caddy would fail to start on reboot. Portal jail '
+                     'left on its old logpath.'
+                     % (rl.stdout or rl.stderr or '')[-200:].strip())
+                return False          # do NOT repoint the jail at a log nothing writes
+            _log('fail2ban: Caddy accepted the portal access log %s — the takportal jail '
+                 'finally has something to read.' % TAKPORTAL_CADDY_LOG)
+            changed = True
     except Exception as e:
         _log(f'fail2ban: portal access-log setup failed (non-fatal): {e}')
         return False
@@ -15206,6 +15216,48 @@ TAKPORTAL_CADDY_LOG = '/var/log/caddy/takportal-access.log'
 # will not fail these two forms 15 times in 10 minutes; an enumerator does hundreds.
 TAKPORTAL_F2B_MAXRETRY = 15
 
+
+def _f2b_prepare_portal_caddy_log():
+    """Make the access log exist AND be writable by Caddy. Must run BEFORE any reload.
+
+    fail2ban refuses a jail whose logpath is missing, so the file has to exist up
+    front — but creating it from the console lands it root-owned, and Caddy drops to
+    its own unprivileged user. Caddy then cannot open it and REJECTS THE WHOLE CONFIG
+    (`open ...: permission denied`, HTTP 400 from the admin API).
+
+    That failure is quiet and delayed in the worst way: `systemctl reload` leaves the
+    running server on its previous config, so the box looks fine — until something
+    restarts Caddy (a reboot) and it cannot load the on-disk Caddyfile at all, taking
+    every proxied service down with it. Hit on the v10.1.11 rollout, 2026-07-27.
+
+    Ownership is taken from /var/log/caddy itself rather than assuming the user is
+    called 'caddy' — the package name differs across distros. Idempotent; also repairs
+    a file already created root-owned by an earlier build."""
+    logdir = os.path.dirname(TAKPORTAL_CADDY_LOG)
+    try:
+        _makedirs_priv(logdir, exist_ok=True)
+    except Exception:
+        pass
+    owner = 'caddy'
+    try:
+        import pwd, grp
+        st = os.stat(logdir)
+        owner = '%s:%s' % (pwd.getpwuid(st.st_uid).pw_name, grp.getgrgid(st.st_gid).gr_name)
+    except Exception:
+        pass
+    try:
+        if not os.path.exists(TAKPORTAL_CADDY_LOG):
+            subprocess.run(_sudo_wrap(['touch', TAKPORTAL_CADDY_LOG]), capture_output=True, timeout=15)
+        # Always re-assert: the file may already exist root-owned from an earlier build.
+        subprocess.run(_sudo_wrap(['chown', owner, TAKPORTAL_CADDY_LOG]),
+                       capture_output=True, timeout=15)
+        _chmod_priv(TAKPORTAL_CADDY_LOG, 0o644)   # fail2ban reads as root; 644 is ample
+    except Exception:
+        pass
+    # Caddy also rolls to <name>-<ts>.log siblings in the same dir; the dir must stay
+    # caddy-writable or rotation fails the same way.
+    return owner
+
 def _f2b_portal_jail_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-takportal.conf')
 
@@ -15235,14 +15287,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
     _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
-    # Ensure the logpath exists (empty is fine) — fail2ban refuses a missing logpath.
-    # Caddy creates this itself on its next reload, but the jail may be written first.
-    try:
-        _makedirs_priv(os.path.dirname(TAKPORTAL_CADDY_LOG))
-        subprocess.run(_sudo_wrap(['touch', TAKPORTAL_CADDY_LOG]), capture_output=True)
-        _chmod_priv(TAKPORTAL_CADDY_LOG, 0o644)
-    except Exception:
-        pass
+    _f2b_prepare_portal_caddy_log()
 
     filter_path = '/etc/fail2ban/filter.d/takportal.conf'
     filter_conf = _F2B_OWNED_FILTERS['takportal']
