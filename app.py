@@ -77473,6 +77473,53 @@ def _selfheal_cloudtak_corrupt_icons(plog=None):
             _log(f"psql FAILED (rc={r.returncode}): {out[:400]}")
             return False
         _log(out[:600])
+        # v10.1.13 (pwtak round 2): the structural SQL pass misses deep corruption —
+        # a row with valid PNG framing can still make sharp/vips throw (bad zlib
+        # stream, or an encode/resource failure: "vips2png: unable to write to
+        # target"). Field: heal reported 0 rows deleted, crash persisted. So ALSO
+        # guard the regen call inside the container: one bad iconset then logs and
+        # skips instead of killing the API. Runtime patch via docker cp (works on a
+        # crash-looping container, unlike exec); survives docker restart; a
+        # container recreate re-triggers this heal through the crash signature.
+        try:
+            _patched = 'no'
+            for _cand in ('/home/etl/api/stateless/routes/icons.ts',
+                          '/home/etl/api/routes/icons.ts'):
+                _fd, _tmp = tempfile.mkstemp(suffix='.ts', prefix='icons-guard-')
+                os.close(_fd)
+                try:
+                    _cpo = subprocess.run(
+                        _sudo_wrap(['docker', 'cp', f'cloudtak-api-1:{_cand}', _tmp]),
+                        capture_output=True, text=True, timeout=30)
+                    if _cpo.returncode != 0:
+                        continue
+                    with open(_tmp, 'r') as _tf:
+                        _src = _tf.read()
+                    if 'TAKWERX-regen-guard' in _src:
+                        _patched = 'already'
+                        break
+                    _tgt = 'await Sprites.regen(config, iconset.uid);'
+                    if _tgt not in _src:
+                        _patched = f'nomatch:{_cand}'
+                        break
+                    _src = _src.replace(_tgt, (
+                        'try { await Sprites.regen(config, iconset.uid); } catch (e) { '
+                        "console.error('TAKWERX-regen-guard: sprite regen failed for iconset', iconset.uid, e); }"), 1)
+                    with open(_tmp, 'w') as _tf:
+                        _tf.write(_src)
+                    _cpb = subprocess.run(
+                        _sudo_wrap(['docker', 'cp', _tmp, f'cloudtak-api-1:{_cand}']),
+                        capture_output=True, text=True, timeout=30)
+                    _patched = f'patched:{_cand}' if _cpb.returncode == 0 else f'copy-back failed:{(_cpb.stderr or "")[:120]}'
+                    break
+                finally:
+                    try:
+                        os.remove(_tmp)
+                    except OSError:
+                        pass
+            _log(f"regen-guard: {_patched}")
+        except Exception as _ge:
+            _log(f"regen-guard error (non-fatal): {_ge}")
         subprocess.run(_sudo_wrap(['docker', 'restart', 'cloudtak-api-1']),
                        capture_output=True, text=True, timeout=90)
         _log("cloudtak-api-1 restarted after icon heal")
