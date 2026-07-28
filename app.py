@@ -30580,6 +30580,22 @@ def run_cloudtak_deploy(cfg=None):
         r = subprocess.run(
             _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
         )
+        # v10.1.13 (pwtak follow-up): the pre-up sweep can't stop a name conflict whose
+        # holder appears DURING the up itself. When `up` fails with docker's
+        # "container name X already in use by container <id>" error, remove exactly the
+        # holder id(s) named in the error and retry the up ONCE. Deterministic on a
+        # fresh deploy (every cloudtak-* name belongs to this project); volumes and
+        # therefore DB data are untouched.
+        if r.returncode != 0 and 'already in use by container' in (r.stdout or ''):
+            _holders = sorted(set(re.findall(r'already in use by container "([0-9a-f]{12,64})"', r.stdout or '')))
+            if _holders:
+                plog(f"  Name conflict on {len(_holders)} container(s) — removing holder(s) and retrying up once...")
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _holders),
+                               capture_output=True, timeout=120)
+                r = subprocess.run(
+                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
+                )
         if r.returncode != 0:
             plog(f"✗ docker compose up failed")
             for line in r.stdout.strip().split('\n')[-10:]:
