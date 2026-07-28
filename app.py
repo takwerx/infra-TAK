@@ -72368,13 +72368,24 @@ def _startup_ensure_broker():
         active = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
                                 capture_output=True, text=True, timeout=8).stdout.strip()
         if unit_changed or active != 'active' or src_hash != old_hash:
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']), capture_output=True, timeout=20)
-            try:
-                with open(stamp, 'w') as sf:
-                    sf.write(src_hash)
-            except OSError:
-                pass
-            print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
+            _rr = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']),
+                                 capture_output=True, text=True, timeout=20)
+            if _rr.returncode == 0:
+                try:
+                    with open(stamp, 'w') as sf:
+                        sf.write(src_hash)
+                except OSError:
+                    pass
+                print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
+            else:
+                # v10.1.13: never stamp a FAILED restart. Stamping it made the box
+                # believe the broker converged, so the stale daemon was never
+                # retried — a console then issues verbs its own broker denies,
+                # and every privileged action fails until a manual start.sh
+                # (the 2026-07-28 field wedge). Leaving the old stamp makes the
+                # next console boot retry the restart.
+                print(f"Startup migration: ⚠ broker restart FAILED (rc={_rr.returncode}): "
+                      f"{(_rr.stderr or _rr.stdout or '').strip()[:200]} — will retry next boot", flush=True)
             # v10.1.4 (WS9): after the restart, BLOCK until the new daemon mediates a real
             # exec. The restart tears down the socket, and the module-level migrations that
             # run next (hardening posture re-assert, TAK Portal recreate, …) raced the new
@@ -77248,39 +77259,34 @@ def _post_update_auto_deploy():
 def _broker_converge_running_source(plog=None):
     _log = plog or (lambda m: print(m, flush=True))
     sock_path = '/run/takwerx-broker.sock'
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_broker.py')
-    if not (os.path.exists(sock_path) and os.path.isfile(src)):
+    if not (os.path.exists(sock_path) and os.path.isfile(_BROKER_SCRIPT)):
         return False
     import hashlib as _hl
-    import socket as _sk
     import time as _tm
     try:
-        with open(src, 'rb') as f:
+        with open(_BROKER_SCRIPT, 'rb') as f:
             want = _hl.sha256(f.read()).hexdigest()
     except Exception:
         return False
 
-    def _ping():
+    def _ping(timeout=45):
+        # brokerctl's own client (600s socket timeout, proven transport). A raw
+        # 5s socket ping FALSE-NEGATIVED fleet-wide (T&E test6 2026-07-28): the
+        # ping response builds enforce-readiness state from the rotating audit
+        # log, which takes >5s on a busy box, so the converge silently no-opped.
         try:
-            s = _sk.socket(_sk.AF_UNIX, _sk.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect(sock_path)
-            s.sendall(json.dumps({'op': 'ping'}).encode())
-            s.shutdown(_sk.SHUT_WR)
-            buf = b''
-            while True:
-                c = s.recv(65536)
-                if not c:
-                    break
-                buf += c
-            s.close()
-            return json.loads(buf.decode())
+            r = subprocess.run([_sys.executable, _BROKER_SCRIPT, 'ping'],
+                               capture_output=True, text=True, timeout=timeout)
+            if r.returncode != 0 or not (r.stdout or '').strip():
+                return None
+            return json.loads(r.stdout.strip())
         except Exception:
             return None
 
     resp = _ping()
     if not resp or not resp.get('pong'):
-        return False  # broker not answering — Restart=always owns that problem
+        _log("[broker-converge] broker did not answer ping — skipping this boot (retries next restart)")
+        return False
     have = (resp.get('src_sha') or '').strip()
     if have == want:
         return False
@@ -77293,9 +77299,9 @@ def _broker_converge_running_source(plog=None):
     except Exception as e:
         _log(f"[broker-converge] restart request failed (non-fatal): {e}")
         return False
-    for _ in range(12):
-        _tm.sleep(1)
-        r2 = _ping()
+    for _ in range(6):
+        _tm.sleep(2)
+        r2 = _ping(timeout=20)
         if r2 and r2.get('pong'):
             got = (r2.get('src_sha') or '').strip()
             if got == want:
