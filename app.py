@@ -26144,14 +26144,32 @@ def run_takportal_deploy():
         # Start the container now that real settings are in place
         subprocess.run(_sudo_wrap(['docker', 'compose', 'start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
 
-        # Wait for container to be healthy
+        # Wait for the container to actually be Up \u2014 POLL, never a fixed sleep.
+        # v10.1.12: this was `time.sleep(5)` then a single check whose failure only
+        # logged a warning. _takportal_sync_certs() below returns
+        # ('TAK Portal container is not running') and copies NOTHING when the
+        # container isn't up yet, and that too was warning-only \u2014 so a container
+        # that took >5s on a fresh install produced a portal with no tak-ca.pem and
+        # no tak-client.p12, under a "\u2713 TAK Portal deployed successfully!" banner.
+        # The portal then cannot build its TAK agent and every Marti call fails with
+        # "Unable to list certificates from /api/certadmin/cert; refusing to proceed".
+        # Fresh-install only (a redeploy already has the certs) and timing-dependent,
+        # which is why it looked random across boxes.
         plog("  Waiting for container...")
-        time.sleep(5)
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-        if 'Up' in r.stdout:
+        _portal_up = False
+        for _i in range(30):                      # up to ~60s, checked every 2s
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal',
+                                           '--format', '{{.Status}}']),
+                               capture_output=True, text=True)
+            if 'Up' in (r.stdout or ''):
+                _portal_up = True
+                break
+            time.sleep(2)
+        if _portal_up:
             plog("\u2713 TAK Portal is running")
         else:
-            plog("\u26a0 Container may not be fully started yet")
+            plog("\u26a0 TAK Portal container did not report Up within 60s \u2014 "
+                 "certificate copy will be retried, but check `docker logs tak-portal`")
 
         # Step 5: Copy TAK Server certs into container
         plog("")
@@ -26161,11 +26179,30 @@ def run_takportal_deploy():
         # pipe silently failed on OpenSSL 3 and shipped an unreadable legacy cert)
         # and the CA chain. restart=False: Step 6 writes settings.json and the
         # deploy restarts the container afterwards.
+        # v10.1.12: RETRY, and verify the files actually landed. A portal without
+        # these two files is not "deployed with a warning" \u2014 it is a portal that
+        # cannot talk to TAK Server at all, so it must not pass silently.
         _certs_ok, _certs_msg = _takportal_sync_certs(plog=plog)
+        if not _certs_ok:
+            plog(f"  \u26a0 Certificate copy failed ({_certs_msg}) \u2014 retrying...")
+            for _attempt in range(3):
+                time.sleep(5)
+                _certs_ok, _certs_msg = _takportal_sync_certs(plog=plog)
+                if _certs_ok:
+                    break
+        if _certs_ok and not _takportal_certs_present():
+            _certs_ok, _certs_msg = False, 'sync reported success but the files are not in the container'
+        if _certs_ok and not _takportal_certs_readable():
+            _certs_ok, _certs_msg = False, 'certs present but the Portal user cannot READ them (ownership)'
         if _certs_ok:
             plog("\u2713 Certificates copied to container data volume")
         else:
-            plog(f"\u26a0 Certificate copy: {_certs_msg}")
+            plog("")
+            plog("\u2717 CERTIFICATE COPY FAILED \u2014 the TAK Portal CANNOT reach TAK Server.")
+            plog(f"  Reason: {_certs_msg}")
+            plog("  Symptom you will see: \"Unable to list certificates from")
+            plog("  /api/certadmin/cert; refusing to proceed\" in TAK Portal.")
+            plog("  Fix: TAK Server page \u2192 Resync Portal Certs (or re-run this deploy).")
         # v10.1.x (PLAN-v10.1.4 item 2): enroll the portal's map bridge (admin cert) in
         # every TAK channel so /map receives live CoT on installs where TAK honors
         # UserAuthenticationFile.xml (else admin is capped at __ANON__ -> empty map).
@@ -66873,6 +66910,135 @@ def _tak_sync_admin_group_cache(plog=None):
     _log("cache still had inactive entries after 3 passes — will retry on next watchdog tick")
 
 
+def _takportal_fix_cert_ownership(plog=None):
+    """Make the copied certs readable BY THE PORTAL PROCESS inside the container.
+
+    `docker cp` preserves the SOURCE file's uid/gid and mode. The re-encoded client
+    cert comes from `tempfile.mkstemp()`, which is mode 0600 owned by whatever user
+    the console runs as — so it lands inside the container as 0600 owned by that
+    uid. The Portal runs as a different, unprivileged uid and simply cannot open it.
+
+    Field evidence (fresh install, 2026-07-28):
+        -rw-r--r-- 1 889  889   tak-ca.pem       <- readable (0644), fine
+        -rw------- 1 1001 ping  tak-client.p12   <- portal (uid 889) CANNOT read
+    The Portal therefore fails every Marti call with "Unable to list certificates
+    from /api/certadmin/cert; refusing to proceed", while the deploy reports success
+    and the files are visibly present — which is why this looked like a cert or
+    network fault for so long.
+
+    This exact chown was applied BY HAND on CORAZ in 2026-06 (see
+    FINDINGS-takportal-cert-deploy-faults) and never made it into the code.
+
+    The owner is read from the container's own data dir rather than hardcoding 889,
+    so it stays correct if upstream changes its uid."""
+    _log = plog or (lambda m: None)
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'stat', '-c', '%u:%g',
+                        '/usr/src/app/data']),
+            capture_output=True, text=True, timeout=20)
+        owner = (r.stdout or '').strip()
+        if not re.match(r'^\d+:\d+$', owner):
+            _log(f'TAK Portal: could not determine the container user (got {owner!r}) — '
+                 'leaving cert ownership alone')
+            return False
+        subprocess.run(
+            _sudo_wrap(['docker', 'exec', '-u', '0', 'tak-portal', 'sh', '-c',
+                        f'chown {owner} /usr/src/app/data/certs/tak-client.p12 '
+                        f'/usr/src/app/data/certs/tak-ca.pem 2>/dev/null; '
+                        f'chmod 600 /usr/src/app/data/certs/tak-client.p12 2>/dev/null; '
+                        f'chmod 644 /usr/src/app/data/certs/tak-ca.pem 2>/dev/null']),
+            capture_output=True, text=True, timeout=20)
+        return True
+    except Exception as e:
+        _log(f'TAK Portal: cert ownership fix failed (non-fatal): {e}')
+        return False
+
+
+def _takportal_certs_readable():
+    """True only if the PORTAL'S OWN USER can actually read both cert files.
+
+    `test -s` as root proves nothing — root can read a 0600 file the portal cannot.
+    Runs the check as the container's default user, which is the only question that
+    matters: can the process that needs these files open them?"""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'sh', '-c',
+                        'head -c1 /usr/src/app/data/certs/tak-client.p12 >/dev/null 2>&1 && '
+                        'head -c1 /usr/src/app/data/certs/tak-ca.pem >/dev/null 2>&1 && echo OK']),
+            capture_output=True, text=True, timeout=20)
+        return 'OK' in (r.stdout or '')
+    except Exception:
+        return False
+
+
+def _takportal_certs_present():
+    """True only if BOTH files the Portal needs for TAK mTLS exist in the container.
+
+    'The sync returned success' is not the same as 'the files are there' — that gap
+    is exactly how a fresh install shipped a Portal that could not reach TAK while
+    reporting a clean deploy. Check the artifacts, not the return code."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'sh', '-c',
+                        'test -s /usr/src/app/data/certs/tak-client.p12 && '
+                        'test -s /usr/src/app/data/certs/tak-ca.pem && echo OK']),
+            capture_output=True, text=True, timeout=20)
+        return 'OK' in (r.stdout or '')
+    except Exception:
+        return False
+
+
+def _takportal_selfheal_certs(plog=None):
+    """Repair a TAK Portal that is running but has no TAK certs.
+
+    Fresh installs before v10.1.12 could finish with an empty data/certs — the deploy
+    waited a fixed 5s for the container, and _takportal_sync_certs() copies NOTHING
+    (returning 'container is not running') if it lost that race, which was logged as a
+    warning under a success banner. The Portal then fails every Marti call with
+    "Unable to list certificates from /api/certadmin/cert; refusing to proceed".
+
+    Console-path delivery: runs at startup so an affected box repairs itself on a
+    normal update, with no SSH and no redeploy. No-ops when the Portal isn't
+    installed/running, when TAK isn't on this box, or when the certs are already
+    present — so it is silent on a healthy box."""
+    _log = plog or (lambda m: None)
+    if not os.path.isdir('/opt/tak/certs/files'):
+        return False                      # TAK not on this box — nothing to sync from
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal',
+                                       '--format', '{{.Status}}']),
+                           capture_output=True, text=True, timeout=20)
+        if 'Up' not in (r.stdout or ''):
+            return False                  # portal not running — deploy/redeploy owns this
+    except Exception:
+        return False
+    if _takportal_certs_present() and _takportal_certs_readable():
+        return False                      # healthy
+    if _takportal_certs_present() and not _takportal_certs_readable():
+        # Files present but 0600-owned by the wrong uid \u2014 the common case. Fixing
+        # ownership is enough; no need to re-copy.
+        _log('TAK Portal: cert files exist but the Portal user cannot read them '
+             '(docker cp preserved a 0600 owned by the console user) - fixing ownership.')
+        _takportal_fix_cert_ownership(plog=plog)
+        if _takportal_certs_readable():
+            subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
+                           capture_output=True, timeout=60)
+            _log('TAK Portal: ownership fixed and portal restarted - Marti calls should work now.')
+            return True
+    _log('TAK Portal: data/certs is missing tak-client.p12 / tak-ca.pem — the Portal '
+         'cannot authenticate to TAK Server. Copying them now (fresh-install race, '
+         'fixed in v10.1.12).')
+    ok, msg = _takportal_sync_certs(plog=plog, restart=True)
+    if ok and _takportal_certs_present():
+        _log('TAK Portal: certificates restored and portal restarted — Marti calls '
+             'should work now.')
+        return True
+    _log(f'TAK Portal: certificate repair FAILED ({msg}). Use TAK Server → Resync '
+         f'Portal Certs, or redeploy the Portal.')
+    return False
+
+
 def _takportal_sync_certs(plog=None, restart=False):
     """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
       - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
@@ -66999,6 +67165,14 @@ def _takportal_sync_certs(plog=None, restart=False):
                 pass
     else:
         _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
+    # v10.1.12: `docker cp` preserves the SOURCE uid/mode, so the client cert lands
+    # 0600 owned by the console user and the Portal's own uid cannot read it. Always
+    # re-assert ownership after copying — see _takportal_fix_cert_ownership().
+    if ok_client or ok_ca:
+        _takportal_fix_cert_ownership(plog=plog)
+        if not _takportal_certs_readable():
+            _log('  \u26a0 certs copied but the PORTAL USER still cannot read them '
+                 '\u2014 Marti calls will fail')
     if restart and (ok_client or ok_ca):
         subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         # v10.1.x (PLAN-v10.1.4 item 5): a restart-intent cert resync can follow a TAK
@@ -74070,6 +74244,14 @@ def _startup_migrations():
             _f2b_selfheal_ak_forwarder(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e5:
             print(f"Startup migration: Authentik log-forwarder self-heal error (non-fatal): {_f2b_e5}", flush=True)
+        # v10.1.12 — a TAK Portal that cannot read its own client cert. `docker cp`
+        # preserves the source 0600/uid, so the cert lands unreadable by the Portal's
+        # user and EVERY Marti call fails while the files look present and the deploy
+        # reported success. Field-hit on a fresh install 2026-07-28.
+        try:
+            _takportal_selfheal_certs(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _tpc_e:
+            print(f"Startup migration: TAK Portal cert self-heal error (non-fatal): {_tpc_e}", flush=True)
         try:
             _f2b_selfheal_portal_caddy_log(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e7:
