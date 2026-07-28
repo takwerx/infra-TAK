@@ -30580,22 +30580,45 @@ def run_cloudtak_deploy(cfg=None):
         r = subprocess.run(
             _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
         )
-        # v10.1.13 (pwtak follow-up): the pre-up sweep can't stop a name conflict whose
-        # holder appears DURING the up itself. When `up` fails with docker's
-        # "container name X already in use by container <id>" error, remove exactly the
-        # holder id(s) named in the error and retry the up ONCE. Deterministic on a
-        # fresh deploy (every cloudtak-* name belongs to this project); volumes and
-        # therefore DB data are untouched.
-        if r.returncode != 0 and 'already in use by container' in (r.stdout or ''):
+        # v10.1.13 (pwtak rounds 2+3): name conflicts here come in two flavors.
+        # (a) A FOREIGN holder (no/other compose project labels) left by earlier runs —
+        #     must be removed. (b) A holder compose CREATED MOMENTS AGO in this very
+        #     run and then collided with (create/list race observed on Docker 29.x /
+        #     compose v5: the retry conflicted with a fresh id that did not exist when
+        #     the retry started). Removing (b) just recreates the race — but because
+        #     it IS properly project-labeled, the next `up` simply ADOPTS it. So:
+        #     retry up to 3 times, each pass removing only foreign holders and leaving
+        #     project-labeled ones for adoption. Volumes/DB are never touched.
+        _project = os.path.basename(cloudtak_dir).lower()
+        for _attempt in range(3):
+            if r.returncode == 0 or 'already in use by container' not in (r.stdout or ''):
+                break
             _holders = sorted(set(re.findall(r'already in use by container "([0-9a-f]{12,64})"', r.stdout or '')))
-            if _holders:
-                plog(f"  Name conflict on {len(_holders)} container(s) — removing holder(s) and retrying up once...")
-                subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _holders),
+            if not _holders:
+                break
+            _foreign = []
+            for _h in _holders:
+                _ins = subprocess.run(
+                    _sudo_wrap(['docker', 'inspect', '-f',
+                                '{{index .Config.Labels "com.docker.compose.project"}}', _h]),
+                    capture_output=True, text=True, timeout=15)
+                _proj = (_ins.stdout or '').strip()
+                if _ins.returncode != 0:
+                    continue  # already gone — nothing holds the name anymore
+                if _proj == _project:
+                    plog(f"  Holder {_h[:12]}: created by this compose project (daemon race) — next up adopts it")
+                else:
+                    _foreign.append(_h)
+                    plog(f"  Holder {_h[:12]}: foreign (project={_proj or 'none'}) — removing")
+            if _foreign:
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _foreign),
                                capture_output=True, timeout=120)
-                r = subprocess.run(
-                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
-                )
+            time.sleep(3)
+            plog(f"  Retrying docker compose up (attempt {_attempt + 2}/4)...")
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'compose', 'up', '-d']),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
+            )
         if r.returncode != 0:
             plog(f"✗ docker compose up failed")
             for line in r.stdout.strip().split('\n')[-10:]:
