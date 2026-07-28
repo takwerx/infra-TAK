@@ -77260,6 +77260,109 @@ try:
 except Exception as _e:
     print(f"[startup] failed to start snapshot scheduler (non-fatal): {_e}", flush=True)
 
+# v10.1.13: heal a CloudTAK api crash-loop caused by corrupt icon rows. CloudTAK
+# regenerates iconset spritesheets at startup from base64 PNG rows in the postgis
+# `icons` table; ONE undecodable row (e.g. a truncated upload) throws in
+# SpriteBuilder.from_icons and kills the API process on every restart — the whole
+# map UI stays down until the row is removed (field report pwtak 2026-07-28:
+# "vipspng: libpng read error"). Rows that cannot be decoded have never rendered
+# and crash the API, so deleting them loses nothing. Boot-time so a console
+# Update Now is enough to heal an affected box — no SSH.
+_CLOUDTAK_ICON_HEAL_SQL = r"""
+DO $heal$
+DECLARE r RECORD; bin bytea; bad boolean; n integer := 0;
+BEGIN
+  FOR r IN SELECT ctid, iconset, name, data FROM icons LOOP
+    bad := false;
+    BEGIN
+      IF r.data IS NULL OR position(',' in r.data) = 0 THEN
+        bad := true;
+      ELSE
+        bin := decode(split_part(r.data, ',', 2), 'base64');
+        IF r.data LIKE 'data:image/png%' AND (
+             substring(bin from 1 for 8) <> '\x89504e470d0a1a0a'::bytea
+             OR position('\x49454e44'::bytea in bin) = 0) THEN
+          bad := true;
+        END IF;
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      bad := true;
+    END;
+    IF bad THEN
+      RAISE NOTICE 'deleting undecodable icon % / %', r.iconset, r.name;
+      DELETE FROM icons WHERE ctid = r.ctid;
+      n := n + 1;
+    END IF;
+  END LOOP;
+  RAISE NOTICE 'icon heal: % corrupt row(s) deleted', n;
+END $heal$;
+"""
+
+
+def _selfheal_cloudtak_corrupt_icons(plog=None):
+    """Detect a cloudtak-api-1 crash-loop with the sprite-build signature, delete
+    undecodable icon rows from the postgis DB, and restart the api container.
+    Idempotent no-op on healthy boxes / boxes without CloudTAK. Returns True only
+    when a heal was performed."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        insp = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '-f',
+                        '{{.State.Status}} {{.RestartCount}}']),
+            capture_output=True, text=True, timeout=15)
+        if insp.returncode != 0:
+            return False  # no CloudTAK api container on this box
+        parts = (insp.stdout or '').split()
+        status = parts[0] if parts else ''
+        restarts = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if status == 'running' and restarts < 3:
+            return False
+        logs = subprocess.run(
+            _sudo_wrap(['docker', 'logs', '--tail', '300', 'cloudtak-api-1']),
+            capture_output=True, text=True, timeout=20)
+        blob = (logs.stdout or '') + (logs.stderr or '')
+        if not (('from_icons' in blob or 'SpriteBuilder' in blob or 'sprites' in blob)
+                and ('libpng' in blob or 'vips' in blob)):
+            return False
+        _log("api crash-looping on sprite build — scanning icons table for undecodable rows")
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1', 'psql', '-U', 'docker',
+                        '-d', 'gis', '-v', 'ON_ERROR_STOP=1', '-c', _CLOUDTAK_ICON_HEAL_SQL]),
+            capture_output=True, text=True, timeout=120)
+        out = ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
+        if r.returncode != 0:
+            _log(f"psql FAILED (rc={r.returncode}): {out[:400]}")
+            return False
+        _log(out[:600])
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'cloudtak-api-1']),
+                       capture_output=True, text=True, timeout=90)
+        _log("cloudtak-api-1 restarted after icon heal")
+        return True
+    except Exception as e:
+        _log(f"error (non-fatal): {e}")
+        return False
+
+
+try:
+    import threading as _threading_iconheal
+
+    def _startup_icon_heal():
+        import time as _t
+        # First check after the container runtime settles; a couple of re-checks so a
+        # crash-loop that develops slowly after boot is still caught.
+        for _i in range(3):
+            _t.sleep(90 if _i == 0 else 120)
+            try:
+                if _selfheal_cloudtak_corrupt_icons(
+                        plog=lambda m: print(f"[startup-iconheal] {m}", flush=True)):
+                    return
+            except Exception:
+                pass
+    _threading_iconheal.Thread(target=_startup_icon_heal, daemon=True,
+                               name='cloudtak-icon-heal').start()
+except Exception as _e:
+    print(f"[startup] failed to start icon heal (non-fatal): {_e}", flush=True)
+
 # v10.1.4 (WS10): converge the CloudTAK postgis role password to .env once per boot.
 # The update-flow sync ran with a false in-sync check for a release (trust-loopback
 # test), so boxes exist where the api crash-loops on 28P01 with no CloudTAK update
