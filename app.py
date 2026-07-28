@@ -77504,42 +77504,57 @@ def _selfheal_cloudtak_corrupt_icons(plog=None):
         # skips instead of killing the API. Runtime patch via docker cp (works on a
         # crash-looping container, unlike exec); survives docker restart; a
         # container recreate re-triggers this heal through the crash signature.
+        # Field-proven manually on test6 2026-07-28 (fresh install, map came LIVE):
+        # two delivery gotchas the first cut got wrong —
+        #  1. The api RUNS compiled dist/**/icons.js; the .ts paths in its stack
+        #     traces are source-map illusions. Patch the dist file first.
+        #  2. No host temp files: docker-cp-as-root output isn't readable by the
+        #     non-root console (EACCES on test6). Stream the file as a tar through
+        #     stdout/stdin instead — binary-safe through the broker.
         try:
-            _patched = 'no'
-            for _cand in ('/home/etl/api/stateless/routes/icons.ts',
+            import io as _io
+            import tarfile as _tarmod
+            _patched = 'no-candidate-file'
+            _guard_re = re.compile(r'await [A-Za-z_$][\w$.]*\.regen\(config, iconset\.uid\);')
+            for _cand in ('/home/etl/api/dist/stateless/routes/icons.js',
+                          '/home/etl/api/dist/routes/icons.js',
+                          '/home/etl/api/stateless/routes/icons.ts',
                           '/home/etl/api/routes/icons.ts'):
-                _fd, _tmp = tempfile.mkstemp(suffix='.ts', prefix='icons-guard-')
-                os.close(_fd)
+                _out = subprocess.run(_sudo_wrap(['docker', 'cp', f'cloudtak-api-1:{_cand}', '-']),
+                                      capture_output=True, timeout=30)
+                if _out.returncode != 0 or not _out.stdout:
+                    continue
                 try:
-                    _cpo = subprocess.run(
-                        _sudo_wrap(['docker', 'cp', f'cloudtak-api-1:{_cand}', _tmp]),
-                        capture_output=True, text=True, timeout=30)
-                    if _cpo.returncode != 0:
-                        continue
-                    with open(_tmp, 'r') as _tf:
-                        _src = _tf.read()
-                    if 'TAKWERX-regen-guard' in _src:
-                        _patched = 'already'
-                        break
-                    _tgt = 'await Sprites.regen(config, iconset.uid);'
-                    if _tgt not in _src:
-                        _patched = f'nomatch:{_cand}'
-                        break
-                    _src = _src.replace(_tgt, (
-                        'try { await Sprites.regen(config, iconset.uid); } catch (e) { '
-                        "console.error('TAKWERX-regen-guard: sprite regen failed for iconset', iconset.uid, e); }"), 1)
-                    with open(_tmp, 'w') as _tf:
-                        _tf.write(_src)
-                    _cpb = subprocess.run(
-                        _sudo_wrap(['docker', 'cp', _tmp, f'cloudtak-api-1:{_cand}']),
-                        capture_output=True, text=True, timeout=30)
-                    _patched = f'patched:{_cand}' if _cpb.returncode == 0 else f'copy-back failed:{(_cpb.stderr or "")[:120]}'
+                    with _tarmod.open(fileobj=_io.BytesIO(_out.stdout)) as _tf:
+                        _member = _tf.getmembers()[0]
+                        _src = _tf.extractfile(_member).read().decode('utf-8')
+                except Exception:
+                    continue
+                if 'TAKWERX-regen-guard' in _src:
+                    _patched = 'already'
                     break
-                finally:
-                    try:
-                        os.remove(_tmp)
-                    except OSError:
-                        pass
+                _m = _guard_re.search(_src)
+                if not _m:
+                    _patched = f'nomatch:{_cand}'
+                    continue
+                _orig = _m.group(0)
+                _src = _src.replace(_orig, (
+                    'try { ' + _orig + " } catch (e) { console.error("
+                    "'TAKWERX-regen-guard: sprite regen failed for iconset', iconset.uid, e); }"), 1)
+                _data = _src.encode('utf-8')
+                _buf = _io.BytesIO()
+                with _tarmod.open(fileobj=_buf, mode='w') as _tw:
+                    _ti = _tarmod.TarInfo(name=os.path.basename(_cand))
+                    _ti.size = len(_data)
+                    _ti.mode = _member.mode
+                    _ti.uid, _ti.gid = _member.uid, _member.gid
+                    _tw.addfile(_ti, _io.BytesIO(_data))
+                _cpb = subprocess.run(
+                    _sudo_wrap(['docker', 'cp', '-', f'cloudtak-api-1:{os.path.dirname(_cand)}']),
+                    input=_buf.getvalue(), capture_output=True, timeout=30)
+                _patched = (f'patched:{_cand}' if _cpb.returncode == 0
+                            else f'copy-back-failed:{(_cpb.stderr or b"").decode(errors="replace")[:120]}')
+                break
             _log(f"regen-guard: {_patched}")
         except Exception as _ge:
             _log(f"regen-guard error (non-fatal): {_ge}")
