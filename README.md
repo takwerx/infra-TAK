@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.12-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.12-alpha)**
+**Current release: [v10.1.13-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.13-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.13-alpha — 2026-07-28 — First-time CloudTAK installs no longer fail, and TAK Portal stops forgetting your SSH settings
+
+**Headline: a first-time CloudTAK deployment could fail in several distinct ways — a leftover container from an earlier attempt blocking startup with a name conflict, and the map's icon builder crashing the entire API on its very first boot so the install never finished — and every failure looked the same from the outside: a deploy that never completed, with Retry making no difference.** Both are fixed at the source. The deployer now clears stale containers before starting and recovers automatically if a conflict appears mid-start; and the icon builder can no longer take the API down — a failing icon set is skipped and logged (the underlying icon-processing fault is an upstream CloudTAK issue we have reported), so the map comes online every time. A failed deployment also finally has an exit: the failure banner now includes a **Remove failed install** button (admin password required) that wipes the partial install, including its database, for a truly clean retry. **Also fixed: TAK Portal SSH settings were being overwritten on every configuration push.** Cloud servers got a public address the Portal container can never reach (breaking Integrations and Locate), and on-premises operators watched their manually entered host and username get reverted after every update. The Portal now always receives the correct in-container address and account by default, and any values you set yourself survive every push. **Also fixed:** security-broker updates now take effect on a normal console update — previously the running broker could keep enforcing outdated rules until a manual reinstall, which could make console actions fail with authorization errors after an update. **Who should update:** anyone deploying CloudTAK for the first time, anyone whose CloudTAK install has never completed, and every TAK Portal user. **Upgrade:** automatic on the next console update; no manual steps.
+
+Full notes: [v10.1.13-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.13-alpha).
 
 ### v10.1.12-alpha — 2026-07-27 — Hot fix: a fresh Red Hat / Rocky install could leave the web server unable to start
 
