@@ -42986,7 +42986,7 @@ window.pollLog = function(redeployBtn) {
               var banner = document.createElement("div");
               banner.id = "deploy-fail-banner";
               banner.style.cssText = "background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)";
-              banner.innerHTML = "<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.";
+              banner.innerHTML = "<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick=\"document.getElementById('uninstall-modal').classList.add('open')\" style='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer'>\ud83d\uddd1 Remove failed install</button>";
               logCard.insertBefore(banner, logCard.querySelector(".log-box") || logCard.firstChild);
             }
             var btn = document.getElementById("deploy-btn");
@@ -43674,7 +43674,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div id="log-card" class="card" style="display:{% if deploying or deploy_error %}block{% else %}none{% endif %}">
     <div class="card-title">Deploy Log</div>
     {% if deploy_error %}
-    <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.</div>
+    <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick="document.getElementById('uninstall-modal').classList.add('open')" style="margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer">&#x1F5D1; Remove failed install</button></div>
     {% endif %}
     <div class="log-box" id="deploy-log-dyn">{% if deploy_error %}Deployment failed. See log above.{% else %}Waiting...{% endif %}</div>
   </div>
