@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.11-alpha"
+VERSION = "10.1.12-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -23225,13 +23225,23 @@ def generate_caddyfile(settings=None):
         # no mount for the path, so the jail sat armed and starving. TAK-Portal is a
         # third-party repo, so rather than wait on it, ban from the log Caddy already
         # has — it is the edge, so it sees the real client IP with no XFF trust needed.
-        lines.append(f"    log {{")
-        lines.append(f"        output file {TAKPORTAL_CADDY_LOG} {{")
-        lines.append(f"            roll_size 10MiB")
-        lines.append(f"            roll_keep 5")
-        lines.append(f"            roll_keep_for 720h")
-        lines.append(f"        }}")
-        lines.append(f"    }}")
+        # GATED on the jail existing — must NOT be emitted unconditionally. This file is
+        # created, chowned to Caddy's user and SELinux-relabelled by
+        # _f2b_prepare_portal_caddy_log(), which only ever runs from the fail2ban paths.
+        # On a box with TAK Portal and NO fail2ban an unguarded block points Caddy at a
+        # file nothing prepared: on RHEL /var/log/caddy is var_log_t, SELinux denies the
+        # write, and Caddy REJECTS THE WHOLE CONFIG — taking every proxied service down
+        # at its next restart. Proven on nuc 2026-07-27. When the jail is enabled later,
+        # _f2b_selfheal_portal_caddy_log() prepares the file AND regenerates this config,
+        # so the block appears exactly when it is both needed and safe.
+        if _f2b_portal_jail_enabled():
+            lines.append(f"    log {{")
+            lines.append(f"        output file {TAKPORTAL_CADDY_LOG} {{")
+            lines.append(f"            roll_size 10MiB")
+            lines.append(f"            roll_keep 5")
+            lines.append(f"            roll_keep_for 720h")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route {{")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
