@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.11-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.11-alpha)**
+**Current release: [v10.1.12-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.12-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.12-alpha — 2026-07-27 — Hot fix: a fresh Red Hat / Rocky install could leave the web server unable to start
+
+**Headline: v10.1.11 added an access log for the TAK Portal that only the optional brute-force protection knows how to set up — so on a Red Hat or Rocky server without that module, the web server was pointed at a log file nothing had prepared, and refused its entire configuration.** The effect was hidden. Because configuration is reloaded rather than restarted, the running server carried on with its previous settings and everything looked normal — until the next reboot, when the web server would fail to start and every service behind it would go offline with it. The log is now only requested when the component that reads it is actually present, so it is set up correctly or not asked for at all. Nothing else changes: servers already running the brute-force protection keep their log exactly as before. **Who should update:** anyone on v10.1.11, and in particular anyone running Red Hat or Rocky — the fault is silent until a restart, so it is worth applying before one happens. Ubuntu servers were not affected in practice, but the fix applies there too. **Upgrade:** automatic on the next console update; no manual steps.
+
+Full notes: [v10.1.12-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.12-alpha).
 
 ### v10.1.11-alpha — 2026-07-27 — The brute-force protection was blocking your own services and, in two places, protecting nothing at all
 
