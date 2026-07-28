@@ -28663,7 +28663,13 @@ def cloudtak_uninstall():
                     # v10.0.8: no shell — --project-directory replaces the bash-cd (denied by
                     # the broker rulebook). `docker compose` only: the legacy docker-compose
                     # fallback was itself a bug (see cloudtak-update-docker-compose memory).
-                    _broker_compose(cloudtak_dir, 'down -v --rmi local', timeout=300)
+                    # v10.1.13: never let a slow/failing compose down (--rmi local can exceed
+                    # the 300s timeout) abort the uninstall thread — the survivors sweep below
+                    # is what guarantees the cloudtak-* names are actually freed.
+                    try:
+                        _broker_compose(cloudtak_dir, 'down -v --rmi local', timeout=300)
+                    except Exception as _cde:
+                        print(f"cloudtak uninstall: compose down issue (continuing to sweep): {_cde}", flush=True)
                 # Belt-and-suspenders: force-remove any surviving cloudtak-* containers by name
                 # (covers a dir-less / root-owned state where compose down didn't catch them) —
                 # two broker calls replace the old bash+xargs pipeline (both denied).
@@ -30556,6 +30562,19 @@ def run_cloudtak_deploy(cfg=None):
         # Step 5: Start containers including media on remapped ports
         plog("")
         plog("━━━ Step 5/7: Starting Containers ━━━")
+        # v10.1.13: unconditional pre-up sweep (field report pwtak/Josh — 4 consecutive
+        # deploys failed at this step on "container name /cloudtak-media-1 already in
+        # use"). A container left by a prior failed run doesn't carry the labels this
+        # compose project expects, so `up` refuses the name instead of recreating it —
+        # and the deploy path had NO teardown of its own (only uninstall did). A fresh
+        # deploy owns every cloudtak-* name by definition; volumes are untouched, so
+        # DB data survives.
+        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cloudtak']),
+                              capture_output=True, text=True, timeout=30)
+        _stale = (_pre.stdout or '').split()
+        if _stale:
+            plog(f"  Removing {len(_stale)} stale cloudtak container(s) from prior runs...")
+            subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _stale), capture_output=True, timeout=120)
         plog("  Starting all containers including media (remapped ports)...")
         plog("  Standalone MediaMTX stays on original ports — no conflict")
         r = subprocess.run(
