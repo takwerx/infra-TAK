@@ -30638,6 +30638,7 @@ def run_cloudtak_deploy(cfg=None):
         start_ts = time.time()
         _last_diag_ts = [0.0]
         _last_status_ts = [0.0]
+        _last_heal_ts = [start_ts]  # first corrupt-icon check ~3 min in — normal startups never trip it
         diag_throttle = 60  # repeat a diagnostic line at most once per minute so we keep heartbeat
         def _check_url(url, name):
             # 15s per-request timeout: during Drizzle migrations Node can be
@@ -30673,6 +30674,20 @@ def run_cloudtak_deploy(cfg=None):
             elif elapsed > 0 and now_ts - _last_status_ts[0] >= 30:
                 _last_status_ts[0] = now_ts
                 plog(f"  ⏳ Waiting for backend... ({elapsed}s elapsed, max {max_wait_sec}s)")
+            # v10.1.13: one corrupt icon row in the persistent postgis volume makes the
+            # api crash-loop on spritesheet regen FOREVER — this poll would then wait the
+            # full 30 min for a process that can never bind, and every redeploy fails the
+            # same way because the volume survives redeploys (field report pwtak
+            # 2026-07-28). Check for that exact signature every 3 min and heal in-loop;
+            # gated on crash-loop state + sprite/libpng log signature, so healthy
+            # first-boot migrations never trip it.
+            if now_ts - _last_heal_ts[0] >= 180:
+                _last_heal_ts[0] = now_ts
+                try:
+                    if _selfheal_cloudtak_corrupt_icons(plog=lambda m: plog(f"  icon-heal: {m}")):
+                        plog("  ✓ corrupt icon row(s) removed and api restarted — continuing to wait for it to bind")
+                except Exception:
+                    pass
             time.sleep(poll_interval)
 
         if not api_ready:
