@@ -60,6 +60,17 @@ MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requ
                                               # non-root CloudTAK rebuild at exactly 10 min
                                               # (test12, 2026-07-17 — exit 125 mid-build).
 SELF_PATH = os.path.realpath(__file__)
+# v10.1.13: sha of the source THIS daemon process was started from, captured at
+# import time (the on-disk file may be newer — a console update replaces the repo
+# file while the daemon keeps running old code until restarted). Reported in the
+# ping response so the console can detect a stale daemon and restart it — that is
+# what lets broker fixes ride Update Now instead of requiring `sudo ./start.sh`.
+try:
+    import hashlib as _hashlib_src
+    with open(SELF_PATH, 'rb') as _sf:
+        RUNNING_SRC_SHA = _hashlib_src.sha256(_sf.read()).hexdigest()
+except Exception:
+    RUNNING_SRC_SHA = ''
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
 # The console repo this broker ships inside (…/broker/takwerx_broker.py -> repo
 # root). Used by the v10.1.4 repo-ownership self-heal carve-out in _check_chown —
@@ -2251,7 +2262,8 @@ def _dispatch(req, peer):
         audit(peer, 'ping', '', 'ALLOW')
         return {'ok': True, 'pong': True, 'enforce': ENFORCE,
                 'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT,
-                'readiness': _enforce_readiness()}
+                'readiness': _enforce_readiness(),
+                'src_sha': RUNNING_SRC_SHA, 'src_path': SELF_PATH}
     if op == 'enforce_enable':
         # Operator opts the box in to enforcement (ratchet — enable only). Audited.
         audit(peer, 'enforce_enable', '', 'ALLOW')

@@ -77231,6 +77231,89 @@ def _post_update_auto_deploy():
     except Exception as e:
         print(f"Post-update auto-deploy error: {e}")
 
+# v10.1.13: make broker fixes ride Update Now. The broker daemon executes
+# broker/takwerx_broker.py from THIS repo (start.sh unit ExecStart), so a console
+# update already puts new broker source on disk — but the RUNNING daemon keeps the
+# old code and old rulebook until something restarts it (RuntimeMaxSec=24h bounds
+# that on newer units; older units run stale forever). That is how a box ends up
+# with a console issuing operations its own broker denies (field report
+# 2026-07-28: privileged actions failing across modules on a non-root box).
+# Compare the daemon's running-source sha (ping.src_sha) with the repo file and
+# restart the daemon on mismatch. A daemon that doesn't report src_sha predates
+# this mechanism and is by definition stale → restart. `systemctl restart` is
+# verb-allowed by every rulebook generation, so the stale daemon itself executes
+# its own refresh. Synchronous and bounded (~20s worst case) — it MUST complete
+# before _startup_migrations()/_post_update_auto_deploy() start issuing broker
+# ops, so the restart can never kill an in-flight migration operation.
+def _broker_converge_running_source(plog=None):
+    _log = plog or (lambda m: print(m, flush=True))
+    sock_path = '/run/takwerx-broker.sock'
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_broker.py')
+    if not (os.path.exists(sock_path) and os.path.isfile(src)):
+        return False
+    import hashlib as _hl
+    import socket as _sk
+    import time as _tm
+    try:
+        with open(src, 'rb') as f:
+            want = _hl.sha256(f.read()).hexdigest()
+    except Exception:
+        return False
+
+    def _ping():
+        try:
+            s = _sk.socket(_sk.AF_UNIX, _sk.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(sock_path)
+            s.sendall(json.dumps({'op': 'ping'}).encode())
+            s.shutdown(_sk.SHUT_WR)
+            buf = b''
+            while True:
+                c = s.recv(65536)
+                if not c:
+                    break
+                buf += c
+            s.close()
+            return json.loads(buf.decode())
+        except Exception:
+            return None
+
+    resp = _ping()
+    if not resp or not resp.get('pong'):
+        return False  # broker not answering — Restart=always owns that problem
+    have = (resp.get('src_sha') or '').strip()
+    if have == want:
+        return False
+    _log(f"[broker-converge] running daemon source "
+         f"{'unreported (pre-10.1.13 daemon)' if not have else have[:12]} != repo {want[:12]} "
+         f"— restarting takwerx-broker to load the updated code/rulebook")
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', '--no-block', 'restart', 'takwerx-broker']),
+                       capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        _log(f"[broker-converge] restart request failed (non-fatal): {e}")
+        return False
+    for _ in range(12):
+        _tm.sleep(1)
+        r2 = _ping()
+        if r2 and r2.get('pong'):
+            got = (r2.get('src_sha') or '').strip()
+            if got == want:
+                _log("[broker-converge] ✓ broker restarted on current repo source")
+            else:
+                _log(f"[broker-converge] ⚠ broker restarted but reports "
+                     f"{got[:12] or 'no src_sha'} from {r2.get('src_path') or '?'} — its unit "
+                     f"likely points at a different install dir; run `sudo ./start.sh` once to re-home it")
+            return True
+    _log("[broker-converge] ⚠ broker did not answer within 12s of restart (non-fatal)")
+    return True
+
+
+try:
+    _broker_converge_running_source()
+except Exception as _e:
+    print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+
 _startup_migrations()
 _post_update_auto_deploy()
 
