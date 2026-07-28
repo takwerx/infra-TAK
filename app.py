@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.12-alpha"
+VERSION = "10.1.13-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -25514,9 +25514,22 @@ def _takportal_build_settings_dict(settings):
         tak_url_host = server_ip
     else:
         tak_url_host = tak_dns or 'host.docker.internal'
-    # SSH: only pre-populate when TAK Server is on the same box
+    # SSH: only pre-populate when TAK Server is on the same box. The portal container
+    # must ALWAYS reach the host's sshd via host.docker.internal (extra_hosts maps it to
+    # host-gateway — see _write_takportal_override): server_ip hairpins and times out from
+    # inside the container on Azure/NAT boxes, and on-prem boxes only expose :22 internally.
     tak_local = os.path.isdir('/opt/tak')
-    ssh_host = ('host.docker.internal' if server_ip in ('localhost', '127.0.0.1', '') else server_ip) if tak_local else ''
+    ssh_host = 'host.docker.internal' if tak_local else ''
+    # SSH user = whoever the console runs as — that's whose ~/.ssh/authorized_keys
+    # _takportal_setup_ssh installs the portal key into (root, or takwerx after the
+    # non-root flip).
+    ssh_user = 'root'
+    if tak_local:
+        try:
+            import pwd as _pwd
+            ssh_user = _pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            pass
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
@@ -25552,7 +25565,7 @@ def _takportal_build_settings_dict(settings):
         "BRAND_LOGO_URL": "",
         "TAK_SSH_HOST": ssh_host,
         "TAK_SSH_PORT": "22",
-        "TAK_SSH_USER": "root",
+        "TAK_SSH_USER": ssh_user,
         "TAK_SSH_PRIVATE_KEY_PATH": "data/ssh/tak_ssh_ed25519",
         "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
         "TAK_SSH_PASSPHRASE": "",
@@ -25564,9 +25577,22 @@ def _takportal_merged_settings_json(settings):
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
+    # SSH target: an operator-entered host/user/port (on-prem internal IP, non-root SSH
+    # user) must survive every settings push. Only values infra-TAK itself is known to
+    # have written are overwritten — so boxes broken by the old server_ip default
+    # self-heal on the next push, while manual fixes are never clobbered again.
+    _server_ip = (settings.get('server_ip') or '').strip()
+    _ssh_managed = {
+        'TAK_SSH_HOST': {'host.docker.internal', _server_ip},
+        'TAK_SSH_USER': {'root', (our.get('TAK_SSH_USER') or '')},
+        'TAK_SSH_PORT': {'22'},
+    }
     for k, v in our.items():
-        if k in PRESERVE_TAKPORTAL_KEYS and (merged.get(k) or '').strip():
+        cur = (merged.get(k) or '').strip() if isinstance(merged.get(k), str) else ''
+        if k in PRESERVE_TAKPORTAL_KEYS and cur:
             continue
+        if k in _ssh_managed and cur and cur not in _ssh_managed[k]:
+            continue  # operator-customized SSH target — never overwrite
         merged[k] = v
     return json.dumps(merged, indent=2)
 
