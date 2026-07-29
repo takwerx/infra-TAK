@@ -31034,7 +31034,7 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
                 "PW=$(grep -E '^POSTGRES_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-) && "
                 "CID=$(docker ps -q -f name=postgis | head -1) && "
                 "[ -n \"$PW\" ] && [ -n \"$CID\" ] || { echo SKIP; exit 0; }; "
-                "for i in $(seq 1 24); do docker exec \"$CID\" pg_isready -U docker -q 2>/dev/null && break; sleep 5; done; "
+                "for i in $(seq 1 24); do docker exec \"$CID\" sh -c 'pg_isready -h \"$(hostname -i)\" -U docker -q' 2>/dev/null && break; sleep 5; done; "
                 "docker exec \"$CID\" psql -U docker -d gis -c \"ALTER USER docker WITH PASSWORD '$PW'\" >/dev/null 2>&1; "
                 "if docker exec -e PGPASSWORD=\"$PW\" \"$CID\" sh -c 'psql -h \"$(hostname -i)\" -U docker -d gis -tAc \"SELECT 1\"' >/dev/null 2>&1; then echo SYNCED; "
                 "else echo FAILED; fi"
@@ -31065,7 +31065,12 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
             return False
         ready = False
         for _ in range(24):  # fresh initdb can outlast a short window — allow 2 min after up -d
-            rdy = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'pg_isready', '-U', 'docker', '-q']),
+            # Probe over the container's NETWORK IP, not the default unix socket: during
+            # initdb the entrypoint runs a TEMPORARY socket-only server, so a socket
+            # pg_isready reports ready while TCP (the path the api and our verify use)
+            # is still refused — seen on nuc 2026-07-29, ⚠ fired 1s after up -d.
+            rdy = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'sh', '-c',
+                                             'pg_isready -h "$(hostname -i)" -U docker -q']),
                                  capture_output=True, timeout=15)
             if rdy.returncode == 0:
                 ready = True
