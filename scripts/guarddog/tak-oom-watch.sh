@@ -1,11 +1,16 @@
 #!/bin/bash
-# v10.0.1: container-aware via _gd-tak-lib.sh. The OOM log lives at the same
+# v10.0.1: container-aware via _gd-tak-lib.sh. The OOM logs live at the same
 # /opt/tak/logs path in both modes (bind-mounted); only the restart targets the
 # takserver container instead of systemd. Native behaviour is byte-identical.
+# v10.1.14: scan messaging AND api logs — TAK runs 5 JVMs with separate heaps,
+# and large DataSyncs exhaust the api process, which survives its OOM and keeps
+# throwing HTTP 500s (so process-watch never fires). Attribute which process
+# tripped so the parked heap-rebalance decision has field evidence.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
-LOGFILE="/opt/tak/logs/takserver-messaging.log"
+LOGDIR="/opt/tak/logs"
+OOM_PROCS="messaging api"
 STATEFILE="/var/run/tak_oom.state"
 SERVICE="takserver"
 MIN_UPTIME_SECS=900
@@ -24,23 +29,32 @@ if [ -n "$_tak_started" ]; then
   [ "$_tak_age" -ge 0 ] && [ "$_tak_age" -lt "$STARTUP_GRACE" ] && exit 0
 fi
 
-# Check for OutOfMemoryError in logs
-if grep -q "OutOfMemoryError: Java heap space" "$LOGFILE" 2>/dev/null; then
-  # Only restart once until log clears
+# Check for OutOfMemoryError in the watched logs; remember which process(es) tripped
+TRIPPED=""
+for _proc in $OOM_PROCS; do
+  if grep -q "OutOfMemoryError: Java heap space" "$LOGDIR/takserver-$_proc.log" 2>/dev/null; then
+    TRIPPED="${TRIPPED:+$TRIPPED+}$_proc"
+  fi
+done
+
+if [ -n "$TRIPPED" ]; then
+  # Only restart once until logs clear — one gate for the whole TAK stack,
+  # regardless of which process tripped
   if [ ! -f "$STATEFILE" ]; then
     touch "$STATEFILE"
-    
+
     TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     LOAD="$(cut -d' ' -f1-3 /proc/loadavg)"
     MEMFREE="$(free -h | awk '/Mem:/ {print $4}')"
-    
+
     mkdir -p /var/log/takguard
-    echo "$TS | restart | OOM detected | load=$LOAD | mem_free=$MEMFREE" >> /var/log/takguard/restarts.log
-    
-    SUBJ="TAK OOM Restart on $SERVER_IDENTIFIER"
-    BODY="TAK Server experienced Out of Memory error and was restarted.
+    echo "$TS | restart | OOM detected ($TRIPPED) | load=$LOAD | mem_free=$MEMFREE" >> /var/log/takguard/restarts.log
+
+    SUBJ="TAK OOM Restart ($TRIPPED) on $SERVER_IDENTIFIER"
+    BODY="TAK Server process(es) [$TRIPPED] experienced Out of Memory error and TAK Server was restarted.
 
 Server: $SERVER_IDENTIFIER
+Process(es): $TRIPPED
 Time (UTC): $TS
 Load: $LOAD
 Free Memory: $MEMFREE
@@ -50,8 +64,9 @@ This usually indicates:
 - Memory leak in application
 - Too many concurrent connections
 - Client reconnect loops causing object accumulation
+- api process: large Data Sync operations exhausting the API heap
 
-Check /opt/tak/logs/takserver-messaging.log for details.
+The tripped log(s) were rotated to $LOGDIR/takserver-<process>.log.pre-oom-<timestamp> for forensics.
 Consider reviewing Data Retention settings in TAK Server UI.
 "
 
@@ -76,7 +91,7 @@ Consider reviewing Data Retention settings in TAK Server UI.
     fi
     _daily=$(cat "$DAILY_COUNT_FILE" 2>/dev/null || echo 0)
     if [ "$_daily" -ge "$MAX_DAILY_RESTARTS" ]; then
-      echo "$TS | SKIP | OOM detected but daily restart cap ($MAX_DAILY_RESTARTS) reached — manual intervention required" >> /var/log/takguard/restarts.log
+      echo "$TS | SKIP | OOM detected ($TRIPPED) but daily restart cap ($MAX_DAILY_RESTARTS) reached — manual intervention required" >> /var/log/takguard/restarts.log
       exit 0
     fi
     echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
@@ -89,9 +104,13 @@ Consider reviewing Data Retention settings in TAK Server UI.
     gd_is_container || pkill -9 -u tak 2>/dev/null || true
     sleep 1
     rm -rf /opt/tak/work
-    # TAK writes to a new file on startup; keep last 3 pre-OOM logs for forensics.
-    mv /opt/tak/logs/takserver-messaging.log "/opt/tak/logs/takserver-messaging.log.pre-oom-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
-    ls -t /opt/tak/logs/takserver-messaging.log.pre-oom-* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+    # TAK writes to a new file on startup; rotate ONLY the log(s) that tripped and
+    # keep last 3 pre-OOM logs per process for forensics.
+    _rot_ts="$(date +%Y%m%d-%H%M%S)"
+    for _proc in $(echo "$TRIPPED" | tr '+' ' '); do
+      mv "$LOGDIR/takserver-$_proc.log" "$LOGDIR/takserver-$_proc.log.pre-oom-$_rot_ts" 2>/dev/null || true
+      ls -t "$LOGDIR/takserver-$_proc.log.pre-oom-"* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+    done
     gd_tak_start
   fi
 else
