@@ -3027,15 +3027,31 @@ document.addEventListener('DOMContentLoaded',_syncThemeUI);
 </script>'''
     return light_mode_block + f'<nav class="sidebar"{nav_style}>\n  ' + '\n  '.join(parts) + '\n</nav>'
 
+# v10.1.15: the headline CPU number is a 60s rolling average, not a raw sample.
+# psutil.cpu_percent(interval=0.5) polled every 5s is an honest half-second
+# snapshot — but this stack is bursty (Node-RED flows, Authentik sweeps, PG
+# checkpoints), so the biggest number on the page swung 5%→90% between polls
+# and operators read burst noise as "the server is pegged" (TN TAK sized VM
+# upgrades off it). The instantaneous value stays available as cpu_percent_now.
+# Samples are fed by the /api/metrics polls themselves (5s per open console
+# tab); after an idle gap the window re-primes from the first fresh sample.
+_CPU_AVG_WINDOW_S = 60
+_cpu_avg_samples = []  # (monotonic_ts, pct)
+
 def get_system_metrics():
-    cpu = psutil.cpu_percent(interval=0.5)
+    cpu_now = psutil.cpu_percent(interval=0.5)
+    _ts = time.monotonic()
+    _cpu_avg_samples.append((_ts, cpu_now))
+    del _cpu_avg_samples[:max(0, len(_cpu_avg_samples) - 64)]
+    _window = [p for t, p in _cpu_avg_samples if t >= _ts - _CPU_AVG_WINDOW_S]
+    cpu = round(sum(_window) / len(_window), 1)
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
     boot = datetime.fromtimestamp(psutil.boot_time())
     uptime = datetime.now() - boot
     d, h, m = uptime.days, uptime.seconds // 3600, (uptime.seconds % 3600) // 60
     uu = _get_unattended_upgrades_status()
-    return {'cpu_percent': cpu, 'ram_percent': round(ram.percent, 1),
+    return {'cpu_percent': cpu, 'cpu_percent_now': round(cpu_now, 1), 'ram_percent': round(ram.percent, 1),
         'ram_used_gb': round(ram.used / (1024**3), 1), 'ram_total_gb': round(ram.total / (1024**3), 1),
         'disk_percent': round(disk.percent, 1), 'disk_used_gb': round(disk.used / (1024**3), 1),
         'disk_total_gb': round(disk.total / (1024**3), 1), 'uptime': f"{d}d {h}h {m}m",
@@ -68995,7 +69011,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
   </div>
 </div>
 <div class="metrics-bar" id="metrics-bar">
-<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div><div class="metric-detail" id="cpu-detail">1-min avg &middot; now {{ metrics.cpu_percent_now }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
@@ -69348,7 +69364,7 @@ async function confirmDiskFold(){
     }
 }
 diskLayoutRefresh();
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';var _cd=document.getElementById('cpu-detail');if(_cd&&d.cpu_percent_now!=null)_cd.textContent='1-min avg · now '+d.cpu_percent_now+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
         for(var k in mods){
@@ -71157,7 +71173,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% endif %}
 <div class="metrics-bar" id="metrics-bar">
-<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div><div class="metric-detail" id="cpu-detail">1-min avg &middot; now {{ metrics.cpu_percent_now }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
@@ -71189,7 +71205,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 <script>
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';var _cd=document.getElementById('cpu-detail');if(_cd&&d.cpu_percent_now!=null)_cd.textContent='1-min avg · now '+d.cpu_percent_now+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
 </script></body></html>'''
 
 # === TAK Server Template ===
