@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.14-alpha"
+VERSION = "10.1.15-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -3618,13 +3618,37 @@ def _friendly_process_name(args):
     return first.split('/')[-1] if first else '?'
 
 
+# v10.1.15: memory column uses PSS (proportional set size), not RSS. ps pmem is
+# RSS-based, so summing a group re-counts shared memory once per process —
+# Postgres is the worst case: ~25 backends each "owning" the same shared_buffers
+# made the console report Authentik at ~2x its real footprint (7.8GB vs ~3GB on
+# a fleet box), and operators sized VMs off that number. PSS divides shared
+# pages among their sharers so per-group sums are truthful. Fallback: processes
+# below 0.1% pmem, or where /proc/<pid>/smaps_rollup is unreadable (non-root,
+# racing exit), keep the RSS-based pmem — same 3-field output either way.
+_TOP_PROCESSES_PS_CMD = (
+    "ps -eo pid,pcpu,pmem,args --no-headers 2>/dev/null | awk '\n"
+    "BEGIN { while ((getline l < \"/proc/meminfo\") > 0) if (l ~ /^MemTotal:/) { split(l, a); mt = a[2]; break }\n"
+    "        close(\"/proc/meminfo\") }\n"
+    "{ pid = $1; cpu = $2; mem = $3\n"
+    "  args = \"\"; for (i = 4; i <= NF; i++) args = args (i > 4 ? \" \" : \"\") $i\n"
+    "  if (mem + 0 >= 0.1 && mt > 0) {\n"
+    "    f = \"/proc/\" pid \"/smaps_rollup\"; pss = -1\n"
+    "    while ((getline l < f) > 0) if (l ~ /^Pss:/) { split(l, a); pss = a[2]; break }\n"
+    "    close(f)\n"
+    "    if (pss >= 0) mem = pss / mt * 100\n"
+    "  }\n"
+    "  printf \"%s %.2f %s\\n\", cpu, mem, args }'"
+)
+
+
 def _top_processes_local():
     """Return { cpu_top, mem_top, total_ram_gb } with friendly names (takserver, authentik, etc.) and percentages."""
     try:
         total_ram_gb = _get_total_ram_gb_local()
         r = subprocess.run(
-            'ps -eo pcpu,pmem,args --no-headers 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=5
+            _TOP_PROCESSES_PS_CMD,
+            shell=True, capture_output=True, text=True, timeout=10
         )
         out = (r.stdout or '').strip()
         by_name = {}
@@ -3669,7 +3693,7 @@ def _top_processes_remote(remote_cfg):
         return {'cpu_top': [], 'mem_top': [], 'error': 'no host'}
     try:
         total_ram_gb = _get_total_ram_gb_remote(remote_cfg)
-        ok, out = _ssh_probe(remote_cfg, 'ps -eo pcpu,pmem,args --no-headers 2>/dev/null', timeout=10)
+        ok, out = _ssh_probe(remote_cfg, _TOP_PROCESSES_PS_CMD, timeout=15)
         if not ok or not out:
             return {'cpu_top': [], 'mem_top': [], 'error': (out or 'ssh failed')[:80]}
         by_name = {}
