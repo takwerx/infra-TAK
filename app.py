@@ -74174,9 +74174,10 @@ def _heal_takserver_coreconfig_step8():
             return None
         needs_trust = 'truststoreFile="certs/files/truststore-root.jks"' in cc
         needs_enroll = ('<vbm enabled="false"/>' in cc) and ('TAKServerCAConfig' not in cc)
-        m8089 = re.search(r'<input[^>]*port="8089"[^>]*/>', cc)
-        warn_8089 = (m8089 and 'auth=' not in m8089.group(0))
-        if not needs_trust and not needs_enroll and not warn_8089:
+        # NOTE: no check on the 8089 input's auth attr — TAK's own upgrades rewrite
+        # input lines without it on perfectly healthy boxes (whole fleet flagged on
+        # first rollout), so its absence carries no damage signal.
+        if not needs_trust and not needs_enroll:
             return None
         # Derive the box's intermediate CA name + org fields from its own signing CA.
         try:
@@ -74223,14 +74224,13 @@ def _heal_takserver_coreconfig_step8():
                 fixes.append('certificateSigning enrollment block restored')
             else:
                 fixes.append(f'{int_ca}-signing.jks absent — enrollment block NOT restored')
-        warn = '; WARN: 8089 input lacks auth="x509" (Step-8 damage, not auto-changed)' if warn_8089 else ''
         if new_cc != cc:
             _write_priv('/opt/tak/CoreConfig.xml', new_cc)  # keeps .infratak-prev backup
             subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=180)
             return ('Step-8 CoreConfig HEAL applied: ' + '; '.join(fixes)
-                    + ' — TAK Server restarted (previous config kept as CoreConfig.xml.infratak-prev)' + warn)
-        if fixes or warn:
-            return 'Step-8 CoreConfig heal: ' + ('; '.join(fixes) if fixes else 'no repairable damage') + warn
+                    + ' — TAK Server restarted (previous config kept as CoreConfig.xml.infratak-prev)')
+        if fixes:
+            return 'Step-8 CoreConfig heal: ' + '; '.join(fixes)
         return None
     except Exception as e:
         return f'Step-8 CoreConfig heal error (non-fatal): {e}'
