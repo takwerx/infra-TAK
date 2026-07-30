@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.13-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.13-alpha)**
+**Current release: [v10.1.14-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.14-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.14-alpha — 2026-07-29 — Guard Dog catches API-process crashes, and a silent TAK Server misconfiguration now heals itself
+
+**Headline: TAK Server runs five separate Java processes, and the one that large Data Sync operations exhaust — the API process — could run out of memory without Guard Dog noticing: it keeps running while returning HTTP 500s (CloudTAK errors, map failures), so the process monitor never fired and the server limped until someone restarted it by hand.** Guard Dog's OOM watch now scans the API process log alongside messaging, restarts TAK Server once (same safety caps as before), and the alert and restart record name *which* process ran out — the evidence needed to tune memory allocation. **Also fixed: a rare deployment fault that left TAK Server silently misconfigured.** If a low-level write failed during one deploy step, the install still reported success — but the server was missing its intermediate certificate trust and its enrollment configuration. The symptoms show up much later and look unrelated: CloudTAK's Initial Server Configuration fails with `UND_ERR_SOCKET: other side closed`, and QR device enrollment fails. The console now detects that exact damage on startup and repairs it automatically from the server's own certificate material (TAK Server restarts once when a repair is applied), and future deploys fail loudly instead of shipping a misconfigured server. **Also fixed: the CloudTAK icon-builder protection from v10.1.13 could be silently undone** — installing or updating a CloudTAK plugin rebuilds the API from source, which discarded the protection and brought the startup crash-loop back with nothing left to heal it. The protection now re-applies itself automatically after plugin rebuilds and through the post-update window. **Also in this release:** every module's failed-deploy banner now has the **Remove failed install** button (previously CloudTAK-only); fresh CloudTAK installs no longer print a scary-but-harmless database-password warning during first boot; and a text-encoding bug that rendered deploy Retry buttons as "Ὠ0 Deploy" instead of "🚀 Deploy" is fixed everywhere. **Who should update:** everyone — especially anyone running large Data Syncs, anyone using CloudTAK plugins, and anyone whose CloudTAK setup or QR enrollment fails as described above. **Upgrade:** automatic on the next console update; no manual steps (if the misconfiguration repair applies, TAK Server restarts once).
+
+Full notes: [v10.1.14-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.14-alpha).
 
 ### v10.1.13-alpha — 2026-07-28 — First-time CloudTAK installs no longer fail, and TAK Portal stops forgetting your SSH settings
 
