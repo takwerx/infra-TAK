@@ -66308,8 +66308,27 @@ def run_takserver_deploy(config):
                 _cc = _cc.replace('"cert_https"/',
                                   f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
             _write_priv('/opt/tak/CoreConfig.xml', _cc)
+            # v10.1.14 (W6): verify the edits actually landed. These failures used to be
+            # swallowed (one log line, deploy still "succeeded") — a broker hiccup left
+            # nuc on STOCK CoreConfig for 3 weeks: root-only truststore (leaf-only TLS
+            # clients → certificate-unknown, CloudTAK bootstrap dead) and no
+            # certificateSigning block (QR enrollment dead). A misconfigured TAK is a
+            # FAILED deploy, not a warning.
+            _cc_check = _read_priv('/opt/tak/CoreConfig.xml')
+            if isinstance(_cc_check, (bytes, bytearray)):
+                _cc_check = _cc_check.decode('utf-8', 'replace')
+            _missing = [_m for _m, _ok in (
+                (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in _cc_check),
+                ('certificateSigning enrollment block', 'TAKServerCAConfig' in _cc_check),
+                ('x509 auth input on 8089', 'auth="x509"' in _cc_check),
+            ) if not _ok]
+            if _missing:
+                raise RuntimeError(f"post-write verification failed — missing: {', '.join(_missing)}")
         except Exception as _cce:
-            log_step(f"  ✗ CoreConfig patch failed: {_cce}")
+            log_step(f"  ✗ CoreConfig patch FAILED: {_cce}")
+            log_step("  ✗ TAK would run MISCONFIGURED (X.509 auth / truststore / enrollment) — aborting deploy.")
+            log_step("    Re-run the deploy; if this repeats, check broker health (journalctl -u takwerx-console).")
+            deploy_status.update({'error': True, 'running': False}); return
         _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
         # For two-server and external_db: ensure JDBC URL and password point to the remote DB host
         import re
@@ -74130,6 +74149,93 @@ def _ensure_console_cert_docker_san(settings):
         return f"console cert SAN check error (non-fatal): {str(e)[:100]}"
 
 
+def _heal_takserver_coreconfig_step8():
+    """v10.1.14 (W6): repair CoreConfigs damaged by silently-swallowed Step-8 writes.
+
+    TAK deploy Step 8 (X.509 input, intermediate truststore, certificateSigning
+    enrollment block) used to log write failures and keep going — a broker hiccup
+    (stale-daemon era, fixed by the 10.1.13 boot converge) or a pre-10.0.5 sed
+    denial left the box running STOCK CoreConfig: leaf-only TLS clients get
+    `certificate unknown` (CloudTAK bootstrap dies with UND_ERR_SOCKET) and QR/cert
+    enrollment is unconfigured (nuc, 2026-07-29). Detect that exact signature,
+    restore the missing pieces from the box's own cert material, restart TAK.
+    Idempotent no-op on healthy boxes; never raises; never guesses — each repair
+    requires the matching cert artifact to exist on disk. The 8089 auth="x509"
+    gap is WARN-only (rewriting auth semantics of a live port is riskier than the
+    gap; the deploy-path hard-fail prevents new cases)."""
+    try:
+        if subprocess.run(_sudo_wrap(['test', '-f', '/opt/tak/CoreConfig.xml']),
+                          capture_output=True, timeout=10).returncode != 0:
+            return None
+        cc = _read_priv('/opt/tak/CoreConfig.xml')
+        if isinstance(cc, (bytes, bytearray)):
+            cc = cc.decode('utf-8', 'replace')
+        if not (cc or '').strip():
+            return None
+        needs_trust = 'truststoreFile="certs/files/truststore-root.jks"' in cc
+        needs_enroll = ('<vbm enabled="false"/>' in cc) and ('TAKServerCAConfig' not in cc)
+        m8089 = re.search(r'<input[^>]*port="8089"[^>]*/>', cc)
+        warn_8089 = (m8089 and 'auth=' not in m8089.group(0))
+        if not needs_trust and not needs_enroll and not warn_8089:
+            return None
+        # Derive the box's intermediate CA name + org fields from its own signing CA.
+        try:
+            ca_pem = _read_priv('/opt/tak/certs/files/ca.pem') or ''
+        except Exception:
+            ca_pem = ''
+        if isinstance(ca_pem, (bytes, bytearray)):
+            ca_pem = ca_pem.decode('utf-8', 'replace')
+        if not ca_pem.strip():
+            return 'Step-8 CoreConfig heal: damage signature present but certs/files/ca.pem unreadable — skipped'
+        r = subprocess.run(['openssl', 'x509', '-noout', '-subject', '-nameopt', 'sep_multiline'],
+                           input=ca_pem, capture_output=True, text=True, timeout=10)
+        subj = {}
+        for _line in (r.stdout or '').splitlines():
+            _line = _line.strip()
+            if '=' in _line:
+                _k, _, _v = _line.partition('=')
+                subj[_k.strip()] = _v.strip()
+        int_ca = subj.get('CN', '')
+        if not int_ca:
+            return 'Step-8 CoreConfig heal: damage signature present but CA CN unparseable — skipped'
+        fixes = []
+        new_cc = cc
+        if needs_trust:
+            ts_path = f'/opt/tak/certs/files/truststore-{int_ca}.jks'
+            if subprocess.run(_sudo_wrap(['test', '-f', ts_path]), capture_output=True, timeout=10).returncode == 0:
+                new_cc = new_cc.replace('truststoreFile="certs/files/truststore-root.jks"',
+                                        f'truststoreFile="certs/files/truststore-{int_ca}.jks"')
+                fixes.append(f'truststore → truststore-{int_ca}.jks')
+            else:
+                fixes.append(f'truststore-root referenced but truststore-{int_ca}.jks absent — NOT changed')
+        if needs_enroll:
+            signing = f'/opt/tak/certs/files/{int_ca}-signing.jks'
+            if subprocess.run(_sudo_wrap(['test', '-f', signing]), capture_output=True, timeout=10).returncode == 0:
+                cert_pass = _get_tak_cert_password(load_settings())
+                cert_block = ('<certificateSigning CA="TAKServer"><certificateConfig>\n'
+                              f'<nameEntries>\n<nameEntry name="O" value="{subj.get("O", "TAK")}"/>\n'
+                              f'<nameEntry name="OU" value="{subj.get("OU", "TAK")}"/>\n</nameEntries>\n'
+                              '</certificateConfig>\n<TAKServerCAConfig keystore="JKS" '
+                              f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
+                              'validityDays="730" signatureAlg="SHA256WithRSA" />\n'
+                              '</certificateSigning>\n<vbm enabled="false"/>')
+                new_cc = new_cc.replace('<vbm enabled="false"/>', cert_block, 1)
+                fixes.append('certificateSigning enrollment block restored')
+            else:
+                fixes.append(f'{int_ca}-signing.jks absent — enrollment block NOT restored')
+        warn = '; WARN: 8089 input lacks auth="x509" (Step-8 damage, not auto-changed)' if warn_8089 else ''
+        if new_cc != cc:
+            _write_priv('/opt/tak/CoreConfig.xml', new_cc)  # keeps .infratak-prev backup
+            subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=180)
+            return ('Step-8 CoreConfig HEAL applied: ' + '; '.join(fixes)
+                    + ' — TAK Server restarted (previous config kept as CoreConfig.xml.infratak-prev)' + warn)
+        if fixes or warn:
+            return 'Step-8 CoreConfig heal: ' + ('; '.join(fixes) if fixes else 'no repairable damage') + warn
+        return None
+    except Exception as e:
+        return f'Step-8 CoreConfig heal error (non-fatal): {e}'
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -74694,6 +74800,16 @@ def _startup_migrations():
                         print(f"Startup migration: LDAP recreate after heal exception: {_re_err}", flush=True)
         except Exception as _shc_err:
             print(f"Startup migration: compose self-heal error (non-fatal): {_shc_err}", flush=True)
+
+        # v10.1.14 (W6): heal TAK CoreConfigs damaged by silently-swallowed deploy
+        # Step-8 writes (root-only truststore → CloudTAK bootstrap dead; missing
+        # certificateSigning → QR enrollment dead). Self-gating; no-op when healthy.
+        try:
+            _s8 = _heal_takserver_coreconfig_step8()
+            if _s8:
+                print(f"Startup migration: {_s8}", flush=True)
+        except Exception as _s8e:
+            print(f"Startup migration: Step-8 CoreConfig heal error (non-fatal): {_s8e}", flush=True)
 
         # v0.9.26 (2026-05-17, after tak-10 surfaced sustained ~80% Authentik
         # server CPU with the symptom traced to the v0.9.5 weekly tasklog
