@@ -77625,9 +77625,13 @@ try:
 
     def _startup_icon_heal():
         import time as _t
-        # First check after the container runtime settles; a couple of re-checks so a
-        # crash-loop that develops slowly after boot is still caught.
-        for _i in range(3):
+        # First check after the container runtime settles, then keep re-checking for
+        # ~15 min: the post-update CloudTAK hardening RECREATES the api container a few
+        # minutes after boot (wiping any regen-guard patch — recreate rebuilds from the
+        # image), and the resulting crash-loop takes another ~4 min to surface (nuc
+        # 2026-07-29: heal at +2m, hardening recreate at +3.5m, loop at ~+8m — the old
+        # 3-check/5.5-min window had just closed). Self-gating no-op when healthy.
+        for _i in range(8):
             _t.sleep(90 if _i == 0 else 120)
             try:
                 if _selfheal_cloudtak_corrupt_icons(
