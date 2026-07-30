@@ -29235,6 +29235,36 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             cloudtak_plugin_status.update({'running': False, 'error': True})
             return
 
+        # v10.1.14 (W5): the rebuild bakes a FRESH image — any regen-guard patch in the
+        # previous container is gone with it. If an iconset still needs the guard, the
+        # new api crash-loops on sprite regen and NOTHING on this path healed it (nuc +
+        # pwtak 2026-07-29: plugin install alone → permanent loop; the deploy-loop and
+        # startup heals never run here). Watch the api and re-apply the heal the moment
+        # the crash signature appears; the heal is a self-gating no-op on healthy boxes.
+        plog('Waiting for the rebuilt API (sprite-regen self-heal armed — dfpc-coe/CloudTAK#1623)...')
+        _api_up = False
+        for _i in range(40):  # 40 × 15s = 10 min; first crash cycle can take ~4 min to surface
+            time.sleep(15)
+            try:
+                _req = urllib.request.Request('http://127.0.0.1:5000/api/server', method='GET')
+                with urllib.request.urlopen(_req, timeout=5) as _resp:
+                    if _resp.status == 200:
+                        _api_up = True
+                        break
+            except Exception:
+                pass
+            if _i >= 3:  # give a healthy start ~60s of grace before probing for the loop
+                try:
+                    if _selfheal_cloudtak_corrupt_icons(plog=lambda m: plog(f'  icon-heal: {m}')):
+                        plog('  ✓ sprite-regen guard re-applied to the rebuilt image — waiting for the api to bind')
+                except Exception:
+                    pass
+        if _api_up:
+            plog('✓ CloudTAK API is up.')
+        else:
+            plog('⚠ API not confirmed up within 10 min. If it is crash-looping on sprite regen, '
+                 'restart the console (startup heal re-patches it) or redeploy CloudTAK.')
+
         action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
         plog(f'✓ Plugin {action_label} successfully.')
         if action in ('install', 'update'):
