@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.14-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.14-alpha)**
+**Current release: [v10.1.15-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.15-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -336,6 +336,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.15-alpha — 2026-07-30 — The dashboard stops crying wolf, and a better Authentik is approved for everyone
+
+**Headline: the console's resource numbers were scaring operators into hardware upgrades they didn't need — and both numbers are now honest.** The "What's using CPU/RAM?" panel counted the database's shared memory once for every database process that touches it, which could show Authentik at two to four times its real memory footprint (a stack really using ~3 GB displayed as nearly 8 GB); the panel now measures proportional memory, so every row reflects what the process actually occupies. And the big CPU gauge refreshed from a half-second snapshot, so on a busy server it whipsawed between 5% and 90% with every refresh even when nothing was wrong; it now shows a steady one-minute average, with the live instantaneous reading kept as a small "now" detail underneath — a genuinely overloaded server still shows itself within a minute, but a two-second burst no longer reads as a crisis. **Also in this release: Authentik 2026.5.6 is now the approved identity-server version for all installations.** It carries upstream fixes for the database-connection buildup that previously forced periodic automatic restarts, plus task-broker fixes that make recovery from a database interruption dramatically cleaner — validated across x86, ARM64, Rocky Linux, and hardened non-root installations, including a deliberate database-interruption stress test that the previously held-back version failed and this version passed. Existing installations pick it up automatically through the normal update flow. **Who should update:** everyone — especially anyone who has looked at their dashboard and wondered whether they need a bigger server. Check the new numbers before buying hardware. **Upgrade:** automatic on the next console update; Authentik upgrades to 2026.5.6 on its normal update path (brief identity-service restart during that upgrade).
+
+Full notes: [v10.1.15-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.15-alpha).
 
 ### v10.1.14-alpha — 2026-07-29 — Guard Dog catches API-process crashes, and a silent TAK Server misconfiguration now heals itself
 
