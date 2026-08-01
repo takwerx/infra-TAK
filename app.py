@@ -8144,6 +8144,7 @@ def _harden_sensitive_permissions(plog=None):
     # chmod alone: a legitimate consumer needs cross-uid read. The fix is a
     # separate, narrower cert path for Node-RED (or a shared group), tracked on
     # the roadmap — NOT a blanket chmod. Do not re-add this without solving that.
+    # Leftover 600s from the W7 window are healed by _heal_nodered_cert_read_access().
     #
     # Module .env files (we generate these). Cover both the non-root home and the
     # root-era layout that pre-flip boxes still carry.
@@ -8223,6 +8224,66 @@ def _harden_sensitive_permissions(plog=None):
              '(_read_priv / _read_coreconfig) before tightening again: '
              + '; '.join(blocked))
     return fixed
+
+
+def _heal_nodered_cert_read_access(plog=None):
+    """v10.1.16 — heal leftover W7 damage on the one cert pair Node-RED must read.
+
+    W7 (cabf599) blanket-tightened /opt/tak/certs to 600 and was reverted ~40
+    minutes later (705d9e6) — but the revert only STOPPED the chmod; it never
+    restored files already tightened. Boxes whose feeds broke loudly were fixed
+    by hand during the 2026-07-25 incident; a box with flows deployed but no
+    configurator configs fails silently ([tls-config:TAK Mission API TLS]
+    EACCES in the container log and nothing else) — found on the NUC
+    2026-08-01, five weeks stale.
+
+    This is the sanctioned EXCEPTION to "only tighten, never widen"
+    (_harden_sensitive_permissions above): exactly two files, admin.pem and
+    admin.key under /opt/tak/certs/files, restored to the 644 that TAK's own
+    cert scripts produce — the Node-RED container (uid 1000) reads them through
+    a bind mount while `tak` owns them, so owner-only modes starve a legitimate
+    consumer (operator decision 2026-07-25: Node-RED keeps the admin cert).
+    Runs only when a local Node-RED install exists (the consumer), never
+    touches ownership, and never touches any other file — CA/signing keys stay
+    as tight as they are. Idempotent, cheap, every boot."""
+    def _say(m):
+        (plog or (lambda x: print(f"Node-RED cert heal: {x}", flush=True)))(m)
+
+    # The consumer: a local Node-RED install — compose dir in this console's
+    # home, or the container itself (a root-era ~/node-red is invisible to a
+    # flipped takwerx console; same union as detect_modules()).
+    present = os.path.exists(os.path.join(os.path.expanduser('~/node-red'), 'docker-compose.yml'))
+    if not present:
+        try:
+            r = subprocess.run(['docker', 'ps', '-a', '--filter', 'name=nodered',
+                                '--format', '{{.Names}}'],
+                               capture_output=True, text=True, timeout=8,
+                               env=_broker_shim_env())
+            present = bool((r.stdout or '').strip())
+        except Exception:
+            present = False
+    if not present:
+        return
+
+    for fname in ('admin.pem', 'admin.key'):
+        path = f'/opt/tak/certs/files/{fname}'
+        try:
+            r = subprocess.run(_sudo_wrap(['stat', '-c', '%a', path]),
+                               capture_output=True, text=True, timeout=15)
+            cur = (r.stdout or '').strip()
+            if not cur or r.returncode != 0:
+                continue                      # TAK not installed / file absent
+            if int(cur, 8) & 0o044 == 0o044:
+                continue                      # group+other read already present
+            c = subprocess.run(_sudo_wrap(['chmod', '644', path]),
+                               capture_output=True, timeout=15)
+            if c.returncode == 0:
+                _say(f'{path} {cur}->644 (Node-RED bind-mount consumer, uid 1000)')
+            else:
+                _say(f'⚠ could not restore {path} (mode {cur}) — Node-RED TAK '
+                     f'TLS will fail with EACCES until it is 644')
+        except Exception:
+            continue
 
 
 # v10.1.9 W1: bump whenever the retrofit's BEHAVIOUR changes, so boxes that
@@ -75142,6 +75203,15 @@ def _startup_migrations():
             _harden_sensitive_permissions()
         except Exception as _hp_e:
             print(f"Startup migration: permissions hardening error (non-fatal): {_hp_e}", flush=True)
+
+        # v10.1.16 — restore Node-RED's read on admin.pem/admin.key if the W7-era
+        # blanket chmod (or anything since) left them owner-only. Loud-failure
+        # boxes were hand-fixed in the 2026-07-25 incident; the NUC sat silently
+        # broken for five weeks because no configurator config exercised the TLS.
+        try:
+            _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _nrh_e:
+            print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
 
         # v10.1.9 W1 — retrofit: encrypt an existing split-box core↔DB link (TLS + SCRAM).
         # One-shot per box; involves a takserver restart + live verification (minutes), so it
