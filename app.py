@@ -58493,12 +58493,28 @@ document.addEventListener('DOMContentLoaded', function() {
     });
     list.innerHTML=html;
   }
+  // Never leave the card sitting on "Loading..." — a silent return here made a
+  // failed status call indistinguishable from a slow one, which cost a real
+  // debugging session on the NUC. Any failure now names itself in the card.
+  function _idpbFail(msg,detail){
+    var list=document.getElementById('idpb-list');
+    if(!list)return;
+    var sel=document.getElementById('idpb-agency');
+    if(sel&&/Loading/.test(sel.innerHTML)){sel.innerHTML='<option value="">- unavailable -</option>';}
+    list.innerHTML='<div style="font-size:12px;color:var(--red)">&#9888; '+esc(msg)+'</div>'
+      +(detail?'<div style="font-size:11px;color:var(--text-dim);margin-top:4px;font-family:JetBrains Mono,monospace">'+esc(detail)+'</div>':'')
+      +'<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Retrying every 30s. If this persists, check '
+      +'<code>journalctl -u takwerx-console</code> and reload the page (an expired SSO session shows up here as 401).</div>';
+  }
   function load(force){
-    fetch('/api/authentik/idp-bridge/status').then(function(r){return r.json();}).then(function(d){
-      if(!d.ok){return;}
+    fetch('/api/authentik/idp-bridge/status').then(function(r){
+      if(!r.ok){throw new Error('HTTP '+r.status+(r.status===401?' — not authenticated; reload the page':''));}
+      return r.json();
+    }).then(function(d){
+      if(!d||!d.ok){_idpbFail('Identity Bridge status unavailable.',(d&&d.error)||'server returned ok=false');return;}
       D=d;
       if(force||!dirty){dirty=false;render();}
-    }).catch(function(){});
+    }).catch(function(e){_idpbFail('Could not load Identity Bridge status.',e&&e.message);});
   }
   var _listEl=document.getElementById('idpb-list');
   if(_listEl){_listEl.addEventListener('change',function(){dirty=true;});}
