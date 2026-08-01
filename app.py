@@ -58475,11 +58475,11 @@ document.addEventListener('DOMContentLoaded', function() {
         +(b.enabled?'<span class="badge badge-green"><span class="dot dot-pulse"></span>Enabled</span>':'<span class="badge badge-red"><span class="dot"></span>Disabled</span>')
         +'</div>'
         +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-        +'<button onclick="idpbToggle(\''+escAttr(slug)+'\','+(b.enabled?'false':'true')+')" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
-        +'<button onclick="idpbSync(\''+escAttr(slug)+'\')" style="'+btnStyle+'">Sync Now</button>'
-        +'<button onclick="idpbInstructions(\''+escAttr(slug)+'\')" style="'+btnStyle+'">Instructions</button>'
+        +'<button data-idpb-act="toggle" data-idpb-slug="'+escAttr(slug)+'" data-idpb-en="'+(b.enabled?'0':'1')+'" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
+        +'<button data-idpb-act="sync" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Sync Now</button>'
+        +'<button data-idpb-act="instructions" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Instructions</button>'
         +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0"><input type="checkbox" id="idpb-delsrc-'+escAttr(slug)+'"> also delete Authentik source</label>'
-        +'<button onclick="idpbDelete(\''+escAttr(slug)+'\')" style="'+btnStyleRed+'">Remove</button>'
+        +'<button data-idpb-act="delete" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyleRed+'">Remove</button>'
         +'</div></div>'
         +'<div style="margin-bottom:10px">'+statusStrip(st)+'</div>'
         +'<table style="width:100%;border-collapse:collapse;margin-bottom:10px"><thead><tr>'
@@ -58488,7 +58488,7 @@ document.addEventListener('DOMContentLoaded', function() {
         +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
         +'<label style="font-size:12px;color:var(--text-dim);margin:0">Default template (unmapped groups):</label>'
         +'<select class="form-input" id="idpb-default-'+escAttr(slug)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,b.default_template,'- none -')+'</select>'
-        +'<button class="btn-primary" onclick="idpbSave(\''+escAttr(slug)+'\')">Save Mapping</button>'
+        +'<button class="btn-primary" data-idpb-act="save" data-idpb-slug="'+escAttr(slug)+'">Save Mapping</button>'
         +'</div></div>';
     });
     list.innerHTML=html;
@@ -58518,6 +58518,26 @@ document.addEventListener('DOMContentLoaded', function() {
   }
   var _listEl=document.getElementById('idpb-list');
   if(_listEl){_listEl.addEventListener('change',function(){dirty=true;});}
+  // Buttons carry data-idpb-act and are dispatched here rather than via an
+  // inline onclick that interpolates slug. Building such an onclick needs an
+  // escaped quote, and this template is a Python triple-quoted literal, so a
+  // source-level backslash-quote collapses to a bare quote before the browser
+  // ever sees it: two adjacent string literals, SyntaxError, and EVERY script
+  // on the page dies. That is what broke this card on the NUC 2026-08-01.
+  // Nothing here needs escaping, so it cannot recur, and slug never lands in
+  // executable position.
+  if(_listEl){_listEl.addEventListener('click',function(e){
+    var t=e.target;
+    while(t&&t!==_listEl&&!t.getAttribute('data-idpb-act')){t=t.parentElement;}
+    if(!t||t===_listEl)return;
+    var act=t.getAttribute('data-idpb-act'),slug=t.getAttribute('data-idpb-slug');
+    if(!act||!slug)return;
+    if(act==='toggle'){idpbToggle(slug,t.getAttribute('data-idpb-en')==='1');}
+    else if(act==='sync'){idpbSync(slug);}
+    else if(act==='instructions'){idpbInstructions(slug);}
+    else if(act==='delete'){idpbDelete(slug);}
+    else if(act==='save'){idpbSave(slug);}
+  });}
   // Placement + token are immutable once a portal agency exists (no edit path),
   // so showing the resulting username shape here is the operator's only chance
   // to notice a wrong one before officers start landing under it.
@@ -58601,7 +58621,9 @@ document.addEventListener('DOMContentLoaded', function() {
   window.idpbDelete=function(slug){
     var delSrcEl=document.getElementById('idpb-delsrc-'+slug);
     var delSrc=!!(delSrcEl&&delSrcEl.checked);
-    if(!confirm('Remove bridge "'+slug+'"?'+(delSrc?' The Authentik SCIM source will ALSO be deleted - the agency\'s pushes will stop.':' The Authentik SCIM source is kept (agency pushes keep landing in Authentik).')+' Users and groups already in Authentik are never touched.')){return;}
+    // No apostrophes in these strings on purpose — see the delegated-click note
+    // above: a source-level escaped quote collapses and breaks the whole script.
+    if(!confirm('Remove bridge "'+slug+'"?'+(delSrc?' The Authentik SCIM source will ALSO be deleted, so this agency stops pushing.':' The Authentik SCIM source is kept (agency pushes keep landing in Authentik).')+' Users and groups already in Authentik are never touched.')){return;}
     fetch('/api/authentik/idp-bridge/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,delete_source:delSrc})})
       .then(function(r){return r.json();}).then(function(d){
         if(d.ok){_idpbToast('Bridge removed'+(d.source_deleted?' (source deleted).':'.'),'success');dirty=false;load(true);}
