@@ -46111,9 +46111,352 @@ def authentik_reputation_clear_scores_api():
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Identity Bridge (v10.1.16) — agency AD/Entra → Authentik SCIM → auto agency
-# + TAK Portal template. W1 config store, W2 reconciler, W3 routes, W5 loop.
+# + TAK Portal template. W1 config store, W2 reconciler, W3 routes, W5 loop,
+# W7 username derivation.
 # Provisioning half only: roster in + auto assignment (no OAuth login leg).
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ── W7: username derivation ────────────────────────────────────────────────
+# TAK Portal usernames are <base><token> (or <token><base>), where the token is
+# the agency's lowercased `suffix` and the order is its `usernameTokenPlacement`.
+# The portal builds that ONLY in its own create-user flow
+# (services/access.service.js:139-158) and has NO rename path anywhere, so a
+# SCIM-created user never gets one — we must supply it.
+#
+# Why this runs as an Authentik property mapping and not (only) as a rename:
+# probed on the NUC 2026-08-01, every SCIM push (PATCH and PUT alike) re-runs
+# the source's property mappings and OVERWRITES `username` from the incoming
+# `userName`. A bare reconciler rename therefore flaps — we rename, the agency's
+# next push reverts it. The mapping is the only mechanism that holds, and it is
+# self-healing because it re-asserts on every push. (Attributes and group
+# memberships are NOT clobbered by a push — verified — so W2 is unaffected.)
+
+IDP_USERNAME_MAX_BASE = 64          # portal has no cap; Authentik's is 150
+IDP_USERNAME_ALLOWED_RE = re.compile(r'[^a-z0-9._-]')
+
+
+def _idp_normalize_base(raw):
+    """Fold an arbitrary human name into the portal's accepted badge charset
+    (^[A-Za-z0-9._-]+$ — validateBadgeNumber, users.service.js:84-92).
+    Returns '' when nothing usable survives; the caller must then SKIP the user
+    rather than invent a name."""
+    import unicodedata
+    s = unicodedata.normalize('NFKD', str(raw or ''))
+    s = ''.join(c for c in s if not unicodedata.combining(c))   # José -> Jose
+    s = s.lower().strip()
+    s = re.sub(r'\s+', '', s)                                   # van der Berg -> vanderberg
+    s = s.replace("'", '').replace('\u2019', '')                # O'Brien -> obrien
+    s = IDP_USERNAME_ALLOWED_RE.sub('', s)
+    s = re.sub(r'([._-])\1+', r'\1', s).strip('._-')
+    return s[:IDP_USERNAME_MAX_BASE]
+
+
+def _idp_derive_base(scim_user):
+    """base = first initial + last name, from a SCIM user record.
+
+    Priority: name.givenName+familyName → displayName → email local-part →
+    userName local-part. `userName` is LAST on purpose: real Entra sends a UPN
+    there (jsmith@agency.gov), so it is the least trustworthy source for a
+    person's actual name. Returns '' if nothing usable."""
+    d = scim_user if isinstance(scim_user, dict) else {}
+    nm = d.get('name') if isinstance(d.get('name'), dict) else {}
+    given = _idp_normalize_base(nm.get('givenName'))
+    family = _idp_normalize_base(nm.get('familyName'))
+    if given and family:
+        return _idp_normalize_base(given[0] + family)
+    disp = str(d.get('displayName') or nm.get('formatted') or '').strip()
+    if ' ' in disp:
+        first, last = disp.rsplit(' ', 1)
+        g, f = _idp_normalize_base(first), _idp_normalize_base(last)
+        if g and f:
+            return _idp_normalize_base(g[0] + f)
+    email = ''
+    for e in (d.get('emails') or []):
+        if isinstance(e, dict) and e.get('value'):
+            email = str(e['value'])
+            if e.get('primary'):
+                break
+    if email:
+        b = _idp_normalize_base(email.split('@', 1)[0])
+        if b:
+            return b
+    return _idp_normalize_base(str(d.get('userName') or '').split('@', 1)[0])
+
+
+def _idp_agency_token(agency):
+    """(token, placement) for an agency record — mirrors the portal exactly:
+    token is `suffix` LOWERCASED (never groupPrefix, not even for prefix
+    placement); placement is 'prefix' only for the portal's recognised aliases,
+    everything else — including missing or garbage — falls back to 'suffix'
+    (normalizeUsernameTokenPlacement, access.service.js:116-127)."""
+    a = agency if isinstance(agency, dict) else {}
+    # The token is embedded in the generated property-mapping source AND lands
+    # in usernames. repr() already makes the embedding injection-proof, but we
+    # constrain the charset anyway: belt-and-braces on generated code, and it
+    # keeps the username inside the portal's own accepted set.
+    token = IDP_USERNAME_ALLOWED_RE.sub('', str(a.get('suffix') or '').strip().lower())
+    raw = a.get('usernameTokenPlacement')
+    if raw is None:
+        raw = a.get('usernameSuffixPlacement')
+    v = str(raw or '').strip().lower()
+    placement = 'prefix' if v in ('prefix', 'start', 'before', 'leading') else 'suffix'
+    return token, placement
+
+
+def _idp_username_for(base, agency):
+    """Apply the agency token to a base. Bare concatenation, no separator —
+    `${sfx}${base}` or `${base}${sfx}` (access.service.js:155-157)."""
+    token, placement = _idp_agency_token(agency)
+    if not base or not token:
+        return ''
+    return (token + base) if placement == 'prefix' else (base + token)
+
+
+def _idp_token_ambiguity(agency, agencies):
+    """Agencies whose token makes usernames ambiguous with this one.
+
+    Usernames are BARE concatenation (the portal uses no separator and we must
+    match it byte-for-byte), so two agencies collide whenever one token is a
+    prefix/suffix of the other: agency `pd` + officer "Jane Adams" → jadamspd,
+    and agency `spd` + a crafted "J Adam" → jadamspd too. The agency's own AD
+    controls the name half, so this is reachable by a remote party, not just
+    bad luck — one agency can mint a username that reads as another's officer,
+    or squat it so the real officer can never be provisioned.
+
+    We cannot fix it by adding a separator (that would diverge from the
+    portal's own usernames, which is the whole point of W7), and placement is
+    immutable, so this is SURFACED, never silently "handled"."""
+    token, placement = _idp_agency_token(agency)
+    out = []
+    if not token:
+        return out
+    for other in (agencies or []):
+        # identity, not suffix-equality: the portal enforces unique suffixes
+        # today, but keying "is this me?" on the very field we are testing for
+        # collisions would silently skip the worst case if that ever changes.
+        if not isinstance(other, dict) or other is agency:
+            continue
+        otok, oplace = _idp_agency_token(other)
+        if not otok:
+            continue
+        if placement == 'prefix' and oplace == 'prefix':
+            bad = token.startswith(otok) or otok.startswith(token)
+        elif placement == 'suffix' and oplace == 'suffix':
+            bad = token.endswith(otok) or otok.endswith(token)
+        else:
+            bad = (token == otok)
+        if bad:
+            out.append(f'{other.get("name") or otok} ({otok})')
+    return out
+
+
+def _idp_username_preview(agency):
+    """Human-readable example for the wizard/instruction sheet. Placement and
+    token are IMMUTABLE once an agency exists (no portal edit path), so showing
+    the resulting shape before the operator connects is the only chance to
+    notice a wrong one."""
+    token, placement = _idp_agency_token(agency)
+    if not token:
+        return ''
+    example = _idp_username_for('jsmith', agency) or 'jsmith'
+    where = 'before' if placement == 'prefix' else 'after'
+    return (f'Users will sign in as "{example}" — first initial + last name, '
+            f'with the agency code "{token}" {where} it.')
+
+
+def _idp_property_mapping_expression(agency):
+    """The Python expression body for the per-bridge Authentik SCIM SOURCE user
+    property mapping. Runs inside Authentik on every push, so it must be
+    self-contained (no console helpers) and must never raise — an exception
+    here blocks the agency's whole roster.
+
+    Contract — read from the CODE, not the docs. The docs page says "each
+    top-level SCIM attribute becomes a variable"; for SCIM *sources* that is
+    wrong, and following it cost a failed live test on the NUC (the mapping
+    returned {} and authentik silently kept the base username, with no error
+    event because nothing raised). The truth, from
+    authentik/sources/scim/views/v2/base.py:
+        self.manager = self.mapper.get_manager(self.model, ["data"])
+    and core/sources/mapper.py, which builds the context keys as
+        ["source", "properties"] + context_keys
+    so an expression gets exactly three useful names: `data` (the whole SCIM
+    payload), `properties` (the base properties authentik already derived), and
+    `source`. There is no bare `userName`/`name`/`emails`.
+
+    Merge order (core/sources/mapper.py:build_object_properties): base
+    properties first — sources/scim/models.py:get_base_user_properties sets
+    `username = data["userName"]` — then each mapping's dict merged on top. So
+    returning {'username': …} overrides the base, and returning {} leaves the
+    raw userName in place.
+
+    If `username` ends up unset the request is rejected outright
+    (views/v2/users.py: `if not properties.get("username"): raise
+    ValidationError("Invalid user")`), so we always return something when we
+    have any name at all.
+
+    Kept byte-identical in shape to _idp_derive_base/_idp_normalize_base above;
+    if you change one, change both (there is a unit check in
+    _idp_selftest_username()).
+    """
+    token, placement = _idp_agency_token(agency)
+    return (
+        "# infra-TAK Identity Bridge — generated, do not hand-edit.\n"
+        "# Derives the TAK Portal-shaped username: first initial + last name +\n"
+        "# the agency token. Regenerated by the console on every bridge save.\n"
+        "import re, unicodedata\n"
+        f"TOKEN = {token!r}\n"
+        f"PLACEMENT = {placement!r}\n"
+        "def _norm(raw):\n"
+        "    s = unicodedata.normalize('NFKD', str(raw or ''))\n"
+        "    s = ''.join(c for c in s if not unicodedata.combining(c))\n"
+        "    s = s.lower().strip()\n"
+        "    s = re.sub(r'\\s+', '', s)\n"
+        "    s = s.replace(chr(39), '').replace(chr(8217), '')\n"
+        "    s = re.sub(r'[^a-z0-9._-]', '', s)\n"
+        "    s = re.sub(r'([._-])\\1+', r'\\1', s).strip('._-')\n"
+        f"    return s[:{IDP_USERNAME_MAX_BASE}]\n"
+        "# The SCIM payload arrives as ONE variable named `data`; `properties`\n"
+        "# holds the base props authentik already derived (username=userName).\n"
+        "# Reads are NameError-guarded so a context change degrades instead of\n"
+        "# throwing — an exception here would fail the agency's whole push.\n"
+        "def _v(fn, default=None):\n"
+        "    try:\n"
+        "        return fn()\n"
+        "    except Exception:\n"
+        "        return default\n"
+        "_d = _v(lambda: data, None)\n"
+        "_d = _d if isinstance(_d, dict) else {}\n"
+        "_p = _v(lambda: properties, None)\n"
+        "_p = _p if isinstance(_p, dict) else {}\n"
+        "_n = _d.get('name')\n"
+        "_n = _n if isinstance(_n, dict) else {}\n"
+        "_raw_un = str(_d.get('userName') or _p.get('username') or '')\n"
+        "_g, _f = _norm(_n.get('givenName')), _norm(_n.get('familyName'))\n"
+        "_base = _norm(_g[0] + _f) if (_g and _f) else ''\n"
+        "if not _base:\n"
+        "    _disp = str(_d.get('displayName') or _n.get('formatted') or '').strip()\n"
+        "    if ' ' in _disp:\n"
+        "        _a, _b = _disp.rsplit(' ', 1)\n"
+        "        _a, _b = _norm(_a), _norm(_b)\n"
+        "        _base = _norm(_a[0] + _b) if (_a and _b) else ''\n"
+        "if not _base:\n"
+        "    _e = ''\n"
+        "    _em = _d.get('emails')\n"
+        "    _em = _em if isinstance(_em, (list, tuple)) else []\n"
+        "    for _x in _em:\n"
+        "        if isinstance(_x, dict) and _x.get('value'):\n"
+        "            _e = str(_x['value'])\n"
+        "            if _x.get('primary'):\n"
+        "                break\n"
+        "    _base = _norm(_e.split('@')[0]) if _e else ''\n"
+        "if not _base:\n"
+        "    _base = _norm(_raw_un.split('@')[0])\n"
+        "if not _base or not TOKEN:\n"
+        "    # Degrade to the raw userName rather than dropping the user — an\n"
+        "    # unset username aborts the import. Only when there is no userName\n"
+        "    # either do we return {} and let authentik refuse: an EMPTY username\n"
+        "    # would be worse than a skipped record.\n"
+        "    _fb = _raw_un.split('@')[0]\n"
+        "    return {'username': _fb} if _fb else {}\n"
+        "return {'username': (TOKEN + _base) if PLACEMENT == 'prefix' else (_base + TOKEN)}\n"
+    )
+
+
+IDP_MAPPING_NAME_FMT = 'infra-TAK Identity Bridge username ({slug})'
+
+
+def _idp_ensure_property_mapping(ak_url, ak_headers, source_slug, agency):
+    """W7 Layer 1 — create/update the per-source username property mapping and
+    make sure the SCIM source actually uses it.
+
+    Returns (ok: bool, detail: str). Never raises.
+
+    Two things this is careful about:
+      * **Append, never replace.** If `user_property_mappings` is set to ONLY
+        ours, authentik stops running the stock mappings and the roster loses
+        email/display name. We read the current list and add ours to it.
+      * **Regenerate every time.** The expression has the agency's token and
+        placement baked in, so re-writing it on every create/save keeps the box
+        fleet-uniform and self-correcting rather than trusting stored state.
+    """
+    name = IDP_MAPPING_NAME_FMT.format(slug=source_slug)
+    expr = _idp_property_mapping_expression(agency)
+    try:
+        existing = None
+        for m in _idp_ak_list(ak_url, ak_headers,
+                              f'propertymappings/source/scim/?name={urllib.parse.quote(name)}'):
+            if m.get('name') == name:
+                existing = m
+                break
+        if existing:
+            if (existing.get('expression') or '') != expr:
+                _idp_ak_json(ak_url, ak_headers,
+                             f"propertymappings/source/scim/{existing['pk']}/",
+                             {'name': name, 'expression': expr}, 'PATCH')
+                detail = 'mapping updated'
+            else:
+                detail = 'mapping already current'
+            pm_pk = existing['pk']
+        else:
+            created = _idp_ak_json(ak_url, ak_headers, 'propertymappings/source/scim/',
+                                   {'name': name, 'expression': expr}, 'POST')
+            pm_pk = created.get('pk')
+            detail = 'mapping created'
+        if not pm_pk:
+            return (False, 'could not create property mapping')
+
+        src = _idp_ak_json(ak_url, ak_headers,
+                           f'sources/scim/{urllib.parse.quote(source_slug)}/')
+        cur = list(src.get('user_property_mappings') or [])
+        if pm_pk not in cur:
+            cur.append(pm_pk)          # APPEND — never clobber the defaults
+            _idp_ak_json(ak_url, ak_headers,
+                         f'sources/scim/{urllib.parse.quote(source_slug)}/',
+                         {'user_property_mappings': cur}, 'PATCH')
+            detail += ', attached to source'
+        return (True, detail)
+    except Exception as e:
+        return (False, f'{type(e).__name__}: {str(e)[:160]}')
+
+
+def _idp_selftest_username():
+    """Guard the console-side derivation against drift. Returns [] when clean.
+    Called once at import; failures are logged, never fatal."""
+    mur = {'suffix': 'mur', 'usernameTokenPlacement': 'suffix'}
+    pre = {'suffix': 'tst', 'usernameTokenPlacement': 'prefix'}
+    cases = [
+        ({'name': {'givenName': 'John', 'familyName': 'Smith'}}, mur, 'jsmithmur'),
+        ({'name': {'givenName': 'Karen', 'familyName': 'Sanchez'}}, mur, 'ksanchezmur'),
+        ({'name': {'givenName': 'Karen', 'familyName': 'Sanchez'}}, pre, 'tstksanchez'),
+        ({'name': {'givenName': 'José', 'familyName': "O'Brien-Smith"}}, mur,
+         'jobrien-smithmur'),
+        ({'name': {'givenName': 'Ann', 'familyName': 'van der Berg'}}, mur,
+         'avanderbergmur'),
+        ({'displayName': 'Dana Cap'}, mur, 'dcapmur'),
+        ({'emails': [{'value': 'tlee@agency.example', 'primary': True}]}, mur, 'tleemur'),
+        ({'userName': 'dcap@agency.example'}, mur, 'dcapmur'),
+        ({'name': {'givenName': '', 'familyName': ''}, 'userName': ''}, mur, ''),
+        # placement garbage must fall back to suffix, exactly like the portal
+        ({'name': {'givenName': 'John', 'familyName': 'Smith'}},
+         {'suffix': 'mur', 'usernameTokenPlacement': 'sideways'}, 'jsmithmur'),
+        # the portal's legacy field name is honored too
+        ({'name': {'givenName': 'John', 'familyName': 'Smith'}},
+         {'suffix': 'tst', 'usernameSuffixPlacement': 'prefix'}, 'tstjsmith'),
+    ]
+    fails = []
+    for rec, ag, want in cases:
+        got = _idp_username_for(_idp_derive_base(rec), ag)
+        if got != want:
+            fails.append(f'{rec} + {ag.get("suffix")} -> {got!r} (want {want!r})')
+    return fails
+
+
+try:
+    _idp_st = _idp_selftest_username()
+    if _idp_st:
+        print(f'[idp-bridge] WARNING username derivation selftest failed: {_idp_st}')
+except Exception as _e:
+    print(f'[idp-bridge] WARNING username selftest error: {_e}')
 
 # W1 — config store: .config/idp-bridges.json, mode 600.
 # Shape: {'bridges': {slug: {agency_suffix, scim_source_slug,
@@ -46212,6 +46555,75 @@ def _idp_ak_group_by_name(ak_url, ak_headers, name, cache):
     return g
 
 
+def _idp_converge_usernames(ak_url, ak_headers, slug, agency, summary, warn):
+    """W7 Layer 2 — bring users that landed BEFORE the property mapping existed
+    onto the derived username, and record the base for badge_number.
+
+    Returns {user_pk: base} for every SCIM user of this source (renamed or not)
+    so the attribute pass can stamp `badge_number` without re-deriving.
+
+    On its own a rename is futile — a SCIM push overwrites `username` from the
+    incoming `userName` (probed 2026-08-01). This is only correct BECAUSE the
+    property mapping is installed first: mapping and rename then agree, so this
+    is a convergence accelerator for the backlog, not a tug-of-war.
+
+    Rename guard — the username IS the LDAP bind identity an ATAK/iTAK EUD
+    authenticates with, so a rename breaks a deployed user's login:
+      1. only users this SCIM source owns (membership in scim_users IS the
+         proof — a hand-created user never appears there), and
+      2. only users who have NEVER signed in (`last_login` is null), and
+      3. never pinned.
+    Anything else that needs a rename is surfaced as a named, actionable row.
+    """
+    bases = {}
+    try:
+        rows = _idp_ak_list(ak_url, ak_headers,
+                            f'sources/scim_users/?source__slug={urllib.parse.quote(slug)}')
+    except Exception as e:
+        warn(f'could not list SCIM source users: {str(e)[:120]}')
+        return bases
+    for row in rows:
+        try:
+            uo = row.get('user_obj') or {}
+            pk, cur = row.get('user'), (uo.get('username') or '')
+            if pk is None:
+                continue
+            raw = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
+            base = _idp_derive_base(raw or {'userName': cur})
+            if not base:
+                warn(f'{cur or pk}: no usable name in the SCIM record — username left as-is')
+                continue
+            bases[pk] = base
+            want = _idp_username_for(base, agency)
+            if not want or want == cur:
+                continue
+            if (uo.get('attributes') or {}).get('idp_bridge', {}).get('pinned') is True:
+                continue
+            if uo.get('last_login'):
+                summary['rename_skipped'].append(f'{cur} → {want} (has signed in)')
+                continue
+            # Never rename ONTO an existing account. The target may belong to
+            # another agency (tokens can be prefix/suffix-ambiguous — see
+            # _idp_token_ambiguity) or be a hand-created/privileged user. The
+            # PATCH would fail on the unique constraint anyway; catching it here
+            # turns a silent 400 into a named, actionable row.
+            taken = [u for u in _idp_ak_list(
+                ak_url, ak_headers, f'core/users/?username={urllib.parse.quote(want)}')
+                if u.get('username') == want and u.get('pk') != pk]
+            if taken:
+                summary['collisions'].append(
+                    f'{cur} → {want} (already taken by user pk {taken[0].get("pk")})')
+                warn(f'{cur}: target username {want!r} already exists and is NOT this '
+                     'agency\'s user — not renamed; resolve by hand')
+                continue
+            _idp_ak_json(ak_url, ak_headers, f'core/users/{pk}/', {'username': want}, 'PATCH')
+            summary['renamed'] += 1
+            summary['rename_detail'].append(f'{cur} → {want}')
+        except Exception as e:
+            warn(f'username converge {row.get("external_id")}: {str(e)[:120]}')
+    return bases
+
+
 def _idp_bridge_reconcile(slug, bridge):
     """W2 — one reconcile pass for one bridge (generalizes the NUC-proven
     poc-glue.py): stamp the portal's create-user attribute contract on every
@@ -46229,7 +46641,10 @@ def _idp_bridge_reconcile(slug, bridge):
     summary = {'ts': now, 'ok': False, 'skipped': False,
                'users_seen': 0, 'converged': 0, 'changed': 0, 'pinned': 0,
                'unmapped': 0, 'multi_role': [], 'warnings': [],
-               'incoming_groups': []}
+               'incoming_groups': [],
+               # W7
+               'renamed': 0, 'rename_detail': [], 'rename_skipped': [],
+               'mapping': '', 'username_preview': '', 'collisions': []}
 
     def warn(msg):
         if msg not in summary['warnings']:
@@ -46257,6 +46672,43 @@ def _idp_bridge_reconcile(slug, bridge):
     mapping = {str(k): str(v) for k, v in (bridge.get('map') or {}).items() if k and v}
     default_tpl = (bridge.get('default_template') or '').strip()
     scim_slug = (bridge.get('scim_source_slug') or '').strip()
+
+    # ── W7 ── Layer 1 FIRST, always: the property mapping is what makes every
+    # future push land on the right username. Only once it is in place is a
+    # rename convergent rather than a flap (see _idp_converge_usernames).
+    summary['username_preview'] = _idp_username_preview(agency)
+    if not _idp_agency_token(agency)[0]:
+        warn(f'agency {suffix!r} has no username identifier set in TAK Portal — '
+             'usernames cannot be derived')
+    else:
+        _pm_ok, _pm_detail = _idp_ensure_property_mapping(ak_url, ak_headers, scim_slug, agency)
+        summary['mapping'] = _pm_detail
+        if not _pm_ok:
+            warn(f'username property mapping NOT installed ({_pm_detail}) — new users '
+                 'will land without the agency identifier')
+    base_by_pk = _idp_converge_usernames(ak_url, ak_headers, scim_slug, agency, summary, warn)
+
+    # Cross-agency ambiguity: bare concatenation means tokens that are a
+    # prefix/suffix of one another share a username namespace. Not fixable here
+    # (a separator would diverge from the portal's own usernames, and placement
+    # is immutable) — so name it loudly. The per-rename check in
+    # _idp_converge_usernames is the enforcement; this is the explanation.
+    for _amb in _idp_token_ambiguity(agency, agencies):
+        warn(f'agency identifier {_idp_agency_token(agency)[0]!r} is ambiguous with '
+             f'{_amb} — their usernames can collide; check any collision rows below')
+
+    # Intra-agency collisions: two people deriving to the same username. No
+    # silent mangling — a guessed username for a real officer is worse than a
+    # named failure.
+    _seen_base = {}
+    for _pk, _b in base_by_pk.items():
+        _seen_base.setdefault(_b, []).append(_pk)
+    for _b, _pks in sorted(_seen_base.items()):
+        if len(_pks) > 1:
+            _who = ', '.join(str(p) for p in sorted(_pks))
+            summary['collisions'].append(f'{_idp_username_for(_b, agency)} (user pks {_who})')
+            warn(f'{len(_pks)} users derive to the same username '
+                 f'{_idp_username_for(_b, agency)!r} — resolve manually; nothing was renamed')
 
     gcache = {}
     # Incoming role groups are resolved by the SCIM SOURCE LINKAGE (group_obj.pk
@@ -46378,6 +46830,19 @@ def _idp_bridge_reconcile(slug, bridge):
             desired.setdefault('created_template', current_tpl)
             desired.setdefault('created_method', 'idp-bridge')
             desired.setdefault('created_at', now)
+            # W7: the rest of the portal's create-time contract. The portal's
+            # "Created By" column reads created_by_*; without them a bridged
+            # user renders differently from a hand-created one.
+            # badge_number is the PRE-token base (users.service.js:1319) and is
+            # written AUTHORITATIVELY, not setdefault: it must stay in lockstep
+            # with the derived username, and a stale operator-typed badge that
+            # disagrees with the username is wrong data, not a preference worth
+            # preserving. AD owns the name for a bridged user (policy is
+            # 'ad_owns_template').
+            if base_by_pk.get(pk):
+                desired['badge_number'] = base_by_pk[pk]
+            desired.setdefault('created_by_username', 'idp-bridge')
+            desired.setdefault('created_by_display_name', 'Identity Bridge')
             new_ib = dict(ib)
             new_ib['source'] = slug
             new_ib['applied_template'] = current_tpl
@@ -46492,8 +46957,14 @@ def idp_bridge_status_api():
         'ok': True,
         'portal_ok': portal_ok,
         'bridges': out_bridges,
+        # W7: placement/token are immutable once an agency exists, so the UI
+        # shows the resulting username shape BEFORE the operator connects.
         'agencies': [{'suffix': a.get('suffix'), 'name': a.get('name'),
-                      'groupPrefix': a.get('groupPrefix'), 'color': a.get('color')}
+                      'groupPrefix': a.get('groupPrefix'), 'color': a.get('color'),
+                      'token': _idp_agency_token(a)[0],
+                      'placement': _idp_agency_token(a)[1],
+                      'username_preview': _idp_username_preview(a),
+                      'ambiguous_with': _idp_token_ambiguity(a, agencies or [])}
                      for a in (agencies or []) if isinstance(a, dict)],
         'templates': [{'name': t.get('name'), 'agencySuffix': t.get('agencySuffix'),
                        'role': t.get('role'), 'groups': len(t.get('groups') or [])}
@@ -46580,6 +47051,23 @@ def idp_bridge_create_api():
             token_key = vk.get('key') or ''
     except Exception as e:
         return jsonify({'ok': False, 'error': f'could not create SCIM source: {str(e)[:200]}'}), 502
+
+    # W7 — install the username property mapping NOW, before the agency can push
+    # a single user. A bridge that runs even briefly without one produces bare
+    # usernames that later get corrected, which is exactly the churn we avoid.
+    token, _placement = _idp_agency_token(agency)
+    mapping_warn = ''
+    ambiguous = _idp_token_ambiguity(agency, agencies)
+    if not token:
+        mapping_warn = (f"Agency {agency.get('name') or suffix} has no Username Agency "
+                        "Identifier set in TAK Portal — usernames cannot be derived. "
+                        "Set it on the agency (it cannot be changed later) and reconnect.")
+    else:
+        pm_ok, pm_detail = _idp_ensure_property_mapping(ak_url, ak_headers, scim_slug, agency)
+        if not pm_ok:
+            mapping_warn = (f'Username mapping could NOT be installed ({pm_detail}). '
+                            'Users will land without the agency identifier until this is fixed.')
+
     scim_url = f'{_get_authentik_base_url(settings)}/source/scim/{scim_slug}/v2'
     cfg = _idp_bridges_load()
     cfg.setdefault('bridges', {})
@@ -46597,6 +47085,7 @@ def idp_bridge_create_api():
     threading.Thread(target=_idp_bridge_run_all, kwargs={'slugs': [scim_slug]},
                      daemon=True, name='idp-bridge-create').start()
     agency_label = agency.get('name') or suffix
+    preview = _idp_username_preview(agency)
     instructions = (
         f"Give these two values to {agency_label}'s IT team (Microsoft Entra: "
         "Enterprise Applications → New application → Create your own application → "
@@ -46606,10 +47095,15 @@ def idp_bridge_create_api():
         "Then have them assign the directory groups they want to send "
         "(e.g. TAK-Patrol, TAK-Command) to that application and turn provisioning "
         "On. Their roster appears here automatically — map each incoming group to "
-        "a TAK template below and enable the bridge."
+        "a TAK template below and enable the bridge.\n\n"
+        f"{preview}\n"
+        "They do not need to match that format on their side — we build it from "
+        "the first name, last name and agency code."
     )
     return jsonify({'ok': True, 'bridge': scim_slug, 'scim_url': scim_url,
                     'token': token_key, 'token_shown_once': True,
+                    'username_preview': preview, 'mapping_warning': mapping_warn,
+                    'ambiguous_with': ambiguous,
                     'instructions': instructions})
 
 
@@ -57348,10 +57842,11 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 <div class="card">
 <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Agencies manage TAK users from their own Active Directory / Entra: a SCIM feed pushes their roster into Authentik ahead of first login, and the console auto-assigns agency + TAK Portal template from the mapping table below. Add-only &mdash; the bridge never removes groups and never touches pinned users. Runs automatically every 5 minutes.</div>
 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
-  <select class="form-input" id="idpb-agency" style="width:auto;min-width:200px"><option value="">Loading agencies...</option></select>
+  <select class="form-input" id="idpb-agency" style="width:auto;min-width:200px" onchange="idpbPreview()"><option value="">Loading agencies...</option></select>
   <button class="btn-primary" id="idpb-create-btn" onclick="idpbCreate()">Connect Agency</button>
   <span style="font-size:11px;color:var(--text-dim)">Creates (or reuses) the agency's SCIM source in Authentik and shows the two values their IT team pastes into Entra provisioning.</span>
 </div>
+<div id="idpb-preview" style="display:none;margin-top:8px;padding:10px 12px;border-left:3px solid var(--accent);background:rgba(59,130,246,0.06);font-size:12px;color:var(--text-primary)"></div>
 <div id="idpb-token-panel" style="display:none;margin-top:10px;padding:14px;border:1px solid rgba(16,185,129,0.4);border-radius:8px;background:rgba(16,185,129,0.06)"></div>
 <div id="idpb-list" style="margin-top:14px"><div style="font-size:12px;color:var(--text-dim)">Loading...</div></div>
 </div>
@@ -57919,9 +58414,17 @@ document.addEventListener('DOMContentLoaded', function() {
     var bits=[(st.users_seen||0)+' users',(st.converged||0)+' converged'];
     if(st.unmapped){bits.push(st.unmapped+' unmapped&rarr;default');}
     if(st.pinned){bits.push(st.pinned+' pinned');}
+    if(st.renamed){bits.push(st.renamed+' renamed');}
+    if(st.rename_skipped&&st.rename_skipped.length){bits.push(st.rename_skipped.length+' rename skipped');}
     bits.push((st.changed||0)+' changed last run');
     var s='<span style="color:var(--cyan);font-family:JetBrains Mono,monospace;font-size:11px">'+bits.join(' &middot; ')+'</span> <span style="color:var(--text-dim);font-size:10px">last sync '+esc(st.ts)+'</span>';
+    if(st.username_preview){s+='<div style="font-size:11px;color:var(--text-dim);margin-top:4px">'+esc(st.username_preview)+'</div>';}
     if(st.multi_role&&st.multi_role.length){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">multi-role (group union applied): '+esc(st.multi_role.join(', '))+'</div>';}
+    (st.rename_detail||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--green);margin-top:3px">renamed '+esc(r)+'</div>';});
+    // A skipped rename is the guard doing its job: the username is the LDAP bind
+    // identity, so we never rename someone who has already signed in.
+    (st.rename_skipped||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--yellow);margin-top:3px">&#9888; not renamed: '+esc(r)+' &mdash; renaming would break their EUD login; fix by hand if needed</div>';});
+    (st.collisions||[]).forEach(function(c){s+='<div style="font-size:11px;color:var(--red);margin-top:3px">&#9888; username collision: '+esc(c)+'</div>';});
     (st.warnings||[]).forEach(function(w){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">&#9888; '+esc(w)+'</div>';});
     return s;
   }
@@ -57941,6 +58444,7 @@ document.addEventListener('DOMContentLoaded', function() {
       var opts='<option value="">- pick agency -</option>';
       (D.agencies||[]).forEach(function(a){opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';});
       sel.innerHTML=opts;if(cur){sel.value=cur;}
+      idpbPreview();
     }
     if(!D.portal_ok){list.innerHTML='<div style="font-size:12px;color:var(--yellow)">TAK Portal is not reachable &mdash; agencies and templates live there. Install/start TAK Portal first.</div>';return;}
     var slugs=Object.keys(D.bridges||{});
@@ -57998,6 +58502,28 @@ document.addEventListener('DOMContentLoaded', function() {
   }
   var _listEl=document.getElementById('idpb-list');
   if(_listEl){_listEl.addEventListener('change',function(){dirty=true;});}
+  // Placement + token are immutable once a portal agency exists (no edit path),
+  // so showing the resulting username shape here is the operator's only chance
+  // to notice a wrong one before officers start landing under it.
+  window.idpbPreview=function(){
+    var el=document.getElementById('idpb-preview');
+    var sfx=(document.getElementById('idpb-agency')||{}).value;
+    if(!el)return;
+    var a=((D&&D.agencies)||[]).filter(function(x){return x.suffix===sfx;})[0];
+    if(!sfx||!a){el.style.display='none';return;}
+    el.style.display='block';
+    if(!a.token){
+      el.innerHTML='<span style="color:var(--yellow)">&#9888; '+esc(a.name)+' has no Username Agency Identifier set in TAK Portal, so usernames cannot be derived. Set it on the agency first &mdash; it cannot be changed after the agency is created.</span>';
+      return;
+    }
+    var amb=(a.ambiguous_with||[]);
+    el.innerHTML='<strong>'+esc(a.username_preview)+'</strong>'
+      +'<div style="color:var(--text-dim);margin-top:4px">Identifier <code>'+esc(a.token)+'</code> ('+esc(a.placement)+'). '
+      +'This is fixed when the agency is created and cannot be changed later &mdash; check it now.</div>'
+      +(amb.length?'<div style="color:var(--red);margin-top:6px">&#9888; This identifier is ambiguous with '+esc(amb.join(', '))
+        +'. Usernames are joined without a separator, so those agencies share a namespace and their users can collide. '
+        +'Consider a distinct identifier before connecting (it cannot be changed later).</div>':'');
+  };
   window.idpbCreate=function(){
     var sfx=(document.getElementById('idpb-agency')||{}).value;
     if(!sfx){_idpbToast('Pick an agency first.','error');return;}
@@ -58011,6 +58537,7 @@ document.addEventListener('DOMContentLoaded', function() {
         p.innerHTML='<div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:8px">Agency connected. Give these two values to their IT team &mdash; the token is shown ONCE, copy it now:</div>'
           +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
           +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token||'(could not fetch token - check Authentik)')+'</div>'
+          +(d.mapping_warning?'<div style="font-size:12px;color:var(--red);margin-bottom:10px">&#9888; '+esc(d.mapping_warning)+'</div>':'')
           +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'+esc(d.instructions||'')+'</pre>';
         dirty=false;setTimeout(function(){load(true);},1200);
       }).catch(function(){btn.disabled=false;btn.textContent='Connect Agency';_idpbToast('Network error','error');});
