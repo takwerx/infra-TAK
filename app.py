@@ -46131,7 +46131,11 @@ def _idp_ak_json(ak_url, ak_headers, path, body=None, method='GET'):
 
 def _idp_ak_group_by_name(ak_url, ak_headers, name, cache):
     """Exact-name group lookup (with per-pass cache). Returns the full group
-    object incl. `users` pks, or None. Names are remote input — always quoted."""
+    object incl. `users` pks, or None. ONLY for OUR OWN objects — the portal's
+    template groups (tak_*), whose names come from agency-templates.json.
+    Incoming/role groups are resolved by SCIM-source linkage instead (see
+    _idp_bridge_reconcile) so one agency's feed can't claim another's group by
+    name. Names go into the URL — always quoted."""
     if name in cache:
         return cache[name]
     g = None
@@ -46194,25 +46198,34 @@ def _idp_bridge_reconcile(slug, bridge):
     scim_slug = (bridge.get('scim_source_slug') or '').strip()
 
     gcache = {}
-    # Incoming role groups = groups pushed by the SCIM source (live discovery so
-    # brand-new AD groups appear in the mapping table before they're mapped)
-    # ∪ the mapping's group names (works even if scim_groups linkage is absent).
-    incoming_names = list(mapping.keys())
+    # Incoming role groups are resolved by the SCIM SOURCE LINKAGE (group_obj.pk
+    # from /sources/scim_groups/?source__slug=), NOT by global name lookup. On a
+    # multi-agency box a name lookup would let agency A's feed pick up a group
+    # named the same as agency B's role group and stamp B's agency/template
+    # (and B's TAK channel groups) onto A's users — a cross-agency privilege
+    # boundary break, and unrevertable because group adds are add-only. Only
+    # groups this bridge's own source pushed are ever treated as incoming.
+    incoming = {}   # name -> group pk (this source only)
     try:
         for sg in _idp_ak_list(ak_url, ak_headers,
                                f'sources/scim_groups/?source__slug={urllib.parse.quote(scim_slug)}'):
-            nm = ((sg.get('group_obj') or {}).get('name') or '').strip()
-            if nm and nm not in incoming_names:
-                incoming_names.append(nm)
+            go = sg.get('group_obj') or {}
+            nm, gpk = (go.get('name') or '').strip(), go.get('pk')
+            if nm and gpk:
+                incoming[nm] = gpk
     except Exception:
-        warn('could not list SCIM source groups — using mapped group names only')
+        warn('could not list SCIM source groups — no incoming groups this pass')
+    for nm in mapping:
+        if nm not in incoming:
+            warn(f'mapped group {nm!r} has not been pushed by this agency\'s SCIM source yet')
 
     members_by_group = {}
-    for nm in sorted(incoming_names):
-        g = _idp_ak_group_by_name(ak_url, ak_headers, nm, gcache)
-        if not g:
-            if nm in mapping:
-                warn(f'mapped incoming group {nm!r} not found in Authentik')
+    for nm in sorted(incoming):
+        try:
+            g = _idp_ak_json(ak_url, ak_headers,
+                             f'core/groups/{urllib.parse.quote(str(incoming[nm]))}/?include_users=true')
+        except Exception as e:
+            warn(f'incoming group {nm!r}: {str(e)[:120]}')
             continue
         members_by_group[nm] = list(g.get('users') or [])
         summary['incoming_groups'].append({
@@ -57826,11 +57839,17 @@ document.addEventListener('DOMContentLoaded', function() {
   var AK_BASE='{{ authentik_base_url }}';
   var D=null,dirty=false;
   function esc(s){return escapeHtml(String(s==null?'':s));}
+  // escapeHtml() serializes a text node — it escapes < > & but NOT quotes, so it is
+  // only safe in TEXT position. Group names and usernames here are pushed by the
+  // agency's remote AD/SCIM feed: a name like  Ops" autofocus onfocus="…  would break
+  // out of an attribute and run script in the console admin's session. Every
+  // attribute interpolation below goes through escAttr.
+  function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
   function agencyName(sfx){var a=((D&&D.agencies)||[]).filter(function(x){return x.suffix===sfx;})[0];return a?a.name:sfx;}
   function tplOptions(sfx,selected,emptyLabel){
     var out='<option value="">'+esc(emptyLabel)+'</option>';
     ((D&&D.templates)||[]).filter(function(t){return t.agencySuffix===sfx;}).forEach(function(t){
-      out+='<option value="'+esc(t.name)+'"'+(t.name===selected?' selected':'')+'>'+esc(t.name)+'</option>';
+      out+='<option value="'+escAttr(t.name)+'"'+(t.name===selected?' selected':'')+'>'+esc(t.name)+'</option>';
     });
     return out;
   }
@@ -57859,7 +57878,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if(sel){
       var cur=sel.value;
       var opts='<option value="">- pick agency -</option>';
-      (D.agencies||[]).forEach(function(a){opts+='<option value="'+esc(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';});
+      (D.agencies||[]).forEach(function(a){opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';});
       sel.innerHTML=opts;if(cur){sel.value=cur;}
     }
     if(!D.portal_ok){list.innerHTML='<div style="font-size:12px;color:var(--yellow)">TAK Portal is not reachable &mdash; agencies and templates live there. Install/start TAK Portal first.</div>';return;}
@@ -57880,7 +57899,7 @@ document.addEventListener('DOMContentLoaded', function() {
           +(mapped?'':' <span style="font-size:9px;color:var(--yellow);background:rgba(234,179,8,0.1);padding:1px 6px;border-radius:4px;border:1px solid rgba(234,179,8,0.3)">unmapped</span>')
           +'</td>'
           +'<td style="padding:5px 8px;font-size:12px;color:var(--text-dim)">'+(g.members==null?'-':g.members)+'</td>'
-          +'<td style="padding:5px 8px"><select class="form-input idpb-map-'+esc(slug)+'" data-group="'+esc(g.name)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,mapped,'- default -')+'</select></td>'
+          +'<td style="padding:5px 8px"><select class="form-input idpb-map-'+escAttr(slug)+'" data-group="'+escAttr(g.name)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,mapped,'- default -')+'</select></td>'
           +'</tr>';
       });
       if(!rows){rows='<tr><td colspan="3" style="padding:6px 8px;font-size:12px;color:var(--text-dim)">No incoming groups yet &mdash; the agency has not pushed groups (or run Sync Now).</td></tr>';}
@@ -57891,11 +57910,11 @@ document.addEventListener('DOMContentLoaded', function() {
         +(b.enabled?'<span class="badge badge-green"><span class="dot dot-pulse"></span>Enabled</span>':'<span class="badge badge-red"><span class="dot"></span>Disabled</span>')
         +'</div>'
         +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-        +'<button onclick="idpbToggle(\''+esc(slug)+'\','+(b.enabled?'false':'true')+')" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
-        +'<button onclick="idpbSync(\''+esc(slug)+'\')" style="'+btnStyle+'">Sync Now</button>'
-        +'<button onclick="idpbInstructions(\''+esc(slug)+'\')" style="'+btnStyle+'">Instructions</button>'
-        +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0"><input type="checkbox" id="idpb-delsrc-'+esc(slug)+'"> also delete Authentik source</label>'
-        +'<button onclick="idpbDelete(\''+esc(slug)+'\')" style="'+btnStyleRed+'">Remove</button>'
+        +'<button onclick="idpbToggle(\''+escAttr(slug)+'\','+(b.enabled?'false':'true')+')" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
+        +'<button onclick="idpbSync(\''+escAttr(slug)+'\')" style="'+btnStyle+'">Sync Now</button>'
+        +'<button onclick="idpbInstructions(\''+escAttr(slug)+'\')" style="'+btnStyle+'">Instructions</button>'
+        +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0"><input type="checkbox" id="idpb-delsrc-'+escAttr(slug)+'"> also delete Authentik source</label>'
+        +'<button onclick="idpbDelete(\''+escAttr(slug)+'\')" style="'+btnStyleRed+'">Remove</button>'
         +'</div></div>'
         +'<div style="margin-bottom:10px">'+statusStrip(st)+'</div>'
         +'<table style="width:100%;border-collapse:collapse;margin-bottom:10px"><thead><tr>'
@@ -57903,8 +57922,8 @@ document.addEventListener('DOMContentLoaded', function() {
         +'</tr></thead><tbody>'+rows+'</tbody></table>'
         +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
         +'<label style="font-size:12px;color:var(--text-dim);margin:0">Default template (unmapped groups):</label>'
-        +'<select class="form-input" id="idpb-default-'+esc(slug)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,b.default_template,'- none -')+'</select>'
-        +'<button class="btn-primary" onclick="idpbSave(\''+esc(slug)+'\')">Save Mapping</button>'
+        +'<select class="form-input" id="idpb-default-'+escAttr(slug)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,b.default_template,'- none -')+'</select>'
+        +'<button class="btn-primary" onclick="idpbSave(\''+escAttr(slug)+'\')">Save Mapping</button>'
         +'</div></div>';
     });
     list.innerHTML=html;
