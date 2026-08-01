@@ -57269,6 +57269,19 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 </div>
 </div>
 {% endif %}
+{% if ak.installed and ak.running %}
+<div class="section-title" style="margin-top:24px">Identity Bridge <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Agency AD/Entra roster &rarr; auto agency + TAK template</span></div>
+<div class="card">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Agencies manage TAK users from their own Active Directory / Entra: a SCIM feed pushes their roster into Authentik ahead of first login, and the console auto-assigns agency + TAK Portal template from the mapping table below. Add-only &mdash; the bridge never removes groups and never touches pinned users. Runs automatically every 5 minutes.</div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+  <select class="form-input" id="idpb-agency" style="width:auto;min-width:200px"><option value="">Loading agencies...</option></select>
+  <button class="btn-primary" id="idpb-create-btn" onclick="idpbCreate()">Connect Agency</button>
+  <span style="font-size:11px;color:var(--text-dim)">Creates (or reuses) the agency's SCIM source in Authentik and shows the two values their IT team pastes into Entra provisioning.</span>
+</div>
+<div id="idpb-token-panel" style="display:none;margin-top:10px;padding:14px;border:1px solid rgba(16,185,129,0.4);border-radius:8px;background:rgba(16,185,129,0.06)"></div>
+<div id="idpb-list" style="margin-top:14px"><div style="font-size:12px;color:var(--text-dim)">Loading...</div></div>
+</div>
+{% endif %}
 
 </div>
 <div class="modal-overlay" id="ak-uninstall-modal">
@@ -57806,6 +57819,174 @@ document.addEventListener('DOMContentLoaded', function() {
   }
   _repLoad();
   setInterval(_repLoad,30000);
+})();
+{% endif %}
+{% if ak.installed and ak.running %}
+(function(){
+  var AK_BASE='{{ authentik_base_url }}';
+  var D=null,dirty=false;
+  function esc(s){return escapeHtml(String(s==null?'':s));}
+  function agencyName(sfx){var a=((D&&D.agencies)||[]).filter(function(x){return x.suffix===sfx;})[0];return a?a.name:sfx;}
+  function tplOptions(sfx,selected,emptyLabel){
+    var out='<option value="">'+esc(emptyLabel)+'</option>';
+    ((D&&D.templates)||[]).filter(function(t){return t.agencySuffix===sfx;}).forEach(function(t){
+      out+='<option value="'+esc(t.name)+'"'+(t.name===selected?' selected':'')+'>'+esc(t.name)+'</option>';
+    });
+    return out;
+  }
+  function statusStrip(st){
+    if(!st||!st.ts){return '<span style="font-size:12px;color:var(--text-dim)">Never synced &mdash; waiting for the agency to push users (or hit Sync Now).</span>';}
+    var bits=[(st.users_seen||0)+' users',(st.converged||0)+' converged'];
+    if(st.unmapped){bits.push(st.unmapped+' unmapped&rarr;default');}
+    if(st.pinned){bits.push(st.pinned+' pinned');}
+    bits.push((st.changed||0)+' changed last run');
+    var s='<span style="color:var(--cyan);font-family:JetBrains Mono,monospace;font-size:11px">'+bits.join(' &middot; ')+'</span> <span style="color:var(--text-dim);font-size:10px">last sync '+esc(st.ts)+'</span>';
+    if(st.multi_role&&st.multi_role.length){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">multi-role (group union applied): '+esc(st.multi_role.join(', '))+'</div>';}
+    (st.warnings||[]).forEach(function(w){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">&#9888; '+esc(w)+'</div>';});
+    return s;
+  }
+  function _idpbToast(msg,type){
+    var t=document.getElementById('idpb-toast');
+    if(!t){t=document.createElement('div');t.id='idpb-toast';t.style.cssText='position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s';document.body.appendChild(t);}
+    t.textContent=msg;t.style.background=type==='success'?'rgba(16,185,129,0.15)':'rgba(239,68,68,0.15)';t.style.border='1px solid '+(type==='success'?'rgba(16,185,129,0.4)':'rgba(239,68,68,0.4)');t.style.color=type==='success'?'var(--green)':'var(--red)';t.style.opacity='1';setTimeout(function(){t.style.opacity='0';},3500);
+  }
+  var btnStyle='padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:JetBrains Mono,monospace';
+  var btnStyleRed='padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:JetBrains Mono,monospace';
+  var thStyle='text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em';
+  function render(){
+    var list=document.getElementById('idpb-list');if(!list||!D)return;
+    var sel=document.getElementById('idpb-agency');
+    if(sel){
+      var cur=sel.value;
+      var opts='<option value="">- pick agency -</option>';
+      (D.agencies||[]).forEach(function(a){opts+='<option value="'+esc(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';});
+      sel.innerHTML=opts;if(cur){sel.value=cur;}
+    }
+    if(!D.portal_ok){list.innerHTML='<div style="font-size:12px;color:var(--yellow)">TAK Portal is not reachable &mdash; agencies and templates live there. Install/start TAK Portal first.</div>';return;}
+    var slugs=Object.keys(D.bridges||{});
+    if(!slugs.length){list.innerHTML='<div style="font-size:12px;color:var(--text-dim)">No bridges yet. Pick an agency above and Connect.</div>';return;}
+    var html='';
+    slugs.sort().forEach(function(slug){
+      var b=D.bridges[slug];var st=b.last_status||{};
+      var groups=(st.incoming_groups||[]).slice();
+      var seen={};groups.forEach(function(g){seen[g.name]=1;});
+      Object.keys(b.map||{}).forEach(function(n){if(!seen[n]){groups.push({name:n,members:null});}});
+      groups.sort(function(a,c){return a.name<c.name?-1:1;});
+      var rows='';
+      groups.forEach(function(g){
+        var mapped=(b.map||{})[g.name]||'';
+        rows+='<tr style="border-bottom:1px solid var(--border)">'
+          +'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+esc(g.name)
+          +(mapped?'':' <span style="font-size:9px;color:var(--yellow);background:rgba(234,179,8,0.1);padding:1px 6px;border-radius:4px;border:1px solid rgba(234,179,8,0.3)">unmapped</span>')
+          +'</td>'
+          +'<td style="padding:5px 8px;font-size:12px;color:var(--text-dim)">'+(g.members==null?'-':g.members)+'</td>'
+          +'<td style="padding:5px 8px"><select class="form-input idpb-map-'+esc(slug)+'" data-group="'+esc(g.name)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,mapped,'- default -')+'</select></td>'
+          +'</tr>';
+      });
+      if(!rows){rows='<tr><td colspan="3" style="padding:6px 8px;font-size:12px;color:var(--text-dim)">No incoming groups yet &mdash; the agency has not pushed groups (or run Sync Now).</td></tr>';}
+      html+='<div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:12px">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px">'
+        +'<div><span style="font-size:13px;font-weight:600;color:var(--text-primary)">'+esc(agencyName(b.agency_suffix))+'</span> '
+        +'<span style="font-size:11px;color:var(--text-dim);font-family:JetBrains Mono,monospace">'+esc(slug)+'</span> '
+        +(b.enabled?'<span class="badge badge-green"><span class="dot dot-pulse"></span>Enabled</span>':'<span class="badge badge-red"><span class="dot"></span>Disabled</span>')
+        +'</div>'
+        +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+        +'<button onclick="idpbToggle(\''+esc(slug)+'\','+(b.enabled?'false':'true')+')" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
+        +'<button onclick="idpbSync(\''+esc(slug)+'\')" style="'+btnStyle+'">Sync Now</button>'
+        +'<button onclick="idpbInstructions(\''+esc(slug)+'\')" style="'+btnStyle+'">Instructions</button>'
+        +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0"><input type="checkbox" id="idpb-delsrc-'+esc(slug)+'"> also delete Authentik source</label>'
+        +'<button onclick="idpbDelete(\''+esc(slug)+'\')" style="'+btnStyleRed+'">Remove</button>'
+        +'</div></div>'
+        +'<div style="margin-bottom:10px">'+statusStrip(st)+'</div>'
+        +'<table style="width:100%;border-collapse:collapse;margin-bottom:10px"><thead><tr>'
+        +'<th style="'+thStyle+'">Incoming group</th><th style="'+thStyle+'">Members</th><th style="'+thStyle+'">TAK template</th>'
+        +'</tr></thead><tbody>'+rows+'</tbody></table>'
+        +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+        +'<label style="font-size:12px;color:var(--text-dim);margin:0">Default template (unmapped groups):</label>'
+        +'<select class="form-input" id="idpb-default-'+esc(slug)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,b.default_template,'- none -')+'</select>'
+        +'<button class="btn-primary" onclick="idpbSave(\''+esc(slug)+'\')">Save Mapping</button>'
+        +'</div></div>';
+    });
+    list.innerHTML=html;
+  }
+  function load(force){
+    fetch('/api/authentik/idp-bridge/status').then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){return;}
+      D=d;
+      if(force||!dirty){dirty=false;render();}
+    }).catch(function(){});
+  }
+  var _listEl=document.getElementById('idpb-list');
+  if(_listEl){_listEl.addEventListener('change',function(){dirty=true;});}
+  window.idpbCreate=function(){
+    var sfx=(document.getElementById('idpb-agency')||{}).value;
+    if(!sfx){_idpbToast('Pick an agency first.','error');return;}
+    var btn=document.getElementById('idpb-create-btn');btn.disabled=true;btn.textContent='Connecting...';
+    fetch('/api/authentik/idp-bridge/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agency_suffix:sfx})})
+      .then(function(r){return r.json();}).then(function(d){
+        btn.disabled=false;btn.textContent='Connect Agency';
+        if(!d.ok){_idpbToast(d.error||'Failed','error');return;}
+        var p=document.getElementById('idpb-token-panel');
+        p.style.display='block';
+        p.innerHTML='<div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:8px">Agency connected. Give these two values to their IT team &mdash; the token is shown ONCE, copy it now:</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token||'(could not fetch token - check Authentik)')+'</div>'
+          +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'+esc(d.instructions||'')+'</pre>';
+        dirty=false;setTimeout(function(){load(true);},1200);
+      }).catch(function(){btn.disabled=false;btn.textContent='Connect Agency';_idpbToast('Network error','error');});
+  };
+  window.idpbSave=function(slug){
+    var map={};
+    document.querySelectorAll('select.idpb-map-'+slug).forEach(function(s){
+      if(s.value){map[s.getAttribute('data-group')]=s.value;}
+    });
+    var defEl=document.getElementById('idpb-default-'+slug);
+    fetch('/api/authentik/idp-bridge/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,map:map,default_template:defEl?defEl.value:''})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Mapping saved - syncing now.','success');dirty=false;setTimeout(function(){load(true);},2500);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbToggle=function(slug,en){
+    fetch('/api/authentik/idp-bridge/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,enabled:en})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Bridge '+(en?'enabled':'disabled')+'.','success');dirty=false;setTimeout(function(){load(true);},800);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbSync=function(slug){
+    _idpbToast('Syncing...','success');
+    fetch('/api/authentik/idp-bridge/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){
+          var st=(d.results||{})[slug]||{};
+          _idpbToast('Sync done: '+(st.users_seen||0)+' users, '+(st.changed||0)+' changed.',st.ok?'success':'error');
+          dirty=false;load(true);
+        }else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbInstructions=function(slug){
+    var b=(D&&D.bridges||{})[slug];if(!b)return;
+    var url=AK_BASE+'/source/scim/'+(b.scim_source_slug||slug)+'/v2';
+    var p=document.getElementById('idpb-token-panel');
+    p.style.display='block';
+    p.innerHTML='<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">'+esc(agencyName(b.agency_suffix))+' &mdash; instruction sheet</div>'
+      +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(url)+'</div>'
+      +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Token: shown once at connect time. Re-run Connect Agency for this agency to view it again (the mapping below is kept).</div>'
+      +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">In Microsoft Entra: Enterprise Applications - New application - Create your own application - Provisioning - Automatic. Paste the SCIM URL and the token, then assign the directory groups to send (e.g. TAK-Patrol, TAK-Command) and turn provisioning On. The roster appears here automatically - map each incoming group to a TAK template and enable the bridge.</pre>';
+  };
+  window.idpbDelete=function(slug){
+    var delSrcEl=document.getElementById('idpb-delsrc-'+slug);
+    var delSrc=!!(delSrcEl&&delSrcEl.checked);
+    if(!confirm('Remove bridge "'+slug+'"?'+(delSrc?' The Authentik SCIM source will ALSO be deleted - the agency\'s pushes will stop.':' The Authentik SCIM source is kept (agency pushes keep landing in Authentik).')+' Users and groups already in Authentik are never touched.')){return;}
+    fetch('/api/authentik/idp-bridge/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,delete_source:delSrc})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Bridge removed'+(d.source_deleted?' (source deleted).':'.'),'success');dirty=false;load(true);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  load(true);
+  setInterval(function(){load(false);},30000);
 })();
 {% endif %}
 </script>
