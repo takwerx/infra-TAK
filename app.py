@@ -46048,6 +46048,538 @@ def authentik_reputation_clear_scores_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Identity Bridge (v10.1.16) — agency AD/Entra → Authentik SCIM → auto agency
+# + TAK Portal template. W1 config store, W2 reconciler, W3 routes, W5 loop.
+# Provisioning half only: roster in + auto assignment (no OAuth login leg).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# W1 — config store: .config/idp-bridges.json, mode 600.
+# Shape: {'bridges': {slug: {agency_suffix, scim_source_slug,
+#         map:{adGroup:template}, default_template, enabled,
+#         policy:'ad_owns_template', last_status:{…}}}}
+# SCIM tokens stay in Authentik — this file holds no secrets.
+IDP_BRIDGES_PATH = os.path.join(CONFIG_DIR, 'idp-bridges.json')
+IDP_BRIDGE_SLUG_RE = re.compile(r'^[-a-zA-Z0-9_]{1,64}$')
+_idp_bridges_write_lock = threading.Lock()
+_idp_bridge_sync_lock = threading.Lock()  # serialize Sync Now vs the 300s loop
+
+
+def _idp_bridges_load():
+    try:
+        with open(IDP_BRIDGES_PATH) as f:
+            d = json.loads(f.read())
+        if isinstance(d, dict) and isinstance(d.get('bridges'), dict):
+            return d
+    except Exception:
+        pass
+    return {'bridges': {}}
+
+
+def _idp_bridges_save(data):
+    # Atomic write (tmp+fsync+replace, same shields as save_settings) — the
+    # mapping table is operator-entered state a torn write must not wipe.
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with _idp_bridges_write_lock:
+        tmp = IDP_BRIDGES_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, IDP_BRIDGES_PATH)
+
+
+def _idp_bridge_portal_file(path):
+    """Read a JSON file out of the tak-portal container. None = container
+    absent/unreadable (the caller decides whether that's a skip or an error)."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', path]),
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0 or not (r.stdout or '').strip():
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def _idp_ak_list(ak_url, ak_headers, path):
+    """GET an Authentik list endpoint following pagination; path may carry a query."""
+    results, page = [], 1
+    while True:
+        sep = '&' if '?' in path else '?'
+        res = _w1_ak_get(ak_url, f'{path}{sep}page={page}&page_size=100', ak_headers)
+        results.extend(res.get('results') or [])
+        nxt = int((res.get('pagination') or {}).get('next') or 0)
+        if nxt <= page:
+            break
+        page = nxt
+    return results
+
+
+def _idp_ak_json(ak_url, ak_headers, path, body=None, method='GET'):
+    resp = _ak_api_call(f'{ak_url}/api/v3/{path}',
+                        data=json.dumps(body).encode() if body is not None else None,
+                        method=method, headers=ak_headers)
+    raw = resp.read().decode() or '{}'
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _idp_ak_group_by_name(ak_url, ak_headers, name, cache):
+    """Exact-name group lookup (with per-pass cache). Returns the full group
+    object incl. `users` pks, or None. Names are remote input — always quoted."""
+    if name in cache:
+        return cache[name]
+    g = None
+    try:
+        for cand in _idp_ak_list(ak_url, ak_headers,
+                                 f'core/groups/?name={urllib.parse.quote(name)}&include_users=true'):
+            if cand.get('name') == name:
+                g = cand
+                break
+    except Exception:
+        g = None
+    cache[name] = g
+    return g
+
+
+def _idp_bridge_reconcile(slug, bridge):
+    """W2 — one reconcile pass for one bridge (generalizes the NUC-proven
+    poc-glue.py): stamp the portal's create-user attribute contract on every
+    SCIM-fed user and add the mapped template's Authentik groups.
+
+    Invariants (PLAN v10.1.16): add-only on groups (never remove), merge-only
+    on attributes, skip pinned (attributes.idp_bridge.pinned == true), unmapped
+    group → default_template, missing template/group ⇒ warning in status —
+    never exception-out of the loop. Multi-role users get the UNION of all
+    matched templates' groups with current_template = the template of the
+    alphabetically-first matched mapping (deterministic), and are flagged.
+    Idempotent: attributes compared before PATCH (applied_at excluded), group
+    membership checked before add — a clean second pass reports 0 changes."""
+    now = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    summary = {'ts': now, 'ok': False, 'skipped': False,
+               'users_seen': 0, 'converged': 0, 'changed': 0, 'pinned': 0,
+               'unmapped': 0, 'multi_role': [], 'warnings': [],
+               'incoming_groups': []}
+
+    def warn(msg):
+        if msg not in summary['warnings']:
+            summary['warnings'].append(msg)
+
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        summary['skipped'] = True
+        warn('Authentik token unavailable (is Authentik installed?)')
+        return summary
+    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+    templates = _idp_bridge_portal_file('/usr/src/app/data/agency-templates.json')
+    if not isinstance(agencies, list) or not isinstance(templates, list):
+        summary['skipped'] = True
+        warn('tak-portal container not readable — sync skipped')
+        return summary
+
+    suffix = (bridge.get('agency_suffix') or '').strip()
+    agency = next((a for a in agencies if isinstance(a, dict) and a.get('suffix') == suffix), None)
+    if not agency:
+        warn(f'agency {suffix!r} not found in TAK Portal agencies.json')
+        return summary
+    tpl_by_name = {t.get('name'): t for t in templates
+                   if isinstance(t, dict) and t.get('agencySuffix') == suffix}
+    mapping = {str(k): str(v) for k, v in (bridge.get('map') or {}).items() if k and v}
+    default_tpl = (bridge.get('default_template') or '').strip()
+    scim_slug = (bridge.get('scim_source_slug') or '').strip()
+
+    gcache = {}
+    # Incoming role groups = groups pushed by the SCIM source (live discovery so
+    # brand-new AD groups appear in the mapping table before they're mapped)
+    # ∪ the mapping's group names (works even if scim_groups linkage is absent).
+    incoming_names = list(mapping.keys())
+    try:
+        for sg in _idp_ak_list(ak_url, ak_headers,
+                               f'sources/scim_groups/?source__slug={urllib.parse.quote(scim_slug)}'):
+            nm = ((sg.get('group_obj') or {}).get('name') or '').strip()
+            if nm and nm not in incoming_names:
+                incoming_names.append(nm)
+    except Exception:
+        warn('could not list SCIM source groups — using mapped group names only')
+
+    members_by_group = {}
+    for nm in sorted(incoming_names):
+        g = _idp_ak_group_by_name(ak_url, ak_headers, nm, gcache)
+        if not g:
+            if nm in mapping:
+                warn(f'mapped incoming group {nm!r} not found in Authentik')
+            continue
+        members_by_group[nm] = list(g.get('users') or [])
+        summary['incoming_groups'].append({
+            'name': nm, 'members': len(members_by_group[nm]),
+            'template': mapping.get(nm), 'mapped': nm in mapping})
+        if nm not in mapping:
+            warn(f'incoming group {nm!r} is not mapped — members get the default template')
+
+    # Source users = role-group members ∪ users this SCIM source pushed
+    # ∪ users previously stamped by this bridge (attributes.idp_bridge.source).
+    user_pks = set()
+    for pks in members_by_group.values():
+        user_pks.update(pks)
+    try:
+        for su in _idp_ak_list(ak_url, ak_headers,
+                               f'sources/scim_users/?source__slug={urllib.parse.quote(scim_slug)}'):
+            if su.get('user') is not None:
+                user_pks.add(su['user'])
+    except Exception:
+        pass
+    try:
+        _attr_q = urllib.parse.quote(json.dumps({'idp_bridge': {'source': slug}}))
+        for u in _idp_ak_list(ak_url, ak_headers, f'core/users/?attributes={_attr_q}'):
+            if u.get('pk') is not None:
+                user_pks.add(u['pk'])
+    except Exception:
+        pass
+
+    orphaned = 0
+    for pk in sorted(user_pks):
+        try:
+            user = _idp_ak_json(ak_url, ak_headers, f'core/users/{pk}/')
+            username = user.get('username') or str(pk)
+            attrs = user.get('attributes') or {}
+            ib = attrs.get('idp_bridge') or {}
+            summary['users_seen'] += 1
+            if ib.get('pinned') is True:
+                summary['pinned'] += 1
+                continue
+            matched = [nm for nm in sorted(mapping.keys())
+                       if pk in (members_by_group.get(nm) or [])]
+            in_any_incoming = any(pk in mpks for mpks in members_by_group.values())
+            if matched:
+                tpl_names = []
+                for nm in matched:
+                    if mapping[nm] not in tpl_names:
+                        tpl_names.append(mapping[nm])
+                current_tpl = mapping[matched[0]]
+                if len(matched) > 1 and len(summary['multi_role']) < 20:
+                    summary['multi_role'].append(username)
+            elif in_any_incoming:
+                summary['unmapped'] += 1
+                if not default_tpl:
+                    warn('users in unmapped groups present but no default template set')
+                    continue
+                tpl_names = [default_tpl]
+                current_tpl = default_tpl
+            else:
+                # previously bridge-managed, now in no incoming role group:
+                # merge-only philosophy — leave everything as-is, flag in status
+                orphaned += 1
+                summary['converged'] += 1
+                continue
+
+            tpl_groups, have_tpl = [], False
+            for tn in tpl_names:
+                tpl = tpl_by_name.get(tn)
+                if not tpl:
+                    warn(f'template {tn!r} not found for agency {suffix!r}')
+                    continue
+                have_tpl = True
+                for gn in (tpl.get('groups') or []):
+                    if gn not in tpl_groups:
+                        tpl_groups.append(gn)
+            if not have_tpl:
+                continue
+            cur_tpl_obj = tpl_by_name.get(current_tpl)
+            role = (cur_tpl_obj.get('role') or 'Team Member') if cur_tpl_obj else 'Team Member'
+
+            desired = dict(attrs)
+            desired.update({
+                'agency': agency.get('suffix'),
+                'agency_name': agency.get('name'),
+                'agency_abbreviation': agency.get('groupPrefix'),
+                'agency_color': agency.get('color'),
+                'role': role,
+                'current_template': current_tpl,
+            })
+            desired.setdefault('created_template', current_tpl)
+            desired.setdefault('created_method', 'idp-bridge')
+            desired.setdefault('created_at', now)
+            new_ib = dict(ib)
+            new_ib['source'] = slug
+            new_ib['applied_template'] = current_tpl
+            desired['idp_bridge'] = new_ib
+
+            adds = []
+            for gn in tpl_groups:
+                g = _idp_ak_group_by_name(ak_url, ak_headers, gn, gcache)
+                if not g:
+                    warn(f'template group {gn!r} missing in Authentik')
+                    continue
+                if pk not in (g.get('users') or []):
+                    adds.append(g)
+
+            # change detection excludes applied_at so a no-op pass PATCHes nothing
+            cmp_new = dict(desired)
+            cmp_new['idp_bridge'] = {k: v for k, v in new_ib.items() if k != 'applied_at'}
+            cmp_cur = dict(attrs)
+            cmp_cur['idp_bridge'] = {k: v for k, v in ib.items() if k != 'applied_at'}
+            if cmp_new != cmp_cur or adds:
+                new_ib['applied_at'] = now
+                _idp_ak_json(ak_url, ak_headers, f'core/users/{pk}/',
+                             {'attributes': desired}, 'PATCH')
+                for g in adds:
+                    _idp_ak_json(ak_url, ak_headers,
+                                 f"core/groups/{g['pk']}/add_user/", {'pk': pk}, 'POST')
+                    g.setdefault('users', []).append(pk)
+                summary['changed'] += 1
+            summary['converged'] += 1
+        except Exception as e:
+            warn(f'user {pk}: {str(e)[:120]}')
+
+    if orphaned:
+        warn(f'{orphaned} bridge-managed user(s) no longer in any incoming role group (left untouched)')
+    summary['ok'] = True
+    return summary
+
+
+def _idp_bridge_run_all(slugs=None, persist_skipped=False):
+    """Run reconcile for the given bridge slugs (None = all enabled bridges);
+    persist per-bridge last_status. Loop calls drop 'stack absent' skips so a
+    box without Authentik/portal doesn't churn the config file every 5 min."""
+    cfg = _idp_bridges_load()
+    bridges = cfg.get('bridges') or {}
+    if slugs is None:
+        slugs = [s for s, b in bridges.items() if b.get('enabled')]
+    out = {}
+    with _idp_bridge_sync_lock:
+        for s in slugs:
+            b = bridges.get(s)
+            if not b:
+                continue
+            try:
+                out[s] = _idp_bridge_reconcile(s, b)
+            except Exception as e:
+                out[s] = {'ok': False, 'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                          'warnings': [f'reconcile crashed: {str(e)[:160]}']}
+        if out:
+            cfg2 = _idp_bridges_load()
+            wrote = False
+            for s, summ in out.items():
+                if summ.get('skipped') and not persist_skipped:
+                    continue
+                if s in (cfg2.get('bridges') or {}):
+                    cfg2['bridges'][s]['last_status'] = summ
+                    wrote = True
+            if wrote:
+                _idp_bridges_save(cfg2)
+    return out
+
+
+def _idp_bridge_loop():
+    """W5 — background reconcile every 300 s (pattern: _offbox_shipper_loop).
+    Idle-cheap: no enabled bridges → just the sleep. Skips silently when
+    Authentik or the tak-portal container is absent (reconcile marks skipped)."""
+    while True:
+        time.sleep(300)
+        try:
+            _idp_bridge_run_all()
+        except Exception:
+            pass
+
+
+try:
+    threading.Thread(target=_idp_bridge_loop, daemon=True, name='idp-bridge').start()
+except Exception:
+    pass
+
+
+@app.route('/api/authentik/idp-bridge/status')
+@login_required
+def idp_bridge_status_api():
+    """W3 — bridges + per-bridge last_status (last sync, users seen/converged,
+    incoming groups w/ member counts + mapped template, warnings). Also serves
+    the wizard pick-lists (portal agencies + templates). No secrets in here."""
+    cfg = _idp_bridges_load()
+    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+    templates = _idp_bridge_portal_file('/usr/src/app/data/agency-templates.json')
+    portal_ok = isinstance(agencies, list) and isinstance(templates, list)
+    out_bridges = {}
+    for slug, b in (cfg.get('bridges') or {}).items():
+        out_bridges[slug] = {
+            'agency_suffix': b.get('agency_suffix'),
+            'scim_source_slug': b.get('scim_source_slug'),
+            'map': b.get('map') or {},
+            'default_template': b.get('default_template') or '',
+            'enabled': bool(b.get('enabled')),
+            'policy': b.get('policy') or 'ad_owns_template',
+            'last_status': b.get('last_status') or {},
+        }
+    return jsonify({
+        'ok': True,
+        'portal_ok': portal_ok,
+        'bridges': out_bridges,
+        'agencies': [{'suffix': a.get('suffix'), 'name': a.get('name'),
+                      'groupPrefix': a.get('groupPrefix'), 'color': a.get('color')}
+                     for a in (agencies or []) if isinstance(a, dict)],
+        'templates': [{'name': t.get('name'), 'agencySuffix': t.get('agencySuffix'),
+                       'role': t.get('role'), 'groups': len(t.get('groups') or [])}
+                      for t in (templates or []) if isinstance(t, dict)],
+    })
+
+
+@app.route('/api/authentik/idp-bridge/save', methods=['POST'])
+@login_required
+def idp_bridge_save_api():
+    """W3 — save mapping table / default template / enabled for one bridge."""
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    cfg = _idp_bridges_load()
+    b = (cfg.get('bridges') or {}).get(slug)
+    if not b:
+        return jsonify({'ok': False, 'error': 'unknown bridge'}), 404
+    if 'map' in d:
+        m = d.get('map')
+        if not isinstance(m, dict):
+            return jsonify({'ok': False, 'error': 'map must be an object'}), 400
+        clean = {}
+        for k, v in m.items():
+            k, v = str(k).strip()[:128], str(v).strip()[:128]
+            if k and v:
+                clean[k] = v
+        b['map'] = clean
+    if 'default_template' in d:
+        b['default_template'] = str(d.get('default_template') or '').strip()[:128]
+    if 'enabled' in d:
+        b['enabled'] = bool(d.get('enabled'))
+    _idp_bridges_save(cfg)
+    # converge quickly after an edit (idempotent; the 300s loop is the backstop)
+    threading.Thread(target=_idp_bridge_run_all, kwargs={'slugs': [slug]},
+                     daemon=True, name='idp-bridge-save').start()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/authentik/idp-bridge/create', methods=['POST'])
+@login_required
+def idp_bridge_create_api():
+    """W3 — connect-agency wizard: create (or reuse) the Authentik SCIM source
+    for a portal agency and return the two paste values (SCIM URL + token).
+    The token is returned ONCE in this response and never stored or logged by
+    the console — it lives in Authentik; re-running the wizard re-fetches it."""
+    import urllib.error as _uerr
+    d = request.get_json(silent=True) or {}
+    suffix = (d.get('agency_suffix') or '').strip()
+    if not re.match(r'^[a-zA-Z0-9_-]{1,32}$', suffix):
+        return jsonify({'ok': False, 'error': 'invalid agency'}), 400
+    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+    if not isinstance(agencies, list):
+        return jsonify({'ok': False, 'error': 'TAK Portal not reachable (is it installed and running?)'}), 400
+    agency = next((a for a in agencies if isinstance(a, dict) and a.get('suffix') == suffix), None)
+    if not agency:
+        return jsonify({'ok': False, 'error': f'agency {suffix} not found in TAK Portal'}), 404
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'ok': False, 'error': 'Authentik token unavailable (is Authentik installed?)'}), 400
+    prefix = (agency.get('groupPrefix') or suffix).strip().lower()
+    scim_slug = re.sub(r'[^a-z0-9_-]', '', f'{prefix}-scim')[:50] or f'{suffix}-scim'
+    src = None
+    try:
+        src = _idp_ak_json(ak_url, ak_headers, f'sources/scim/{urllib.parse.quote(scim_slug)}/')
+    except _uerr.HTTPError as e:
+        if e.code != 404:
+            return jsonify({'ok': False, 'error': f'Authentik API error HTTP {e.code}'}), 502
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 502
+    try:
+        if not src or not src.get('slug'):
+            src = _idp_ak_json(ak_url, ak_headers, 'sources/scim/', {
+                'name': (d.get('name') or f"{agency.get('name') or suffix} SCIM").strip()[:120],
+                'slug': scim_slug,
+                'enabled': True,
+            }, 'POST')
+        tok_ident = (src.get('token_obj') or {}).get('identifier') or ''
+        token_key = ''
+        if tok_ident:
+            vk = _idp_ak_json(ak_url, ak_headers,
+                              f'core/tokens/{urllib.parse.quote(tok_ident)}/view_key/')
+            token_key = vk.get('key') or ''
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'could not create SCIM source: {str(e)[:200]}'}), 502
+    scim_url = f'{_get_authentik_base_url(settings)}/source/scim/{scim_slug}/v2'
+    cfg = _idp_bridges_load()
+    cfg.setdefault('bridges', {})
+    b = cfg['bridges'].get(scim_slug) or {}
+    b.setdefault('map', {})
+    b.setdefault('default_template', '')
+    b.setdefault('enabled', False)
+    b.setdefault('created_at', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))
+    b['agency_suffix'] = suffix
+    b['scim_source_slug'] = scim_slug
+    b['policy'] = 'ad_owns_template'
+    cfg['bridges'][scim_slug] = b
+    _idp_bridges_save(cfg)
+    # populate the incoming-groups listing right away (bridge may still be disabled)
+    threading.Thread(target=_idp_bridge_run_all, kwargs={'slugs': [scim_slug]},
+                     daemon=True, name='idp-bridge-create').start()
+    agency_label = agency.get('name') or suffix
+    instructions = (
+        f"Give these two values to {agency_label}'s IT team (Microsoft Entra: "
+        "Enterprise Applications → New application → Create your own application → "
+        "Provisioning → Automatic):\n\n"
+        f"  Tenant / SCIM URL:  {scim_url}\n"
+        "  Secret Token:       (shown once above — copy it now)\n\n"
+        "Then have them assign the directory groups they want to send "
+        "(e.g. TAK-Patrol, TAK-Command) to that application and turn provisioning "
+        "On. Their roster appears here automatically — map each incoming group to "
+        "a TAK template below and enable the bridge."
+    )
+    return jsonify({'ok': True, 'bridge': scim_slug, 'scim_url': scim_url,
+                    'token': token_key, 'token_shown_once': True,
+                    'instructions': instructions})
+
+
+@app.route('/api/authentik/idp-bridge/sync', methods=['POST'])
+@login_required
+def idp_bridge_sync_api():
+    """W3 — run the reconciler now; returns per-bridge summaries."""
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if slug and not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    res = _idp_bridge_run_all(slugs=[slug] if slug else None, persist_skipped=True)
+    return jsonify({'ok': True, 'results': res})
+
+
+@app.route('/api/authentik/idp-bridge/delete', methods=['POST'])
+@login_required
+def idp_bridge_delete_api():
+    """W3 — remove bridge config. delete_source (default OFF) also deletes the
+    Authentik SCIM source (stops the agency's pushes). Users/groups already in
+    Authentik are never touched — the add-only philosophy extends to delete."""
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    cfg = _idp_bridges_load()
+    b = (cfg.get('bridges') or {}).pop(slug, None)
+    if not b:
+        return jsonify({'ok': False, 'error': 'unknown bridge'}), 404
+    _idp_bridges_save(cfg)
+    src_deleted = False
+    if d.get('delete_source') is True:
+        try:
+            ak_url, ak_headers, _s = _w1_ak_ctx()
+            if ak_url:
+                _ak_api_call(f"{ak_url}/api/v3/sources/scim/"
+                             f"{urllib.parse.quote(b.get('scim_source_slug') or slug)}/",
+                             method='DELETE', headers=ak_headers)
+                src_deleted = True
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'source_deleted': src_deleted})
+
+
 def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Authentik on a remote host via SSH (Docker Compose)."""
     import secrets as _sec
