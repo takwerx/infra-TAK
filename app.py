@@ -57960,7 +57960,7 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 {% if ak.installed and ak.running %}
 <div class="section-title" style="margin-top:24px">Identity Bridge <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Agency AD/Entra roster &rarr; auto agency + TAK template</span></div>
 <div class="card">
-<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Agencies manage TAK users from their own Active Directory / Entra: a SCIM feed pushes their roster into Authentik ahead of first login, and the console auto-assigns agency + TAK Portal template from the mapping table below. Add-only &mdash; the bridge never removes groups and never touches pinned users. Runs automatically every 5 minutes.</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Agencies manage TAK users from their own Active Directory / Entra: a SCIM feed pushes their roster into Authentik ahead of first login, and the console auto-assigns agency + TAK Portal template from the mapping table below. The bridge only ever manages channels it granted itself &mdash; anything you set by hand is never touched, and pinned users are skipped entirely. When AD moves someone to a different role group, they move to that template's channels and lose the old ones. Runs automatically every 5 minutes.</div>
 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
   <select class="form-input" id="idpb-agency" style="width:auto;min-width:200px" onchange="idpbPreview()"><option value="">Loading agencies...</option></select>
   <button class="btn-primary" id="idpb-create-btn" onclick="idpbCreate()">Connect Agency</button>
