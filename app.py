@@ -58806,7 +58806,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if(p){p.style.display='none';p.innerHTML='';}
   };
   window.idpbRotate=function(slug){
-    if(!confirm('Issue a NEW token for "'+slug+'"?\n\nThe current token stops working immediately. This agency\u2019s roster sync will FAIL until their IT pastes the new value into Entra.'))return;
+    if(!confirm('Issue a NEW token for "'+slug+'"? The current token stops working immediately, and this agency roster sync will FAIL until their IT pastes the new value into Entra.'))return;
     fetch('/api/authentik/idp-bridge/rotate-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
       .then(function(r){return r.json();}).then(function(d){
         if(!d.ok){_idpbToast(d.error||'Failed','error');return;}
