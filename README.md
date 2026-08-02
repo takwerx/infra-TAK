@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.15-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.15-alpha)**
+**Current release: [v10.1.16-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.16-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.16-alpha — 2026-08-02 — Agencies bring their own directory, and a guard against a database migration that would break TAK
+
+**Headline: an agency can now manage its TAK users from its own Microsoft Entra or Active Directory, and the console does the rest.** Their IT points a standard directory feed at a URL you hand them; their staff appear in TAK already assigned to the right agency, with the right username, in the right channels — before anyone logs in for the first time, with no spreadsheets and no clicking through users one at a time. Usernames are built from the identifier the agency already uses for its people (a badge or employee number) joined to your agency code, so they match the format your hand-created users already follow. When someone changes role in the agency's directory, they move to that role's channels and lose the old ones automatically; when they leave the directory, the access stops following them around. The console deliberately refuses to guess: if a person arrives without a unique identifier it declines to create them and tells you why, rather than inventing a username from their name — two people called J. Smith would otherwise end up sharing one TAK account. Someone who has already signed in is never renamed, because that would break the tablet in their vehicle. **Also in this release: TAK Server 5.8 installs are blocked.** TAK 5.8 includes a PostgreSQL database migration, and installing it through the normal update flow would leave TAK stranded partway through an upgrade with no clean way back. Until guided-upgrade support ships, uploading a 5.8 package is safe but the update itself is refused, with an explanation. **Who should update:** everyone. The 5.8 guard matters to every installation the moment 5.8 is released; the directory integration matters if you support more than a handful of agencies. **Upgrade:** automatic on the next console update. The directory integration is opt-in per agency and changes nothing until you connect one.
+
+Full notes: [v10.1.16-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.16-alpha).
 
 ### v10.1.15-alpha — 2026-07-30 — The dashboard stops crying wolf, and a better Authentik is approved for everyone
 
