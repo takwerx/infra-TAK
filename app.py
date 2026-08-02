@@ -58877,6 +58877,45 @@ document.addEventListener('DOMContentLoaded', function() {
   setInterval(function(){load(false);},30000);
 })();
 {% endif %}
+// ── Collapsible sections ────────────────────────────────────────────────────
+// Any .section-title carrying data-collapse="<id>" becomes a toggle for the
+// element that follows it. data-collapsed="1" is the default state; the
+// operator's choice is remembered per-section so a page they collapsed stays
+// collapsed on the next visit.
+(function(){
+  function apply(h, body, open){
+    body.style.display = open ? '' : 'none';
+    var car = h.querySelector('.sect-caret');
+    if(car){ car.textContent = open ? '\u25BE' : '\u25B8'; }
+    h.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  document.querySelectorAll('.section-title[data-collapse]').forEach(function(h){
+    var body = h.nextElementSibling;
+    if(!body) return;
+    var key = 'idpb-sect-' + h.getAttribute('data-collapse');
+    var stored = null;
+    try { stored = localStorage.getItem(key); } catch(e) {}
+    var open = stored === null ? h.getAttribute('data-collapsed') !== '1' : stored === 'open';
+    var car = document.createElement('span');
+    car.className = 'sect-caret';
+    car.style.cssText = 'display:inline-block;width:14px;color:var(--text-dim);font-size:11px';
+    h.insertBefore(car, h.firstChild);
+    h.style.cursor = 'pointer';
+    h.setAttribute('role', 'button');
+    h.setAttribute('tabindex', '0');
+    h.title = 'Click to show/hide';
+    apply(h, body, open);
+    function toggle(){
+      open = !open;
+      apply(h, body, open);
+      try { localStorage.setItem(key, open ? 'open' : 'closed'); } catch(e) {}
+    }
+    h.addEventListener('click', toggle);
+    h.addEventListener('keydown', function(e){
+      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); }
+    });
+  });
+})();
 </script>
 </body></html>'''
 
@@ -72712,46 +72751,6 @@ function doCoturnUninstall(){
     msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
-
-// ── Collapsible sections ────────────────────────────────────────────────────
-// Any .section-title carrying data-collapse="<id>" becomes a toggle for the
-// element that follows it. data-collapsed="1" is the default state; the
-// operator's choice is remembered per-section so a page they collapsed stays
-// collapsed on the next visit.
-(function(){
-  function apply(h, body, open){
-    body.style.display = open ? '' : 'none';
-    var car = h.querySelector('.sect-caret');
-    if(car){ car.textContent = open ? '\u25BE' : '\u25B8'; }
-    h.setAttribute('aria-expanded', open ? 'true' : 'false');
-  }
-  document.querySelectorAll('.section-title[data-collapse]').forEach(function(h){
-    var body = h.nextElementSibling;
-    if(!body) return;
-    var key = 'idpb-sect-' + h.getAttribute('data-collapse');
-    var stored = null;
-    try { stored = localStorage.getItem(key); } catch(e) {}
-    var open = stored === null ? h.getAttribute('data-collapsed') !== '1' : stored === 'open';
-    var car = document.createElement('span');
-    car.className = 'sect-caret';
-    car.style.cssText = 'display:inline-block;width:14px;color:var(--text-dim);font-size:11px';
-    h.insertBefore(car, h.firstChild);
-    h.style.cursor = 'pointer';
-    h.setAttribute('role', 'button');
-    h.setAttribute('tabindex', '0');
-    h.title = 'Click to show/hide';
-    apply(h, body, open);
-    function toggle(){
-      open = !open;
-      apply(h, body, open);
-      try { localStorage.setItem(key, open ? 'open' : 'closed'); } catch(e) {}
-    }
-    h.addEventListener('click', toggle);
-    h.addEventListener('keydown', function(e){
-      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); }
-    });
-  });
-})();
 
 </script>
 </body></html>'''
