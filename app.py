@@ -58801,6 +58801,16 @@ document.addEventListener('DOMContentLoaded', function() {
   };
   // The panel shows a live credential — let the operator clear it off screen
   // once they have copied it, rather than leaving it up until a page reload.
+  // The panel sits at the TOP of the card while the buttons that fill it are in
+  // the bridge boxes below, so writing to it without scrolling reads as "the
+  // button does nothing". Every writer calls this.
+  function _idpbShowPanel(html){
+    var p=document.getElementById('idpb-token-panel');
+    if(!p)return;
+    p.style.display='block';
+    p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'+html;
+    if(p.scrollIntoView){p.scrollIntoView({behavior:'smooth',block:'center'});}
+  }
   window.idpbHideToken=function(){
     var p=document.getElementById('idpb-token-panel');
     if(p){p.style.display='none';p.innerHTML='';}
@@ -58852,14 +58862,24 @@ document.addEventListener('DOMContentLoaded', function() {
       }).catch(function(){_idpbToast('Network error','error');});
   };
   window.idpbInstructions=function(slug){
-    var b=(D&&D.bridges||{})[slug];if(!b)return;
+    var b=(D&&D.bridges||{})[slug];
+    if(!b){_idpbToast('No bridge config for '+slug,'error');return;}
     var url=AK_BASE+'/source/scim/'+(b.scim_source_slug||slug)+'/v2';
-    var p=document.getElementById('idpb-token-panel');
-    p.style.display='block';
-    p.innerHTML='<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">'+esc(agencyName(b.agency_suffix))+' &mdash; instruction sheet</div>'
+    var shape=b.username_preview||'';
+    _idpbShowPanel(
+      '<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">'+esc(agencyName(b.agency_suffix))+' &mdash; instruction sheet</div>'
       +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(url)+'</div>'
-      +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Token: shown once at connect time. Re-run Connect Agency for this agency to view it again (the mapping below is kept).</div>'
-      +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">In Microsoft Entra: Enterprise Applications - New application - Create your own application - Provisioning - Automatic. Paste the SCIM URL and the token, then assign the directory groups to send (e.g. TAK-Patrol, TAK-Command) and turn provisioning On. The roster appears here automatically - map each incoming group to a TAK template and enable the bridge.</pre>';
+      // The old text said "re-run Connect Agency to see the token again" — that
+      // stopped being possible when connected agencies were removed from the
+      // picker. New Token is the way now.
+      +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Token: shown once, at connect time. It cannot be read back &mdash; use <strong>New Token</strong> above to issue a replacement (that invalidates the current one).</div>'
+      +(shape?'<div style="font-size:11px;color:var(--text-primary);margin-bottom:10px">'+esc(shape)+'</div>':'')
+      +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'
+      +'In Microsoft Entra: Enterprise Applications - New application - Create your own application - Provisioning - Automatic. '
+      +'Paste the SCIM URL and the token, then assign the directory groups to send and turn provisioning On.<br><br>'
+      +'Two things their IT must get right:<br>'
+      +'  1. Send a UNIQUE employee identifier (badge or employee number) in the "'+esc(b.username_field||'employeeNumber')+'" attribute. Not names - two people called J. Smith would share one TAK account.<br>'
+      +'  2. Put each person in exactly ONE role group. Someone in two has no single template, so we flag them and assign nothing.</pre>');
   };
   window.idpbDelete=function(slug){
     var delSrcEl=document.getElementById('idpb-delsrc-'+slug);
