@@ -58574,7 +58574,7 @@ document.addEventListener('DOMContentLoaded', function() {
 {% if ak.installed and ak.running %}
 (function(){
   var AK_BASE='{{ authentik_base_url }}';
-  var D=null,dirty=false;
+  var D=null,dirty=false,holdRender=false;
   function esc(s){return escapeHtml(String(s==null?'':s));}
   // escapeHtml() serializes a text node — it escapes < > & but NOT quotes, so it is
   // only safe in TEXT position. Group names and usernames here are pushed by the
@@ -58691,6 +58691,7 @@ document.addEventListener('DOMContentLoaded', function() {
         +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0" title="Unticked, Remove only disconnects the console: the SCIM source stays in Authentik and the agency keeps pushing. Ticked, the source is deleted too and their provisioning stops. Either way, users already created are never deleted."><input type="checkbox" id="idpb-delsrc-'+escAttr(slug)+'"> also delete Authentik source <span style="color:var(--text-dim);border:1px solid var(--border);border-radius:50%;width:13px;height:13px;display:inline-flex;align-items:center;justify-content:center;font-size:9px">?</span></label>'
         +'<button data-idpb-act="delete" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyleRed+'">Remove</button>'
         +'</div></div>'
+        +'<div id="idpb-out-'+escAttr(slug)+'" style="display:none;margin-bottom:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,0.02)"></div>'
         +'<div style="margin-bottom:10px">'+statusStrip(st)+'</div>'
         +'<table style="width:100%;border-collapse:collapse;margin-bottom:10px"><thead><tr>'
         +'<th style="'+thStyle+'">Incoming group</th><th style="'+thStyle+'">Members</th><th style="'+thStyle+'">TAK template</th>'
@@ -58725,7 +58726,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }).then(function(d){
       if(!d||!d.ok){_idpbFail('Identity Bridge status unavailable.',(d&&d.error)||'server returned ok=false');return;}
       D=d;
-      if(force||!dirty){dirty=false;render();}
+      if((force||!dirty)&&!holdRender){dirty=false;render();}
     }).catch(function(e){_idpbFail('Could not load Identity Bridge status.',e&&e.message);});
   }
   var _listEl=document.getElementById('idpb-list');
@@ -58808,25 +58809,44 @@ document.addEventListener('DOMContentLoaded', function() {
     var p=document.getElementById('idpb-token-panel');
     if(!p)return;
     p.style.display='block';
+    holdRender=true;
     p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'+html;
     if(p.scrollIntoView){p.scrollIntoView({behavior:'smooth',block:'center'});}
   }
+  // Render a result inside the agency box the operator clicked in. The shared
+  // panel at the top of the card is only right for Connect, where the button is
+  // genuinely up there; using it for per-agency actions threw the operator to
+  // the top of the page away from what they were doing.
+  function _idpbShowIn(slug, html){
+    var el=document.getElementById('idpb-out-'+slug);
+    if(!el){_idpbShowPanel(html);return;}   // fall back if the box is not rendered
+    // The 30s refresh re-renders the whole list, which would erase a token the
+    // operator is still copying — and it is shown exactly once. Hold rendering
+    // until they dismiss it.
+    holdRender=true;
+    el.style.display='block';
+    el.innerHTML='<button onclick="idpbHideIn(&quot;'+escAttr(slug)+'&quot;)" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'+html;
+  }
+  window.idpbHideIn=function(slug){
+    var el=document.getElementById('idpb-out-'+slug);
+    if(el){el.style.display='none';el.innerHTML='';}
+    holdRender=false;
+  };
   window.idpbHideToken=function(){
     var p=document.getElementById('idpb-token-panel');
     if(p){p.style.display='none';p.innerHTML='';}
+    holdRender=false;
   };
   window.idpbRotate=function(slug){
     if(!confirm('Issue a NEW token for "'+slug+'"? The current token stops working immediately, and this agency roster sync will FAIL until their IT pastes the new value into Entra.'))return;
     fetch('/api/authentik/idp-bridge/rotate-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
       .then(function(r){return r.json();}).then(function(d){
         if(!d.ok){_idpbToast(d.error||'Failed','error');return;}
-        var p=document.getElementById('idpb-token-panel');
-        p.style.display='block';
-        p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'
-          +'<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:8px">New token issued &mdash; shown ONCE, copy it now:</div>'
+        _idpbShowIn(slug,
+           '<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:8px">New token issued &mdash; shown ONCE, copy it now:</div>'
           +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
           +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token)+'</div>'
-          +'<div style="font-size:11px;color:var(--yellow)">'+esc(d.note||'')+'</div>';
+          +'<div style="font-size:11px;color:var(--yellow)">'+esc(d.note||'')+'</div>');
         _idpbToast('Token rotated.','success');
       }).catch(function(){_idpbToast('Network error','error');});
   };
@@ -58866,7 +58886,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if(!b){_idpbToast('No bridge config for '+slug,'error');return;}
     var url=AK_BASE+'/source/scim/'+(b.scim_source_slug||slug)+'/v2';
     var shape=b.username_preview||'';
-    _idpbShowPanel(
+    _idpbShowIn(slug,
       '<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">'+esc(agencyName(b.agency_suffix))+' &mdash; instruction sheet</div>'
       +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(url)+'</div>'
       // The old text said "re-run Connect Agency to see the token again" — that
