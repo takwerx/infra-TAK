@@ -1884,7 +1884,7 @@ async function startTakUpdate(){
   try{
     var r=await fetch('/api/takserver/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});
     var d=await r.json();
-    if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';msg.style.whiteSpace='normal';msg.style.lineHeight='1.5';msg.style.display='block';msg.style.marginTop='8px';}if(btn)btn.disabled=false;return;}
     var wrap=document.getElementById('upgrade-log-wrap');if(wrap)wrap.style.display='block';
     var el=document.getElementById('upgrade-log');if(el)el.textContent='Connecting...';
     upgradeLogIndex=0;pollUpgradeLog();

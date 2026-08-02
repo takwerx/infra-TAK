@@ -64423,6 +64423,62 @@ def takserver_security_config_post():
     return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
 
 
+# ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
+# TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
+# package on a PG-15 box through our update flow wedges TAK mid-upgrade
+# (SchemaManager runs against the wrong PG major) and there is no clean way back
+# without a restore. Until the guided migration ships, the console REFUSES 5.8+
+# artifacts. Background: private notes ROADMAP.md, "Ubuntu 24.04 LTS
+# transition", Phase 0.5.
+TAK_GATE_BLOCK_FROM = (5, 8)
+TAK_GATE_MESSAGE = (
+    'STOP - TAK Server 5.8+ requires a PostgreSQL 15 to 18 database migration. '
+    'Do not install it manually. Console support for a guided upgrade is coming '
+    'in an upcoming release.'
+)
+# First major.minor after "takserver" in the artifact name. Covers every shape
+# we accept: takserver_5.7-RELEASE43_all.deb, takserver-5.8-RELEASE1.noarch.rpm,
+# takserver-docker-5.4-RELEASE.zip, takserver-core_5.7-..., takserver-database-...
+_TAK_VER_RE = re.compile(r'takserver[^0-9]*(\d+)\.(\d+)', re.I)
+
+
+def _tak_artifact_version(filename):
+    """(major, minor) parsed from an artifact filename, or None if unparseable."""
+    m = _TAK_VER_RE.search(os.path.basename(str(filename or '')))
+    if not m:
+        return None
+    try:
+        return (int(m.group(1)), int(m.group(2)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _tak_target_version_gate(*filenames):
+    """Return the STOP message if ANY artifact is >= 5.8, else None.
+
+    Unparseable names are ALLOWED on purpose — an operator with an oddly named
+    but legitimate 5.7 package must not be locked out of updating, and the gate
+    is a guard rail rather than an authorisation boundary.
+
+    settings['allow_tak_58'] (truthy, settings.json only, no UI) bypasses this so
+    real 5.8 artifacts can be exercised on dev boxes without reverting the gate.
+    """
+    try:
+        allow = bool(load_settings().get('allow_tak_58'))
+    except Exception:
+        allow = False
+    for fn in filenames:
+        ver = _tak_artifact_version(fn)
+        if not ver or ver < TAK_GATE_BLOCK_FROM:
+            continue
+        if allow:
+            print('[tak-gate] BYPASSED by allow_tak_58: permitting TAK %d.%d artifact %r'
+                  % (ver[0], ver[1], os.path.basename(str(fn))), flush=True)
+            return None
+        return TAK_GATE_MESSAGE
+    return None
+
+
 @app.route('/api/takserver/update', methods=['POST'])
 @login_required
 def takserver_update():
@@ -64440,6 +64496,9 @@ def takserver_update():
         if not _zips:
             return jsonify({'error': 'Container upgrade: upload the new takserver-docker-*.zip bundle (not a .deb).'}), 400
         _zip = os.path.join(UPLOAD_DIR, sorted(_zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+        _g = _tak_target_version_gate(_zip)
+        if _g:
+            return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=run_takserver_upgrade_container, args=(_zip,), daemon=True).start()
@@ -64459,6 +64518,9 @@ def takserver_update():
             _db_rpm = next((f for f in _all_rpms if 'database' in f.lower()), '')
             if not _core_rpm or not _db_rpm:
                 return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .noarch.rpm packages. Upload both.'}), 400
+            _g = _tak_target_version_gate(_core_rpm, _db_rpm)
+            if _g:
+                return jsonify({'error': _g}), 400
             _s1 = _tak_cfg.get('server_one', {})
             if not _s1.get('host'):
                 return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
@@ -64473,6 +64535,9 @@ def takserver_update():
                        key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)), reverse=True)
         if not _rpms:
             return jsonify({'error': 'No takserver .rpm found. Upload the new takserver-*.noarch.rpm from tak.gov first (the single-server package, not core/database).'}), 400
+        _g = _tak_target_version_gate(_rpms[0])
+        if _g:
+            return jsonify({'error': _g}), 400
         # external_db: pass the RDS block so the upgrade runs SchemaManager against the managed DB.
         _edb = _tak_cfg.get('external_db') if _tak_cfg.get('mode') == 'external_db' else None
         upgrade_log.clear()
@@ -64493,6 +64558,9 @@ def takserver_update():
         db_pkg = next((f for f in pkg_files if 'database' in f.lower()), '')
         if not core_pkg or not db_pkg:
             return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .deb packages. Upload both.'}), 400
+        _g = _tak_target_version_gate(core_pkg, db_pkg)
+        if _g:
+            return jsonify({'error': _g}), 400
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
@@ -64507,6 +64575,9 @@ def takserver_update():
         single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
         if not single_pkgs:
             return jsonify({'error': 'Only split packages (core/database) found. For one-server update, upload the single takserver .deb. Remove the wrong files and upload the correct package.'}), 400
+        _g = _tak_target_version_gate(single_pkgs[0])
+        if _g:
+            return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
@@ -73117,6 +73188,10 @@ function takPurgeFailed(){
 {% elif 'ubuntu' in settings.get('os_type', '') %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
 {% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-X.X-RELEASE-XX.noarch.rpm</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">dnf install ./package.rpm</span> and restarts TAK Server &mdash; your <strong>database is preserved</strong>.</p>
 {% endif %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8?</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">5.8 includes a PostgreSQL database migration (15 to 18). This console will <strong>block 5.8 installs</strong> until guided-upgrade support ships in an upcoming release. Uploading a 5.8 package is safe &mdash; the update itself is what is refused.</div>
+</div>
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
 <input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
 <div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>
