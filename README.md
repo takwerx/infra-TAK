@@ -202,6 +202,10 @@ start.sh                    ← One CLI command to launch everything
 └── .config/                ← Auth + settings (gitignored)
 ```
 
+Full codebase map — how the code is organized, why it's a single service, the
+platform-abstraction seams, and where the decomposition is headed:
+**[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
 ## Ports
 
 > **v0.9.12 hardening:** Every host port is classified by exposure tier. **Tier 1 (Public)** is reachable from the internet, **Tier 3 (Caddy-loopback)** binds to `127.0.0.1` and is reached only via Caddy on 443, **Tier 4 (Docker-internal)** has no host port at all, **Tier 5 (Source-scoped)** is allowed only from a specific peer IP.
