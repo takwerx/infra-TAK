@@ -57979,7 +57979,7 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 </div>
 {% endif %}
 {% if ak.installed and ak.running %}
-<div class="section-title" data-collapse="reputation" style="margin-top:24px">Reputation Policy <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Flow-level brute-force blocking</span></div>
+<div class="section-title" data-collapse="reputation" data-collapsed="1" style="margin-top:24px">Reputation Policy <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Flow-level brute-force blocking</span></div>
 <div class="card">
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
   <div>
@@ -58019,7 +58019,7 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 </div>
 {% endif %}
 {% if ak.installed and ak.running %}
-<div class="section-title" data-collapse="identity-bridge" style="margin-top:24px">Identity Bridge <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Agency AD/Entra roster &rarr; auto agency + TAK template</span></div>
+<div class="section-title" data-collapse="identity-bridge" data-collapsed="1" style="margin-top:24px">Identity Bridge <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Agency AD/Entra roster &rarr; auto agency + TAK template</span></div>
 <div class="card">
 <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Agencies manage TAK users from their own Active Directory / Entra: a SCIM feed pushes their roster into Authentik ahead of first login, and the console auto-assigns agency + TAK Portal template from the mapping table below. The bridge only ever manages channels it granted itself &mdash; anything you set by hand is never touched, and pinned users are skipped entirely. When AD moves someone to a different role group, they move to that template's channels and lose the old ones. Runs automatically every 5 minutes.</div>
 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
@@ -58898,7 +58898,7 @@ document.addEventListener('DOMContentLoaded', function() {
       body.push(n);
     }
     if(!body.length) return;
-    var key = 'idpb-sect-' + h.getAttribute('data-collapse');
+    var key = 'idpb-sect2-' + h.getAttribute('data-collapse');
     var stored = null;
     try { stored = localStorage.getItem(key); } catch(e) {}
     var open = stored === null ? h.getAttribute('data-collapsed') !== '1' : stored === 'open';
