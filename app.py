@@ -47218,7 +47218,19 @@ def idp_bridge_create_api():
         "Someone in two role groups has no single template, so we will flag "
         "them and assign nothing until it is corrected.\n\n"
         "They do not need to build the username themselves - we add the agency "
-        "code."
+        "code.\n\n"
+        "KEEPING THIS RUNNING\n"
+        "  New Token       - issues a fresh secret and invalidates the current "
+        "one immediately. Use it if the token has been shared too widely or "
+        "someone with access has left. Their provisioning FAILS until they "
+        "paste the new value in, so tell them before you press it.\n"
+        "  Remove          - disconnects the console only. The SCIM source "
+        "stays in Authentik, the agency keeps pushing, and existing users are "
+        "untouched. You just stop auto-assigning agency and templates.\n"
+        "  Remove + 'also delete Authentik source' - additionally deletes the "
+        "SCIM endpoint itself, so the agency's provisioning starts failing on "
+        "their next cycle. Users and groups already created are still NOT "
+        "deleted - this cuts the feed, it does not remove people."
     )
     return jsonify({'ok': True, 'bridge': scim_slug, 'scim_url': scim_url,
                     'token': token_key, 'token_shown_once': True,
@@ -47237,6 +47249,55 @@ def idp_bridge_sync_api():
         return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
     res = _idp_bridge_run_all(slugs=[slug] if slug else None, persist_skipped=True)
     return jsonify({'ok': True, 'results': res})
+
+
+@app.route('/api/authentik/idp-bridge/rotate-token', methods=['POST'])
+@login_required
+def idp_bridge_rotate_token_api():
+    """W3 — issue a NEW SCIM token for a bridge, invalidating the old one.
+
+    Needed because the token is a live credential handed to a third party: it
+    ends up in emails and ticket systems, staff turn over, and it grants write
+    access to that agency's roster (anyone holding it can inject users who will
+    be auto-assigned that agency's templates and channels). There has to be a
+    way to roll it without deleting and rebuilding the whole bridge.
+
+    Uses Authentik's own set_key so the token IDENTITY is unchanged — the
+    source keeps working, only the secret changes. The agency's provisioning
+    breaks until they paste the new value in, which is the point.
+
+    Returned ONCE, never stored by the console and never logged.
+    """
+    import secrets as _sec
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    cfg = _idp_bridges_load()
+    b = (cfg.get('bridges') or {}).get(slug)
+    if not b:
+        return jsonify({'ok': False, 'error': 'unknown bridge'}), 404
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'ok': False, 'error': 'Authentik unavailable'}), 400
+    src_slug = (b.get('scim_source_slug') or slug)
+    try:
+        src = _idp_ak_json(ak_url, ak_headers,
+                           f'sources/scim/{urllib.parse.quote(src_slug)}/')
+        ident = (src.get('token_obj') or {}).get('identifier')
+        if not ident:
+            return jsonify({'ok': False, 'error': 'source has no token object'}), 502
+        new_key = _sec.token_urlsafe(45)
+        _ak_api_call(f'{ak_url}/api/v3/core/tokens/{urllib.parse.quote(ident)}/set_key/',
+                     data=json.dumps({'key': new_key}).encode(),
+                     method='POST', headers=ak_headers)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'could not rotate: {str(e)[:200]}'}), 502
+    scim_url = f'{_get_authentik_base_url(settings)}/source/scim/{src_slug}/v2'
+    return jsonify({'ok': True, 'token': new_key, 'scim_url': scim_url,
+                    'note': 'The previous token stopped working immediately. The '
+                            'agency must paste this new value into their Entra '
+                            'provisioning or their roster sync will fail.'})
 
 
 @app.route('/api/authentik/idp-bridge/delete', methods=['POST'])
@@ -57753,7 +57814,7 @@ body{display:flex;min-height:100vh}
 <div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
 </div>
 </div>
-<div class="section-title">LDAP Configuration</div>
+<div class="section-title" data-collapse="ldap-config" data-collapsed="1">LDAP Configuration</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:12px;line-height:2">
 <div><span style="color:var(--text-dim)">Base DN:</span> <span style="color:var(--cyan)">DC=takldap</span></div>
@@ -57798,7 +57859,7 @@ body{display:flex;min-height:100vh}
 <a href="/takportal" style="padding:8px 20px;background:var(--bg-surface);color:var(--green);border:1px solid rgba(16,185,129,0.3);border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap">→ TAK Portal</a>
 </div>
 {% endif %}
-<div class="section-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
+<div class="section-title" data-collapse="container-logs" data-collapsed="1">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
 <div class="deploy-log" id="container-log">Loading logs...</div>
 <div class="card" id="ak-log-card" style="display:none;margin-top:24px">
   <div class="card-title">Update config & reconnect — Log</div>
@@ -57810,7 +57871,7 @@ body{display:flex;min-height:100vh}
   <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
 </div>
 {% else %}
-<div class="section-title">About Authentik</div>
+<div class="section-title" data-collapse="about-authentik" data-collapsed="1">About Authentik</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary);line-height:1.8">
 Authentik is an open-source <span style="color:var(--cyan)">Identity Provider</span> supporting SSO, SAML, OAuth2/OIDC, LDAP, and RADIUS.<br><br>
@@ -58579,8 +58640,18 @@ document.addEventListener('DOMContentLoaded', function() {
     var sel=document.getElementById('idpb-agency');
     if(sel){
       var cur=sel.value;
+      // An agency that already has a bridge is not offered again — connecting
+      // it twice would just re-show its token and confuse who owns what.
+      var taken={};
+      Object.keys(D.bridges||{}).forEach(function(k){taken[(D.bridges[k]||{}).agency_suffix]=1;});
       var opts='<option value="">- pick agency -</option>';
-      (D.agencies||[]).forEach(function(a){opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';});
+      var avail=0;
+      (D.agencies||[]).forEach(function(a){
+        if(taken[a.suffix])return;
+        avail++;
+        opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';
+      });
+      if(!avail){opts='<option value="">- all agencies connected -</option>';}
       sel.innerHTML=opts;if(cur){sel.value=cur;}
       idpbPreview();
     }
@@ -58616,7 +58687,8 @@ document.addEventListener('DOMContentLoaded', function() {
         +'<button data-idpb-act="toggle" data-idpb-slug="'+escAttr(slug)+'" data-idpb-en="'+(b.enabled?'0':'1')+'" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
         +'<button data-idpb-act="sync" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Sync Now</button>'
         +'<button data-idpb-act="instructions" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Instructions</button>'
-        +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0"><input type="checkbox" id="idpb-delsrc-'+escAttr(slug)+'"> also delete Authentik source</label>'
+        +'<button data-idpb-act="rotate" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'" title="Issue a new SCIM token. The old one stops working immediately.">New Token</button>'
+        +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0" title="Unticked, Remove only disconnects the console: the SCIM source stays in Authentik and the agency keeps pushing. Ticked, the source is deleted too and their provisioning stops. Either way, users already created are never deleted."><input type="checkbox" id="idpb-delsrc-'+escAttr(slug)+'"> also delete Authentik source <span style="color:var(--text-dim);border:1px solid var(--border);border-radius:50%;width:13px;height:13px;display:inline-flex;align-items:center;justify-content:center;font-size:9px">?</span></label>'
         +'<button data-idpb-act="delete" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyleRed+'">Remove</button>'
         +'</div></div>'
         +'<div style="margin-bottom:10px">'+statusStrip(st)+'</div>'
@@ -58677,6 +58749,7 @@ document.addEventListener('DOMContentLoaded', function() {
     else if(act==='instructions'){idpbInstructions(slug);}
     else if(act==='delete'){idpbDelete(slug);}
     else if(act==='save'){idpbSave(slug);}
+    else if(act==='rotate'){idpbRotate(slug);}
   });}
   // Placement + token are immutable once a portal agency exists (no edit path),
   // so showing the resulting username shape here is the operator's only chance
@@ -58717,13 +58790,35 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         var p=document.getElementById('idpb-token-panel');
         p.style.display='block';
-        p.innerHTML='<div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:8px">Agency connected. Give these two values to their IT team &mdash; the token is shown ONCE, copy it now:</div>'
+        p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'
+          +'<div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:8px">Agency connected. Give these two values to their IT team &mdash; the token is shown ONCE, copy it now:</div>'
           +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
           +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token||'(could not fetch token - check Authentik)')+'</div>'
           +(d.mapping_warning?'<div style="font-size:12px;color:var(--red);margin-bottom:10px">&#9888; '+esc(d.mapping_warning)+'</div>':'')
           +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'+esc(d.instructions||'')+'</pre>';
         dirty=false;setTimeout(function(){load(true);},1200);
       }).catch(function(){btn.disabled=false;btn.textContent='Connect Agency';_idpbToast('Network error','error');});
+  };
+  // The panel shows a live credential — let the operator clear it off screen
+  // once they have copied it, rather than leaving it up until a page reload.
+  window.idpbHideToken=function(){
+    var p=document.getElementById('idpb-token-panel');
+    if(p){p.style.display='none';p.innerHTML='';}
+  };
+  window.idpbRotate=function(slug){
+    if(!confirm('Issue a NEW token for "'+slug+'"?\n\nThe current token stops working immediately. This agency\u2019s roster sync will FAIL until their IT pastes the new value into Entra.'))return;
+    fetch('/api/authentik/idp-bridge/rotate-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(!d.ok){_idpbToast(d.error||'Failed','error');return;}
+        var p=document.getElementById('idpb-token-panel');
+        p.style.display='block';
+        p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'
+          +'<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:8px">New token issued &mdash; shown ONCE, copy it now:</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token)+'</div>'
+          +'<div style="font-size:11px;color:var(--yellow)">'+esc(d.note||'')+'</div>';
+        _idpbToast('Token rotated.','success');
+      }).catch(function(){_idpbToast('Network error','error');});
   };
   window.idpbSave=function(slug){
     var map={};
@@ -72617,6 +72712,47 @@ function doCoturnUninstall(){
     msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
+
+// ── Collapsible sections ────────────────────────────────────────────────────
+// Any .section-title carrying data-collapse="<id>" becomes a toggle for the
+// element that follows it. data-collapsed="1" is the default state; the
+// operator's choice is remembered per-section so a page they collapsed stays
+// collapsed on the next visit.
+(function(){
+  function apply(h, body, open){
+    body.style.display = open ? '' : 'none';
+    var car = h.querySelector('.sect-caret');
+    if(car){ car.textContent = open ? '\u25BE' : '\u25B8'; }
+    h.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  document.querySelectorAll('.section-title[data-collapse]').forEach(function(h){
+    var body = h.nextElementSibling;
+    if(!body) return;
+    var key = 'idpb-sect-' + h.getAttribute('data-collapse');
+    var stored = null;
+    try { stored = localStorage.getItem(key); } catch(e) {}
+    var open = stored === null ? h.getAttribute('data-collapsed') !== '1' : stored === 'open';
+    var car = document.createElement('span');
+    car.className = 'sect-caret';
+    car.style.cssText = 'display:inline-block;width:14px;color:var(--text-dim);font-size:11px';
+    h.insertBefore(car, h.firstChild);
+    h.style.cursor = 'pointer';
+    h.setAttribute('role', 'button');
+    h.setAttribute('tabindex', '0');
+    h.title = 'Click to show/hide';
+    apply(h, body, open);
+    function toggle(){
+      open = !open;
+      apply(h, body, open);
+      try { localStorage.setItem(key, open ? 'open' : 'closed'); } catch(e) {}
+    }
+    h.addEventListener('click', toggle);
+    h.addEventListener('keydown', function(e){
+      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); }
+    });
+  });
+})();
+
 </script>
 </body></html>'''
 
