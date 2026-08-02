@@ -79460,7 +79460,8 @@ def _selfheal_cloudtak_corrupt_icons(plog=None):
         if status == 'running' and restarts < 3:
             return False
         logs = subprocess.run(
-            _sudo_wrap(['docker', 'logs', '--tail', '300', 'cloudtak-api-1']),
+            _sudo_wrap(['docker', 'logs', '--since', '3m', '--tail', '300',
+                        'cloudtak-api-1']),
             capture_output=True, text=True, timeout=20)
         blob = (logs.stdout or '') + (logs.stderr or '')
         if not (('from_icons' in blob or 'SpriteBuilder' in blob or 'sprites' in blob)
@@ -79558,12 +79559,19 @@ try:
         # image), and the resulting crash-loop takes another ~4 min to surface (nuc
         # 2026-07-29: heal at +2m, hardening recreate at +3.5m, loop at ~+8m — the old
         # 3-check/5.5-min window had just closed). Self-gating no-op when healthy.
+        # Do NOT stop after a successful heal. Field, nuc 2026-08-02: heal ran at
+        # +2.5 min and patched the regen-guard, then "CloudTAK recreated with
+        # hardened port bindings" fired 79 s later, rebuilt the container from the
+        # image, wiped the patch, and the api crash-looped for hours with nothing
+        # watching — because the loop had already returned. The 15-min window this
+        # code deliberately opens was useless while the first success closed it.
+        # The check is self-gating (healthy + no RECENT crash signature = no-op),
+        # so keeping the watch open costs a docker inspect every 2 min.
         for _i in range(8):
             _t.sleep(90 if _i == 0 else 120)
             try:
-                if _selfheal_cloudtak_corrupt_icons(
-                        plog=lambda m: print(f"[startup-iconheal] {m}", flush=True)):
-                    return
+                _selfheal_cloudtak_corrupt_icons(
+                    plog=lambda m: print(f"[startup-iconheal] {m}", flush=True))
             except Exception:
                 pass
     _threading_iconheal.Thread(target=_startup_icon_heal, daemon=True,
