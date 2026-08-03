@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.16-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.16-alpha)**
+**Current release: [v10.1.17-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.17-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.17-alpha — 2026-08-03 — The identity server stops burning a CPU core doing nothing, and CloudTAK follows upstream releases directly
+
+**Headline: Authentik was quietly consuming about a full CPU core on every installation — at idle — and this release eliminates all three causes.** First, the current Authentik release line carries an upstream one-character bug that makes its internal task scheduler run continuously instead of once a minute; the console now patches that one line automatically (and removes the patch by itself the moment an Authentik release ships with the fix — we've reported it upstream). Second, every login event fanned out into four notification checks that could never notify anyone, which was two-thirds of all background work; those dead-end rules are removed for good, with Guard Dog remaining the alerting authority on this stack. Third, the console's own LDAP session setting forced every connected system to fully re-authenticate every two minutes; that's now one hour. Together with a one-time cleanup of old event records and a database tuning fix, identity-server background load drops by more than 95% — on modest hardware that's the difference between a server that always feels busy and one that's actually idle. **Also in this release: CloudTAK now tracks upstream releases directly.** The version pin is gone — Deploy and Update install the newest CloudTAK release on every channel, so you get their fixes the day they ship, and the update path now self-heals a known CloudTAK startup crash (a bad map icon could previously keep the map UI down after an update). **Two things to know:** the first console update after this release restarts Authentik once to apply the fixes, and an LDAP password change or account disable now takes up to an hour to cut off an already-connected TAK client (was two minutes; restart the LDAP outpost for immediate effect). Authentik's own admin-UI notifications for configuration errors are retired — Guard Dog owns alerting. **Who should update:** everyone, immediately — this affects every installation at idle, around the clock. **Upgrade:** automatic on the next console update.
+
+Full notes: [v10.1.17-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.17-alpha).
 
 ### v10.1.16-alpha — 2026-08-02 — Agencies bring their own directory, and a guard against a database migration that would break TAK
 
