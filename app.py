@@ -80032,8 +80032,8 @@ def _startup_selinux_policy_canary():
         return _stamp() == want
 
     if _wait(180):
-        print(f"[selinux-canary] ✓ {name} at shipped version {want} "
-              f"(box {mode}; domain enforcing from 1.0 — no permissive line)", flush=True)
+        print(f"[selinux-canary] ✓ {name} at shipped version {want} (box {mode}; "
+              f"domain mode is whatever the shipped .te declares — see its header)", flush=True)
         return
     # .te-only bump: nothing restarted the broker this boot — request one.
     print(f"[selinux-canary] {name} stamp {_stamp() or 'absent'} != shipped {want} — "
