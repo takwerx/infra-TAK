@@ -80096,16 +80096,29 @@ except Exception as _e:
     print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
 
 
-# v10.1.18 (SELinux enforce-the-domain): read-only canary that the box's
+# v10.1.18 (SELinux enforce-the-domain): verify the box's
 # takwerx_console_confined module actually matches the shipped .te — never
 # assume a policy landed. The INSTALL is root-side in the broker's startup
 # (_selinux_policy_converge in broker/takwerx_broker.py): the boot converge
 # above already restarted the broker if its source changed, so on a normal
-# update the refresh is in flight when this canary starts polling. For a
-# .te-only bump (broker source unchanged → no restart above) the canary
+# update the refresh is in flight when this gate starts polling. For a
+# .te-only bump (broker source unchanged → no restart above) the gate
 # requests ONE broker restart itself — `systemctl restart` is rulebook-allowed
 # — then re-polls. Refresh-only: a box never provisioned with the confined
 # domain (root install) is left alone.
+#
+# WHY THIS IS A GATE AND NOT A BACKGROUND THREAD (operator catch, 2026-08-03):
+# the customer path is Update Now → new code on disk → console restart. The
+# console then boots, restarts the broker, and the broker compiles+installs the
+# policy in a BACKGROUND thread — which takes ~10-60 s. Run as a daemon thread,
+# this check let `_startup_migrations()` proceed immediately, so a release's NEW
+# code ran its first-boot migrations under the PREVIOUS release's policy. Field
+# evidence: NUC 2026-08-03, console up 12:33:24, policy 1.5 not loaded until
+# 12:33:37 — the whole converge ran on the old rule set (and produced denials
+# that the new rules already covered). Invisible under permissive; under an
+# ENFORCING domain that is a first-boot breakage on every customer box whose
+# release adds a rule. So: when a policy change is PENDING, block here until it
+# lands (bounded) before any migration runs. No pending change = fast no-op.
 def _startup_selinux_policy_canary():
     name = 'takwerx_console_confined'
     te = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'selinux', name + '.te')
@@ -80153,9 +80166,19 @@ def _startup_selinux_policy_canary():
             _tm.sleep(5)
         return _stamp() == want
 
-    if _wait(180):
+    # Fast path: already converged (the overwhelming majority of boots — the .te
+    # only changes on releases that touch it). Costs one file read.
+    if _stamp() == want:
         print(f"[selinux-canary] ✓ {name} at shipped version {want} (box {mode}; "
               f"domain mode is whatever the shipped .te declares — see its header)", flush=True)
+        return
+    # A policy change IS pending. Hold the boot here (bounded) so migrations run
+    # under the policy that shipped WITH this code, not the previous release's.
+    print(f"[selinux-canary] policy change pending ({_stamp() or 'unstamped'} -> {want}) — "
+          f"holding startup migrations until it lands", flush=True)
+    if _wait(180):
+        print(f"[selinux-canary] ✓ {name} converged to {want} before migrations "
+              f"(box {mode})", flush=True)
         return
     # .te-only bump: nothing restarted the broker this boot — request one.
     print(f"[selinux-canary] {name} stamp {_stamp() or 'absent'} != shipped {want} — "
@@ -80171,12 +80194,16 @@ def _startup_selinux_policy_canary():
     else:
         print(f"[selinux-canary] ⚠ {name} still at {_stamp() or 'unstamped'} (want {want}) — "
               f"check the broker audit log (op=selinux-policy) on this box; "
-              f"the domain may be running an OLD allow set", flush=True)
+              f"the domain may be running an OLD allow set. Proceeding with startup "
+              f"(a stuck policy install must never block the console from booting).",
+              flush=True)
 
 
+# Synchronous by design — see the ordering note above. Bounded at ~6 min worst
+# case (two 180 s waits) and a no-op when no policy change is pending, so it can
+# never wedge a boot; any failure path falls through to the migrations.
 try:
-    threading.Thread(target=_startup_selinux_policy_canary, daemon=True,
-                     name='startup-selinux-policy-canary').start()
+    _startup_selinux_policy_canary()
 except Exception as _e:
     print(f"[startup] selinux policy canary skipped (non-fatal): {_e}", flush=True)
 
