@@ -2111,9 +2111,20 @@ def _selinux_heal_module_dir_labels(log=None):
         else:
             print(f"[selinux-labels] {m}", flush=True)
 
+    # v10.1.18b: enumerate the home's subdirectories rather than carrying a
+    # hardcoded module list. The first cut listed five known dirs and MISSED
+    # ~/eud-remote-assist and ~/netbird on aws-rocky, both left as admin_home_t
+    # by the root-era install — 128 denials/boot that the list could never see.
+    # Any module dir we create can drift; scanning finds them all, including
+    # modules added after this code was written.
     home = os.path.expanduser('~')
     healed = 0
-    for name in ('CloudTAK', 'authentik', 'node-red', 'TAK-Portal', 'tak-docker'):
+    try:
+        candidates = sorted(d for d in os.listdir(home)
+                            if os.path.isdir(os.path.join(home, d)) and not d.startswith('.'))
+    except Exception:
+        candidates = []
+    for name in candidates:
         path = os.path.join(home, name)
         if not os.path.isdir(path):
             continue

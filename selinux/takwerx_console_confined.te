@@ -1,4 +1,4 @@
-module takwerx_console_confined 1.6;
+module takwerx_console_confined 1.7;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -87,6 +87,20 @@ module takwerx_console_confined 1.6;
 #        RULE FOR FUTURE HARVESTS: derive rules from `ausearch -m avc` /
 #        `sealert -l` RAW records (scontext/tcontext/tclass), NEVER from the
 #        setroubleshoot summary line. This cost three rounds today.
+#   1.7  10.1.18. Cross-box reality check: aws-rocky runs DIFFERENT modules from
+#        the NUC (cesium-tiles, netbird, eud-remote-assist vs CloudTAK/mediamtx),
+#        so it surfaced a different gap set entirely — 128 denials/boot the NUC
+#        can never show. Adds: httpd_config_t (the console READS
+#        /etc/caddy/Caddyfile directly in _selinux_sync_caddy_ports),
+#        httpd_sys_content_t (cesium tile store stat), and the socket classes
+#        `ss` enumerates beyond tcp/udp/unix_stream (unix_dgram,
+#        netlink_kobject_uevent). Also on aws-rocky: ~/eud-remote-assist and
+#        ~/netbird were admin_home_t (root-era install drift) — fixed by making
+#        _selinux_heal_module_dir_labels SCAN the home instead of carrying a
+#        hardcoded module list.
+#        STANDING CAVEAT for the enforce flip: the required allow set is the
+#        UNION across every module combination in the field. Any box running a
+#        module none of our test boxes runs can still surface new denials.
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -115,6 +129,9 @@ require {
 	type device_t;
 	type fixed_disk_device_t;
 	type gconf_home_t;
+	type admin_home_t;
+	type httpd_config_t;
+	type httpd_sys_content_t;
 	type httpd_exec_t;
 	type ifconfig_exec_t;
 	type ldap_port_t;
@@ -174,6 +191,10 @@ require {
 	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
 	class netlink_route_socket { bind create getattr getopt nlmsg_read setopt read write };
 	class icmp_socket { create getopt setopt read write bind getattr connect };
+	class unix_dgram_socket getattr;
+	class netlink_kobject_uevent_socket getattr;
+	class packet_socket getattr;
+	class rawip_socket getattr;
 	class blk_file { getattr open read };
 	class chr_file { getattr open read };
 	class process getattr;
@@ -400,8 +421,15 @@ allow takwerx_console_t var_lib_t:file { append create getattr ioctl lock open r
 
 # `ss` reports on peer unix sockets as well as tcp/udp (the v1.1 rules covered
 # only the latter two). Read-only socket metadata — same class as the process
-# getattr the health monitor already has.
+# getattr the health monitor already has. v1.7: bare `ss` enumerates EVERY
+# socket family, so cover the rest it touches rather than discovering them one
+# release at a time (verified tgt=unconfined_t, a domain, on the NUC).
 allow takwerx_console_t domain:unix_stream_socket getattr;
+allow takwerx_console_t domain:unix_dgram_socket getattr;
+allow takwerx_console_t domain:netlink_kobject_uevent_socket getattr;
+allow takwerx_console_t domain:netlink_route_socket getattr;
+allow takwerx_console_t domain:packet_socket getattr;
+allow takwerx_console_t domain:rawip_socket getattr;
 
 # keytool/findmnt stat sysfs device nodes (/sys/devices/.../dm/name). v1.2
 # granted sysfs_t:file open+read but not getattr, so the stat itself still
@@ -465,6 +493,21 @@ allow takwerx_console_t ssh_home_t:file ioctl;
 
 # --- `ps` stats the console's controlling terminal. Metadata only.
 allow takwerx_console_t tty_device_t:chr_file getattr;
+
+# --- v1.7 (aws-rocky module set) ---
+# The console READS the generated Caddyfile directly (_selinux_sync_caddy_ports
+# parses it for listener ports). Read-only: the WRITE path goes through the
+# broker as root, so the console never needs write on httpd_config_t.
+allow takwerx_console_t httpd_config_t:dir { getattr open read search };
+allow takwerx_console_t httpd_config_t:file { getattr ioctl open read };
+# Cesium tile store — module detection stats the directory.
+allow takwerx_console_t httpd_sys_content_t:dir { getattr open read search };
+allow takwerx_console_t httpd_sys_content_t:file { getattr ioctl open read };
+# Root-era module dirs still carrying admin_home_t on boxes whose relabel has
+# not run yet (the self-heal fixes the LABEL; this keeps the box working in the
+# window before it does, and on any tree we deliberately leave alone).
+allow takwerx_console_t admin_home_t:dir { getattr open read search };
+allow takwerx_console_t admin_home_t:file { getattr ioctl open read };
 
 # =====================================================================
 # v1.5 — startup-converge close-out. See History note 1.5.
