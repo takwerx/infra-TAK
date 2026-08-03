@@ -1,14 +1,23 @@
-module takwerx_console_confined 1.0;
+module takwerx_console_confined 1.1;
 
 ########################################
-# infra-TAK console — CONFINED SELinux domain (ENFORCING as of v1.0 / 10.1.18)
+# infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
 #
 # Moves the non-root console OFF unconfined_service_t into `takwerx_console_t`.
 # The console is a thin Flask/gunicorn app; ALL genuinely-privileged work happens
 # in the SEPARATE root broker process, so the console itself needs comparatively
 # little — which is what makes confining it feasible.
 #
-# STATUS v1.0: ENFORCING. The `permissive takwerx_console_t` line is GONE.
+# STATUS v1.1: PERMISSIVE again (deliberate). v1.0 enforced and broke the NUC
+# console within seconds of install (2026-08-03 ~09:46): gunicorn came up mute
+# (no journal output) and reset every TLS handshake — the 24h corpus was
+# steady-state-only, setroubleshoot-top-30-filtered, and label-blind
+# (~/.local is gconf_home_t on a restorecon'd box, not the user_home_t the
+# earlier audit2allow harvest saw). The PLAN's own sequencing (A2 enforce ONLY
+# after A3 validates) was collapsed into one release — v1.1 restores it:
+# run PERMISSIVE with the v1.1 rule set, harvest raw AVCs on NUC + aws-rocky
+# through a full module-action sweep + soak, and only a v1.2 with a clean
+# window drops the `permissive` line again.
 # History:
 #   0.2  first harvest (audit2allow, full deploy exercise on Rocky 9.8)
 #   0.3  10.1.9 W5: NUC live-denial harvest (broker connectto vs
@@ -18,6 +27,10 @@ module takwerx_console_confined 1.0;
 #        then `permissive` removed. Every corpus line was a legitimate console
 #        operation — no dontaudit rules were needed (nothing observed was
 #        benign-but-deniable; it was all required function).
+#   1.1  10.1.18 hot fix (same day): re-add `permissive`; add the enforcing-era
+#        live harvest — gconf_home_t (~/.local policy-default label), proc
+#        ioctl (psutil), ifconfig_exec_t (`ip` in-domain), self:tcp_socket
+#        shutdown (ldapsearch child), domain tcp/udp socket getattr (`ss`).
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -42,6 +55,8 @@ require {
 	type init_t;
 	type unconfined_service_t;
 	type fs_t;
+	type gconf_home_t;
+	type ifconfig_exec_t;
 	type user_home_t;
 	type user_home_dir_t;
 	type bin_t;
@@ -86,7 +101,7 @@ require {
 	class process getattr;
 	class sock_file { getattr write };
 	class system status;
-	class tcp_socket { accept bind connect create getattr getopt ioctl listen name_bind name_connect node_bind setopt };
+	class tcp_socket { accept bind connect create getattr getopt ioctl listen name_bind name_connect node_bind setopt shutdown };
 	class udp_socket { connect create getattr setopt };
 	class unix_stream_socket { connectto getattr ioctl };
 	class process { transition dyntransition siginh rlimitinh noatsecure sigchld };
@@ -97,7 +112,10 @@ type takwerx_console_t;
 typeattribute takwerx_console_t domain;
 role system_r types takwerx_console_t;
 
-# v1.0: `permissive takwerx_console_t;` REMOVED — the domain now enforces.
+# v1.1: PERMISSIVE reinstated (logs every would-deny, blocks nothing) — the
+# v1.0 enforce was premature; see STATUS above. Removing this single line
+# (v1.2, after a clean NUC + aws-rocky harvest window) enforces the domain.
+permissive takwerx_console_t;
 
 # --- structural: systemd launch transition + broker-socket connect ---
 allow init_t takwerx_console_t:process { transition dyntransition siginh rlimitinh noatsecure };
@@ -121,9 +139,16 @@ allow takwerx_console_t unconfined_service_t:unix_stream_socket connectto;
 # (incl. ones not seen during harvest), so enforcing won't AVC on a new service.
 # Read-only process metadata; the Guard Dog dashboard's legitimate need.
 allow takwerx_console_t domain:dir { getattr open read search };
-allow takwerx_console_t domain:file { getattr open read };
+# v1.1: + ioctl — psutil issues TCGETS-class ioctls on /proc/<pid> files it
+# opens (live harvest 2026-08-03: /proc/<pid>/cgroup, 34 hits in minutes).
+allow takwerx_console_t domain:file { getattr ioctl open read };
 allow takwerx_console_t domain:lnk_file read;
 allow takwerx_console_t domain:process getattr;
+# v1.1: `ss` runs in-domain (GD/console listener inspection) and getattrs other
+# processes' sockets — read-only metadata, same rationale as process getattr
+# above (live harvest 2026-08-03).
+allow takwerx_console_t domain:tcp_socket getattr;
+allow takwerx_console_t domain:udp_socket getattr;
 
 # --- functional init_t/systemd interaction (broker socket, systemctl reads, dbus) ---
 allow takwerx_console_t init_t:dbus send_msg;
@@ -150,10 +175,13 @@ allow takwerx_console_t net_conf_t:file { getattr open read };
 allow takwerx_console_t node_t:tcp_socket node_bind;
 allow takwerx_console_t passwd_file_t:file { getattr open read };
 allow takwerx_console_t proc_t:dir read;
-allow takwerx_console_t proc_t:file { getattr open read };
+# v1.1: + ioctl (psutil on /proc/meminfo — live harvest 2026-08-03).
+allow takwerx_console_t proc_t:file { getattr ioctl open read };
 allow takwerx_console_t self:netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
 allow takwerx_console_t self:process getattr;
-allow takwerx_console_t self:tcp_socket { accept bind connect create getattr getopt ioctl listen setopt };
+# v1.1: + shutdown — ldapsearch (in-domain child, LDAP SA verification) calls
+# shutdown() on its connection (live harvest 2026-08-03).
+allow takwerx_console_t self:tcp_socket { accept bind connect create getattr getopt ioctl listen setopt shutdown };
 allow takwerx_console_t self:udp_socket { connect create getattr setopt };
 allow takwerx_console_t sssd_public_t:dir search;
 allow takwerx_console_t sssd_var_lib_t:dir search;
@@ -208,11 +236,19 @@ allow takwerx_console_t ssh_home_t:dir { getattr open read search };
 allow takwerx_console_t ssh_home_t:file { getattr open read };
 
 # Companion to the user_home_t ~/.local rules above: on a box where ~/.local
-# carries its POLICY-DEFAULT label (data_home_t — any box that ever ran
-# restorecon on /home), the same python sys.path scan denies against
-# data_home_t instead. Same operation, both observed labels covered.
+# carries policy-default labels, the same python sys.path scan denies against
+# those types instead. Live harvest 2026-08-03 (NUC, post-restorecon): EL9 maps
+# `HOME_DIR/.local(/.*)` to gconf_home_t — the actual observed label — while
+# `.local/share` maps to data_home_t. All observed labels covered, read-only.
 allow takwerx_console_t data_home_t:dir { getattr open read search };
 allow takwerx_console_t data_home_t:file { getattr ioctl open read };
+allow takwerx_console_t gconf_home_t:dir { getattr open read search };
+allow takwerx_console_t gconf_home_t:file { getattr ioctl map open read };
+
+# v1.1 (live harvest 2026-08-03): the console shells `ip` in-domain at some
+# call sites (route/addr inspection) — /usr/sbin/ip is ifconfig_exec_t, its own
+# policy type, so the bin_t exec rules do not cover it.
+allow takwerx_console_t ifconfig_exec_t:file { execute execute_no_trans getattr map open read };
 
 # corpus: 1,804/day name_connect to tcp:1880 — the Node-RED health/API probe.
 # 1880 has no SELinux port label (unreserved_port_t); this also covers the

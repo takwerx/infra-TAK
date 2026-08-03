@@ -986,7 +986,7 @@ install_selinux_console_policy() {
     if [ "$BORN_NONROOT" = "1" ] \
        && _install_selinux_module takwerx_console_confined "$INSTALL_DIR/selinux/takwerx_console_confined.te"; then
         CONFINED_POLICY_OK=1
-        echo "  ✓ SELinux confined console domain installed (takwerx_console_t, enforcing)"
+        echo "  ✓ SELinux confined console domain installed (takwerx_console_t, permissive until v1.2)"
     fi
 }
 
