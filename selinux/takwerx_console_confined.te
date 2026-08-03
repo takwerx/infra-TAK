@@ -1,4 +1,4 @@
-module takwerx_console_confined 1.7;
+module takwerx_console_confined 1.8;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -101,6 +101,19 @@ module takwerx_console_confined 1.7;
 #        STANDING CAVEAT for the enforce flip: the required allow set is the
 #        UNION across every module combination in the field. Any box running a
 #        module none of our test boxes runs can still surface new denials.
+#   1.8  10.1.18 — ROOT CAUSE of the label drift found, via the TVR install on
+#        the NUC (2026-08-03). Nearly every denial in that deploy had
+#        tcontext=user_home_dir_t: when the console creates a module tree under
+#        /home/takwerx, there is no type_transition for its domain, so the new
+#        files/dirs INHERIT the parent's directory type (user_home_dir_t) instead
+#        of user_home_t. That is why ~/CloudTAK, ~/tak-video-restreamer and
+#        friends are all mislabeled on arrival — the deploys were never at fault,
+#        the policy simply never said what a console-created home file should be.
+#        Fixed at the source with type_transition rules (below), so new module
+#        dirs are born correctly labeled; `_selinux_heal_module_dir_labels`
+#        (app.py) stays as the repair path for trees created before this.
+#        NB the drifted perms are ALSO granted below — a box keeps working in the
+#        window between an old deploy and its relabel.
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -124,6 +137,7 @@ module takwerx_console_confined 1.7;
 require {
 	type init_t;
 	type unconfined_service_t;
+	type ephemeral_port_t;
 	type fs_t;
 	type config_home_t;
 	type device_t;
@@ -187,7 +201,7 @@ require {
 	class dbus send_msg;
 	class dir { add_name create getattr open read remove_name rmdir search write };
 	class file { append create entrypoint execute execute_no_trans getattr ioctl lock map open read relabelfrom relabelto rename setattr unlink write };
-	class lnk_file read;
+	class lnk_file { getattr read };
 	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
 	class netlink_route_socket { bind create getattr getopt nlmsg_read setopt read write };
 	class icmp_socket { create getopt setopt read write bind getattr connect };
@@ -493,6 +507,25 @@ allow takwerx_console_t ssh_home_t:file ioctl;
 
 # --- `ps` stats the console's controlling terminal. Metadata only.
 allow takwerx_console_t tty_device_t:chr_file getattr;
+
+# --- v1.8: label the module trees we create CORRECTLY at creation time. ---
+# Without these, files the console creates under /home/takwerx inherit
+# user_home_dir_t from the parent and every later read of them denies. This is
+# the source-level fix for the drift the self-heal has been repairing.
+type_transition takwerx_console_t user_home_dir_t:dir user_home_t;
+type_transition takwerx_console_t user_home_dir_t:file user_home_t;
+type_transition takwerx_console_t user_home_dir_t:lnk_file user_home_t;
+
+# Interim + legacy: existing trees created BEFORE the transition rules above are
+# still user_home_dir_t until their relabel runs. Grant the operations the
+# console performs on its own module trees so those boxes keep working.
+allow takwerx_console_t user_home_dir_t:dir { add_name create getattr open read remove_name rmdir search write };
+allow takwerx_console_t user_home_dir_t:file { append create getattr ioctl map open read rename setattr unlink write };
+allow takwerx_console_t user_home_dir_t:lnk_file { getattr read };
+
+# Module services on high/ephemeral ports (TVR's API, dynamic container ports)
+# — the console health-checks them over TCP.
+allow takwerx_console_t ephemeral_port_t:tcp_socket name_connect;
 
 # --- v1.7 (aws-rocky module set) ---
 # The console READS the generated Caddyfile directly (_selinux_sync_caddy_ports
