@@ -778,20 +778,17 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.6"   # v10.1.15: promoted — PG conn-leak + dramatiq broker fixes (5.5/5.6). 60-min soak on 4 boxes 2026-07-30 (test6, test12, nuc/Rocky-nonroot, aws-arm/ARM64) all clean; PG-bounce test on test12 PASSED with 0 CRITICALs (the 5.4 yellow-flag dramatiq cluster did not reproduce — hold rationale resolved)
 AUTHENTIK_DEV_RELEASE    = "2026.5.6"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
-# CloudTAK version gate. v13.45 split the server into hub (stateful) / api (stateless) modes —
+# CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
-# contract and validated 13.49.0 end-to-end on test12 (plugins built, routes loaded, Events
-# CRUD in browser) — un-gated per operator decision 2026-07-17.
-CLOUDTAK_VETTED_RELEASE = "13.54.3"     # v10.1.9: 13.50.0 -> 13.54.3, validated 2026-07-26 on Ubuntu/Rocky/ARM64; pre-13.45 plugin installs refused
-                                        # The GATE STAYS. Operator decision 2026-07-26: keep gating CloudTAK
-                                        # and bump the vetted number deliberately. dfpc-coe ships fast (six
-                                        # releases 13.53.1 -> 13.54.3 in three days, 24-26 Jul) and 13.45's
-                                        # hub/api split already broke plugin server routes once — this pin is
-                                        # what keeps a customer clicking Update from landing on whatever
-                                        # merged that morning. Dev-channel boxes still track upstream latest,
-                                        # so the fleet runs ahead of the pin by design; bumping is a one-line
-                                        # change once it has been watched.
+# contract; pre-13.45 plugin installs are still refused (compatibility floor — unchanged).
+CLOUDTAK_VETTED_RELEASE = "13.54.3"     # OFFLINE FALLBACK ONLY since v10.1.17 — the CloudTAK version
+                                        # gate is REMOVED (operator decision 2026-08-02, reversing the
+                                        # 2026-07-26 "the gate stays": dfpc-coe ships too fast to keep
+                                        # bumping a pin by hand, and customers want the new builds).
+                                        # BOTH channels now deploy and update to upstream latest; this
+                                        # value is used only when the GitHub release lookup is
+                                        # unreachable. Bump to current latest when convenient.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -24954,16 +24951,14 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
 
 
 def _get_cloudtak_target_release_tag(settings=None, use_cache=True):
-    """Channel-target CloudTAK release tag (e.g. 'v13.44.0') — mirrors
-    _get_authentik_target_release. Main → the vetted pin, always (deterministic, no
-    GitHub dependency). Dev → upstream latest, falling back to the pin if GitHub is
-    unreachable. Deploy AND update both install this tag — a main-channel box must
-    never receive raw upstream latest (13.45+ breaks plugin compatibility)."""
-    s = settings if settings is not None else load_settings()
-    if (s.get('update_channel') or 'main').strip().lower() == 'dev':
-        tag = _get_cloudtak_latest_release_tag(use_cache=use_cache)
-        if tag:
-            return tag
+    """Target CloudTAK release tag (e.g. 'v13.54.3') — upstream latest on EVERY
+    channel (v10.1.17: version gate removed, operator decision 2026-08-02).
+    Falls back to CLOUDTAK_VETTED_RELEASE only when the GitHub release lookup is
+    unreachable, so offline deploys still work. Deploy AND update both install
+    this tag. `settings` kept for call-site signature compatibility."""
+    tag = _get_cloudtak_latest_release_tag(use_cache=use_cache)
+    if tag:
+        return tag
     return 'v' + CLOUDTAK_VETTED_RELEASE
 
 
@@ -25022,31 +25017,18 @@ def _get_cloudtak_version_info():
                 except Exception:
                     pass
 
-    # Channel-appropriate target (same model as Authentik): main → CLOUDTAK_VETTED_RELEASE
-    # (only what we pin and authorize), dev → upstream latest (dev boxes exist to test
-    # what's coming — anything past the main pin surfaces as an installable update).
-    out['latest'] = CLOUDTAK_VETTED_RELEASE
-    out['upstream_latest'] = None
+    # v10.1.17: version gate removed (operator decision 2026-08-02) — EVERY channel
+    # targets upstream latest, falling back to the offline pin when GitHub is
+    # unreachable. upstream_* fields kept for API-shape stability but no longer
+    # diverge from `latest` (the pin-vs-upstream distinction is gone).
+    _up = None
+    try:
+        _up = _get_cloudtak_latest_release_tag()
+    except Exception:
+        pass
+    out['latest'] = (_up or '').lstrip('vV') or CLOUDTAK_VETTED_RELEASE
+    out['upstream_latest'] = out['latest']
     out['upstream_newer'] = False
-    if _channel == 'dev':
-        try:
-            _up = _get_cloudtak_latest_release_tag()
-            if _up:
-                out['upstream_latest'] = _up.lstrip('vV')
-                _pin = tuple(int(x) for x in re.findall(r'\d+', CLOUDTAK_VETTED_RELEASE))
-                _ut = tuple(int(x) for x in re.findall(r'\d+', out['upstream_latest']))
-                if _ut > _pin:
-                    out['latest'] = out['upstream_latest']
-                    # v10.1.4: badge only when upstream is beyond what's INSTALLED.
-                    # Unlike Authentik/NetBird (dev installs a pin, so vs-pin is right),
-                    # CloudTAK's dev channel installs upstream latest — after an update
-                    # installed == upstream and '↑ available upstream' was stale noise
-                    # (test12 2026-07-17: showed '↑ v13.49.0' while running 13.49.0).
-                    _iv = tuple(int(x) for x in re.findall(r'\d+', out['version'])) if out['version'] else ()
-                    if not _iv or _ut > _iv:
-                        out['upstream_newer'] = True
-        except Exception:
-            pass
 
     # Compare installed vs target: only flag update_available if target > installed
     if out['version'] and out['latest']:
@@ -43611,7 +43593,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version_info and cloudtak_version_info.version %} <span class="os-badge" style="margin-left:6px;font-weight:500;font-size:14px">v{{ cloudtak_version_info.version }}</span>{% if cloudtak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:11px" title="Main/vetted channel is pinned to v{{ cloudtak_version_info.vetted_release }} — what production customers run">main: v{{ cloudtak_version_info.vetted_release }}</span>{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} · <span style="color:var(--cyan);font-size:12px" title="Update available — click Update to install v{{ cloudtak_version_info.latest }}">v{{ cloudtak_version_info.latest }} available</span>{% elif cloudtak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:11px" title="Upstream CloudTAK v{{ cloudtak_version_info.upstream_latest }} is newer than the vetted pin. v13.45+ requires plugin migration for the hub/api split — bump CLOUDTAK_VETTED_RELEASE only after plugins are validated. Not auto-installed.">↑ v{{ cloudtak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} · <span style="color:var(--cyan);font-size:12px" title="Update available — click Update to install v{{ cloudtak_version_info.latest }}">v{{ cloudtak_version_info.latest }} available</span>{% else %} · <span style="color:var(--green);font-size:11px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}</h1>
+    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version_info and cloudtak_version_info.version %} <span class="os-badge" style="margin-left:6px;font-weight:500;font-size:14px">v{{ cloudtak_version_info.version }}</span>{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} · <span style="color:var(--cyan);font-size:12px" title="Update available — click Update to install v{{ cloudtak_version_info.latest }}">v{{ cloudtak_version_info.latest }} available</span>{% else %} · <span style="color:var(--green);font-size:11px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% endif %}</h1>
     <p>Browser-based TAK client — in-browser map and situational awareness via TAK Server</p>
   </div>
 
@@ -71223,13 +71205,8 @@ function refreshModuleVersions(){
                 }
             }else if(key==='netbird'&&d.vetted&&!d.update_available){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
-            }else if(key==='cloudtak'&&d.channel==='dev'){
-                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
-                if(d.update_available){
-                    s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
-                }
-            }else if(key==='cloudtak'&&d.vetted_release&&!d.update_available){
-                s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
+            }else if(key==='cloudtak'&&d.latest&&!d.update_available){
+                s+=' <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>';
             }else if(d.update_available){
                 s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
             }else if(key==='authentik'&&d.ahead_of_vetted&&d.vetted_release){
