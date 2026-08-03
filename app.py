@@ -75390,6 +75390,18 @@ entries: []
 """
 
 
+# Set once module import finishes (after _startup_migrations + _post_update_auto_deploy
+# at the bottom of the file). The converge thread WAITS on this: on the first boot after
+# the 10.1.17 pull, the W4 env fixer inside _startup_migrations recreates server+worker
+# at the same moment the converge runs its `up -d` — two concurrent compose operations
+# collided on test6/test8 (T&E 2026-08-02: `up -d failed rc=1`, reclaim hit a postgres
+# mid-recreate, rule delete hit a 503 server). Serializing behind the import removes the
+# whole race class; the lock below additionally serializes the boot thread against the
+# run_authentik_deploy() invocation.
+_STARTUP_IMPORT_DONE = threading.Event()
+_AK_IDLE_CONVERGE_LOCK = threading.Lock()
+
+
 def _startup_authentik_idle_load_converge(log=None):
     """Apply W1/W2/W4/W5 of PLAN-v10.1.17 to the local Authentik install.
     Idempotent, never raises; every re-run re-verifies with canaries instead of
@@ -75411,222 +75423,256 @@ def _startup_authentik_idle_load_converge(log=None):
             _l('PyYAML unavailable — skipped (mount edits need parse-and-mutate)')
             return
 
-        patches_dir = os.path.join(ak_dir, 'patches')
-        broker_patch_path = os.path.join(patches_dir, 'broker.py')
+        # Wait for import (and thus every synchronous startup migration, incl. the W4
+        # env-fixer recreate) to finish before touching compose — see _STARTUP_IMPORT_DONE.
+        # Timeout is a deadlock backstop only; on timeout we proceed rather than never run.
+        if not _STARTUP_IMPORT_DONE.wait(timeout=1200):
+            _l('startup import still not done after 20 min — proceeding anyway (backstop)')
+        # Blocking acquire: a deploy-invoked pass queues behind the boot pass instead
+        # of skipping (both are idempotent; second pass is a fast no-op).
+        with _AK_IDLE_CONVERGE_LOCK:
 
-        # The worker container tells us which image the box actually runs (the
-        # compose tag alone can lie if the operator never pulled). At whole-box
-        # boot Authentik may still be starting — retry briefly, then proceed
-        # with what we can do without it.
-        img = ''
-        for _attempt in range(4):
-            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}}',
-                                           'authentik-worker-1']),
-                               capture_output=True, text=True, timeout=20)
-            if r.returncode == 0 and (r.stdout or '').strip():
-                img = r.stdout.strip()
-                break
-            time.sleep(30)
-        tag = img.rsplit(':', 1)[-1] if ':' in img else ''
+            patches_dir = os.path.join(ak_dir, 'patches')
+            broker_patch_path = os.path.join(patches_dir, 'broker.py')
 
-        with open(compose_path) as f:
-            compose_data = _yaml.safe_load(f.read())
-        if not isinstance(compose_data, dict):
-            _l('compose did not parse as a dict — skipped')
-            return
-        services = compose_data.setdefault('services', {})
-        worker_vols = (services.get('worker') or {}).get('volumes') or []
-        broker_mounted = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in worker_vols)
+            # The worker container tells us which image the box actually runs (the
+            # compose tag alone can lie if the operator never pulled). At whole-box
+            # boot Authentik may still be starting — retry briefly, then proceed
+            # with what we can do without it.
+            img = ''
+            for _attempt in range(4):
+                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}}',
+                                               'authentik-worker-1']),
+                                   capture_output=True, text=True, timeout=20)
+                if r.returncode == 0 and (r.stdout or '').strip():
+                    img = r.stdout.strip()
+                    break
+                time.sleep(30)
+            tag = img.rsplit(':', 1)[-1] if ':' in img else ''
 
-        # ── W1: decide desired broker.py mount state (True/False/None=leave alone) ──
-        broker_desired = None
-        if not img:
-            _l('W1: worker container not inspectable — leaving scheduler patch state unchanged')
-        elif not tag.startswith('2026.5'):
-            broker_desired = False
-            if broker_mounted:
-                _l(f'W1: image tag {tag or img} is outside 2026.5.x — retiring the scheduler patch mount')
-        elif broker_mounted and os.path.exists(broker_patch_path):
-            broker_desired = True  # already applied; canary below verifies it landed
-        else:
-            # Mount not yet active, so the container view of broker.py is the
-            # image's own file — grep it for the upstream typo.
-            g = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
-                                           _AK_BROKER_TYPO_LINE, _AK_BROKER_CONTAINER_PATH]),
-                               capture_output=True, text=True, timeout=30)
-            if g.returncode == 0:
-                c = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'cat',
-                                               _AK_BROKER_CONTAINER_PATH]),
+            with open(compose_path) as f:
+                compose_data = _yaml.safe_load(f.read())
+            if not isinstance(compose_data, dict):
+                _l('compose did not parse as a dict — skipped')
+                return
+            services = compose_data.setdefault('services', {})
+            worker_vols = (services.get('worker') or {}).get('volumes') or []
+            broker_mounted = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in worker_vols)
+
+            # ── W1: decide desired broker.py mount state (True/False/None=leave alone) ──
+            broker_desired = None
+            if not img:
+                _l('W1: worker container not inspectable — leaving scheduler patch state unchanged')
+            elif not tag.startswith('2026.5'):
+                broker_desired = False
+                if broker_mounted:
+                    _l(f'W1: image tag {tag or img} is outside 2026.5.x — retiring the scheduler patch mount')
+            elif broker_mounted and os.path.exists(broker_patch_path):
+                broker_desired = True  # already applied; canary below verifies it landed
+            else:
+                # Mount not yet active, so the container view of broker.py is the
+                # image's own file — grep it for the upstream typo.
+                g = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
+                                               _AK_BROKER_TYPO_LINE, _AK_BROKER_CONTAINER_PATH]),
                                    capture_output=True, text=True, timeout=30)
-                src = c.stdout or ''
-                if c.returncode == 0 and _AK_BROKER_TYPO_LINE in src:
-                    patched = src.replace(_AK_BROKER_TYPO_LINE, _AK_BROKER_FIXED_LINE)
-                    os.makedirs(patches_dir, exist_ok=True)
-                    with open(broker_patch_path, 'w') as f:
-                        f.write(patched)
-                    os.chmod(broker_patch_path, 0o644)
-                    broker_desired = True
-                    _l(f'W1: scheduler busy-loop typo confirmed in {img} — patched broker.py '
-                       f'written (schedule_last_run → scheduler_last_run)')
+                if g.returncode == 0:
+                    c = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'cat',
+                                                   _AK_BROKER_CONTAINER_PATH]),
+                                       capture_output=True, text=True, timeout=30)
+                    src = c.stdout or ''
+                    if c.returncode == 0 and _AK_BROKER_TYPO_LINE in src:
+                        patched = src.replace(_AK_BROKER_TYPO_LINE, _AK_BROKER_FIXED_LINE)
+                        os.makedirs(patches_dir, exist_ok=True)
+                        with open(broker_patch_path, 'w') as f:
+                            f.write(patched)
+                        os.chmod(broker_patch_path, 0o644)
+                        broker_desired = True
+                        _l(f'W1: scheduler busy-loop typo confirmed in {img} — patched broker.py '
+                           f'written (schedule_last_run → scheduler_last_run)')
+                    else:
+                        _l('W1: could not extract broker.py from the worker — leaving unchanged this boot')
+                elif g.returncode == 1:
+                    broker_desired = False
+                    _l(f'W1: {img} does not carry the scheduler typo — patch not needed')
                 else:
-                    _l('W1: could not extract broker.py from the worker — leaving unchanged this boot')
-            elif g.returncode == 1:
-                broker_desired = False
-                _l(f'W1: {img} does not carry the scheduler typo — patch not needed')
-            else:
-                # grep rc 2 = path missing (unknown layout) → per plan, do not patch.
-                broker_desired = False
-                _l(f'W1: broker.py not found at the known path in {img} (unknown layout) — not patching')
+                    # grep rc 2 = path missing (unknown layout) → per plan, do not patch.
+                    broker_desired = False
+                    _l(f'W1: broker.py not found at the known path in {img} (unknown layout) — not patching')
 
-        # ── Mutate compose volumes: W1 broker mount (tri-state) + W2 mask (always) ──
-        broker_mount = f'./patches/broker.py:{_AK_BROKER_CONTAINER_PATH}:ro'
-        events_mount = f'./patches/events-default.yaml:{_AK_EVENTS_BP_CONTAINER_PATH}:ro'
+            # ── Mutate compose volumes: W1 broker mount (tri-state) + W2 mask (always) ──
+            broker_mount = f'./patches/broker.py:{_AK_BROKER_CONTAINER_PATH}:ro'
+            events_mount = f'./patches/events-default.yaml:{_AK_EVENTS_BP_CONTAINER_PATH}:ro'
 
-        # W2 mask file — write/refresh before it is ever mounted.
-        os.makedirs(patches_dir, exist_ok=True)
-        events_mask_path = os.path.join(patches_dir, 'events-default.yaml')
-        _cur_mask = ''
-        if os.path.exists(events_mask_path):
+            # W2 mask file — write/refresh before it is ever mounted.
+            os.makedirs(patches_dir, exist_ok=True)
+            events_mask_path = os.path.join(patches_dir, 'events-default.yaml')
+            _cur_mask = ''
+            if os.path.exists(events_mask_path):
+                try:
+                    with open(events_mask_path) as f:
+                        _cur_mask = f.read()
+                except Exception:
+                    _cur_mask = ''
+            if _cur_mask != _AK_EVENTS_BP_MASK:
+                with open(events_mask_path, 'w') as f:
+                    f.write(_AK_EVENTS_BP_MASK)
+                os.chmod(events_mask_path, 0o644)
+                _l('W2: wrote empty-blueprint mask for events-default.yaml')
+
+            compose_changed = False
+            for _svc_name in ('server', 'worker'):
+                _svc = services.get(_svc_name)
+                if not isinstance(_svc, dict):
+                    continue
+                _vols = _svc.setdefault('volumes', [])
+                if not isinstance(_vols, list):
+                    continue
+                if not any(_AK_EVENTS_BP_CONTAINER_PATH in str(v) for v in _vols):
+                    _vols.append(events_mount)
+                    compose_changed = True
+                    _l(f'W2: added events-default.yaml mask mount to {_svc_name}')
+                _has_broker = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _vols)
+                if broker_desired is True and not _has_broker:
+                    _vols.append(broker_mount)
+                    compose_changed = True
+                    _l(f'W1: added broker.py patch mount to {_svc_name}')
+                elif broker_desired is False and _has_broker:
+                    _svc['volumes'] = [v for v in _vols if _AK_BROKER_CONTAINER_PATH not in str(v)]
+                    compose_changed = True
+                    _l(f'W1: removed broker.py patch mount from {_svc_name}')
+
+            if compose_changed:
+                with open(compose_path, 'w') as f:
+                    _yaml.safe_dump(compose_data, f, default_flow_style=False, sort_keys=False,
+                                    allow_unicode=True, width=200)
+
+            # W5 (jit=off via the ladder tail) + any drifted tuning — same guarded
+            # "compose changed" path, so it lands in the same single up -d below.
+            if _ensure_authentik_compose_patches(compose_path, lambda m: _l(f'W5/tuning: {m.strip()}')):
+                compose_changed = True
+
+            # Canary — never assume a mount landed: if compose declares a mount but
+            # the RUNNING container doesn't show its content, the recreate never
+            # happened (a previous up -d failed) → force one now.
+            force_up = False
+            if img and not compose_changed:
+                try:
+                    with open(compose_path) as f:
+                        _now = _yaml.safe_load(f.read()) or {}
+                    _wv = ((_now.get('services') or {}).get('worker') or {}).get('volumes') or []
+                    if any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _wv):
+                        k = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
+                                                       _AK_BROKER_FIXED_LINE, _AK_BROKER_CONTAINER_PATH]),
+                                           capture_output=True, text=True, timeout=30)
+                        if k.returncode == 1:
+                            force_up = True
+                            _l('W1 canary: compose has the patch mount but the worker still runs the typo — forcing up -d')
+                    if any(_AK_EVENTS_BP_CONTAINER_PATH in str(v) for v in _wv):
+                        k = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
+                                                       'entries: []', _AK_EVENTS_BP_CONTAINER_PATH]),
+                                           capture_output=True, text=True, timeout=30)
+                        if k.returncode == 1:
+                            force_up = True
+                            _l('W2 canary: compose has the mask mount but the worker still sees the stock blueprint — forcing up -d')
+                except Exception:
+                    pass
+
+            # ── ONE compose apply for everything above ──
+            if compose_changed or force_up:
+                _l('applying compose changes — one `docker compose up -d` (recreates only changed services)')
+                r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                                   capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    # Tail, not head — compose streams progress first, the error is at the end.
+                    _l(f'up -d failed rc={r.returncode}: …{((r.stderr or r.stdout) or "")[-300:]} '
+                       f'— canary re-forces next boot')
+                else:
+                    _l('compose applied')
+
+            # ── W2: delete the stock rules via API AFTER the bounce, once the server
+            # answers (the mask mount is live by now, so nothing recreates them).
+            # T&E 2026-08-02: deleting before the bounce 503'd on all five boxes (the
+            # env-fixer recreate / our own up -d had the server mid-boot) and the rules
+            # survived the whole soak — hence the readiness retry here, not next-boot.
             try:
-                with open(events_mask_path) as f:
-                    _cur_mask = f.read()
-            except Exception:
-                _cur_mask = ''
-        if _cur_mask != _AK_EVENTS_BP_MASK:
-            with open(events_mask_path, 'w') as f:
-                f.write(_AK_EVENTS_BP_MASK)
-            os.chmod(events_mask_path, 0o644)
-            _l('W2: wrote empty-blueprint mask for events-default.yaml')
+                ak_url, ak_headers, _ak_settings = _w1_ak_ctx()
+                if ak_url:
+                    _deleted, _last_err = 0, ''
+                    for _attempt in range(20):  # up to ~10 min for a post-bounce server
+                        try:
+                            _rules = _w1_ak_get(ak_url, 'events/rules/?page_size=100',
+                                                ak_headers).get('results', [])
+                            for _rule in _rules:
+                                if str(_rule.get('name') or '').startswith('default-notify-'):
+                                    _ak_api_call(f'{ak_url}/api/v3/events/rules/{_rule.get("pk")}/',
+                                                 method='DELETE', headers=ak_headers)
+                                    _deleted += 1
+                            _last_err = ''
+                            break
+                        except Exception as _re:
+                            _last_err = str(_re)[:100]
+                            time.sleep(30)
+                    if _deleted:
+                        _l(f'W2: deleted {_deleted} stock default-notify-* notification rules '
+                           f'(no destination group — pure no-op task fan-out; Guard Dog owns alerting)')
+                    elif _last_err:
+                        _l(f'W2: rule delete failed after retries ({_last_err}) — retries next boot')
+            except Exception as _e:
+                _l(f'W2: rule delete skipped this pass ({str(_e)[:100]}) — retries next boot')
 
-        compose_changed = False
-        for _svc_name in ('server', 'worker'):
-            _svc = services.get(_svc_name)
-            if not isinstance(_svc, dict):
-                continue
-            _vols = _svc.setdefault('volumes', [])
-            if not isinstance(_vols, list):
-                continue
-            if not any(_AK_EVENTS_BP_CONTAINER_PATH in str(v) for v in _vols):
-                _vols.append(events_mount)
-                compose_changed = True
-                _l(f'W2: added events-default.yaml mask mount to {_svc_name}')
-            _has_broker = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _vols)
-            if broker_desired is True and not _has_broker:
-                _vols.append(broker_mount)
-                compose_changed = True
-                _l(f'W1: added broker.py patch mount to {_svc_name}')
-            elif broker_desired is False and _has_broker:
-                _svc['volumes'] = [v for v in _vols if _AK_BROKER_CONTAINER_PATH not in str(v)]
-                compose_changed = True
-                _l(f'W1: removed broker.py patch mount from {_svc_name}')
-
-        if compose_changed:
-            with open(compose_path, 'w') as f:
-                _yaml.safe_dump(compose_data, f, default_flow_style=False, sort_keys=False,
-                                allow_unicode=True, width=200)
-
-        # W5 (jit=off via the ladder tail) + any drifted tuning — same guarded
-        # "compose changed" path, so it lands in the same single up -d below.
-        if _ensure_authentik_compose_patches(compose_path, lambda m: _l(f'W5/tuning: {m.strip()}')):
-            compose_changed = True
-
-        # Canary — never assume a mount landed: if compose declares a mount but
-        # the RUNNING container doesn't show its content, the recreate never
-        # happened (a previous up -d failed) → force one now.
-        force_up = False
-        if img and not compose_changed:
+            # ── W4: one-time legacy event-backlog reclaim (marker-gated) ──
             try:
-                with open(compose_path) as f:
-                    _now = _yaml.safe_load(f.read()) or {}
-                _wv = ((_now.get('services') or {}).get('worker') or {}).get('volumes') or []
-                if any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _wv):
-                    k = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
-                                                   _AK_BROKER_FIXED_LINE, _AK_BROKER_CONTAINER_PATH]),
-                                       capture_output=True, text=True, timeout=30)
-                    if k.returncode == 1:
-                        force_up = True
-                        _l('W1 canary: compose has the patch mount but the worker still runs the typo — forcing up -d')
-                if any(_AK_EVENTS_BP_CONTAINER_PATH in str(v) for v in _wv):
-                    k = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
-                                                   'entries: []', _AK_EVENTS_BP_CONTAINER_PATH]),
-                                       capture_output=True, text=True, timeout=30)
-                    if k.returncode == 1:
-                        force_up = True
-                        _l('W2 canary: compose has the mask mount but the worker still sees the stock blueprint — forcing up -d')
-            except Exception:
-                pass
-
-        # ── W2: delete the stock rules via API BEFORE the bounce (server is up now;
-        # the mask keeps them from coming back after it). Re-checked every boot, so a
-        # failed attempt here just retries next time.
-        try:
-            ak_url, ak_headers, _ak_settings = _w1_ak_ctx()
-            if ak_url:
-                _deleted = 0
-                for _rule in _w1_ak_get(ak_url, 'events/rules/?page_size=100',
-                                        ak_headers).get('results', []):
-                    if str(_rule.get('name') or '').startswith('default-notify-'):
-                        _ak_api_call(f'{ak_url}/api/v3/events/rules/{_rule.get("pk")}/',
-                                     method='DELETE', headers=ak_headers)
-                        _deleted += 1
-                if _deleted:
-                    _l(f'W2: deleted {_deleted} stock default-notify-* notification rules '
-                       f'(no destination group — pure no-op task fan-out; Guard Dog owns alerting)')
-        except Exception as _e:
-            _l(f'W2: rule delete skipped this pass ({str(_e)[:100]}) — retries next boot')
-
-        # ── ONE compose apply for everything above ──
-        if compose_changed or force_up:
-            _l('applying compose changes — one `docker compose up -d` (recreates only changed services)')
-            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
-                               capture_output=True, text=True, timeout=600)
-            if r.returncode != 0:
-                _l(f'up -d failed rc={r.returncode}: {((r.stderr or r.stdout) or "")[:300]} '
-                   f'— canary re-forces next boot')
-            else:
-                _l('compose applied')
-
-        # ── W4: one-time legacy event-backlog reclaim (marker-gated) ──
-        try:
-            _s = load_settings()
-            if not (_s.get('ak_event_backlog_reclaimed') or {}).get('done'):
-                _days = int(AK_EVENT_RETENTION.split('=')[1])
-                _batch_sql = ('DELETE FROM authentik_events_event WHERE id IN '
-                              '(SELECT id FROM authentik_events_event '
-                              f"WHERE created < now() - interval '{_days} days' LIMIT 10000);")
-                _total, _failed = 0, False
-                for _i in range(500):  # hard cap (5M rows) — a runaway backstop, not a target
-                    r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1',
-                                                   'psql', '-U', 'authentik', '-d', 'authentik',
-                                                   '-c', _batch_sql]),
-                                       capture_output=True, text=True, timeout=120)
-                    if r.returncode != 0:
-                        _failed = True
-                        _l(f'W4: reclaim batch failed ({((r.stderr or r.stdout) or "")[:150]}) '
-                           f'— marker NOT set, retries next boot')
-                        break
-                    _m = re.search(r'DELETE (\d+)', (r.stdout or ''))
-                    _n = int(_m.group(1)) if _m else 0
-                    _total += _n
-                    if _n == 0:
-                        break
-                    time.sleep(0.5)  # batched precisely so PG never sees one giant delete
-                if not _failed:
-                    if _total:
-                        subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1',
-                                                   'psql', '-U', 'authentik', '-d', 'authentik',
-                                                   '-c', 'VACUUM ANALYZE authentik_events_event;']),
-                                       capture_output=True, text=True, timeout=600)
-                    _s = load_settings()
-                    _s['ak_event_backlog_reclaimed'] = {
-                        'done': True, 'rows': _total,
-                        'utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
-                    save_settings(_s)
-                    _l(f'W4: legacy event backlog reclaimed — {_total} rows older than '
-                       f'{_days}d deleted, VACUUM ANALYZE done' if _total else
-                       'W4: no legacy event backlog to reclaim — marker set')
-        except Exception as _e:
-            _l(f'W4: reclaim skipped this pass ({str(_e)[:120]}) — retries next boot')
+                _s = load_settings()
+                if not (_s.get('ak_event_backlog_reclaimed') or {}).get('done'):
+                    # If the up -d above recreated postgres (jit=off), give it time to
+                    # come back before the first batch (T&E 2026-08-02: reclaim fired
+                    # into a mid-recreate postgres and burned its once-per-boot shot).
+                    for _attempt in range(10):  # up to ~5 min
+                        _pr = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1',
+                                                         'pg_isready', '-U', 'authentik']),
+                                             capture_output=True, text=True, timeout=20)
+                        if _pr.returncode == 0:
+                            break
+                        time.sleep(30)
+                    _days = int(AK_EVENT_RETENTION.split('=')[1])
+                    # PK is event_uuid (Django UUID pk — there is NO id column;
+                    # verified live on test6, T&E 2026-08-02).
+                    _batch_sql = ('DELETE FROM authentik_events_event WHERE event_uuid IN '
+                                  '(SELECT event_uuid FROM authentik_events_event '
+                                  f"WHERE created < now() - interval '{_days} days' LIMIT 10000);")
+                    _total, _failed = 0, False
+                    for _i in range(500):  # hard cap (5M rows) — a runaway backstop, not a target
+                        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1',
+                                                       'psql', '-U', 'authentik', '-d', 'authentik',
+                                                       '-c', _batch_sql]),
+                                           capture_output=True, text=True, timeout=120)
+                        if r.returncode != 0:
+                            _failed = True
+                            _l(f'W4: reclaim batch failed ({((r.stderr or r.stdout) or "")[:150]}) '
+                               f'— marker NOT set, retries next boot')
+                            break
+                        _m = re.search(r'DELETE (\d+)', (r.stdout or ''))
+                        _n = int(_m.group(1)) if _m else 0
+                        _total += _n
+                        if _n == 0:
+                            break
+                        time.sleep(0.5)  # batched precisely so PG never sees one giant delete
+                    if not _failed:
+                        if _total:
+                            subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1',
+                                                       'psql', '-U', 'authentik', '-d', 'authentik',
+                                                       '-c', 'VACUUM ANALYZE authentik_events_event;']),
+                                           capture_output=True, text=True, timeout=600)
+                        _s = load_settings()
+                        _s['ak_event_backlog_reclaimed'] = {
+                            'done': True, 'rows': _total,
+                            'utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
+                        save_settings(_s)
+                        _l(f'W4: legacy event backlog reclaimed — {_total} rows older than '
+                           f'{_days}d deleted, VACUUM ANALYZE done' if _total else
+                           'W4: no legacy event backlog to reclaim — marker set')
+            except Exception as _e:
+                _l(f'W4: reclaim skipped this pass ({str(_e)[:120]}) — retries next boot')
     except Exception as _e:
         try:
             _l(f'error (non-fatal): {str(_e)[:200]}')
@@ -79730,6 +79776,12 @@ except Exception as _e:
 
 _startup_migrations()
 _post_update_auto_deploy()
+
+# v10.1.17: release the AK idle-load converge thread — every synchronous startup
+# migration (incl. the W4 env-fixer server+worker recreate) and any post-update
+# auto-deploy has finished, so its compose operations can no longer collide with
+# ours (the test6/test8 first-boot race, T&E 2026-08-02).
+_STARTUP_IMPORT_DONE.set()
 
 # Universal firewall: on RHEL, ensure the ufw→firewalld translation shim is present so
 # every module deploy's `ufw ...` call drives firewalld (state-safe — installs a script,
