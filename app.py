@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.16-alpha"
+VERSION = "10.1.17-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -4707,6 +4707,25 @@ AK_WEBAUTHN_FRIENDLY = 'Use a Passkey'
 # per-operator value, no max(cur,target)); applied as an idempotent startup migration on EVERY
 # box (pure load/hygiene fix, posture-independent). See memory authentik-event-retention-pg-cpu.
 AK_EVENT_RETENTION = 'days=30'
+
+# v10.1.17 W3 — LDAP bind-cache session duration is a fleet-uniform constant. The LDAP
+# provider (bind_mode: cached) re-runs the FULL ldap-authentication-flow every time the
+# User Login stage's session expires; at the old seconds=120 that meant ~30 fresh binds/hour
+# per credential set of pure ambient load, each one a `login` event fanning out through the
+# event pipeline (PLAN-v10.1.17 §3c — fleet-wide idle CPU burn). hours=1 is the
+# CJIS-defensible balance: an LDAP-side password change/revocation takes up to 1h to bite
+# for an already-cached credential set (was 2 min); anything longer needs a revocation-
+# latency signoff first. Web SSO flows are untouched (ldap-authentication-flow is dedicated).
+# KEEP IN SYNC with the two blueprint literals (`session_duration: hours=1` in the local and
+# remote tak-ldap-setup.yaml templates) — those are plain strings and cannot interpolate this.
+AK_LDAP_SESSION_DURATION = 'hours=1'
+
+# v10.1.17 W4 — finished-task retention for the 2026.5 postgres-backed worker queue.
+# Stock AUTHENTIK_WORKER__TASK_EXPIRATION=days=30 held ~59k `done` rows per box in
+# authentik_tasks_task, scanned by every purge/schedule pass. 3 days keeps a real
+# debugging window while shrinking the table ~10×.
+# https://docs.goauthentik.io/install-config/configuration/
+AK_TASK_EXPIRATION = 'days=3'
 
 def _ensure_authentik_login_copy(log=None):
     """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
@@ -47388,6 +47407,7 @@ AUTHENTIK_SECRET_KEY={secret_key}
 COMPOSE_PORT_HTTP=9090
 COMPOSE_PORT_HTTPS=9443
 AUTHENTIK_ERROR_REPORTING__ENABLED=false
+AUTHENTIK_WORKER__TASK_EXPIRATION={AK_TASK_EXPIRATION}
 AUTHENTIK_BOOTSTRAP_PASSWORD={bootstrap_pass}
 AUTHENTIK_BOOTSTRAP_TOKEN={bootstrap_token}
 AUTHENTIK_BOOTSTRAP_EMAIL=admin@takwerx.local
@@ -47502,7 +47522,7 @@ entries:
       geoip_binding: bind_continent
       network_binding: bind_asn
       remember_me_offset: seconds=0
-      session_duration: seconds=120
+      session_duration: hours=1
     identifiers:
       name: ldap-authentication-login
     model: authentik_stages_user_login.userloginstage
@@ -47626,7 +47646,7 @@ entries:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
     shm_size: 256m
-    command: postgres -c max_connections=2000 -c shared_buffers=12GB -c effective_cache_size=36GB -c work_mem=16MB -c maintenance_work_mem=2GB -c wal_buffers=64MB -c max_wal_size=4GB -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=2000 -c shared_buffers=12GB -c effective_cache_size=36GB -c work_mem=16MB -c maintenance_work_mem=2GB -c wal_buffers=64MB -c max_wal_size=4GB -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6 -c jit=off
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -50655,6 +50675,10 @@ def _authentik_apply_official_tunings(plog):
         # now handled properly by _f2b_ensure_authentik_logrotate() rather than by
         # throwing away the security events.
         ('AUTHENTIK_LOG_LEVEL', 'info', 'log level info (upstream default) — REQUIRED: the Authentik fail2ban jail matches logger.info("invalid_login"); at warning it can never fire'),
+        # v10.1.17 W4: shrink authentik_tasks_task ~10× — see AK_TASK_EXPIRATION.
+        # Double-underscore name per upstream config docs (the single-underscore
+        # AUTHENTIK_WEB_WORKERS lesson above); verify with `ak dump_config`.
+        ('AUTHENTIK_WORKER__TASK_EXPIRATION', AK_TASK_EXPIRATION, 'expire finished worker task rows after 3 days (stock 30d held ~59k done rows scanned by every purge/schedule pass)'),
     ]
     for key, value, description in target_settings:
         existing = next((ln for ln in new_lines if re.match(rf'^{re.escape(key)}\s*=', ln)), None)
@@ -50879,9 +50903,12 @@ _AUTHENTIK_PG_COMMAND_ENTERPRISE = (
     ' -c tcp_keepalives_idle=60'
     ' -c tcp_keepalives_interval=10'
     ' -c tcp_keepalives_count=6'
+    ' -c jit=off'
 )
 
 # Shared timeout/keepalive tail — identical across every PG tier.
+# jit=off (v10.1.17 W5): PG JIT compilation degrades authentik workloads
+# (upstream goauthentik #24179, open — jit=off is the documented workaround).
 _AUTHENTIK_PG_COMMAND_TAIL = (
     ' -c statement_timeout=120s'
     ' -c idle_session_timeout=300s'
@@ -50889,6 +50916,7 @@ _AUTHENTIK_PG_COMMAND_TAIL = (
     ' -c tcp_keepalives_idle=60'
     ' -c tcp_keepalives_interval=10'
     ' -c tcp_keepalives_count=6'
+    ' -c jit=off'
 )
 
 
@@ -56284,6 +56312,8 @@ AUTHENTIK_SECRET_KEY={secret_key}
 COMPOSE_PORT_HTTP=9090
 COMPOSE_PORT_HTTPS=9443
 AUTHENTIK_ERROR_REPORTING__ENABLED=false
+# v10.1.17 W4: expire finished worker task rows after 3 days (stock 30d bloats authentik_tasks_task)
+AUTHENTIK_WORKER__TASK_EXPIRATION={AK_TASK_EXPIRATION}
 # Bootstrap (first run only - sets akadmin password and API token)
 AUTHENTIK_BOOTSTRAP_PASSWORD={bootstrap_pass}
 AUTHENTIK_BOOTSTRAP_TOKEN={bootstrap_token}
@@ -56417,7 +56447,7 @@ entries:
       geoip_binding: bind_continent
       network_binding: bind_asn
       remember_me_offset: seconds=0
-      session_duration: seconds=120
+      session_duration: hours=1
     identifiers:
       name: ldap-authentication-login
     model: authentik_stages_user_login.userloginstage
@@ -57641,6 +57671,15 @@ entries:
             plog("  ✓ redis + pgbouncer up inline — no restart needed")
         except Exception as _opt_e:
             plog(f"  ⚠ inline redis/pgbouncer optimize skipped (next console restart retries): {str(_opt_e)[:160]}")
+        # v10.1.17: idle-load converge (W1 scheduler patch, W2 blueprint mask + rule delete,
+        # W5 jit=off, W4 backlog reclaim) — same function the boot thread runs, so a fresh
+        # deploy reaches the exact same state as an updated box without waiting for the
+        # next console restart. Never fails the deploy.
+        try:
+            plog("  Applying Authentik idle-load converge (v10.1.17)...")
+            _startup_authentik_idle_load_converge(log=plog)
+        except Exception as _ilc_e:
+            plog(f"  ⚠ idle-load converge skipped (next console restart retries): {str(_ilc_e)[:160]}")
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -59759,7 +59798,7 @@ def _ensure_ldap_flow_authentication_none():
                 login_stage = _find_stage('stages/user_login/', 'ldap-authentication-login')
                 if not login_stage:
                     login_stage = _create_ldap_stage('stages/user_login/', 'ldap-authentication-login', {
-                        'session_duration': 'seconds=120', 'remember_me_offset': 'seconds=0'})
+                        'session_duration': AK_LDAP_SESSION_DURATION, 'remember_me_offset': 'seconds=0'})
                 if id_stage and pw_stage and login_stage:
                     existing_orders = {b.get('order') for b in ldap_bindings}
                     binding_specs = [(10, id_stage), (15, pw_stage), (20, login_stage)]
@@ -59774,12 +59813,19 @@ def _ensure_ldap_flow_authentication_none():
                                 pass
                 else:
                     return False, f'LDAP stages not found/created: id={id_stage} pw={pw_stage} login={login_stage}'
-            # Always enforce short session_duration on ldap-authentication-login so password
-            # changes propagate within 2 minutes (cached bind mode caches for session lifetime)
+            # v10.1.17 W3: enforce the fleet bind-cache constant on ldap-authentication-login
+            # (cached bind mode caches for session lifetime — see AK_LDAP_SESSION_DURATION for
+            # the seconds=120 → hours=1 rationale and the revocation-latency trade-off).
+            # Read-compare-PATCH so live boxes CONVERGE when the value drifts, and boots where
+            # it already matches stay write-free.
             _login_stage_pk = _find_stage('stages/user_login/', 'ldap-authentication-login')
             if _login_stage_pk:
                 try:
-                    _patch(f'stages/user_login/{_login_stage_pk}/', {'session_duration': 'seconds=120'})
+                    _live_sd = _get(f'stages/user_login/{_login_stage_pk}/').get('session_duration')
+                    if _live_sd != AK_LDAP_SESSION_DURATION:
+                        _patch(f'stages/user_login/{_login_stage_pk}/',
+                               {'session_duration': AK_LDAP_SESSION_DURATION})
+                        print(f'  LDAP bind-cache session_duration {_live_sd} → {AK_LDAP_SESSION_DURATION} (v10.1.17 W3)', flush=True)
                 except urllib.error.HTTPError:
                     pass
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
@@ -75281,6 +75327,315 @@ def _startup_resync_ldap_service_account():
 # ongoing safety net, so deferring the one-shot boot heal off the critical path is safe.
 threading.Thread(target=_startup_resync_ldap_service_account, daemon=True,
                  name='startup-ldap-sa-resync').start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v10.1.17 — Authentik idle-load converge (PLAN-v10.1.17)
+#
+# One idempotent converge for the three multipliers that made Authentik burn
+# ~1 full core fleet-wide at idle (2026-08-02 incident, all boxes at once):
+#   W1  scheduler busy-loop — upstream one-char typo in 2026.5.x
+#       django_dramatiq_postgres/broker.py writes `self.schedule_last_run`
+#       (missing the trailing r) so the 60s scheduler gate is permanently
+#       expired and every consumer wakeup runs the scheduler. Fixed only on
+#       upstream main; no released fix exists (2026.5.6 is newest). We byte-
+#       patch the one line and bind-mount the corrected file :ro over the
+#       container path. Guarded: applies only on 2026.5.x images that carry
+#       the typo, and self-retires the mount on any image outside 2026.5.x —
+#       the patch must never survive an image that no longer needs it.
+#   W2  ×4 notification-rule task fan-out — the 4 stock default-notify-* rules
+#       have no destination group, so every event enqueues 4 handler tasks that
+#       conclude "notify nobody" (67% of all worker tasks measured). Deleting
+#       the rules via API alone does not stick: blueprints/default/
+#       events-default.yaml recreates them on every apply — so we ALSO mask
+#       that file with a valid empty blueprint (an empty FILE fails blueprint
+#       validation; it must parse with version/metadata/entries).
+#   W5  jit=off rides along via _ensure_authentik_compose_patches (the ladder
+#       tail now carries it — upstream #24179 workaround).
+#   W4  one-time legacy event-backlog reclaim: pre-v0.9.56 events were stamped
+#       with 365d expiry, so the days=30 retention constant never touched them
+#       (~150k rows on aged boxes). Batched DELETE (id IN … LIMIT 10000 — PG
+#       has no LIMIT on DELETE) + VACUUM ANALYZE, marker-gated in settings so
+#       it runs once. Never touches rows younger than AK_EVENT_RETENTION.
+#
+# ALL compose changes land in ONE `docker compose up -d` — several separate
+# bounces is exactly the chain-restart spiral risk this fleet has been burned
+# by ([[authentik-2026-dramatiq-worker-spiral]]).
+#
+# Runs as a daemon thread at boot (skips silently when Authentik absent) and
+# synchronously at the end of run_authentik_deploy() so fresh deploys converge
+# without waiting for the next console restart. Fleet-uniform: every action
+# writes the fleet constant; no max(cur, target) anywhere.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_AK_BROKER_CONTAINER_PATH = ('/ak-root/packages/django-dramatiq-postgres/'
+                             'django_dramatiq_postgres/broker.py')
+_AK_BROKER_TYPO_LINE = 'self.schedule_last_run = timezone.now()'
+_AK_BROKER_FIXED_LINE = 'self.scheduler_last_run = timezone.now()'
+_AK_EVENTS_BP_CONTAINER_PATH = '/blueprints/default/events-default.yaml'
+
+# Valid EMPTY blueprint — masks upstream events-default.yaml so the stock
+# default-notify-* rules are never recreated. Must parse as a blueprint
+# (version/metadata/entries); a zero-byte file fails validation and the
+# upstream default would win again.
+_AK_EVENTS_BP_MASK = """# infra-TAK v10.1.17 (PLAN-v10.1.17 W2): masks upstream events-default.yaml.
+# The stock default-notify-* rules have no destination group — every event
+# fanned out 4 no-op handler tasks (67% of worker load). Guard Dog owns
+# alerting on this stack; Authentik admin-UI notifications are deliberately
+# retired. Managed by the console idle-load converge — do not edit.
+version: 1
+metadata:
+  name: Default - Events notification transports and rules (masked by infra-TAK)
+entries: []
+"""
+
+
+def _startup_authentik_idle_load_converge(log=None):
+    """Apply W1/W2/W4/W5 of PLAN-v10.1.17 to the local Authentik install.
+    Idempotent, never raises; every re-run re-verifies with canaries instead of
+    assuming a prior pass landed. Silent no-op when Authentik is not installed."""
+    def _l(m):
+        line = f'AK idle-load converge: {m}'
+        if log:
+            log(f'  {line}')
+        print(line, flush=True)
+
+    try:
+        ak_dir = os.path.expanduser('~/authentik')
+        compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+        if not (os.path.exists(os.path.join(ak_dir, '.env')) and os.path.exists(compose_path)):
+            return  # Authentik absent — silent skip
+        try:
+            import yaml as _yaml
+        except ImportError:
+            _l('PyYAML unavailable — skipped (mount edits need parse-and-mutate)')
+            return
+
+        patches_dir = os.path.join(ak_dir, 'patches')
+        broker_patch_path = os.path.join(patches_dir, 'broker.py')
+
+        # The worker container tells us which image the box actually runs (the
+        # compose tag alone can lie if the operator never pulled). At whole-box
+        # boot Authentik may still be starting — retry briefly, then proceed
+        # with what we can do without it.
+        img = ''
+        for _attempt in range(4):
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}}',
+                                           'authentik-worker-1']),
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode == 0 and (r.stdout or '').strip():
+                img = r.stdout.strip()
+                break
+            time.sleep(30)
+        tag = img.rsplit(':', 1)[-1] if ':' in img else ''
+
+        with open(compose_path) as f:
+            compose_data = _yaml.safe_load(f.read())
+        if not isinstance(compose_data, dict):
+            _l('compose did not parse as a dict — skipped')
+            return
+        services = compose_data.setdefault('services', {})
+        worker_vols = (services.get('worker') or {}).get('volumes') or []
+        broker_mounted = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in worker_vols)
+
+        # ── W1: decide desired broker.py mount state (True/False/None=leave alone) ──
+        broker_desired = None
+        if not img:
+            _l('W1: worker container not inspectable — leaving scheduler patch state unchanged')
+        elif not tag.startswith('2026.5'):
+            broker_desired = False
+            if broker_mounted:
+                _l(f'W1: image tag {tag or img} is outside 2026.5.x — retiring the scheduler patch mount')
+        elif broker_mounted and os.path.exists(broker_patch_path):
+            broker_desired = True  # already applied; canary below verifies it landed
+        else:
+            # Mount not yet active, so the container view of broker.py is the
+            # image's own file — grep it for the upstream typo.
+            g = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
+                                           _AK_BROKER_TYPO_LINE, _AK_BROKER_CONTAINER_PATH]),
+                               capture_output=True, text=True, timeout=30)
+            if g.returncode == 0:
+                c = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'cat',
+                                               _AK_BROKER_CONTAINER_PATH]),
+                                   capture_output=True, text=True, timeout=30)
+                src = c.stdout or ''
+                if c.returncode == 0 and _AK_BROKER_TYPO_LINE in src:
+                    patched = src.replace(_AK_BROKER_TYPO_LINE, _AK_BROKER_FIXED_LINE)
+                    os.makedirs(patches_dir, exist_ok=True)
+                    with open(broker_patch_path, 'w') as f:
+                        f.write(patched)
+                    os.chmod(broker_patch_path, 0o644)
+                    broker_desired = True
+                    _l(f'W1: scheduler busy-loop typo confirmed in {img} — patched broker.py '
+                       f'written (schedule_last_run → scheduler_last_run)')
+                else:
+                    _l('W1: could not extract broker.py from the worker — leaving unchanged this boot')
+            elif g.returncode == 1:
+                broker_desired = False
+                _l(f'W1: {img} does not carry the scheduler typo — patch not needed')
+            else:
+                # grep rc 2 = path missing (unknown layout) → per plan, do not patch.
+                broker_desired = False
+                _l(f'W1: broker.py not found at the known path in {img} (unknown layout) — not patching')
+
+        # ── Mutate compose volumes: W1 broker mount (tri-state) + W2 mask (always) ──
+        broker_mount = f'./patches/broker.py:{_AK_BROKER_CONTAINER_PATH}:ro'
+        events_mount = f'./patches/events-default.yaml:{_AK_EVENTS_BP_CONTAINER_PATH}:ro'
+
+        # W2 mask file — write/refresh before it is ever mounted.
+        os.makedirs(patches_dir, exist_ok=True)
+        events_mask_path = os.path.join(patches_dir, 'events-default.yaml')
+        _cur_mask = ''
+        if os.path.exists(events_mask_path):
+            try:
+                with open(events_mask_path) as f:
+                    _cur_mask = f.read()
+            except Exception:
+                _cur_mask = ''
+        if _cur_mask != _AK_EVENTS_BP_MASK:
+            with open(events_mask_path, 'w') as f:
+                f.write(_AK_EVENTS_BP_MASK)
+            os.chmod(events_mask_path, 0o644)
+            _l('W2: wrote empty-blueprint mask for events-default.yaml')
+
+        compose_changed = False
+        for _svc_name in ('server', 'worker'):
+            _svc = services.get(_svc_name)
+            if not isinstance(_svc, dict):
+                continue
+            _vols = _svc.setdefault('volumes', [])
+            if not isinstance(_vols, list):
+                continue
+            if not any(_AK_EVENTS_BP_CONTAINER_PATH in str(v) for v in _vols):
+                _vols.append(events_mount)
+                compose_changed = True
+                _l(f'W2: added events-default.yaml mask mount to {_svc_name}')
+            _has_broker = any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _vols)
+            if broker_desired is True and not _has_broker:
+                _vols.append(broker_mount)
+                compose_changed = True
+                _l(f'W1: added broker.py patch mount to {_svc_name}')
+            elif broker_desired is False and _has_broker:
+                _svc['volumes'] = [v for v in _vols if _AK_BROKER_CONTAINER_PATH not in str(v)]
+                compose_changed = True
+                _l(f'W1: removed broker.py patch mount from {_svc_name}')
+
+        if compose_changed:
+            with open(compose_path, 'w') as f:
+                _yaml.safe_dump(compose_data, f, default_flow_style=False, sort_keys=False,
+                                allow_unicode=True, width=200)
+
+        # W5 (jit=off via the ladder tail) + any drifted tuning — same guarded
+        # "compose changed" path, so it lands in the same single up -d below.
+        if _ensure_authentik_compose_patches(compose_path, lambda m: _l(f'W5/tuning: {m.strip()}')):
+            compose_changed = True
+
+        # Canary — never assume a mount landed: if compose declares a mount but
+        # the RUNNING container doesn't show its content, the recreate never
+        # happened (a previous up -d failed) → force one now.
+        force_up = False
+        if img and not compose_changed:
+            try:
+                with open(compose_path) as f:
+                    _now = _yaml.safe_load(f.read()) or {}
+                _wv = ((_now.get('services') or {}).get('worker') or {}).get('volumes') or []
+                if any(_AK_BROKER_CONTAINER_PATH in str(v) for v in _wv):
+                    k = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
+                                                   _AK_BROKER_FIXED_LINE, _AK_BROKER_CONTAINER_PATH]),
+                                       capture_output=True, text=True, timeout=30)
+                    if k.returncode == 1:
+                        force_up = True
+                        _l('W1 canary: compose has the patch mount but the worker still runs the typo — forcing up -d')
+                if any(_AK_EVENTS_BP_CONTAINER_PATH in str(v) for v in _wv):
+                    k = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-worker-1', 'grep', '-qF',
+                                                   'entries: []', _AK_EVENTS_BP_CONTAINER_PATH]),
+                                       capture_output=True, text=True, timeout=30)
+                    if k.returncode == 1:
+                        force_up = True
+                        _l('W2 canary: compose has the mask mount but the worker still sees the stock blueprint — forcing up -d')
+            except Exception:
+                pass
+
+        # ── W2: delete the stock rules via API BEFORE the bounce (server is up now;
+        # the mask keeps them from coming back after it). Re-checked every boot, so a
+        # failed attempt here just retries next time.
+        try:
+            ak_url, ak_headers, _ak_settings = _w1_ak_ctx()
+            if ak_url:
+                _deleted = 0
+                for _rule in _w1_ak_get(ak_url, 'events/rules/?page_size=100',
+                                        ak_headers).get('results', []):
+                    if str(_rule.get('name') or '').startswith('default-notify-'):
+                        _ak_api_call(f'{ak_url}/api/v3/events/rules/{_rule.get("pk")}/',
+                                     method='DELETE', headers=ak_headers)
+                        _deleted += 1
+                if _deleted:
+                    _l(f'W2: deleted {_deleted} stock default-notify-* notification rules '
+                       f'(no destination group — pure no-op task fan-out; Guard Dog owns alerting)')
+        except Exception as _e:
+            _l(f'W2: rule delete skipped this pass ({str(_e)[:100]}) — retries next boot')
+
+        # ── ONE compose apply for everything above ──
+        if compose_changed or force_up:
+            _l('applying compose changes — one `docker compose up -d` (recreates only changed services)')
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                _l(f'up -d failed rc={r.returncode}: {((r.stderr or r.stdout) or "")[:300]} '
+                   f'— canary re-forces next boot')
+            else:
+                _l('compose applied')
+
+        # ── W4: one-time legacy event-backlog reclaim (marker-gated) ──
+        try:
+            _s = load_settings()
+            if not (_s.get('ak_event_backlog_reclaimed') or {}).get('done'):
+                _days = int(AK_EVENT_RETENTION.split('=')[1])
+                _batch_sql = ('DELETE FROM authentik_events_event WHERE id IN '
+                              '(SELECT id FROM authentik_events_event '
+                              f"WHERE created < now() - interval '{_days} days' LIMIT 10000);")
+                _total, _failed = 0, False
+                for _i in range(500):  # hard cap (5M rows) — a runaway backstop, not a target
+                    r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1',
+                                                   'psql', '-U', 'authentik', '-d', 'authentik',
+                                                   '-c', _batch_sql]),
+                                       capture_output=True, text=True, timeout=120)
+                    if r.returncode != 0:
+                        _failed = True
+                        _l(f'W4: reclaim batch failed ({((r.stderr or r.stdout) or "")[:150]}) '
+                           f'— marker NOT set, retries next boot')
+                        break
+                    _m = re.search(r'DELETE (\d+)', (r.stdout or ''))
+                    _n = int(_m.group(1)) if _m else 0
+                    _total += _n
+                    if _n == 0:
+                        break
+                    time.sleep(0.5)  # batched precisely so PG never sees one giant delete
+                if not _failed:
+                    if _total:
+                        subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1',
+                                                   'psql', '-U', 'authentik', '-d', 'authentik',
+                                                   '-c', 'VACUUM ANALYZE authentik_events_event;']),
+                                       capture_output=True, text=True, timeout=600)
+                    _s = load_settings()
+                    _s['ak_event_backlog_reclaimed'] = {
+                        'done': True, 'rows': _total,
+                        'utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
+                    save_settings(_s)
+                    _l(f'W4: legacy event backlog reclaimed — {_total} rows older than '
+                       f'{_days}d deleted, VACUUM ANALYZE done' if _total else
+                       'W4: no legacy event backlog to reclaim — marker set')
+        except Exception as _e:
+            _l(f'W4: reclaim skipped this pass ({str(_e)[:120]}) — retries next boot')
+    except Exception as _e:
+        try:
+            _l(f'error (non-fatal): {str(_e)[:200]}')
+        except Exception:
+            pass
+
+
+threading.Thread(target=_startup_authentik_idle_load_converge, daemon=True,
+                 name='startup-ak-idle-load-converge').start()
 
 
 def _fail2ban_install_and_configure(plog):
