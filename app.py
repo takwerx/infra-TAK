@@ -929,6 +929,15 @@ def main():
             (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
             (r'\bdef api_share_links_revoke\s*\(', ('/api/share-links/revoke', 'share-links/revoke'), 'api_share_links_revoke_core'),
     ):
+        # Idempotency guard (2026-08-03 field crash, test6): once this endpoint
+        # is stamped anywhere, later runs must SKIP the target entirely. Without
+        # this, run 2 can't re-find the (now endpoint=-carrying) hinted route,
+        # falls through to the nearest-route fallback below, and stamps an
+        # UNRELATED decorator with a duplicate endpoint -> Flask AssertionError
+        # -> editor crash-loop on every start (upstream v2.1.0 put its new
+        # /api/playback-mode POST route inside the 20-line window).
+        if ("endpoint='" + endpoint_val + "'") in src:
+            continue
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
                 continue
@@ -1003,6 +1012,7 @@ MEDIAMTX_REMOTE_EP_PATCH_SCRIPT = (
     "with open(f) as h: src=h.read()\n"
     "lines=src.splitlines(keepends=True)\n"
     "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
+    " if \"endpoint='\"+ev+\"'\" in src: continue\n"
     " for i in range(len(lines)-1,-1,-1):\n"
     "  if not re.search(dp,lines[i]): continue\n"
     "  for j in range(i-1,max(-1,i-20),-1):\n"
@@ -50609,6 +50619,23 @@ def _heal_container_ports_loopback(plog=None):
                 subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                                capture_output=True, text=True, timeout=60)
                 _log("container-ports: mediamtx-webeditor overlay refreshed (loopback bind) + restarted")
+            # 2026-08-03 field crash (test6): the pre-guard ep-patch double-ran and
+            # stamped the editor's /api/playback-mode POST route (upstream v2.1.0)
+            # with the share-links endpoint -> duplicate Flask endpoint -> editor
+            # crash-loop on every start. The guard above stops NEW damage; this
+            # heals the exact known mangle already on disk. Exact-string on
+            # purpose: any other duplicate shape should surface, not be guessed at.
+            ed = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+            bad = "@app.route('/api/playback-mode', methods=['POST'], endpoint='api_share_links_list_core')"
+            try:
+                ed_src = _read_priv(ed)
+            except Exception:
+                ed_src = ''
+            if bad in ed_src:
+                _write_priv(ed, ed_src.replace(bad, "@app.route('/api/playback-mode', methods=['POST'])"))
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, text=True, timeout=60)
+                _log("container-ports: mediamtx-webeditor duplicate-endpoint mangle healed + restarted")
     except Exception as e:
         _log(f"container-ports: mediamtx-webeditor loopback heal skipped (non-fatal): {str(e)[:140]}")
 
