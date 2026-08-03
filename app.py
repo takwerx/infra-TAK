@@ -941,32 +941,32 @@ def main():
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
                 continue
+            # Walk ONLY this def's contiguous decorator block (the lines
+            # directly above it, each starting with '@'). The old 20-line
+            # window could reach a NEIGHBOURING route's decorators — that is
+            # exactly how the 2026-08-03 test6 crash happened (upstream v2.1.0
+            # put /api/playback-mode POST inside the window and it got stamped
+            # with the share-links endpoint -> duplicate -> Flask refused the
+            # app). Prefer the hinted route line; else the block's only
+            # unstamped @app.route; else stamp NOTHING (a miss is safe — the
+            # duplicate-endpoint symptom this patch exists for surfaces loudly).
+            block = []
             j = i - 1
-            while j >= 0 and j >= i - 20:
-                line = lines[j]
-                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
-                    if line.rstrip().endswith(')'):
-                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                    else:
-                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                    src = ''.join(lines)
-                    changed = True
-                    break
+            while j >= 0 and lines[j].lstrip().startswith('@'):
+                block.append(j)
                 j -= 1
-            else:
-                # Fallback: patch the nearest @app.route above this def (same route block)
-                j = i - 1
-                while j >= 0 and j >= i - 20:
-                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
-                        l = lines[j]
-                        if l.rstrip().endswith(')'):
-                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                        else:
-                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                        src = ''.join(lines)
-                        changed = True
-                        break
-                    j -= 1
+            route_js = [k for k in block if '@app.route' in lines[k] and 'endpoint=' not in lines[k]]
+            hinted = [k for k in route_js if any(h in lines[k] for h in route_hints)]
+            pick = hinted or route_js
+            if pick:
+                k = pick[0]
+                l = lines[k]
+                if l.rstrip().endswith(')'):
+                    lines[k] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                else:
+                    lines[k] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                src = ''.join(lines)
+                changed = True
             break
 
     # 5. No-cache headers so browsers/proxies never serve stale editor pages
@@ -1011,18 +1011,25 @@ MEDIAMTX_REMOTE_EP_PATCH_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
     "with open(f) as h: src=h.read()\n"
     "lines=src.splitlines(keepends=True)\n"
-    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
+    # NB escaping: this script reaches the target as a FILE (python3 /tmp/<name>.py,
+    # app.py ~26727 — no shell layer), so regexes here need SINGLE logical
+    # backslashes (\\b in this source = \b in the written file). The old
+    # quadruple-escaped patterns (\\\\bdef -> literal backslash in the regex)
+    # never matched anything — the remote ep-patch was a silent no-op.
+    "for (dp,rh,ev) in [(r'\\bdef shared_stream_page\\s*\\(',('/shared/',),'shared_stream_page_core'),(r'\\bdef shared_hls_proxy\\s*\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\bdef api_share_links_list\\s*\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\bdef api_share_links_generate\\s*\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\bdef api_share_links_revoke\\s*\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
     " if \"endpoint='\"+ev+\"'\" in src: continue\n"
     " for i in range(len(lines)-1,-1,-1):\n"
     "  if not re.search(dp,lines[i]): continue\n"
-    "  for j in range(i-1,max(-1,i-20),-1):\n"
-    "   L=lines[j]\n"
-    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
-    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
-    "  else:\n"
-    "   for j in range(i-1,max(-1,i-20),-1):\n"
-    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
-    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+    "  blk=[]\n"
+    "  j=i-1\n"
+    "  while j>=0 and lines[j].lstrip().startswith('@'):\n"
+    "   blk.append(j); j-=1\n"
+    "  rjs=[k for k in blk if '@app.route' in lines[k] and 'endpoint=' not in lines[k]]\n"
+    "  hin=[k for k in rjs if any(h in lines[k] for h in rh)]\n"
+    "  pick=hin or rjs\n"
+    "  if pick:\n"
+    "   k=pick[0]; L=lines[k]\n"
+    "   lines[k]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"\n"
     "  break\n"
     "with open(f,'w') as h: h.write(''.join(lines))\n"
 )
