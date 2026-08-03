@@ -1,4 +1,4 @@
-module takwerx_console_confined 1.1;
+module takwerx_console_confined 1.2;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -31,6 +31,17 @@ module takwerx_console_confined 1.1;
 #        live harvest — gconf_home_t (~/.local policy-default label), proc
 #        ioctl (psutil), ifconfig_exec_t (`ip` in-domain), self:tcp_socket
 #        shutdown (ldapsearch child), domain tcp/udp socket getattr (`ss`).
+#   1.2  10.1.18 A3 harvest (2026-08-03, 40 min permissive on the live fleet).
+#        aws-rocky reached **ZERO** denials on 1.1; the NUC's remaining traffic
+#        (it runs CloudTAK + Caddy + the GD ping monitor) gave the last families:
+#        httpd_exec_t (`which caddy` / `caddy validate`), self:icmp_socket (GD
+#        ping — the 1.0 comment claiming "no socket rule needed" was WRONG, the
+#        corpus simply never showed it), self:netlink_route_socket (hostname /
+#        ip / ldapsearch), ldap port 389 name_connect, config_home_t (git),
+#        and device-mapper reads (findmnt / keytool disk probes).
+#        NOT fixed by a rule: ~/CloudTAK/docker-compose.yml carries
+#        user_home_dir_t (a DIRECTORY type on a file = label drift) — that is a
+#        relabel job (`restorecon`), never an allow rule for a wrong label.
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -55,8 +66,14 @@ require {
 	type init_t;
 	type unconfined_service_t;
 	type fs_t;
+	type config_home_t;
+	type device_t;
+	type fixed_disk_device_t;
 	type gconf_home_t;
+	type httpd_exec_t;
 	type ifconfig_exec_t;
+	type ldap_port_t;
+	type sysfs_t;
 	type user_home_t;
 	type user_home_dir_t;
 	type bin_t;
@@ -81,7 +98,6 @@ require {
 	type ssh_home_t;
 	type sssd_public_t;
 	type sssd_var_lib_t;
-	type sysfs_t;
 	type system_dbusd_t;
 	type system_dbusd_var_run_t;
 	type systemd_systemctl_exec_t;
@@ -98,13 +114,16 @@ require {
 	class file { create entrypoint execute execute_no_trans getattr ioctl lock map open read relabelfrom relabelto rename setattr unlink write };
 	class lnk_file read;
 	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
+	class netlink_route_socket { bind create getattr getopt nlmsg_read setopt read write };
+	class icmp_socket { create getopt setopt read write bind getattr connect };
+	class blk_file { getattr open read };
 	class process getattr;
 	class sock_file { getattr write };
 	class system status;
 	class tcp_socket { accept bind connect create getattr getopt ioctl listen name_bind name_connect node_bind setopt shutdown };
 	class udp_socket { connect create getattr setopt };
 	class unix_stream_socket { connectto getattr ioctl };
-	class process { transition dyntransition siginh rlimitinh noatsecure sigchld };
+	class process { transition dyntransition siginh rlimitinh noatsecure sigchld setcap };
 	class filesystem getattr;
 }
 
@@ -272,3 +291,42 @@ allow takwerx_console_t selinux_config_t:dir search;
 allow takwerx_console_t selinux_config_t:file { getattr open read };
 allow takwerx_console_t security_t:dir search;
 allow takwerx_console_t security_t:file { getattr map open read };
+
+# --- v1.2: the A3 harvest (see History). Each rule = an observed, legitimate
+# console operation on the live fleet under permissive. ---
+
+# `which caddy` (126/40min) + `caddy validate|version` self-exec (104/40min).
+# The COPR caddy rpm labels the binary httpd_exec_t — its OWN policy type, so
+# neither bin_t nor the shell rules above reach it. execute_no_trans keeps caddy
+# in the console's domain rather than transitioning to httpd_t.
+allow takwerx_console_t httpd_exec_t:file { execute execute_no_trans getattr map open read };
+
+# Guard Dog's network monitor pings in-domain (92/40min ×3 perms). v1.0 asserted
+# "no icmp rule needed — the corpus showed none"; that was an artifact of the
+# corpus being top-N filtered, not evidence of absence. EL9 does NOT grant this
+# broadly to a custom domain.
+allow takwerx_console_t self:icmp_socket { bind connect create getattr getopt setopt read write };
+
+# `hostname` (20/40min ×4), `ip` and `ldapsearch` (16/40min) each open a netlink
+# route socket for interface/route enumeration — standard libc/NSS behaviour for
+# in-domain helpers.
+allow takwerx_console_t self:netlink_route_socket { bind create getattr getopt nlmsg_read read setopt write };
+
+# `ldapsearch` reaching Authentik's LDAP outpost (389) for the SA bind check.
+allow takwerx_console_t ldap_port_t:tcp_socket name_connect;
+
+# git reads ~/.config (config_home_t) for its own configuration.
+allow takwerx_console_t config_home_t:dir { getattr open read search };
+allow takwerx_console_t config_home_t:file { getattr open read };
+
+# Disk-layout probes: `findmnt` resolves /dev/dm-0 and its /sys name symlink;
+# keytool stats the same sysfs node. Read-only device metadata for the
+# disk-reclaim detector and the cert tooling — no device WRITE is granted.
+allow takwerx_console_t fixed_disk_device_t:blk_file { getattr open read };
+allow takwerx_console_t device_t:lnk_file read;
+allow takwerx_console_t sysfs_t:lnk_file read;
+allow takwerx_console_t sysfs_t:dir { getattr open read search };
+
+# `ip` probes its own capability set at startup; the console never needs `ip` to
+# SET capabilities, so silence it rather than grant it (88/40min of pure noise).
+dontaudit takwerx_console_t self:process setcap;
