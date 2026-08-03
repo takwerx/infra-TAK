@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.17-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.17-alpha)**
+**Current release: [v10.1.18-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.18-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.18-alpha — 2026-08-03 — CloudTAK Events actually reach the field, and a one-click certificate that makes them work
+
+**Headline: CloudTAK's new Core Events feature needs a specific kind of TAK certificate to deliver anything, and this release generates it for you in one click.** CloudTAK 13.59 and newer republishes each Event as a live map marker to the channels you assign it — but it does that over a single administrative certificate, and it *silently skips* any channel that certificate cannot see. With an ordinary user certificate, you create an Event, nothing appears on anyone's map, and nothing anywhere reports an error. The CloudTAK page now has a **Generate CloudTAK Bootstrap Admin p12** button that creates a certificate with exactly the right properties, so Events reach every channel on the server — including channels you create later. Already running CloudTAK? Generate it, then swap it once under CloudTAK Admin → Server; no reinstall and no re-bootstrap. The setup guide has been rewritten around the new step. **Also in this release:** the MediaMTX web editor could enter a restart loop after an editor update, which took every video page offline (watch pages, share links, HLS) — that's fixed at the cause, and Guard Dog now watches the editor and alerts you if it ever goes down, which it previously did not. On Red Hat and Rocky systems, the console's security confinement received a full round of hardening: module folders were being created with incorrect security labels, which is now corrected at the source and repaired automatically on existing systems, and the constant background security logging (tens of thousands of entries a day on some systems) is gone — noticeably less idle CPU on smaller hardware. **Who should update:** anyone running CloudTAK 13.59+ who wants Events to work, anyone using the video restreamer, and all Rocky/RHEL installations. **Upgrade:** automatic on the next console update.
+
+Full notes: [v10.1.18-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.18-alpha).
 
 ### v10.1.17-alpha — 2026-08-03 — The identity server stops burning a CPU core doing nothing, and CloudTAK follows upstream releases directly
 
