@@ -1,26 +1,41 @@
-module takwerx_console_confined 0.3;
+module takwerx_console_confined 1.0;
 
 ########################################
-# infra-TAK console — CONFINED SELinux domain (v10.0.5 hardening)
+# infra-TAK console — CONFINED SELinux domain (ENFORCING as of v1.0 / 10.1.18)
 #
 # Moves the non-root console OFF unconfined_service_t into `takwerx_console_t`.
 # The console is a thin Flask/gunicorn app; ALL genuinely-privileged work happens
 # in the SEPARATE root broker process, so the console itself needs comparatively
 # little — which is what makes confining it feasible.
 #
-# STATUS: PERMISSIVE first cut. The allow-rules below the structural block are the
-# RAW audit2allow harvest from a full deploy + console exercise on Rocky 9.8 — i.e.
-# "make it run", NOT yet security-minimised. Before this domain is ENFORCED it
-# needs TIGHTENING + review (operator/security):
-#   - it still allows exec of shell_exec_t/bin_t/systemd_systemctl_exec_t/
-#     container_runtime_exec_t (sh/python/systemctl/docker, execute_no_trans) —
-#     scope these to only what the console truly needs.
-#   - usr_t relabelfrom/relabelto + write/create/rename — tighten to .config only.
-#   - process getattr on every domain (reads /proc/<pid> for all procs = Guard Dog
-#     health monitoring) — consider a dedicated subdomain or `domain_read_all_*`.
-#   - prefer SELinux booleans/interfaces over broad allows where possible.
-# Until tightened it ships `permissive takwerx_console_t` (logs, never blocks), so
-# it can NEVER brick the console. Built raw (checkmodule -M -m) — no make dep.
+# STATUS v1.0: ENFORCING. The `permissive takwerx_console_t` line is GONE.
+# History:
+#   0.2  first harvest (audit2allow, full deploy exercise on Rocky 9.8)
+#   0.3  10.1.9 W5: NUC live-denial harvest (broker connectto vs
+#        unconfined_service_t, ~/.local site-packages, fs_t statfs, shim exec)
+#   1.0  10.1.18: 24h NUC AVC corpus (2026-08-02/03, ~100 would-deny/min,
+#        50–70k/day) translated into the reviewed rules marked "corpus:" below,
+#        then `permissive` removed. Every corpus line was a legitimate console
+#        operation — no dontaudit rules were needed (nothing observed was
+#        benign-but-deniable; it was all required function).
+#
+# Delivery: start.sh installs on provision; on EXISTING boxes the root broker
+# refreshes this module at daemon startup when the shipped version differs from
+# the /etc/selinux/.takwerx-takwerx_console_confined.ver stamp (broker rides the
+# console update + restarts on source change), and the console verifies with a
+# read-only canary at boot (never assumes the module loaded).
+#
+# KILL SWITCH (SSH, root) if enforcing ever wedges a box:
+#   semanage permissive -a takwerx_console_t     # domain back to log-only
+#   (revert with: semanage permissive -d takwerx_console_t)
+#
+# Known-broad rules kept DELIBERATELY (harvested from real deploy exercises; a
+# non-validatable tightening is riskier than the documented breadth — console
+# writes its own install tree, spawns git/tar/openssl in-domain):
+#   - bin_t/shell_exec_t/systemctl/docker-client exec (execute_no_trans)
+#   - usr_t write/create/rename/relabel (the /opt/infratak install tree)
+#   - process getattr on every domain (Guard Dog health monitor reads /proc)
+# Built raw (checkmodule -M -m) — no make dep.
 ########################################
 
 require {
@@ -34,13 +49,21 @@ require {
 	type cgroup_t;
 	type commplex_link_port_t;
 	type container_runtime_exec_t;
+	type data_home_t;
 	type http_port_t;
 	type init_var_run_t;
+	type ld_so_t;
 	type net_conf_t;
 	type node_t;
 	type passwd_file_t;
+	type ping_exec_t;
 	type proc_t;
+	type rpm_exec_t;
+	type rpm_var_lib_t;
+	type security_t;
+	type selinux_config_t;
 	type shell_exec_t;
+	type ssh_home_t;
 	type sssd_public_t;
 	type sssd_var_lib_t;
 	type sysfs_t;
@@ -49,6 +72,7 @@ require {
 	type systemd_systemctl_exec_t;
 	type systemd_unit_file_t;
 	type tmp_t;
+	type unreserved_port_t;
 	type usr_t;
 	type var_run_t;
 	type websm_port_t;
@@ -56,7 +80,7 @@ require {
 	role system_r;
 	class dbus send_msg;
 	class dir { add_name getattr open read remove_name search write };
-	class file { create entrypoint execute execute_no_trans getattr ioctl map open read relabelfrom relabelto rename setattr unlink write };
+	class file { create entrypoint execute execute_no_trans getattr ioctl lock map open read relabelfrom relabelto rename setattr unlink write };
 	class lnk_file read;
 	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
 	class process getattr;
@@ -66,9 +90,6 @@ require {
 	class udp_socket { connect create getattr setopt };
 	class unix_stream_socket { connectto getattr ioctl };
 	class process { transition dyntransition siginh rlimitinh noatsecure sigchld };
-	class file entrypoint;
-	class sock_file write;
-	class unix_stream_socket connectto;
 	class filesystem getattr;
 }
 
@@ -76,9 +97,7 @@ type takwerx_console_t;
 typeattribute takwerx_console_t domain;
 role system_r types takwerx_console_t;
 
-# PERMISSIVE while harvested rules are tightened. Removing this single line (after
-# tightening + a clean enforcing validation) enforces the domain.
-permissive takwerx_console_t;
+# v1.0: `permissive takwerx_console_t;` REMOVED — the domain now enforces.
 
 # --- structural: systemd launch transition + broker-socket connect ---
 allow init_t takwerx_console_t:process { transition dyntransition siginh rlimitinh noatsecure };
@@ -92,8 +111,9 @@ allow init_t user_home_t:lnk_file read;
 allow takwerx_console_t var_run_t:sock_file write;
 allow takwerx_console_t init_t:unix_stream_socket connectto;
 # v0.3 (10.1.9 W5): the broker daemon itself runs unconfined_service_t — connectto
-# resolves against the LISTENER's domain, not the socket file. Harvested live on
-# the NUC (Rocky 9, permissive churn: 4312 hits on this one rule).
+# resolves against the LISTENER's domain, not the socket file.
+# corpus: 4,084/day connectto /run/takwerx-broker.sock — the top denial; every
+# privileged console op crosses this edge.
 allow takwerx_console_t unconfined_service_t:unix_stream_socket connectto;
 
 # --- health-monitor: read /proc state of EVERY process. Collapsed from ~25
@@ -117,7 +137,7 @@ allow takwerx_console_t shell_exec_t:file { execute execute_no_trans map };
 allow takwerx_console_t container_runtime_exec_t:file { execute execute_no_trans getattr open read map };
 allow takwerx_console_t systemd_systemctl_exec_t:file { execute execute_no_trans open read map };
 
-# --- HARVESTED resource-specific rules (audit2allow; still to be minimised) ---
+# --- HARVESTED resource-specific rules (0.2/0.3 audit2allow; field-derived) ---
 allow takwerx_console_t cert_t:dir { getattr open read search };
 allow takwerx_console_t cert_t:file { getattr open read };
 allow takwerx_console_t cert_t:lnk_file read;
@@ -150,15 +170,69 @@ allow takwerx_console_t systemd_unit_file_t:file { getattr ioctl open read };
 allow takwerx_console_t tmp_t:dir { add_name remove_name write };
 allow takwerx_console_t tmp_t:file { create open setattr unlink write };
 allow takwerx_console_t user_home_dir_t:dir { getattr search };
+# corpus: 3,894/day getattr /home/takwerx + 2,772/day getattr ~/CloudTAK +
+# 2,730/day getattr ~/CloudTAK/docker-compose.yml + ~13k/day ~/.local
+# site-packages dir walks (search/getattr/read/open) — module detection +
+# python's sys.path scan. On the NUC ~/.local carries user_home_t (created by
+# then-unconfined processes; default-context relabel never ran).
 allow takwerx_console_t user_home_t:dir { getattr open read search };
 allow takwerx_console_t user_home_t:file { getattr ioctl open read };
 allow takwerx_console_t usr_t:dir { add_name remove_name write };
 allow takwerx_console_t usr_t:file { create entrypoint execute execute_no_trans relabelfrom relabelto rename setattr unlink write };
 allow takwerx_console_t var_run_t:sock_file getattr;
 allow takwerx_console_t websm_port_t:tcp_socket name_connect;
-# v0.3 (10.1.9 W5) — remaining NUC-harvest gaps that flooded setroubleshoot:
-#   ~/.local site-packages imports (dir open/read above), statfs on / (df calls),
-#   `which`-style stat/read of bin_t helpers, and exec of the /opt/infratak/.shims
-#   wrappers via bash (usr_t execute_no_trans above).
+# corpus: 2,930/day getattr filesystem / — psutil/df disk gauges.
 allow takwerx_console_t fs_t:filesystem getattr;
+# corpus: 2,748/2,744/2,712/day `which caddy` getattr/execute/read on
+# /usr/bin/caddy (bin_t — the COPR rpm ships no policy) + 1,784/1,770/day caddy
+# open/map of its own binary when the console runs `caddy validate/version`.
 allow takwerx_console_t bin_t:file { getattr open read };
+
+# --- v1.0 additions — each translated from the 24h NUC corpus (2026-08-02/03) ---
+
+# corpus: ~1,854/day bash getattr/read/execute /usr/bin/rpm + rpm
+# open/map/execute_no_trans of itself — the RHEL package-presence probes
+# (`rpm -q ...`) behind module detection. rpm_exec_t is rpm's own policy type,
+# so the bin_t exec rules above do NOT cover it. Read-only queries; `lock` is
+# sqlite's mandatory flock companion to the observed open/map of rpmdb.sqlite
+# (1,848–1,854/day) — without it every rpm -q fails under enforcing.
+allow takwerx_console_t rpm_exec_t:file { execute execute_no_trans getattr map open read };
+allow takwerx_console_t rpm_var_lib_t:dir { getattr open read search };
+allow takwerx_console_t rpm_var_lib_t:file { getattr ioctl lock map open read };
+
+# corpus: 1,852/day search + 1,828/day getattr on ~/.ssh/infratak_anchor — the
+# connectivity-anchor SSH identity (~/.ssh is ssh_home_t, not user_home_t).
+# Read-only: the console reads the key to hand it to ssh; it never writes here
+# (key creation is a provision-time root op).
+allow takwerx_console_t ssh_home_t:dir { getattr open read search };
+allow takwerx_console_t ssh_home_t:file { getattr open read };
+
+# Companion to the user_home_t ~/.local rules above: on a box where ~/.local
+# carries its POLICY-DEFAULT label (data_home_t — any box that ever ran
+# restorecon on /home), the same python sys.path scan denies against
+# data_home_t instead. Same operation, both observed labels covered.
+allow takwerx_console_t data_home_t:dir { getattr open read search };
+allow takwerx_console_t data_home_t:file { getattr ioctl open read };
+
+# corpus: 1,804/day name_connect to tcp:1880 — the Node-RED health/API probe.
+# 1880 has no SELinux port label (unreserved_port_t); this also covers the
+# console's other unlabeled module-port probes (18554 restreamer, 8446 cert
+# enroll, …) — same operation family, one rule.
+allow takwerx_console_t unreserved_port_t:tcp_socket name_connect;
+
+# corpus: 1,790/day ×4 — Guard Dog's network monitor execs /usr/bin/ping
+# (ping_exec_t, its own policy type) in-domain, incl. ping's direct exec of
+# /lib64/ld-linux-x86-64.so.2 (ld_so_t). No transition to ping_t: the console
+# stays accountable for the probe. ICMP socket use showed zero denials in the
+# corpus (EL9 grants dgram icmp_socket broadly), so no socket rule is added.
+allow takwerx_console_t ping_exec_t:file { execute execute_no_trans getattr map open read };
+allow takwerx_console_t ld_so_t:file execute;
+
+# NEW IN v1.0 (not corpus-derivable — the mechanism ships with this version):
+# the console's enforce canary reads the /etc/selinux/.takwerx-*.ver stamps
+# (selinux_config_t) and calls getenforce/selinuxenabled (libselinux reads
+# /sys/fs/selinux — security_t). Read-only; policy WRITES stay root/broker-side.
+allow takwerx_console_t selinux_config_t:dir search;
+allow takwerx_console_t selinux_config_t:file { getattr open read };
+allow takwerx_console_t security_t:dir search;
+allow takwerx_console_t security_t:file { getattr map open read };

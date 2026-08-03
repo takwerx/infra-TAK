@@ -2493,6 +2493,96 @@ def _do_enforce_enable(req):
                      else 'opted in; will enforce once the audit window is clean — %s' % rd['reason'])}
 
 
+def _selinux_policy_converge():
+    """v10.1.18 (SELinux enforce-the-domain): refresh the console's shipped
+    SELinux modules on EXISTING boxes. start.sh installs them at provision time,
+    but the console-update path never re-runs start.sh, so .te version bumps
+    (0.2 -> 0.3 -> 1.0/enforcing) historically only reached freshly-provisioned
+    boxes — the NUC burned 50-70k would-deny AVCs/day on a stale module for
+    three weeks. The broker daemon executes from the repo and is restarted onto
+    new source by the console's boot converge (app.py
+    _broker_converge_running_source), so THIS hook runs root-side on every
+    update that changes broker code, and the console's read-only canary
+    (_startup_selinux_policy_canary) requests one extra broker restart for
+    .te-only bumps. REFRESH-ONLY by design: a module a box was never
+    provisioned with (root installs) is not first-installed here. Not a client
+    op — no rulebook surface is added.
+    """
+    if os.geteuid() != 0 or not shutil.which('getenforce'):
+        return
+    try:
+        r = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=10)
+        if (r.stdout or '').strip() == 'Disabled':
+            return
+    except Exception:
+        return
+    selinux_dir = os.path.join(os.path.dirname(os.path.dirname(SELF_PATH)), 'selinux')
+    try:
+        listed = subprocess.run(['semodule', '-l'], capture_output=True, text=True,
+                                timeout=60).stdout or ''
+    except Exception as e:
+        AUDIT.info(json.dumps({'op': 'selinux-policy', 'verdict': 'ERROR',
+                               'summary': f'semodule -l failed: {e}'}))
+        return
+    installed = {ln.strip().split()[0] for ln in listed.splitlines() if ln.strip()}
+    for name in ('takwerx_console', 'takwerx_console_confined'):
+        te = os.path.join(selinux_dir, name + '.te')
+        if name not in installed or not os.path.isfile(te):
+            continue
+        want = ''
+        try:
+            with open(te) as f:
+                m = re.match(r'^module\s+%s\s+([0-9.]+)' % re.escape(name), f.readline())
+            want = m.group(1) if m else ''
+        except OSError:
+            continue
+        stamp = '/etc/selinux/.takwerx-%s.ver' % name    # same stamp start.sh writes
+        try:
+            with open(stamp) as f:
+                have = f.read().strip()
+        except OSError:
+            have = ''
+        if not want or have == want:
+            continue
+        # checkpolicy ships checkmodule/semodule_package; start.sh installs it on
+        # provision but a minimal image may lack it. dnf-only is deliberate: this
+        # code is gated on getenforce (SELinux hosts = RHEL family here); guard
+        # anyway so a missing dnf can't kill the converge thread.
+        if not shutil.which('checkmodule') and shutil.which('dnf'):
+            try:
+                subprocess.run(['dnf', 'install', '-y', 'checkpolicy'],
+                               capture_output=True, timeout=300)
+            except Exception:
+                pass
+        if not (shutil.which('checkmodule') and shutil.which('semodule_package')):
+            AUDIT.info(json.dumps({'op': 'selinux-policy', 'verdict': 'ERROR',
+                                   'summary': f'{name}: checkpolicy tools unavailable — module stays at {have or "unknown"}'}))
+            continue
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='takwerx-selinux-')
+        try:
+            mod, pp = os.path.join(tmp, name + '.mod'), os.path.join(tmp, name + '.pp')
+            for argv in (['checkmodule', '-M', '-m', '-o', mod, te],
+                         ['semodule_package', '-o', pp, '-m', mod],
+                         ['semodule', '-i', pp]):
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    AUDIT.info(json.dumps({'op': 'selinux-policy', 'verdict': 'ERROR',
+                                           'summary': f'{name} {have or "?"} -> {want}: {argv[0]} failed: {(r.stderr or r.stdout or "")[:300]}'}))
+                    break
+            else:
+                with open(stamp, 'w') as f:
+                    f.write(want + '\n')
+                os.chmod(stamp, 0o644)
+                AUDIT.info(json.dumps({'op': 'selinux-policy', 'verdict': 'INFO',
+                                       'summary': f'{name} refreshed {have or "unstamped"} -> {want}'}))
+        except Exception as e:
+            AUDIT.info(json.dumps({'op': 'selinux-policy', 'verdict': 'ERROR',
+                                   'summary': f'{name}: {type(e).__name__}: {e}'}))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def serve():
     global AUDIT, ENFORCE, ENFORCE_INFO
     if os.geteuid() != 0:
@@ -2528,6 +2618,10 @@ def serve():
         sys.stderr.write(f'takwerx-broker: socket perms warning: {e}\n')
     AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
                            'summary': f'listening on {SOCKET_PATH}'}))
+    # SELinux module refresh runs AFTER the socket is up (a policy rebuild can
+    # take tens of seconds; the console's boot ping must not wait on it).
+    threading.Thread(target=_selinux_policy_converge, daemon=True,
+                     name='selinux-policy-converge').start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

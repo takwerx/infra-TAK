@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.17-alpha"
+VERSION = "10.1.18-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -28571,6 +28571,175 @@ def cloudtak_bootstrap_admin_p12_status_api():
     })
 
 
+# v10.1.18 — CloudTAK CoreEvents bootstrap ADMIN cert ("Channels Disabled Admin
+# Cert", Nick Ingalls 2026-08-03). CloudTAK ≥13.59.0 reposts Events as m-g CoTs
+# over connection 0 (the cert in server.auth) and silently skips channels that
+# cert can't resolve. TAK's channel selection only engages for certs whose EKU
+# carries the enrollment OID 1.2.840.113549.1.9.7 — makeCert.sh certs do NOT
+# have it, so a makeCert-issued cert bypasses the group cache ("channels
+# disabled"); certmod -A makes it ROLE_ADMIN, and stock
+# x509assignAdminAllGroups=true then grants every in/out group dynamically,
+# including channels created later. So: makeCert client + certmod -A, nothing
+# else. The CN is a fixed constant a TAK Portal user can never collide with
+# (UAF matches fingerprint OR identifier==CN; portal org-suffixes usernames,
+# which mitigates, but the reserved -svc- name closes it).
+# NO auto-bootstrap (operator decision 2026-08-03): the operator downloads the
+# p12 and uploads it in the CloudTAK wizard / Admin → Server swap themselves.
+CLOUDTAK_BOOTSTRAP_CERT_CN = 'cloudtak-svc-bootstrap'
+
+
+def _cloudtak_bootstrap_cert_target(settings):
+    """Where the TAK cert store for the bootstrap admin cert lives.
+    Returns ('local', None) when /opt/tak/certs is on this box (native or
+    container — /opt/tak is symlinked into the bundle on the container path),
+    ('remote', server_two_cfg) on a split deploy with a remote TAK core, or
+    ('absent', None)."""
+    if os.path.exists('/opt/tak/certs/makeCert.sh'):
+        return 'local', None
+    try:
+        tak_cfg = _get_tak_deployment_config(settings)
+        s2 = tak_cfg.get('server_two', {}) if isinstance(tak_cfg.get('server_two'), dict) else {}
+        s2_host = (s2.get('host') or '').strip()
+        if (tak_cfg.get('mode') == 'two_server' and s2_host
+                and not s2.get('use_localhost')
+                and s2_host not in ('127.0.0.1', 'localhost', '::1')):
+            return 'remote', s2
+    except Exception:
+        pass
+    return 'absent', None
+
+
+@app.route('/api/cloudtak/generate-bootstrap-cert', methods=['POST'])
+@login_required
+def cloudtak_generate_bootstrap_cert_api():
+    """Generate (idempotent) the CoreEvents-ready CloudTAK bootstrap admin cert:
+    makeCert.sh client cloudtak-svc-bootstrap + UserManager certmod -A."""
+    settings = load_settings()
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    mode, s2 = _cloudtak_bootstrap_cert_target(settings)
+    if mode == 'absent':
+        return jsonify({'success': False,
+                        'error': 'TAK Server certificate store not found — deploy TAK Server first '
+                                 '(or configure the two-server Core SSH settings).'}), 400
+
+    if mode == 'remote':
+        # Split deploy: certs + UserManager live on the remote TAK core. One SSH
+        # round-trip: generate if missing, then (always) converge the admin flip.
+        # CN is a fixed constant — nothing request-controlled enters the command.
+        cmd = (
+            f'cd /opt/tak/certs && '
+            f'if [ -f files/{cn}.p12 ]; then echo P12_EXISTS; else '
+            f'echo y | sudo -u tak ./makeCert.sh client {cn} 2>&1; fi && '
+            f'test -f files/{cn}.p12 && echo P12_OK && '
+            f'sudo java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/{cn}.pem 2>&1 '
+            f'&& echo CERTMOD_OK'
+        )
+        ok, out = _ssh_probe(s2, cmd, timeout=120)
+        out = out or ''
+        if 'P12_OK' not in out:
+            return jsonify({'success': False,
+                            'error': f'Remote cert generation failed on TAK core: {out[-400:]}'}), 500
+        return jsonify({
+            'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': True,
+            'created': 'P12_EXISTS' not in out,
+            'admin_flip_ok': 'CERTMOD_OK' in out,
+            'download_url': '/api/cloudtak/bootstrap-cert/download',
+            'note': ('' if 'CERTMOD_OK' in out else
+                     'Cert exists but the ROLE_ADMIN flip (certmod -A) failed on the remote core — '
+                     'Events will not deliver until it succeeds; see the SSH output in the console log.'),
+        })
+
+    # Local (native or container) — mirrors takserver_create_client_cert.
+    cert_dir = '/opt/tak/certs/files'
+    p12_path = os.path.join(cert_dir, f'{cn}.p12')
+    pem_path = os.path.join(cert_dir, f'{cn}.pem')
+    created = False
+    try:
+        if not os.path.exists(p12_path):
+            _patch_openssl_string_mask()
+            if _tak_is_container():
+                _run_priv_chain([['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+            else:
+                _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'],
+                                 ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+            r = subprocess.run(
+                _rotate_tak_cert_cmd(f'cd /opt/tak/certs && echo y | runuser -u tak -- /opt/tak/certs/makeCert.sh client {cn} 2>&1'),
+                shell=True, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not os.path.exists(p12_path):
+                return jsonify({'success': False,
+                                'error': f'makeCert.sh failed: {(r.stdout or r.stderr or "")[-400:]}'}), 500
+            created = True
+
+        # ROLE_ADMIN flip — the entire point of this cert (assignAdminAllGroups
+        # then feeds it every channel). Unlike the best-effort group assignment
+        # in create-client-cert, a failure here is surfaced, not swallowed.
+        cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod -A {shlex.quote(pem_path)}'
+        full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
+        gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=60)
+        certmod_ok = gr.returncode == 0
+        # Canary — never assume the jar wrote the UAF entry (native non-root
+        # consoles can't write the tak-owned UAF from a bare java run).
+        uaf_has_entry = False
+        try:
+            uaf_has_entry = f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
+        except Exception:
+            pass
+        note = ''
+        if not (certmod_ok and uaf_has_entry):
+            note = ('The ROLE_ADMIN flip (certmod -A) did not verify — Events will not deliver '
+                    'until the UAF carries this cert with ROLE_ADMIN. Output: '
+                    + (gr.stdout or gr.stderr or '')[-300:])
+        return jsonify({
+            'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': False,
+            'created': created,
+            'admin_flip_ok': bool(certmod_ok and uaf_has_entry),
+            'download_url': '/api/cloudtak/bootstrap-cert/download',
+            'note': note,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+
+
+@app.route('/api/cloudtak/bootstrap-cert/download')
+@login_required
+def cloudtak_bootstrap_cert_download():
+    """Download cloudtak-svc-bootstrap.p12 — local cert store, or fetched over
+    SSH from the remote TAK core on a split deploy (same pattern as
+    _load_admin_p12_bytes_from_tak_core)."""
+    settings = load_settings()
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    mode, s2 = _cloudtak_bootstrap_cert_target(settings)
+    if mode == 'local':
+        return _send_cert_file_priv('/opt/tak/certs/files', f'{cn}.p12')
+    if mode == 'remote':
+        cmd = (
+            "python3 - <<'PY'\n"
+            "import base64,sys\n"
+            f"p='/opt/tak/certs/files/{cn}.p12'\n"
+            "try:\n"
+            "  b=open(p,'rb').read()\n"
+            "  print(base64.b64encode(b).decode())\n"
+            "except Exception as e:\n"
+            "  print('ERR:'+str(e))\n"
+            "  sys.exit(1)\n"
+            "PY"
+        )
+        ok, out = _ssh_probe(s2, cmd, timeout=30)
+        if ok and out:
+            import base64 as _b64mod
+            try:
+                data = _b64mod.b64decode((out or '').strip().splitlines()[-1])
+            except Exception:
+                data = b''
+            if data:
+                resp = app.response_class(data, mimetype='application/x-pkcs12')
+                resp.headers['Content-Disposition'] = f'attachment; filename={cn}.p12'
+                return resp
+        return jsonify({'error': f'Could not fetch {cn}.p12 from the remote TAK core — '
+                                 'generate it first.'}), 404
+    return jsonify({'error': 'TAK Server certificate store not found'}), 404
+
+
 @app.route('/api/cloudtak/deploy', methods=['POST'])
 @login_required
 def cloudtak_deploy_api():
@@ -43411,6 +43580,38 @@ window.ctCopyPluginLog = function(btn) {
   }
 };
 
+window.ctGenBootstrapCert = function(btn) {
+  var out = document.getElementById('ct-bootstrap-cert-result');
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generating…';
+  if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--text-dim)">Generating certificate + applying ROLE_ADMIN (this takes a few seconds)…</span>'; }
+  fetch('/api/cloudtak/generate-bootstrap-cert', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+    credentials: 'same-origin'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    btn.disabled = false; btn.textContent = orig;
+    if (!out) return;
+    if (!d || !d.success) {
+      out.innerHTML = '<span style="color:var(--red)">✗ ' + esc((d && d.error) || 'Generation failed') + '</span>';
+      return;
+    }
+    var html = '<div style="color:var(--green);font-weight:600">✓ ' + esc(d.cn) + '.p12 ' + (d.created ? 'generated' : 'already exists') +
+               (d.admin_flip_ok ? ' — ROLE_ADMIN applied (all channels via assignAdminAllGroups)' : '') + '</div>';
+    if (!d.admin_flip_ok) {
+      html += '<div style="color:var(--yellow);margin-top:6px">⚠ ' + esc(d.note || 'ROLE_ADMIN flip did not verify.') + '</div>';
+    }
+    html += '<div style="margin-top:8px"><a href="' + d.download_url + '" style="color:var(--cyan);font-weight:600">⬇ Download ' + d.cn + '.p12</a>' +
+            ' <span style="color:var(--text-dim);font-size:12px;margin-left:10px">certificate password: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">{{ cloudtak_cert_password }}</code></span></div>';
+    out.innerHTML = html;
+  }).catch(function(e) {
+    btn.disabled = false; btn.textContent = orig;
+    if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + (e && e.message ? e.message : String(e)) + '</span>';
+  });
+};
+
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
   if (action === 'remove') {
@@ -43711,13 +43912,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         </div>
 
         <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
-          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 2 — Download the bootstrap user.p12 certificate</div>
-          <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
-            <li style="margin-bottom:5px">In infra-TAK, go to <strong style="color:var(--text-primary)">TAK Server</strong> → <strong style="color:var(--text-primary)">Certificates</strong></li>
-            <li style="margin-bottom:5px">Find <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> in the certificate list (created automatically during deploy)</li>
-            <li style="margin-bottom:5px">Click <strong style="color:var(--text-primary)">Download</strong> → save <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> to your computer</li>
-            <li style="color:var(--text-dim);font-size:12px">The certificate password is shown on this same Certificates page — note it, you will need it in Step 3.</li>
-          </ol>
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 2 — Generate &amp; download the Bootstrap Admin certificate</div>
+          <p style="margin:0 0 10px;font-size:12px;color:var(--text-secondary)">CloudTAK 13.59+ (Core Events) reposts Events over this certificate and <strong style="color:var(--text-primary)">silently skips channels the cert can\'t reach</strong> — it needs a <em>channels-disabled admin</em> cert, not a regular user cert. This button creates <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> with exactly that shape (makeCert-issued + ROLE_ADMIN, all channels via TAK\'s assignAdminAllGroups).</p>
+          <button class="btn btn-primary" onclick="ctGenBootstrapCert(this)" style="font-size:12px">Generate CloudTAK Bootstrap Admin p12</button>
+          <div id="ct-bootstrap-cert-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
+          <p style="margin:10px 0 0;font-size:12px;color:var(--text-dim)">Already running CloudTAK? Generate + download here, then swap it once in <strong style="color:var(--text-primary)">CloudTAK Admin → Server → Admin Certificate</strong> — no re-bootstrap needed. (The legacy <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">user.p12</code> still connects, but Events will not deliver with it.)</p>
         </div>
 
         <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
@@ -43726,7 +43925,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
             <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %} — if the setup/config page does not appear, wait a minute and reload (CloudTAK may still be starting); if it stays stale, clear it via <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--text-secondary)">DevTools → Application → Clear site data</code></li>
             <li style="margin-bottom:5px">When prompted for the TAK Server address, enter: {% if settings.fqdn %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.{{ settings.fqdn }}</code>{% else %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.yourdomain.com</code>{% endif %}</li>
             <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> (the full suffixed name from Step 1) and the password you set in Step 1</li>
-            <li style="margin-bottom:5px">Upload <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> and enter the certificate password you noted in Step 2</li>
+            <li style="margin-bottom:5px">Upload <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> from Step 2 and enter the certificate password shown there</li>
             <li>CloudTAK will save and reload to the login page — sign in with your <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> credentials</li>
           </ol>
         </div>
@@ -68766,7 +68965,12 @@ def _takportal_sync_map_channels(plog=None):
         content = _read_priv(uaf)
     except Exception:
         content = ''
-    if not content or 'identifier="admin"' not in content:
+    # v10.1.18: also converge the CloudTAK CoreEvents bootstrap admin cert
+    # (cloudtak-svc-bootstrap) when its UAF entry exists — belt-and-suspenders
+    # over x509assignAdminAllGroups, per the CORAZ __ANON__ precedent (a
+    # ROLE_ADMIN entry whose groupList drifts empty delivers to nobody).
+    sync_ids = ('admin', CLOUDTAK_BOOTSTRAP_CERT_CN)
+    if not content or not any(f'identifier="{i}"' in content for i in sync_ids):
         return
     import xml.etree.ElementTree as ET
     ET.register_namespace('', _TAK_UAF_NS)  # emit unprefixed tags + xmlns default, matching the source
@@ -68777,7 +68981,7 @@ def _takportal_sync_map_channels(plog=None):
         return
     ns = '{%s}' % _TAK_UAF_NS
     admin_els = [u for u in root.iter()
-                 if u.tag in (ns + 'User', 'User') and u.get('identifier') == 'admin']
+                 if u.tag in (ns + 'User', 'User') and u.get('identifier') in sync_ids]
     if not admin_els:
         return
     changed = False
@@ -68795,13 +68999,13 @@ def _takportal_sync_map_channels(plog=None):
             ET.SubElement(admin_el, ns + 'groupList').text = name
         changed = True
     if not changed:
-        _log(f"admin bridge already in {len(target)} channels — no change, no restart")
+        _log(f"admin bridge (+bootstrap cert) already in {len(target)} channels — no change, no restart")
         return
     import io as _io
     _buf = _io.StringIO()
     ET.ElementTree(root).write(_buf, xml_declaration=True, encoding='unicode')
     _write_priv(uaf, _buf.getvalue())
-    _log(f"admin bridge channel membership {old_count} -> {len(target)}; restarting tak-portal")
+    _log(f"admin bridge (+bootstrap cert) channel membership {old_count} -> {len(target)}; restarting tak-portal")
     subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=90)
 
 
@@ -79768,6 +79972,91 @@ try:
     _broker_converge_running_source()
 except Exception as _e:
     print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+
+
+# v10.1.18 (SELinux enforce-the-domain): read-only canary that the box's
+# takwerx_console_confined module actually matches the shipped .te — never
+# assume a policy landed. The INSTALL is root-side in the broker's startup
+# (_selinux_policy_converge in broker/takwerx_broker.py): the boot converge
+# above already restarted the broker if its source changed, so on a normal
+# update the refresh is in flight when this canary starts polling. For a
+# .te-only bump (broker source unchanged → no restart above) the canary
+# requests ONE broker restart itself — `systemctl restart` is rulebook-allowed
+# — then re-polls. Refresh-only: a box never provisioned with the confined
+# domain (root install) is left alone.
+def _startup_selinux_policy_canary():
+    name = 'takwerx_console_confined'
+    te = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'selinux', name + '.te')
+    if not (shutil.which('getenforce') and os.path.isfile(te)):
+        return
+    try:
+        mode = (subprocess.run(['getenforce'], capture_output=True, text=True,
+                               timeout=10).stdout or '').strip()
+    except Exception:
+        return
+    if mode == 'Disabled':
+        return
+    import re as _re
+    try:
+        with open(te) as f:
+            m = _re.match(r'^module\s+%s\s+([0-9.]+)' % name, f.readline())
+        want = m.group(1) if m else ''
+    except OSError:
+        want = ''
+    if not want:
+        return
+    try:
+        listed = subprocess.run(_sudo_wrap(['semodule', '-l']), capture_output=True,
+                                text=True, timeout=60).stdout or ''
+    except Exception:
+        listed = ''
+    if name not in {ln.strip().split()[0] for ln in listed.splitlines() if ln.strip()}:
+        print(f"[selinux-canary] {name} not installed on this box (root-install / "
+              f"non-confined) — refresh-only, skipping", flush=True)
+        return
+    stamp = f'/etc/selinux/.takwerx-{name}.ver'
+
+    def _stamp():
+        try:
+            with open(stamp) as f:
+                return f.read().strip()
+        except OSError:
+            return ''
+
+    def _wait(seconds):
+        import time as _tm
+        for _ in range(max(1, seconds // 5)):
+            if _stamp() == want:
+                return True
+            _tm.sleep(5)
+        return _stamp() == want
+
+    if _wait(180):
+        print(f"[selinux-canary] ✓ {name} at shipped version {want} "
+              f"(box {mode}; domain enforcing from 1.0 — no permissive line)", flush=True)
+        return
+    # .te-only bump: nothing restarted the broker this boot — request one.
+    print(f"[selinux-canary] {name} stamp {_stamp() or 'absent'} != shipped {want} — "
+          f"restarting takwerx-broker to run its policy refresh", flush=True)
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', '--no-block', 'restart', 'takwerx-broker']),
+                       capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        print(f"[selinux-canary] broker restart request failed (non-fatal): {e}", flush=True)
+        return
+    if _wait(180):
+        print(f"[selinux-canary] ✓ {name} refreshed to {want} after broker restart", flush=True)
+    else:
+        print(f"[selinux-canary] ⚠ {name} still at {_stamp() or 'unstamped'} (want {want}) — "
+              f"check the broker audit log (op=selinux-policy) on this box; "
+              f"the domain may be running an OLD allow set", flush=True)
+
+
+try:
+    threading.Thread(target=_startup_selinux_policy_canary, daemon=True,
+                     name='startup-selinux-policy-canary').start()
+except Exception as _e:
+    print(f"[startup] selinux policy canary skipped (non-fatal): {_e}", flush=True)
 
 _startup_migrations()
 _post_update_auto_deploy()

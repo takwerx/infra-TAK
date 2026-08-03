@@ -975,15 +975,18 @@ install_selinux_console_policy() {
     fi
 
     # 2) Born-non-root: the CONFINED domain (takwerx_console_t) — the console runs
-    #    in its own SELinux domain instead of unconfined_service_t. Ships
-    #    PERMISSIVE (logs AVCs, never blocks) for a safe rollout; enforcing is a
-    #    deliberate flip (drop the `permissive` line in the .te) after a fleet
-    #    soak — already validated to run a full deploy with 0 denials. Sets
-    #    CONFINED_POLICY_OK so create_service emits the takwerx_console_t context.
+    #    in its own SELinux domain instead of unconfined_service_t. ENFORCING as
+    #    of .te v1.0 (10.1.18): the allow set was codified from the 24h NUC AVC
+    #    corpus and the `permissive` line dropped. On existing boxes the module
+    #    is refreshed by the root broker at daemon startup (see
+    #    _selinux_policy_converge in broker/takwerx_broker.py); this path covers
+    #    fresh provisions. Sets CONFINED_POLICY_OK so create_service emits the
+    #    takwerx_console_t context. SSH kill switch if enforcing ever wedges:
+    #    `semanage permissive -a takwerx_console_t`.
     if [ "$BORN_NONROOT" = "1" ] \
        && _install_selinux_module takwerx_console_confined "$INSTALL_DIR/selinux/takwerx_console_confined.te"; then
         CONFINED_POLICY_OK=1
-        echo "  ✓ SELinux confined console domain installed (takwerx_console_t, permissive)"
+        echo "  ✓ SELinux confined console domain installed (takwerx_console_t, enforcing)"
     fi
 }
 
