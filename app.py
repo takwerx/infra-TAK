@@ -31480,6 +31480,26 @@ def run_cloudtak_update():
         plog("  version — CloudTAK's service worker serves a cached copy. To force it:")
         plog("  DevTools (F12) → Application → Clear site data, then reload.")
         plog("  (In-app Settings → Refresh App sometimes works but is not reliable.)")
+        # v10.1.17 (T&E finding, test6): the rebuild bakes a FRESH image, wiping any
+        # regen-guard patch — and the sprite-regen crash loop takes ~4 min to surface,
+        # so a single post-update heal check always ran too early to see it. The boot
+        # path (10.1.16) and the plugin-rebuild path (10.1.14) both keep a watch window
+        # open; THIS path — the Update button, now the hot path with the version gate
+        # removed — never did: test6 crash-looped 100+ restarts on 13.59.1 with nothing
+        # watching. Arm the same self-gating 8-check/~15-min watch, detached so the
+        # update itself reports complete immediately.
+        if not is_remote:
+            def _post_update_icon_watch():
+                for _i in range(8):
+                    time.sleep(90 if _i == 0 else 120)
+                    try:
+                        _selfheal_cloudtak_corrupt_icons(
+                            plog=lambda m: print(f"[update-iconheal] {m}", flush=True))
+                    except Exception:
+                        pass
+            threading.Thread(target=_post_update_icon_watch, daemon=True,
+                             name='cloudtak-update-icon-heal').start()
+            plog("  (sprite-regen self-heal armed for the next ~15 min — dfpc-coe/CloudTAK#1623)")
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
