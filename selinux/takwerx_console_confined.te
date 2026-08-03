@@ -1,4 +1,4 @@
-module takwerx_console_confined 2.0;
+module takwerx_console_confined 2.1;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -131,6 +131,12 @@ module takwerx_console_confined 2.0;
 #        checks the home dir itself, and /home traversal (home_root_t dir
 #        getattr/search/read) is granted because that is legitimate on EVERY box,
 #        drift or not — the console must walk /home to reach its own tree.
+#   2.1  10.1.18 final. One operation left after the aws-rocky relabel: the
+#        customization path copies branding assets into a module tree
+#        (~/authentik/media/.../tak-gov-brand.svg) and relabels them. The domain
+#        already had relabelfrom/relabelto on usr_t (the install tree); this
+#        extends the SAME permission to user_home_t (module trees), which is
+#        where the assets actually land. No new KIND of privilege.
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -598,6 +604,9 @@ allow takwerx_console_t default_context_t:file { getattr map open read };
 # (~/authentik/.env, ~/CloudTAK/docker-compose.override.yml). v1.4 granted
 # append + map; the generators rewrite whole files, which needs write.
 allow takwerx_console_t user_home_t:file { create setattr unlink write };
+# v2.1: branding/customization assets are copied into module trees and relabeled
+# (~/authentik/media/...). Same permission the domain already holds on usr_t.
+allow takwerx_console_t user_home_t:file { relabelfrom relabelto };
 
 # `tar` resolves users/groups through nss-systemd over the userdb socket. The
 # LISTENER's domain is kernel_t on EL9 (connectto resolves against the listener,
