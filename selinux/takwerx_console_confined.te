@@ -1,4 +1,4 @@
-module takwerx_console_confined 1.4;
+module takwerx_console_confined 1.5;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -62,6 +62,14 @@ module takwerx_console_confined 1.4;
 #        system utilities is its job; the privilege boundary is the root broker,
 #        not which binaries it may exec (and bin_t/shell_exec_t were already
 #        granted, so this widens far less than it appears).
+#   1.5  10.1.18 close-out. v1.4 left 16 denials, ALL from the console's own
+#        startup converge (not operator clicks): mktemp/rm creating+removing
+#        scratch dirs under /opt/infratak, the console WRITING module config
+#        files it owns (~/authentik/.env, ~/CloudTAK/docker-compose.override.yml
+#        — v1.4 granted append+map but not write), tar's nss-systemd userdb
+#        lookup, and matchpathcon reading the context DB (file_context_t needed
+#        map/read on the FILE, not just dir search). These recur on every boot,
+#        so they are rules, not noise.
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -128,6 +136,7 @@ require {
 	type random_device_t;
 	type system_cron_spool_t;
 	type systemd_userdbd_runtime_t;
+	type systemd_userdbd_t;
 	type tty_device_t;
 	type tmp_t;
 	type unreserved_port_t;
@@ -140,7 +149,7 @@ require {
 	attribute logfile;
 	role system_r;
 	class dbus send_msg;
-	class dir { add_name getattr open read remove_name rmdir search write };
+	class dir { add_name create getattr open read remove_name rmdir search write };
 	class file { append create entrypoint execute execute_no_trans getattr ioctl lock map open read relabelfrom relabelto rename setattr unlink write };
 	class lnk_file read;
 	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
@@ -437,3 +446,25 @@ allow takwerx_console_t ssh_home_t:file ioctl;
 
 # --- `ps` stats the console's controlling terminal. Metadata only.
 allow takwerx_console_t tty_device_t:chr_file getattr;
+
+# =====================================================================
+# v1.5 — startup-converge close-out. See History note 1.5.
+# =====================================================================
+
+# mktemp/mv/rm working in the console's own install tree (/opt/infratak, usr_t):
+# create + remove scratch directories. v1.0 granted file create/rename but never
+# DIRECTORY create/rmdir.
+allow takwerx_console_t usr_t:dir { create rmdir };
+
+# The console writes the module config files it owns and generates
+# (~/authentik/.env, ~/CloudTAK/docker-compose.override.yml). v1.4 granted
+# append + map; the generators rewrite whole files, which needs write.
+allow takwerx_console_t user_home_t:file { create setattr unlink write };
+
+# `tar` resolves users/groups through nss-systemd, which connects to
+# systemd-userdbd. Without it archives can record wrong ownership.
+allow takwerx_console_t systemd_userdbd_t:unix_stream_socket connectto;
+
+# matchpathcon (our label self-heal) mmaps the compiled context database and
+# reads the substitution list. Read-only.
+allow takwerx_console_t file_context_t:file { getattr map open read };
