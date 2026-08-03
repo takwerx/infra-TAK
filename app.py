@@ -2124,8 +2124,13 @@ def _selinux_heal_module_dir_labels(log=None):
                             if os.path.isdir(os.path.join(home, d)) and not d.startswith('.'))
     except Exception:
         candidates = []
-    for name in candidates:
-        path = os.path.join(home, name)
+    # The HOME DIRECTORY ITSELF is checked first: on aws-rocky /home/takwerx was
+    # home_root_t (the label for /home) instead of user_home_dir_t, while
+    # /home/rocky next to it was correct — so the console's own home was
+    # unreadable-by-policy and the earlier subdirectory-only scan could never
+    # see it. Anything wrong at this level poisons everything under it.
+    for path in [home] + [os.path.join(home, n) for n in candidates]:
+        name = os.path.basename(path) or path
         if not os.path.isdir(path):
             continue
         try:

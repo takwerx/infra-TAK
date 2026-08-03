@@ -1,4 +1,4 @@
-module takwerx_console_confined 1.9;
+module takwerx_console_confined 2.0;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -123,6 +123,14 @@ module takwerx_console_confined 1.9;
 #        with the console. The setroubleshoot summary calls it "/usr/bin/bash",
 #        which is how it masquerades as ours; do not grant the console
 #        capabilities for it. Ever.
+#   2.0  10.1.18 close. Last gap, found on aws-rocky: /home/takwerx ITSELF was
+#        home_root_t (the type for /home) instead of user_home_dir_t — while
+#        /home/rocky beside it was correct. The console's own home was therefore
+#        unreadable-by-policy, and the subdirectory-only self-heal could never
+#        see it (it scanned INSIDE the home). Fixed both ways: the heal now
+#        checks the home dir itself, and /home traversal (home_root_t dir
+#        getattr/search/read) is granted because that is legitimate on EVERY box,
+#        drift or not — the console must walk /home to reach its own tree.
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -153,6 +161,7 @@ require {
 	type fixed_disk_device_t;
 	type gconf_home_t;
 	type admin_home_t;
+	type home_root_t;
 	type httpd_config_t;
 	type httpd_sys_content_t;
 	type httpd_exec_t;
@@ -535,6 +544,13 @@ allow takwerx_console_t user_home_dir_t:lnk_file { getattr read };
 # Module services on high/ephemeral ports (TVR's API, dynamic container ports)
 # — the console health-checks them over TCP.
 allow takwerx_console_t ephemeral_port_t:tcp_socket name_connect;
+
+# v2.0: traverse /home (home_root_t) to reach the console user's tree. Legitimate
+# and required on every box — /home is correctly home_root_t by policy. Read-only:
+# the console never writes at this level. File perms cover the window before a
+# drifted home (see History 2.0) gets relabeled.
+allow takwerx_console_t home_root_t:dir { getattr open read search };
+allow takwerx_console_t home_root_t:file { getattr ioctl open read };
 
 # v1.9: hard links in the install tree (atomic file swaps during update/backup).
 allow takwerx_console_t usr_t:file link;
