@@ -1,4 +1,4 @@
-module takwerx_console_confined 1.8;
+module takwerx_console_confined 1.9;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -114,6 +114,15 @@ module takwerx_console_confined 1.8;
 #        (app.py) stays as the repair path for trees created before this.
 #        NB the drifted perms are ALSO granted below — a box keeps working in the
 #        window between an old deploy and its relabel.
+#   1.9  10.1.18. Post-TVR + post-relabel window on the NUC (FULL module set incl.
+#        TAK Video Restreamer) left only TWO operations in our domain: a hard
+#        link in the install tree and a write to pip's cache. Everything else
+#        still logging on that box is NetworkManager's own dispatcher
+#        (scontext=NetworkManager_dispatcher_t / _chronyc_t, sys_admin +
+#        sys_resource capabilities) — a DIFFERENT domain that has nothing to do
+#        with the console. The setroubleshoot summary calls it "/usr/bin/bash",
+#        which is how it masquerades as ours; do not grant the console
+#        capabilities for it. Ever.
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -200,7 +209,7 @@ require {
 	role system_r;
 	class dbus send_msg;
 	class dir { add_name create getattr open read remove_name rmdir search write };
-	class file { append create entrypoint execute execute_no_trans getattr ioctl lock map open read relabelfrom relabelto rename setattr unlink write };
+	class file { append create entrypoint execute execute_no_trans getattr ioctl link lock map open read relabelfrom relabelto rename setattr unlink write };
 	class lnk_file { getattr read };
 	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
 	class netlink_route_socket { bind create getattr getopt nlmsg_read setopt read write };
@@ -526,6 +535,12 @@ allow takwerx_console_t user_home_dir_t:lnk_file { getattr read };
 # Module services on high/ephemeral ports (TVR's API, dynamic container ports)
 # — the console health-checks them over TCP.
 allow takwerx_console_t ephemeral_port_t:tcp_socket name_connect;
+
+# v1.9: hard links in the install tree (atomic file swaps during update/backup).
+allow takwerx_console_t usr_t:file link;
+# v1.9: pip's cache under ~/.cache is written during venv/dependency work.
+allow takwerx_console_t cache_home_t:dir { add_name remove_name write };
+allow takwerx_console_t cache_home_t:file { create setattr unlink write };
 
 # --- v1.7 (aws-rocky module set) ---
 # The console READS the generated Caddyfile directly (_selinux_sync_caddy_ports
