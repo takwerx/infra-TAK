@@ -2072,6 +2072,77 @@ def _selinux_allow_caddy_port(port, log=None):
         return False
 
 
+def _selinux_heal_module_dir_labels(log=None):
+    """v10.1.18 (RHEL/SELinux) — relabel console-user module trees whose SELinux
+    type has drifted from the policy default.
+
+    Field origin (NUC, 2026-08-03, 10.1.18 A3 harvest): every file under
+    ~/CloudTAK carried `user_home_dir_t` — the type for a home DIRECTORY, stamped
+    on regular FILES. The confined console domain has no read rule for that type
+    on files (correctly — no policy should), so every module-detection stat of
+    docker-compose.yml / .override.yml / .env logged a would-deny. That single
+    tree was ~80% of the domain's residual AVCs; relabeling it took the box from
+    ~1 denial/min to ZERO. Sibling trees (~/authentik, ~/node-red, ~/TAK-Portal,
+    ~/infra-TAK) were already correct, so this is drift from the CloudTAK deploy
+    path — the correct fix is a relabel, NOT an allow rule for the wrong type
+    (that would bake the drift into shipped policy forever).
+
+    Deliberately generic over the known module dirs rather than CloudTAK-only:
+    the same drift class can appear on any tree we create, and the check is a
+    cheap string compare per directory.
+
+    Idempotent and safe: reads the policy default with `matchpathcon` and calls
+    `restorecon -R` ONLY on a genuine mismatch. Read-only on a healthy box.
+    No-op off-RHEL / when SELinux is disabled. Returns the number relabeled."""
+    if _distro_family() != 'rhel':
+        return 0
+    if not shutil.which('matchpathcon'):
+        return 0
+    try:
+        if (subprocess.run(['getenforce'], capture_output=True, text=True,
+                           timeout=10).stdout or '').strip() == 'Disabled':
+            return 0
+    except Exception:
+        return 0
+
+    def _log(m):
+        if log:
+            log(m)
+        else:
+            print(f"[selinux-labels] {m}", flush=True)
+
+    home = os.path.expanduser('~')
+    healed = 0
+    for name in ('CloudTAK', 'authentik', 'node-red', 'TAK-Portal', 'tak-docker'):
+        path = os.path.join(home, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            want = subprocess.run(['matchpathcon', path], capture_output=True,
+                                  text=True, timeout=15).stdout or ''
+            # "<path>\t<user>:<role>:<type>:<level>" -> type
+            want_t = want.strip().split('\t')[-1].split(':')[2] if ':' in want else ''
+            cur = subprocess.run(['ls', '-Zd', path], capture_output=True,
+                                 text=True, timeout=15).stdout or ''
+            cur_t = cur.strip().split()[0].split(':')[2] if ':' in cur else ''
+        except Exception:
+            continue
+        if not (want_t and cur_t) or want_t == cur_t:
+            continue
+        _log(f"{name}: SELinux type drift {cur_t} -> {want_t}; relabeling (restorecon -R)")
+        try:
+            r = subprocess.run(_sudo_wrap(['restorecon', '-R', path]),
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode == 0:
+                healed += 1
+                _log(f"{name}: ✓ relabeled to {want_t}")
+            else:
+                _log(f"{name}: ⚠ restorecon failed: {(r.stderr or r.stdout or '')[:160]}")
+        except Exception as e:
+            _log(f"{name}: ⚠ restorecon error: {str(e)[:120]}")
+    return healed
+
+
 def _selinux_sync_caddy_ports(log=None):
     """RHEL self-heal: scan the on-disk Caddyfile for listener ports and ensure
     each non-standard one is labeled http_port_t so confined Caddy can bind it.
@@ -77589,6 +77660,23 @@ def _startup_migrations():
                 print(f"Startup migration: relabeled {_ct_labeled} Caddy port(s) for SELinux and reloaded Caddy", flush=True)
         except Exception as caddy_selinux_err:
             print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")
+
+        # v10.1.18 — self-heal SELinux label DRIFT on the console user's module
+        # trees. Found during the 10.1.18 A3 harvest (NUC 2026-08-03): the whole
+        # ~/CloudTAK tree carried `user_home_dir_t` — a DIRECTORY type stamped on
+        # every FILE inside it — which alone produced ~80% of the confined
+        # domain's remaining would-deny AVCs (getattr/open/read on
+        # docker-compose.yml, .override.yml, .env). Sibling trees (~/authentik,
+        # ~/node-red, ~/TAK-Portal, ~/infra-TAK) were correctly `user_home_t`, so
+        # this is deploy-path drift, not a policy gap — the fix is a relabel, and
+        # writing an allow rule for the wrong type would have baked the drift into
+        # shipped policy permanently.
+        # Idempotent + cheap: compares each dir's current type against the policy
+        # default (matchpathcon) and only calls restorecon on a real mismatch.
+        try:
+            _selinux_heal_module_dir_labels(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _lbl_err:
+            print(f"Startup migration: SELinux module-dir label heal error (non-fatal): {_lbl_err}")
 
         # v10.1.8 — re-route CloudTAK video /stream/* to media-infra (:9997). The old
         # Caddy template sent it to raw MediaMTX HLS (18888), which 404'd every

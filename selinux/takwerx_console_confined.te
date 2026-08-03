@@ -1,4 +1,4 @@
-module takwerx_console_confined 1.2;
+module takwerx_console_confined 1.3;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -42,6 +42,13 @@ module takwerx_console_confined 1.2;
 #        NOT fixed by a rule: ~/CloudTAK/docker-compose.yml carries
 #        user_home_dir_t (a DIRECTORY type on a file = label drift) — that is a
 #        relabel job (`restorecon`), never an allow rule for a wrong label.
+#   1.3  10.1.18 A3 close-out (2026-08-03). The ~/CloudTAK relabel landed as a
+#        fleet self-heal (`_selinux_heal_module_dir_labels`, app.py) and the NUC
+#        went to **ZERO denials in a clean 90 s window** — matching aws-rocky.
+#        This version adds only the last three low-rate operations observed
+#        before that: the console writing its own /var/lib state dir, `ss`
+#        getattr on a peer unix socket, and sysfs FILE getattr (keytool's disk
+#        probe — the 1.2 rule granted open/read but not getattr).
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -105,13 +112,14 @@ require {
 	type tmp_t;
 	type unreserved_port_t;
 	type usr_t;
+	type var_lib_t;
 	type var_run_t;
 	type websm_port_t;
 	attribute domain;
 	role system_r;
 	class dbus send_msg;
 	class dir { add_name getattr open read remove_name search write };
-	class file { create entrypoint execute execute_no_trans getattr ioctl lock map open read relabelfrom relabelto rename setattr unlink write };
+	class file { append create entrypoint execute execute_no_trans getattr ioctl lock map open read relabelfrom relabelto rename setattr unlink write };
 	class lnk_file read;
 	class netlink_tcpdiag_socket { bind create getattr nlmsg_read setopt };
 	class netlink_route_socket { bind create getattr getopt nlmsg_read setopt read write };
@@ -330,3 +338,21 @@ allow takwerx_console_t sysfs_t:dir { getattr open read search };
 # `ip` probes its own capability set at startup; the console never needs `ip` to
 # SET capabilities, so silence it rather than grant it (88/40min of pure noise).
 dontaudit takwerx_console_t self:process setcap;
+
+# --- v1.3: A3 close-out. The last three observed operations. ---
+
+# The console's own state directory /var/lib/takwerx-console (var_lib_t is the
+# POLICY-CORRECT type here — verified with matchpathcon, so this is a genuine
+# missing rule, not drift). Scoped to that dir's contents; no relabel perms.
+allow takwerx_console_t var_lib_t:dir { add_name getattr open read remove_name search write };
+allow takwerx_console_t var_lib_t:file { append create getattr ioctl lock open read rename setattr unlink write };
+
+# `ss` reports on peer unix sockets as well as tcp/udp (the v1.1 rules covered
+# only the latter two). Read-only socket metadata — same class as the process
+# getattr the health monitor already has.
+allow takwerx_console_t domain:unix_stream_socket getattr;
+
+# keytool/findmnt stat sysfs device nodes (/sys/devices/.../dm/name). v1.2
+# granted sysfs_t:file open+read but not getattr, so the stat itself still
+# denied. Read-only.
+allow takwerx_console_t sysfs_t:file getattr;
