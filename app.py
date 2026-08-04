@@ -25669,7 +25669,12 @@ takportal_deploy_log = []
 takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 
 # Keys in TAK Portal settings.json that are configurable in TAK Portal UI (e.g. custom logo/photo). We never overwrite these when pushing settings on update/reconfigure/deploy.
-PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL', 'TAK_SSH_ONBOARDED', 'TAK_SSH_LAST_HANDSHAKE_AT'])
+# EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO: operator-set CC/BCC addresses entered in TAK
+# Portal's UI. _portal_email_settings() always emits them as "" — without preserve,
+# every settings push (deploy, update-config, post-update guardrail) wiped them
+# (field report, fixed v10.1.19). Preserve-if-set: fresh installs still get "".
+PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL', 'TAK_SSH_ONBOARDED', 'TAK_SSH_LAST_HANDSHAKE_AT',
+                                     'EMAIL_ALWAYS_CC', 'EMAIL_SEND_COPY_TO'])
 
 
 def _takportal_get_existing_settings():
