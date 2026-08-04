@@ -50650,6 +50650,36 @@ entries:
             except Exception as e:
                 plog(f"  ⚠ Authentik SMTP auto-config failed: {e}")
                 plog("  You can run it from Email Relay → 'Configure Authentik to use these settings'.")
+        else:
+            # v10.1.20: no Email Relay — the recovery flow must still exist, or the login page
+            # never shows "Forgot password?" (field report: fresh deploys without the relay left
+            # recovery_flow=null on the identification stage, with no console action to fix it).
+            # Recovery email stages use use_global_settings=true, so the flow works with whatever
+            # SMTP is in Authentik's env (e.g. AUTHENTIK_EMAIL__* set directly), or none yet.
+            plog("")
+            plog("🔑 Ensuring password-recovery flow (no Email Relay configured)...")
+            try:
+                _ak_token = ''
+                if os.path.exists(env_path):
+                    with open(env_path) as f:
+                        for line in f:
+                            if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
+                                _ak_token = line.strip().split('=', 1)[1].strip()
+                                break
+                if not _ak_token:
+                    plog("  ⚠ No bootstrap token readable — recovery flow not ensured (configure Email Relay to retry)")
+                elif _wait_for_authentik_api('http://127.0.0.1:9090',
+                                             {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'},
+                                             max_attempts=60, plog=plog):
+                    _ok, _rmsg, _rslug = _ensure_authentik_recovery_flow(
+                        'http://127.0.0.1:9090',
+                        {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'})
+                    plog(f"  {'✓' if _ok else '⚠'} {_rmsg}")
+                else:
+                    plog("  ⚠ Authentik API not ready — recovery flow not ensured (re-run deploy or configure Email Relay later)")
+            except Exception as e:
+                plog(f"  ⚠ Recovery-flow setup failed (non-fatal): {e}")
+                plog("  You can run it from Email Relay → 'Configure Authentik to use these settings'.")
         # Final LDAP restart: ensure container has the injected token and internal URL (after SMTP/recreate)
         try:
             subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
