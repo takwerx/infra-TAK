@@ -1,0 +1,973 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Console — infra-TAK</title>
+<style>
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0');
+*{margin:0;padding:0;box-sizing:border-box}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;word-wrap:normal;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow:visible;line-height:1.35}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+:root{--bg-primary:#0a0e17;--bg-card:rgba(15,23,42,0.7);--bg-card-hover:rgba(15,23,42,0.9);--border:rgba(59,130,246,0.1);--border-hover:rgba(59,130,246,0.3);--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--accent-glow:rgba(59,130,246,0.15);--green:#10b981;--red:#ef4444;--yellow:#f59e0b;--cyan:#06b6d4}
+body{font-family:'DM Sans',sans-serif;background:var(--bg-primary);color:var(--text-primary);min-height:100vh}
+body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-image:linear-gradient(rgba(59,130,246,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,0.02) 1px,transparent 1px);background-size:60px 60px;pointer-events:none;z-index:0}
+.top-bar{position:fixed;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),var(--cyan),transparent);z-index:100}
+.header{position:relative;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:20px 32px;border-bottom:1px solid var(--border)}
+.header-left{display:flex;align-items:center;gap:14px}
+.header-icon{width:40px;height:40px;background:linear-gradient(135deg,#1e40af,#0891b2);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
+.header-title{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:18px}
+.header-subtitle{font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.header-right{display:flex;align-items:center;gap:16px}
+.os-badge{background:var(--bg-card);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)}
+.btn-logout,.btn-back{color:var(--text-dim);text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:12px;padding:6px 14px;border:1px solid var(--border);border-radius:8px;transition:all 0.2s}
+.btn-logout:hover,.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;font-weight:600}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
+.metric-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
+.footer{text-align:center;padding:24px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}
+.form-field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);font-weight:600;margin-bottom:6px}
+.form-field input[type="text"],.form-field input[type="password"]{width:100%;padding:10px 14px;background:rgba(15,23,42,0.6);border:1px solid rgba(59,130,246,0.2);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px}
+.form-field input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+@media(max-width:768px){.metrics-bar{grid-template-columns:repeat(2,1fr)}.modules-grid{grid-template-columns:1fr}.header{padding:16px 20px}.main{padding:20px}}
+
+body{display:flex;flex-direction:row;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.modules-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:32px}
+@media(max-width:900px){.modules-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.modules-grid{grid-template-columns:1fr}}
+.module-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px;cursor:pointer;transition:all 0.3s;text-decoration:none;display:block;color:inherit}
+.module-card:hover{border-color:var(--border-hover);background:var(--bg-card-hover);transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.3)}
+.module-header{display:flex;align-items:flex-end;gap:10px;margin-bottom:8px}
+.module-header--logo .module-icon{max-height:36px;width:auto;object-fit:contain}
+.module-header .module-icon{flex-shrink:0}
+.module-icon{font-size:22px}
+.module-header .module-name{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:14px;margin-bottom:0;padding-bottom:2px}
+.module-name{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:14px;margin-bottom:4px}
+.module-desc{font-size:12px;color:var(--text-dim);line-height:1.35}
+.module-status{font-family:'JetBrains Mono',monospace;font-size:10px;padding:3px 8px;border-radius:4px;display:inline-flex;align-items:center;gap:4px;margin-top:8px}
+.status-running{background:rgba(16,185,129,0.1);color:var(--green)}
+.status-caution{background:rgba(234,179,8,0.15);color:var(--yellow)}
+.status-critical{background:rgba(239,68,68,0.1);color:var(--red)}
+.status-stopped{background:rgba(239,68,68,0.1);color:var(--red)}
+.status-not-installed{background:rgba(71,85,105,0.2);color:var(--text-dim)}
+.status-updating{background:rgba(6,182,212,0.1);color:var(--cyan)}
+.status-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
+.status-running .status-dot,.status-caution .status-dot{animation:pulse 2s infinite}
+.status-updating .status-dot{animation:uu-spin .7s linear infinite;width:8px;height:8px;border:2px solid var(--cyan);border-top-color:transparent;background:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.uu-spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uu-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes uu-spin{to{transform:rotate(360deg)}}
+.meta-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:90vw}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px}
+.btn-danger{background:var(--red);color:#fff;border:none;padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+{% if not settings.get('fqdn') %}
+<div style="background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(239,68,68,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:20px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div>
+<div style="font-size:13px;font-weight:600;color:var(--yellow)">🔒 No Domain Configured — Running in IP-Only Mode</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:6px;line-height:1.5">Without a domain: no TAK client QR enrollment · no TAK Portal authentication · no trusted SSL · self-signed certs only</div>
+</div>
+<a href="/caddy" style="padding:8px 18px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;white-space:nowrap">Set Up Domain →</a>
+</div>
+</div>
+{% endif %}
+{% if srv_update_available %}<div id="srv-update-banner" style="background:linear-gradient(135deg,rgba(30,64,175,0.15),rgba(14,116,144,0.15));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:16px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px"><div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#x26A1; Update Available</div><div style="font-size:12px;color:var(--text-secondary);margin-top:4px">v{{ version }} &#x2192; v{{ srv_latest }}</div></div><form action="/api/update/apply" method="POST" style="display:inline"><button type="submit" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Update Now</button></form></div></div>{% endif %}
+<div id="update-banner" style="display:none;background:linear-gradient(135deg,rgba(30,64,175,0.15),rgba(14,116,144,0.15));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:16px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div>
+<div style="font-size:13px;font-weight:600;color:var(--cyan)">⚡ Update Available</div>
+<div style="font-size:12px;color:var(--text-secondary);margin-top:4px"><span id="update-info"></span></div>
+</div>
+<div style="display:flex;gap:8px">
+<button onclick="toggleUpdateDetails()" id="update-details-btn" style="padding:6px 14px;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Details</button>
+<button onclick="applyUpdate()" id="update-apply-btn" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Update Now</button>
+</div>
+</div>
+<div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
+<div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
+</div>
+<div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now<span id="kpatch-cve"></span></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div></div>
+<div id="kpatch-running" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Kernel patch in progress &mdash; <span id="kpatch-pid"></span></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Detached from console &mdash; safe to close this tab. Job runs to completion regardless. Typical time: 2-5 min.</div></div>
+</div>
+<pre id="kpatch-log" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="kpatch-done" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--green)">&#10003; Kernel patch complete &mdash; reboot required to boot the new kernel</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get full-upgrade finished cleanly. The new kernel is staged but the running system is still on the old one. Reboot when ready.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="rebootForKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I&#39;ll reboot later</button>
+</div></div>
+<pre id="kpatch-log-done" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:10px;font-size:10px;color:var(--text-dim);max-height:140px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="kpatch-error" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--red)">&#10007; Kernel patch FAILED &mdash; see log below</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get exited non-zero. No reboot will run. Investigate the log and either retry or fix manually over SSH.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Retry</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div></div>
+<pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+</div>
+<!-- v10.1.9 W8 — disk-reclaim card. Hidden unless /api/guarddog/disk-layout reports
+     mode != 'ok'. Backend (WI-1/2/3) already exists and is NOT touched by this card. -->
+<div id="disk-reclaim-card" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:280px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow)">&#128190; <span id="disk-reclaim-headline">Disk layout</span></div>
+<div id="disk-reclaim-detail" style="font-size:11px;color:var(--text-dim);margin-top:4px;line-height:1.5"></div>
+</div>
+<div id="disk-reclaim-actions" style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" id="disk-grow-btn" onclick="diskReclaimGrow()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reclaim free space</button>
+<button type="button" id="disk-fold-btn" onclick="promptDiskFold()" style="display:none;padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reclaim /home &mdash; destructive</button>
+</div>
+</div>
+<div id="disk-reclaim-status" style="display:none;font-size:11px;margin-top:10px"></div>
+<pre id="disk-reclaim-log" style="display:none;margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="disk-fold-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div style="font-size:13px;font-weight:700;color:var(--red);margin-bottom:6px">&#9888; Destroy the /home volume</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;line-height:1.5">This <b>permanently removes</b> the logical volume below and gives its space to root. Its contents are archived to <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/var/lib/takwerx-broker/home-fold/</code> (root-only) and restored into a plain <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/home</code> directory first. <b>Docker is stopped</b> for the duration &mdash; every container goes down and comes back, and <b>any shell logged in under /home is signed out</b> (log back in after). If anything other than a shell is using /home, this stops and changes nothing.</div>
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 12px;margin-bottom:14px">
+      <div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">Volume to be destroyed</div>
+      <div id="disk-fold-lv" style="font-size:15px;font-weight:700;color:var(--red);word-break:break-all">-</div>
+      <div id="disk-fold-lv-meta" style="font-size:10px;color:var(--text-dim);margin-top:4px"></div>
+    </div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Type the volume name to confirm</label>
+    <input id="disk-fold-lv-input" type="text" autocomplete="off" spellcheck="false" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;margin-bottom:12px" placeholder="vg/home">
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="disk-fold-pw" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmDiskFold()">
+    <div id="disk-fold-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button id="disk-fold-cancel" onclick="closeDiskFoldModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button id="disk-fold-confirm" onclick="confirmDiskFold()" style="padding:7px 16px;background:var(--red);color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Destroy and reclaim</button>
+    </div>
+  </div>
+</div>
+<div class="metrics-bar" id="metrics-bar">
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div><div class="metric-detail" id="cpu-detail">1-min avg &middot; now {{ metrics.cpu_percent_now }}%</div></div>
+<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
+{% for host in uu_hosts %}
+<div class="metric-card" style="position:relative" title="OS/apt automatic upgrades on this host." data-uu-target="{{ host.id }}">
+<div style="min-height:52px">
+<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended upgrades — {{ host.label }}
+{% if host.enabled and host.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="Upgrade in progress"></span>{% endif %}
+</div>
+{% if host.get('error') %}<div class="metric-detail" style="color:var(--red);font-size:10px;margin-top:2px">{{ host.error }}</div>{% endif %}
+<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt</div>
+</div>
+<div style="display:flex;align-items:center;gap:8px;margin-top:6px">
+<label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
+<input type="checkbox" class="uu-toggle" data-target="{{ host.id }}" {% if host.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
+<span class="uu-slider" data-target="{{ host.id }}" style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if host.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s"></span>
+<span class="uu-knob" data-target="{{ host.id }}" style="position:absolute;height:16px;width:16px;left:{% if host.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s"></span>
+</label>
+<span class="uu-spinner" data-target="{{ host.id }}" style="display:none"></span>
+<span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
+</div>
+<button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
+<div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
+</div>
+{% endfor %}
+</div>
+<div class="section-title">Console</div>
+<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button><button type="button" onclick="promptPower('reboot')" title="Reboot this box (asks for your console password)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot</button><button type="button" onclick="promptPower('poweroff')" title="Power off this box (asks for your console password)" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Power Off</button><a href="/firewall" id="exp-badge-console" title="Service exposure — click for detail" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;text-decoration:none;border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8"><span id="exp-badge-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8"></span><span id="exp-badge-text">exposure…</span></a></div>
+<script>
+(function(){
+  /* v10.1.4 WS6: the first exposure audit after a console restart can exceed a short
+     abort on busy boxes (test12: 61 sockets/42 rules > 6s) — the badge then showed a
+     scary 'n/a' while the Firewall page (no timeout) showed All Clear. 15s abort +
+     retry twice (audit is cached after it finishes, so a retry is instant) and only
+     admit 'n/a' after the last attempt fails. */
+  var a=document.getElementById('exp-badge-console');if(!a)return;
+  var dot=document.getElementById('exp-badge-dot'),txt=document.getElementById('exp-badge-text');
+  var tries=0;
+  function fail(){
+    if(tries<3){setTimeout(attempt,5000);}
+    else{txt.textContent='Exposure: n/a';}
+  }
+  function attempt(){
+    tries++;
+    var ctl=new AbortController();var to=setTimeout(function(){try{ctl.abort();}catch(e){}},15000);
+    fetch('/api/firewall/exposure/summary',{signal:ctl.signal}).then(function(r){return r.json();}).then(function(s){
+      clearTimeout(to);
+      var st=s.status||'unknown',red=s.issue_count||0,yel=s.warn_count||0;
+      if(st==='ok'){dot.style.background='#10b981';a.style.color='#10b981';a.style.borderColor='rgba(16,185,129,.4)';txt.textContent='Exposure OK';}
+      else if(st==='warn'){dot.style.background='#eab308';a.style.color='#eab308';a.style.borderColor='rgba(234,179,8,.4)';txt.textContent='Exposure: '+yel+' to review';}
+      else if(st==='issue'){dot.style.background='#ef4444';a.style.color='#ef4444';a.style.borderColor='rgba(239,68,68,.5)';txt.textContent='Exposure: '+red+' exposed';}
+      else{fail();}
+    }).catch(function(){clearTimeout(to);fail();});
+  }
+  attempt();
+})();
+</script>
+<div id="dev-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:320px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div style="font-size:13px;font-weight:700;color:var(--yellow);margin-bottom:6px">⚠ Switch to dev channel</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">Dev tracks unreleased builds. Enter your console password to confirm.</div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="dev-pw-input" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmDevChannel()">
+    <div id="dev-pw-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button onclick="closeDevModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button onclick="confirmDevChannel()" style="padding:7px 16px;background:var(--yellow);color:#0f172a;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Switch to dev</button>
+    </div>
+  </div>
+</div>
+<div id="power-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:340px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div id="power-pw-title" style="font-size:13px;font-weight:700;color:var(--yellow);margin-bottom:6px">⚠ Power</div>
+    <div id="power-pw-msg" style="font-size:11px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">Enter your console password to confirm.</div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="power-pw-input" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmPower()">
+    <div id="power-pw-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button onclick="closePowerModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button id="power-pw-confirm" onclick="confirmPower()" style="padding:7px 16px;background:var(--yellow);color:#0f172a;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Confirm</button>
+    </div>
+  </div>
+</div>
+<div class="modules-grid">
+{% if not modules %}
+<div style="grid-column:1/-1;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:48px;text-align:center">
+<div style="font-size:15px;color:var(--text-secondary);margin-bottom:12px">No deployed services yet</div>
+<div style="font-size:13px;color:var(--text-dim);margin-bottom:20px">Install and deploy from the Marketplace to see them here.</div>
+<a href="/marketplace" style="display:inline-block;padding:10px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;text-decoration:none">Go to Marketplace</a>
+</div>
+{% else %}
+{% for key, mod in modules.items() %}
+<a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:{% if key == 'remote_assist' %}32px{% else %}36px{% endif %};width:auto;max-width:{% if key == 'takserver' %}72px{% elif key == 'remote_assist' %}100%{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+</div>
+{% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('latest') %} <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+<span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
+{% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+</a>
+{% endfor %}
+{% endif %}
+</div>
+<script>
+function updateUUHost(hostId,uu){
+    if(!uu)return;
+    var tog=document.querySelector('.uu-toggle[data-target="'+hostId+'"]'),sl=document.querySelector('.uu-slider[data-target="'+hostId+'"]'),kn=document.querySelector('.uu-knob[data-target="'+hostId+'"]'),lb=document.getElementById('uu-label-'+hostId);
+    if(!tog)return;
+    tog.checked=uu.enabled;
+    if(sl)sl.style.background=uu.enabled?'var(--green)':'rgba(71,85,105,0.5)';
+    if(kn)kn.style.left=uu.enabled?'18px':'2px';
+    if(lb){lb.style.color=uu.enabled?'var(--green)':'var(--text-dim)';lb.textContent=(uu.enabled&&uu.running)?'Running...':uu.enabled?'Enabled':'Disabled';}
+}
+function updateUUHosts(hosts){
+    if(!hosts||!hosts.length)return;
+    hosts.forEach(function(h){updateUUHost(h.id,{enabled:h.enabled,running:h.running});});
+}
+async function toggleUU(cb){
+    var target=cb.getAttribute('data-target')||'this_host';
+    var action=cb.checked?'enable':'disable';
+    var lb=document.getElementById('uu-label-'+target),sp=document.querySelector('.uu-spinner[data-target="'+target+'"]');
+    if(sp)sp.style.display='inline-block';
+    if(lb){lb.textContent=cb.checked?'Enabling...':'Disabling...';lb.style.color='var(--cyan)';}
+    try{
+        var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,target:target})});
+        var d=await r.json();
+        if(sp)sp.style.display='none';
+        if(d.success){updateUUHost(target,d);}
+        else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed: ':'Enable failed: ')+(d.error||'unknown');lb.style.color='var(--red)';}}
+    }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
+}
+function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
+function cpuColor(pct){var n=Number(pct||0);if(n>=80)return 'var(--red)';if(n>=50)return '#eab308';return 'var(--green)';}
+function normCpu(rawPct,vcpus){return vcpus>1?rawPct/vcpus:rawPct;}
+function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
+function renderResourceBreakdown(div,data,hostId){
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
+    var refreshBtn=`<button onclick="refreshResourceBreakdown('${hostId}')" style="margin-bottom:8px;padding:3px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:10px;cursor:pointer">&#8635; Refresh</button>`;
+    if(err){div.innerHTML=refreshBtn+'<br><span style="color:var(--red)">'+escapeHtml(err)+'</span>';return;}
+    var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left',th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)',td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)',r='text-align:right';
+    var html=refreshBtn;
+    if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim)">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-weight:600">'+vcpuCount+' vCPUs</div>';}
+    if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
+    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
+    if(speedWrite!=null){var sw=Number(speedWrite),swColor=diskIoColor(sw);html+='<div style="margin-bottom:6px">Disk speed test (256 MiB): <span style="color:'+swColor+'">'+sw.toFixed(0)+' MB/s</span></div>';}
+    else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--red)">Disk speed test: '+escapeHtml(speedErr)+'</div>';
+    var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
+    if(cpuTop&&cpuTop.length){
+        var cpuHdr=vcpuCount?'CPU % (sys)':'CPU %';
+        html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong>'+(vcpuCount?'<span style="color:var(--text-dim);font-size:10px;margin-left:6px">normalized across '+vcpuCount+' vCPUs</span>':'')+'<table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">'+cpuHdr+'</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
+        cpuTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var rawCpu=Number(p.cpu_pct||0);var dispCpu=normCpu(rawCpu,vcpuCount||1);var tooltip=vcpuCount?'title="'+rawCpu.toFixed(1)+'% per-core ('+rawCpu.toFixed(1)+' / '+vcpuCount+' vCPUs)"':'';html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+';color:'+cpuColor(dispCpu)+'" '+tooltip+'>'+dispCpu.toFixed(1)+'%</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'</tr>';});
+        html+='</tbody></table></div>';
+    }
+    if(memTop&&memTop.length){
+        html+='<div><strong style="color:var(--cyan)">Top by RAM</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'<th style="'+th+';'+r+'">'+cpuHdr+'</th></tr></thead><tbody>';
+        memTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var rawCpu=Number(p.cpu_pct||0);var dispCpu=normCpu(rawCpu,vcpuCount||1);var tooltip=vcpuCount?'title="'+rawCpu.toFixed(1)+'% per-core"':'';html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'<td style="'+td+';'+r+';color:'+cpuColor(dispCpu)+'" '+tooltip+'>'+dispCpu.toFixed(1)+'%</td></tr>';});
+        html+='</tbody></table></div>';
+    }
+    if(!html)html='No process data.';
+    div.innerHTML=html;
+}
+async function refreshResourceBreakdown(hostId){
+    var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
+    div.removeAttribute('data-loaded');div.style.display='block';div.textContent='Loading…';
+    try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
+    catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
+}
+async function toggleResourceBreakdown(hostId){
+    var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
+    if(div.style.display==='block'){div.style.display='none';return;}
+    if(!div.getAttribute('data-loaded')){
+        div.style.display='block';div.textContent='Loading…';
+        try{var r=await fetchRetry('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
+        catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
+        return;
+    }
+    div.style.display='block';
+}
+/* v0.9.57: cap read/poll fetches with a client-side timeout so a slow poll on a busy box
+   ABORTS (freeing the single-worker console's thread) instead of hanging forever and
+   starving on-demand button clicks (the "what's using CPU/RAM" / "check for release"
+   fails that cleared on a page reload). Whitelisted to read endpoints only — the
+   long-running action endpoints (update/apply, *_control, deploy) are never touched. */
+(function(){if(window.__fetchTO)return;window.__fetchTO=1;var _f=window.fetch.bind(window);var L=[['/api/metrics',10000],['/api/modules/version',15000],['/api/modules',12000],['/api/host-resource-usage',30000],['/api/update/check',15000],['/api/guarddog',12000]];window.fetch=function(u,o){o=o||{};if(typeof u==='string'&&!o.signal){for(var i=0;i<L.length;i++){if(u.indexOf(L[i][0])===0){var c=new AbortController();o.signal=c.signal;var t=setTimeout(function(){try{c.abort()}catch(e){}},L[i][1]);return _f(u,o).finally(function(){clearTimeout(t)});}}}return _f(u,o);};})();
+/* v0.9.58: idle-lock 401 handler is injected on EVERY console page globally via the
+   _inject_idle_lock_handler after_request hook (app.py) — no longer inline here. */
+/* v0.9.58 (#1): on-demand button fetches fail silently on the FIRST transient miss
+   (a momentary thread-starvation, an aborted poll, a 5xx) and strand the operator
+   until they reload the page. fetchRetry() auto-retries a transient failure 1-2x with
+   a short backoff so a blip just succeeds. Use ONLY for short read/idempotent calls —
+   never for update/apply, deploys, or non-idempotent POSTs. Pairs with __fetchTO above
+   (each retry gets a fresh timeout). */
+async function fetchRetry(url,opts,tries){
+  opts=opts||{}; tries=(tries==null)?2:tries; var lastErr;
+  for(var a=0;a<tries;a++){
+    try{
+      var r=await fetch(url,opts);
+      if(r.status>=500&&a<tries-1){await new Promise(function(res){setTimeout(res,350*(a+1));});continue;}
+      return r;
+    }catch(e){
+      lastErr=e;
+      if(a<tries-1){await new Promise(function(res){setTimeout(res,350*(a+1));});continue;}
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+/* ---- v10.1.9 W8: disk-reclaim card ----------------------------------------
+   Frontend for the WI-1/2/3 backend that already exists (_detect_disk_layout,
+   GET /api/guarddog/disk-layout, POST /api/console/disk/reclaim). The card is
+   invisible on a healthy box (mode 'ok', which also covers "not on LVM").
+   grow_free is non-destructive -> one confirm. fold_home DESTROYS an LV -> the
+   Power-Off treatment: password re-confirm plus the operator types the exact LV,
+   which is what the API's confirm_lv echo is for. */
+var _diskLayout=null,_diskBusy=false;
+function _diskEsc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function _diskEl(id){return document.getElementById(id);}
+function diskLayoutRefresh(){
+    if(_diskBusy)return;
+    var card=_diskEl('disk-reclaim-card');if(!card)return;
+    /* Every /api/guarddog* URL inherits a 12s global abort (see __fetchTO). The
+       layout probe shells out to lvs/vgs through the broker and can outrun that on
+       a loaded box, so it supplies its own longer signal to opt out. */
+    var ctl=new AbortController();var to=setTimeout(function(){try{ctl.abort();}catch(e){}},30000);
+    fetch('/api/guarddog/disk-layout',{credentials:'same-origin',signal:ctl.signal}).then(function(r){return r.json();}).then(function(d){
+        clearTimeout(to);
+        if(!d||!d.success||!d.layout)return;
+        _diskLayout=d.layout;
+        _diskRenderCard(d.layout);
+    }).catch(function(){clearTimeout(to);});
+}
+function _diskRenderCard(L){
+    var card=_diskEl('disk-reclaim-card');if(!card)return;
+    if(!L||L.mode==='ok'){card.style.display='none';return;}
+    card.style.display='block';
+    var head=_diskEl('disk-reclaim-headline');
+    if(head)head.textContent='Root is only '+L.root_pct_of_vg+'% of this disk — '+L.reclaimable_gb+' GB is reclaimable for TAK';
+    var bits=[];
+    if(L.mode==='free_extents'||L.mode==='both')
+        bits.push('<b>'+_diskEsc(L.vg_free_gb)+' GB</b> of volume group <b>'+_diskEsc(L.vg)+'</b> is unallocated. Growing <b>'+_diskEsc(L.root_lv)+'</b> into it is non-destructive, needs no reboot, and nothing has to stop.');
+    if(L.mode==='idle_home'||L.mode==='both')
+        bits.push('<b>'+_diskEsc(L.home_lv)+'</b> is a separate <b>'+_diskEsc(L.home_lv_gb)+' GB</b> volume holding only '+_diskEsc(L.home_used_mb)+' MB. Folding it into root hands that space to TAK — <b>this destroys the volume</b> and stops Docker while it runs.');
+    bits.push('TAK Server, Docker, Postgres, Authentik and CloudTAK all live on root ('+_diskEsc(L.root_gb)+' GB), so space parked anywhere else is unusable.');
+    var det=_diskEl('disk-reclaim-detail');
+    if(det)det.innerHTML=bits.join('<br>');
+    var grow=_diskEl('disk-grow-btn'),fold=_diskEl('disk-fold-btn');
+    if(grow){
+        var showGrow=(L.mode==='free_extents'||L.mode==='both');
+        grow.style.display=showGrow?'':'none';
+        grow.textContent='Reclaim '+L.vg_free_gb+' GB';
+    }
+    if(fold)fold.style.display=(L.mode==='idle_home'||L.mode==='both')?'':'none';
+}
+function _diskSetBusy(on,text){
+    _diskBusy=on;
+    var grow=_diskEl('disk-grow-btn'),fold=_diskEl('disk-fold-btn'),st=_diskEl('disk-reclaim-status');
+    if(grow)grow.disabled=on;
+    if(fold)fold.disabled=on;
+    if(st&&text){st.style.display='block';st.style.color='var(--cyan)';st.textContent=text;}
+}
+function _diskShowResult(ok,msg,d){
+    var st=_diskEl('disk-reclaim-status'),lg=_diskEl('disk-reclaim-log');
+    if(st){st.style.display='block';st.style.color=ok?'var(--green)':'var(--red)';st.textContent=(ok?'✓ ':'✗ ')+msg;}
+    var lines=(d&&d.log)?d.log.slice():[];
+    if(d&&d.df_after)lines.push('','',d.df_after);
+    if(d&&d.backup)lines.push('','Backup archive kept at '+d.backup+' (root-only, 0600).');
+    if(lg){
+        if(lines.length){lg.style.display='block';lg.textContent=lines.join('\n');}
+        else{lg.style.display='none';lg.textContent='';}
+    }
+}
+async function diskReclaimGrow(){
+    var L=_diskLayout;if(!L)return;
+    if(!confirm('Grow '+L.root_lv+' into '+L.vg_free_gb+' GB of unallocated space?\n\nNon-destructive: no data is touched, no reboot, nothing stops. The filesystem is grown online.'))return;
+    _diskSetBusy(true,'Growing root — this takes a few seconds…');
+    try{
+        var r=await fetch('/api/console/disk/reclaim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'grow_free'}),credentials:'same-origin'});
+        var d=await r.json();
+        _diskSetBusy(false,'');
+        if(d.success){
+            _diskShowResult(true,'Root grew into the free extents.',d);
+            if(d.layout){_diskLayout=d.layout;_diskRenderCard(d.layout);}
+        }else{
+            _diskShowResult(false,d.error||'Reclaim failed.',d);
+        }
+    }catch(e){
+        _diskSetBusy(false,'');
+        _diskShowResult(false,'Request failed: '+(e.message||'unknown'),null);
+    }
+}
+function promptDiskFold(){
+    var L=_diskLayout;if(!L||!L.home_lv)return;
+    var m=_diskEl('disk-fold-modal');
+    var lv=_diskEl('disk-fold-lv'),meta=_diskEl('disk-fold-lv-meta');
+    var inp=_diskEl('disk-fold-lv-input'),pw=_diskEl('disk-fold-pw'),err=_diskEl('disk-fold-err');
+    if(lv)lv.textContent=L.home_lv;
+    if(meta)meta.textContent=L.home_lv_gb+' GB volume, '+L.home_used_mb+' MB in use — root gains the whole '+L.home_lv_gb+' GB.';
+    if(inp){inp.value='';inp.placeholder=L.home_lv;}
+    if(pw)pw.value='';
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    var btn=_diskEl('disk-fold-confirm');if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+    var cancel=_diskEl('disk-fold-cancel');if(cancel)cancel.disabled=false;
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closeDiskFoldModal(){
+    if(_diskBusy)return;      /* never let the operator lose sight of a running fold-in */
+    var m=_diskEl('disk-fold-modal');
+    if(m)m.style.display='none';
+}
+async function confirmDiskFold(){
+    var L=_diskLayout;if(!L||!L.home_lv)return;
+    var inp=_diskEl('disk-fold-lv-input'),pw=_diskEl('disk-fold-pw'),err=_diskEl('disk-fold-err');
+    var typed=(inp?inp.value:'').trim(),pass=(pw?pw.value:'');
+    function fail(msg){if(err){err.style.color='var(--red)';err.textContent=msg;}}
+    if(typed!==L.home_lv){fail('Type the volume name exactly: '+L.home_lv);return;}
+    if(!pass){fail('Console password required');return;}
+    fail('');
+    var btn=_diskEl('disk-fold-confirm'),cancel=_diskEl('disk-fold-cancel');
+    if(btn){btn.disabled=true;btn.textContent='Working…';}
+    if(cancel)cancel.disabled=true;
+    _diskSetBusy(true,'Folding '+L.home_lv+' into root — Docker is stopped for this. Can take several minutes on a large /home. Do not close this tab.');
+    if(err){err.style.color='var(--cyan)';err.textContent='Archiving /home, then removing the volume… this window stays open until it finishes.';}
+    /* Deliberately no client-side timeout: the broker allows up to 40 min for the
+       rsync + tar + lvremove + filesystem grow. */
+    try{
+        var r=await fetch('/api/console/disk/reclaim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'fold_home',password:pass,confirm_lv:L.home_lv}),credentials:'same-origin'});
+        var d=await r.json();
+        _diskSetBusy(false,'');
+        if(d.success){
+            var m=_diskEl('disk-fold-modal');if(m)m.style.display='none';
+            _diskShowResult(true,L.home_lv+' folded into root.',d);
+            if(d.layout){_diskLayout=d.layout;_diskRenderCard(d.layout);}
+        }else{
+            if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+            if(cancel)cancel.disabled=false;
+            fail(d.error||'Reclaim failed.');
+            /* Broker failure paths roll back (fstab restored, /home remounted, Docker
+               restarted) and return their log — show it rather than swallow it. */
+            if(d.log&&d.log.length)_diskShowResult(false,d.error||'Reclaim failed.',d);
+        }
+    }catch(e){
+        _diskSetBusy(false,'');
+        if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+        if(cancel)cancel.disabled=false;
+        fail('Connection lost: '+(e.message||'unknown')+'. The fold-in may still be running on the box — wait a few minutes, reload this page, and check the card before retrying.');
+    }
+}
+diskLayoutRefresh();
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';var _cd=document.getElementById('cpu-detail');if(_cd&&d.cpu_percent_now!=null)_cd.textContent='1-min avg · now '+d.cpu_percent_now+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
+function refreshModuleCards(){
+    fetch('/api/modules').then(r=>r.json()).then(function(mods){
+        for(var k in mods){
+            var el=document.getElementById('module-status-'+k);
+            if(!el)continue;
+            var m=mods[k];
+            if(m.updating_config){
+                el.className='module-status status-updating';
+                el.innerHTML='<span class="status-dot"></span> Updating config…';
+                continue;
+            }
+            if(k==='guarddog'&&m.installed&&m.running){ continue; }
+            var cls='module-status status-'+(m.installed&&m.running?'running':m.installed?'stopped':'not-installed');
+            var label=m.installed&&m.running?'<span class="status-dot"></span> Running':m.installed?'<span class="status-dot"></span> Stopped':'Not Installed';
+            el.className=cls;el.innerHTML=label;
+        }
+        if(mods.guarddog&&mods.guarddog.installed&&mods.guarddog.running) updateGuardDogOverallHealth();
+    }).catch(function(){});
+}
+var _gdHealthCallCount=0;
+function updateGuardDogOverallHealth(){
+    var el=document.getElementById('module-status-guarddog');
+    if(!el)return;
+    _gdHealthCallCount++;
+    fetch('/api/guarddog/overall-health?_='+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+        var overall=d.overall||'ok';
+        // Only show caution/critical after at least 2 successful checks (avoid cold-start false positive)
+        if(overall!=='ok'&&_gdHealthCallCount<3) return;
+        var cls='module-status status-'+(overall==='ok'?'running':overall==='caution'?'caution':'critical');
+        var label=overall==='ok'?'Healthy':overall==='caution'?'Caution':'Critical';
+        el.className=cls; el.innerHTML='<span class="status-dot"></span> '+label;
+    }).catch(function(){});
+}
+setInterval(refreshModuleCards,8000);
+setTimeout(refreshModuleCards,3000);
+function refreshModuleVersions(){
+    fetch('/api/modules/version').then(function(r){return r.json()}).then(function(data){
+        for(var key in data){
+            var el=document.getElementById('module-version-'+key);
+            if(!el)continue;
+            var d=data[key];
+            var s='';
+            if(d.version)s=(key==='mediamtx'?'':'v')+d.version;
+            if(key==='authentik'&&d.channel==='dev'){
+                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+                if(d.update_available){
+                    s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
+                }
+            }else if(key==='netbird'&&d.channel==='dev'){
+                if(d.vetted)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted+'">· main: v'+d.vetted+'</span>';
+                if(d.update_available){
+                    s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
+                }
+            }else if(key==='netbird'&&d.vetted&&!d.update_available){
+                s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
+            }else if(key==='cloudtak'&&d.latest&&!d.update_available){
+                s+=' <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>';
+            }else if(d.update_available){
+                s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
+            }else if(key==='authentik'&&d.ahead_of_vetted&&d.vetted_release){
+                s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+d.vetted_release+') — not yet validated on main channel">! unvetted</span>';
+            }else if(key==='authentik'&&d.vetted_release){
+                s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
+            }
+            el.innerHTML=s;if(s)el.style.display='';
+        }
+    }).catch(function(){});
+}
+setInterval(refreshModuleVersions,30000);
+refreshModuleVersions();
+function loadTakCertExpiry(){
+    var el=document.getElementById('takserver-card-cert-expiry');
+    if(!el)return;
+    fetch('/api/takserver/cert-expiry').then(function(r){return r.json()}).then(function(d){
+        function fmt(days){
+            var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+            var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+            return p.join(' ');
+        }
+        var parts=[];
+        var certs=[['root_ca','Root'],['intermediate_ca','Int']];
+        for(var i=0;i<certs.length;i++){
+            var key=certs[i][0],label=certs[i][1],c=d[key];
+            if(!c||c.error)continue;
+            var days=c.days_left,color='#22c55e';
+            if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
+            parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+        }
+        el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
+    }).catch(function(){});
+}
+function fmtCertDays(days){
+    var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+    var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+    return p.join(' ');
+}
+function loadCaddyCertDays(){
+    var el=document.getElementById('caddy-card-cert-days');
+    if(!el)return;
+    fetch('/api/caddy/cert-days').then(function(r){return r.json()}).then(function(d){
+        var days=d.days_left,color=d.color;
+        if(days==null){el.textContent='Cert: —';el.style.color='var(--text-dim)';return;}
+        el.textContent='Cert: '+fmtCertDays(days);
+        if(color==='green')el.style.color='var(--green)';
+        else if(color==='yellow')el.style.color='var(--yellow)';
+        else if(color==='red')el.style.color='var(--red)';
+        else el.style.color='var(--text-dim)';
+    }).catch(function(){el.textContent='Cert: —';el.style.color='var(--text-dim)';});
+}
+loadTakCertExpiry();
+function loadFedHubCardCertExpiry(){
+  var el=document.getElementById('fedhub-card-cert-expiry');
+  if(!el)return;
+  fetch('/api/fedhub/cert-expiry',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    function fmt(days){
+      var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+      var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+      return p.join(' ');
+    }
+    var parts=[];
+    var certs=[['root_ca','Root'],['intermediate_ca','Int']];
+    for(var i=0;i<certs.length;i++){
+      var key=certs[i][0],label=certs[i][1],c=d[key];
+      if(!c||c.error)continue;
+      var days=c.days_left,color='#22c55e';
+      if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
+      parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+    }
+    el.innerHTML=parts.length?parts.join(' &nbsp;&middot;&nbsp; '):'';
+  }).catch(function(){el.innerHTML='';});
+}
+if(document.getElementById('fedhub-card-cert-expiry')){
+  loadFedHubCardCertExpiry();
+  setInterval(loadFedHubCardCertExpiry,60000);
+}
+loadCaddyCertDays();
+var _kpatchPollTimer=null;
+function _kpatchShowState(state){
+    ['kpatch-idle','kpatch-running','kpatch-done','kpatch-error'].forEach(function(id){
+        var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
+    });
+}
+async function checkKernelPatch(){
+    var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
+    var dismissed=localStorage.getItem('kernel-patch-dismissed');
+    // First: check if a background patch job is in flight (started in a prior
+    // session — UI reload, browser refresh, etc.). If so, jump straight into
+    // the live polling state instead of showing the idle banner.
+    try{
+        var jr=await fetch('/api/system/kernel-patch/job-status',{credentials:'same-origin',cache:'no-store'});
+        var jd=await jr.json();
+        if(jd && jd.running){
+            banner.style.display='block';
+            _kpatchShowState('running');
+            document.getElementById('kpatch-pid').textContent='pid '+(jd.pid||'?');
+            document.getElementById('kpatch-log').textContent=jd.log_tail||'(no output yet)';
+            _kpatchStartPolling();
+            return;
+        }
+        if(jd && jd.done){
+            banner.style.display='block';
+            _kpatchShowState('done');
+            document.getElementById('kpatch-log-done').textContent=jd.log_tail||'';
+            return;
+        }
+        if(jd && jd.error){
+            banner.style.display='block';
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent=jd.log_tail||'';
+            return;
+        }
+    }catch(e){}
+    // No in-flight job — fall back to the "is there a kernel update available?" check
+    try{
+        var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        if(d.patched){localStorage.removeItem('kernel-patch-dismissed');banner.style.display='none';return;}
+        var cveEl=document.getElementById('kpatch-cve');
+        if(cveEl)cveEl.textContent=d.cve_banner?(' to fix '+d.cve_banner):'';
+        if(!dismissed){banner.style.display='block';_kpatchShowState('idle');}
+    }catch(e){}
+}
+function dismissKernelBanner(){
+    var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
+    localStorage.setItem('kernel-patch-dismissed','1');
+    // Don't kill the polling timer if a job is running in the background —
+    // we just hide the UI. The job continues to run regardless.
+}
+async function startKernelPatch(){
+    if(!confirm("Start kernel patch?\n\nThis will run a full OS package upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\u2019s a separate explicit click.\n\nContinue?"))return;
+    var banner=document.getElementById('kernel-patch-banner');
+    _kpatchShowState('running');
+    document.getElementById('kpatch-pid').textContent='starting...';
+    document.getElementById('kpatch-log').textContent='Spawning detached background job...';
+    try{
+        var r=await fetch('/api/system/kernel-patch/start',{method:'POST',credentials:'same-origin'});
+        var d=await r.json();
+        if(!d.ok && !d.message){
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent='start failed: '+(d.error||'unknown error');
+            return;
+        }
+        document.getElementById('kpatch-pid').textContent='pid '+(d.pid||'?')+(d.ok?'':' (already running)');
+        _kpatchStartPolling();
+    }catch(e){
+        _kpatchShowState('error');
+        document.getElementById('kpatch-log-error').textContent='start failed: network error - '+e;
+    }
+}
+function _kpatchStartPolling(){
+    if(_kpatchPollTimer)return;
+    _kpatchPollTimer=setInterval(_kpatchPollOnce,3000);
+    _kpatchPollOnce();
+}
+async function _kpatchPollOnce(){
+    try{
+        var r=await fetch('/api/system/kernel-patch/job-status',{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        var logEl=document.getElementById('kpatch-log');
+        if(logEl && d.log_tail){
+            var atBottom=(logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight)<10;
+            logEl.textContent=d.log_tail;
+            if(atBottom)logEl.scrollTop=logEl.scrollHeight;
+        }
+        if(d.done){
+            clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            _kpatchShowState('done');
+            document.getElementById('kpatch-log-done').textContent=d.log_tail||'';
+            return;
+        }
+        if(d.error){
+            clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent=d.log_tail||'';
+            return;
+        }
+        if(!d.running && !d.done && !d.error){
+            // Job is no longer running, log doesn't show DONE or FATAL — could
+            // be the apt subprocess got killed by the OS, an unexpected exit,
+            // or we polled in the tiny window between Popen returning and the
+            // log getting its first line. Wait one more cycle before deciding.
+            // The next poll will either flip to done/error (apt actually
+            // finished while we were polling) or stay in this limbo state,
+            // in which case we treat it as error.
+            // For now: leave the UI in 'running' state, the next poll resolves.
+        }
+    }catch(e){}
+}
+async function rebootForKernelPatch(){
+    if(!confirm('Reboot now?\n\nThis will reboot the server immediately. The console will be unavailable until the box comes back (usually 1-3 min).\n\nContinue?'))return;
+    var logEl=document.getElementById('kpatch-log-done');
+    if(logEl)logEl.textContent+='\n[browser] reboot requested...';
+    try{
+        await fetch('/api/system/kernel-patch/reboot',{method:'POST',credentials:'same-origin'});
+    }catch(e){}
+    // Either way the box is going down; show a friendly message
+    var bn=document.getElementById('kpatch-done');
+    if(bn)bn.innerHTML='<div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Reboot in progress &mdash; the console will reload automatically when the box is back up...</div>';
+    setTimeout(function(){location.reload();},45000);
+}
+checkKernelPatch();
+var updateBody='';
+async function checkUpdate(forceRefresh){
+    var btn=document.getElementById('check-release-btn');
+    if(btn){btn.disabled=true;btn.textContent='Checking...';}
+    try{
+        var url='/api/update/check';if(forceRefresh)url+='?refresh=1';
+        var r=await fetchRetry(url,{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        if(d.update_available){
+            document.getElementById('update-banner').style.display='block';
+            document.getElementById('update-info').textContent='v'+d.current+' -> v'+d.latest+(d.notes?' - '+d.notes:'');
+            updateBody=d.body||'No details available';
+        }else if(forceRefresh&&btn){btn.textContent='Up to date';setTimeout(function(){btn.textContent='Check for new release';},2000);}
+    }catch(e){if(forceRefresh&&btn)btn.textContent='Check failed';}
+    if(btn){btn.disabled=false;if(btn.textContent==='Checking...'||btn.textContent==='Check failed')setTimeout(function(){btn.textContent='Check for new release';},2000);}
+}
+function toggleUpdateDetails(){
+    var el=document.getElementById('update-details');
+    if(el.style.display==='none'){el.textContent=updateBody;el.style.display='block'}
+    else{el.style.display='none'}
+}
+async function applyUpdate(){
+    var btn=document.getElementById('update-apply-btn');
+    var status=document.getElementById('update-status');
+    btn.disabled=true;btn.textContent='Updating...';btn.style.opacity='0.7';
+    status.style.display='block';status.style.color='var(--cyan)';status.textContent='Pulling latest from GitHub...';
+    try{
+        var r=await fetch('/api/update/apply',{method:'POST'});var d=await r.json();
+        if(d.success){
+            status.style.color='var(--green)';
+            status.textContent='OK Updated! Restarting console...';
+            if(d.restart_message){status.innerHTML=status.textContent+'<br><small style="opacity:0.9;display:block;margin-top:6px">'+d.restart_message+'</small>';}
+            setTimeout(function(){window.location.reload()},12000);
+        }else if(d.in_progress){
+            // v0.9.24 Item 1: server-side single-flight lock detected an
+            // in-progress update (e.g. clicked from a second tab). Keep
+            // button disabled, show a friendlier waiting message, and
+            // auto-reload after a longer delay so the user lands on the
+            // post-update page once the deploy is done.
+            status.style.color='var(--cyan)';
+            status.textContent=d.error||'Update is already running on this server.';
+            btn.textContent='Update in progress…';
+            setTimeout(function(){window.location.reload()},30000);
+        }else{
+            status.style.color='var(--red)';status.textContent='Error: '+d.error;
+            if(d.workaround){status.innerHTML=status.textContent+'<br><small style="opacity:0.9">'+d.workaround+'</small>';}
+            btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1';
+        }
+    }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
+}
+// --- Update channel toggle ---
+var _currentChannel = '{{ settings.get("update_channel", "main") }}';
+function _renderChannelButtons(ch){
+    var mb=document.getElementById('ch-main-btn');
+    var db=document.getElementById('ch-dev-btn');
+    if(!mb||!db)return;
+    var base="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;";
+    var devBorder="border-left:1px solid var(--border);";
+    if(ch==='dev'){
+        mb.style.cssText=base+'background:transparent;color:var(--text-dim);';
+        db.style.cssText=base+devBorder+'background:var(--yellow);color:#0f172a;';
+    }else{
+        mb.style.cssText=base+'background:var(--green);color:#0f172a;';
+        db.style.cssText=base+devBorder+'background:transparent;color:var(--text-dim);';
+    }
+}
+_renderChannelButtons(_currentChannel);
+function promptDevChannel(){
+    if(_currentChannel==='dev'){setUpdateChannel('main');return;}
+    var m=document.getElementById('dev-pw-modal');
+    var inp=document.getElementById('dev-pw-input');
+    var err=document.getElementById('dev-pw-err');
+    if(err)err.textContent='';
+    if(inp)inp.value='';
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closeDevModal(){
+    var m=document.getElementById('dev-pw-modal');
+    if(m)m.style.display='none';
+}
+async function confirmDevChannel(){
+    var inp=document.getElementById('dev-pw-input');
+    var err=document.getElementById('dev-pw-err');
+    var pw=(inp?inp.value:'').trim();
+    if(!pw){if(err)err.textContent='Password required';return;}
+    if(err)err.textContent='';
+    try{
+        var r=await fetchRetry('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'dev',password:pw}),credentials:'same-origin'});
+        var d=await r.json();
+        if(d.ok){
+            closeDevModal();
+            _currentChannel='dev';
+            _renderChannelButtons('dev');
+            var st=document.getElementById('ch-status');
+            if(st)st.textContent='Switched to dev — checking…';
+            checkUpdate(true);
+            setTimeout(function(){var s=document.getElementById('ch-status');if(s)s.textContent='';},3000);
+        }else{if(err)err.textContent=d.error||'Incorrect password';}
+    }catch(e){if(err)err.textContent='Error: '+e.message;}
+}
+var _powerAction='';
+function promptPower(action){
+    _powerAction=action;
+    var m=document.getElementById('power-pw-modal');
+    var inp=document.getElementById('power-pw-input');
+    var err=document.getElementById('power-pw-err');
+    var ttl=document.getElementById('power-pw-title');
+    var msg=document.getElementById('power-pw-msg');
+    var btn=document.getElementById('power-pw-confirm');
+    if(action==='poweroff'){
+      if(ttl)ttl.textContent='⚠ Power off this box';
+      if(msg)msg.textContent='The box shuts down completely — you will need physical access to power it back on. Enter your console password to confirm.';
+      if(btn){btn.textContent='Power Off';btn.style.background='var(--red)';btn.style.color='#fff';}
+    }else{
+      if(ttl)ttl.textContent='⚠ Reboot this box';
+      if(msg)msg.textContent='The box restarts — you will lose the console for about a minute while it comes back. Enter your console password to confirm.';
+      if(btn){btn.textContent='Reboot';btn.style.background='var(--yellow)';btn.style.color='#0f172a';}
+    }
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    if(btn)btn.disabled=false;
+    if(inp)inp.value='';
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closePowerModal(){
+    var m=document.getElementById('power-pw-modal');
+    if(m)m.style.display='none';
+}
+async function confirmPower(){
+    var inp=document.getElementById('power-pw-input');
+    var err=document.getElementById('power-pw-err');
+    var msg=document.getElementById('power-pw-msg');
+    var pw=(inp?inp.value:'').trim();
+    if(!pw){if(err){err.style.color='var(--red)';err.textContent='Password required';}return;}
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    try{
+        var r=await fetchRetry('/api/console/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:_powerAction,password:pw}),credentials:'same-origin'});
+        var d=await r.json();
+        if(d.success){
+            if(msg)msg.textContent=(_powerAction==='poweroff'?'Powering off now — this console will go offline in a moment.':'Rebooting now — the console will return in about a minute.');
+            if(err){err.style.color='var(--green)';err.textContent='Command sent.';}
+            var btn=document.getElementById('power-pw-confirm');if(btn)btn.disabled=true;
+        }else{if(err){err.style.color='var(--red)';err.textContent=d.error||'Incorrect password';}}
+    }catch(e){if(err){err.style.color='var(--red)';err.textContent='Error: '+e.message;}}
+}
+async function setUpdateChannel(ch){
+    var st=document.getElementById('ch-status');
+    if(st)st.textContent='Saving…';
+    try{
+        var r=await fetchRetry('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch}),credentials:'same-origin'});
+        var d=await r.json();
+        if(d.ok){
+            _currentChannel=ch;
+            _renderChannelButtons(ch);
+            if(st)st.textContent='Switched to '+ch+' — checking…';
+            checkUpdate(true);
+            setTimeout(function(){if(st)st.textContent='';},3000);
+        }else{if(st)st.textContent='Error: '+(d.error||'unknown');}
+    }catch(e){if(st)st.textContent='Error: '+e.message;}
+}
+checkUpdate();
+// Hide the server-side fallback banner once JS is running — JS banner takes over.
+(function(){var b=document.getElementById('srv-update-banner');if(b)b.style.display='none';})();
+async function doConsoleRollback(){
+    if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
+    var bar=document.getElementById('console-rollback-bar');
+    if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--yellow)">Rolling back…</div>';
+    try{
+        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        if(d.ok){
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--green)">✓ '+d.message+'</div>';
+            setTimeout(function(){window.location.reload()},10000);
+        }else{
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">✗ Error: '+(d.error||'failed')+'</div>';
+        }
+    }catch(e){if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">Network error: '+e.message+'</div>';}
+}
+</script></body></html>

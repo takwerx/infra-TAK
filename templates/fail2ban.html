@@ -1,0 +1,1764 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Fail2ban — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px;font-family:'JetBrains Mono',monospace}
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:0}
+@media(max-width:900px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+.stat-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center}
+.cfg-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;transition:border-color .2s}.cfg-input:focus{border-color:var(--cyan)}
+.stat-value{font-family:'JetBrains Mono',monospace;font-size:28px;font-weight:700;margin-bottom:4px}
+.stat-label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em}
+.stat-value.red{color:var(--red)}.stat-value.green{color:var(--green)}.stat-value.yellow{color:var(--yellow)}.stat-value.cyan{color:var(--cyan)}
+.form-row{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;font-family:'JetBrains Mono',monospace}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;transition:border-color .2s}
+.form-input:focus{border-color:var(--cyan)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:5px}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:opacity .2s}
+.btn-primary:hover{opacity:.85}
+.btn-danger-sm{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;font-family:'JetBrains Mono',monospace}
+.btn-danger-sm:hover{background:rgba(239,68,68,.2)}
+.ban-table{width:100%;border-collapse:collapse;font-size:13px}
+.ban-table th{text-align:left;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid var(--border)}
+.ban-table td{padding:10px 12px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:12px}
+.ban-table tr:last-child td{border-bottom:none}
+.ban-table tr:hover td{background:rgba(255,255,255,.02)}
+.log-box{background:#060910;border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.6}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:600}
+.badge-green{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.badge-yellow{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
+.dot-pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes f2b-spin{to{transform:rotate(360deg)}}
+.ip-chip{display:inline-flex;align-items:center;gap:5px;background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.25);color:var(--cyan);font-family:monospace;font-size:11px;padding:3px 8px;border-radius:4px}
+.ip-chip button{background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;line-height:1}.ip-chip button:hover{color:var(--red)}
+.not-installed-banner{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:12px;padding:28px;text-align:center;margin-bottom:24px}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;z-index:9999;display:none}
+.toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
+.toast.error{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);color:var(--red)}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div style="margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+<div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+<img src="https://avatars.githubusercontent.com/u/1087378?s=128&v=4" alt="Fail2ban" style="height:40px;width:auto;border-radius:6px">
+<div>
+<span style="font-family:'JetBrains Mono',monospace;font-weight:700;font-size:20px">Fail2ban</span>
+<span id="f2b-version-badge" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-left:10px"></span>
+</div>
+</div>
+<div style="font-size:13px;color:var(--text-dim)">Brute-force IP blocking for Authentik &amp; TAK Server.</div>
+</div>
+<span id="forwarder-badge" class="badge badge-yellow"><span class="dot"></span>Loading…</span>
+</div>
+
+<div id="daemon-warn" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.35);border-radius:10px;padding:14px 18px;margin-bottom:20px;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--red)">
+⚠ fail2ban daemon is not running — jails are inactive. Toggle any jail ON to auto-restart it, or run <code>systemctl enable --now fail2ban</code> on the server.
+</div>
+
+{% if not installed %}
+<div class="not-installed-banner">
+<img src="https://avatars.githubusercontent.com/u/1087378?s=128&v=4" alt="Fail2ban" style="height:56px;width:auto;border-radius:8px;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto">
+<div style="font-size:15px;font-weight:600;margin-bottom:8px">fail2ban is not installed</div>
+<div style="font-size:13px;color:var(--text-dim);max-width:480px;margin:0 auto 20px;line-height:1.6">
+Blocks brute-force login attempts on Authentik and port scans on TAK Server.
+Bans IPs via UFW and sends Guard Dog email alerts.
+</div>
+<button id="install-btn" class="btn-primary" onclick="startInstall()" style="margin-bottom:16px">Install Fail2ban</button>
+<div id="install-log-box" style="display:none;background:#060910;border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:220px;overflow-y:auto;white-space:pre-wrap;text-align:left;max-width:580px;margin:0 auto"></div>
+</div>
+{% else %}
+
+<!-- Trusted Upstream Networks (fleet-wide ignoreip) -->
+<div class="card" id="f2b-trusted-card" style="margin-bottom:8px">
+<div class="card-title">🌐 Trusted Upstream Networks</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:6px;line-height:1.6">
+If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure App Gateway, an Nginx/HAProxy in front, etc.), inbound traffic appears to come from the upstream's handful of IPs. A jail trip could then ban the <strong>gateway itself</strong> — and since it is the only way in, <strong>every site 502s</strong> while the box is perfectly healthy. Add the upstream's subnet(s) here and they are whitelisted in <strong>every</strong> jail, and re-applied automatically on each jail rebuild. Localhost and the box's own attached private subnet are always trusted.
+</div>
+<div style="margin-top:14px">
+<label class="form-label">Trusted CIDRs / IPs</label>
+<input class="form-input" id="f2b-trusted-cidrs" type="text" placeholder="e.g. 10.35.77.0/24  10.0.0.0/8" style="font-family:monospace" oninput="renderChips('f2b-trusted-cidrs','f2b-trusted-chips')">
+<div id="f2b-trusted-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div id="f2b-trusted-auto" style="font-size:11px;color:var(--text-dim);margin-top:10px"></div>
+<div style="display:flex;align-items:center;gap:12px;margin-top:14px">
+<button class="btn btn-primary" onclick="saveTrustedCidrs()">Save trusted networks</button>
+<span id="f2b-trusted-msg" style="font-size:12px"></span>
+</div>
+</div>
+
+<!-- Repeat Offender Protection -->
+<div class="card" id="recidive-card" style="margin-bottom:8px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>🛡 Repeat Offender Protection</span>
+<span class="badge badge-red" id="recidive-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="recidive-refresh-btn" onclick="manualRecidiveRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="recidive-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="recidive-toggle" onchange="toggleRecidiveJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="recidive-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="recidive-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Permanently bans repeat offenders. An IP banned by <strong>any</strong> jail N times within the watch window is blocked forever — until you manually unban them. Permanent bans survive reboots.</div>
+
+<div id="recidive-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="recidive-banned-toggle" onclick="toggleRecidiveBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see permanently banned IPs">
+<div class="stat-value red" id="recidive-stat-banned">0</div>
+<div class="stat-label">Permanently Banned <span style="font-size:10px;color:var(--text-dim)" id="recidive-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted">
+<div class="stat-value cyan" id="recidive-stat-total">0</div>
+<div class="stat-label">Total Caught <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div>
+</div>
+</div>
+
+<div id="recidive-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Permanently Banned IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3)">∞ permanent</span></div>
+<input type="text" id="recidive-ban-search" oninput="filterRecidiveBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="recidive-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:8px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Strikes before permanent ban</label>
+<input class="form-input" type="number" id="recidive-cfg-maxretry" value="3" min="2" max="20">
+<div class="form-hint">Bans in any jail that trigger a permanent block</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Watch window (hours)</label>
+<input class="form-input" type="number" id="recidive-cfg-findtime" value="24" min="1" max="720">
+<div class="form-hint">How far back to look — use 720 (30 days) for maximum strictness</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveRecidiveConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /recidive-enabled-section -->
+</div><!-- /Repeat Offender Protection card -->
+
+<!-- Authentik Jail card -->
+<div class="card" style="margin-bottom:20px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>Authentik Jail</span>
+<span class="badge badge-yellow" id="auth-jail-badge" style="font-size:10px;padding:2px 8px">Loading…</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="auth-refresh-btn2" onclick="manualRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="auth-refresh-icon2" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="auth-toggle" onchange="toggleAuthentikJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="auth-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="auth-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+
+<div id="auth-enabled-section" style="display:none">
+<div class="stat-grid" id="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="auth-banned-toggle" onclick="toggleAuthBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="auth-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card"><div class="stat-value yellow" id="stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="auth-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="auth-ban-search" oninput="filterAuthBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<!-- Configuration -->
+<div class="card">
+<div class="card-title">Jail Configuration</div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" id="cfg-maxretry" type="number" min="1" max="50" value="5">
+<div class="form-hint">Failed logins before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (minutes)</label>
+<input class="form-input" id="cfg-findtime" type="number" min="1" max="1440" value="10">
+<div class="form-hint">Time window to count failures</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" id="cfg-bantime" type="number" min="1" max="43200" value="60">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" id="cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace" oninput="renderChips('cfg-ignoreip','cfg-ignoreip-chips')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt. Type or paste, then Save &amp; Reload.</div>
+<div id="cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveConfig()">Save &amp; Reload</button>
+<span style="font-size:11px;color:var(--text-dim);margin-left:12px">Applies immediately — active bans unaffected</span>
+</div>
+</div>
+
+<!-- Activity Log -->
+<div class="card" style="margin-top:16px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+<span>Recent Activity</span>
+<span style="font-size:11px;color:var(--text-dim);font-weight:400">Last 100 authentik events — auto-refreshes every 30s</span>
+</div>
+<div class="log-box" id="log-box">Loading…</div>
+</div>
+</div><!-- /auth-enabled-section -->
+</div><!-- /Authentik Jail card -->
+
+<!-- SSH Jail -->
+<div class="card" id="ssh-jail-card">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>SSH Jail</span>
+<span class="badge badge-red" id="ssh-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="ssh-refresh-btn" onclick="manualSshRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="ssh-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="ssh-toggle" onchange="toggleSshJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="ssh-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="ssh-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Watches failed SSH logins &mdash; from the system auth log, or the systemd journal on boxes without rsyslog. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
+
+<div id="ssh-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="ssh-banned-toggle" onclick="toggleSshBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="ssh-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="ssh-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" id="ssh-watching-toggle" onclick="toggleSshWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="ssh-stat-failed">0</div>
+<div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="ssh-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="ssh-safety-banner" style="display:none;margin-bottom:14px;border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.5"></div>
+
+<div id="ssh-neverban-panel" style="margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Never Banned</div>
+<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Addresses fail2ban will never lock out, and why. A ban blocks <b>every port</b> from an address &mdash; not just SSH.</div>
+<div id="ssh-neverban-list"><div style="color:var(--text-dim);font-size:12px;font-family:'JetBrains Mono',monospace">Loading…</div></div>
+</div>
+
+<div id="ssh-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within find window, not yet banned</div>
+<input type="text" id="ssh-watching-search" oninput="filterSshWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="ssh-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+
+<div id="ssh-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="ssh-ban-search" oninput="filterSshBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="ssh-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="ssh-cfg-maxretry" value="3" min="1" max="50">
+<div class="form-hint">Attempts before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (minutes)</label>
+<input class="form-input" type="number" id="ssh-cfg-findtime" value="10" min="1" max="1440">
+<div class="form-hint">Time window to count attempts</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="ssh-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" type="text" id="ssh-cfg-ignoreip" placeholder="e.g. 10.0.0.5, 192.168.1.0/24" style="font-family:monospace" oninput="renderChips('ssh-cfg-ignoreip','ssh-cfg-ignoreip-chips')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt.</div>
+<div id="ssh-cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveSshConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /ssh-enabled-section -->
+</div><!-- /SSH Jail card -->
+
+<!-- MediaMTX RTSP Jail -->
+<div class="card" id="mediamtx-jail-card" style="display:none">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>MediaMTX RTSP Jail</span>
+<span class="badge badge-red" id="mediamtx-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="mediamtx-refresh-btn" onclick="manualMtxRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="mediamtx-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="mediamtx-toggle" onchange="toggleMtxJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="mediamtx-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="mediamtx-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for aggressive RTSP scanner traffic. Triggered by <em>opened</em> events — catches scanners before their probe cycle completes. Guard Dog email alert fires on ban. Default thresholds match the tak-10 scanner profile (20 probes in 10 s).</div>
+
+<div id="mediamtx-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="mediamtx-banned-toggle" onclick="toggleMtxBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="mediamtx-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" id="mediamtx-watching-toggle" onclick="toggleMtxWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="mediamtx-stat-failed">0</div>
+<div class="stat-label">Currently Watching <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="mediamtx-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="mediamtx-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="mediamtx-ban-search" oninput="filterMtxBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="mediamtx-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div id="mediamtx-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — opens within find window, not yet banned</div>
+<input type="text" id="mediamtx-watching-search" oninput="filterMtxWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="mediamtx-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="mediamtx-cfg-maxretry" value="10" min="1" max="100">
+<div class="form-hint">Opens before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (seconds)</label>
+<input class="form-input" type="number" id="mediamtx-cfg-findtime" value="30" min="10" max="3600">
+<div class="form-hint">Time window to count opens</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="mediamtx-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveMtxConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /mediamtx-enabled-section -->
+</div><!-- /MediaMTX RTSP Jail card -->
+
+<!-- TAK Portal Form Jail -->
+<div class="card" id="takportal-jail-card" style="display:none">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>TAK Portal Form Jail</span>
+<span class="badge badge-red" id="takportal-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="takportal-refresh-btn" onclick="manualTpjRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="takportal-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="takportal-toggle" onchange="toggleTpjJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="takportal-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="takportal-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Bans IPs that <strong>fail</strong> the public <code>/lookup</code> (apparatus credential) and <code>/request-access</code> (self-enrollment) forms — defense-in-depth behind the page CAPTCHA. Successful lookups never count toward a ban. Reads the TAK Portal request log <code>/var/log/tak-portal/lookup.log</code>, which is also the apparatus-lookup audit.</div>
+<div id="takportal-log-hint" style="display:none;font-size:11px;color:var(--yellow);margin-top:8px"></div>
+
+<div id="takportal-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="takportal-banned-toggle" onclick="toggleTpjBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="takportal-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="takportal-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" id="takportal-watching-toggle" onclick="toggleTpjWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="takportal-stat-failed">0</div>
+<div class="stat-label">Currently Watching <span style="font-size:10px;color:var(--text-dim)" id="takportal-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="takportal-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="takportal-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="takportal-ban-search" oninput="filterTpjBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="takportal-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div id="takportal-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within the find window, not yet banned</div>
+<input type="text" id="takportal-watching-search" oninput="filterTpjWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="takportal-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="takportal-cfg-maxretry" value="5" min="1" max="100">
+<div class="form-hint">Failed attempts before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (seconds)</label>
+<input class="form-input" type="number" id="takportal-cfg-findtime" value="600" min="10" max="86400">
+<div class="form-hint">Window to count failures</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="takportal-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveTpjConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /takportal-enabled-section -->
+</div><!-- /TAK Portal Form Jail card -->
+
+<!-- TAK Server Jail -->
+<div class="card" id="tak-jail-card" style="display:none">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>TAK Server Jail</span>
+<span class="badge badge-yellow" id="tak-jail-badge" style="font-size:10px;padding:2px 8px">Loading…</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="tak-refresh-btn" onclick="manualTakRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:'JetBrains Mono',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="tak-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="tak-toggle" onchange="toggleTakJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="tak-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="tak-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+
+<div id="tak-not-ready" style="display:none;margin-top:16px;font-size:13px;color:var(--text-dim)">
+TAK Server filter not yet installed — restart the console to complete setup.
+</div>
+
+<div id="tak-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="tak-banned-toggle" onclick="toggleTakBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="tak-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="tak-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" id="tak-watching-toggle" onclick="toggleWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="tak-stat-failed">0</div>
+<div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="tak-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="tak-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="tak-ban-search" oninput="filterTakBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="tak-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div id="tak-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within find window, not yet banned</div>
+<input type="text" id="tak-watching-search" oninput="filterTakWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
+<div id="tak-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" id="tak-cfg-maxretry" type="number" min="1" max="100" value="20">
+<div class="form-hint">Attempts before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (minutes)</label>
+<input class="form-input" id="tak-cfg-findtime" type="number" min="1" max="1440" value="5">
+<div class="form-hint">Time window to count attempts</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" id="tak-cfg-bantime" type="number" min="1" max="43200" value="60">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" id="tak-cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace" oninput="renderChips('tak-cfg-ignoreip','tak-cfg-ignoreip-chips')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt. Type or paste, then Save &amp; Reload.</div>
+<div id="tak-cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveTakConfig()">Save &amp; Reload</button>
+</div>
+</div>
+</div>
+
+{% endif %}
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+function showToast(msg, type) {
+  var t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast ' + type; t.style.display = 'block';
+  setTimeout(function(){ t.style.display = 'none'; }, 3500);
+}
+
+function renderChips(inputId, chipsId) {
+  var input = document.getElementById(inputId);
+  var container = document.getElementById(chipsId);
+  if (!input || !container) return;
+  var ips = input.value.trim().split(/\s+/).filter(function(s){ return s.length > 0; });
+  if (!ips.length) { container.innerHTML = ''; return; }
+  container.innerHTML = ips.map(function(ip) {
+    return '<span class="ip-chip">' + ip +
+      '<button title="Remove" onclick="removeChip(\''+ inputId +'\',\''+ chipsId +'\',\''+ ip +'\')">&times;</button></span>';
+  }).join('');
+}
+
+function removeChip(inputId, chipsId, ip) {
+  var input = document.getElementById(inputId);
+  if (!input) return;
+  var ips = input.value.trim().split(/\s+/).filter(function(s){ return s.length > 0 && s !== ip; });
+  input.value = ips.join(' ');
+  renderChips(inputId, chipsId);
+}
+
+{% if not installed %}
+var _installPoll = null;
+function startInstall() {
+  document.getElementById('install-btn').disabled = true;
+  document.getElementById('install-btn').textContent = 'Installing…';
+  document.getElementById('install-log-box').style.display = 'block';
+  document.getElementById('install-log-box').textContent = 'Starting installation…\n';
+  fetch('/api/fail2ban/install', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(r){ return r.json(); }).then(function(d){
+      if (!d.ok) {
+        document.getElementById('install-log-box').textContent += 'Error: ' + (d.error || 'Unknown error');
+        document.getElementById('install-btn').disabled = false;
+        document.getElementById('install-btn').textContent = 'Install Fail2ban';
+        return;
+      }
+      _installPoll = setInterval(pollInstall, 1500);
+    }).catch(function(){ document.getElementById('install-log-box').textContent += 'Network error.'; });
+}
+function pollInstall() {
+  fetch('/api/fail2ban/install/status').then(function(r){ return r.json(); }).then(function(d){
+    var box = document.getElementById('install-log-box');
+    box.textContent = (d.log || []).join('\n');
+    box.scrollTop = box.scrollHeight;
+    if (d.done) {
+      clearInterval(_installPoll);
+      if (d.ok) {
+        box.textContent += '\n✓ Installation complete — reloading…';
+        setTimeout(function(){ window.location.reload(); }, 1500);
+      } else {
+        box.textContent += '\n✗ Installation failed. Check logs above.';
+        document.getElementById('install-btn').disabled = false;
+        document.getElementById('install-btn').textContent = 'Retry Install';
+      }
+    }
+  }).catch(function(){});
+}
+{% endif %}
+
+{% if installed %}
+function _spinIcon(iconId, spinning) {
+  var el = document.getElementById(iconId);
+  if (!el) return;
+  if (spinning) {
+    el.style.display = 'inline-block';
+    el.style.animation = 'f2b-spin 0.6s linear infinite';
+  } else {
+    el.style.animation = '';
+    el.style.transform = 'rotate(0deg)';
+  }
+}
+
+function manualRefresh() {
+  _spinIcon('auth-refresh-icon2', true);
+  var btn = document.getElementById('auth-refresh-btn2');
+  if (btn) btn.disabled = true;
+  loadStatus(function() {
+    _spinIcon('auth-refresh-icon2', false);
+    if (btn) btn.disabled = false;
+  });
+  loadLog();
+}
+
+function _applyAuthentikJailState(enabled) {
+  var toggle = document.getElementById('auth-toggle');
+  var track  = document.getElementById('auth-toggle-track');
+  var thumb  = document.getElementById('auth-toggle-thumb');
+  var badge  = document.getElementById('auth-jail-badge');
+  var sec    = document.getElementById('auth-enabled-section');
+  if (toggle) toggle.checked = enabled;
+  if (track)  track.style.background  = enabled ? 'var(--green)' : 'var(--border)';
+  if (thumb)  thumb.style.transform   = enabled ? 'translateX(18px)' : 'translateX(0)';
+  if (badge) {
+    badge.className = enabled ? 'badge badge-green' : 'badge badge-red';
+    badge.innerHTML = enabled
+      ? '<span class="dot dot-pulse"></span>Active'
+      : '<span class="dot"></span>Disabled';
+  }
+  if (sec) sec.style.display = enabled ? '' : 'none';
+}
+
+function toggleAuthentikJail() {
+  var enabled = document.getElementById('auth-toggle').checked;
+  fetch('/api/fail2ban/authentik/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: enabled})
+  }).then(r=>r.json()).then(d=>{
+    if (d.ok) {
+      _applyAuthentikJailState(enabled);
+      if (enabled && d.forwarder) showToast('Authentik jail enabled — ' + d.forwarder, 'success');
+      else if (!enabled) showToast('Authentik jail disabled.', 'success');
+      loadStatus();
+    } else {
+      showToast(d.error || 'Toggle failed', 'error');
+      document.getElementById('auth-toggle').checked = !enabled;
+    }
+  }).catch(()=>showToast('Network error', 'error'));
+}
+
+function loadStatus(cb) {
+  fetch('/api/fail2ban/status').then(r=>r.json()).then(d=>{
+    if (!d.available) {
+      var _fb = document.getElementById('forwarder-badge');
+      if (_fb) { _fb.className = 'badge badge-yellow'; _fb.innerHTML = '<span class="dot"></span>Not installed'; }
+      if (typeof cb === 'function') cb();
+      return;
+    }
+    var jailEnabled = d.jail_enabled !== false;  // default true if key missing
+    _applyAuthentikJailState(jailEnabled);
+    // Warn if the fail2ban daemon itself is not running
+    var daemonWarn = document.getElementById('daemon-warn');
+    if (daemonWarn) daemonWarn.style.display = (d.daemon_running === false) ? '' : 'none';
+
+    document.getElementById('stat-banned').textContent = d.currently_banned || 0;
+    document.getElementById('stat-failed').textContent = d.currently_failed || 0;
+    document.getElementById('stat-total-banned').textContent = d.total_banned || 0;
+    document.getElementById('stat-total-failed').textContent = d.total_failed || 0;
+    var vb = document.getElementById('f2b-version-badge');
+    if (vb && d.version) vb.textContent = d.version;
+
+    var fb = document.getElementById('forwarder-badge');
+    if (d.forwarder_active) {
+      fb.className = 'badge badge-green';
+      fb.innerHTML = '<span class="dot dot-pulse"></span>Log Forwarder Active';
+    } else {
+      fb.className = 'badge badge-red';
+      fb.innerHTML = '<span class="dot"></span>Log Forwarder Stopped';
+    }
+
+    var cfg = d.jail_config || {};
+    if (cfg.maxretry) document.getElementById('cfg-maxretry').value = cfg.maxretry;
+    if (cfg.findtime) document.getElementById('cfg-findtime').value = Math.round(cfg.findtime / 60);
+    if (cfg.bantime)  document.getElementById('cfg-bantime').value  = Math.round(cfg.bantime / 60);
+    var ignoreipEl = document.getElementById('cfg-ignoreip');
+    if (ignoreipEl) {
+      ignoreipEl.value = (cfg.ignoreip || '').replace(/127\.0\.0\.1\/8\s*::1\s*/,'').trim();
+      renderChips('cfg-ignoreip', 'cfg-ignoreip-chips');
+    }
+
+    var ips = d.banned_ips || [];
+    window._authBannedIps = ips;
+    renderAuthBanList(ips);
+    var caret = document.getElementById('auth-banned-caret');
+    if (caret) caret.textContent = ips.length ? '▼ details' : '';
+    if (typeof cb === 'function') cb();
+  }).catch(()=>{ showToast('Failed to load status', 'error'); if (typeof cb === 'function') cb(); });
+}
+
+window._authBannedIps = [];
+window._authSortAsc = true;
+function _authIpToNum(ip){var p=ip.split('.');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+function renderAuthBanList(ips){
+  var c=document.getElementById('ban-list-container');if(!c)return;
+  if(!ips.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>';return;}
+  var sorted=ips.slice().sort(function(a,b){var d=_authIpToNum(a)-_authIpToNum(b);return window._authSortAsc?d:-d;});
+  var arrow=window._authSortAsc?' ▲':' ▼';
+  var rows=sorted.map(function(ip){return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanIP(\''+ip+'\')">Unban</button></td></tr>';}).join('');
+  c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleAuthSort()">IP Address'+arrow+'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+function toggleAuthSort(){window._authSortAsc=!window._authSortAsc;filterAuthBanList();}
+function filterAuthBanList(){var q=(document.getElementById('auth-ban-search').value||'').trim().toLowerCase();renderAuthBanList(q?window._authBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._authBannedIps);}
+function toggleAuthBanPanel(){
+  var panel=document.getElementById('auth-ban-panel');var caret=document.getElementById('auth-banned-caret');if(!panel)return;
+  var open=panel.style.display!=='none';panel.style.display=open?'none':'';
+  if(caret)caret.textContent=open?'▼ details':'▲ details';
+  if(!open){var s=document.getElementById('auth-ban-search');if(s)s.value='';renderAuthBanList(window._authBannedIps);}
+}
+
+function loadLog() {
+  fetch('/api/fail2ban/log').then(r=>r.json()).then(d=>{
+    var box = document.getElementById('log-box');
+    if (d.lines && d.lines.length) {
+      box.textContent = d.lines.join('\n');
+      box.scrollTop = box.scrollHeight;
+    } else {
+      box.textContent = d.error || 'No authentik events in fail2ban.log yet.';
+    }
+  }).catch(()=>{ document.getElementById('log-box').textContent = 'Error loading log.'; });
+}
+
+function saveConfig() {
+  var body = {
+    maxretry: parseInt(document.getElementById('cfg-maxretry').value) || 5,
+    findtime: (parseInt(document.getElementById('cfg-findtime').value) || 10) * 60,
+    bantime:  (parseInt(document.getElementById('cfg-bantime').value)  || 60) * 60,
+    ignoreip: (document.getElementById('cfg-ignoreip').value || '').trim()
+  };
+  fetch('/api/fail2ban/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) showToast('Config saved and fail2ban reloaded.', 'success');
+      else showToast(d.error || 'Save failed', 'error');
+    }).catch(()=>showToast('Network error', 'error'));
+}
+
+function unbanIP(ip) {
+  if (!confirm('Unban ' + ip + '?')) return;
+  fetch('/api/fail2ban/unban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) { showToast(ip + ' unbanned.', 'success'); loadStatus(); }
+      else showToast(d.error || 'Unban failed', 'error');
+    }).catch(()=>showToast('Network error', 'error'));
+}
+
+function loadTrustedCidrs() {
+  fetch('/api/fail2ban/trusted-cidrs').then(r=>r.json()).then(d=>{
+    if (!d.ok) return;
+    var el = document.getElementById('f2b-trusted-cidrs');
+    if (el) { el.value = (d.cidrs || []).join(' '); renderChips('f2b-trusted-cidrs','f2b-trusted-chips'); }
+    var auto = document.getElementById('f2b-trusted-auto');
+    if (auto) {
+      var locals = (d.local_subnets || []);
+      auto.innerHTML = 'Always trusted: <code>127.0.0.1/8 ::1</code>' +
+        (locals.length ? ' &nbsp;·&nbsp; auto-detected private subnet(s): <code>' + locals.join('</code> <code>') + '</code>' : '');
+    }
+  }).catch(()=>{});
+}
+
+function saveTrustedCidrs() {
+  var msg = document.getElementById('f2b-trusted-msg');
+  var val = (document.getElementById('f2b-trusted-cidrs').value || '').trim();
+  if (msg) { msg.style.color = 'var(--text-dim)'; msg.textContent = 'Saving…'; }
+  fetch('/api/fail2ban/trusted-cidrs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cidrs: val})})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) {
+        if (msg) { msg.style.color = 'var(--green)'; msg.textContent = 'Saved — applied to ' + (d.rewritten||[]).length + ' jail(s).'; }
+        showToast('Trusted networks saved and applied to all jails.', 'success');
+        loadTrustedCidrs();
+      } else {
+        if (msg) { msg.style.color = 'var(--red)'; msg.textContent = d.error || 'Save failed'; }
+        showToast(d.error || 'Save failed', 'error');
+      }
+    }).catch(()=>{ if (msg) { msg.style.color = 'var(--red)'; msg.textContent = 'Network error'; } showToast('Network error', 'error'); });
+}
+
+loadTrustedCidrs();
+loadStatus();
+loadLog();
+setInterval(function(){ loadStatus(); loadLog(); }, 30000);
+{% endif %}
+
+// TAK Server Jail
+(function(){
+  var takReady = false;
+  var watchingPanelOpen = false;
+
+  window.toggleWatchingPanel = function() {
+    watchingPanelOpen = !watchingPanelOpen;
+    var panel  = document.getElementById('tak-watching-panel');
+    var caret  = document.getElementById('tak-watching-caret');
+    var toggle = document.getElementById('tak-watching-toggle');
+    if (!panel) return;
+    if (watchingPanelOpen) {
+      panel.style.display = 'block';
+      if (caret)  caret.textContent = '▲ hide';
+      if (toggle) toggle.style.borderColor = 'var(--yellow)';
+      _loadWatchingList();
+    } else {
+      panel.style.display = 'none';
+      if (caret)  caret.textContent = '▼ details';
+      if (toggle) toggle.style.borderColor = '';
+    }
+  };
+
+  window._takWatchingList = [];
+  window._takWatchingSortCol = 'ip';
+  window._takWatchingSortAsc = true;
+
+  window.renderTakWatchingList = function(list) {
+    var el = document.getElementById('tak-watching-list'); if (!el) return;
+    if (!list.length) { el.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>'; return; }
+    var col = window._takWatchingSortCol; var asc = window._takWatchingSortAsc;
+    var sorted = list.slice().sort(function(a,b){
+      if (col==='ip') { var d=_takIpToNum(a.ip)-_takIpToNum(b.ip); return asc?d:-d; }
+      return asc ? a.attempts-b.attempts : b.attempts-a.attempts;
+    });
+    var ipArrow  = col==='ip'      ? (asc?' ▲':' ▼') : '';
+    var attArrow = col==='attempts' ? (asc?' ▲':' ▼') : '';
+    var rows = sorted.map(function(w){
+      return '<tr style="border-bottom:1px solid var(--border)">'+
+        '<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">'+w.ip+'</td>'+
+        '<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">'+w.attempts+'</td>'+
+        '<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">'+w.last_seen+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanTakIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+    }).join('');
+    el.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
+      '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakWatchingSort(\'ip\')">IP Address'+ipArrow+'</th>'+
+      '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakWatchingSort(\'attempts\')">Attempts'+attArrow+'</th>'+
+      '<th style="padding:4px 8px;text-align:left">Last Seen</th>'+
+      '<th style="padding:4px 8px;text-align:right">Action</th>'+
+      '</tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.toggleTakWatchingSort = function(col) {
+    if (window._takWatchingSortCol === col) window._takWatchingSortAsc = !window._takWatchingSortAsc;
+    else { window._takWatchingSortCol = col; window._takWatchingSortAsc = col==='attempts' ? false : true; }
+    filterTakWatchingList();
+  };
+
+  window.filterTakWatchingList = function() {
+    var q = (document.getElementById('tak-watching-search').value || '').trim().toLowerCase();
+    renderTakWatchingList(q ? window._takWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._takWatchingList);
+  };
+
+  function _loadWatchingList() {
+    fetch('/api/fail2ban/takserver/watching').then(function(r){ return r.json(); }).then(function(d){
+      window._takWatchingList = d.watching || [];
+      var s = document.getElementById('tak-watching-search');
+      var q = s ? s.value.trim().toLowerCase() : '';
+      renderTakWatchingList(q ? window._takWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._takWatchingList);
+    }).catch(function(){
+      var el = document.getElementById('tak-watching-list');
+      if (el) el.innerHTML = '<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>';
+    });
+  }
+
+  window.manualBanTakIP = function(ip) {
+    if (!confirm('Manually ban ' + ip + ' from the TAK Server jail now?')) return;
+    fetch('/api/fail2ban/takserver/ban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + ' banned.', 'success'); loadTakStatus(); if (watchingPanelOpen) _loadWatchingList(); }
+        else showToast(d.error || 'Ban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  function _updateToggleStyle(on) {
+    var track = document.getElementById('tak-toggle-track');
+    var thumb = document.getElementById('tak-toggle-thumb');
+    if (!track) return;
+    track.style.background = on ? 'var(--green)' : 'var(--border)';
+    thumb.style.transform   = on ? 'translateX(18px)' : 'none';
+  }
+
+  function _updateBadge(enabled, filterReady) {
+    var b = document.getElementById('tak-jail-badge');
+    if (!b) return;
+    if (!filterReady) {
+      b.className = 'badge badge-yellow'; b.textContent = 'Filter installing…';
+    } else if (enabled) {
+      b.className = 'badge badge-green'; b.innerHTML = '<span class="dot dot-pulse"></span>Active';
+    } else {
+      b.className = 'badge badge-red'; b.innerHTML = '<span class="dot"></span>Disabled';
+    }
+  }
+
+  window.manualTakRefresh = function() {
+    _spinIcon('tak-refresh-icon', true);
+    var btn = document.getElementById('tak-refresh-btn');
+    if (btn) btn.disabled = true;
+    window.loadTakStatus(function() {
+      _spinIcon('tak-refresh-icon', false);
+      if (btn) btn.disabled = false;
+    });
+    if (watchingPanelOpen) _loadWatchingList();
+  };
+
+  window.loadTakStatus = function(cb) {
+    fetch('/api/fail2ban/takserver/status').then(function(r){ return r.json(); }).then(function(d){
+      var card = document.getElementById('tak-jail-card');
+      if (!d.tak_installed) { if (card) card.style.display = 'none'; return; }
+      if (card) card.style.display = '';
+
+      var notReady = document.getElementById('tak-not-ready');
+      var enabledSec = document.getElementById('tak-enabled-section');
+      var toggle = document.getElementById('tak-toggle');
+      takReady = d.filter_ready;
+
+      _updateBadge(d.jail_enabled, d.filter_ready);
+      _updateToggleStyle(d.jail_enabled);
+      if (toggle) toggle.checked = d.jail_enabled;
+
+      if (!d.filter_ready) {
+        if (notReady)   notReady.style.display   = '';
+        if (enabledSec) enabledSec.style.display  = 'none';
+        return;
+      }
+      if (notReady) notReady.style.display = 'none';
+
+      if (d.jail_enabled) {
+        if (enabledSec) enabledSec.style.display = '';
+        document.getElementById('tak-stat-banned').textContent       = d.currently_banned  !== undefined ? d.currently_banned  : 0;
+        document.getElementById('tak-stat-failed').textContent       = d.currently_failed  !== undefined ? d.currently_failed  : 0;
+        document.getElementById('tak-stat-total-banned').textContent = d.total_banned       !== undefined ? d.total_banned       : 0;
+        document.getElementById('tak-stat-total-failed').textContent = d.total_failed       !== undefined ? d.total_failed       : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById('tak-cfg-maxretry').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById('tak-cfg-findtime').value = Math.round(cfg.findtime / 60);
+        if (cfg.bantime)  document.getElementById('tak-cfg-bantime').value  = Math.round(cfg.bantime  / 60);
+        var takIgnoreipEl = document.getElementById('tak-cfg-ignoreip');
+        if (takIgnoreipEl) {
+          takIgnoreipEl.value = (cfg.ignoreip || '').replace(/127\.0\.0\.1\/8\s*::1\s*/,'').trim();
+          renderChips('tak-cfg-ignoreip', 'tak-cfg-ignoreip-chips');
+        }
+        var ips = d.banned_ips || [];
+        window._takBannedIps = ips;
+        renderTakBanList(ips);
+        var caret = document.getElementById('tak-banned-caret');
+        if (caret) caret.textContent = ips.length ? '▼ details' : '';
+      } else {
+        if (enabledSec) enabledSec.style.display = 'none';
+      }
+      if (typeof cb === 'function') cb();
+    }).catch(function(){ if (typeof cb === 'function') cb(); });
+  };
+
+  window.toggleTakJail = function() {
+    var enabled = document.getElementById('tak-toggle').checked;
+    _updateToggleStyle(enabled);
+    if (!enabled) {
+      fetch('/api/fail2ban/takserver/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast('TAK Server jail disabled.', 'success'); loadTakStatus(); }
+          else { showToast(d.error || 'Failed to disable', 'error'); loadTakStatus(); }
+        }).catch(function(){ showToast('Network error', 'error'); loadTakStatus(); });
+    } else {
+      saveTakConfig();
+    }
+  };
+
+  window.saveTakConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById('tak-cfg-maxretry').value) || 20,
+      findtime: (parseInt(document.getElementById('tak-cfg-findtime').value) || 5)  * 60,
+      bantime:  (parseInt(document.getElementById('tak-cfg-bantime').value)  || 60) * 60,
+      ignoreip: (document.getElementById('tak-cfg-ignoreip').value || '').trim()
+    };
+    fetch('/api/fail2ban/takserver/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast('TAK Server jail ' + (d.enabled ? 'enabled and saved.' : 'disabled.'), 'success'); loadTakStatus(); }
+        else showToast(d.error || 'Save failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window._takBannedIps = [];
+  window._takSortAsc = true;
+  function _takIpToNum(ip){var p=ip.split('.');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+  window.renderTakBanList = function(ips){
+    var c=document.getElementById('tak-ban-list-container');if(!c)return;
+    if(!ips.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>';return;}
+    var sorted=ips.slice().sort(function(a,b){var d=_takIpToNum(a)-_takIpToNum(b);return window._takSortAsc?d:-d;});
+    var arrow=window._takSortAsc?' ▲':' ▼';
+    var rows=sorted.map(function(ip){return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTakIP(\''+ip+'\')">Unban</button></td></tr>';}).join('');
+    c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakSort()">IP Address'+arrow+'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+  window.toggleTakSort = function(){window._takSortAsc=!window._takSortAsc;filterTakBanList();};
+  window.filterTakBanList = function(){var q=(document.getElementById('tak-ban-search').value||'').trim().toLowerCase();renderTakBanList(q?window._takBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._takBannedIps);};
+  window.toggleTakBanPanel = function(){
+    var panel=document.getElementById('tak-ban-panel');var caret=document.getElementById('tak-banned-caret');if(!panel)return;
+    var open=panel.style.display!=='none';panel.style.display=open?'none':'';
+    if(caret)caret.textContent=open?'▼ details':'▲ details';
+    if(!open){var s=document.getElementById('tak-ban-search');if(s)s.value='';renderTakBanList(window._takBannedIps);}
+  };
+
+  window.unbanTakIP = function(ip) {
+    if (!confirm('Unban ' + ip + ' from TAK Server jail?')) return;
+    fetch('/api/fail2ban/takserver/unban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + ' unbanned.', 'success'); loadTakStatus(); }
+        else showToast(d.error || 'Unban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  loadTakStatus();
+  setInterval(function(){ loadTakStatus(); if (watchingPanelOpen) _loadWatchingList(); }, 30000);
+})();
+
+// SSH Jail
+(function(){
+  var sshCard = document.getElementById('ssh-jail-card');
+  if (!sshCard) return;
+
+  function renderNeverBan(info) {
+    var list = document.getElementById('ssh-neverban-list');
+    var banner = document.getElementById('ssh-safety-banner');
+    if (!list) return;
+    if (!info || !info.groups) { list.innerHTML = '<div style="color:var(--text-dim);font-size:12px">Unavailable.</div>'; return; }
+    var esc = function(s){ var d=document.createElement('div'); d.textContent=(s===undefined||s===null)?'':String(s); return d.innerHTML; };
+    var html = '';
+    info.groups.forEach(function(g){
+      var chips = g.cidrs.map(function(c){
+        return '<code style="background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:4px;padding:1px 6px;margin-right:6px;font-size:11px">' + esc(c) + '</code>';
+      }).join('');
+      html += '<div style="margin-bottom:10px">'
+           +  '<div style="font-size:12px;color:var(--text-primary);font-weight:600;margin-bottom:3px">' + esc(g.label) + '</div>'
+           +  '<div style="margin-bottom:3px">' + chips + '</div>'
+           +  '<div style="font-size:11px;color:var(--text-dim)">' + esc(g.why) + '</div>'
+           +  '</div>';
+    });
+    list.innerHTML = html || '<div style="color:var(--text-dim);font-size:12px">Nothing whitelisted.</div>';
+
+    if (!banner) return;
+    if (info.client_covered === true) {
+      banner.style.display = 'block';
+      banner.style.background = 'rgba(34,197,94,0.08)';
+      banner.style.border = '1px solid rgba(34,197,94,0.35)';
+      banner.style.color = 'var(--text-secondary)';
+      banner.innerHTML = '\u2713 You are connected from <code>' + esc(info.client_ip) + '</code>, covered by '
+                       + '<code>' + esc(info.client_matched) + '</code>. fail2ban cannot lock you out from here.';
+    } else if (info.client_covered === false) {
+      banner.style.display = 'block';
+      banner.style.background = 'rgba(234,179,8,0.10)';
+      banner.style.border = '1px solid rgba(234,179,8,0.45)';
+      banner.style.color = 'var(--text-secondary)';
+      banner.innerHTML = '\u26a0 You are connected from <code>' + esc(info.client_ip) + '</code>, which is <b>not</b> on the never-ban list. '
+                       + 'If fail2ban bans it, <b>every port</b> from that address is blocked and you lose access to this box. '
+                       + 'Add it below if this is how you normally reach it.';
+    } else {
+      banner.style.display = 'none';
+    }
+  }
+
+  function loadSshStatus() {
+    fetch('/api/fail2ban/ssh/status').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      var badge  = document.getElementById('ssh-jail-badge');
+      var toggle = document.getElementById('ssh-toggle');
+      var sec    = document.getElementById('ssh-enabled-section');
+      if (badge) {
+        if (d.jail_enabled) { badge.className = 'badge badge-green'; badge.innerHTML = '<span class="dot dot-pulse"></span>Active'; }
+        else                { badge.className = 'badge badge-red';   badge.innerHTML = '<span class="dot"></span>Disabled'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      var sshTrack = document.getElementById('ssh-toggle-track');
+      var sshThumb = document.getElementById('ssh-toggle-thumb');
+      if (sshTrack) sshTrack.style.background = d.jail_enabled ? 'var(--green)' : 'var(--border)';
+      if (sshThumb) sshThumb.style.transform  = d.jail_enabled ? 'translateX(18px)' : '';
+      if (sec)    sec.style.display = d.jail_enabled ? '' : 'none';
+      if (d.jail_enabled) {
+        document.getElementById('ssh-stat-banned').textContent       = d.currently_banned  !== undefined ? d.currently_banned  : 0;
+        document.getElementById('ssh-stat-failed').textContent       = d.currently_failed  !== undefined ? d.currently_failed  : 0;
+        document.getElementById('ssh-stat-total-banned').textContent = d.total_banned       !== undefined ? d.total_banned       : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById('ssh-cfg-maxretry').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById('ssh-cfg-findtime').value = Math.round(cfg.findtime / 60);
+        if (cfg.bantime)  document.getElementById('ssh-cfg-bantime').value  = Math.round(cfg.bantime  / 60);
+        var ipEl = document.getElementById('ssh-cfg-ignoreip');
+        if (ipEl) { ipEl.value = (cfg.ignoreip || '').replace(/127\.0\.0\.1\/8\s*::1\s*/,'').trim(); renderChips('ssh-cfg-ignoreip', 'ssh-cfg-ignoreip-chips'); }
+        renderNeverBan(d.ignoreip);
+        var ips = d.banned_ips || [];
+        window._sshBannedIps = ips;
+        renderSshBanList(ips);
+        var caret = document.getElementById('ssh-banned-caret');
+        if (caret) caret.textContent = ips.length ? '▼ details' : '';
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleSshJail = function() {
+    var enabled = document.getElementById('ssh-toggle').checked;
+    if (!enabled) {
+      fetch('/api/fail2ban/ssh/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast('SSH jail disabled.', 'success'); loadSshStatus(); }
+          else { showToast(d.error || 'Failed to disable', 'error'); loadSshStatus(); }
+        }).catch(function(){ showToast('Network error', 'error'); loadSshStatus(); });
+    } else {
+      saveSshConfig();
+    }
+  };
+
+  window.saveSshConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById('ssh-cfg-maxretry').value) || 3,
+      findtime: (parseInt(document.getElementById('ssh-cfg-findtime').value) || 10) * 60,
+      bantime:  (parseInt(document.getElementById('ssh-cfg-bantime').value)  || 60) * 60,
+      ignoreip: (document.getElementById('ssh-cfg-ignoreip').value || '').trim()
+    };
+    fetch('/api/fail2ban/ssh/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast('SSH jail ' + (d.enabled ? 'enabled and saved.' : 'disabled.'), 'success'); loadSshStatus(); }
+        else showToast(d.error || 'Save failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window._sshBannedIps = [];
+  window._sshSortAsc = true;
+
+  function _ipToNum(ip){var p=ip.split('.');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+
+  window.renderSshBanList = function(ips) {
+    var c = document.getElementById('ssh-ban-list-container');
+    if (!c) return;
+    if (!ips.length) {
+      c.innerHTML = '<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>';
+      return;
+    }
+    var sorted = ips.slice().sort(function(a,b){ var d=_ipToNum(a)-_ipToNum(b); return window._sshSortAsc?d:-d; });
+    var arrow = window._sshSortAsc ? ' ▲' : ' ▼';
+    var rows = sorted.map(function(ip){
+      return '<tr style="border-bottom:1px solid var(--border)">'+
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanSshIP(\''+ip+'\')">Unban</button></td></tr>';
+    }).join('');
+    c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
+      '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshSort()">IP Address'+arrow+'</th>'+
+      '<th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.toggleSshSort = function() {
+    window._sshSortAsc = !window._sshSortAsc;
+    filterSshBanList();
+  };
+
+  window.filterSshBanList = function() {
+    var q = (document.getElementById('ssh-ban-search').value || '').trim().toLowerCase();
+    var filtered = q ? window._sshBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._sshBannedIps;
+    renderSshBanList(filtered);
+  };
+
+  var _sshWatchingOpen = false;
+  window.toggleSshWatchingPanel = function() {
+    _sshWatchingOpen = !_sshWatchingOpen;
+    var panel = document.getElementById('ssh-watching-panel');
+    var caret = document.getElementById('ssh-watching-caret');
+    var tog   = document.getElementById('ssh-watching-toggle');
+    if (!panel) return;
+    panel.style.display = _sshWatchingOpen ? 'block' : 'none';
+    if (caret) caret.textContent = _sshWatchingOpen ? '▲ hide' : '▼ details';
+    if (tog)   tog.style.borderColor = _sshWatchingOpen ? 'var(--yellow)' : '';
+    if (_sshWatchingOpen) _loadSshWatchingList();
+  };
+  window._sshWatchingList = [];
+  window._sshWatchingSortCol = 'ip';
+  window._sshWatchingSortAsc = true;
+
+  window.renderSshWatchingList = function(list) {
+    var el = document.getElementById('ssh-watching-list'); if (!el) return;
+    if (!list.length) { el.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>'; return; }
+    var col = window._sshWatchingSortCol; var asc = window._sshWatchingSortAsc;
+    var sorted = list.slice().sort(function(a,b){
+      if (col==='ip') { var d=_ipToNum(a.ip)-_ipToNum(b.ip); return asc?d:-d; }
+      return asc ? a.attempts-b.attempts : b.attempts-a.attempts;
+    });
+    var ipArrow  = col==='ip'      ? (asc?' ▲':' ▼') : '';
+    var attArrow = col==='attempts' ? (asc?' ▲':' ▼') : '';
+    var rows = sorted.map(function(w){
+      return '<tr style="border-bottom:1px solid var(--border)">'+
+        '<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">'+w.ip+'</td>'+
+        '<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">'+w.attempts+'</td>'+
+        '<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">'+w.last_seen+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanSshIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+    }).join('');
+    el.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
+      '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshWatchingSort(\'ip\')">IP Address'+ipArrow+'</th>'+
+      '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshWatchingSort(\'attempts\')">Attempts'+attArrow+'</th>'+
+      '<th style="padding:4px 8px;text-align:left">Last Seen</th>'+
+      '<th style="padding:4px 8px;text-align:right">Action</th>'+
+      '</tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.toggleSshWatchingSort = function(col) {
+    if (window._sshWatchingSortCol === col) window._sshWatchingSortAsc = !window._sshWatchingSortAsc;
+    else { window._sshWatchingSortCol = col; window._sshWatchingSortAsc = col==='attempts' ? false : true; }
+    filterSshWatchingList();
+  };
+
+  window.filterSshWatchingList = function() {
+    var q = (document.getElementById('ssh-watching-search').value || '').trim().toLowerCase();
+    renderSshWatchingList(q ? window._sshWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._sshWatchingList);
+  };
+
+  function _loadSshWatchingList() {
+    fetch('/api/fail2ban/ssh/watching').then(function(r){return r.json();}).then(function(d){
+      window._sshWatchingList = d.watching || [];
+      var s = document.getElementById('ssh-watching-search');
+      var q = s ? s.value.trim().toLowerCase() : '';
+      renderSshWatchingList(q ? window._sshWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._sshWatchingList);
+    }).catch(function(){ var el=document.getElementById('ssh-watching-list'); if(el) el.innerHTML='<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>'; });
+  }
+  window.manualBanSshIP = function(ip) {
+    if (!confirm('Manually ban ' + ip + ' from the SSH jail now?')) return;
+    fetch('/api/fail2ban/ssh/ban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){return r.json();}).then(function(d){
+        if (d.ok) { showToast(ip + ' banned.', 'success'); loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }
+        else showToast(d.error || 'Ban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window.toggleSshBanPanel = function() {
+    var panel = document.getElementById('ssh-ban-panel');
+    var caret = document.getElementById('ssh-banned-caret');
+    if (!panel) return;
+    var open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : '';
+    if (caret) caret.textContent = open ? '▼ details' : '▲ details';
+    if (!open) { var s = document.getElementById('ssh-ban-search'); if(s) s.value=''; renderSshBanList(window._sshBannedIps); }
+  };
+
+  window.unbanSshIP = function(ip) {
+    if (!confirm('Unban ' + ip + ' from SSH jail?')) return;
+    fetch('/api/fail2ban/ssh/unban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + ' unbanned.', 'success'); loadSshStatus(); }
+        else showToast(d.error || 'Unban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window.manualSshRefresh = function() {
+    _spinIcon('ssh-refresh-icon', true);
+    var btn = document.getElementById('ssh-refresh-btn');
+    if (btn) btn.disabled = true;
+    loadSshStatus();
+    setTimeout(function(){ _spinIcon('ssh-refresh-icon', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadSshStatus();
+  setInterval(function(){ loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }, 30000);
+})();
+
+// MediaMTX RTSP Jail
+(function(){
+  var card = document.getElementById('mediamtx-jail-card');
+  if (!card) return;
+
+  function loadMtxStatus() {
+    fetch('/api/fail2ban/mediamtx/status').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      // Show card only when mediamtx is installed
+      if (d.mediamtx_installed) card.style.display = '';
+      var badge  = document.getElementById('mediamtx-jail-badge');
+      var toggle = document.getElementById('mediamtx-toggle');
+      var sec    = document.getElementById('mediamtx-enabled-section');
+      if (badge) {
+        if (d.jail_enabled) { badge.className='badge badge-green'; badge.innerHTML='<span class="dot dot-pulse"></span>Active'; }
+        else                { badge.className='badge badge-red';   badge.innerHTML='<span class="dot"></span>Disabled'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      var trk = document.getElementById('mediamtx-toggle-track');
+      var thb = document.getElementById('mediamtx-toggle-thumb');
+      if (trk) trk.style.background = d.jail_enabled ? 'var(--green)' : 'var(--border)';
+      if (thb) thb.style.transform  = d.jail_enabled ? 'translateX(18px)' : '';
+      if (sec) sec.style.display = d.jail_enabled ? '' : 'none';
+      if (d.jail_enabled) {
+        document.getElementById('mediamtx-stat-banned').textContent       = d.currently_banned !== undefined ? d.currently_banned : 0;
+        document.getElementById('mediamtx-stat-failed').textContent       = d.currently_failed !== undefined ? d.currently_failed : 0;
+        document.getElementById('mediamtx-stat-total-banned').textContent = d.total_banned      !== undefined ? d.total_banned      : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById('mediamtx-cfg-maxretry').value = cfg.maxretry;
+        // findtime stored in seconds for mediamtx (not minutes like SSH)
+        if (cfg.findtime) document.getElementById('mediamtx-cfg-findtime').value = cfg.findtime;
+        if (cfg.bantime)  document.getElementById('mediamtx-cfg-bantime').value  = Math.round(cfg.bantime / 60);
+        var ips = d.banned_ips || [];
+        window._mtxBannedIps = ips;
+        renderMtxBanList(ips);
+        var caret = document.getElementById('mediamtx-banned-caret');
+        if (caret && caret.textContent === '') caret.textContent = '▼ details';
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleMtxJail = function() {
+    var enabled = document.getElementById('mediamtx-toggle').checked;
+    if (!enabled) {
+      fetch('/api/fail2ban/mediamtx/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast('MediaMTX RTSP jail disabled.', 'success'); loadMtxStatus(); }
+          else { showToast(d.error || 'Failed to disable', 'error'); loadMtxStatus(); }
+        }).catch(function(){ showToast('Network error', 'error'); loadMtxStatus(); });
+    } else {
+      saveMtxConfig();
+    }
+  };
+
+  window.saveMtxConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById('mediamtx-cfg-maxretry').value) || 10,
+      findtime: parseInt(document.getElementById('mediamtx-cfg-findtime').value)  || 30,
+      bantime:  (parseInt(document.getElementById('mediamtx-cfg-bantime').value)  || 60) * 60
+    };
+    fetch('/api/fail2ban/mediamtx/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast('MediaMTX RTSP jail ' + (d.enabled ? 'enabled and saved.' : 'disabled.'), 'success'); loadMtxStatus(); }
+        else showToast(d.error || 'Save failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window._mtxBannedIps = [];
+  window.renderMtxBanList = function(ips) {
+    var c = document.getElementById('mediamtx-ban-list-container'); if (!c) return;
+    if (!ips.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>'; return; }
+    var rows = ips.map(function(ip){
+      return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanMtxIP(\''+ip+'\')">Unban</button></td></tr>';
+    }).join('');
+    c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.filterMtxBanList = function() {
+    var q = (document.getElementById('mediamtx-ban-search').value || '').trim().toLowerCase();
+    var filtered = q ? window._mtxBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._mtxBannedIps;
+    renderMtxBanList(filtered);
+  };
+
+  var _mtxWatchingPanelOpen = false;
+  window._mtxWatchingList = [];
+
+  window.renderMtxWatchingList = function(list) {
+    var c = document.getElementById('mediamtx-watching-list'); if (!c) return;
+    if (!list.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently being watched.</div>'; return; }
+    var rows = list.map(function(w){
+      return '<tr style="border-bottom:1px solid var(--border)">'+
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+w.ip+'</td>'+
+        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">'+w.attempts+'</td>'+
+        '<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">'+w.last_seen+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banMtxIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+    }).join('');
+    c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Attempts</th><th style="padding:4px 8px">Last Seen</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.filterMtxWatchingList = function() {
+    var q = (document.getElementById('mediamtx-watching-search').value || '').trim().toLowerCase();
+    window.renderMtxWatchingList(q ? window._mtxWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._mtxWatchingList);
+  };
+
+  function _loadMtxWatchingList() {
+    fetch('/api/fail2ban/mediamtx/watching').then(function(r){ return r.json(); }).then(function(d){
+      window._mtxWatchingList = d.watching || [];
+      var s = document.getElementById('mediamtx-watching-search');
+      var q = s ? s.value.trim().toLowerCase() : '';
+      window.renderMtxWatchingList(q ? window._mtxWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._mtxWatchingList);
+    }).catch(function(){
+      var el = document.getElementById('mediamtx-watching-list');
+      if (el) el.innerHTML = '<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>';
+    });
+  }
+
+  window.toggleMtxWatchingPanel = function() {
+    _mtxWatchingPanelOpen = !_mtxWatchingPanelOpen;
+    var panel  = document.getElementById('mediamtx-watching-panel');
+    var caret  = document.getElementById('mediamtx-watching-caret');
+    var toggle = document.getElementById('mediamtx-watching-toggle');
+    if (_mtxWatchingPanelOpen) {
+      if (panel)  panel.style.display = 'block';
+      if (caret)  caret.textContent = '▲ hide';
+      if (toggle) toggle.style.borderColor = 'var(--yellow)';
+      _loadMtxWatchingList();
+    } else {
+      if (panel)  panel.style.display = 'none';
+      if (caret)  caret.textContent = '▼ details';
+      if (toggle) toggle.style.borderColor = '';
+    }
+  };
+
+  window.toggleMtxBanPanel = function() {
+    var panel = document.getElementById('mediamtx-ban-panel');
+    var caret = document.getElementById('mediamtx-banned-caret');
+    if (!panel) return;
+    var open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : '';
+    if (caret) caret.textContent = open ? '▼ details' : '▲ details';
+    if (!open) { var s = document.getElementById('mediamtx-ban-search'); if(s) s.value=''; renderMtxBanList(window._mtxBannedIps); }
+  };
+
+  window.unbanMtxIP = function(ip) {
+    if (!confirm('Unban ' + ip + ' from MediaMTX RTSP jail?')) return;
+    fetch('/api/fail2ban/mediamtx/unban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + ' unbanned.', 'success'); loadMtxStatus(); }
+        else showToast(d.error || 'Unban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window.banMtxIP = function(ip) {
+    if (!confirm('Manually ban ' + ip + ' from MediaMTX RTSP jail now?')) return;
+    fetch('/api/fail2ban/mediamtx/ban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + ' banned.', 'success'); loadMtxStatus(); if (_mtxWatchingPanelOpen) _loadMtxWatchingList(); }
+        else showToast(d.error || 'Ban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window.manualMtxRefresh = function() {
+    _spinIcon('mediamtx-refresh-icon', true);
+    var btn = document.getElementById('mediamtx-refresh-btn');
+    if (btn) btn.disabled = true;
+    loadMtxStatus();
+    if (_mtxWatchingPanelOpen) _loadMtxWatchingList();
+    setTimeout(function(){ _spinIcon('mediamtx-refresh-icon', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadMtxStatus();
+  setInterval(function(){ loadMtxStatus(); if (_mtxWatchingPanelOpen) _loadMtxWatchingList(); }, 30000);
+})();
+
+// TAK Portal Form Jail
+(function(){
+  var card = document.getElementById('takportal-jail-card');
+  if (!card) return;
+
+  function loadTpjStatus() {
+    fetch('/api/fail2ban/takportal/status').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      card.style.display = '';
+      var badge  = document.getElementById('takportal-jail-badge');
+      var toggle = document.getElementById('takportal-toggle');
+      var sec    = document.getElementById('takportal-enabled-section');
+      var hint   = document.getElementById('takportal-log-hint');
+      if (badge) {
+        if (d.jail_enabled) { badge.className='badge badge-green'; badge.innerHTML='<span class="dot dot-pulse"></span>Active'; }
+        else                { badge.className='badge badge-red';   badge.innerHTML='<span class="dot"></span>Disabled'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      var trk = document.getElementById('takportal-toggle-track');
+      var thb = document.getElementById('takportal-toggle-thumb');
+      if (trk) trk.style.background = d.jail_enabled ? 'var(--green)' : 'var(--border)';
+      if (thb) thb.style.transform  = d.jail_enabled ? 'translateX(18px)' : '';
+      if (sec) sec.style.display = d.jail_enabled ? '' : 'none';
+      if (hint) {
+        if (d.jail_enabled && !d.log_present) {
+          hint.style.display = '';
+          hint.innerHTML = '⚠ Jail armed, but the portal log '+(d.log_path||'')+' has no entries yet — waiting for the TAK Portal writer. It will act as soon as lines arrive.';
+        } else { hint.style.display = 'none'; }
+      }
+      if (d.jail_enabled) {
+        document.getElementById('takportal-stat-banned').textContent       = d.currently_banned !== undefined ? d.currently_banned : 0;
+        document.getElementById('takportal-stat-failed').textContent       = d.currently_failed !== undefined ? d.currently_failed : 0;
+        document.getElementById('takportal-stat-total-banned').textContent = d.total_banned      !== undefined ? d.total_banned      : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById('takportal-cfg-maxretry').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById('takportal-cfg-findtime').value = cfg.findtime;
+        if (cfg.bantime)  document.getElementById('takportal-cfg-bantime').value  = Math.round(cfg.bantime / 60);
+        var ips = d.banned_ips || [];
+        window._tpjBannedIps = ips;
+        renderTpjBanList(ips);
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleTpjJail = function() {
+    var enabled = document.getElementById('takportal-toggle').checked;
+    if (!enabled) {
+      fetch('/api/fail2ban/takportal/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast('TAK Portal form jail disabled.', 'success'); loadTpjStatus(); }
+          else { showToast(d.error || 'Failed to disable', 'error'); loadTpjStatus(); }
+        }).catch(function(){ showToast('Network error', 'error'); loadTpjStatus(); });
+    } else {
+      saveTpjConfig();
+    }
+  };
+
+  window.saveTpjConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById('takportal-cfg-maxretry').value) || 5,
+      findtime: parseInt(document.getElementById('takportal-cfg-findtime').value)  || 600,
+      bantime:  (parseInt(document.getElementById('takportal-cfg-bantime').value)  || 60) * 60
+    };
+    fetch('/api/fail2ban/takportal/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast('TAK Portal form jail ' + (d.enabled ? 'enabled and saved.' : 'disabled.'), 'success'); loadTpjStatus(); }
+        else showToast(d.error || 'Save failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window._tpjBannedIps = [];
+  window.renderTpjBanList = function(ips) {
+    var c = document.getElementById('takportal-ban-list-container'); if (!c) return;
+    if (!ips.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>'; return; }
+    var rows = ips.map(function(ip){
+      return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTpjIP(\''+ip+'\')">Unban</button></td></tr>';
+    }).join('');
+    c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.filterTpjBanList = function() {
+    var q = (document.getElementById('takportal-ban-search').value || '').trim().toLowerCase();
+    var filtered = q ? window._tpjBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._tpjBannedIps;
+    renderTpjBanList(filtered);
+  };
+
+  var _tpjWatchingPanelOpen = false;
+  window._tpjWatchingList = [];
+
+  window.renderTpjWatchingList = function(list) {
+    var c = document.getElementById('takportal-watching-list'); if (!c) return;
+    if (!list.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently being watched.</div>'; return; }
+    var rows = list.map(function(w){
+      return '<tr style="border-bottom:1px solid var(--border)">'+
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+w.ip+'</td>'+
+        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">'+w.attempts+'</td>'+
+        '<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">'+w.last_seen+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banTpjIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+    }).join('');
+    c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Attempts</th><th style="padding:4px 8px">Last Seen</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.filterTpjWatchingList = function() {
+    var q = (document.getElementById('takportal-watching-search').value || '').trim().toLowerCase();
+    window.renderTpjWatchingList(q ? window._tpjWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._tpjWatchingList);
+  };
+
+  function _loadTpjWatchingList() {
+    fetch('/api/fail2ban/takportal/watching').then(function(r){ return r.json(); }).then(function(d){
+      window._tpjWatchingList = d.watching || [];
+      var s = document.getElementById('takportal-watching-search');
+      var q = s ? s.value.trim().toLowerCase() : '';
+      window.renderTpjWatchingList(q ? window._tpjWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._tpjWatchingList);
+    }).catch(function(){
+      var el = document.getElementById('takportal-watching-list');
+      if (el) el.innerHTML = '<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>';
+    });
+  }
+
+  window.toggleTpjWatchingPanel = function() {
+    _tpjWatchingPanelOpen = !_tpjWatchingPanelOpen;
+    var panel  = document.getElementById('takportal-watching-panel');
+    var caret  = document.getElementById('takportal-watching-caret');
+    var toggle = document.getElementById('takportal-watching-toggle');
+    if (_tpjWatchingPanelOpen) {
+      if (panel)  panel.style.display = 'block';
+      if (caret)  caret.textContent = '▲ hide';
+      if (toggle) toggle.style.borderColor = 'var(--yellow)';
+      _loadTpjWatchingList();
+    } else {
+      if (panel)  panel.style.display = 'none';
+      if (caret)  caret.textContent = '▼ details';
+      if (toggle) toggle.style.borderColor = '';
+    }
+  };
+
+  window.toggleTpjBanPanel = function() {
+    var panel = document.getElementById('takportal-ban-panel');
+    var caret = document.getElementById('takportal-banned-caret');
+    if (!panel) return;
+    var open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : '';
+    if (caret) caret.textContent = open ? '▼ details' : '▲ details';
+    if (!open) { var s = document.getElementById('takportal-ban-search'); if(s) s.value=''; renderTpjBanList(window._tpjBannedIps); }
+  };
+
+  window.unbanTpjIP = function(ip) {
+    if (!confirm('Unban ' + ip + ' from the TAK Portal form jail?')) return;
+    fetch('/api/fail2ban/takportal/unban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + ' unbanned.', 'success'); loadTpjStatus(); }
+        else showToast(d.error || 'Unban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window.banTpjIP = function(ip) {
+    if (!confirm('Manually ban ' + ip + ' from the TAK Portal form jail now?')) return;
+    fetch('/api/fail2ban/takportal/ban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + ' banned.', 'success'); loadTpjStatus(); if (_tpjWatchingPanelOpen) _loadTpjWatchingList(); }
+        else showToast(d.error || 'Ban failed', 'error');
+      }).catch(function(){ showToast('Network error', 'error'); });
+  };
+
+  window.manualTpjRefresh = function() {
+    _spinIcon('takportal-refresh-icon', true);
+    var btn = document.getElementById('takportal-refresh-btn');
+    if (btn) btn.disabled = true;
+    loadTpjStatus();
+    if (_tpjWatchingPanelOpen) _loadTpjWatchingList();
+    setTimeout(function(){ _spinIcon('takportal-refresh-icon', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadTpjStatus();
+  setInterval(function(){ loadTpjStatus(); if (_tpjWatchingPanelOpen) _loadTpjWatchingList(); }, 30000);
+})();
+
+// Repeat Offender Protection
+(function(){
+  window._recidiveBannedIps=[];
+  window._recidiveSortAsc=true;
+  function _recIpToNum(ip){var p=ip.split('.');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+
+  window.renderRecidiveBanList=function(ips){
+    var c=document.getElementById('recidive-ban-list-container');if(!c)return;
+    if(!ips.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>';return;}
+    var sorted=ips.slice().sort(function(a,b){var d=_recIpToNum(a)-_recIpToNum(b);return window._recidiveSortAsc?d:-d;});
+    var arrow=window._recidiveSortAsc?' ▲':' ▼';
+    var rows=sorted.map(function(ip){
+      return '<tr style="border-bottom:1px solid var(--border)">'+
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
+        '<td style="padding:5px 8px;text-align:center"><span style="font-size:10px;color:var(--red);background:rgba(239,68,68,0.1);padding:1px 5px;border-radius:3px;border:1px solid rgba(239,68,68,0.3)">&#8734;</span></td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanRecidiveIP(\''+ip+'\')">Unban</button></td></tr>';
+    }).join('');
+    c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
+      '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleRecidiveSort()">IP Address'+arrow+'</th>'+
+      '<th style="padding:4px 8px;text-align:center">Duration</th>'+
+      '<th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  };
+
+  window.toggleRecidiveSort=function(){window._recidiveSortAsc=!window._recidiveSortAsc;filterRecidiveBanList();};
+  window.filterRecidiveBanList=function(){var q=(document.getElementById('recidive-ban-search').value||'').trim().toLowerCase();renderRecidiveBanList(q?window._recidiveBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._recidiveBannedIps);};
+  window.toggleRecidiveBanPanel=function(){
+    var panel=document.getElementById('recidive-ban-panel');var caret=document.getElementById('recidive-banned-caret');if(!panel)return;
+    var open=panel.style.display!=='none';panel.style.display=open?'none':'';
+    if(caret)caret.textContent=open?'▼ details':'▲ details';
+    if(!open){var s=document.getElementById('recidive-ban-search');if(s)s.value='';renderRecidiveBanList(window._recidiveBannedIps);}
+  };
+
+  function loadRecidiveStatus(){
+    fetch('/api/fail2ban/recidive/status').then(function(r){return r.json();}).then(function(d){
+      if(!d.available)return;
+      var badge=document.getElementById('recidive-badge');
+      var toggle=document.getElementById('recidive-toggle');
+      var track=document.getElementById('recidive-toggle-track');
+      var thumb=document.getElementById('recidive-toggle-thumb');
+      var sec=document.getElementById('recidive-enabled-section');
+      if(d.jail_enabled){
+        if(badge){badge.className='badge badge-green';badge.innerHTML='<span class="dot dot-pulse"></span>Active';}
+        if(track)track.style.background='var(--green)';
+        if(thumb)thumb.style.transform='translateX(18px)';
+      }else{
+        if(badge){badge.className='badge badge-red';badge.innerHTML='<span class="dot"></span>Disabled';}
+        if(track)track.style.background='var(--border)';
+        if(thumb)thumb.style.transform='';
+      }
+      if(toggle)toggle.checked=d.jail_enabled;
+      if(sec)sec.style.display=d.jail_enabled?'':'none';
+      if(d.jail_enabled){
+        document.getElementById('recidive-stat-banned').textContent=d.currently_banned||0;
+        document.getElementById('recidive-stat-total').textContent=d.total_banned||0;
+        var cfg=d.jail_config||{};
+        if(cfg.maxretry)document.getElementById('recidive-cfg-maxretry').value=cfg.maxretry;
+        if(cfg.findtime)document.getElementById('recidive-cfg-findtime').value=Math.round(cfg.findtime/3600);
+        var ips=d.banned_ips||[];
+        window._recidiveBannedIps=ips;
+        renderRecidiveBanList(ips);
+        var caret=document.getElementById('recidive-banned-caret');
+        if(caret)caret.textContent=ips.length?'▼ details':'';
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleRecidiveJail=function(){
+    var enabled=document.getElementById('recidive-toggle').checked;
+    if(!enabled){
+      fetch('/api/fail2ban/recidive/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:false})})
+        .then(function(r){return r.json();}).then(function(d){
+          if(d.ok){showToast('Repeat Offender Protection disabled.','success');loadRecidiveStatus();}
+          else{showToast(d.error||'Failed to disable','error');loadRecidiveStatus();}
+        }).catch(function(){showToast('Network error','error');loadRecidiveStatus();});
+    }else{saveRecidiveConfig();}
+  };
+
+  window.saveRecidiveConfig=function(){
+    var body={
+      enabled:true,
+      maxretry:parseInt(document.getElementById('recidive-cfg-maxretry').value)||3,
+      findtime:(parseInt(document.getElementById('recidive-cfg-findtime').value)||24)*3600
+    };
+    fetch('/api/fail2ban/recidive/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){showToast('Repeat Offender Protection saved.','success');loadRecidiveStatus();}
+        else showToast(d.error||'Save failed','error');
+      }).catch(function(){showToast('Network error','error');});
+  };
+
+  window.unbanRecidiveIP=function(ip){
+    if(!confirm('Permanently unban '+ip+' from Repeat Offender Protection?\n\nThis IP will be able to attempt connections again.'))return;
+    fetch('/api/fail2ban/recidive/unban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:ip})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){showToast(ip+' permanently unbanned.','success');loadRecidiveStatus();}
+        else showToast(d.error||'Unban failed','error');
+      }).catch(function(){showToast('Network error','error');});
+  };
+
+  window.manualRecidiveRefresh=function(){
+    _spinIcon('recidive-refresh-icon',true);
+    var btn=document.getElementById('recidive-refresh-btn');if(btn)btn.disabled=true;
+    loadRecidiveStatus();
+    setTimeout(function(){_spinIcon('recidive-refresh-icon',false);if(btn)btn.disabled=false;},1200);
+  };
+
+  loadRecidiveStatus();
+  setInterval(loadRecidiveStatus,30000);
+})();
+</script>
+</body></html>

@@ -1,0 +1,472 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>WebODM — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0;display:flex;flex-direction:column}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.section-title{font-size:20px;font-weight:700;color:var(--text-primary);margin-bottom:24px;display:flex;align-items:center;gap:10px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}.btn-ghost:hover{border-color:var(--accent)}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.status-dot.green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.status-dot.yellow{background:var(--yellow)}
+.status-dot.red{background:var(--red)}
+.log-box{background:#0a0d14;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);max-height:260px;overflow-y:auto;line-height:1.7}
+.log-line{color:var(--text-dim)}.log-line.err{color:var(--red)}.log-line.ok{color:var(--green)}
+.info-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 20px;font-size:13px}
+.info-label{color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}
+.info-value{color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:11px;word-break:break-all}
+.step-item{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(30,39,54,.5)}
+.step-item:last-child{border-bottom:none}
+.step-num{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
+.open-btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;transition:opacity .2s}.open-btn:hover{opacity:.85}
+.toast{position:fixed;bottom:24px;right:24px;background:#1e2736;border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;color:var(--text-primary);display:none;z-index:999}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:12px}.modal p{font-size:13px;color:var(--text-dim);line-height:1.6;margin-bottom:18px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
+.form-group{margin-bottom:12px}.form-label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none}.form-input:focus{border-color:var(--accent)}
+.btn-sm{padding:6px 14px;font-size:11px}
+.uninstall-spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+.uninstall-progress-row{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:12px;color:var(--text-secondary)}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.04);border-left-color:var(--border)}
+.nav-item.active{color:var(--accent);background:rgba(59,130,246,.08);border-left-color:var(--accent)}
+.nav-icon{font-size:18px;width:22px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.sidebar-logo{padding:0 20px 16px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.sidebar-logo span{display:block;font-size:15px;font-weight:700;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:11px;color:var(--text-dim);margin-top:2px}
+body.light-mode{--bg-deep:#f1f5f9;--bg-surface:#fff;--bg-card:#f8fafc;--border:#e2e8f0;--text-primary:#0f172a;--text-secondary:#334155;--text-dim:#64748b}
+body.light-mode .nav-item:hover{background:rgba(0,0,0,.04)}
+body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="section-title"><img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)">WebODM</div>
+
+{% if not wo.get('installed') or deploying or deploy_error %}
+<!-- Deploy state (also shown for an in-place Reapply on an installed box) -->
+<div style="background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px">
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">Drone Photo Processing for TAK</div>
+<div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install the TAK Incident Overlay plugin by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a>. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
+<div style="margin-top:12px;font-size:12px;color:var(--text-dim)">Deploys: WebODM 3.2+ · NodeODM processing node · <a href="https://github.com/Humble-Helper-96/webodm-tak-overlay" target="_blank" style="color:var(--cyan);text-decoration:none">TAK Overlay plugin v0.7.7</a></div>
+</div>
+
+{% if deploying %}
+<div class="card">
+<div class="card-title">Deploying WebODM…</div>
+<div class="log-box" id="deploy-log">{% for line in deploy_log %}<div class="log-line{% if 'ERROR' in line %} err{% elif '✓' in line or 'success' in line.lower() %} ok{% endif %}">{{ line }}</div>{% endfor %}</div>
+<div style="margin-top:14px;font-size:12px;color:var(--text-dim)">Image pull may take several minutes…</div>
+</div>
+<script>
+var WO_URL = {{ wo_url|tojson }};
+(function(){
+var _lastCount = document.getElementById('deploy-log').children.length;
+var _interval = setInterval(function(){
+    fetch('/api/webodm/deploy-status').then(function(r){return r.json();}).then(function(d){
+        var box = document.getElementById('deploy-log');
+        if(box && d.log && d.log.length > _lastCount){
+            for(var i=_lastCount;i<d.log.length;i++){
+                var div=document.createElement('div');
+                var line=d.log[i];
+                div.className='log-line'+(line.indexOf('ERROR')>=0?' err':(line.indexOf('✓')>=0||line.toLowerCase().indexOf('success')>=0?' ok':''));
+                div.textContent=line;
+                box.appendChild(div);
+            }
+            _lastCount=d.log.length;
+            box.scrollTop=box.scrollHeight;
+        }
+        if(!d.running){
+            clearInterval(_interval);
+            if(d.error){
+                setTimeout(function(){window.location.reload();},800);
+            } else {
+                startWarmup();
+            }
+        }
+    }).catch(function(){});
+},3000);
+
+function startWarmup(){
+    var logBox = document.getElementById('deploy-log');
+    var title = document.querySelector('.card-title');
+    if(title) title.textContent = 'WebODM deployed — warming up…';
+    var footer = document.querySelector('[style*="Image pull may take"]');
+    if(footer) footer.remove();
+
+    var warmupDiv = document.createElement('div');
+    warmupDiv.style = 'margin-top:16px;padding:14px 16px;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.2);border-radius:8px;font-size:12px;color:var(--text-dim)';
+    warmupDiv.innerHTML = '<div style="display:flex;align-items:center;gap:10px"><div id="wo-warmup-spinner" style="width:14px;height:14px;border:2px solid rgba(6,182,212,.3);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0"></div><span id="wo-warmup-msg">WebODM containers are starting — waiting for readiness check…</span></div><div id="wo-ready-btn-wrap" style="margin-top:14px;display:none"><a id="wo-open-btn" href="#" target="_blank" class="open-btn" style="opacity:.5;pointer-events:none;cursor:default"><span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM</a><span id="wo-ready-label" style="margin-left:12px;font-size:12px;color:var(--green);font-weight:600"></span></div>';
+    if(logBox) logBox.parentNode.insertBefore(warmupDiv, logBox.nextSibling);
+
+    var checks = 0;
+    var maxChecks = 36; // ~3 min max
+    var warmupInterval = setInterval(function(){
+        checks++;
+        fetch('/api/webodm/ready').then(function(r){return r.json();}).then(function(d){
+            var msg = document.getElementById('wo-warmup-msg');
+            if(d.ready){
+                clearInterval(warmupInterval);
+                var spinner = document.getElementById('wo-warmup-spinner');
+                if(spinner) spinner.style.borderTopColor='var(--green)';
+                if(msg) msg.innerHTML = '<span style="color:var(--green);font-weight:600">✓ WebODM is ready</span>';
+                var btnWrap = document.getElementById('wo-ready-btn-wrap');
+                if(btnWrap) btnWrap.style.display='block';
+                var openBtn = document.getElementById('wo-open-btn');
+                if(openBtn){ openBtn.style.opacity='1'; openBtn.style.pointerEvents='auto'; openBtn.style.cursor='pointer'; openBtn.href=d.url||WO_URL||'#'; }
+                var lbl = document.getElementById('wo-ready-label');
+                if(lbl) lbl.textContent = 'Authentik proxy is live — you can log in now';
+            } else {
+                if(msg) msg.textContent = d.status || ('Waiting for WebODM to finish startup… (' + checks * 5 + 's)');
+                if(checks >= maxChecks){
+                    clearInterval(warmupInterval);
+                    if(msg) msg.innerHTML = '<span style="color:var(--yellow)">Taking longer than expected — try opening manually.</span>';
+                    var btnWrap2 = document.getElementById('wo-ready-btn-wrap');
+                    if(btnWrap2) btnWrap2.style.display='block';
+                    var ob2 = document.getElementById('wo-open-btn');
+                    if(ob2){ ob2.style.opacity='1'; ob2.style.pointerEvents='auto'; ob2.style.cursor='pointer'; ob2.href=d.url||WO_URL||'#'; }
+                }
+            }
+        }).catch(function(){});
+    }, 5000);
+}
+})();
+</script>
+{% elif deploy_error %}
+<div class="card">
+<div class="card-title" style="color:var(--red)">Deploy Failed</div>
+<div class="log-box">{% for line in deploy_log %}<div class="log-line{% if 'ERROR' in line %} err{% endif %}">{{ line }}</div>{% endfor %}</div>
+<button class="btn btn-primary" onclick="startDeploy()" style="margin-top:14px" id="deploy-btn">Retry Deploy</button>
+</div>
+{% else %}
+<div class="card" style="max-width:560px">
+<div class="card-title">Deployment Target</div>
+<div style="display:flex;gap:10px;margin-bottom:16px">
+  <button id="wo-target-local-btn" onclick="woSetTarget('local')" class="btn btn-sm" style="{% if wo_deploy_cfg.target_mode != 'remote' %}background:rgba(6,182,212,.15);color:var(--cyan);border:1px solid rgba(6,182,212,.4){% else %}background:rgba(30,39,54,.5);color:var(--text-dim);border:1px solid var(--border){% endif %}">This server</button>
+  <button id="wo-target-remote-btn" onclick="woSetTarget('remote')" class="btn btn-sm" style="{% if wo_deploy_cfg.target_mode == 'remote' %}background:rgba(6,182,212,.15);color:var(--cyan);border:1px solid rgba(6,182,212,.4){% else %}background:rgba(30,39,54,.5);color:var(--text-dim);border:1px solid var(--border){% endif %}">Remote host</button>
+</div>
+<div id="wo-remote-cfg" style="display:{% if wo_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+  <div class="form-group"><label class="form-label">Remote host (IP or hostname)</label><input class="form-input" id="wo-ssh-host" value="{{ wo_deploy_cfg.remote.host or '' }}" placeholder="192.168.1.50"></div>
+  <div style="display:flex;gap:10px">
+    <div class="form-group" style="flex:1"><label class="form-label">SSH user</label><input class="form-input" id="wo-ssh-user" value="{{ wo_deploy_cfg.remote.ssh_user or 'root' }}" placeholder="root"></div>
+    <div class="form-group" style="width:90px"><label class="form-label">Port</label><input class="form-input" id="wo-ssh-port" value="{{ wo_deploy_cfg.remote.ssh_port or 22 }}" placeholder="22" type="number"></div>
+  </div>
+  <div class="form-group"><label class="form-label">Auth method</label>
+    <select class="form-input" id="wo-auth-method" onchange="woAuthMethodChange()">
+      <option value="ssh_key" {% if wo_deploy_cfg.remote.auth_method != 'password' %}selected{% endif %}>SSH key</option>
+      <option value="password" {% if wo_deploy_cfg.remote.auth_method == 'password' %}selected{% endif %}>Password</option>
+    </select>
+  </div>
+  <div id="wo-key-row" class="form-group" style="display:{% if wo_deploy_cfg.remote.auth_method == 'password' %}none{% else %}block{% endif %}">
+    <label class="form-label">SSH key path (leave blank for default ~/.ssh/id_ed25519)</label>
+    <input class="form-input" id="wo-ssh-key-path" value="{{ wo_deploy_cfg.remote.ssh_key_path or '' }}" placeholder="~/.ssh/id_ed25519">
+  </div>
+  <div id="wo-pw-row" class="form-group" style="display:{% if wo_deploy_cfg.remote.auth_method == 'password' %}block{% else %}none{% endif %}">
+    <label class="form-label">SSH password</label>
+    <input class="form-input" type="password" id="wo-ssh-password" placeholder="SSH password">
+  </div>
+  <div style="display:flex;gap:8px;margin-top:4px;align-items:center;flex-wrap:wrap">
+    <button class="btn btn-sm btn-ghost" onclick="woSaveConfig()">Save</button>
+    <button class="btn btn-sm btn-ghost" onclick="woEnsureSshKey()">Generate SSH key</button>
+    <button class="btn btn-sm btn-ghost" onclick="woInstallSshKey()">Install SSH key</button>
+    <button class="btn btn-sm btn-ghost" onclick="woTestSsh()">Test connection</button>
+    <span id="wo-cfg-msg" style="font-size:12px;color:var(--text-dim)"></span>
+  </div>
+</div>
+</div>
+<div class="card" style="max-width:560px">
+<div class="card-title">Deploy WebODM{% if wo_deploy_cfg.target_mode == 'remote' and wo_deploy_cfg.remote.host %} <span style="font-size:10px;color:var(--cyan);font-weight:400;margin-left:6px">→ {{ wo_deploy_cfg.remote.host }}</span>{% endif %}</div>
+<div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will pull WebODM images (~1.5 GB), start all containers, clone the TAK overlay plugin, and register the NodeODM processing node. Takes 3–8 minutes on first deploy.</div>
+<div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:20px;background:rgba(30,39,54,.35)">
+  <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:4px">ODM resource limit</div>
+  <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">Caps the ODM processing container so a job can't starve the TAK stack. Leave blank for auto. ODM is hard-capped at {{ odm_max_cores }} cores fleet-wide.</div>
+  <div style="display:flex;gap:10px">
+    <div class="form-group" style="flex:1;margin-bottom:0"><label class="form-label">CPU cores</label><input class="form-input" id="wo-odm-cpus" type="number" min="1" max="{{ odm_max_cores }}" value="{{ wo_deploy_cfg.odm_cpus or '' }}" placeholder="auto (cores − 2, max {{ odm_max_cores }})"></div>
+    <div class="form-group" style="flex:1;margin-bottom:0"><label class="form-label">Memory (GB)</label><input class="form-input" id="wo-odm-mem" type="number" min="2" value="{{ wo_deploy_cfg.odm_mem_g or '' }}" placeholder="auto (cores + 2)"></div>
+  </div>
+</div>
+<button class="btn btn-primary" onclick="startDeploy()" id="deploy-btn">
+<span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy WebODM
+</button>
+<div id="deploy-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+{% endif %}
+<script>
+function woSetTarget(mode){
+  var localBtn=document.getElementById('wo-target-local-btn');
+  var remoteBtn=document.getElementById('wo-target-remote-btn');
+  var cfg=document.getElementById('wo-remote-cfg');
+  var active='background:rgba(6,182,212,.15);color:var(--cyan);border:1px solid rgba(6,182,212,.4)';
+  var inactive='background:rgba(30,39,54,.5);color:var(--text-dim);border:1px solid var(--border)';
+  if(mode==='remote'){remoteBtn.style.cssText=active;localBtn.style.cssText=inactive;cfg.style.display='block';}
+  else{localBtn.style.cssText=active;remoteBtn.style.cssText=inactive;cfg.style.display='none';}
+  woMsg('');
+}
+function woAuthMethodChange(){
+  var m=document.getElementById('wo-auth-method').value;
+  document.getElementById('wo-key-row').style.display=m==='password'?'none':'block';
+  document.getElementById('wo-pw-row').style.display=m==='password'?'block':'none';
+}
+function woMsg(t,c){var el=document.getElementById('wo-cfg-msg');if(el){el.textContent=t;el.style.color=c||'var(--text-dim)';}}
+function _woCfg(extraMode){
+  return {target_mode:extraMode||(document.getElementById('wo-remote-cfg').style.display!=='none'?'remote':'local'),
+    remote:{host:(document.getElementById('wo-ssh-host')||{}).value||'',
+      ssh_user:(document.getElementById('wo-ssh-user')||{}).value||'root',
+      ssh_port:parseInt((document.getElementById('wo-ssh-port')||{}).value||22,10)||22,
+      auth_method:(document.getElementById('wo-auth-method')||{}).value||'ssh_key',
+      ssh_key_path:(document.getElementById('wo-ssh-key-path')||{}).value||'',
+      ssh_password:(document.getElementById('wo-ssh-password')||{}).value||''},
+    odm_cpus:(document.getElementById('wo-odm-cpus')||{}).value||'',
+    odm_mem_g:(document.getElementById('wo-odm-mem')||{}).value||''};
+}
+function woSaveConfig(mode){
+  woMsg('Saving…');
+  fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg(mode)}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){var ok=d&&!d.error;woMsg(ok?'Saved':'Error: '+((d&&d.error)||'failed'),ok?'var(--green)':'var(--red)');setTimeout(function(){woMsg('');},3000);}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+function woEnsureSshKey(){
+  woMsg('Generating key…');
+  fetch('/api/webodm/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key ready'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+function woInstallSshKey(){
+  woMsg('Installing key…');
+  fetch('/api/webodm/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?(d.message||'Key installed'):'Error: '+(d.error||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+function woTestSsh(){
+  woMsg('Testing…');
+  fetch('/api/webodm/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){woMsg(d.success?'✓ Connected':'✗ '+(d.error||d.output||'failed'),d.success?'var(--green)':'var(--red)');}).catch(function(e){woMsg(e.message,'var(--red)');});
+}
+</script>
+
+{% else %}
+<!-- Management state -->
+<div class="card" style="margin-bottom:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+<div style="display:flex;align-items:center;gap:10px">
+<span class="status-dot {% if wo.get('running') %}green{% else %}yellow{% endif %}"></span>
+<span style="font-size:14px;font-weight:600">{% if wo.get('running') %}Running{% else %}Stopped{% endif %}</span>
+{% if wo_version %}<span style="font-size:12px;color:var(--text-dim);margin-left:10px">v{{ wo_version }}</span>{% endif %}
+{% if wo_update_available and wo_latest %}<span style="font-size:12px;color:var(--cyan);margin-left:8px;font-weight:600">v{{ wo_latest }} available</span>{% endif %}
+{% if wo_url %}
+<span style="font-size:12px;color:var(--text-dim);margin-left:8px">· {{ wo_url }}</span>
+{% endif %}
+</div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+{% if wo_url %}
+<a href="{{ wo_url }}" target="_blank" class="open-btn">
+<span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM
+</a>
+{% endif %}
+{% if wo_update_available and wo_latest %}
+<button class="btn btn-primary btn-sm" id="wo-update-btn" onclick="updateWebODM(this)">↑ Update to v{{ wo_latest }}</button>
+{% endif %}
+<button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
+<button class="btn btn-ghost" onclick="reapplyWebODM(this)" title="Re-run the deploy in place: re-clone the TAK overlay plugin, refresh docker-compose and the OIDC login config, restart containers. Projects and data are kept.">⟳ Reapply Plugin &amp; Config</button>
+<button class="btn btn-ghost" onclick="openWoPwModal()" title="Show admin accounts and reset password">🔑 Account Recovery</button>
+<button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">Uninstall</button>
+</div>
+</div>
+</div>
+
+<!-- Connection info -->
+<div class="card">
+<div class="card-title">Connection Info</div>
+<div class="info-grid">
+<span class="info-label">WebODM URL</span>
+<span class="info-value">{{ wo_url or 'Configure FQDN in Settings first' }}</span>
+<span class="info-label">Default login</span>
+<span class="info-value">admin / admin (change after first login)</span>
+<span class="info-label">Processing node</span>
+<span class="info-value">wo_nodeodm:3000 (auto-registered)</span>
+<span class="info-label">Plugin</span>
+<span class="info-value">TAK Incident Overlay v0.7.7 by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a></span>
+</div>
+</div>
+
+<!-- Workflow -->
+<div class="card">
+<div class="card-title">TAK Overlay Workflow</div>
+<div class="steps-list">
+<div class="step-item"><div class="step-num">1</div><div class="step-text">Open WebODM at <span class="step-code">{{ wo_url or 'your WebODM URL' }}</span> and log in</div></div>
+<div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>TAK Incident Overlay</strong> plugin in the sidebar</div></div>
+<div class="step-item"><div class="step-num">3</div><div class="step-text">Upload your GPS-tagged drone photos (up to 150 JPEGs, 300 in high-capacity mode)</div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Processing runs automatically — typical time 3–25 minutes depending on quality mode</div></div>
+<div class="step-item"><div class="step-num">5</div><div class="step-text">Download the <span class="step-code">.mbtiles</span> file from the completed job</div></div>
+<div class="step-item"><div class="step-num">6</div><div class="step-text">Import into ATAK via <strong>Overlay Manager</strong> → <strong>Add</strong> → select the MBTiles file — the georeferenced orthomap appears on the TAK map at the correct location</div></div>
+</div>
+</div>
+{% endif %}
+</div>
+
+<!-- Uninstall modal -->
+<!-- Account recovery modal -->
+<div id="wo-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:420px;width:90%">
+<div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:4px">WebODM Account Recovery</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Shows all admin accounts and lets you set a new password for any of them.</div>
+<div id="wo-acct-list" style="background:rgba(6,182,212,.04);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:var(--text-dim)">Loading accounts…</div>
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">Username to reset</label>
+<input id="wo-pw-user" type="text" class="form-input" placeholder="e.g. admin" style="margin-bottom:12px">
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">New password</label>
+<input id="wo-pw-input" type="password" class="form-input" placeholder="Min. 8 characters" style="margin-bottom:10px">
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">Confirm password</label>
+<input id="wo-pw-confirm" type="password" class="form-input" placeholder="Confirm new password" style="margin-bottom:14px">
+<div id="wo-pw-msg" style="font-size:12px;color:var(--red);min-height:16px;margin-bottom:10px"></div>
+<div style="display:flex;gap:10px;justify-content:flex-end">
+<button class="btn btn-ghost btn-sm" onclick="closeWoPwModal()">Cancel</button>
+<button class="btn btn-primary btn-sm" id="wo-pw-btn" onclick="resetWoPassword()">Set Password</button>
+</div>
+</div>
+</div>
+
+<div class="modal-overlay" id="uninstall-modal"><div class="modal">
+  <h3>&#x26a0; Uninstall WebODM?</h3><p>This will stop and remove all WebODM containers and the plugin. Processed job data in ~/webodm/media/ will be preserved on disk.</p>
+  <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password" onkeydown="if(event.key==='Enter')doUninstall()"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" id="uninstall-cancel-btn" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" id="uninstall-confirm-btn" onclick="doUninstall()">Uninstall</button></div>
+  <div id="uninstall-progress" style="display:none;margin-top:12px;padding:10px 14px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);border-radius:8px;font-size:12px;color:var(--text-secondary)"><span class="uninstall-spinner"></span><span id="uninstall-progress-msg">Uninstalling…</span></div>
+  <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+
+<div id="toast" class="toast"></div>
+<script>
+function startDeploy(){
+    var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;
+    var st=document.getElementById('deploy-status');if(st)st.textContent='Saving config…';
+    // Persist deployment config (incl. ODM resource caps) before kicking off the deploy,
+    // which reads the saved webodm_deployment cfg and takes no request body. The config
+    // form only exists in the fresh-deploy state — on Retry (error state) there is no
+    // form, so skip the save and deploy with the already-saved config (_woCfg would
+    // throw on the missing elements).
+    (document.getElementById('wo-remote-cfg')
+      ? fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+      : Promise.resolve())
+      .then(function(){if(st)st.textContent='Starting deploy…';return fetch('/api/webodm/deploy',{method:'POST'});})
+      .then(r=>r.json()).then(d=>{
+        if(d.success){window.location.reload();}
+        else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
+    }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
+}
+function updateWebODM(btn){
+    btn.disabled=true;btn.textContent='Pulling update…';
+    var log=document.getElementById('wo-update-log');
+    if(!log){
+        log=document.createElement('div');
+        log.id='wo-update-log';
+        log.style='margin-top:10px;font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow-y:auto;background:rgba(0,0,0,.3);border-radius:6px;padding:10px';
+        btn.parentNode.parentNode.parentNode.appendChild(log);
+    }
+    log.textContent='Starting update...';
+    function poll(){
+        fetch('/api/webodm/update-status').then(r=>r.json()).then(d=>{
+            log.textContent=d.log||'';log.scrollTop=log.scrollHeight;
+            if(d.running){setTimeout(poll,1500);}
+            else if(d.complete){btn.textContent='↑ Update to latest';btn.disabled=false;showToast('✓ WebODM updated — reload page for new version');setTimeout(()=>window.location.reload(),2000);}
+            else if(d.error){btn.textContent='↑ Update to latest';btn.disabled=false;showToast('Update error — see log');}
+        });
+    }
+    fetch('/api/webodm/update',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.started){setTimeout(poll,1000);}
+        else{btn.disabled=false;btn.textContent='↑ Update to latest';showToast('Error: '+(d.error||'unknown'));}
+    });
+}
+function reapplyWebODM(btn){
+    if(!confirm('Re-run the WebODM deploy in place?\n\nThis re-clones the TAK overlay plugin, rewrites docker-compose (adding the one-click Authentik login config), and restarts the WebODM containers.\n\nProjects, accounts and processed data are KEPT. Running processing jobs will be interrupted and everyone is logged out of WebODM.'))return;
+    btn.disabled=true;btn.textContent='Starting…';
+    fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.reload();}
+        else{showToast('Error: '+(d.error||'unknown'));btn.disabled=false;btn.textContent='⟳ Reapply Plugin & Config';}
+    }).catch(e=>{showToast('Network error');btn.disabled=false;btn.textContent='⟳ Reapply Plugin & Config';});
+}
+function repairAuthentik(btn){
+    btn.disabled=true;btn.textContent='Repairing…';
+    fetch('/api/webodm/repair-authentik',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){showToast('✓ Authentik configured — try opening WebODM now.');btn.textContent='↻ Repair Authentik';btn.disabled=false;}
+        else{showToast('Error: '+(d.error||'unknown'));btn.textContent='↻ Repair Authentik';btn.disabled=false;}
+    }).catch(e=>{showToast('Network error');btn.textContent='↻ Repair Authentik';btn.disabled=false;});
+}
+function openWoPwModal(){
+    document.getElementById('wo-pw-modal').style.display='flex';
+    document.getElementById('wo-acct-list').textContent='Loading accounts…';
+    document.getElementById('wo-pw-user').value='';
+    document.getElementById('wo-pw-input').value='';
+    document.getElementById('wo-pw-confirm').value='';
+    document.getElementById('wo-pw-msg').textContent='';
+    fetch('/api/webodm/admin-accounts').then(r=>r.json()).then(d=>{
+        var el=document.getElementById('wo-acct-list');
+        if(d.accounts&&d.accounts.length){
+            el.innerHTML='<span style="color:var(--text-secondary)">Admin accounts: </span>'+d.accounts.map(function(u){return '<code style="color:var(--cyan);margin-right:8px">'+u+'</code>';}).join('');
+            document.getElementById('wo-pw-user').value=d.accounts[0];
+        } else {el.textContent=d.error||'Could not load accounts — WebODM may still be starting.';}
+    }).catch(function(){document.getElementById('wo-acct-list').textContent='Could not reach WebODM container.';});
+}
+function closeWoPwModal(){
+    document.getElementById('wo-pw-modal').style.display='none';
+}
+function resetWoPassword(){
+    var user=document.getElementById('wo-pw-user').value.trim();
+    var pw=document.getElementById('wo-pw-input').value;
+    var pw2=document.getElementById('wo-pw-confirm').value;
+    var msg=document.getElementById('wo-pw-msg');
+    var btn=document.getElementById('wo-pw-btn');
+    msg.textContent='';
+    if(!user){msg.textContent='Enter a username.';return;}
+    if(!pw){msg.textContent='Enter a password.';return;}
+    if(pw.length<8){msg.textContent='Password must be at least 8 characters.';return;}
+    if(pw!==pw2){msg.textContent='Passwords do not match.';return;}
+    btn.disabled=true;btn.textContent='Setting…';
+    fetch('/api/webodm/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pw})})
+    .then(r=>r.json()).then(d=>{
+        btn.disabled=false;btn.textContent='Set Password';
+        if(d.success){closeWoPwModal();showToast('✓ Password updated for '+user);}
+        else{msg.textContent='Error: '+(d.error||'unknown');}
+    }).catch(function(){btn.disabled=false;btn.textContent='Set Password';msg.textContent='Network error';});
+}
+function doUninstall(){
+  var pw=document.getElementById('uninstall-password').value;
+  var msg=document.getElementById('uninstall-msg');
+  var progress=document.getElementById('uninstall-progress');
+  var progressMsg=document.getElementById('uninstall-progress-msg');
+  var confirmBtn=document.getElementById('uninstall-confirm-btn');
+  var cancelBtn=document.getElementById('uninstall-cancel-btn');
+  msg.textContent='';
+  if(!pw){msg.textContent='Password required.';return;}
+  progress.style.display='block';
+  progressMsg.textContent='Stopping and removing WebODM containers…';
+  if(confirmBtn){confirmBtn.disabled=true;}
+  if(cancelBtn){cancelBtn.disabled=true;}
+  fetch('/api/webodm/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){
+        progress.style.display='none';
+        if(confirmBtn)confirmBtn.disabled=false;
+        if(cancelBtn)cancelBtn.disabled=false;
+        msg.textContent=d.error;
+        return;
+      }
+      progressMsg.textContent='Done — reloading…';
+      setTimeout(function(){location.reload();},1200);
+    })
+    .catch(function(e){
+      progress.style.display='none';
+      if(confirmBtn)confirmBtn.disabled=false;
+      if(cancelBtn)cancelBtn.disabled=false;
+      msg.textContent=e.message||'Request failed';
+    });
+}
+function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
+</script></body></html>

@@ -1,0 +1,151 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Firewall — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03);border-left-color:var(--border-hover)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;padding:22px 24px;overflow-x:hidden}
+.page-header{margin-bottom:16px}
+.page-header h1{font-size:26px;font-weight:700;display:flex;align-items:center;gap:10px}
+.page-header p{font-size:13px;color:var(--text-dim);margin-top:6px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:12px}
+.card summary{cursor:pointer;list-style:none;font-weight:700;color:var(--cyan);display:flex;align-items:center;justify-content:space-between;gap:8px}
+.card summary::-webkit-details-marker{display:none}
+.card-body{margin-top:12px}
+.form-input{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px}
+.btn{padding:8px 12px;border:1px solid var(--border);background:transparent;color:var(--text-secondary);border-radius:8px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:12px}
+.btn:hover{border-color:var(--cyan);color:var(--cyan)}
+.rules-box{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:340px;overflow:auto}
+.fw-summary-left{display:flex;align-items:center;gap:8px}
+.fw-summary-chevron{transition:transform .2s ease;color:var(--text-dim)}
+.card[open] .fw-summary-chevron{transform:rotate(180deg)}
+.exp-tbl{width:100%;border-collapse:collapse;font-size:12px}
+.exp-tbl th{text-align:left;color:var(--text-dim);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding:6px 8px;border-bottom:1px solid var(--border)}
+.exp-tbl td{padding:6px 8px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;color:var(--text-secondary);vertical-align:top}
+.exp-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.exp-ok{background:var(--green)}.exp-warn{background:var(--yellow)}.exp-alert{background:var(--red)}.exp-na{background:var(--text-dim)}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><span class="material-symbols-outlined">shield_locked</span>Firewall</h1>
+    <p>Always-on {{ fw_name }} controls. Open/close ports, restrict by source IP/CIDR, and remove rules.</p>
+  </div>
+
+  <details class="card" open id="exposure-card">
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">policy</span>Service Exposure</span><span style="display:flex;align-items:center;gap:10px"><span id="exp-badge" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">checking…</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></span></summary>
+    <div class="card-body">
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">Live bind + firewall state vs. the declared exposure policy for every installed service. Read-only — drift is re-hardened automatically on update, or fix it with the controls below.</p>
+      <div id="exp-table">Loading exposure audit…</div>
+      <div id="exp-undeclared"></div>
+    </div>
+  </details>
+
+  <details class="card" open>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">list</span>Current Rules</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
+    <div class="card-body">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn" type="button" onclick="fwRefresh()">Refresh</button>
+        <span id="fw-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+      <div id="fw-rules" class="rules-box">Loading firewall status...</div>
+    </div>
+  </details>
+
+  <details class="card" open>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">add_circle</span>Open / Close Port</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input class="form-input" type="number" id="fw-port" min="1" max="65535" placeholder="Port" style="max-width:120px">
+        <select class="form-input" id="fw-proto" style="max-width:100px"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+        <button class="btn" type="button" id="fw-open-btn" onclick="fwOpenPort()">Open</button>
+        <button class="btn" type="button" id="fw-close-btn" onclick="fwClosePort()" style="border-color:var(--yellow);color:var(--yellow)">Close</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="card" open>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">filter_alt</span>Restrict Source IP to Service</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input class="form-input" type="text" id="fw-src" placeholder="Source IP/CIDR (e.g. 203.0.113.10 or 203.0.113.0/24)" style="min-width:300px">
+        <select class="form-input" id="fw-action" style="max-width:120px"><option value="allow">allow</option><option value="deny">deny</option></select>
+        <input class="form-input" type="number" id="fw-src-port" min="1" max="65535" placeholder="Port" style="max-width:120px">
+        <select class="form-input" id="fw-src-proto" style="max-width:100px"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+        <button class="btn" type="button" id="fw-src-btn" onclick="fwRestrictSource()">Apply</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="card" open>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">delete</span>Delete Rule by Number</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input class="form-input" type="number" id="fw-rule-num" min="1" placeholder="Rule #" style="max-width:120px">
+        <button class="btn" type="button" id="fw-del-btn" onclick="fwDeleteRule()" style="border-color:var(--red);color:var(--red)">Delete rule</button>
+      </div>
+      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use the numbers shown in "Current Rules" above.</p>
+    </div>
+  </details>
+</div>
+<script>
+(function(){
+  function dot(s){return '<span class="exp-dot exp-'+s+'"></span>';}
+  var TIER={1:'Public',3:'Caddy-loopback',4:'Docker-internal',5:'Source-scoped'};
+  function esc(t){var d=document.createElement('div');d.textContent=(t==null?'':String(t));return d.innerHTML;}
+  fetch('/api/firewall/exposure').then(function(r){return r.json();}).then(function(d){
+    var badge=document.getElementById('exp-badge');
+    var st=(d.summary&&d.summary.status)||'unknown';
+    var red=(d.summary&&d.summary.issue_count)||0, yel=(d.summary&&d.summary.warn_count)||0;
+    if(st==='ok'){badge.innerHTML=dot('ok')+'All clear';badge.style.color='var(--green)';}
+    else if(st==='warn'){badge.innerHTML=dot('warn')+yel+' to review';badge.style.color='var(--yellow)';}
+    else if(st==='issue'){badge.innerHTML=dot('alert')+red+' exposed'+(yel?' · '+yel+' to review':'');badge.style.color='var(--red)';}
+    else{badge.textContent='unavailable';}
+    var rows=d.rows||[];
+    var html='';
+    if(rows.length){
+      html='<table class="exp-tbl"><thead><tr><th>Service</th><th>Port</th><th>Tier</th><th>Bind</th><th>Status</th></tr></thead><tbody>';
+      rows.forEach(function(x){
+        html+='<tr><td style="font-family:\'DM Sans\',sans-serif;color:var(--text-primary)">'+esc(x.label)+'</td><td>'+esc(x.port)+'/'+esc(x.proto)+'</td><td>'+esc(TIER[x.tier]||x.tier)+'</td><td>'+esc(x.bind)+'</td><td>'+dot(x.severity)+esc(x.note)+'</td></tr>';
+      });
+      html+='</tbody></table>';
+    } else { html='<p style="color:var(--text-dim);font-size:12px">No installed services to audit.</p>'; }
+    document.getElementById('exp-table').innerHTML=html;
+    var extra='';
+    var u=d.undeclared||[];
+    if(u.length){
+      extra='<p style="margin-top:14px;color:var(--yellow);font-size:12px;font-weight:600">'+dot('warn')+'Public listeners not in the standard catalog — review:</p><div class="rules-box" style="max-height:160px">';
+      u.forEach(function(x){extra+=esc(x.port)+'/tcp  '+esc((x.procs||[]).join(', '))+'\n';});
+      extra+='</div>';
+    }
+    var tc=d.tak_connectors||[];
+    if(tc.length){
+      extra+='<p style="margin-top:14px;color:var(--text-dim);font-size:12px">'+dot('ok')+'TAK Server connectors (expected): '+tc.map(function(x){return esc(x.port);}).join(', ')+'</p>';
+    }
+    if(d.firewall_blocked){
+      extra+='<p style="margin-top:10px;color:var(--text-dim);font-size:11px">'+dot('ok')+d.firewall_blocked+' listener(s) bound publicly but firewall-blocked — not reachable.</p>';
+    }
+    if(d.firewall_supported===false){
+      extra+='<p style="margin-top:10px;color:var(--text-dim);font-size:11px">No host firewall detected — bind state shown without firewall correlation.</p>';
+    }
+    document.getElementById('exp-undeclared').innerHTML=extra;
+  }).catch(function(){
+    document.getElementById('exp-table').innerHTML='<p style="color:var(--text-dim);font-size:12px">Exposure audit unavailable.</p>';
+    var b=document.getElementById('exp-badge');if(b){b.textContent='unavailable';}
+  });
+})();
+</script>
+<script src="/firewall.js?v={{ version }}"></script>
+</body></html>

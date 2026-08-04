@@ -1,0 +1,419 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>CloudTAK — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03);border-left-color:var(--border-hover)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}
+.page-header h1{font-size:22px;font-weight:700;color:var(--text-primary)}
+.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px;font-weight:500}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;transition:border-color .15s;outline:none}
+.form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-success{background:var(--green);color:#fff}.btn-success:hover{background:#059669}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
+.info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;line-height:1.7;white-space:pre-wrap}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-update{border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.tab-bar{display:flex;gap:4px;margin-bottom:20px;background:var(--bg-surface);padding:4px;border-radius:10px;width:fit-content}
+.tab{padding:7px 16px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;color:var(--text-dim);transition:all .15s}
+.tab.active{background:var(--bg-card);color:var(--text-primary)}
+.tab-panel{display:none}.tab-panel.active{display:block}
+.uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+.ct-btn-spinner{display:inline-block;width:11px;height:11px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+.uninstall-progress-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)}
+.svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:8px}
+.svc-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:12px}
+.svc-name{color:var(--text-secondary);font-weight:600;margin-bottom:4px}
+.svc-status{font-size:11px}
+</style></head>
+<body data-deploying="{{ 'true' if deploying else 'false' }}">
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version_info and cloudtak_version_info.version %} <span class="os-badge" style="margin-left:6px;font-weight:500;font-size:14px">v{{ cloudtak_version_info.version }}</span>{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} · <span style="color:var(--cyan);font-size:12px" title="Update available — click Update to install v{{ cloudtak_version_info.latest }}">v{{ cloudtak_version_info.latest }} available</span>{% else %} · <span style="color:var(--green);font-size:11px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% endif %}</h1>
+    <p>Browser-based TAK client — in-browser map and situational awareness via TAK Server</p>
+  </div>
+
+  {% if sec_compromised %}
+  <div style="background:rgba(239,68,68,0.10);border:2px solid var(--red);border-radius:12px;padding:18px 22px;margin-bottom:20px;color:var(--red)">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <span class="material-symbols-outlined" style="font-size:28px;flex-shrink:0">warning</span>
+      <div style="flex:1">
+        <div style="font-weight:700;font-size:15px;margin-bottom:6px;color:var(--red)">CRITICAL: CloudTAK PostGIS compromise detected on this host</div>
+        <div style="color:var(--text-secondary);font-size:13px;line-height:1.6">
+          The v0.9.11 security update found malware persistence (PG_MEM / PGMiner cryptominer) in your CloudTAK postgis data volume.
+          The malware has been quarantined and CloudTAK has been stopped. <strong style="color:var(--text-primary)">Attacker artifacts may still exist in the DB itself (additional postgres roles, pg_cron jobs, event triggers) — they cannot be reliably cleaned in place.</strong>
+          <br><br>
+          <strong style="color:var(--text-primary)">Required action:</strong> Click <strong style="color:var(--red)">Remove</strong> below (wipes the data volume), then <strong style="color:var(--green)">Install</strong> (fresh DB with strong random password and locked-down ports). Forensic details: <code>~/CloudTAK/COMPROMISE-DETECTED.txt</code> on the server, and <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md" target="_blank" rel="noopener" style="color:var(--cyan)">docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md</a>.
+        </div>
+      </div>
+    </div>
+  </div>
+  {% elif sec_legacy_install and cloudtak.installed %}
+  <div style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.4);border-radius:12px;padding:16px 20px;margin-bottom:20px">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <span class="material-symbols-outlined" style="font-size:24px;color:var(--yellow);flex-shrink:0">shield_locked</span>
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:14px;margin-bottom:4px;color:var(--yellow)">Action recommended: Remove + Reinstall CloudTAK to complete v0.9.11 security hardening</div>
+        <div style="color:var(--text-secondary);font-size:12.5px;line-height:1.6">
+          v0.9.11 already locked down your network exposure (postgis host port removed, MinIO console on 127.0.0.1 only, UFW deny rules in place), but your existing postgis database still uses the upstream default password.
+          PostgreSQL only honors <code>POSTGRES_PASSWORD</code> on first <code>initdb</code>, so the rotation requires a fresh data volume.
+          <br><br>
+          <strong style="color:var(--text-primary)">To finish hardening:</strong> click <strong style="color:var(--red)">Remove</strong> then <strong style="color:var(--green)">Install</strong> when it's convenient. Your TAK Server, Authentik, and TAK Portal data are unaffected — only the CloudTAK gis database is rebuilt. Details: <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/RELEASE-v0.9.11-alpha.md" target="_blank" rel="noopener" style="color:var(--cyan)">docs/RELEASE-v0.9.11-alpha.md</a>.
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if cloudtak.running %}
+  <div class="status-banner running"><div class="dot"></div>CloudTAK is running</div>
+  {% elif cloudtak.installed %}
+  <div class="status-banner stopped"><div class="dot"></div>CloudTAK is installed but stopped</div>
+  {% else %}
+  <div class="status-banner not-installed"><div class="dot"></div>CloudTAK is not installed</div>
+  {% endif %}
+
+  {% if cloudtak.installed %}
+  <div class="section-title" style="margin-top:20px">Controls</div>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+  <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+  {% if cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  </div>
+  <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+
+  {% if cloudtak.running and not deploying %}
+  <!-- Access (only when install/deploy is complete) -->
+  <div class="card">
+    <div class="card-title">Access</div>
+    <div class="info-grid">
+      {% if cloudtak_cfg.target_mode == 'remote' and cloudtak_cfg.remote.host %}
+      <div class="info-item"><div class="info-label">Remote host</div><div class="info-value" style="color:var(--cyan);font-family:'JetBrains Mono',monospace">{{ cloudtak_cfg.remote.host }}</div></div>
+      {% endif %}
+      {% if settings.fqdn %}
+      <div class="info-item"><div class="info-label">Web UI</div><div class="info-value"><a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">https://map.{{ settings.fqdn }}</a> <span style="color:var(--text-dim);font-size:11px">↗</span></div></div>
+      <div class="info-item"><div class="info-label">Tile Server</div><div class="info-value">https://tiles.map.{{ settings.fqdn }}</div></div>
+      <div class="info-item"><div class="info-label">Video (MediaMTX)</div><div class="info-value"><a href="https://video.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">https://video.{{ settings.fqdn }}</a></div></div>
+      {% else %}
+      <div class="info-item"><div class="info-label">Web UI</div><div class="info-value"><a href="http://{{ settings.server_ip }}:5000" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">http://{{ settings.server_ip }}:5000</a> <span style="color:var(--text-dim);font-size:11px">↗</span></div></div>
+      <div class="info-item"><div class="info-label">Tile Server</div><div class="info-value">http://{{ settings.server_ip }}:5002</div></div>
+      {% endif %}
+      <div class="info-item"><div class="info-label">Install Dir</div><div class="info-value">~/CloudTAK</div></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if cloudtak.running and not deploying %}
+  <!-- Post-install first-time setup guide -->
+  <details style="margin-bottom:20px;border:1px solid rgba(16,185,129,0.25);border-radius:12px;overflow:hidden" id="cloudtak-setup-guide">
+    <summary style="padding:14px 20px;background:rgba(16,185,129,0.07);cursor:pointer;font-size:13px;font-weight:600;color:var(--green);list-style:none;display:flex;align-items:center;gap:10px" onclick="var a=this.parentElement.querySelector('.ct-guide-arrow');if(a)a.style.transform=this.parentElement.open?'rotate(0deg)':'rotate(180deg)'">
+      <span style="font-size:16px">🚀</span> First-Time Setup — Connect CloudTAK to TAK Server
+      <span class="ct-guide-arrow" style="margin-left:auto;font-size:14px;color:var(--text-dim);transition:transform 0.2s;display:inline-block;transform:rotate(0deg)">▼</span>
+    </summary>
+    <div style="padding:20px 24px;font-size:13px;color:var(--text-secondary);line-height:1.75;background:var(--bg-card)">
+
+      <p style="margin:0 0 14px;color:var(--text-primary);font-weight:600">CloudTAK needs its own TAK Server user + certificate to connect. Follow these steps once after install:</p>
+
+      <div style="display:flex;flex-direction:column;gap:14px">
+
+        <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:'JetBrains Mono',monospace;margin-bottom:8px">STEP 1 — Create a CloudTAK admin user in TAK Portal</div>
+          <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
+            <li style="margin-bottom:5px">Open <strong style="color:var(--text-primary)">TAK Portal</strong> → <strong style="color:var(--text-primary)">Users</strong> → <strong style="color:var(--text-primary)">Create User</strong></li>
+            <li style="margin-bottom:5px">Set the username to <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin</code> (or your preferred name)</li>
+            <li style="margin-bottom:5px">This must be a <strong>regular user — do NOT check the admin box</strong></li>
+            <li style="margin-bottom:5px">Assign to any agency and at least one group</li>
+            <li style="margin-bottom:5px">Set a password for the account — you will need this in Step 3</li>
+            <li style="color:var(--yellow);font-size:12px">⚠ TAK Portal appends an org suffix to every username (e.g. <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">cloudtakadmin-orgname</code>). Note the full suffixed username shown after creation — that is what you enter in CloudTAK, not just <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">cloudtakadmin</code>.</li>
+          </ol>
+        </div>
+
+        <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:'JetBrains Mono',monospace;margin-bottom:8px">STEP 2 — Generate &amp; download the Bootstrap Admin certificate</div>
+          <p style="margin:0 0 10px;font-size:12px;color:var(--text-secondary)">CloudTAK 13.59+ (Core Events) reposts Events over this certificate and <strong style="color:var(--text-primary)">silently skips channels the cert can't reach</strong> — it needs a <em>channels-disabled admin</em> cert, not a regular user cert. This button creates <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> with exactly that shape (makeCert-issued + ROLE_ADMIN, all channels via TAK's assignAdminAllGroups).</p>
+          <button class="btn btn-primary" onclick="ctGenBootstrapCert(this)" style="font-size:12px">Generate CloudTAK Bootstrap Admin p12</button>
+          <div id="ct-bootstrap-cert-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
+          <p style="margin:10px 0 0;font-size:12px;color:var(--text-dim)">Already running CloudTAK? Generate + download here, then swap it once in <strong style="color:var(--text-primary)">CloudTAK Admin → Server → Admin Certificate</strong> — no re-bootstrap needed. (The legacy <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">user.p12</code> still connects, but Events will not deliver with it.)</p>
+        </div>
+
+        <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:'JetBrains Mono',monospace;margin-bottom:8px">STEP 3 — Configure CloudTAK on first launch</div>
+          <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
+            <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %} — if the setup/config page does not appear, wait a minute and reload (CloudTAK may still be starting); if it stays stale, clear it via <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--text-secondary)">DevTools → Application → Clear site data</code></li>
+            <li style="margin-bottom:5px">When prompted for the TAK Server address, enter: {% if settings.fqdn %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.{{ settings.fqdn }}</code>{% else %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.yourdomain.com</code>{% endif %}</li>
+            <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> (the full suffixed name from Step 1) and the password you set in Step 1</li>
+            <li style="margin-bottom:5px">Upload <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> from Step 2 and enter the certificate password shown there</li>
+            <li>CloudTAK will save and reload to the login page — sign in with your <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> credentials</li>
+          </ol>
+        </div>
+
+      </div>
+
+      <p style="margin:16px 0 0;font-size:12px;color:var(--text-dim);border-top:1px solid var(--border);padding-top:12px">
+        This is a one-time bootstrap to connect CloudTAK to TAK Server. After setup, additional users just create a TAK Portal account and log into CloudTAK with their username and password — no .p12 required.
+      </p>
+    </div>
+  </details>
+  {% endif %}
+
+  {% if container_info.get('containers') %}
+  <div class="card">
+    <div class="card-title">Services</div>
+    <div class="svc-grid">
+      {% for c in container_info.containers %}
+      <div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'Up' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div></div>
+      {% endfor %}
+      <div class="svc-card" onclick="filterLogs('')" style="cursor:pointer" id="svc-all"><div class="svc-name">all containers</div><div class="svc-status" style="color:var(--text-dim)">● combined</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
+    <div class="log-box" id="container-logs">Loading...</div>
+  </div>
+  {% endif %}
+
+  <!-- Plugins -->
+  {% if cloudtak_cfg.get('target_mode') == 'remote' %}
+  <div class="card" style="background:rgba(59,130,246,.04);border-color:rgba(59,130,246,.2)">
+    <div class="card-title">Plugins</div>
+    <p style="font-size:13px;color:var(--text-dim)">Plugin management is not available for remote CloudTAK installations. Manage plugins directly on the remote host via SSH using the <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="color:var(--cyan)">upstream plugin docs</a>.</p>
+  </div>
+  {% elif cloudtak_plugins is defined %}
+  <div class="card" id="ct-plugins-section">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Plugins</span>
+      <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">upstream docs ↗</a>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
+      Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
+      After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong> to activate the new service worker. The plugin then appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
+      <span style="color:var(--text-dim)">(A refresh — even Cmd/Ctrl+Shift+R — does not help; CloudTAK's service worker serves a cached copy. If Settings → Refresh App doesn't update it, clear it: DevTools → Application → Clear site data, then reload.)</span>
+    </p>
+    <div id="ct-plugin-cards" style="display:grid;grid-template-columns:1fr;gap:12px">
+      {% for p in cloudtak_plugins %}
+      <div style="background:var(--bg-surface);border:1px solid {% if p.installed %}rgba(16,185,129,.35){% else %}var(--border){% endif %};border-radius:10px;padding:16px 20px" id="ct-plugin-card-{{ p.key }}">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px">{{ p.name }}</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;line-height:1.5">{{ p.description }}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">author: {{ p.author }}</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">{{ p.license }}</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">requires {{ p.requires }}</span>
+            </div>
+            {% if p.repo %}<a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>{% elif p.local %}<span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">local dev (dev branch only)</span>{% endif %}
+            {% if p.installed and p.sha %}
+            <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.sha }}{% if p.channel == 'dev' %} <span style="color:#eab308;border:1px solid rgba(234,179,8,.4);border-radius:4px;padding:0 5px;margin-left:6px;font-size:10px;font-weight:600" title="This box tracks the plugin's dev branch (dev update channel)">dev</span>{% endif %}{% if p.update_available %} <span style="color:var(--cyan);margin-left:6px">update available</span>{% endif %}</div>
+            {% endif %}
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex-shrink:0">
+            {% if p.installed %}
+            <span style="font-size:11px;font-weight:600;color:var(--green);background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:5px;padding:3px 9px">INSTALLED</span>
+            <button class="btn btn-ghost" id="ct-plugin-update-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px;{% if p.update_available %}border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan);{% endif %}" onclick="ctPluginAction('{{ p.key }}','update')">⬆ Update{% if p.update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button>
+            <button class="btn" id="ct-plugin-remove-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px;background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)" onclick="ctPluginAction('{{ p.key }}','remove')">Remove</button>
+            {% else %}
+            <span style="font-size:11px;font-weight:600;color:var(--text-dim);background:var(--bg-card);border:1px solid var(--border);border-radius:5px;padding:3px 9px">NOT INSTALLED</span>
+            <button class="btn btn-primary" id="ct-plugin-install-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px" onclick="ctPluginAction('{{ p.key }}','install')">Install</button>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Plugin action log (hidden until an action starts) -->
+    <div id="ct-plugin-log-card" style="display:none;margin-top:20px">
+      <div class="section-title" style="margin-bottom:10px;display:flex;align-items:center;gap:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span><button class="btn btn-ghost" style="margin-left:auto;font-size:11px;padding:4px 10px;text-transform:none;letter-spacing:0" onclick="ctCopyPluginLog(this)">⧉ Copy</button></div>
+      <div class="log-box" id="ct-plugin-log">Waiting...</div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% else %}
+  <!-- Deployment Target -->
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="cloudtakToggleSection('cloudtak-target')">
+      <span class="section-title" style="margin-bottom:0">Deployment Target</span>
+      <span id="cloudtak-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
+    </div>
+  <div id="cloudtak-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+    <div class="form-group">
+      <label class="form-label">Where should CloudTAK run?</label>
+      <select id="cloudtak-target-mode" class="form-input">
+        <option value="local" {% if cloudtak_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
+        <option value="remote" {% if cloudtak_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (SSH)</option>
+      </select>
+    </div>
+    <div id="cloudtak-remote-fields" style="display:{% if cloudtak_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">Remote Host/IP</label>
+          <input id="cloudtak-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ cloudtak_cfg.remote.host or '' }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">SSH Port</label>
+          <input id="cloudtak-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ cloudtak_cfg.remote.port or 22 }}">
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">SSH Username</label>
+          <input id="cloudtak-remote-user" class="form-input" type="text" placeholder="root" value="{{ cloudtak_cfg.remote.username or 'root' }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">SSH Key Path</label>
+          <input id="cloudtak-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-cloudtak" value="{{ cloudtak_cfg.remote.ssh_key_path or '' }}">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">One-time remote password (for key copy only)</label>
+        <input id="cloudtak-remote-password" class="form-input" type="password" placeholder="Used only for Install SSH Key">
+        <div class="form-hint">Password is never stored. It is used only for one-time <code>ssh-copy-id</code>.</div>
+      </div>
+      <div class="controls" style="margin-top:8px">
+        <button class="btn btn-ghost" type="button" onclick="ensureCloudtakSshKey()">Generate SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="installCloudtakSshKey()">Install SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="testCloudtakRemoteSsh()">Test SSH</button>
+      </div>
+      <div id="cloudtak-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+      <div class="form-group" style="margin-top:12px">
+        <label class="form-label">Public key (manual copy fallback)</label>
+        <textarea id="cloudtak-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key"></textarea>
+      </div>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-ghost" type="button" onclick="saveCloudtakTarget()">Save target settings</button>
+      <span id="cloudtak-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+  </div>
+  </div>
+  <!-- Deploy form -->
+  <div class="card">
+    <div class="card-title">Deploy CloudTAK</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
+      CloudTAK is a browser-based TAK client built by the Colorado DFPC Center of Excellence.
+      It connects to your TAK Server and provides a full map interface in any web browser.
+      Video streams from your standalone MediaMTX install will be used automatically.
+    </p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:20px">
+      First deploy builds Docker images and can take 10–15 minutes. Keep the tab open; if the log stops updating, refresh the page to reconnect.
+    </p>
+
+    {% if not settings.fqdn %}
+    <div style="background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:12px;color:var(--yellow)">
+      ⚠ No domain configured. Deploy Caddy SSL first for HTTPS access.
+    </div>
+    {% endif %}
+
+    <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()">🚀 Deploy CloudTAK</button>
+    {% if not settings.fqdn %}
+    <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:8px;padding:12px 16px;margin-top:16px;font-size:12px;color:#f87171">
+      🔒 <strong>SSL Required</strong> — CloudTAK requires a domain with SSL configured.<br>
+      <span style="color:var(--text-dim)">Go to <a href="/caddy" style="color:var(--cyan)">Caddy SSL</a> and configure your domain first.</span>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- Deploy log (single card: shown when deploying or after error) -->
+  <div id="log-card" class="card" style="display:{% if deploying or deploy_error %}block{% else %}none{% endif %}">
+    <div class="card-title">Deploy Log</div>
+    {% if deploy_error %}
+    <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick="document.getElementById('uninstall-modal').classList.add('open')" style="margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer">&#x1F5D1; Remove failed install</button></div>
+    {% endif %}
+    <div class="log-box" id="deploy-log-dyn">{% if deploy_error %}Deployment failed. See log above.{% else %}Waiting...{% endif %}</div>
+  </div>
+  {% if deploy_error %}
+  <script>(function(){ var btn = document.getElementById("deploy-btn"); if(btn){ btn.disabled = false; btn.textContent = "✗ Deployment failed — Retry"; btn.style.background = "var(--red)"; btn.style.opacity = "1"; btn.onclick = function(){ btn.textContent = "🚀 Deploy CloudTAK"; btn.style.background = ""; startDeploy(); }; } })();</script>
+  {% endif %}
+</div>
+
+<!-- Uninstall modal -->
+<div class="modal-overlay" id="ct-reset-modal">
+  <div class="modal">
+    <h3>🔑 Reset CloudTAK Server Config?</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">This clears the stored TAK Server connection (URL, cert, and admin account) from CloudTAK's database so you can re-run the bootstrap wizard with new TAK Server details.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Your map data and tile layers remain intact. Only the TAK Server connection is cleared.</p>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ghost" onclick="document.getElementById('ct-reset-modal').classList.remove('open')">Cancel</button>
+      <button class="btn" id="ct-reset-confirm-btn" onclick="doCloudtakResetConfig()" style="background:linear-gradient(135deg,#92400e,#b45309);color:#fff;border:none">Reset Config</button>
+    </div>
+    <div id="ct-reset-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="uninstall-modal">
+  <div class="modal">
+    <h3>&#x26a0; Uninstall CloudTAK?</h3>
+    <p>This will stop and remove all CloudTAK Docker containers, volumes, and the ~/CloudTAK directory. This cannot be undone.</p>
+    <div class="form-group">
+      <label class="form-label">Admin Password</label>
+      <input class="form-input" id="uninstall-password" type="password" placeholder="Confirm your password">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="uninstall-cancel-btn" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button>
+      <button class="btn btn-danger" id="uninstall-confirm-btn" onclick="doUninstall()">Uninstall</button>
+    </div>
+    <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+    <div id="uninstall-progress" class="uninstall-progress-row" style="margin-top:8px;font-size:13px;color:var(--text-secondary);min-height:24px" aria-live="polite"></div>
+  </div>
+</div>
+
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
+<script src="/cloudtak/page.js"></script>
+<script>
+(function(){
+  var deploying = document.body.getAttribute('data-deploying') === 'true';
+  if (deploying) { document.addEventListener('DOMContentLoaded', function() { window.logIndex = 0; if (window.pollLog) window.pollLog(null); }); }
+})();
+</script>
+</body></html>

@@ -414,12 +414,14 @@ install_dependencies() {
         exit 1
     fi
 
-    # pyyaml: the module compose patchers use it for ROBUST, IDEMPOTENT YAML edits.
-    # Without it they fall back to a legacy text patcher that double-appends keys on
+    # All Python deps are pinned in requirements.txt (fleet-uniform rule: every box
+    # gets the exact same versions regardless of install date). Notable entries:
+    # pyyaml — the module compose patchers use it for ROBUST, IDEMPOTENT YAML edits;
+    # without it they fall back to a legacy text patcher that double-appends keys on
     # re-deploy (duplicate `healthcheck` -> "mapping key already defined" parse error).
-    # pystun3: Connectivity Wizard (v10.1.0) NAT/public-IP detection. Pinned — pure-python,
-    # vetted at 2.0.0; bump deliberately, not by re-running start.sh.
-    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn pyyaml pystun3==2.0.0 2>"$apt_log"; then
+    # pystun3 — Connectivity Wizard (v10.1.0) NAT/public-IP detection, pure-python.
+    # Bump pins deliberately in requirements.txt, not by re-running start.sh.
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt" 2>"$apt_log"; then
         echo -e "${RED}  pip install failed:${NC}"
         tail -20 "$apt_log"
         rm -f "$apt_log"

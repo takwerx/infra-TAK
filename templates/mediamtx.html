@@ -1,0 +1,457 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>MediaMTX — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03);border-left-color:var(--border-hover)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}
+.page-header h1{font-size:22px;font-weight:700}
+.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px;font-weight:500}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
+.info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:360px;overflow-y:auto;line-height:1.7;white-space:pre-wrap}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .15s}
+.form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.proto-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:4px}
+.proto-item{background:#0a0e1a;border-radius:8px;padding:10px 12px;text-align:center}
+.proto-name{font-size:11px;font-weight:700;color:var(--cyan);margin-bottom:2px}
+.proto-port{font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+.uninstall-progress-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1 style="display:flex;align-items:flex-end;gap:0"><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;margin-right:8px">{% if mediamtx_version or editor_version %}<span style="font-weight:500;color:var(--text-dim);font-size:16px;line-height:1">· MediaMTX v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px;line-height:1">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px;line-height:1">editor v{{ editor_latest }} available</span>{% endif %}</h1>
+    <p>Video Streaming Server (bluenviron) + Web Editor (takwerx)</p>
+  </div>
+
+  {% if mtx.running %}
+  <div class="status-banner running"><div class="dot"></div>MediaMTX is running{% if mediamtx_version %} · MediaMTX v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
+  {% elif mtx.installed %}
+  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped{% if mediamtx_version %} · MediaMTX v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
+  {% else %}
+  <div class="status-banner not-installed"><div class="dot"></div>MediaMTX is not installed</div>
+  {% endif %}
+
+  {% if mtx.installed %}
+
+  <div class="section-title" style="margin-top:20px">Controls</div>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+  <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Patch web editor if stream URL won't load after an update">🔧 Patch web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Patch web editor if stream URL won&#39;t load after an update">🔧 Patch web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  </div>
+  <p style="margin-top:10px;font-size:12px;color:var(--text-dim)">If the <strong>Web Console</strong> link below won’t load (e.g. after an editor update), click <strong>Patch web editor</strong> to patch and restart the stream config UI.</p>
+  <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+
+  <!-- Access info -->
+  <div class="card">
+    <div class="card-title">Access</div>
+    <div class="info-grid">
+      {% if mediamtx_deploy_cfg.target_mode == 'remote' and mediamtx_deploy_cfg.remote.host %}
+      <div class="info-item"><div class="info-label">Remote host</div><div class="info-value" style="color:var(--cyan);font-family:'JetBrains Mono',monospace">{{ mediamtx_deploy_cfg.remote.host }}</div></div>
+      {% endif %}
+      {% if settings.fqdn %}
+      <div class="info-item"><div class="info-label">Web Console</div><div class="info-value"><a href="https://stream.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">https://stream.{{ settings.fqdn }}</a> <span style="color:var(--text-dim);font-size:11px">↗</span></div></div>
+      {% else %}
+      <div class="info-item"><div class="info-label">Web Console</div><div class="info-value"><a href="http://{{ settings.server_ip }}:5080" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">http://{{ settings.server_ip }}:5080</a> <span style="color:var(--text-dim);font-size:11px">↗</span></div></div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Container logs -->
+  <div class="card" id="logs-card" style="display:none">
+    <div class="card-title" id="logs-card-title">Service Logs</div>
+    <div class="log-box" id="service-logs">Loading...</div>
+  </div>
+
+  {% else %}
+  <!-- Deployment Target -->
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="mediamtxToggleSection('mediamtx-target')">
+      <span class="section-title" style="margin-bottom:0">Deployment Target</span>
+      <span id="mediamtx-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
+    </div>
+    <div id="mediamtx-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+      <div class="form-group">
+        <label class="form-label">Where should MediaMTX run?</label>
+        <select id="mediamtx-target-mode" class="form-input">
+          <option value="local" {% if mediamtx_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
+          <option value="remote" {% if mediamtx_deploy_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (SSH)</option>
+        </select>
+      </div>
+      <div id="mediamtx-remote-fields" style="display:{% if mediamtx_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+        <div class="grid-2">
+          <div class="form-group">
+            <label class="form-label">Remote Host/IP</label>
+            <input id="mediamtx-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ mediamtx_deploy_cfg.remote.host or '' }}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">SSH Port</label>
+            <input id="mediamtx-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ mediamtx_deploy_cfg.remote.port or 22 }}">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="form-group">
+            <label class="form-label">SSH Username</label>
+            <input id="mediamtx-remote-user" class="form-input" type="text" placeholder="root" value="{{ mediamtx_deploy_cfg.remote.username or 'root' }}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">SSH Key Path</label>
+            <input id="mediamtx-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-mediamtx" value="{{ mediamtx_deploy_cfg.remote.ssh_key_path or '' }}">
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">One-time remote password (for key copy only)</label>
+          <input id="mediamtx-remote-password" class="form-input" type="password" placeholder="Used only for Install SSH Key">
+          <div class="form-hint">Password is never stored. It is used only for one-time <code>ssh-copy-id</code>.</div>
+        </div>
+        <div class="controls" style="margin-top:8px">
+          <button class="btn btn-ghost" type="button" onclick="ensureMediamtxSshKey()">Generate SSH key</button>
+          <button class="btn btn-ghost" type="button" onclick="installMediamtxSshKey()">Install SSH key</button>
+          <button class="btn btn-ghost" type="button" onclick="testMediamtxRemoteSsh()">Test SSH</button>
+        </div>
+        <div id="mediamtx-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+        <div class="form-group" style="margin-top:12px">
+          <label class="form-label">Public key (manual copy fallback)</label>
+          <textarea id="mediamtx-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key"></textarea>
+        </div>
+      </div>
+      <div class="controls" style="margin-top:10px">
+        <button class="btn btn-ghost" type="button" onclick="saveMediamtxTarget()">Save target settings</button>
+        <span id="mediamtx-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Deploy -->
+  <div class="card">
+    <div class="card-title">Deploy MediaMTX</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
+      Installs MediaMTX streaming server with FFmpeg for drone video (MPEG-TS to RTSP to HLS),
+      the web configuration editor, and wires SSL certificates from Caddy automatically.
+    </p>
+    {% if settings.fqdn %}
+    <div style="background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.15);border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:12px;color:var(--text-secondary)">
+      Caddy domain detected — <span style="color:var(--green)">SSL will be configured automatically</span><br>
+      Web editor will be available at <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">https://stream.{{ settings.fqdn }}</span>
+    </div>
+    {% endif %}
+    <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()"{% if mediamtx_update_available %} style="border:1px solid var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>{% if mediamtx_update_available %}⬆ Update MediaMTX{% if mediamtx_latest %} <span style="color:var(--cyan)" title="Update available: v{{ mediamtx_latest }}">●</span>{% endif %}{% else %}🚀 Deploy MediaMTX{% endif %}</button>
+  </div>
+  {% endif %}
+
+  <!-- Deploy log -->
+  <div class="card" id="log-card" style="display:{% if deploying or deploy_done %}block{% else %}none{% endif %}">
+    <div class="card-title">Deploy Log</div>
+    <div class="log-box" id="deploy-log">{% if deploying %}Starting...{% elif deploy_done %}Deploy complete.{% endif %}</div>
+  </div>
+</div>
+
+<!-- Uninstall modal -->
+<div class="modal-overlay" id="uninstall-modal">
+  <div class="modal">
+    <h3>⚠ Uninstall MediaMTX?</h3>
+    <p>This will stop and remove MediaMTX, the web editor, all systemd services, and the binary. Config and recordings will be removed.</p>
+    <div class="form-group" style="margin-bottom:16px">
+      <label class="form-label">Admin Password</label>
+      <input class="form-input" id="uninstall-password" type="password" placeholder="Confirm your password">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="uninstall-cancel-btn" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button>
+      <button class="btn btn-danger" id="uninstall-confirm-btn" onclick="doUninstall()">Uninstall</button>
+    </div>
+    <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+    <div id="uninstall-progress" class="uninstall-progress-row" style="display:none" aria-live="polite"></div>
+  </div>
+</div>
+
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('service-logs');</script>
+<script>
+let logIndex = 0;
+let logInterval = null;
+
+function collectMediamtxDeployConfig() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  var mode = modeEl ? modeEl.value : 'local';
+  var cfg = { target_mode: mode };
+  if (mode === 'remote') {
+    var host = (document.getElementById('mediamtx-remote-host') || {}).value || '';
+    var user = (document.getElementById('mediamtx-remote-user') || {}).value || 'root';
+    var key = (document.getElementById('mediamtx-remote-key') || {}).value || '';
+    var portVal = (document.getElementById('mediamtx-remote-port') || {}).value || '22';
+    var p = parseInt(portVal, 10);
+    cfg.remote = { host: host.trim(), ssh_user: (user || 'root').trim(), ssh_port: isNaN(p) ? 22 : p, ssh_key_path: key.trim() };
+  }
+  return cfg;
+}
+function toggleMediamtxTargetFields() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  var remoteBox = document.getElementById('mediamtx-remote-fields');
+  if (modeEl && remoteBox) remoteBox.style.display = modeEl.value === 'remote' ? 'block' : 'none';
+}
+function mediamtxToggleSection(id) {
+  var body = document.getElementById(id + '-body');
+  var icon = document.getElementById(id + '-toggle-icon');
+  if (!body) return;
+  var show = body.style.display === 'none';
+  body.style.display = show ? 'block' : 'none';
+  if (icon) icon.style.transform = show ? 'rotate(180deg)' : '';
+}
+function saveMediamtxTarget() {
+  var msg = document.getElementById('mediamtx-target-save-msg');
+  if (msg) msg.textContent = 'Saving...';
+  fetch('/api/mediamtx/deployment-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && (d.target_mode !== undefined || d.remote)) { if (msg) msg.textContent = 'Saved'; setTimeout(function() { if (msg) msg.textContent = ''; }, 1600); }
+      else if (msg) msg.textContent = (d && d.error) ? d.error : 'Save failed';
+    }).catch(function(e) { if (msg) msg.textContent = 'Save failed: ' + (e && e.message ? e.message : String(e)); });
+}
+function _mediamtxSshStatus(msg, isError, isSuccess) {
+  var el = document.getElementById('mediamtx-ssh-status');
+  if (el) { el.style.color = isError ? 'var(--red)' : isSuccess ? 'var(--green)' : 'var(--text-dim)'; el.textContent = msg || ''; }
+}
+function ensureMediamtxSshKey() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleMediamtxTargetFields(); }
+  _mediamtxSshStatus('Generating SSH key...', false);
+  fetch('/api/mediamtx/remote/ensure-ssh-key', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (!d || !d.success) { _mediamtxSshStatus((d && d.error) ? d.error : 'Key generation failed', true); return; }
+      var keyEl = document.getElementById('mediamtx-remote-key'); if (d.key_path && keyEl) keyEl.value = d.key_path;
+      var pk = document.getElementById('mediamtx-public-key'); if (pk) pk.value = d.public_key || '';
+      _mediamtxSshStatus('✓ ' + (d.message || 'SSH key ready') + (d.fingerprint ? ' | ' + d.fingerprint : ''), false, true);
+    }).catch(function(e) { _mediamtxSshStatus('Key generation failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+function installMediamtxSshKey() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleMediamtxTargetFields(); }
+  var pw = (document.getElementById('mediamtx-remote-password') || {}).value || '';
+  if (!pw) { _mediamtxSshStatus('Enter password for ssh-copy-id', true); return; }
+  _mediamtxSshStatus('Installing key...', false);
+  fetch('/api/mediamtx/remote/install-ssh-key', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password: pw, config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && d.success) { _mediamtxSshStatus('✓ SSH key installed', false, true); }
+      else { _mediamtxSshStatus((d && d.error) ? d.error : 'Install failed', true); }
+    }).catch(function(e) { _mediamtxSshStatus('Install failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+function testMediamtxRemoteSsh() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleMediamtxTargetFields(); }
+  _mediamtxSshStatus('Testing SSH...', false);
+  fetch('/api/mediamtx/remote/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && d.success) { _mediamtxSshStatus('✓ Test passed', false, true); }
+      else { _mediamtxSshStatus((d && d.error) ? d.error : (d && d.output) || 'Test failed', true); }
+    }).catch(function(e) { _mediamtxSshStatus('Test failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+document.addEventListener('DOMContentLoaded', function() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl) modeEl.addEventListener('change', toggleMediamtxTargetFields);
+});
+
+function startDeploy() {
+  document.getElementById('deploy-btn').disabled = true;
+  document.getElementById('log-card').style.display = 'block';
+  document.getElementById('deploy-log').textContent = 'Starting deployment...';
+  logIndex = 0;
+  var config = typeof collectMediamtxDeployConfig === 'function' ? collectMediamtxDeployConfig() : {};
+  fetch('/api/mediamtx/deploy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ config: config })})
+    .then(r => r.json()).then(d => {
+      if (d.error) {
+        var lg = document.getElementById('log-card');
+        var dyn = document.getElementById('deploy-log');
+        if (dyn) dyn.textContent = 'Error: ' + d.error;
+        if (lg && !document.getElementById('deploy-fail-banner')) {
+          var banner = document.createElement('div');
+          banner.id = 'deploy-fail-banner';
+          banner.style.cssText = 'background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';
+          banner.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);
+          lg.insertBefore(banner, lg.querySelector('.log-box') || lg.firstChild);
+        }
+        var btn = document.getElementById('deploy-btn');
+        if (btn) { btn.disabled = false; btn.textContent = '✗ Deployment failed — Retry'; btn.style.background = 'var(--red)'; btn.style.opacity = '1'; btn.onclick = function() { btn.textContent = '🚀 Deploy MediaMTX'; btn.style.background = ''; startDeploy(); }; }
+      } else {
+        pollLog();
+      }
+    });
+}
+
+function pollLog() {
+  logInterval = setInterval(() => {
+    fetch('/api/mediamtx/deploy/log?index=' + logIndex)
+      .then(r => r.json()).then(d => {
+        if (d.entries && d.entries.length) {
+          const box = document.getElementById('deploy-log');
+          if (logIndex === 0) box.textContent = '';
+          box.textContent += d.entries.join(String.fromCharCode(10)) + String.fromCharCode(10);
+          box.scrollTop = box.scrollHeight;
+          logIndex += d.entries.length;
+        }
+        if (!d.running) {
+          clearInterval(logInterval);
+          if (d.complete) {
+            var btn = document.getElementById('deploy-btn');
+            if (btn) { btn.textContent = '✓ Deployment Complete'; btn.style.background = 'var(--green)'; btn.style.opacity = '1'; btn.style.cursor = 'default'; }
+            var box = document.getElementById('deploy-log');
+            var refreshBtn = document.createElement('button');
+            refreshBtn.textContent = '↻ Refresh Page';
+            refreshBtn.style.cssText = 'display:block;width:100%;padding:12px;margin-top:16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;';
+            refreshBtn.onclick = function() { window.location.href = '/mediamtx'; };
+            box.appendChild(refreshBtn);
+            box.scrollTop = box.scrollHeight;
+          } else if (d.error) {
+            var logCard = document.getElementById('log-card');
+            if (logCard && !document.getElementById('deploy-fail-banner')) {
+              var banner = document.createElement('div');
+              banner.id = 'deploy-fail-banner';
+              banner.style.cssText = 'background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';
+              banner.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);
+              logCard.insertBefore(banner, logCard.querySelector('.log-box') || logCard.firstChild);
+            }
+            var btn = document.getElementById('deploy-btn');
+            if (btn) { btn.textContent = '✗ Deployment failed — Retry'; btn.style.background = 'var(--red)'; btn.style.opacity = '1'; btn.disabled = false; btn.onclick = function() { btn.textContent = '🚀 Deploy MediaMTX'; btn.style.background = ''; startDeploy(); }; }
+          }
+        }
+      });
+  }, 800);
+}
+
+function control(action) {
+  document.getElementById('control-status').textContent = action + '...';
+  fetch('/api/mediamtx/control', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action})
+  }).then(r => r.json()).then(d => {
+    document.getElementById('control-status').textContent = d.running ? '✓ Running' : '○ Stopped';
+    setTimeout(() => document.getElementById('control-status').textContent = '', 3000);
+  });
+}
+
+function loadLogs(unit) {
+  unit = unit || 'mediamtx';
+  const card = document.getElementById('logs-card');
+  const titleEl = document.getElementById('logs-card-title');
+  card.style.display = 'block';
+  if (titleEl) titleEl.textContent = unit === 'mediamtx-webeditor' ? 'Web editor logs' : 'Service logs';
+  document.getElementById('service-logs').textContent = 'Loading...';
+  fetch('/api/mediamtx/logs?lines=80&unit=' + encodeURIComponent(unit)).then(r => r.json()).then(d => {
+    document.getElementById('service-logs').textContent = d.entries.join(String.fromCharCode(10)) || '(no output)';
+  });
+}
+
+function runRecovery() {
+  const statusEl = document.getElementById('control-status');
+  const btn = document.getElementById('recovery-btn');
+  if (btn) btn.disabled = true;
+  statusEl.textContent = 'Patching web editor…';
+  fetch('/api/mediamtx/recovery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.success) {
+        statusEl.textContent = (d.message || '✓ Patched. Web editor restarted.');
+        statusEl.style.color = 'var(--green)';
+      } else {
+        statusEl.textContent = d.error || 'Patch failed';
+        statusEl.style.color = 'var(--red)';
+      }
+      setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 6000);
+    })
+    .catch(e => {
+      statusEl.textContent = e.message || 'Request failed';
+      statusEl.style.color = 'var(--red)';
+      setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 5000);
+    })
+    .finally(() => { if (btn) btn.disabled = false; });
+}
+
+function doUninstall() {
+  const password = document.getElementById('uninstall-password').value;
+  const msgEl = document.getElementById('uninstall-msg');
+  const progressEl = document.getElementById('uninstall-progress');
+  const cancelBtn = document.getElementById('uninstall-cancel-btn');
+  const confirmBtn = document.getElementById('uninstall-confirm-btn');
+  msgEl.textContent = '';
+  progressEl.style.display = 'flex';
+  progressEl.innerHTML = '<span class="uninstall-spinner"></span><span>Uninstalling…</span>';
+  confirmBtn.disabled = true;
+  cancelBtn.disabled = true;
+  fetch('/api/mediamtx/uninstall', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({password})
+  }).then(r => r.json()).then(d => {
+    if (d.error) {
+      msgEl.textContent = d.error;
+      progressEl.style.display = 'none';
+      progressEl.innerHTML = '';
+      confirmBtn.disabled = false;
+      cancelBtn.disabled = false;
+      return;
+    }
+    progressEl.innerHTML = '<span class="uninstall-spinner"></span><span>Done. Reloading…</span>';
+    setTimeout(() => location.reload(), 800);
+  }).catch(err => {
+    msgEl.textContent = 'Request failed: ' + (err.message || 'network error');
+    progressEl.style.display = 'none';
+    progressEl.innerHTML = '';
+    confirmBtn.disabled = false;
+    cancelBtn.disabled = false;
+  });
+}
+
+{% if deploying %}
+document.addEventListener('DOMContentLoaded', () => { logIndex = 0; pollLog(); });
+{% elif deploy_done %}
+document.addEventListener('DOMContentLoaded', () => { logIndex = 0; pollLog(); });
+{% endif %}
+</script>
+</body></html>

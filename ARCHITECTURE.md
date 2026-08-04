@@ -101,8 +101,10 @@ detection, update, and rebuild are handled generically by the console.
 The decomposition is planned and sequenced (registry-first, then files —
 splitting duplicated code just multiplies it):
 
-1. **Templates out of app.py** — the ~24 inline HTML pages (roughly half the
-   file) move to a real `templates/` tree with shared base styling.
+1. **Templates out of app.py** — ✅ done in v10.1.19: the 25 inline HTML pages
+   moved byte-identically to `templates/*.html` (rendered via `render_template`).
+   Shared base styling (`base.html`/Jinja inheritance) is the follow-up, kept
+   separate because it changes rendered bytes.
 2. **A module registry** — the per-module deploy/status/control/uninstall
    plumbing (today hand-written per module) collapses into one generic engine
    driven by a declarative registry, the same pattern `CLOUDTAK_PLUGINS`

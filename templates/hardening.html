@@ -1,0 +1,299 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Cyber Controls — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow:visible;line-height:1.35}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;text-decoration:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.ctl-row{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;border:1px solid var(--border);background:var(--bg-deep);border-radius:8px;margin-bottom:8px}
+.ctl-health{width:9px;height:9px;border-radius:50%;flex-shrink:0;margin-top:5px;background:var(--text-dim)}
+.ctl-health.pass{background:var(--green);box-shadow:0 0 5px var(--green)}
+.ctl-health.off{background:var(--text-dim)}
+.ctl-body{flex:1}.ctl-title{font-weight:600;font-size:13px}.ctl-desc{color:var(--text-secondary);font-size:12px;line-height:1.5;margin-top:3px}
+.ctl-detail{color:var(--text-dim);font-size:11px;font-family:'JetBrains Mono',monospace;margin-top:4px}
+.bg-ok{color:var(--green);font-weight:600}.bg-bad{color:var(--red);font-weight:600}
+.hist-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:3px 0}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon material-symbols-outlined" style="font-size:24px">shield_toggle</span><span>Cyber Controls</span></h1>
+  <p>Flip this assembled stack from the default <strong>Standard</strong> posture into <strong>Hardened</strong> — eliminating the on-sight disqualifiers a security reviewer fails a system for, then self-documenting what it did. Reversible, idempotent, with an on-box break-glass recovery path.</p></div>
+
+  <div class="card">
+    <div class="card-title">Console Security Guard</div>
+    <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A built-in security <strong>guard</strong> sits between the web console and the system &mdash; the console can't make powerful changes (installs, restarts, config edits) except through the guard, and every action is recorded. Press <strong>Run self-test</strong> to check it's working.</p>
+    <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="broker-test-btn" class="btn btn-ghost" onclick="runBrokerSelftest()"><span class="material-symbols-outlined" style="font-size:18px">fact_check</span>Run self-test</button>
+      <button id="broker-toggle-btn" class="btn btn-ghost" onclick="toggleBrokerRouting()"><span class="material-symbols-outlined" style="font-size:18px">shield</span>Turn on guard</button>
+      <button id="broker-migrate-btn" class="btn btn-primary" style="display:none" onclick="migrateNonroot()"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Switch to non-root</button>
+      <span id="broker-msg" style="font-size:12px;margin-left:6px"></span>
+    </div>
+    <div id="broker-selftest" class="ctl-detail" style="margin-top:12px"></div>
+    <p style="font-size:11px;color:var(--text-dim);margin-top:10px">Everything the guard does is recorded here: <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">/var/log/takwerx-broker/audit.log</code></p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Posture</div>
+    <div id="posture-banner" class="status-banner stopped" style="display:inline-flex;margin-bottom:14px"><div class="dot"></div><span id="posture-text">Loading…</span></div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="apply-btn" class="btn btn-primary" onclick="doApply()"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture</button>
+      <button id="revert-btn" class="btn btn-ghost" onclick="doRevert()"><span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard</button>
+      <a class="btn btn-ghost" href="/api/hardening/report" target="_blank"><span class="material-symbols-outlined" style="font-size:18px">description</span>Readiness Report</a>
+      <span id="action-msg" style="font-size:12px;margin-left:6px"></span>
+    </div>
+    <div id="action-log" class="ctl-detail" style="margin-top:12px;white-space:pre-wrap"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Posture controls</div>
+    <div id="controls">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Boundary assertions (W4) — read-only</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Host firewall, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
+    <div id="assertions">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Break-glass recovery (W6)</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6">If SSO/Authentik is ever down, console access is recovered from an <strong>on-box shell</strong> with <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code> — an access-controlled, auditable path, <strong>not</strong> a network backdoor. Hardening can never permanently lock you out.</p>
+    <p id="breakglass-status" style="margin-top:10px;font-size:12px;font-family:'JetBrains Mono',monospace"></p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Recent activity</div>
+    <div id="history" style="font-size:12px;color:var(--text-dim)">—</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Audit log (W3) — local, who/what/when</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Newest first. Off-box immutable shipping with &ge;365-day retention lands in .56; this is the local record.</p>
+    <div id="audit-log" class="log-box" style="background:#070a12;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:300px;overflow:auto;white-space:pre-wrap">Loading…</div>
+  </div>
+</div>
+<script>
+function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function setBusy(b){document.getElementById('apply-btn').disabled=b;document.getElementById('revert-btn').disabled=b;}
+function renderStatus(d){
+  var hardened=(d.posture==='hardened');
+  var banner=document.getElementById('posture-banner');
+  banner.className='status-banner '+(hardened?'running':'stopped');
+  document.getElementById('posture-text').innerHTML='Current posture: <strong>'+(hardened?'HARDENED':'STANDARD')+'</strong>'+(hardened?' — security controls enforced':' — default behavior, nothing enforced');
+  // Posture-aware action buttons: the blue (primary) button is always the move AWAY from current state.
+  var applyBtn=document.getElementById('apply-btn'),revertBtn=document.getElementById('revert-btn');
+  if(hardened){
+    applyBtn.className='btn btn-ghost';applyBtn.disabled=true;
+    applyBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">check</span>Hardened posture active';
+    revertBtn.className='btn btn-primary';revertBtn.disabled=false;
+    revertBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard';
+  }else{
+    applyBtn.className='btn btn-primary';applyBtn.disabled=false;
+    applyBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture';
+    revertBtn.className='btn btn-ghost';revertBtn.disabled=true;
+    revertBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard';
+  }
+  var html='';
+  (d.controls||[]).forEach(function(c){
+    var on=hardened&&c.pass;
+    html+='<div class="ctl-row"><div class="ctl-health '+(on?'pass':'off')+'"></div>'+
+      '<div class="ctl-body"><div class="ctl-title">'+esc(c.title)+'</div>'+
+      '<div class="ctl-desc">'+esc(c.desc||'')+'</div>'+
+      '<div class="ctl-detail">'+(on?'ENFORCED':'not applied')+' — '+esc(c.detail||'')+'</div></div></div>';
+  });
+  document.getElementById('controls').innerHTML=html||'No controls registered yet.';
+  var bg=d.breakglass||{};
+  document.getElementById('breakglass-status').innerHTML=(bg.present?'<span class="bg-ok">&#10003; recovery script present</span>':'<span class="bg-bad">&#10007; recovery script MISSING</span>')+' &middot; '+esc(bg.path||'');
+  var h=(d.history||[]);
+  document.getElementById('history').innerHTML=h.length?h.slice().reverse().map(function(e){return '<div class="hist-line">'+esc(e.ts)+'  '+esc(e.actor)+'  '+esc(e.action)+' -> '+esc(e.result)+'</div>';}).join(''):'No activity yet.';
+}
+function loadStatus(){
+  fetch('/api/hardening/status').then(function(r){return r.json();}).then(renderStatus).catch(function(){document.getElementById('controls').textContent='Failed to load status.';});
+}
+function loadAssertions(){
+  fetch('/api/hardening/assertions').then(function(r){return r.json();}).then(function(d){
+    var map={pass:['pass','&#10003;','var(--green)'],fail:['fail','&#10007;','var(--red)'],warn:['off','&#9888;','var(--yellow)'],na:['off','&#8211;','var(--text-dim)']};
+    var html=(d.assertions||[]).map(function(a){
+      var m=map[a.status]||map.na;
+      return '<div class="ctl-row"><div class="ctl-health '+m[0]+'" style="background:'+m[2]+'"></div>'+
+        '<div class="ctl-body"><div class="ctl-title">'+esc(a.label)+' <span style="color:'+m[2]+';font-family:JetBrains Mono,monospace;font-size:11px">'+a.status.toUpperCase()+'</span></div>'+
+        '<div class="ctl-detail">'+esc(a.detail||'')+'</div></div></div>';
+    }).join('');
+    document.getElementById('assertions').innerHTML=html||'No assertions.';
+  }).catch(function(){document.getElementById('assertions').textContent='Failed to load assertions.';});
+}
+function loadAudit(){
+  fetch('/api/hardening/audit').then(function(r){return r.json();}).then(function(d){
+    var el=document.getElementById('audit-log');
+    var lines=(d.lines||[]);
+    if(!lines.length){el.textContent=d.enabled?'No audit entries yet.':'Audit log inactive (apply Hardened posture to enable).';return;}
+    el.innerHTML=lines.map(function(e){return esc(e.ts)+'  '+esc(e.user)+'  ['+esc(e.ip)+']  '+esc(e.event)+(e.detail?('  '+esc(e.detail)):'');}).join('\n');
+  }).catch(function(){document.getElementById('audit-log').textContent='Failed to load audit log.';});
+}
+function postFlip(url,confirmMsg){
+  if(!confirm(confirmMsg))return;
+  setBusy(true);
+  var msg=document.getElementById('action-msg');msg.textContent='Working…';msg.style.color='var(--text-dim)';
+  document.getElementById('action-log').textContent='';
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json();}).then(function(d){
+    setBusy(false);
+    msg.textContent=d.success?('Done — posture: '+d.posture):('Error: '+(d.error||'failed'));
+    msg.style.color=d.success?'var(--green)':'var(--red)';
+    document.getElementById('action-log').textContent=(d.log||[]).join('\n');
+    loadStatus();loadAssertions();loadAudit();
+  }).catch(function(e){setBusy(false);msg.textContent='Request failed';msg.style.color='var(--red)';});
+}
+function doApply(){postFlip('/api/hardening/apply','Apply HARDENED posture? This enforces the security controls listed above. You can revert at any time, and on-box break-glass recovery always works.');}
+function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture? This relaxes the hardening controls back to default behavior.');}
+
+function badge(on,label){var c=on?'var(--green)':'var(--text-dim)';var m=on?'&#10003;':'&#8211;';return '<span style="color:'+c+';margin-right:14px">'+m+' '+esc(label)+'</span>';}
+function renderBrokerStatus(d){
+  var el=document.getElementById('broker-status');
+  var nonRoot=(d.console_uid!==undefined && d.console_uid!==0);
+  if(!d.installed){el.innerHTML='<span style="color:var(--yellow)">&#9888; Guard not installed yet — restart the console (or re-run <code>sudo ./start.sh</code>).</span>';}
+  else{var on=(d.service_active&&d.socket_present&&d.routing_active);
+    var html=on?'<span style="color:var(--green);font-weight:600;font-size:14px">&#10003; Guard is ON</span>':'<span style="color:var(--yellow);font-weight:600;font-size:14px">&#9888; Guard is OFF</span>';
+    // Honesty banner: the guard is an ENFORCED boundary only when the console is
+    // non-root AND the broker is enforcing. Otherwise it mediates/audits but does
+    // not confine a root console — say so plainly (a reviewer reads this).
+    if(on){
+      // The boundary EXISTS iff the console is non-root (it then cannot make
+      // privileged changes except through the guard). permissive-vs-enforce is an
+      // internal rollout phase, not a deficiency to flag — fresh installs ship
+      // non-root + permissive, which IS the locked-down state. Only a still-root
+      // console (a legacy box that turned the guard on but hasn't migrated) is not
+      // yet a boundary, and that is the one case worth a caution.
+      if(nonRoot){html+='<div style="margin-top:8px;color:var(--green);font-size:12px;line-height:1.5">&#10003; Console runs <strong>unprivileged</strong> and is confined to the guard — it cannot make privileged changes except through it.</div>';}
+      else{html+='<div style="margin-top:8px;color:var(--yellow);font-size:12px;line-height:1.5">&#9888; Console runs as <strong>root</strong> — the guard records changes but cannot block them yet. Fresh installs are non-root automatically; an existing root box is switched with the on-box migration.</div>';}
+      // v10.0.8: enforce state, opt-in flow, and read-only denial counter.
+      var ei=d.enforce_info||{};
+      var rd=d.readiness||{};
+      if(d.enforce===true){
+        var dc=(d.deny_count===null||d.deny_count===undefined)?null:d.deny_count;
+        html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--green)">&#128274; <strong>ENFORCING</strong> — requests outside the rulebook are refused'+(ei.clean_since?(' (clean since '+esc(ei.clean_since)+')'):'')+'.</div>';
+        if(dc!==null){html+='<div style="font-size:12px;line-height:1.5;color:'+(dc>0?'var(--yellow)':'var(--text-dim)')+'">'+(dc>0?('&#9888; '+dc+' request'+(dc===1?'':'s')+' DENIED since the guard last started — check the audit log.'):'0 denials since the guard last started.')+'</div>';}
+      }else if(d.enforce===false){
+        if(rd.opted_in){
+          // enforcement enabled by the operator — will switch on once clean
+          html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--cyan)">Enforcing is <strong>enabled</strong> and will switch on automatically once the guard has 72&nbsp;hours of clean audit'+(rd.reason?(' — '+esc(rd.reason)):'')+'.</div>';
+        }else if(rd.ready){
+          // clean for 72h+ — green light: offer the deliberate flip
+          html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--green)">&#9989; <strong>Ready to enforce.</strong> The guard has been clean for 72&nbsp;hours — nothing legitimate is being flagged, so blocking is safe to turn on.</div>';
+          html+='<button id="broker-enforce-btn" onclick="turnOnEnforcing()" class="btn btn-primary" style="margin-top:8px"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Turn on enforcing</button>';
+        }else{
+          // watching, not yet eligible — show the countdown reason
+          html+='<div style="margin-top:6px;font-size:12px;line-height:1.5;color:var(--text-dim)">Watch mode — recording, blocking nothing. Not yet eligible to enforce'+(rd.reason?(': '+esc(rd.reason)):'')+'. It becomes eligible after 72&nbsp;hours with a clean record.</div>';
+        }
+        html+='<div id="broker-enforce-msg" style="margin-top:6px;font-size:12px"></div>';
+      }
+    }
+    el.innerHTML=html;}
+  var tb=document.getElementById('broker-toggle-btn');
+  // On a NON-ROOT console the broker is the only path to privilege, so routing is mandatory and
+  // can't be toggled (Disable would do nothing). Hide the misleading button; show it only on a
+  // root console, where Enable routing force-routes through the guard to dry-run before going non-root.
+  if(nonRoot){tb.style.display='none';}
+  else if(d.force_enabled){tb.style.display='';tb.className='btn btn-primary';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield_lock</span>Turn off guard';}
+  else{tb.style.display='';tb.className='btn btn-ghost';tb.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">shield</span>Turn on guard';}
+  document.getElementById('broker-test-btn').disabled=!d.socket_present;
+  // "Switch to non-root" — the browser path off root (no CLI). Only on a still-root
+  // console with the guard installed; on non-root boxes it's already done, so hide it.
+  var mb=document.getElementById('broker-migrate-btn');
+  if(mb){mb.style.display=(!nonRoot && d.installed)?'':'none';}
+}
+function loadBroker(){
+  fetch('/api/console/broker/status').then(function(r){return r.json();}).then(renderBrokerStatus)
+    .catch(function(){document.getElementById('broker-status').textContent='Failed to load guard status.';});
+}
+function runBrokerSelftest(){
+  var out=document.getElementById('broker-selftest');
+  if(out.innerHTML.trim()!==''){out.innerHTML='';return;}  // already showing — second press collapses it
+  out.innerHTML='Running self-test…';
+  fetch('/api/console/broker/selftest').then(function(r){return r.json();}).then(function(d){
+    if(d.error){out.innerHTML='<span style="color:var(--red)">'+esc(d.error)+'</span>';return;}
+    var rows=(d.checks||[]).map(function(c){
+      var lvl=c.level||(c.ok?'pass':'fail');
+      var col=lvl==='pass'?'var(--green)':(lvl==='warn'?'var(--yellow)':'var(--red)');
+      var m=lvl==='pass'?'&#10003;':(lvl==='warn'?'&#9888;':'&#10007;');
+      var showDetail=(lvl!=='pass')&&c.detail;
+      return '<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:'+col+'">'+m+' '+esc(c.name)+(showDetail?('  — '+esc(c.detail)):'')+'</div>';
+    }).join('');
+    var ov=d.overall||(d.ok?'pass':'fail');
+    var hdrCol=ov==='pass'?'var(--green)':(ov==='warn'?'var(--yellow)':'var(--red)');
+    var hdrTxt=ov==='pass'?'SELF-TEST PASSED — console confined to the guard':(ov==='warn'?'GUARD ON — but the console runs as root (not yet a boundary)':'SELF-TEST FAILED');
+    out.innerHTML='<div style="margin-bottom:6px;font-weight:600;color:'+hdrCol+'">'+esc(hdrTxt)+'</div>'+rows;
+  }).catch(function(){out.innerHTML='<span style="color:var(--red)">Self-test request failed.</span>';});
+}
+function turnOnEnforcing(){
+  if(!confirm('Turn on ENFORCING for this box?\n\nThe guard will start BLOCKING anything not on its allow-list (not just recording it). This box has been clean for 72 hours, so nothing legitimate should be affected. To turn enforcing back off you would need SSH access to the box (break-glass) — it cannot be undone from here.\n\nProceed?'))return;
+  var m=document.getElementById('broker-enforce-msg');if(m){m.textContent='Enabling enforcement… the guard will restart briefly.';m.style.color='var(--text-dim)';}
+  var b=document.getElementById('broker-enforce-btn');if(b)b.disabled=true;
+  fetch('/api/console/broker/enforce',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(function(r){return r.json();}).then(function(d){
+    if(d.success){if(m){m.textContent=d.message||'Enforcement enabled.';m.style.color='var(--green)';}setTimeout(loadBroker,4000);}
+    else{if(m){m.textContent='Error: '+(d.error||'failed');m.style.color='var(--red)';}if(b)b.disabled=false;}
+  }).catch(function(){if(m){m.textContent='Request failed';m.style.color='var(--red)';}if(b)b.disabled=false;});
+}
+function toggleBrokerRouting(){
+  fetch('/api/console/broker/status').then(function(r){return r.json();}).then(function(s){
+    var enable=!s.force_enabled;
+    var msg=enable?'Turn on the guard? The console will restart (about 15 seconds). It starts in watch mode — the guard records everything but blocks nothing yet, so nothing breaks.':'Turn off the guard and restart the console?';
+    if(!confirm(msg))return;
+    var m=document.getElementById('broker-msg');m.textContent='Applying… console will restart.';m.style.color='var(--text-dim)';
+    document.getElementById('broker-toggle-btn').disabled=true;
+    fetch('/api/console/broker/routing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enable:enable})}).then(function(r){return r.json();}).then(function(d){
+      if(d.success){m.textContent=d.restart_message||'Restarting…';m.style.color='var(--green)';setTimeout(function(){location.reload();},16000);}
+      else{m.textContent='Error: '+(d.error||'failed');m.style.color='var(--red)';document.getElementById('broker-toggle-btn').disabled=false;}
+    }).catch(function(){m.textContent='Request failed';m.style.color='var(--red)';document.getElementById('broker-toggle-btn').disabled=false;});
+  });
+}
+function migrateNonroot(){
+  if(!confirm('Switch the console to a non-root (unprivileged) user now?\n\nThe console restarts as the takwerx user — expect a brief disconnect (about 30-60 seconds). This page reconnects on its own. If the switch fails it rolls back to the current root console, so you are never locked out.'))return;
+  var m=document.getElementById('broker-msg');m.textContent='Starting migration…';m.style.color='var(--text-dim)';
+  var mb=document.getElementById('broker-migrate-btn');if(mb)mb.disabled=true;
+  fetch('/api/console/migrate-nonroot',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){m.textContent='Error: '+(d.error||'failed');m.style.color='var(--red)';if(mb)mb.disabled=false;return;}
+    m.textContent=d.message||'Migrating… reconnecting.';m.style.color='var(--green)';
+    setTimeout(function(){pollMigrate(0);},6000);
+  }).catch(function(){m.textContent='Request failed';m.style.color='var(--red)';if(mb)mb.disabled=false;});
+}
+function pollMigrate(n){
+  // The console restarts mid-migration, so early polls WILL fail (502/timeout) — expected.
+  // Keep trying ~3 min; success == the console answers as non-root. A dropped login
+  // session after the restart surfaces as a non-JSON/redirect → handled by reloading.
+  var m=document.getElementById('broker-msg');
+  if(n>45){m.innerHTML='Migration is taking longer than expected — <a href="javascript:location.reload()" style="color:var(--cyan)">refresh</a> to check, or see /var/log/takwerx-console-nonroot-migrate.log';m.style.color='var(--yellow)';return;}
+  fetch('/api/console/migrate-nonroot/status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(d.nonroot||d.state==='done'){m.textContent='✓ Now running non-root — reloading…';m.style.color='var(--green)';setTimeout(function(){location.reload();},2000);return;}
+    if(d.state==='failed'){m.textContent='Migration failed ('+(d.detail||'unknown')+') — rolled back to the root console.';m.style.color='var(--red)';var fb=document.getElementById('broker-migrate-btn');if(fb)fb.disabled=false;return;}
+    m.textContent='Migrating… (console restarting, '+(n*4)+'s)';m.style.color='var(--text-dim)';
+    setTimeout(function(){pollMigrate(n+1);},4000);
+  }).catch(function(){
+    m.textContent='Reconnecting… (console restarting, '+(n*4)+'s)';m.style.color='var(--text-dim)';
+    setTimeout(function(){pollMigrate(n+1);},4000);
+  });
+}
+loadStatus();loadAssertions();loadAudit();loadBroker();
+</script>
+</body></html>

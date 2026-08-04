@@ -1,0 +1,64 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Certificates — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'DM Sans',sans-serif;background:var(--bg-deep);color:var(--text-primary);min-height:100vh}
+.top-bar{height:3px;background:linear-gradient(90deg,var(--accent),var(--cyan),var(--green))}
+.header{padding:20px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--bg-surface)}
+.header-left{display:flex;align-items:center;gap:16px}.header-icon{font-size:28px}.header-title{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;letter-spacing:-0.5px}.header-subtitle{font-size:13px;color:var(--text-dim)}
+.header-right{display:flex;align-items:center;gap:12px}
+.btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.cert-table{width:100%;border-collapse:collapse}
+.cert-table tr{border-bottom:1px solid var(--border);transition:background 0.15s}
+.cert-table tr:hover{background:rgba(59,130,246,0.05)}
+.cert-table td{padding:12px 8px;font-family:'JetBrains Mono',monospace;font-size:13px}
+.cert-icon{width:30px;text-align:center}
+.cert-name{color:var(--text-secondary)}
+.cert-size{color:var(--text-dim);text-align:right;width:80px}
+.cert-dl{text-align:right;width:40px}
+.cert-dl a{color:var(--accent);text-decoration:none;font-size:14px;padding:4px 8px;border-radius:4px;transition:background 0.15s}
+.cert-dl a:hover{background:rgba(59,130,246,0.1)}
+.info-bar{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:20px}
+.info-bar span{color:var(--cyan)}
+.filter-btns{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}
+.filter-btn{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;transition:all 0.2s}
+.filter-btn:hover,.filter-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(59,130,246,0.05)}
+.footer{text-align:center;padding:24px;font-size:12px;color:var(--text-dim);margin-top:40px}
+</style></head><body>
+<div class="top-bar"></div>
+<header class="header"><div class="header-left"><div class="header-icon">⚡</div><div><div class="header-title">infra-TAK</div><div class="header-subtitle">Certificates</div></div></div><div class="header-right"><a href="/takserver" class="btn-back">← TAK Server</a></div></header>
+<main class="main">
+<div class="section-title">Certificate Files</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px">
+<div class="info-bar">Password: <span>{{ settings.get('tak_cert_password','atakatak') }}</span> &nbsp;&middot;&nbsp; {{ files|length }} files in /opt/tak/certs/files/</div>
+<div class="filter-btns">
+<button class="filter-btn active" onclick="filterCerts('all')">All</button>
+<button class="filter-btn" onclick="filterCerts('p12')">🔑 .p12</button>
+<button class="filter-btn" onclick="filterCerts('pem')">📄 .pem</button>
+<button class="filter-btn" onclick="filterCerts('jks')">☕ .jks</button>
+<button class="filter-btn" onclick="filterCerts('key')">🔐 .key</button>
+<button class="filter-btn" onclick="filterCerts('other')">Other</button>
+</div>
+<table class="cert-table">
+{% for f in files %}
+<tr data-ext="{{ f.ext }}"><td class="cert-icon">{{ f.icon }}</td><td class="cert-name">{{ f.name }}</td><td class="cert-size">{{ f.size }}</td><td class="cert-dl"><a href="/api/certs/download/{{ f.name }}" title="Download">⬇</a></td></tr>
+{% endfor %}
+</table>
+</div>
+</main>
+<footer class="footer">infra-TAK</footer>
+<script>
+function filterCerts(ext){
+    document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+    event.target.classList.add('active');
+    document.querySelectorAll('.cert-table tr').forEach(r=>{
+        if(ext==='all')r.style.display='';
+        else if(ext==='other')r.style.display=['p12','pem','jks','key'].includes(r.dataset.ext)?'none':'';
+        else r.style.display=r.dataset.ext===ext?'':'none';
+    });
+}
+</script>
+</body></html>

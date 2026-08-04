@@ -1,0 +1,1003 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Federation Hub — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03);border-left-color:var(--border-hover)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}
+.page-header h1{font-size:22px;font-weight:700}
+.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px;font-weight:500}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .15s}
+.form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
+.info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:8px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:22px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(15,23,42,.25);margin-bottom:12px}
+.upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:rgba(59,130,246,.08)}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:360px;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
+.progress-item{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px}
+.progress-bar-outer{width:100%;height:4px;background:rgba(59,130,246,0.1);border-radius:2px;margin-top:8px;overflow:hidden}
+.progress-bar-inner{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width 0.25s ease}
+.fh-section{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;overflow:hidden}
+.fh-section>summary{list-style:none;cursor:pointer;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;color:var(--text-secondary);font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.fh-section>summary::-webkit-details-marker{display:none}
+.fh-section>summary .chev{transition:transform .2s ease;color:var(--text-dim)}
+.fh-section[open]>summary .chev{transform:rotate(180deg)}
+.fh-section-body{padding:0 24px 24px;border-top:1px solid var(--border)}
+@media(max-width:1000px){.metrics-bar{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.metrics-bar{grid-template-columns:1fr}}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><span class="material-symbols-outlined" style="vertical-align:middle;margin-right:8px;font-size:32px">hub</span>Federation Hub{% if fedhub_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ fedhub_version }}</span>{% endif %}</h1>
+    <p>TAK Federation Hub on a dedicated <strong>Ubuntu</strong> host (remote SSH). Starting point: official TAK.gov install guide.</p>
+  </div>
+
+  {% if fh.running %}
+  <div class="status-banner running"><div class="dot"></div>federation-hub service is <strong>active</strong> on {{ fedhub_deploy_cfg.remote.host }}{% if fedhub_version %} · {{ fedhub_version }}{% endif %}</div>
+  {% elif fh.installed %}
+  <div class="status-banner stopped"><div class="dot"></div>Registered on {{ fedhub_deploy_cfg.remote.host }}{% if fedhub_version %} · {{ fedhub_version }}{% endif %} — service not active (check target)</div>
+  {% else %}
+  <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, choose target (local or remote) below, then <strong>Deploy</strong> (or confirm manually)</div>
+  {% endif %}
+
+  {% if fh.installed %}
+  <div id="fedhub-cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin:-4px 0 18px;line-height:1.5;min-height:1.2em"></div>
+  {% endif %}
+
+  {% if fedhub_remote_host %}
+  <div class="card">
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="fedhub-remote-host-ip">{{ fedhub_remote_host }}</span></div>
+    <div class="card-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+    <div class="metrics-bar" id="fedhub-remote-metrics-bar">
+      <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="fedhub-remote-cpu-value">—</div></div>
+      <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="fedhub-remote-ram-value">—</div><div class="metric-detail" id="fedhub-remote-ram-detail"></div></div>
+      <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="fedhub-remote-disk-value">—</div><div class="metric-detail" id="fedhub-remote-disk-detail"></div></div>
+      <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="fedhub-remote-uptime-value" style="font-size:18px">—</div></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if fh.installed %}
+  <div class="card">
+    <div class="card-title">Controls</div>
+    <div class="controls">
+      {% if fh.running %}<button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="fedhubControl('stop')">■ Stop</button>{% else %}<button class="control-btn btn-start" onclick="fedhubControl('start')">▶ Start</button><button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button>{% endif %}
+      <button class="btn btn-ghost" type="button" onclick="fedhubRefreshStatus()">Refresh status</button>
+      <button class="btn btn-danger" type="button" onclick="fedhubClearRegistration()">Remove from console</button>
+    </div>
+    <div id="fedhub-control-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    <div class="info-grid" style="margin-top:16px">
+      <div class="info-item"><div class="info-label">Service</div><div class="info-value" id="fedhub-svc-state">—</div></div>
+      <div class="info-item"><div class="info-label">Install dir</div><div class="info-value" id="fedhub-dir-state">—</div></div>
+    </div>
+    <div id="fedhub-clear-msg" style="margin-top:10px;font-size:12px"></div>
+  </div>
+  {% endif %}
+
+  {% if fh.installed %}
+  <details class="fh-section">
+    <summary><span>Certificates &amp; CA rotation</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <div id="fedhub-cert-expiry-section" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.5;min-height:1.2em"></div>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:10px"><strong>Browser admin cert:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (from deploy or CA rotation, also under <code style="font-size:11px">$HOME/</code> on the Fed Hub host). Keystore / P12 password (effective): <code style="font-size:11px;font-family:'JetBrains Mono',monospace">{{ fh_cert_password_effective }}</code> — set under <strong>Certificate metadata</strong> below (or inherits TAK console cert password). Or use <strong>Authentik SSO</strong> below.</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px">
+        <button class="btn btn-ghost" type="button" onclick="fedhubDownloadWebadminCert()">⬇ Download webadmin-fed.p12</button>
+        <span id="fedhub-cert-download-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Generate a new Federation Hub root/intermediate CA pair and new server/admin certs. Auto-named CAs use <code style="font-size:11px">…-01</code>, <code style="font-size:11px">…-02</code>, etc. (from saved names in settings). This restarts Federation Hub and requires re-importing the new <code style="font-size:11px">webadmin-fed.p12</code> in browsers.</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
+        <button type="button" id="fedhub-rotate-btn" class="btn btn-primary" onclick="fedhubStartRotateCa()">Rotate CA + regenerate certs</button>
+        <span id="fedhub-rotate-msg" class="form-hint" style="margin:0"></span>
+      </div>
+      <div id="fedhub-rotate-log-wrap" style="display:{% if fedhub_rotating or fedhub_rotate_done or fedhub_rotate_error %}block{% else %}none{% endif %};margin-top:16px">
+        <div class="card-title" style="margin-bottom:8px">Rotation log</div>
+        <div class="log-box" id="fedhub-rotate-log">{% if fedhub_rotating %}Starting…{% elif fedhub_rotate_done %}Done.{% elif fedhub_rotate_error %}Rotation failed.{% endif %}</div>
+      </div>
+    </div>
+  </details>
+  {% endif %}
+
+  {% if not fh.installed %}
+  <details class="fh-section">
+    <summary><span>Package upload &amp; install</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Upload <code style="font-size:12px">takserver-fed-hub</code> .deb here. For <strong>local</strong> mode it installs directly on this machine; for <strong>remote</strong> mode infra-TAK SCPs it to the target and runs <code style="font-size:12px">apt-get install</code> there.</p>
+    <div id="fedhub-upload-area" class="upload-area" onclick="var i=document.getElementById('fedhub-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+      <div style="font-size:28px;margin-bottom:8px">📦</div>
+      <div style="font-size:14px;color:var(--text-secondary)">Drop .deb here or click to upload</div>
+      <div class="form-hint" style="margin-top:8px">Validation uses <code>dpkg-deb</code> on this host (Linux console recommended).</div>
+    </div>
+    <input type="file" id="fedhub-file-input" accept=".deb" style="display:none" onchange="fedhubFilePicked(this.files)">
+    <div id="fedhub-progress-area" style="margin-bottom:12px" aria-live="polite"></div>
+    <p id="fedhub-upload-hint-empty" class="form-hint" style="margin-bottom:10px{% if fedhub_pkg_filename %};display:none{% endif %}">No package uploaded yet — progress appears below when you select a file.</p>
+    <div class="controls">
+      <button class="btn btn-primary" type="button" id="fedhub-deploy-btn" onclick="fedhubStartDeploy()">Deploy Federation Hub</button>
+    </div>
+    <div id="fedhub-deploy-log-card" style="display:{% if fedhub_deploying or (fedhub_deploy_done and fedhub_deploy_error) %}block{% else %}none{% endif %};margin-top:18px;padding-top:18px;border-top:1px solid var(--border)">
+      <div class="card-title" style="margin-bottom:10px">Deploy log</div>
+      <div class="log-box" id="fedhub-deploy-log">{% if fedhub_deploying %}Starting…{% endif %}</div>
+    </div>
+    </div>
+  </details>
+  {% endif %}
+
+  <details class="fh-section"{% if not fh.installed %} open{% endif %}>
+    <summary><span>Certificate metadata (Federation Hub)</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Used when generating certs on the remote host (<strong>Deploy</strong>, <strong>Update</strong> if certs are recreated, and <strong>Rotate CA</strong>). Values are saved in console settings; empty fields fall back to the same DN as <strong>TAK Server</strong> deploy defaults where applicable. Certificate fields must use only printable ASN.1 characters (same rules as TAK deploy).</p>
+    <p style="font-size:11px;color:var(--text-dim);margin:-6px 0 14px;line-height:1.45">Effective P12 / keystore password (read-only here): <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">{{ fh_cert_password_effective }}</span>. Set a Fed Hub&ndash;specific password below, or leave blank to use the TAK console cert password.</p>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">Country (C)</label>
+        <input id="fedhub-cert-country" class="form-input" type="text" maxlength="64" value="{{ fh_cert_country }}" placeholder="US" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">State (ST)</label>
+        <input id="fedhub-cert-state" class="form-input" type="text" maxlength="64" value="{{ fh_cert_state }}" placeholder="CA" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">City (L)</label>
+        <input id="fedhub-cert-city" class="form-input" type="text" maxlength="64" value="{{ fh_cert_city }}" placeholder="City" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organization (O)</label>
+        <input id="fedhub-cert-org" class="form-input" type="text" maxlength="64" value="{{ fh_cert_org }}" placeholder="Org" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organizational unit (OU)</label>
+        <input id="fedhub-cert-ou" class="form-input" type="text" maxlength="64" value="{{ fh_cert_ou }}" placeholder="FederationHub" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Fed Hub keystore password (optional)</label>
+        <input id="fedhub-cert-password" class="form-input" type="password" placeholder="Leave blank = TAK cert password" autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Root CA name</label>
+        <input id="fedhub-root-ca" class="form-input" type="text" value="{{ fh_root_ca }}" placeholder="FEDHUB-ROOT-CA" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Intermediate CA name</label>
+        <input id="fedhub-intermediate-ca" class="form-input" type="text" value="{{ fh_intermediate_ca }}" placeholder="FEDHUB-INT-CA" autocomplete="off">
+      </div>
+    </div>
+    <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-top:8px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubSaveCertSettings()">Save certificate settings</button>
+      <span id="fedhub-cert-settings-msg" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+    </div>
+  </details>
+
+  <details class="fh-section">
+    <summary><span>Deployment target</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Deploy Federation Hub on <strong>this machine</strong> or a <strong>separate host</strong> via SSH. One rule: the hub <strong>cannot share an OS with TAK Server</strong> — the hub's JVM + MongoDB would contend with TAK Server's JVM + Postgres for RAM (MongoDB alone defaults to ~50% of system memory) and a single outage would take down both. A console host with no TAK Server can run the hub locally; a host already running TAK Server must point at a <strong>separate target</strong> (a different machine, or a separate VM on the same physical host — just not the same OS as TAK Server).</p>
+    <input type="hidden" id="fedhub-deployed-flag" value="{% if fedhub_deploy_cfg.deployed %}1{% else %}0{% endif %}">
+    <div style="display:flex;gap:24px;margin-bottom:16px;align-items:center">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:{% if fedhub_colocation_blocked %}not-allowed;opacity:.5{% else %}pointer{% endif %}">
+        <input type="radio" name="fedhub-target-mode" id="fedhub-mode-local" value="local"
+          {% if (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}checked{% endif %}
+          {% if fedhub_colocation_blocked %}disabled{% endif %}
+          onchange="fedhubToggleTargetMode()">
+        <span>This machine (local){% if fedhub_colocation_blocked %} — unavailable (TAK Server on this host){% endif %}</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="radio" name="fedhub-target-mode" id="fedhub-mode-remote" value="remote"
+          {% if fedhub_deploy_cfg.target_mode == 'remote' %}checked{% endif %}
+          onchange="fedhubToggleTargetMode()">
+        <span>Remote host (SSH)</span>
+      </label>
+    </div>
+    {% if fedhub_colocation_blocked and fedhub_deploy_cfg.deployed and (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}
+    <div style="font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:6px;margin-bottom:14px;line-height:1.5">
+      This hub is running locally on a host that also has TAK Server (legacy). Migrating it to a separate host is strongly recommended.
+    </div>
+    {% elif fedhub_colocation_blocked %}
+    <div style="font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:6px;margin-bottom:14px;line-height:1.5">
+      ⚠ <strong>TAK Server is installed on this machine.</strong> Federation Hub can't be deployed here — it needs its own host so it doesn't contend with TAK Server for RAM. Configure an <strong>SSH target</strong> below (a separate machine, or a separate VM on this physical host).
+    </div>
+    {% endif %}
+    <div id="fedhub-local-note" style="{% if fedhub_colocation_blocked or fedhub_deploy_cfg.target_mode == 'remote' %}display:none;{% endif %}font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.15);border-radius:6px;margin-bottom:14px;line-height:1.5">
+      Federation Hub will be installed directly on this machine. Upload the .deb below and click <strong>Deploy</strong>.
+    </div>
+    <div id="fedhub-ssh-fields" style="{% if (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}display:none;{% endif %}">
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">Remote host / IP</label>
+        <input id="fedhub-remote-host" class="form-input" type="text" placeholder="10.0.0.50" value="{{ fedhub_deploy_cfg.remote.host or '' }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">SSH port</label>
+        <input id="fedhub-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.remote.port or 22 }}">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">SSH user</label>
+        <input id="fedhub-remote-user" class="form-input" type="text" placeholder="root" value="{{ fedhub_deploy_cfg.remote.username or 'root' }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">SSH private key path</label>
+        <input id="fedhub-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-fedhub" value="{{ fedhub_deploy_cfg.remote.ssh_key_path or '' }}">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">One-time password (for Install SSH key only)</label>
+      <input id="fedhub-remote-password" class="form-input" type="password" placeholder="Not stored" autocomplete="off">
+      <div class="form-hint">Used only for ssh-copy-id; never saved in settings.</div>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubEnsureKey()">Generate SSH key</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubInstallKey()">Install SSH key</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubTestSsh()">Test SSH</button>
+    </div>
+    <div id="fedhub-ssh-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+    <div class="form-group" style="margin-top:12px">
+      <label class="form-label">Public key (manual fallback)</label>
+      <textarea id="fedhub-public-key" class="form-input" rows="3" readonly placeholder="Generate SSH key"></textarea>
+    </div>
+    </div>
+    <div class="controls" style="margin-top:12px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubSaveTarget()">Save target</button>
+    </div>
+    </div>
+  </details>
+
+  <details class="fh-section">
+    <summary><span>HTTPS access</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Federation Hub is a <strong>separate web app</strong> on the remote host. <strong>Caddy</strong> on this console can terminate TLS at <code style="font-size:12px">https://fedhub.&lt;your FQDN&gt;</code> and reverse-proxy to the hub’s HTTP port (same pattern as <code style="font-size:12px">stream.*</code> → MediaMTX).</p>
+    {% if settings.fqdn and fedhub_public_url %}
+    <p style="font-size:13px;margin-bottom:12px">When the module is registered and Caddy is deployed, open: <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:12px">{{ fedhub_public_url }}</a></p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+      <a href="{{ fedhub_sso_prime_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-ghost" style="text-decoration:none">Open TAK SSO first ↗</a>
+      <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open Fed Hub ↗</a>
+    </div>
+    <p class="form-hint" style="margin-bottom:10px;line-height:1.45">Recommended: open <code style="font-size:11px">{{ fedhub_sso_prime_url }}</code> first, then <code style="font-size:11px">{{ fedhub_public_url }}</code> so Authentik already knows you at the edge.</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px">The hub UI may still show <strong>Login with Keycloak</strong> — that redirects through <strong>Authentik</strong> (OIDC). Your browser stores an Authentik <strong>session cookie</strong> for your domain; on a later visit, if that cookie is still valid (same browser, site data not cleared, session not expired), you may go <strong>straight in</strong> without that step. Use a <strong>private window</strong> or clear cookies for your domain to test a cold login.</p>
+    <p class="form-hint" style="margin-bottom:14px">DNS: point <code style="font-size:11px">{{ fedhub_service_domain }}</code> (A/AAAA) to this <strong>console</strong> public IP — same as <code style="font-size:11px">infratak.*</code> / other subdomains — not the private Fed Hub IP.</p>
+    {% else %}
+    <p class="form-hint" style="margin-bottom:14px">Set the base <strong>FQDN</strong> in Console settings and run <strong>Caddy SSL</strong> deploy so subdomains get certificates. Then add DNS for <code style="font-size:11px">fedhub.&lt;FQDN&gt;</code> to this server.</p>
+    {% endif %}
+    <div class="form-group">
+      <label class="form-label">Hub web UI port (on remote host, HTTP)</label>
+      <input id="fedhub-web-ui-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.web_ui_port }}">
+      <div class="form-hint">Must match the hub web port on the target (recommended <strong>8080</strong> for Caddy upstream). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
+    </div>
+    <p class="form-hint" style="margin-bottom:10px;line-height:1.45">Client certificate for the hub UI: use <strong>Certificates &amp; CA rotation</strong> → <strong>Download webadmin-fed.p12</strong>. TAK.gov: <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">Federation Hub docs</a>.</p>
+    <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
+    </div>
+  </details>
+
+  {% if fh.installed and authentik_installed %}
+  <details class="fh-section">
+    <summary><span>Authentik SSO login</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body" style="background:rgba(59,130,246,.05)">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Enable <strong>Authentik OAuth</strong> on the Federation Hub UI so users can log in with their Authentik credentials instead of importing a client certificate. Creates an OAuth2/OIDC application in Authentik and patches <code style="font-size:11px">federation-hub-ui.yml</code> on the remote host. Users in the <strong>authentik Admins</strong> group get admin access.</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Users may see <strong>Login with Keycloak</strong> on the hub — that is the OIDC handoff to Authentik. After once, a browser <strong>session cookie</strong> often means the next visit skips that click (until the cookie expires or data is cleared).</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Client cert login (<code style="font-size:11px">webadmin-fed.p12</code>) continues to work alongside OAuth.</p>
+    <button class="btn btn-primary" type="button" onclick="fedhubEnableAuthentik()" id="fedhub-ak-btn">Enable Authentik login</button>
+    <div id="fedhub-ak-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    </div>
+  </details>
+  {% elif fh.installed and not authentik_installed %}
+  <details class="fh-section">
+    <summary><span>Authentik SSO login</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Deploy <strong>Authentik</strong> from the Marketplace first, then return here to enable OAuth login for the Federation Hub UI.</p>
+    </div>
+  </details>
+  {% endif %}
+
+  {% if fh.installed %}
+  <details class="fh-section"{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %} open{% endif %}>
+    <summary><span>Update Federation Hub</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <p class="form-hint" style="margin:14px 0 12px;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and install it on the same target (same pattern as <strong>Update TAK Server</strong>).</p>
+    <div id="fedhub-update-body">
+      <div id="fedhub-upgrade-upload-area" class="upload-area" style="margin-top:16px" onclick="var i=document.getElementById('fedhub-upgrade-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDropUpgrade(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+        <div style="font-size:22px;margin-bottom:6px">⬆</div>
+        <div style="font-size:13px;color:var(--text-secondary)">Drop replacement .deb here or click (same upload store as above)</div>
+      </div>
+      <input type="file" id="fedhub-upgrade-file-input" accept=".deb" style="display:none" onchange="fedhubUpgradeFilePicked(this.files)">
+      <div id="fedhub-upgrade-progress-area" style="margin-bottom:12px" aria-live="polite"></div>
+      <p id="fedhub-upgrade-hint-empty" class="form-hint" style="margin-bottom:12px{% if fedhub_pkg_filename %};display:none{% endif %}">No package in the upload store — drop a newer .deb here (same as main upload).</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
+        <button type="button" id="fedhub-update-btn" class="btn btn-primary" onclick="fedhubStartUpdate()">Update Federation Hub</button>
+        <span id="fedhub-update-msg" class="form-hint" style="margin:0"></span>
+      </div>
+      <div id="fedhub-upgrade-log-wrap" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %};margin-top:18px">
+        <div class="card-title" style="margin-bottom:8px">Update log</div>
+        <div class="log-box" id="fedhub-upgrade-log">{% if fedhub_upgrading %}Connecting…{% elif fedhub_upgrade_done %}Done.{% elif fedhub_upgrade_error %}Update failed.{% endif %}</div>
+      </div>
+    </div>
+    </div>
+  </details>
+  {% else %}
+  <div class="card">
+    <div class="card-title">Register without automated install</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:14px">If you installed the .deb manually on the Ubuntu host and <code style="font-size:12px">/opt/tak/federation-hub</code> exists, you can register the module without re-running deploy.</p>
+    <button class="btn btn-primary" type="button" onclick="fedhubMarkDeployed()">Confirm install on target</button>
+    <div id="fedhub-mark-msg" style="margin-top:12px;font-size:13px;color:var(--text-dim)"></div>
+  </div>
+  {% endif %}
+
+  <details class="fh-section">
+    <summary><span>Documentation</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin:14px 0 12px">Follow the <strong>Federation Hub</strong> section on TAK.gov for Ubuntu (.deb), Java, optional MongoDB, certificates, and <code style="font-size:12px">systemctl</code> service <code style="font-size:12px">federation-hub</code>.</p>
+      <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open TAK.gov Federation Hub guide ↗</a>
+    </div>
+  </details>
+</div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('fedhub-deploy-log');initLogToolbar('fedhub-upgrade-log');initLogToolbar('fedhub-rotate-log');</script>
+<script>
+var fedhubLogIndex=0,fedhubLogInterval=null;
+var fedhubUpgradeLogIndex=0,fedhubUpgradeLogInterval=null;
+var fedhubRotateLogIndex=0,fedhubRotateLogInterval=null;
+var fedhubUploadXhr=null;
+function fedhubFormatSize(b){
+  if(b==null||isNaN(+b))return'';
+  b=+b;
+  if(b<1024)return b+' B';
+  if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  return (b/(1024*1024)).toFixed(1)+' MB';
+}
+function fedhubToggleEmptyHints(hasFile){
+  var h1=document.getElementById('fedhub-upload-hint-empty');
+  var h2=document.getElementById('fedhub-upgrade-hint-empty');
+  if(h1)h1.style.display=hasFile?'none':'block';
+  if(h2)h2.style.display=hasFile?'none':'block';
+}
+function fedhubMaybeResetUploadZones(){
+  var p1=document.getElementById('fedhub-progress-area');
+  var p2=document.getElementById('fedhub-upgrade-progress-area');
+  var empty=(!p1||!p1.children.length)&&(!p2||!p2.children.length);
+  if(empty){
+    var ua=document.getElementById('fedhub-upload-area');
+    if(ua){ua.style.maxHeight='';ua.style.padding='';}
+    var u2=document.getElementById('fedhub-upgrade-upload-area');
+    if(u2){u2.style.maxHeight='';u2.style.padding='';}
+    fedhubToggleEmptyHints(false);
+  }
+}
+function fedhubShrinkZonesWhenHasPackage(){
+  var p1=document.getElementById('fedhub-progress-area');
+  var p2=document.getElementById('fedhub-upgrade-progress-area');
+  var has=(p1&&p1.children.length)||(p2&&p2.children.length);
+  if(!has)return;
+  var ua=document.getElementById('fedhub-upload-area');
+  if(ua){ua.style.maxHeight='72px';ua.style.padding='16px';}
+  var u2=document.getElementById('fedhub-upgrade-upload-area');
+  if(u2){u2.style.maxHeight='72px';u2.style.padding='14px';}
+  fedhubToggleEmptyHints(true);
+}
+function fedhubCancelUploadRow(row){
+  if(row&&row._xhr){try{row._xhr.abort();}catch(e){}row._xhr=null;}
+  if(fedhubUploadXhr&&row&&row._xhr===fedhubUploadXhr)fedhubUploadXhr=null;
+  fedhubUploadXhr=null;
+  if(row&&row.parentNode)row.parentNode.removeChild(row);
+  fedhubMaybeResetUploadZones();
+}
+function fedhubAppendCompleteRow(pa,filename,sizeMb){
+  if(!pa)return;
+  var row=document.createElement('div');
+  row.className='progress-item';
+  row.setAttribute('data-filename',filename);
+  var top=document.createElement('div');
+  top.style.cssText='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px';
+  var lbl=document.createElement('span');
+  lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary);word-break:break-all';
+  lbl.textContent=filename+(sizeMb!=null?' ('+sizeMb+' MB)':'');
+  var right=document.createElement('span');
+  right.style.cssText='display:flex;align-items:center;gap:8px';
+  var pct=document.createElement('span');
+  pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)';
+  pct.textContent='✓ ';
+  var rBtn=document.createElement('span');
+  rBtn.textContent='✗';
+  rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';
+  rBtn.title='Remove';
+  rBtn.onclick=function(){fedhubRemoveUploadFile(filename);};
+  pct.appendChild(rBtn);
+  top.appendChild(lbl);
+  top.appendChild(right);
+  right.appendChild(pct);
+  var barOuter=document.createElement('div');
+  barOuter.className='progress-bar-outer';
+  var barInner=document.createElement('div');
+  barInner.className='progress-bar-inner';
+  barInner.style.width='100%';
+  barInner.style.background='var(--green)';
+  barOuter.appendChild(barInner);
+  row.appendChild(top);
+  row.appendChild(barOuter);
+  pa.appendChild(row);
+}
+function fedhubRemoveUploadFile(filename){
+  fetch('/api/upload/fedhub/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:filename}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(x){
+      if(x&&x.success)fedhubRefreshPackageRowsFromServer();
+      else alert((x&&x.error)||'Remove failed');
+    }).catch(function(){alert('Remove failed');});
+}
+function fedhubRefreshPackageRowsFromServer(){
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var p1=document.getElementById('fedhub-progress-area');
+    var p2=document.getElementById('fedhub-upgrade-progress-area');
+    if(p1)p1.innerHTML='';
+    if(p2)p2.innerHTML='';
+    if(d&&d.filename){
+      if(p1)fedhubAppendCompleteRow(p1,d.filename,d.size_mb);
+      if(p2)fedhubAppendCompleteRow(p2,d.filename,d.size_mb);
+      fedhubShrinkZonesWhenHasPackage();
+    }else{
+      fedhubMaybeResetUploadZones();
+    }
+  }).catch(function(){fedhubMaybeResetUploadZones();});
+}
+function fedhubDoUpload(fileList,source){
+  source=source||'main';
+  var files=[];
+  for(var i=0;i<fileList.length;i++){
+    var f=fileList[i];
+    if(f&&f.name&&f.name.toLowerCase().endsWith('.deb'))files.push(f);
+  }
+  if(!files.length){alert('Select a Federation Hub .deb file.');return;}
+  var paId=source==='upgrade'?'fedhub-upgrade-progress-area':'fedhub-progress-area';
+  var pa=document.getElementById(paId);
+  var ua=document.getElementById(source==='upgrade'?'fedhub-upgrade-upload-area':'fedhub-upload-area');
+  if(ua){ua.style.maxHeight='72px';ua.style.padding=source==='upgrade'?'14px':'16px';}
+  if(pa)pa.innerHTML='';
+  if(fedhubUploadXhr){try{fedhubUploadXhr.abort();}catch(e){}}
+  var row=document.createElement('div');
+  row.className='progress-item';
+  var top=document.createElement('div');
+  top.style.cssText='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px';
+  var names=files.map(function(f){return f.name;}).join(', ');
+  var totalBytes=0;
+  for(var j=0;j<files.length;j++)totalBytes+=files[j].size||0;
+  var lbl=document.createElement('span');
+  lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary);word-break:break-all';
+  lbl.textContent=names+' ('+fedhubFormatSize(totalBytes)+')';
+  var right=document.createElement('span');
+  right.style.cssText='display:flex;align-items:center;gap:8px';
+  var pct=document.createElement('span');
+  pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan)';
+  pct.textContent='0%';
+  var cancelBtn=document.createElement('span');
+  cancelBtn.textContent='✗';
+  cancelBtn.style.cssText='color:var(--red);cursor:pointer;font-size:14px';
+  cancelBtn.title='Cancel upload';
+  cancelBtn.onclick=function(){fedhubCancelUploadRow(row);};
+  right.appendChild(pct);
+  right.appendChild(cancelBtn);
+  top.appendChild(lbl);
+  top.appendChild(right);
+  var barOuter=document.createElement('div');
+  barOuter.className='progress-bar-outer';
+  var barInner=document.createElement('div');
+  barInner.className='progress-bar-inner';
+  barInner.style.width='0%';
+  barOuter.appendChild(barInner);
+  row.appendChild(top);
+  row.appendChild(barOuter);
+  if(pa)pa.appendChild(row);
+  var fd=new FormData();
+  for(var k=0;k<files.length;k++)fd.append('files',files[k]);
+  var xhr=new XMLHttpRequest();
+  fedhubUploadXhr=xhr;
+  row._xhr=xhr;
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){
+      var pr=Math.round((e.loaded/e.total)*100);
+      barInner.style.width=pr+'%';
+      pct.textContent=pr+'%';
+    }
+  };
+  xhr.onload=function(){
+    row._xhr=null;
+    fedhubUploadXhr=null;
+    cancelBtn.remove();
+    if(xhr.status===200){
+      try{
+        var resp=JSON.parse(xhr.responseText);
+        if(!resp||!resp.success){
+          barInner.style.background='var(--red)';
+          pct.textContent=(resp&&resp.error)||'Upload failed';
+          pct.style.color='var(--red)';
+          return;
+        }
+        barInner.style.width='100%';
+        fedhubRefreshPackageRowsFromServer();
+      }catch(ex){
+        barInner.style.background='var(--red)';
+        pct.textContent='Bad response';
+        pct.style.color='var(--red)';
+      }
+    }else{
+      barInner.style.background='var(--red)';
+      pct.textContent='HTTP '+xhr.status;
+      pct.style.color='var(--red)';
+    }
+  };
+  xhr.onerror=function(){row._xhr=null;fedhubUploadXhr=null;barInner.style.background='var(--red)';pct.textContent='Failed';pct.style.color='var(--red)';};
+  xhr.onabort=function(){row._xhr=null;fedhubUploadXhr=null;};
+  xhr.timeout=1800000;
+  xhr.ontimeout=function(){row._xhr=null;fedhubUploadXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
+  xhr.open('POST','/api/upload/fedhub');
+  xhr.send(fd);
+}
+function fedhubDrop(ev){ev.preventDefault();var z=document.getElementById('fedhub-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files,'main');}
+function fedhubDropUpgrade(ev){ev.preventDefault();var z=document.getElementById('fedhub-upgrade-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files,'upgrade');}
+function fedhubFilePicked(files){
+  if(files&&files.length)fedhubDoUpload(files,'main');
+  var inp=document.getElementById('fedhub-file-input');
+  if(inp)setTimeout(function(){inp.value='';},100);
+}
+function fedhubUpgradeFilePicked(files){
+  if(files&&files.length)fedhubDoUpload(files,'upgrade');
+  var inp=document.getElementById('fedhub-upgrade-file-input');
+  if(inp)setTimeout(function(){inp.value='';},100);
+}
+function fedhubRemoveUpload(){
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){fedhubRefreshPackageRowsFromServer();return;}
+    fedhubRemoveUploadFile(d.filename);
+  }).catch(function(){fedhubRefreshPackageRowsFromServer();});
+}
+function _fhCertV(id){
+  var el=document.getElementById(id);
+  return el?(el.value||'').trim():'';
+}
+function collectFedhubCertPayload(forSave){
+  var o={
+    cert_country:_fhCertV('fedhub-cert-country').toUpperCase(),
+    cert_state:_fhCertV('fedhub-cert-state').toUpperCase(),
+    cert_city:_fhCertV('fedhub-cert-city').toUpperCase(),
+    cert_org:_fhCertV('fedhub-cert-org').toUpperCase(),
+    cert_ou:_fhCertV('fedhub-cert-ou').toUpperCase(),
+    root_ca_name:_fhCertV('fedhub-root-ca'),
+    intermediate_ca_name:_fhCertV('fedhub-intermediate-ca')
+  };
+  var pw=_fhCertV('fedhub-cert-password');
+  if(forSave)o.cert_password=pw;
+  else if(pw)o.cert_password=pw;
+  return o;
+}
+function validateFedhubCertFields(){
+  var rf=[{id:'fedhub-cert-country',l:'Country'},{id:'fedhub-cert-state',l:'State'},{id:'fedhub-cert-city',l:'City'},{id:'fedhub-cert-org',l:'Organization'},{id:'fedhub-cert-ou',l:'Org Unit'},{id:'fedhub-root-ca',l:'Root CA'},{id:'fedhub-intermediate-ca',l:'Intermediate CA'}];
+  var empty=rf.filter(function(f){var el=document.getElementById(f.id);return !el||!el.value.trim();});
+  if(empty.length>0){
+    alert('Please fill in: '+empty.map(function(f){return f.l;}).join(', '));
+    empty.forEach(function(f){var el=document.getElementById(f.id);if(el){el.style.borderColor='var(--red)';el.addEventListener('input',function(){el.style.borderColor='';},{once:true});}});
+    return false;
+  }
+  var asn1ok=/^[A-Za-z0-9 '()+,./:=?-]*$/;
+  var certFields=[{id:'fedhub-cert-country',l:'Country'},{id:'fedhub-cert-state',l:'State'},{id:'fedhub-cert-city',l:'City'},{id:'fedhub-cert-org',l:'Organization'},{id:'fedhub-cert-ou',l:'Org Unit'}];
+  var bad=certFields.filter(function(f){var el=document.getElementById(f.id);var v=el?(el.value||'').trim():'';return v&&!asn1ok.test(v);});
+  if(bad.length>0){
+    alert("Invalid characters in: "+bad.map(function(f){return f.l;}).join(", ")+"\n\nCertificate fields only allow: A-Z, 0-9, spaces, and ' ( ) + , - . / : = ?\n\nNo underscores, @, #, ! or special characters.");
+    bad.forEach(function(f){var el=document.getElementById(f.id);if(el){el.style.borderColor='var(--red)';el.addEventListener('input',function(){el.style.borderColor='';},{once:true});}});
+    return false;
+  }
+  var pwt=_fhCertV('fedhub-cert-password');
+  if(pwt&&!/^[a-zA-Z0-9!@#%^+=_.,:-]+$/.test(pwt)){
+    alert('Fed Hub keystore password contains unsupported characters for the remote install scripts. Use letters, digits, and limited punctuation only.');
+    var pe=document.getElementById('fedhub-cert-password');if(pe){pe.style.borderColor='var(--red)';pe.addEventListener('input',function(){pe.style.borderColor='';},{once:true});}
+    return false;
+  }
+  return true;
+}
+function fedhubSaveCertSettings(){
+  var msg=document.getElementById('fedhub-cert-settings-msg');
+  if(msg){msg.textContent='Saving...';msg.style.color='var(--text-dim)';}
+  fetch('/api/fedhub/cert-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fedhub_cert:collectFedhubCertPayload(true)}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){
+        if(msg){msg.textContent='Saved. Reload the page to refresh the effective password hint if you changed the password.';msg.style.color='var(--green)';}
+      }else{if(msg){msg.textContent=(d&&d.error)||'Save failed';msg.style.color='var(--red)';}}
+    }).catch(function(e){if(msg){msg.textContent='Save failed';msg.style.color='var(--red)';}});
+}
+function fedhubStartDeploy(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  if(!host.trim()){alert('Set remote host first');return;}
+  if(!validateFedhubCertFields())return;
+  var btn=document.getElementById('fedhub-deploy-btn');
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){alert('Upload the Federation Hub .deb first');return;}
+    if(btn)btn.disabled=true;
+    var lc=document.getElementById('fedhub-deploy-log-card');var lg=document.getElementById('fedhub-deploy-log');
+    if(lc)lc.style.display='block';if(lg)lg.textContent='Starting deployment...';
+    fedhubLogIndex=0;if(fedhubLogInterval){clearInterval(fedhubLogInterval);fedhubLogInterval=null;}
+    fetch('/api/fedhub/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig(),fedhub_cert:collectFedhubCertPayload(false)}),credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(res){
+        if(res&&res.error){
+          if(lg)lg.textContent='Error: '+res.error;
+          if(btn)btn.disabled=false;
+          return;
+        }
+        fedhubPollLog();
+      }).catch(function(e){if(lg)lg.textContent='Request failed';if(btn)btn.disabled=false;});
+  });
+}
+function fedhubPollLog(){
+  fedhubLogInterval=setInterval(function(){
+    fetch('/api/fedhub/deploy/log?index='+fedhubLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-deploy-log');
+      if(d.entries&&d.entries.length){
+        if(fedhubLogIndex===0&&box)box.textContent='';
+        if(box)box.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);
+        if(box)box.scrollTop=box.scrollHeight;
+        fedhubLogIndex+=d.entries.length;
+      }
+      if(!d.running){
+        clearInterval(fedhubLogInterval);fedhubLogInterval=null;
+        var btn=document.getElementById('fedhub-deploy-btn');
+        if(d.complete&&!d.error){
+          if(btn){btn.textContent='Done — reloading';btn.style.background='var(--green)';}
+          location.reload();
+        }else if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='Retry deploy';}
+        }else if(btn){btn.disabled=false;}
+      }
+    });
+  },800);
+}
+function fedhubResumeErrorLog(){
+  fetch('/api/fedhub/deploy/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-deploy-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubLogIndex=d.total||0;
+  });
+}
+function fedhubToggleUpdate(){
+  var body=document.getElementById('fedhub-update-body');
+  var icon=document.getElementById('fedhub-update-toggle-icon');
+  if(!body)return;
+  var isHidden=body.style.display==='none'||body.style.display==='';
+  body.style.display=isHidden?'block':'none';
+  if(icon)icon.style.transform=isHidden?'rotate(180deg)':'';
+}
+function fedhubStartUpdate(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  if(!host.trim()){alert('Set remote host first');return;}
+  if(!validateFedhubCertFields())return;
+  var btn=document.getElementById('fedhub-update-btn');
+  var msg=document.getElementById('fedhub-update-msg');
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){alert('Upload the new Federation Hub .deb first');return;}
+    if(btn)btn.disabled=true;
+    if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
+    var wrap=document.getElementById('fedhub-upgrade-log-wrap');
+    var lg=document.getElementById('fedhub-upgrade-log');
+    if(wrap)wrap.style.display='block';
+    if(lg)lg.textContent='Starting update...';
+    fedhubUpgradeLogIndex=0;
+    if(fedhubUpgradeLogInterval){clearInterval(fedhubUpgradeLogInterval);fedhubUpgradeLogInterval=null;}
+    fetch('/api/fedhub/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig(),fedhub_cert:collectFedhubCertPayload(false)}),credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(res){
+        if(res&&res.error){
+          if(lg)lg.textContent='Error: '+res.error;
+          if(btn)btn.disabled=false;
+          if(msg){msg.textContent=res.error;msg.style.color='var(--red)';}
+          return;
+        }
+        fedhubPollUpgradeLog();
+      }).catch(function(e){if(lg)lg.textContent='Request failed';if(btn)btn.disabled=false;});
+  });
+}
+function fedhubPollUpgradeLog(){
+  fedhubUpgradeLogInterval=setInterval(function(){
+    fetch('/api/fedhub/update/log?index='+fedhubUpgradeLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-upgrade-log');
+      if(d.entries&&d.entries.length){
+        if(fedhubUpgradeLogIndex===0&&box)box.textContent='';
+        if(box)box.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);
+        if(box)box.scrollTop=box.scrollHeight;
+        fedhubUpgradeLogIndex=d.total||0;
+      }
+      if(!d.running){
+        clearInterval(fedhubUpgradeLogInterval);fedhubUpgradeLogInterval=null;
+        var btn=document.getElementById('fedhub-update-btn');
+        var msg=document.getElementById('fedhub-update-msg');
+        if(d.complete&&!d.error){
+          if(btn){btn.textContent='Update complete';btn.style.background='var(--green)';}
+          if(msg){msg.textContent='Done. Refreshing...';msg.style.color='var(--green)';}
+          setTimeout(function(){location.reload();},1200);
+        }else if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='Retry update';}
+          if(msg){msg.textContent='Update failed';msg.style.color='var(--red)';}
+        }else if(btn){btn.disabled=false;}
+      }
+    });
+  },800);
+}
+function fedhubGetTargetMode(){
+  var r=document.getElementById('fedhub-mode-remote');
+  return(r&&r.checked)?'remote':'local';
+}
+function fedhubToggleTargetMode(){
+  var isRemote=fedhubGetTargetMode()==='remote';
+  var sf=document.getElementById('fedhub-ssh-fields');
+  var ln=document.getElementById('fedhub-local-note');
+  if(sf)sf.style.display=isRemote?'':'none';
+  if(ln)ln.style.display=isRemote?'none':'';
+}
+function collectFedhubDeployConfig(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  var user=(document.getElementById('fedhub-remote-user')||{}).value||'root';
+  var key=(document.getElementById('fedhub-remote-key')||{}).value||'';
+  var portVal=(document.getElementById('fedhub-remote-port')||{}).value||'22';
+  var p=parseInt(portVal,10);
+  var wup=(document.getElementById('fedhub-web-ui-port')||{}).value;
+  var wp=parseInt(wup,10);
+  var dep=document.getElementById('fedhub-deployed-flag');
+  var mode=fedhubGetTargetMode();
+  return{target_mode:mode,deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+}
+function _fedhubSshMsg(msg,err,ok){
+  var el=document.getElementById('fedhub-ssh-status');
+  if(el){el.style.color=err?'var(--red)':ok?'var(--green)':'var(--text-dim)';el.textContent=msg||'';}
+}
+function fedhubSaveTarget(){
+  var msg=document.getElementById('fedhub-ssh-status');
+  if(msg)msg.textContent='Saving...';
+  fetch('/api/fedhub/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&(d.target_mode!==undefined||d.remote)){_fedhubSshMsg('Saved',false,true);setTimeout(function(){_fedhubSshMsg('',false,false);},1500);}
+      else _fedhubSshMsg((d&&d.error)||'Save failed',true);
+    }).catch(function(e){_fedhubSshMsg('Save failed',true);});
+}
+function fedhubEnsureKey(){
+  _fedhubSshMsg('Generating...',false,false);
+  fetch('/api/fedhub/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.success){_fedhubSshMsg((d&&d.error)||'Failed',true);return;}
+      var kp=document.getElementById('fedhub-remote-key');if(d.key_path&&kp)kp.value=d.key_path;
+      var pk=document.getElementById('fedhub-public-key');if(pk)pk.value=d.public_key||'';
+      _fedhubSshMsg('SSH key ready'+(d.fingerprint?' | '+d.fingerprint:''),false,true);
+    }).catch(function(e){_fedhubSshMsg('Failed',true);});
+}
+function fedhubInstallKey(){
+  var pw=(document.getElementById('fedhub-remote-password')||{}).value||'';
+  if(!pw){_fedhubSshMsg('Enter password for ssh-copy-id',true);return;}
+  _fedhubSshMsg('Installing key...',false,false);
+  fetch('/api/fedhub/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success)_fedhubSshMsg('SSH key installed',false,true);
+      else _fedhubSshMsg((d&&d.error)||'Install failed',true);
+    }).catch(function(e){_fedhubSshMsg('Install failed',true);});
+}
+function fedhubTestSsh(){
+  _fedhubSshMsg('Testing...',false,false);
+  fetch('/api/fedhub/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success)_fedhubSshMsg('SSH OK',false,true);
+      else _fedhubSshMsg((d&&d.error)||(d&&d.output)||'Test failed',true);
+    }).catch(function(e){_fedhubSshMsg('Test failed',true);});
+}
+function fedhubMarkDeployed(){
+  var el=document.getElementById('fedhub-mark-msg');
+  if(el)el.textContent='Checking target...';
+  fetch('/api/fedhub/mark-deployed',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){location.reload();return;}
+      if(el)el.textContent=(d&&d.error)||'Failed';
+      if(d&&d.detail&&el)el.textContent+=' — '+(d.detail||'').substring(0,200);
+    }).catch(function(e){if(el)el.textContent='Request failed';});
+}
+function fedhubEnableAuthentik(){
+  var btn=document.getElementById('fedhub-ak-btn');
+  var el=document.getElementById('fedhub-ak-msg');
+  if(btn)btn.disabled=true;
+  if(el){el.style.color='var(--text-dim)';el.textContent='Creating OAuth app in Authentik and patching config...';}
+  fetch('/api/fedhub/enable-authentik',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(btn)btn.disabled=false;
+      if(d&&d.success){
+        if(el){el.style.color='var(--green)';el.textContent=d.message||'Authentik SSO enabled';}
+      } else {
+        var msg=(d&&d.error)||'Failed';
+        if(d&&d.steps&&d.steps.length)msg+=String.fromCharCode(10)+d.steps.join(String.fromCharCode(10));
+        if(el){el.style.color='var(--red)';el.textContent=msg;el.style.whiteSpace='pre-wrap';}
+      }
+    }).catch(function(e){if(btn)btn.disabled=false;if(el){el.style.color='var(--red)';el.textContent='Request failed';}});
+}
+function fedhubClearRegistration(){
+  if(!confirm('Remove Federation Hub from this console only?'))return;
+  var el=document.getElementById('fedhub-clear-msg');
+  fetch('/api/fedhub/clear-registration',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){location.reload();return;}
+      if(el){el.style.color='var(--red)';el.textContent=(d&&d.error)||'Failed';}
+    }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
+}
+function fedhubDownloadWebadminCert(){
+  var el=document.getElementById('fedhub-cert-download-msg')||document.getElementById('fedhub-control-msg');
+  if(el){el.style.color='var(--text-dim)';el.textContent='Preparing certificate download...';}
+  window.location='/api/fedhub/download-webadmin-cert';
+  if(el){setTimeout(function(){el.textContent='';},2500);}
+}
+function loadFedhubCertExpiry(){
+  function fmt(days){
+    var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+    var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+    return p.join(' ');
+  }
+  function fill(el,d){
+    if(!el)return;
+    var parts=[];
+    var certs=[['root_ca','Root'],['intermediate_ca','Int']];
+    for(var i=0;i<certs.length;i++){
+      var key=certs[i][0],label=certs[i][1],c=d[key];
+      if(!c||c.error){parts.push(label+' <span style="color:var(--text-dim)">—</span>');continue;}
+      var days=c.days_left,color='#22c55e';
+      if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
+      parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+    }
+    el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
+  }
+  fetch('/api/fedhub/cert-expiry',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    fill(document.getElementById('fedhub-cert-expiry-banner'),d);
+    fill(document.getElementById('fedhub-cert-expiry-section'),d);
+  }).catch(function(){
+    var b=document.getElementById('fedhub-cert-expiry-banner');
+    var s=document.getElementById('fedhub-cert-expiry-section');
+    if(b)b.innerHTML='';
+    if(s)s.innerHTML='';
+  });
+}
+function fedhubPollRotateLog(){
+  if(fedhubRotateLogInterval)clearInterval(fedhubRotateLogInterval);
+  fedhubRotateLogInterval=setInterval(function(){
+    fetch('/api/fedhub/rotate-ca/log?index='+fedhubRotateLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-rotate-log');
+      if(box&&d.entries&&d.entries.length){
+        var t=(box.textContent||'');
+        if(t&&t.slice(-1)!==String.fromCharCode(10))t+=String.fromCharCode(10);
+        box.textContent=t+d.entries.join(String.fromCharCode(10));
+        box.scrollTop=box.scrollHeight;
+        fedhubRotateLogIndex=d.total||fedhubRotateLogIndex;
+      }
+      if(d.complete){
+        clearInterval(fedhubRotateLogInterval);fedhubRotateLogInterval=null;
+        var btn=document.getElementById('fedhub-rotate-btn');
+        var msg=document.getElementById('fedhub-rotate-msg');
+        if(btn){btn.disabled=false;btn.textContent=d.error?'Retry CA rotation':'Rotate CA + regenerate certs';}
+        if(msg){msg.style.color=d.error?'var(--red)':'var(--green)';msg.textContent=d.error?'Rotation failed':'Rotation complete. Re-import webadmin-fed.p12 before next login.';}
+      }
+    });
+  },1200);
+}
+function fedhubStartRotateCa(){
+  if(!confirm('Rotate Federation Hub CA and regenerate certs now? This restarts federation-hub and requires importing a new webadmin-fed.p12.'))return;
+  var btn=document.getElementById('fedhub-rotate-btn');
+  var msg=document.getElementById('fedhub-rotate-msg');
+  var wrap=document.getElementById('fedhub-rotate-log-wrap');
+  var box=document.getElementById('fedhub-rotate-log');
+  if(btn){btn.disabled=true;btn.textContent='Rotating...';}
+  if(msg){msg.style.color='var(--text-dim)';msg.textContent='Starting rotation...';}
+  if(wrap)wrap.style.display='block';
+  if(box)box.textContent='';
+  fedhubRotateLogIndex=0;
+  fetch('/api/fedhub/rotate-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.success){
+        if(btn){btn.disabled=false;btn.textContent='Rotate CA + regenerate certs';}
+        if(msg){msg.style.color='var(--red)';msg.textContent=(d&&d.error)||'Failed to start rotation';}
+        return;
+      }
+      fedhubPollRotateLog();
+    }).catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='Rotate CA + regenerate certs';}
+      if(msg){msg.style.color='var(--red)';msg.textContent='Request failed';}
+    });
+}
+function fedhubControl(act){
+  var el=document.getElementById('fedhub-control-msg');
+  if(el){el.style.color='var(--text-dim)';el.textContent='Running...';}
+  fetch('/api/fedhub/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:act}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(el){el.style.color=d&&d.success?'var(--green)':'var(--red)';el.textContent=(d&&d.success)?'OK':((d&&d.error)||'Failed');if(d&&d.output)el.textContent+=' '+(d.output||'').substring(0,200);}
+      fedhubRefreshStatus();
+    }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
+}
+function fedhubRefreshStatus(){
+  fetch('/api/fedhub/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var s=document.getElementById('fedhub-svc-state');
+    var di=document.getElementById('fedhub-dir-state');
+    if(!d.registered)return;
+    if(s)s.textContent=d.service_state||'—';
+    if(di)di.textContent=d.dir_ok?'/opt/tak/federation-hub present':'missing';
+  }).catch(function(){});
+}
+document.addEventListener('DOMContentLoaded',function(){
+  if(document.getElementById('fedhub-progress-area'))fedhubRefreshPackageRowsFromServer();
+  if(document.getElementById('fedhub-svc-state'))fedhubRefreshStatus();
+  {% if fedhub_deploying %}
+  fedhubLogIndex=0;
+  fedhubPollLog();
+  {% elif fedhub_deploy_done and fedhub_deploy_error %}
+  fedhubResumeErrorLog();
+  {% endif %}
+  {% if fedhub_upgrading %}
+  fedhubUpgradeLogIndex=0;
+  var uw=document.getElementById('fedhub-upgrade-log-wrap');
+  if(uw)uw.style.display='block';
+  fedhubPollUpgradeLog();
+  {% elif fedhub_upgrade_done or fedhub_upgrade_error %}
+  fetch('/api/fedhub/update/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-upgrade-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubUpgradeLogIndex=d.total||0;
+  });
+  {% endif %}
+  {% if fedhub_rotating %}
+  fedhubRotateLogIndex=0;
+  var rw=document.getElementById('fedhub-rotate-log-wrap');
+  if(rw)rw.style.display='block';
+  fedhubPollRotateLog();
+  {% elif fedhub_rotate_done or fedhub_rotate_error %}
+  fetch('/api/fedhub/rotate-ca/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-rotate-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubRotateLogIndex=d.total||0;
+  });
+  {% endif %}
+  if(document.getElementById('fedhub-remote-metrics-bar')){loadFedhubRemoteMetrics();setInterval(loadFedhubRemoteMetrics,5000);}
+  if(document.getElementById('fedhub-cert-expiry-banner')||document.getElementById('fedhub-cert-expiry-section')){
+    loadFedhubCertExpiry();
+    setInterval(loadFedhubCertExpiry,60000);
+  }
+});
+async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'});if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='—';document.getElementById('fedhub-remote-ram-value').textContent='—';document.getElementById('fedhub-remote-disk-value').textContent='—';document.getElementById('fedhub-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'—';}catch(e){}}
+</script>
+</body></html>

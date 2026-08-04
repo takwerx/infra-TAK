@@ -1,0 +1,327 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Email Relay — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'DM Sans',sans-serif;background:var(--bg-deep);color:var(--text-primary);min-height:100vh}
+.top-bar{height:3px;background:linear-gradient(90deg,var(--accent),var(--cyan),var(--green))}
+.header{padding:20px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--bg-surface)}
+.header-left{display:flex;align-items:center;gap:16px}.header-icon{font-size:28px}.header-title{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;letter-spacing:-0.5px}.header-subtitle{font-size:13px;color:var(--text-dim)}
+.header-right{display:flex;align-items:center;gap:12px}
+.btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
+.btn-logout{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-logout:hover{color:var(--red);border-color:rgba(239,68,68,0.3)}
+.os-badge{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:4px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
+.status-banner{background:var(--bg-card);border:1px solid var(--border);border-top:none;border-radius:12px;padding:24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between}
+.status-info{display:flex;align-items:center;gap:16px}
+.status-icon{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px}
+.status-icon.running{background:rgba(16,185,129,0.1)}.status-icon.stopped{background:rgba(239,68,68,0.1)}.status-icon.not-installed{background:rgba(71,85,105,0.2)}
+.status-text{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600}
+.status-detail{font-size:13px;color:var(--text-dim);margin-top:4px}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
+.input-field{width:100%;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px;outline:none;transition:border-color 0.2s}
+.input-field:focus{border-color:var(--accent)}
+select.input-field{cursor:pointer}
+.input-label{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:8px;display:block}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.form-group{display:flex;flex-direction:column}
+.form-group.full{grid-column:1/-1}
+.provider-link{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent);margin-top:8px;display:block}
+.info-box{background:rgba(59,130,246,0.07);border:1px solid rgba(59,130,246,0.2);border-radius:10px;padding:16px;font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px}
+.info-box code{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);background:rgba(6,182,212,0.1);padding:2px 6px;border-radius:4px}
+.config-table{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:12px}
+.config-table td{padding:10px 14px;border-bottom:1px solid var(--border)}
+.config-table td:first-child{color:var(--text-dim);width:140px}
+.config-table td:last-child{color:var(--cyan)}
+.footer{text-align:center;padding:24px;font-size:12px;color:var(--text-dim);margin-top:40px}
+.status-logo-wrap{display:flex;align-items:center;gap:10px}
+.status-logo{height:36px;width:auto;max-width:100px;object-fit:contain}
+.status-name{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:18px;color:var(--text-primary)}
+.tag{display:inline-block;padding:3px 8px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600}
+.tag-green{background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.2)}
+.tag-blue{background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.2)}
+body{display:flex;flex-direction:row;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+
+<!-- Status Banner -->
+<div class="status-banner">
+{% if email.installed and email.running %}
+<div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">outgoing_mail</span><span class="status-name">Email Relay</span></div><div>
+<div class="status-text" style="color:var(--green)">Running</div>
+<div class="status-detail">Postfix relay active{% if relay_config.get('provider') %} · {{ providers.get(relay_config.provider,{}).get('name', relay_config.provider) }}{% endif %}{% if relay_config.get('from_addr') %} · {{ relay_config.from_addr }}{% endif %}</div>
+</div></div>
+{% elif email.installed %}
+<div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">outgoing_mail</span><span class="status-name">Email Relay</span></div><div>
+<div class="status-text" style="color:var(--red)">Stopped</div>
+<div class="status-detail">Postfix is installed but not running</div>
+</div></div>
+{% else %}
+<div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">outgoing_mail</span><span class="status-name">Email Relay</span></div><div>
+<div class="status-text" style="color:var(--text-dim)">Not Installed</div>
+<div class="status-detail">Postfix email relay — apps use localhost, provider handles delivery</div>
+</div></div>
+{% endif %}
+</div>
+
+{% if email.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if email.running %}<button class="control-btn" onclick="emailControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="emailControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="emailUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="emailControl('start')">▶ Start</button><button class="control-btn btn-remove" onclick="emailUninstall()">🗑 Remove</button>{% endif %}
+</div></div>
+{% endif %}
+
+{% if deploying %}
+<!-- Deploy Log -->
+<div class="section-title">Deployment Log</div>
+<div class="deploy-log" id="deploy-log">Starting deployment...</div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');</script>
+<script>
+(function pollLog(){
+    var el=document.getElementById('deploy-log');
+    var last=0;
+    var iv=setInterval(async()=>{
+        var r=await fetch('/api/emailrelay/log');var d=await r.json();
+        if(d.entries&&d.entries.length>last){el.textContent=d.entries.join('\n');el.scrollTop=el.scrollHeight;last=d.entries.length}
+        if(!d.running){clearInterval(iv);
+        if(d.error){var card=el.parentElement;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);card.insertBefore(b,el);}var rbtn=document.createElement('button');rbtn.textContent='✗ Deployment failed — Retry';rbtn.style.cssText='margin-top:12px;padding:12px 24px;background:var(--red);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer';rbtn.onclick=function(){location.reload();};card.appendChild(rbtn);}
+        else if(d.complete){setTimeout(()=>location.reload(),1500)}}
+    },1500);
+})();
+</script>
+
+{% elif email.installed and email.running %}
+<!-- Running State -->
+<div class="section-title">Current Configuration</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<table class="config-table">
+<tr><td>Provider</td><td>{{ providers.get(relay_config.get('provider',''),{}).get('name', relay_config.get('provider','—')) }}</td></tr>
+<tr><td>Relay Host</td><td>{{ relay_config.get('relay_host','—') }}:{{ relay_config.get('relay_port','587') }}</td></tr>
+<tr><td>SMTP Login</td><td>{{ relay_config.get('smtp_user','—') }}</td></tr>
+<tr><td>From Address</td><td>{{ relay_config.get('from_addr','—') }}</td></tr>
+<tr><td>From Name</td><td>{{ relay_config.get('from_name','—') }}</td></tr>
+</table>
+</div>
+
+<div class="section-title">App SMTP Settings</div>
+<div class="info-box">
+Configure TAK Portal and MediaMTX to use the local relay:<br><br>
+<strong>SMTP Host:</strong> <code>localhost</code> &nbsp;&nbsp;
+<strong>Port:</strong> <code>25</code> &nbsp;&nbsp;
+<strong>Username:</strong> <code>blank</code> &nbsp;&nbsp;
+<strong>Password:</strong> <code>blank</code> &nbsp;&nbsp;
+<strong>TLS:</strong> <code>off</code>
+</div>
+
+{% if modules.get('authentik', {}).get('installed') %}
+<div class="section-title">Configure Authentik</div>
+<div id="cfg-ak-card" style="background:var(--bg-card);border:1px solid {% if authentik_smtp_configured %}rgba(16,185,129,0.4){% else %}var(--border){% endif %};border-radius:12px;padding:24px;margin-bottom:24px;border-left:4px solid {% if authentik_smtp_configured %}var(--green){% else %}var(--border){% endif %}">
+<p style="margin:0 0 8px 0;color:var(--text-muted)">Push this relay (localhost:25) and your From address into Authentik so recovery emails and other Authentik mail use the same relay. After you deploy Email Relay, this runs automatically; you can also click below to run it now or after switching providers.</p>
+<p id="cfg-ak-status" style="margin:0 0 16px 0;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600">{% if authentik_smtp_configured %}<span style="color:var(--green)">✓ Authentik SMTP: Configured</span> — password recovery will use this relay.{% else %}<span style="color:var(--yellow)">Authentik SMTP: Not configured</span> — click the button below so &quot;Forgot username or password&quot; emails are sent.{% endif %}</p>
+<button onclick="configureAuthentik()" id="cfg-ak-btn" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer">Configure Authentik to use these settings</button>
+<p style="margin:8px 0 0 0;font-size:11px;color:var(--text-dim)">If you switch providers later, click this again to push the new relay into Authentik.</p>
+<div id="cfg-ak-result" style="margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;display:none"></div>
+</div>
+{% endif %}
+
+<div class="section-title">Send Test Email</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div style="display:flex;gap:12px;align-items:end">
+<div style="flex:1"><label class="input-label">Send test to</label>
+<input type="email" id="test-addr" class="input-field" placeholder="you@example.com"></div>
+<button onclick="sendTest()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Send Test</button>
+</div>
+<div id="test-result" style="margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;display:none"></div>
+</div>
+
+<div class="section-title">Switch Provider</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div id="swap-form">
+<div class="form-grid">
+<div class="form-group full">
+<label class="input-label">Email Provider</label>
+<select class="input-field" id="swap-provider" onchange="updateProviderUI('swap-')">
+{% for key, p in providers.items() %}<option value="{{ key }}"{% if relay_config.get("provider")==key %} selected{% endif %}>{{ p.name }}</option>{% endfor %}
+</select>
+<a id="swap-provider-link" href="#" target="_blank" class="provider-link" style="display:none">→ Get credentials from provider ↗</a>
+</div>
+<div class="form-group"><label class="input-label">SMTP Username / Login</label>
+<input type="text" id="swap-smtp_user" class="input-field" placeholder="user@smtp-brevo.com" value="{{ relay_config.get('smtp_user','') }}"></div>
+<div class="form-group"><label class="input-label">SMTP Password / API Key</label>
+<input type="password" id="swap-smtp_pass" class="input-field" placeholder="••••••••••••"></div>
+<div class="form-group"><label class="input-label">From Address</label>
+<input type="email" id="swap-from_addr" class="input-field" placeholder="noreply@yourdomain.com" value="{{ relay_config.get('from_addr','') }}"></div>
+<div class="form-group"><label class="input-label">From Name</label>
+<input type="text" id="swap-from_name" class="input-field" placeholder="TAK Operations" value="{{ relay_config.get('from_name','') }}"></div>
+<div class="form-group full" id="swap-custom-fields" style="display:none;grid-template-columns:1fr 120px;gap:12px">
+<div><label class="input-label">Custom SMTP Host</label><input type="text" id="swap-custom_host" class="input-field" placeholder="smtp.yourdomain.com" value="{{ relay_config.get('relay_host','') if relay_config.get('provider')=='custom' else '' }}"></div>
+<div><label class="input-label">Port</label><input type="text" id="swap-custom_port" class="input-field" placeholder="587" value="{{ relay_config.get('relay_port','587') if relay_config.get('provider')=='custom' else '587' }}"></div>
+</div></div>
+<div style="margin-top:20px;text-align:center">
+<button onclick="swapProvider()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer">↔ Switch Provider</button>
+</div>
+</div>
+</div>
+
+{% elif not email.installed %}
+<!-- Not Installed -->
+<div class="section-title">How It Works</div>
+<div class="info-box">
+The Email Relay installs <strong>Postfix</strong> as a local mail relay on this server. Your apps (TAK Portal, MediaMTX) send to <code>localhost:25</code> with no credentials — Postfix handles authentication and delivery through your chosen provider.<br><br>
+Switching providers later requires only updating Postfix credentials — no changes to your apps.
+</div>
+
+<div class="section-title">Deploy Email Relay</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+{% if deploy_error %}
+<div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick="emailUninstall()" style="margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer">&#x1F5D1; Remove failed install</button></div>
+{% endif %}
+<div class="form-grid">
+<div class="form-group full">
+<label class="input-label">Email Provider</label>
+<select class="input-field" id="deploy-provider" onchange="updateProviderUI('deploy-')">
+{% for key, p in providers.items() %}<option value="{{ key }}">{{ p.name }}</option>{% endfor %}
+</select>
+<a id="deploy-provider-link" href="#" target="_blank" class="provider-link" style="display:none">→ Get credentials from provider ↗</a>
+</div>
+<div class="form-group"><label class="input-label">SMTP Username / Login</label>
+<input type="text" id="deploy-smtp_user" class="input-field" placeholder="user@smtp-brevo.com"></div>
+<div class="form-group"><label class="input-label">SMTP Password / API Key</label>
+<input type="password" id="deploy-smtp_pass" class="input-field" placeholder="••••••••••••"></div>
+<div class="form-group"><label class="input-label">From Address</label>
+<input type="email" id="deploy-from_addr" class="input-field" placeholder="noreply@yourdomain.com"></div>
+<div class="form-group"><label class="input-label">From Name</label>
+<input type="text" id="deploy-from_name" class="input-field" placeholder="TAK Operations"></div>
+<div class="form-group full" id="deploy-custom-fields" style="display:none;grid-template-columns:1fr 120px;gap:12px">
+<div><label class="input-label">Custom SMTP Host</label><input type="text" id="deploy-custom_host" class="input-field" placeholder="smtp.yourdomain.com"></div>
+<div><label class="input-label">Port</label><input type="text" id="deploy-custom_port" class="input-field" placeholder="587" value="587"></div>
+</div></div>
+<div style="margin-top:20px;text-align:center">
+<button onclick="deployRelay()" id="deploy-btn" style="padding:14px 40px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:16px;font-weight:600;cursor:pointer">{% if deploy_error %}&#x2717; Deployment failed — Retry{% else %}📧 Deploy Email Relay{% endif %}</button>
+</div>
+</div>
+{% if deploy_error %}
+<script>(function(){ var btn=document.getElementById('deploy-btn'); if(btn){ btn.style.background='var(--red)'; btn.onclick=function(){ btn.textContent='📧 Deploy Email Relay'; btn.style.background=''; deployRelay(); }; } })();</script>
+{% endif %}
+{% endif %}
+
+</div>
+<footer class="footer"></footer>
+
+<script>
+var PROVIDERS = {{ providers | tojson }};
+
+function updateProviderUI(prefix){
+    var sel = document.getElementById(prefix+'provider');
+    if(!sel) return;
+    var key = sel.value;
+    var p = PROVIDERS[key] || {};
+    var linkEl = document.getElementById(prefix+'provider-link');
+    if(linkEl){
+        if(p.url){ linkEl.href=p.url; linkEl.style.display='inline'; }
+        else { linkEl.style.display='none'; }
+    }
+    var customFields = document.getElementById(prefix+'custom-fields');
+    if(customFields) customFields.style.display = (key==='custom') ? 'grid' : 'none';
+}
+updateProviderUI('swap-');
+updateProviderUI('deploy-');
+
+async function deployRelay(){
+    var btn=document.getElementById('deploy-btn');
+    var provider=document.getElementById('deploy-provider').value;
+    var user=document.getElementById('deploy-smtp_user').value.trim();
+    var pass=document.getElementById('deploy-smtp_pass').value.trim();
+    var from=document.getElementById('deploy-from_addr').value.trim();
+    var name=document.getElementById('deploy-from_name').value.trim();
+    if(!user||!pass||!from){alert('SMTP username, password, and From address are required');return}
+    var body={provider,smtp_user:user,smtp_pass:pass,from_addr:from,from_name:name};
+    if(provider==='custom'){
+        body.custom_host=document.getElementById('deploy-custom_host').value.trim();
+        body.custom_port=document.getElementById('deploy-custom_port').value.trim();
+    }
+    btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';
+    var r=await fetch('/api/emailrelay/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var d=await r.json();
+    if(d.success){location.reload()}
+    else{var card=btn.closest('div[style*="background:var(--bg-card)"]')||btn.parentElement;
+    if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}
+    btn.disabled=false;btn.textContent='✗ Deployment failed — Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='὎7 Deploy Email Relay';btn.style.background='';deployRelay();};}
+}
+
+async function swapProvider(){
+    var provider=document.getElementById('swap-provider').value;
+    var user=document.getElementById('swap-smtp_user').value.trim();
+    var pass=document.getElementById('swap-smtp_pass').value.trim();
+    var from=document.getElementById('swap-from_addr').value.trim();
+    var name=document.getElementById('swap-from_name').value.trim();
+    if(!user||!pass||!from){alert('All fields required');return}
+    var body={provider,smtp_user:user,smtp_pass:pass,from_addr:from,from_name:name};
+    if(provider==='custom'){
+        body.custom_host=document.getElementById('swap-custom_host').value.trim();
+        body.custom_port=document.getElementById('swap-custom_port').value.trim();
+    }
+    if(!confirm('Switch to '+PROVIDERS[provider].name+'? Postfix will restart.')){return}
+    var r=await fetch('/api/emailrelay/swap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var d=await r.json();
+    if(d.success){location.reload()}
+    else{alert('Error: '+d.error)}
+}
+
+async function sendTest(){
+    var to=document.getElementById('test-addr').value.trim();
+    if(!to){alert('Enter a recipient address');return}
+    var res=document.getElementById('test-result');
+    res.style.display='block';res.style.color='var(--text-dim)';res.textContent='Sending...';
+    var r=await fetch('/api/emailrelay/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to})});
+    var d=await r.json();
+    if(d.success){res.style.color='var(--green)';res.textContent='✓ '+d.output}
+    else{res.style.color='var(--red)';res.textContent='✗ '+d.error}
+}
+
+async function configureAuthentik(){
+    var btn=document.getElementById('cfg-ak-btn');
+    var res=document.getElementById('cfg-ak-result');
+    if(!btn||!res) return;
+    btn.disabled=true;res.style.display='block';res.style.color='var(--text-dim)';res.textContent='Configuring...';
+    var r=await fetch('/api/emailrelay/configure-authentik',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    var d=await r.json();
+    if(d.success){res.style.color='var(--green)';res.textContent='✓ '+d.message;setTimeout(function(){location.reload();},1500)}
+    else{res.style.color='var(--red)';res.textContent='✗ '+(d.error||'Failed')}
+    btn.disabled=false;
+}
+
+async function emailControl(action){
+    var r=await fetch('/api/emailrelay/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+    var d=await r.json();
+    if(d.success){location.reload()}else{alert('Error: '+(d.error||d.output))}
+}
+
+async function emailUninstall(){
+    if(!confirm('Remove Postfix email relay? Apps will need to be reconfigured.')){return}
+    var r=await fetch('/api/emailrelay/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    var d=await r.json();
+    if(d.success){location.reload()}else{alert('Error removing Postfix')}
+}
+</script>
+</body></html>

@@ -1,0 +1,354 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Customization — infra-TAK</title>
+<style>
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0');
+*{margin:0;padding:0;box-sizing:border-box}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;word-wrap:normal;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow:visible;line-height:1.35}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+:root{--bg-primary:#0a0e17;--bg-card:rgba(15,23,42,0.7);--bg-card-hover:rgba(15,23,42,0.9);--border:rgba(59,130,246,0.1);--border-hover:rgba(59,130,246,0.3);--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--accent-glow:rgba(59,130,246,0.15);--green:#10b981;--red:#ef4444;--yellow:#f59e0b;--cyan:#06b6d4}
+body{font-family:'DM Sans',sans-serif;background:var(--bg-primary);color:var(--text-primary);min-height:100vh}
+body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-image:linear-gradient(rgba(59,130,246,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,0.02) 1px,transparent 1px);background-size:60px 60px;pointer-events:none;z-index:0}
+.top-bar{position:fixed;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),var(--cyan),transparent);z-index:100}
+.header{position:relative;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:20px 32px;border-bottom:1px solid var(--border)}
+.header-left{display:flex;align-items:center;gap:14px}
+.header-icon{width:40px;height:40px;background:linear-gradient(135deg,#1e40af,#0891b2);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
+.header-title{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:18px}
+.header-subtitle{font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.header-right{display:flex;align-items:center;gap:16px}
+.os-badge{background:var(--bg-card);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)}
+.btn-logout,.btn-back{color:var(--text-dim);text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:12px;padding:6px 14px;border:1px solid var(--border);border-radius:8px;transition:all 0.2s}
+.btn-logout:hover,.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;font-weight:600}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
+.metric-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
+.footer{text-align:center;padding:24px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}
+.form-field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);font-weight:600;margin-bottom:6px}
+.form-field input[type="text"],.form-field input[type="password"]{width:100%;padding:10px 14px;background:rgba(15,23,42,0.6);border:1px solid rgba(59,130,246,0.2);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px}
+.form-field input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+@media(max-width:768px){.metrics-bar{grid-template-columns:repeat(2,1fr)}.modules-grid{grid-template-columns:1fr}.header{padding:16px 20px}.main{padding:20px}}
+
+body{display:flex;flex-direction:row;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:20px}
+.form-row{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;font-family:'JetBrains Mono',monospace}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;transition:border-color .2s}
+.form-input:focus{border-color:var(--cyan)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:5px}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0}
+.toggle-label{font-size:13px;color:var(--text-secondary)}
+.toggle{position:relative;display:inline-block;width:44px;height:24px}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#1e2736;border-radius:24px;transition:.3s}
+.toggle-slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#64748b;border-radius:50%;transition:.3s}
+input:checked+.toggle-slider{background:rgba(6,182,212,.2);border:1px solid var(--cyan)}
+input:checked+.toggle-slider:before{transform:translateX(20px);background:var(--cyan)}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:opacity .2s}
+.btn-primary:hover{opacity:.85}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-family:'JetBrains Mono',monospace}
+.btn-ghost:hover{background:rgba(255,255,255,.08)}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-family:'JetBrains Mono',monospace}
+.btn-danger:hover{background:rgba(239,68,68,.2)}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:28px;text-align:center;cursor:pointer;transition:border-color .2s;margin-bottom:12px}
+.upload-area:hover,.upload-area.drag{border-color:var(--cyan);background:rgba(6,182,212,.04)}
+.upload-area input[type=file]{display:none}
+.logo-preview{max-height:60px;max-width:200px;object-fit:contain;border-radius:6px;border:1px solid var(--border);padding:6px;background:rgba(255,255,255,.03)}
+.banner-preview{display:flex;align-items:center;justify-content:center;gap:18px;padding:8px 24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;font-weight:700;font-size:15px;letter-spacing:.07em;color:var(--text-primary);margin-top:16px;min-height:84px}
+.banner-preview-logo{height:68px;width:auto;max-height:68px;object-fit:contain;flex-shrink:0}
+.font-btn{background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:7px;padding:8px 14px;cursor:pointer;font-size:12px;color:var(--text-secondary);transition:all .15s;white-space:nowrap}
+.font-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.font-btn.active{border-color:var(--cyan);background:rgba(6,182,212,.08);color:var(--cyan)}
+.color-swatch{width:30px;height:30px;border-radius:50%;cursor:pointer;border:2px solid transparent;transition:all .15s;flex-shrink:0}
+.color-swatch:hover{transform:scale(1.15)}
+.color-swatch.active{border-color:#fff;box-shadow:0 0 0 2px var(--cyan)}
+.banner-preview-text{flex:1;text-align:center;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;z-index:9999;display:none;animation:fadeIn .2s}
+.toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
+.toast.error{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);color:var(--red)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="top-bar"></div>
+<div style="margin-bottom:28px">
+<div style="font-family:'JetBrains Mono',monospace;font-weight:700;font-size:20px;margin-bottom:6px">Customization</div>
+<div style="font-size:13px;color:var(--text-dim)">Custom banner and agency branding for this infra-TAK instance.</div>
+</div>
+
+<!-- Banner Card -->
+<div class="card">
+<div class="card-title">Custom Identification Banner</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">
+When enabled, a banner appears at the top of every page showing your text flanked by your agency logo (or the infra-TAK mark if no logo is uploaded).
+Useful for operators managing multiple infra-TAK instances.
+</div>
+<div class="toggle-row">
+<span class="toggle-label">Enable banner</span>
+<label class="toggle"><input type="checkbox" id="banner-enabled" {% if customization.get('banner_enabled') %}checked{% endif %}><span class="toggle-slider"></span></label>
+</div>
+<div class="form-row">
+<label class="form-label">Banner Text <span style="color:var(--text-dim)">(max 120 chars)</span></label>
+<input class="form-input" id="banner-text" type="text" maxlength="120"
+  placeholder="e.g. REGION 5 OPS CENTER — ALPHA UNIT"
+  value="{{ customization.get('banner_text', '') | e }}">
+<div class="form-hint">This text appears centered in the banner on every page.</div>
+</div>
+
+<div class="form-row">
+<div class="form-label">Font</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px">
+<button class="font-btn" id="font-btn-jetbrains" data-font="JetBrains Mono"
+  style="font-family:'JetBrains Mono',monospace" onclick="selectFont('JetBrains Mono')">JetBrains Mono</button>
+<button class="font-btn" id="font-btn-orbitron" data-font="Orbitron"
+  style="font-family:'Orbitron',sans-serif" onclick="selectFont('Orbitron')">Orbitron</button>
+<button class="font-btn" id="font-btn-dmsans" data-font="DM Sans"
+  style="font-family:'DM Sans',sans-serif" onclick="selectFont('DM Sans')">DM Sans</button>
+<button class="font-btn" id="font-btn-system" data-font="System UI"
+  style="font-family:system-ui,-apple-system,sans-serif" onclick="selectFont('System UI')">System UI</button>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-label">Text Size</div>
+<div style="display:flex;gap:8px;margin-top:4px">
+<button class="font-btn" id="size-btn-small"  onclick="selectSize('small')"  style="font-size:11px">Small</button>
+<button class="font-btn" id="size-btn-medium" onclick="selectSize('medium')" style="font-size:13px">Medium</button>
+<button class="font-btn" id="size-btn-large"  onclick="selectSize('large')"  style="font-size:16px">Large</button>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-label">Text Color</div>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
+<button class="color-swatch" title="White" data-color="#f1f5f9" style="background:#f1f5f9" onclick="selectColor('#f1f5f9',this)"></button>
+<button class="color-swatch" title="Cyan" data-color="#06b6d4" style="background:#06b6d4" onclick="selectColor('#06b6d4',this)"></button>
+<button class="color-swatch" title="Amber" data-color="#f59e0b" style="background:#f59e0b" onclick="selectColor('#f59e0b',this)"></button>
+<button class="color-swatch" title="Green" data-color="#10b981" style="background:#10b981" onclick="selectColor('#10b981',this)"></button>
+<button class="color-swatch" title="Red" data-color="#ef4444" style="background:#ef4444" onclick="selectColor('#ef4444',this)"></button>
+<button class="color-swatch" title="Gold" data-color="#fbbf24" style="background:#fbbf24" onclick="selectColor('#fbbf24',this)"></button>
+<div style="display:flex;align-items:center;gap:6px;margin-left:4px">
+<input type="color" id="banner-color-picker" value="{{ customization.get('banner_color','#f1f5f9') }}"
+  style="width:30px;height:30px;border-radius:50%;border:2px solid var(--border);padding:0;cursor:pointer;background:none"
+  oninput="onColorPicker(this.value)">
+<span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace" id="color-hex-label">{{ customization.get('banner_color','#f1f5f9') }}</span>
+</div>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-label">Live Preview</div>
+<div class="banner-preview" id="banner-preview">
+<span id="preview-logo-left" class="preview-logo-holder"></span>
+<span class="banner-preview-text" id="preview-text-wrap" style="display:flex;flex-direction:column;align-items:center;gap:3px">
+<span id="preview-text">{{ customization.get('banner_text', '') | e }}</span>
+{% if settings.get('server_ip') or settings.get('fqdn') %}
+<span style="font-size:11px;font-weight:400;opacity:.6;letter-spacing:.04em">
+  {{ settings.get('server_ip','') }}{% if settings.get('server_ip') and settings.get('fqdn') %} | {% endif %}{{ settings.get('fqdn','').split(':')[0] }}
+</span>
+{% endif %}
+</span>
+<span id="preview-logo-right" class="preview-logo-holder"></span>
+</div>
+</div>
+<div style="margin-top:20px">
+<button class="btn-primary" onclick="saveBanner()">Save Banner Settings</button>
+</div>
+</div>
+
+<!-- Agency Logo Card -->
+<div class="card">
+<div class="card-title">Agency Logo</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">
+Upload your agency logo (PNG, SVG, or JPEG — max 512 KB). It will appear on both sides of the banner text.
+If no logo is uploaded, the infra-TAK mark is used instead.
+</div>
+{% if customization.get('agency_logo_b64') %}
+<div style="margin-bottom:16px">
+<div class="form-label">Current Logo</div>
+<img src="{{ customization.get('agency_logo_b64') }}" alt="Agency Logo" class="logo-preview">
+</div>
+<button class="btn-danger" onclick="removeLogo()">Remove Logo</button>
+{% else %}
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">No logo uploaded — infra-TAK mark is used.</div>
+{% endif %}
+<div class="upload-area" id="upload-area" onclick="document.getElementById('logo-file').click()"
+  ondragover="event.preventDefault();this.classList.add('drag')"
+  ondragleave="this.classList.remove('drag')"
+  ondrop="handleDrop(event)">
+<input type="file" id="logo-file" accept="image/png,image/svg+xml,image/jpeg" onchange="uploadLogo(this.files[0])">
+<span class="material-symbols-outlined" style="font-size:32px;color:var(--text-dim);margin-bottom:8px;display:block">upload</span>
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">Click or drag to upload logo</div>
+<div style="font-size:11px;color:var(--text-dim)">PNG, SVG, or JPEG &mdash; max 512 KB</div>
+</div>
+</div>
+
+</div>
+<div class="toast" id="toast"></div>
+<script>
+// Load Orbitron from Google Fonts so it renders correctly in font buttons
+(function(){
+  var l = document.createElement('link');
+  l.rel = 'stylesheet';
+  l.href = 'https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;800&display=swap';
+  document.head.appendChild(l);
+})();
+
+var _currentFont  = {{ customization.get('banner_font', 'JetBrains Mono') | tojson }};
+var _currentColor = {{ customization.get('banner_color', '#f1f5f9') | tojson }};
+var _currentSize  = {{ customization.get('banner_size', 'medium') | tojson }};
+var _sizePxMap = {'small': '14px', 'medium': '20px', 'large': '28px'};
+var _fontFamilyMap = {
+  'JetBrains Mono': "'JetBrains Mono', monospace",
+  'Orbitron':       "'Orbitron', sans-serif",
+  'DM Sans':        "'DM Sans', sans-serif",
+  'System UI':      "system-ui, -apple-system, sans-serif"
+};
+
+// Populate preview logos on load
+(function(){
+  var b64 = {{ customization.get('agency_logo_b64', '') | tojson }};
+  setPreviewLogos(b64);
+  setFontActive(_currentFont);
+  setColorActive(_currentColor);
+  setSizeActive(_currentSize);
+  updatePreview();
+})();
+
+function setPreviewLogos(b64) {
+  var markup = b64
+    ? '<img src="' + b64 + '" alt="" class="banner-preview-logo">'
+    : '<span style="font-family:Orbitron,sans-serif;font-size:12px;font-weight:700;color:#06b6d4;letter-spacing:.08em">infra-TAK</span>';
+  document.getElementById('preview-logo-left').innerHTML = markup;
+  document.getElementById('preview-logo-right').innerHTML = markup;
+}
+
+function updatePreview() {
+  var t = document.getElementById('banner-text').value || 'Banner text preview';
+  var p = document.getElementById('banner-preview');
+  document.getElementById('preview-text').textContent = t;
+  p.style.fontFamily = _fontFamilyMap[_currentFont] || "'JetBrains Mono', monospace";
+  p.style.color = _currentColor;
+  p.style.fontSize = _sizePxMap[_currentSize] || '20px';
+}
+
+function selectSize(size) {
+  _currentSize = size;
+  setSizeActive(size);
+  updatePreview();
+}
+
+function setSizeActive(size) {
+  ['small', 'medium', 'large'].forEach(function(k){
+    var el = document.getElementById('size-btn-' + k);
+    if (el) el.classList.toggle('active', k === size);
+  });
+}
+
+function selectFont(font) {
+  _currentFont = font;
+  setFontActive(font);
+  updatePreview();
+}
+
+function setFontActive(font) {
+  ['jetbrains', 'orbitron', 'dmsans', 'system'].forEach(function(k){
+    var el = document.getElementById('font-btn-' + k);
+    if (el) el.classList.remove('active');
+  });
+  var keyMap = {'JetBrains Mono': 'jetbrains', 'Orbitron': 'orbitron', 'DM Sans': 'dmsans', 'System UI': 'system'};
+  var el = document.getElementById('font-btn-' + keyMap[font]);
+  if (el) el.classList.add('active');
+}
+
+function selectColor(hex, el) {
+  _currentColor = hex;
+  document.getElementById('banner-color-picker').value = hex;
+  document.getElementById('color-hex-label').textContent = hex;
+  document.querySelectorAll('.color-swatch').forEach(function(s){ s.classList.remove('active'); });
+  if (el) el.classList.add('active');
+  updatePreview();
+}
+
+function onColorPicker(hex) {
+  _currentColor = hex;
+  document.getElementById('color-hex-label').textContent = hex;
+  document.querySelectorAll('.color-swatch').forEach(function(s){ s.classList.remove('active'); });
+  updatePreview();
+}
+
+function setColorActive(hex) {
+  document.getElementById('banner-color-picker').value = hex;
+  document.getElementById('color-hex-label').textContent = hex;
+  document.querySelectorAll('.color-swatch').forEach(function(s){
+    s.classList.toggle('active', s.getAttribute('data-color') === hex);
+  });
+}
+
+document.getElementById('banner-text').addEventListener('input', updatePreview);
+
+function showToast(msg, type) {
+  var t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast ' + type; t.style.display = 'block';
+  setTimeout(function(){ t.style.display = 'none'; }, 3000);
+}
+
+function saveBanner() {
+  fetch('/api/customization/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      banner_enabled: document.getElementById('banner-enabled').checked,
+      banner_text: document.getElementById('banner-text').value.trim(),
+      banner_font: _currentFont,
+      banner_color: _currentColor,
+      banner_size: _currentSize
+    })
+  }).then(r => r.json()).then(d => {
+    if (d.ok) { showToast('Banner settings saved.', 'success'); setTimeout(()=>location.reload(),600); }
+    else showToast(d.error || 'Save failed', 'error');
+  }).catch(()=>showToast('Network error', 'error'));
+}
+
+function uploadLogo(file) {
+  if (!file) return;
+  if (file.size > 512*1024) { showToast('File too large (max 512 KB)', 'error'); return; }
+  var fd = new FormData(); fd.append('logo', file);
+  fetch('/api/customization/logo', {method:'POST', body:fd})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) { setPreviewLogos(d.data_uri); showToast('Logo uploaded.', 'success'); setTimeout(()=>location.reload(),600); }
+      else showToast(d.error || 'Upload failed', 'error');
+    }).catch(()=>showToast('Network error', 'error'));
+}
+
+function handleDrop(e) {
+  e.preventDefault();
+  document.getElementById('upload-area').classList.remove('drag');
+  var file = e.dataTransfer.files[0];
+  if (file) uploadLogo(file);
+}
+
+function removeLogo() {
+  fetch('/api/customization/logo', {method:'DELETE'})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) { setPreviewLogos(null); showToast('Logo removed.', 'success'); setTimeout(()=>location.reload(),600); }
+      else showToast(d.error || 'Error', 'error');
+    }).catch(()=>showToast('Network error', 'error'));
+}
+</script>
+</body></html>

@@ -1,0 +1,483 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>NetBird VPN — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700;display:flex;align-items:center;gap:12px}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
+.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all 0.2s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:0.9}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn-danger{background:var(--red);color:#fff}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-update{border-color:rgba(6,182,212,0.3)}.control-btn.btn-update:hover{background:rgba(6,182,212,0.08);color:var(--cyan)}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.terminal-block{background:#06090f;border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);position:relative;margin-top:8px}
+.terminal-copy{position:absolute;top:8px;right:8px;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text-secondary);border-radius:4px;padding:4px 8px;cursor:pointer;font-size:10px;font-family:sans-serif}
+.terminal-copy:hover{color:#fff;background:rgba(255,255,255,.1)}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1>
+      <img src="https://netbird.io/favicon.ico" alt="" style="height:32px;width:auto;object-fit:contain">
+      <span>NetBird VPN</span>{% if netbird_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ netbird_version }}</span>{% endif %}{% if netbird_channel == 'dev' and netbird_vetted %} <span style="color:#f59e0b;font-size:11px" title="Main channel is pinned to v{{ netbird_vetted }} — what production customers run">· main: v{{ netbird_vetted }}</span>{% endif %}{% if netbird_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:4px" title="Update to install v{{ netbird_latest }}">· v{{ netbird_latest }} available</span>{% elif netbird_upstream_newer and netbird_upstream_latest %} <span style="font-size:11px;color:#f59e0b;font-weight:600;margin-left:4px" title="netbirdio has shipped v{{ netbird_upstream_latest }}, newer than the vetted pin. Not auto-installed — bump the dev pin to try it on dev, then promote to main if login + a peer connect pass.">· ↑ v{{ netbird_upstream_latest }} available upstream</span>{% elif netbird_channel == 'main' %} <span style="color:var(--green);font-size:10px" title="Running the fleet-vetted NetBird release">· vetted ✓</span>{% endif %}
+    </h1>
+    <p>Zero-trust overlay WireGuard VPN with Authentik Identity Management and automatic NAT traversal</p>
+  </div>
+
+  {% if netbird.running %}
+    <div class="status-banner running"><div class="dot"></div>NetBird is running{% if netbird_version %} · {{ netbird_version }}{% endif %}{% if netbird_update_available and netbird_latest %} · <span style="color:var(--cyan)">{{ netbird_latest }} available</span>{% endif %}</div>
+  {% elif netbird.installed %}
+    <div class="status-banner stopped"><div class="dot"></div>NetBird is installed but stopped{% if netbird_version %} · {{ netbird_version }}{% endif %}{% if netbird_update_available and netbird_latest %} · <span style="color:var(--cyan)">{{ netbird_latest }} available</span>{% endif %}</div>
+  {% else %}
+    <div class="status-banner not-installed"><div class="dot"></div>NetBird is not installed</div>
+  {% endif %}
+
+  {% if netbird.installed %}
+    <div class="section-title">Controls</div>
+    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+      <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        {% if netbird.running %}
+          <button class="control-btn" onclick="controlNetbird('restart')">↻ Restart</button>
+          <button class="control-btn" onclick="loadNetbirdLogs()">📋 Container Logs</button>
+          <button class="control-btn btn-update" id="netbird-update-btn" onclick="netbirdUpdate()"{% if netbird_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)" title="Update available: {{ netbird_latest }}">●</span>{% endif %}</button>
+          <button class="control-btn btn-stop" onclick="controlNetbird('stop')">■ Stop</button>
+          <button class="control-btn btn-remove" onclick="document.getElementById('uninstall-netbird-modal').classList.add('open')">🗑 Remove</button>
+        {% else %}
+          <button class="control-btn btn-start" onclick="controlNetbird('start')">▶ Start</button>
+          <button class="control-btn" onclick="loadNetbirdLogs()">📋 Container Logs</button>
+          <button class="control-btn btn-update" id="netbird-update-btn" onclick="netbirdUpdate()"{% if netbird_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)" title="Update available: {{ netbird_latest }}">●</span>{% endif %}</button>
+          <button class="control-btn btn-remove" onclick="document.getElementById('uninstall-netbird-modal').classList.add('open')">🗑 Remove</button>
+        {% endif %}
+      </div>
+      <div id="netbird-update-status" style="display:none;margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+      <div id="netbird-control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Integration & Access Details</div>
+      <div class="info-grid">
+        <div class="info-item">
+          <div class="info-label">Dashboard (GUI)</div>
+          <div class="info-value">
+            <a href="{{ netbird_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">{{ netbird_url }} &#8599;</a>
+          </div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Connected Peers</div>
+          <div class="info-value" id="netbird-peer-count" style="color:var(--text-secondary)">Loading…</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Setup Keys (headless peers)</div>
+          <div class="info-value">
+            <a href="{{ netbird_url }}/settings?tab=setup-keys" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Settings → Setup Keys &#8599;</a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="border-color:rgba(16,185,129,.2)">
+      <div class="card-title" style="color:var(--green)">How to Connect Peer Clients</div>
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">
+        To add servers, operators, or mobile devices to your secure overlay network:
+      </p>
+
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Servers / headless Linux (setup key):</h4>
+      <p style="font-size:13px;color:var(--text-dim);line-height:1.5;margin-top:4px">
+        1. In the NetBird dashboard open <strong>Settings → Setup Keys</strong> (<a href="{{ netbird_url }}/settings?tab=setup-keys" target="_blank" rel="noopener" style="color:var(--cyan)">direct link</a>) and click <strong>Create Key</strong>.<br>
+        2. Copy the key, then on the server run:<br>
+        <code style="color:var(--cyan);font-family:'JetBrains Mono'">sudo netbird up --management-url {{ netbird_url }} --setup-key &lt;KEY&gt;</code>
+      </p>
+
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Linux Terminal Setup (interactive SSO):</h4>
+      <div class="terminal-block">
+        <button class="terminal-copy" onclick="copyText('linux-install-cmd')">Copy</button>
+        <span id="linux-install-cmd">curl -fsSL https://pkgs.netbird.io/install.sh | sh
+sudo netbird up --management-url {{ netbird_url }}</span>
+      </div>
+
+      <h4 style="font-size:13px;font-weight:600;margin-top:16px;color:var(--text-primary)">Desktop (macOS / Windows):</h4>
+      <p style="font-size:13px;color:var(--text-dim);line-height:1.5;margin-top:4px">
+        1. Download the desktop client from <a href="https://netbird.io/download" target="_blank" rel="noopener" style="color:var(--cyan)">netbird.io/download</a>.<br>
+        2. Open Preferences / Settings.<br>
+        3. Set the <strong>Management URL</strong> to: <code style="color:var(--cyan);font-family:'JetBrains Mono'">{{ netbird_url }}</code><br>
+        4. Click <strong>Connect</strong>. It will open Authentik in your browser. Log in, and the device will register.
+      </p>
+
+      <div style="margin-top:16px;padding:10px 12px;border:1px solid rgba(234,179,8,.25);border-radius:6px;background:rgba(234,179,8,.06)">
+        <div style="font-size:12px;font-weight:600;color:var(--yellow)">Peers behind strict / symmetric NAT</div>
+        <p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-top:4px">
+          Most peers connect directly via STUN (UDP&nbsp;3478) or relay over 443. A peer behind
+          <strong>strict or symmetric NAT</strong> (some cellular/CGNAT and corporate networks) can't hole-punch and
+          must fall back to a <strong>TURN relay</strong>. If such a peer shows connected in the dashboard but
+          traffic doesn't flow, the box needs the CoTURN TURN relay reachable — see the Remote Assist
+          page's CoTURN setup (the 3478/3479 port split keeps NetBird and Remote Assist TURN from
+          colliding). Do <em>not</em> blindly open the legacy 49152–65535 TURN range.
+        </p>
+      </div>
+    </div>
+
+    <div class="card" id="netbird-logs-card" style="display:none">
+      <div class="card-title">Docker Container Logs</div>
+      <div class="log-box" id="netbird-container-logs">Loading logs...</div>
+    </div>
+
+  {% else %}
+    <!-- Not Installed / Setup view -->
+    <div class="card">
+      <div class="card-title">Install NetBird VPN Module</div>
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px">
+        Deploy a self-hosted NetBird VPN orchestrator locally. NetBird integrates zero-trust connection brokers and WireGuard meshes with Authentik OIDC Single Sign-On (SSO) automatically.
+      </p>
+      
+      <div style="background:rgba(59,130,246,.05);border:1px solid rgba(59,130,246,.2);padding:14px 18px;border-radius:8px;margin-bottom:20px">
+        <h4 style="font-size:13px;font-weight:600;color:var(--accent);margin-bottom:6px">Deployment Blueprint</h4>
+        <ul style="font-size:12px;color:var(--text-dim);line-height:1.5;padding-left:18px">
+          <li>Registers a dedicated NetBird Client Application and OIDC OAuth2 Provider in Authentik.</li>
+          <li>Generates a secure JSON Web Token keypair (RS256) for authentication handshake.</li>
+          <li>Sets up directories and configuration files under <code style="color:var(--cyan)">~/netbird</code>.</li>
+          <li>Launches `netbird-server` (combined controller) and Nginx-based `dashboard` container.</li>
+          <li>Updates Caddy reverse-proxy rules to terminate SSL/TLS at `netbird.{{ settings.fqdn or 'localhost' }}`.</li>
+        </ul>
+      </div>
+
+      <div id="deploy-actions">
+        <button class="btn btn-primary" onclick="startNetbirdDeploy()">🚀 Deploy NetBird Localhost</button>
+      </div>
+
+      <div id="netbird-install-progress" style="display:none;margin-top:20px">
+        <div class="section-title">Deployment Console</div>
+        <div class="log-box" id="netbird-deploy-logs" style="height:250px">Preparing to deploy...</div>
+      </div>
+    </div>
+  {% endif %}
+</div>
+
+<!-- Uninstall Password Modal -->
+<div class="modal-overlay" id="uninstall-netbird-modal">
+  <div class="modal">
+    <h3>Uninstall NetBird</h3>
+    <p>Are you sure you want to stop NetBird, remove its Docker containers, delete volumes/configurations under ~/netbird, and remove its domain endpoint? This action is permanent.</p>
+    <div class="form-group" style="margin-bottom:16px">
+      <label class="form-label">Admin Password</label>
+      <input type="password" id="uninstall-admin-password" class="form-input" placeholder="Enter administrative password">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="document.getElementById('uninstall-netbird-modal').classList.remove('open')">Cancel</button>
+      <button class="btn btn-danger" onclick="confirmUninstallNetbird()">Uninstall NetBird</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let logPoller = null;
+
+function copyText(elemId) {
+  const text = document.getElementById(elemId).innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('#' + elemId + ' ~ .terminal-copy') || event.target;
+    const oldText = btn.innerText;
+    btn.innerText = 'Copied!';
+    setTimeout(() => { btn.innerText = oldText; }, 1500);
+  });
+}
+
+function startNetbirdDeploy() {
+  document.getElementById('deploy-actions').style.display = 'none';
+  document.getElementById('netbird-install-progress').style.display = 'block';
+  const logBox = document.getElementById('netbird-deploy-logs');
+  logBox.textContent = 'Triggering background deployment agent...';
+
+  fetch('/api/netbird/deploy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin'
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.error) {
+      logBox.textContent += '\nError triggering: ' + data.error;
+      document.getElementById('deploy-actions').style.display = 'block';
+      return;
+    }
+    // Poll logs
+    pollDeployLogs();
+  })
+  .catch(err => {
+    logBox.textContent += '\nConnection error: ' + err;
+    document.getElementById('deploy-actions').style.display = 'block';
+  });
+}
+
+function pollDeployLogs() {
+  if (logPoller) clearInterval(logPoller);
+  const logBox = document.getElementById('netbird-deploy-logs');
+
+  logPoller = setInterval(() => {
+    fetch('/api/netbird/deploy-status', { credentials: 'same-origin' })
+    .then(res => res.json())
+    .then(status => {
+      logBox.textContent = status.log.join('\n');
+      logBox.scrollTop = logBox.scrollHeight;
+
+      if (!status.running) {
+        clearInterval(logPoller);
+        if (status.complete && !status.error) {
+          logBox.textContent += '\n\n━━━ SUCCESS ━━━\nNetBird deployed successfully. Reloading page in 3 seconds...';
+          setTimeout(() => { window.location.reload(); }, 3000);
+        } else {
+          logBox.textContent += '\n\n━━━ DEPLOYMENT FAILED ━━━\nPlease review the console logs above.';
+          document.getElementById('deploy-actions').style.display = 'block';
+        }
+      }
+    })
+    .catch(err => {
+      console.error('Error polling deploy logs:', err);
+    });
+  }, 1000);
+}
+
+function controlNetbird(action) {
+  const statusDiv = document.getElementById('netbird-control-status');
+  statusDiv.textContent = 'Running container command: ' + action + '...';
+  
+  fetch('/api/netbird/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: action }),
+    credentials: 'same-origin'
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.error) {
+      statusDiv.textContent = 'Command failed: ' + data.error;
+      statusDiv.style.color = 'var(--red)';
+    } else {
+      statusDiv.textContent = 'Action completed successfully. Status: ' + (data.running ? 'Running' : 'Stopped');
+      statusDiv.style.color = data.running ? 'var(--green)' : 'var(--yellow)';
+      setTimeout(() => { window.location.reload(); }, 2000);
+    }
+  })
+  .catch(err => {
+    statusDiv.textContent = 'Error: ' + err;
+    statusDiv.style.color = 'var(--red)';
+  });
+}
+
+async function netbirdUpdate() {
+  const btn = document.getElementById('netbird-update-btn');
+  const statusDiv = document.getElementById('netbird-update-status');
+  const controlDiv = document.getElementById('netbird-control-status');
+  if (!btn || !statusDiv) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px"></span>Updating...';
+  statusDiv.style.display = 'block';
+  statusDiv.style.color = 'var(--text-secondary)';
+  statusDiv.textContent = 'Pulling latest netbird-server and dashboard images...';
+  if (controlDiv) controlDiv.textContent = '';
+  document.querySelectorAll('.control-btn').forEach(function(b) {
+    if (b !== btn) { b.disabled = true; b.style.opacity = '0.5'; }
+  });
+  try {
+    const res = await fetch('/api/netbird/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'update' }),
+      credentials: 'same-origin'
+    });
+    let data = {};
+    try { data = res.ok ? await res.json() : await res.json(); } catch (_) {}
+    if (!res.ok || !data.success) {
+      statusDiv.style.color = 'var(--red)';
+      statusDiv.textContent = '✗ ' + ((data.error || 'Update failed').slice(0, 120));
+    } else {
+      statusDiv.style.color = 'var(--green)';
+      statusDiv.textContent = '✓ Updated' + (data.pull ? ' — ' + data.pull : '') + (data.version ? ' (' + data.version + ')' : '');
+      setTimeout(function() { window.location.reload(); }, 1500);
+    }
+  } catch (err) {
+    statusDiv.style.color = 'var(--red)';
+    statusDiv.textContent = '✗ Update failed — ' + err;
+  }
+  btn.disabled = false;
+  btn.innerHTML = '⬆ Update{% if netbird_update_available %} <span style="color:var(--cyan)">●</span>{% endif %}';
+  document.querySelectorAll('.control-btn').forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
+}
+
+function loadNetbirdLogs() {
+  const logsCard = document.getElementById('netbird-logs-card');
+  const logBox = document.getElementById('netbird-container-logs');
+  
+  logsCard.style.display = 'block';
+  logBox.textContent = 'Loading logs from compose agent...';
+  
+  fetch('/api/netbird/logs', { credentials: 'same-origin' })
+  .then(res => res.json())
+  .then(data => {
+    logBox.textContent = data.lines.join('\n');
+    logBox.scrollTop = logBox.scrollHeight;
+  })
+  .catch(err => {
+    logBox.textContent = 'Error loading logs: ' + err;
+  });
+}
+
+function loadNetbirdStats() {
+  const el = document.getElementById('netbird-peer-count');
+  if (!el) return;
+  fetch('/api/netbird/stats', { credentials: 'same-origin' })
+  .then(res => res.json())
+  .then(data => {
+    if (data.ok && data.connected != null) {
+      el.textContent = data.connected + ' of ' + data.total;
+      el.style.color = data.connected > 0 ? 'var(--green)' : 'var(--text-secondary)';
+    } else {
+      el.textContent = 'Unavailable';
+      el.style.color = 'var(--text-dim)';
+    }
+  })
+  .catch(() => {
+    el.textContent = 'Unavailable';
+    el.style.color = 'var(--text-dim)';
+  });
+}
+
+if (document.getElementById('netbird-peer-count')) {
+  loadNetbirdStats();
+  setInterval(loadNetbirdStats, 30000);
+}
+
+function confirmUninstallNetbird() {
+  const password = document.getElementById('uninstall-admin-password').value;
+  if (!password) {
+    alert('Please enter your administrative password.');
+    return;
+  }
+  
+  const modal = document.getElementById('uninstall-netbird-modal');
+  modal.classList.remove('open');
+
+  // Create full-screen progress overlay
+  let overlay = document.getElementById('netbird-uninstall-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'netbird-uninstall-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(8,11,20,0.92);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)';
+    overlay.innerHTML = `
+      <div style="text-align:center;max-width:420px;padding:40px">
+        <div id="uninstall-spinner" style="width:56px;height:56px;border:4px solid rgba(255,255,255,0.1);border-top-color:var(--cyan);border-radius:50%;margin:0 auto 24px;animation:spin 0.8s linear infinite"></div>
+        <div id="uninstall-check" style="display:none;width:56px;height:56px;border-radius:50%;background:var(--green);margin:0 auto 24px;line-height:56px;font-size:28px;color:#fff">✓</div>
+        <h3 id="uninstall-title" style="font-size:18px;font-weight:600;color:var(--text-primary);margin-bottom:8px">Removing NetBird…</h3>
+        <p id="uninstall-detail" style="font-size:13px;color:var(--text-dim);line-height:1.5">Stopping containers, cleaning up files, and updating proxy routes. This may take a moment.</p>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+  } else {
+    overlay.style.display = 'flex';
+    document.getElementById('uninstall-spinner').style.display = 'block';
+    document.getElementById('uninstall-check').style.display = 'none';
+    document.getElementById('uninstall-title').textContent = 'Removing NetBird…';
+    document.getElementById('uninstall-detail').textContent = 'Stopping containers, cleaning up files, and updating proxy routes. This may take a moment.';
+  }
+  
+  fetch('/api/netbird/uninstall', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: password }),
+    credentials: 'same-origin'
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.error) {
+      overlay.style.display = 'none';
+      alert('Failed to uninstall: ' + data.error);
+      return;
+    }
+    // Poll for completion
+    function pollStatus() {
+      fetch('/api/netbird/uninstall-status', { credentials: 'same-origin' })
+        .then(r => r.json())
+        .then(st => {
+          if (st.complete) {
+            document.getElementById('uninstall-spinner').style.display = 'none';
+            document.getElementById('uninstall-check').style.display = 'block';
+            if (st.error) {
+              document.getElementById('uninstall-title').textContent = 'Uninstall completed with errors';
+              document.getElementById('uninstall-detail').textContent = 'NetBird was removed but some cleanup steps may have failed. Redirecting…';
+            } else {
+              document.getElementById('uninstall-title').textContent = 'NetBird Removed';
+              document.getElementById('uninstall-detail').textContent = 'All containers and configuration have been cleaned up. Redirecting…';
+            }
+            setTimeout(() => { window.location.href = '/marketplace'; }, 2000);
+          } else {
+            setTimeout(pollStatus, 1500);
+          }
+        })
+        .catch(() => {
+          // Server may be restarting Caddy — retry
+          setTimeout(pollStatus, 2000);
+        });
+    }
+    setTimeout(pollStatus, 1500);
+  })
+  .catch(() => {
+    // Connection may have been cut by Caddy reload — still poll
+    function retryPoll() {
+      fetch('/api/netbird/uninstall-status', { credentials: 'same-origin' })
+        .then(r => r.json())
+        .then(st => {
+          if (st.complete) {
+            document.getElementById('uninstall-spinner').style.display = 'none';
+            document.getElementById('uninstall-check').style.display = 'block';
+            document.getElementById('uninstall-title').textContent = st.error ? 'Uninstall completed with errors' : 'NetBird Removed';
+            document.getElementById('uninstall-detail').textContent = 'Redirecting to marketplace…';
+            setTimeout(() => { window.location.href = '/marketplace'; }, 2000);
+          } else {
+            setTimeout(retryPoll, 2000);
+          }
+        })
+        .catch(() => setTimeout(retryPoll, 2500));
+    }
+    setTimeout(retryPoll, 3000);
+  });
+}
+</script>
+</body></html>

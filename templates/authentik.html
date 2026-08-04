@@ -1,0 +1,1305 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Authentik — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'DM Sans',sans-serif;background:var(--bg-deep);color:var(--text-primary);min-height:100vh}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.top-bar{height:3px;background:linear-gradient(90deg,var(--accent),var(--cyan),var(--green))}
+.header{padding:20px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--bg-surface)}
+.header-left{display:flex;align-items:center;gap:16px}.header-icon{font-size:28px}.header-title{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;letter-spacing:-0.5px}.header-subtitle{font-size:13px;color:var(--text-dim)}
+.header-right{display:flex;align-items:center;gap:12px}
+.btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
+.btn-logout{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-logout:hover{color:var(--red);border-color:rgba(239,68,68,0.3)}
+.os-badge{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:4px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:600}
+.badge-green{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.badge-yellow{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
+.dot-pulse{animation:ak-pulse 2s infinite}
+@keyframes ak-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
+.status-banner{background:var(--bg-card);border:1px solid var(--border);border-top:none;border-radius:12px;padding:24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between}
+.status-info{display:flex;align-items:center;gap:16px}
+.status-icon{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px}
+.status-icon.running{background:rgba(16,185,129,0.1)}.status-icon.stopped{background:rgba(239,68,68,0.1)}.status-icon.not-installed{background:rgba(71,85,105,0.2)}
+.status-text{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600}
+.status-detail{font-size:13px;color:var(--text-dim);margin-top:4px}
+.status-logo-wrap{display:flex;align-items:center;gap:10px}
+.status-logo{height:36px;width:auto;max-width:100px;max-height:36px;object-fit:contain}
+.status-name{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:18px;color:var(--text-primary)}
+.controls{display:flex;gap:10px}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-update{border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.cert-btn{padding:10px 20px;border-radius:8px;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:all 0.2s}
+.cert-btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
+.cert-btn-secondary{background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border)}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;transition:border-color .15s;outline:none}
+.form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+ .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+ .btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:opacity .2s}.btn-primary:hover{opacity:.85}
+ .btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+ .btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+ .btn:disabled{opacity:.5;cursor:not-allowed}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;line-height:1.7;white-space:pre-wrap}
+.deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
+.svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:8px}
+.svc-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:12px}
+.svc-name{color:var(--text-secondary);font-weight:600;margin-bottom:4px}
+.svc-status{font-size:11px}
+.footer{text-align:center;padding:24px;font-size:12px;color:var(--text-dim);margin-top:40px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px}
+.uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+.uninstall-progress-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)}
+body{display:flex;min-height:100vh}
+.sidebar{width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="status-banner">
+{% if deploying %}
+<div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
+{% elif ak.installed and ak.running %}
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}</div></div></div>
+{% elif ak.installed %}
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}</div></div></div>
+{% else %}
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
+{% endif %}
+</div>
+
+{% if ak.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+</div>
+<div id="ak-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+</div>
+{% endif %}
+
+{% if deploying %}
+<div class="section-title">Deployment Log</div>
+<div class="deploy-log" id="deploy-log">Waiting for deployment to start...</div>
+{% elif deploy_error %}
+<div class="section-title">Deployment Failed</div>
+<div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:12px;padding:24px;margin-bottom:24px;text-align:center">
+<div style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--red);margin-bottom:16px">✗ Authentik deployment failed</div>
+{% if error_log_exists %}
+<a href="/api/authentik/error-log" class="cert-btn cert-btn-secondary" style="text-decoration:none;display:inline-block">⬇ Download Error Log</a>
+{% endif %}
+</div>
+{% elif ak.installed and ak.running %}
+<div class="section-title">Access</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+{% if remote_host %}
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="remote-host-ip">{{ remote_host }}</span></div>
+<div class="section-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+<div class="metrics-bar" id="remote-metrics-bar">
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="remote-cpu-value">—</div></div>
+<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="remote-ram-value">—</div><div class="metric-detail" id="remote-ram-detail"></div></div>
+<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="remote-disk-value">—</div><div class="metric-detail" id="remote-disk-detail"></div></div>
+<div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="remote-uptime-value" style="font-size:18px">—</div></div>
+</div>
+{% endif %}
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+<a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px;display:inline-flex;align-items:center;gap:6px" title="Open Authentik admin interface"><img src="{{ authentik_logo_url }}" alt="" style="width:18px;height:18px;object-fit:contain">Authentik{% if not settings.get('fqdn') %} :{{ ak_port }}{% endif %}</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
+<a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
+<a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
+</div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">Admin user: <span style="color:var(--cyan)">akadmin</span> · <button type="button" onclick="showAkPassword()" id="ak-pw-btn" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">🔑 Show Password</button> <span id="ak-pw-display" style="color:var(--green);user-select:all;display:none"></span></div>
+<div id="admin-accounts-status" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px">
+<span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Protected admin accounts</span>
+<button type="button" onclick="refreshAdminAccounts()" id="admin-accounts-refresh" title="Re-check is_active in Authentik" style="background:none;border:1px solid var(--border);color:var(--text-dim);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">↻ Refresh</button>
+</div>
+<div id="admin-accounts-rows" style="display:flex;flex-direction:column;gap:6px;font-family:'JetBrains Mono',monospace;font-size:11px"><div style="color:var(--text-dim)">Loading…</div></div>
+<div id="admin-accounts-msg" style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
+<div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
+</div>
+</div>
+<div class="section-title" data-collapse="ldap-config" data-collapsed="1">LDAP Configuration</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:12px;line-height:2">
+<div><span style="color:var(--text-dim)">Base DN:</span> <span style="color:var(--cyan)">DC=takldap</span></div>
+<div><span style="color:var(--text-dim)">Service Account:</span> <span style="color:var(--cyan)">adm_ldapservice</span></div>
+<div><span style="color:var(--text-dim)">LDAP Port:</span> <span style="color:var(--cyan)">389</span> <span style="color:var(--text-dim)">(Docker outpost)</span></div>
+<div style="margin-top:8px;font-size:11px;color:var(--text-dim)">LDAP configured via blueprint · Check Admin → Outposts to verify</div>
+</div>
+</div>
+<div class="card" id="ak-log-card" style="display:none">
+  <div class="card-title">Update config &amp; reconnect — Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
+</div>
+
+<div class="card" id="domain-audit-card">
+  <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+    <span>Domain Migration Audit</span>
+    <button onclick="runDomainAudit()" id="domain-audit-btn" style="padding:6px 14px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Run Audit</button>
+  </div>
+  <div style="font-size:12px;color:var(--text-dim);margin-top:8px;margin-bottom:12px">Scans .env, docker-compose.yml, and all Authentik API objects (brand, outpost, proxy providers) for stale domain references after a domain change.</div>
+  <div id="domain-audit-result" style="display:none"></div>
+</div>
+
+{% if container_info.get('containers') %}
+<div class="section-title">Services</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div class="svc-grid">
+{% for c in container_info.containers %}
+<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'healthy' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div>{% if 'cpu_sys' in c %}<div id="svc-metrics-{{ c.name }}" style="font-size:10px;margin-top:4px;line-height:1.5"><span class="svc-cpu" style="color:{{ 'var(--red)' if c.cpu_sys >= 50 else 'var(--text-dim)' }}" title="{{ c.cpu_raw }}% per-core{{ ' · investigate if sustained' if c.cpu_sys >= 50 else '' }}">{{ c.cpu_sys }}% sys</span><span class="svc-mem" style="color:var(--text-dim);margin-left:6px">{{ c.mem }}</span></div>{% endif %}</div>
+{% endfor %}
+<div class="svc-card" onclick="filterLogs('')" style="cursor:pointer" id="svc-all"><div class="svc-name">all containers</div><div class="svc-status" style="color:var(--text-dim)">● combined</div></div>
+</div>
+</div>
+{% endif %}
+{% if all_healthy and not portal_installed %}
+<div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:12px;padding:20px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--green)">✓ Authentik is healthy — next: configure SMTP, then deploy TAK Server, then TAK Portal</div>
+<a href="/emailrelay" style="padding:8px 16px;background:rgba(5,150,105,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap;margin-right:8px">→ Email Relay</a><a href="/takserver" style="padding:8px 16px;background:rgba(5,150,105,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap;margin-right:8px">→ TAK Server</a><a href="/takportal" style="padding:8px 20px;background:linear-gradient(135deg,#059669,#0e7490);color:#fff;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap">→ TAK Portal</a>
+</div>
+{% elif all_healthy and portal_running %}
+<div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:12px;padding:20px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--green)">✓ Full stack healthy — Authentik + TAK Portal running</div>
+<a href="/takportal" style="padding:8px 20px;background:var(--bg-surface);color:var(--green);border:1px solid rgba(16,185,129,0.3);border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap">→ TAK Portal</a>
+</div>
+{% endif %}
+<div class="section-title" data-collapse="container-logs" data-collapsed="1">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
+<div class="deploy-log" id="container-log">Loading logs...</div>
+<div class="card" id="ak-log-card" style="display:none;margin-top:24px">
+  <div class="card-title">Update config & reconnect — Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
+</div>
+{% elif ak.installed %}
+<div class="card" id="ak-log-card" style="display:none;margin-top:24px">
+  <div class="card-title">Update config & reconnect — Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
+</div>
+{% else %}
+<div class="section-title" data-collapse="about-authentik" data-collapsed="1">About Authentik</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary);line-height:1.8">
+Authentik is an open-source <span style="color:var(--cyan)">Identity Provider</span> supporting SSO, SAML, OAuth2/OIDC, LDAP, and RADIUS.<br><br>
+It provides centralized user authentication and management for all your services — including <span style="color:var(--cyan)">TAK Portal</span> for TAK Server user/cert management and <span style="color:var(--cyan)">MediaMTX</span> for stream access and user/group management (with or without TAK Portal).<br><br>
+<span style="color:var(--text-dim)">Deploys: PostgreSQL + Redis + Authentik Server + Worker (4 containers)</span><br>
+<span style="color:var(--text-dim)">Ports: 9090 (HTTP) · 9443 (HTTPS)</span><br>
+<span style="color:var(--text-dim)">Recommended: 2+ CPU cores, 2+ GB RAM</span>
+</div>
+</div>
+
+<!-- Deployment Target -->
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="authentikToggleSection('authentik-target')">
+    <span class="section-title" style="margin-bottom:0">Deployment Target</span>
+    <span id="authentik-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
+  </div>
+  <div id="authentik-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+    <div class="form-group">
+      <label class="form-label">Where should Authentik run?</label>
+      <select id="authentik-target-mode" class="form-input">
+        <option value="local" {% if authentik_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
+        <option value="remote" {% if authentik_deploy_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (SSH)</option>
+      </select>
+    </div>
+    <div id="authentik-remote-fields" style="display:{% if authentik_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">Remote Host/IP</label>
+          <input id="authentik-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ authentik_deploy_cfg.remote.host or '' }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">SSH Port</label>
+          <input id="authentik-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ authentik_deploy_cfg.remote.port or 22 }}">
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">SSH Username</label>
+          <input id="authentik-remote-user" class="form-input" type="text" placeholder="root" value="{{ authentik_deploy_cfg.remote.username or 'root' }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">SSH Key Path</label>
+          <input id="authentik-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-authentik" value="{{ authentik_deploy_cfg.remote.ssh_key_path or '' }}">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">One-time remote password (for key copy only)</label>
+        <input id="authentik-remote-password" class="form-input" type="password" placeholder="Used only for Install SSH Key">
+        <div class="form-hint">Password is never stored. It is used only for one-time <code>ssh-copy-id</code>.</div>
+      </div>
+      <div class="controls" style="margin-top:8px">
+        <button class="btn btn-ghost" type="button" onclick="ensureAuthentikSshKey()">Generate SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="installAuthentikSshKey()">Install SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="testAuthentikRemoteSsh()">Test SSH</button>
+      </div>
+      <div id="authentik-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+      <div class="form-group" style="margin-top:12px">
+        <label class="form-label">Public key (manual copy fallback)</label>
+        <textarea id="authentik-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key"></textarea>
+      </div>
+    </div>
+    <div class="controls" style="margin-top:10px">
+      <button class="btn btn-ghost" type="button" onclick="saveAuthentikTarget()">Save target settings</button>
+      <span id="authentik-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Deploy Authentik</div>
+  <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
+    Deploys Authentik identity provider with PostgreSQL, Redis, Server, Worker, and LDAP outpost.
+    Provides centralized authentication and user management for all TAK services.
+  </p>
+  <button class="btn btn-primary" id="deploy-btn" onclick="deployAk()">🚀 Deploy Authentik</button>
+  {% if not settings.fqdn %}
+  <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:10px;padding:16px 20px;margin-top:16px;font-size:13px;color:#f87171">
+    🔒 <strong>SSL Required</strong> — Authentik requires a domain with SSL configured.<br>
+    <span style="color:var(--text-dim)">Go to <a href="/caddy" style="color:var(--cyan)">Caddy SSL</a> and configure your domain first.</span>
+  </div>
+  {% endif %}
+</div>
+<div class="card" id="ak-log-card" style="display:none">
+  <div class="card-title">Deploy Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting for deployment to start...</div>
+</div>
+{% endif %}
+
+{% if deploy_done %}
+<div style="background:rgba(16,185,129,0.1);border:1px solid var(--border);border-radius:10px;padding:20px;margin-top:20px;text-align:center">
+<div style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--green);margin-bottom:8px">✓ Authentik deployed!</div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);margin-bottom:12px;text-align:left">
+<strong>Typical order</strong> (Email Relay may already be configured on your host):<br>
+1. <strong>Authentik</strong> — use the admin link below; deploy log must show LDAP SA bind verified before TAK.<br>
+2. <strong>SMTP</strong> — <a href="/emailrelay" style="color:var(--cyan)">Email Relay</a>: configure if needed, then &quot;Configure Authentik&quot;.<br>
+3. <strong>TAK Server</strong> — <a href="/takserver" style="color:var(--cyan)">TAK Server</a> after LDAP is healthy.<br>
+4. <strong>TAK Portal</strong> — <a href="/takportal" style="color:var(--cyan)">TAK Portal</a> when ready.<br>
+Additional admins: Authentik → Groups → authentik Admins → Users.
+</div>
+<a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;margin-right:10px">Authentik</a>
+<a href="/emailrelay" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">Email Relay</a>
+<a href="/takserver" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">TAK Server</a>
+<a href="/takportal" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">TAK Portal</a>
+<button onclick="window.location.href='/authentik'" style="padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Refresh Page</button>
+</div>
+{% endif %}
+{% if ak.installed and ak.running %}
+<div class="section-title" data-collapse="reputation" data-collapsed="1" style="margin-top:24px">Reputation Policy <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Flow-level brute-force blocking</span></div>
+<div class="card">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <div style="font-size:13px;font-weight:600;color:var(--text-primary)">Authentik Reputation Policy</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Blocks logins at the flow level when a source IP exceeds the failure threshold. Complementary to Fail2ban — trips first, lower overhead.</div>
+  </div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <span class="badge badge-red" id="rep-badge"><span class="dot"></span>Disabled</span>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+      <span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+      <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+        <input type="checkbox" id="rep-toggle" onchange="toggleReputation()" style="opacity:0;width:0;height:0;position:absolute">
+        <span id="rep-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+        <span id="rep-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+      </div>
+    </label>
+  </div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+  <label style="font-size:12px;color:var(--text-dim);white-space:nowrap;font-family:'JetBrains Mono',monospace">Score threshold:</label>
+  <input class="form-input" type="number" id="rep-threshold" value="-5" min="-100" max="-1" style="width:80px">
+  <span style="font-size:11px;color:var(--text-dim)">Failed login = −1. Success = +1. Block when score ≤ threshold. Only IPs with negative scores are shown below.</span>
+  <button class="btn-primary" onclick="toggleReputation()" style="white-space:nowrap">Save</button>
+</div>
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Flagged IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);text-transform:none;letter-spacing:0">negative score only</span></div>
+<table style="width:100%;border-collapse:collapse">
+  <thead><tr>
+    <th style="text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em">IP</th>
+    <th style="text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em">Score</th>
+  </tr></thead>
+  <tbody id="rep-score-table"></tbody>
+</table>
+<div style="margin-top:12px;display:flex;gap:8px">
+  <button onclick="clearRepScores()" style="padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:'JetBrains Mono',monospace">Clear All Scores</button>
+  <button onclick="refreshRepScores()" style="padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:'JetBrains Mono',monospace">↻ Refresh</button>
+</div>
+</div>
+{% endif %}
+{% if ak.installed and ak.running %}
+<div class="section-title" data-collapse="identity-bridge" data-collapsed="1" style="margin-top:24px">Identity Bridge <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Agency AD/Entra roster &rarr; auto agency + TAK template</span></div>
+<div class="card">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Agencies manage TAK users from their own Active Directory / Entra: a SCIM feed pushes their roster into Authentik ahead of first login, and the console auto-assigns agency + TAK Portal template from the mapping table below. The bridge only ever manages channels it granted itself &mdash; anything you set by hand is never touched, and pinned users are skipped entirely. When AD moves someone to a different role group, they move to that template's channels and lose the old ones. Runs automatically every 5 minutes.</div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+  <select class="form-input" id="idpb-agency" style="width:auto;min-width:200px" onchange="idpbPreview()"><option value="">Loading agencies...</option></select>
+  <button class="btn-primary" id="idpb-create-btn" onclick="idpbCreate()">Connect Agency</button>
+  <span style="font-size:11px;color:var(--text-dim)">Creates (or reuses) the agency's SCIM source in Authentik and shows the two values their IT team pastes into Entra provisioning.</span>
+</div>
+<div id="idpb-preview" style="display:none;margin-top:8px;padding:10px 12px;border-left:3px solid var(--accent);background:rgba(59,130,246,0.06);font-size:12px;color:var(--text-primary)"></div>
+<div id="idpb-token-panel" style="display:none;margin-top:10px;padding:14px;border:1px solid rgba(16,185,129,0.4);border-radius:8px;background:rgba(16,185,129,0.06)"></div>
+<div id="idpb-list" style="margin-top:14px"><div style="font-size:12px;color:var(--text-dim)">Loading...</div></div>
+</div>
+{% endif %}
+
+</div>
+<div class="modal-overlay" id="ak-uninstall-modal">
+<div class="modal">
+<h3>⚠ Uninstall Authentik?</h3>
+<p>This will remove Authentik, all Docker containers, volumes, images, and data. This cannot be undone.</p>
+<label class="form-label">Admin Password</label>
+<input class="form-input" id="ak-uninstall-password" type="password" placeholder="Confirm your password">
+<div class="modal-actions">
+<button type="button" class="btn btn-ghost" id="ak-uninstall-cancel" onclick="document.getElementById('ak-uninstall-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="btn btn-danger" id="ak-uninstall-confirm" onclick="doUninstallAk()">Uninstall</button>
+</div>
+<div id="ak-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+<div id="ak-uninstall-progress" class="uninstall-progress-row" style="display:none;margin-top:10px" aria-live="polite"></div>
+</div>
+</div>
+<footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('container-log');</script>
+<script>
+async function showAkPassword(){
+    var btn=document.getElementById('ak-pw-btn');
+    var display=document.getElementById('ak-pw-display');
+    if(display.style.display==='inline'){display.style.display='none';btn.textContent='🔑 Show Password';return}
+    try{
+        var r=await fetch('/api/authentik/password');
+        var d=await r.json();
+        if(d.password){display.textContent=d.password;display.style.display='inline';btn.textContent='🔑 Hide'}
+        else{display.textContent='Not found';display.style.display='inline'}
+    }catch(e){display.textContent='Error';display.style.display='inline'}
+}
+
+async function refreshAdminAccounts(){
+    var container = document.getElementById('admin-accounts-rows');
+    if (!container) return;
+    var refreshBtn = document.getElementById('admin-accounts-refresh');
+    if (refreshBtn) { refreshBtn.disabled = true; }
+    try {
+        var r = await fetch('/api/authentik/admin-accounts');
+        var d = await r.json();
+        if (!d || d.available === false) {
+            container.innerHTML = '<div style="color:var(--text-dim)">' + escapeHtml((d && d.error) || 'Status unavailable') + '</div>';
+            return;
+        }
+        var rows = '';
+        (d.accounts || []).forEach(function(a){
+            var pill, btnHtml = '';
+            var reactivateBtn = ` <button type="button" id="reactivate-${escapeHtml(a.username)}-btn" onclick="reactivateAdmin('${escapeHtml(a.username)}')" style="margin-left:10px;background:rgba(16,185,129,.15);border:1px solid var(--green);color:var(--green);padding:2px 14px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reactivate</button>`;
+            if (a.error) {
+                pill = '<span style="color:var(--text-dim)">? ' + escapeHtml(a.error) + '</span>';
+                btnHtml = reactivateBtn;
+            } else if (!a.exists) {
+                pill = '<span style="color:var(--text-dim)">— not present in Authentik</span>';
+            } else if (a.is_active) {
+                var su = a.is_superuser ? ' · <span style="color:var(--text-dim)">superuser</span>' : '';
+                pill = '<span style="color:var(--green)">✓ Active</span>' + su;
+            } else {
+                pill = '<span style="color:var(--red);font-weight:600">⚠ DEACTIVATED</span>';
+                btnHtml = reactivateBtn;
+            }
+            rows += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="color:var(--cyan);min-width:110px">' + escapeHtml(a.username) + '</span>' + pill + btnHtml + '</div>';
+        });
+        var sourceTag = d.source === 'ak-shell' ? '<div style="margin-top:6px;color:var(--text-dim);font-size:10px">status read via <code>ak shell</code> (Authentik API unavailable)</div>' : '';
+        container.innerHTML = (rows || '<div style="color:var(--text-dim)">No accounts reported</div>') + sourceTag;
+    } catch(e) {
+        container.innerHTML = '<div style="color:var(--red)">Error: ' + escapeHtml(e.message) + '</div>';
+    } finally {
+        if (refreshBtn) { refreshBtn.disabled = false; }
+    }
+}
+
+async function reactivateAdmin(username){
+    var btn = document.getElementById('reactivate-' + username + '-btn');
+    var msg = document.getElementById('admin-accounts-msg');
+    if (btn) { btn.disabled = true; btn.textContent = 'Reactivating…'; btn.style.opacity = '0.6'; btn.style.cursor = 'wait'; }
+    if (msg) { msg.style.display = 'block'; msg.style.color = 'var(--text-dim)'; msg.textContent = 'Reactivating ' + username + '…'; }
+    try {
+        var r = await fetch('/api/authentik/recover-admin', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({user: username})
+        });
+        var d = await r.json();
+        if (msg) {
+            msg.style.color = d.success ? 'var(--green)' : 'var(--red)';
+            var methodSuffix = d.method ? ' [via ' + d.method + ']' : '';
+            msg.textContent = (d.success ? '✓ ' : '✗ ') + (d.message || (d.success ? 'Done.' : 'Failed.')) + methodSuffix;
+        }
+    } catch(e) {
+        if (msg) { msg.style.color = 'var(--red)'; msg.textContent = 'Error: ' + e.message; }
+    } finally {
+        setTimeout(refreshAdminAccounts, 600);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+    if (document.getElementById('admin-accounts-status')) { refreshAdminAccounts(); }
+});
+
+async function akUpdate(){
+    var btn=document.getElementById('ak-update-btn');
+    var status=document.getElementById('ak-update-status');
+    if(!confirm('Pull the latest Authentik image and restart containers?\n\nThis may take 2-5 minutes. The page will reload when done.'))return;
+    btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating...';
+    document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
+    status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Pulling latest Authentik image and restarting… (may take 2–5 min)';
+    // v0.9.58 (#5): a long Authentik image pull can outlast a fronting proxy/gateway's
+    // response timeout, which then returns an HTML 502/504 page; the old r.json() then
+    // threw "Unexpected token '<'" and showed a scary failure even though the update was
+    // still running on the box (seen on CORAZ). Detect the gateway-timeout / non-JSON
+    // case and tell the operator to wait, instead of surfacing a parse error.
+    function _akUpdateStillRunning(){
+        status.style.color='var(--cyan)';
+        status.innerHTML='⏳ Authentik update is still running in the background — the image pull can exceed the gateway timeout. This page will refresh automatically in a few minutes (or refresh manually once Authentik is back). Do not re-click Update.';
+        btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating…';
+        setTimeout(()=>location.reload(),180000);
+    }
+    try{
+        var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});
+        var d=null,parseFail=false;
+        try{ d=await r.json(); }catch(_pe){ parseFail=true; }
+        if(parseFail||r.status===502||r.status===504){ _akUpdateStillRunning(); return; }
+        if(d&&d.success){
+            status.style.color='var(--green)';status.textContent='✓ Authentik updated successfully. Reloading…';
+            setTimeout(()=>location.reload(),2500);
+        }else{
+            status.style.color='var(--red)';status.textContent='✗ Update failed: '+((d&&d.error)||'unknown error');
+            btn.disabled=false;btn.innerHTML='⬆ Update';
+            document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+        }
+    }catch(e){
+        // The POST itself dropped (proxy reset / timeout mid-pull) — same long-running
+        // case, not a real failure. Surface the wait message, log the real error for debug.
+        try{console.error('akUpdate transport error (treating as still-running):',e);}catch(_le){}
+        _akUpdateStillRunning();
+    }
+}
+async function akControl(action){
+    var btns=document.querySelectorAll('.control-btn');
+    btns.forEach(function(b){b.disabled=true;b.style.opacity='0.5'});
+    try{
+        var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
+        var d=await r.json();
+        if(d.success)window.location.href='/authentik';
+        else alert('Error: '+(d.error||'Unknown'));
+    }catch(e){alert('Error: '+e.message)}
+    btns.forEach(function(b){b.disabled=false;b.style.opacity='1'});
+}
+
+async function deployAk(){
+    var btn=document.getElementById('deploy-btn');
+    btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';btn.style.cursor='wait';
+    var logCard=document.getElementById('ak-log-card');if(logCard)logCard.style.display='block';
+    var config=typeof collectAuthentikDeployConfig==='function'?collectAuthentikDeployConfig():{};
+    try{
+        var r=await fetch('/api/authentik/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:config})});
+        var d=await r.json();
+        if(d.success)pollDeployLog();
+        else{var lg=document.getElementById('deploy-log');if(lg)lg.textContent='Error: '+d.error;var card=lg?lg.closest('.card'):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('ak-uninstall-modal').classList.add('open')};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}btn.disabled=false;btn.textContent='✗ Deployment failed — Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='Deploy Authentik';btn.style.background='';deployAk();};}
+    }catch(e){document.getElementById('deploy-log').textContent='Error: '+e.message}
+}
+async function reconfigureAk(){
+    try{
+        var r=await fetch('/api/authentik/reconfigure',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var d=await r.json();
+        if(d.success){
+            var logCard=document.getElementById('ak-log-card');
+            var logEl=document.getElementById('deploy-log');
+            if(logCard){logCard.style.display='block';logCard.scrollIntoView({behavior:'smooth',block:'nearest'});}
+            if(logEl){logEl.innerHTML='';logEl.appendChild(document.createTextNode('Starting update config & reconnect...'));}
+            logIndex=0;
+            pollDeployLog();
+        }
+        else alert('Error: '+(d.error||'Reconfigure failed'));
+    }catch(e){alert('Error: '+e.message)}
+}
+
+function escapeHtml(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+async function runDomainAudit(){
+    var btn = document.getElementById('domain-audit-btn');
+    var res = document.getElementById('domain-audit-result');
+    if (!res) return;
+    if (btn) { btn.disabled=true; btn.textContent='Scanning…'; }
+    res.style.display='none';
+    try {
+        var r = await fetch('/api/authentik/domain-audit');
+        var d = await r.json();
+        if (!d.ok) { res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:"JetBrains Mono",monospace">'+escapeHtml(d.error||'Audit failed')+'</div>'; res.style.display='block'; return; }
+        if (d.clean) {
+            res.innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;font-size:12px;color:var(--green);font-family:"JetBrains Mono",monospace"><span>✓</span><span>All domain references match <strong>'+escapeHtml(d.fqdn)+'</strong> — no stale config found.</span></div>';
+        } else {
+            var rows = d.stale.map(function(s){ return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 10px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.location)+'</td><td style="padding:5px 10px;font-size:11px;color:var(--yellow)">'+escapeHtml(s.field)+'</td><td style="padding:5px 10px;font-size:11px;font-family:"JetBrains Mono",monospace;color:var(--red)">'+escapeHtml(s.current_value)+'</td></tr>'; }).join('');
+            res.innerHTML='<div style="color:var(--yellow);font-size:12px;font-family:"JetBrains Mono",monospace;margin-bottom:8px">⚠ '+d.stale.length+' stale reference'+(d.stale.length>1?'s':'')+' found — use <em>Update config &amp; reconnect</em> or the Domain Sync button to fix</div>'+
+                '<button onclick="triggerDomainSync()" style="margin-bottom:12px;padding:6px 14px;background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-size:11px;font-family:"JetBrains Mono",monospace;cursor:pointer">↻ Sync Domain Now</button>'+
+                '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em"><th style="padding:4px 10px;text-align:left">Location</th><th style="padding:4px 10px;text-align:left">Field</th><th style="padding:4px 10px;text-align:left">Current (stale) Value</th></tr></thead><tbody>'+rows+'</tbody></table>';
+        }
+        res.style.display='block';
+    } catch(e) {
+        res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:"JetBrains Mono",monospace">Network error: '+escapeHtml(e.message)+'</div>';
+        res.style.display='block';
+    } finally {
+        if (btn) { btn.disabled=false; btn.textContent='Run Audit'; }
+    }
+}
+
+async function triggerDomainSync(){
+    var res = document.getElementById('domain-audit-result');
+    if (res) res.innerHTML='<div style="color:var(--text-dim);font-size:12px;font-family:"JetBrains Mono",monospace">Triggering domain sync — this calls Update config &amp; reconnect…</div>';
+    await reconfigureAk();
+}
+async function fixAkLdapToken(btn){
+    if(!btn)return;
+    var orig=btn.textContent;
+    btn.disabled=true;
+    btn.textContent='… Fixing…';
+    try{
+        var r=await fetch('/api/authentik/fix-ldap-token',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var d=await r.json();
+        if(d.success){alert(d.message||'LDAP token fixed.');if(typeof loadContainerLogs==='function')loadContainerLogs();}
+        else alert('Error: '+(d.error||'Fix failed'));
+    }catch(e){alert('Error: '+e.message)}
+    btn.disabled=false;
+    btn.textContent=orig;
+}
+
+var logIndex=0;
+function pollDeployLog(){
+    fetch('/api/authentik/deploy/log?index='+logIndex).then(function(r){return r.json()}).then(function(d){
+        var el=document.getElementById('deploy-log');
+        if(d.entries.length>0){
+            d.entries.forEach(function(e){
+                var isTimer=e.trim().charAt(0)==='⏳'&&e.indexOf(':')>0;
+                if(isTimer){var prev=el.querySelector('[data-timer]');if(prev){prev.textContent=e;logIndex=d.total;return}}
+                if(!isTimer){var old=el.querySelector('[data-timer]');if(old)old.removeAttribute('data-timer')}
+                var l=document.createElement('div');
+                if(isTimer)l.setAttribute('data-timer','1');
+                if(e.indexOf('✓')>=0)l.style.color='var(--green)';
+                else if(e.indexOf('✗')>=0||e.indexOf('FATAL')>=0)l.style.color='var(--red)';
+                else if(e.indexOf('━━━')>=0)l.style.color='var(--cyan)';
+                else if(e.indexOf('===')>=0)l.style.color='var(--green)';
+                l.textContent=e;el.appendChild(l);
+            });
+            logIndex=d.total;el.scrollTop=el.scrollHeight;
+        }
+        if(d.running)setTimeout(pollDeployLog,1000);
+        else if(d.complete){
+            var btn=document.getElementById('deploy-btn');
+            if(btn){btn.textContent='✓ Deployment Complete';btn.style.background='var(--green)';btn.style.opacity='1';btn.style.cursor='default';}
+            var el=document.getElementById('deploy-log');
+            var inst=document.createElement('div');
+            inst.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);margin-top:16px;margin-bottom:8px;text-align:left;line-height:1.6';
+            inst.innerHTML='<strong>Typical order</strong> (SMTP may already be set):<br>1. <strong>Authentik</strong> — deploy log showed LDAP SA bind OK.<br>2. <strong>Email Relay</strong> if you still need SMTP / &quot;Configure Authentik&quot;.<br>3. <strong>TAK Server</strong>, then <strong>TAK Portal</strong> when ready.';
+            el.appendChild(inst);
+            var authUrl=el.getAttribute('data-authentik-url')||'';
+            var launchLink=document.createElement('a');
+            launchLink.href=authUrl;launchLink.target='_blank';launchLink.rel='noopener noreferrer';
+            launchLink.textContent='Launch Authentik Admin';
+            launchLink.style.cssText='display:block;width:100%;padding:12px;margin-top:8px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box';
+            el.appendChild(launchLink);
+            var refreshBtn=document.createElement('button');
+            refreshBtn.textContent='↻ Refresh Authentik Page';
+            refreshBtn.style.cssText='display:block;width:100%;padding:10px;margin-top:8px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:13px;cursor:pointer;';
+            refreshBtn.onclick=function(){window.location.href='/authentik';};
+            el.appendChild(refreshBtn);
+            el.scrollTop=el.scrollHeight;
+        }
+        else if(d.error){
+            var el=document.getElementById('deploy-log');
+            var card=el?el.closest('.card'):null;
+            if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('ak-uninstall-modal').classList.add('open')};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}
+            var btn=document.getElementById('deploy-btn');
+            if(btn){btn.disabled=false;btn.textContent='✗ Deployment failed — Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='Deploy Authentik';btn.style.background='';deployAk();};}
+        }
+    });
+}
+
+var activeContainer = '';
+function filterLogs(containerName){
+    activeContainer = containerName;
+    // Highlight selected card
+    document.querySelectorAll('.svc-card').forEach(function(c){c.style.borderColor='';c.style.boxShadow=''});
+    var id = containerName ? 'svc-'+containerName : 'svc-all';
+    var card = document.getElementById(id);
+    if(card){card.style.borderColor='var(--cyan)';card.style.boxShadow='0 0 0 1px var(--cyan)'}
+    var label = document.getElementById('log-filter-label');
+    if(label) label.textContent = containerName ? '— '+containerName : '';
+    loadContainerLogs();
+}
+async function loadContainerLogs(){
+    var el=document.getElementById('container-log');
+    if(!el)return;
+    try{
+        var url = activeContainer
+            ? '/api/authentik/logs?lines=80&container='+encodeURIComponent(activeContainer)
+            : '/api/authentik/logs?lines=80';
+        var r=await fetch(url);
+        var d=await r.json();
+        el.textContent='';
+        if(d.entries&&d.entries.length>0){
+            d.entries.forEach(function(e){
+                var l=document.createElement('div');
+                if(e.indexOf('ERROR')>=0||e.indexOf('error')>=0)l.style.color='var(--red)';
+                else if(e.indexOf('WARNING')>=0||e.indexOf('warn')>=0)l.style.color='var(--yellow)';
+                l.textContent=e;el.appendChild(l);
+            });
+            el.scrollTop=el.scrollHeight;
+        }else{el.textContent='No logs available yet.';}
+    }catch(e){el.textContent='Failed to load logs';}
+}
+if(document.getElementById('container-log')){loadContainerLogs();setInterval(loadContainerLogs,10000)}
+
+async function refreshContainerStats(){
+    try{
+        var r=await fetch('/api/authentik/container-stats');
+        if(!r.ok)return;
+        var data=await r.json();
+        for(var name in data){
+            var el=document.getElementById('svc-metrics-'+name);
+            if(!el)continue;
+            var d=data[name];
+            var cpuSys=Number(d.cpu_sys||0);
+            var cpuEl=el.querySelector('.svc-cpu');
+            var memEl=el.querySelector('.svc-mem');
+            if(cpuEl){
+                cpuEl.textContent=cpuSys.toFixed(1)+'% sys';
+                cpuEl.style.color=cpuSys>=50?'var(--red)':'var(--text-dim)';
+                cpuEl.title=Number(d.cpu_raw||0).toFixed(1)+'% per-core'+(cpuSys>=50?' · investigate if sustained':'');
+            }
+            if(memEl)memEl.textContent=d.mem||'';
+        }
+    }catch(e){}
+}
+if(document.querySelector('[id^="svc-metrics-"]')){refreshContainerStats();setInterval(refreshContainerStats,15000);}
+
+async function loadRemoteMetrics(){
+    var bar=document.getElementById('remote-metrics-bar');
+    if(!bar)return;
+    try{
+        var r=await fetch('/api/authentik/remote-metrics');
+        if(!r.ok){document.getElementById('remote-cpu-value').textContent='—';document.getElementById('remote-ram-value').textContent='—';document.getElementById('remote-disk-value').textContent='—';document.getElementById('remote-uptime-value').textContent='—';return;}
+        var d=await r.json();
+        var cpu=document.getElementById('remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';
+        var ram=document.getElementById('remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';
+        var ramD=document.getElementById('remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';
+        var disk=document.getElementById('remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';
+        var diskD=document.getElementById('remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';
+        var uptime=document.getElementById('remote-uptime-value');if(uptime)uptime.textContent=d.uptime||'—';
+    }catch(e){var cpu=document.getElementById('remote-cpu-value');if(cpu)cpu.textContent='—';}
+}
+if(document.getElementById('remote-metrics-bar')){loadRemoteMetrics();setInterval(loadRemoteMetrics,5000);}
+
+function uninstallAk(){
+    document.getElementById('ak-uninstall-modal').classList.add('open');
+}
+async function doUninstallAk(){
+    var pw=document.getElementById('ak-uninstall-password').value;
+    if(!pw){document.getElementById('ak-uninstall-msg').textContent='Please enter your password';return;}
+    var msgEl=document.getElementById('ak-uninstall-msg');
+    var progressEl=document.getElementById('ak-uninstall-progress');
+    var cancelBtn=document.getElementById('ak-uninstall-cancel');
+    var confirmBtn=document.getElementById('ak-uninstall-confirm');
+    msgEl.textContent='';
+    progressEl.style.display='flex';
+    progressEl.innerHTML='<span class="uninstall-spinner"></span><span>Uninstalling…</span>';
+    confirmBtn.disabled=true;
+    cancelBtn.disabled=true;
+    try{
+        var r=await fetch('/api/authentik/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+        var d=await r.json();
+        if(d.success){
+            progressEl.innerHTML='<span class="uninstall-spinner"></span><span>Done. Reloading…</span>';
+            setTimeout(function(){window.location.href='/authentik';},800);
+        }else{
+            msgEl.textContent=d.error||'Uninstall failed';
+            progressEl.style.display='none';
+            progressEl.innerHTML='';
+            confirmBtn.disabled=false;
+            cancelBtn.disabled=false;
+        }
+    }catch(e){
+        msgEl.textContent='Request failed: '+e.message;
+        progressEl.style.display='none';
+        progressEl.innerHTML='';
+        confirmBtn.disabled=false;
+        cancelBtn.disabled=false;
+    }
+}
+
+function collectAuthentikDeployConfig() {
+  var modeEl = document.getElementById('authentik-target-mode');
+  var mode = modeEl ? modeEl.value : 'local';
+  var cfg = { target_mode: mode };
+  if (mode === 'remote') {
+    var host = (document.getElementById('authentik-remote-host') || {}).value || '';
+    var user = (document.getElementById('authentik-remote-user') || {}).value || 'root';
+    var key = (document.getElementById('authentik-remote-key') || {}).value || '';
+    var portVal = (document.getElementById('authentik-remote-port') || {}).value || '22';
+    var p = parseInt(portVal, 10);
+    cfg.remote = { host: host.trim(), ssh_user: (user || 'root').trim(), ssh_port: isNaN(p) ? 22 : p, ssh_key_path: key.trim() };
+  }
+  return cfg;
+}
+function toggleAuthentikTargetFields() {
+  var modeEl = document.getElementById('authentik-target-mode');
+  var remoteBox = document.getElementById('authentik-remote-fields');
+  if (modeEl && remoteBox) remoteBox.style.display = modeEl.value === 'remote' ? 'block' : 'none';
+}
+function authentikToggleSection(id) {
+  var body = document.getElementById(id + '-body');
+  var icon = document.getElementById(id + '-toggle-icon');
+  if (!body) return;
+  var show = body.style.display === 'none';
+  body.style.display = show ? 'block' : 'none';
+  if (icon) icon.style.transform = show ? 'rotate(180deg)' : '';
+}
+function saveAuthentikTarget() {
+  var msg = document.getElementById('authentik-target-save-msg');
+  if (msg) msg.textContent = 'Saving...';
+  fetch('/api/authentik/deployment-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectAuthentikDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && (d.target_mode !== undefined || d.remote)) { if (msg) msg.textContent = 'Saved'; setTimeout(function() { if (msg) msg.textContent = ''; }, 1600); }
+      else if (msg) msg.textContent = (d && d.error) ? d.error : 'Save failed';
+    }).catch(function(e) { if (msg) msg.textContent = 'Save failed: ' + (e && e.message ? e.message : String(e)); });
+}
+function _authentikSshStatus(msg, isError, isSuccess) {
+  var el = document.getElementById('authentik-ssh-status');
+  if (el) { el.style.color = isError ? 'var(--red)' : isSuccess ? 'var(--green)' : 'var(--text-dim)'; el.textContent = msg || ''; }
+}
+function ensureAuthentikSshKey() {
+  var modeEl = document.getElementById('authentik-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleAuthentikTargetFields(); }
+  _authentikSshStatus('Generating SSH key...', false);
+  fetch('/api/authentik/remote/ensure-ssh-key', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectAuthentikDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (!d || !d.success) { _authentikSshStatus((d && d.error) ? d.error : 'Key generation failed', true); return; }
+      var keyEl = document.getElementById('authentik-remote-key'); if (d.key_path && keyEl) keyEl.value = d.key_path;
+      var pk = document.getElementById('authentik-public-key'); if (pk) pk.value = d.public_key || '';
+      _authentikSshStatus('✓ ' + (d.message || 'SSH key ready') + (d.fingerprint ? ' | ' + d.fingerprint : ''), false, true);
+    }).catch(function(e) { _authentikSshStatus('Key generation failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+function installAuthentikSshKey() {
+  var modeEl = document.getElementById('authentik-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleAuthentikTargetFields(); }
+  var pw = (document.getElementById('authentik-remote-password') || {}).value || '';
+  if (!pw) { _authentikSshStatus('Enter password for ssh-copy-id', true); return; }
+  _authentikSshStatus('Installing key...', false);
+  fetch('/api/authentik/remote/install-ssh-key', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password: pw, config: collectAuthentikDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && d.success) { _authentikSshStatus('✓ SSH key installed', false, true); }
+      else { _authentikSshStatus((d && d.error) ? d.error : 'Install failed', true); }
+    }).catch(function(e) { _authentikSshStatus('Install failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+function testAuthentikRemoteSsh() {
+  var modeEl = document.getElementById('authentik-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleAuthentikTargetFields(); }
+  _authentikSshStatus('Testing SSH...', false);
+  fetch('/api/authentik/remote/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectAuthentikDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && d.success) { _authentikSshStatus('✓ Test passed', false, true); }
+      else { _authentikSshStatus((d && d.error) ? d.error : (d && d.output) || 'Test failed', true); }
+    }).catch(function(e) { _authentikSshStatus('Test failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+document.addEventListener('DOMContentLoaded', function() {
+  var modeEl = document.getElementById('authentik-target-mode');
+  if (modeEl) modeEl.addEventListener('change', toggleAuthentikTargetFields);
+});
+
+{% if deploying %}pollDeployLog();{% endif %}
+{% if ak.installed and ak.running %}
+(function(){
+  function _applyRepState(enabled){
+    var badge=document.getElementById('rep-badge');
+    var track=document.getElementById('rep-toggle-track');
+    var thumb=document.getElementById('rep-toggle-thumb');
+    var toggle=document.getElementById('rep-toggle');
+    if(badge){
+      badge.className=enabled?'badge badge-green':'badge badge-red';
+      badge.innerHTML=enabled?'<span class="dot dot-pulse"></span>Active':'<span class="dot"></span>Disabled';
+    }
+    if(track)track.style.background=enabled?'var(--green)':'var(--border)';
+    if(thumb)thumb.style.transform=enabled?'translateX(18px)':'';
+    if(toggle)toggle.checked=enabled;
+  }
+  function _repLoad(){
+    fetch('/api/authentik/reputation/status').then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){return;}
+      _applyRepState(d.enabled);
+      var threshEl=document.getElementById('rep-threshold');
+      if(threshEl&&d.threshold!==undefined){threshEl.value=d.threshold;}
+      _renderRepScores(d.scores||[]);
+    }).catch(function(){});
+  }
+  function _renderRepScores(scores){
+    var scoreTable=document.getElementById('rep-score-table');
+    if(!scoreTable)return;
+    var negative=scores.filter(function(s){return s.score<0;});
+    negative.sort(function(a,b){return a.score-b.score;});
+    scoreTable.innerHTML='';
+    if(negative.length>0){
+      negative.forEach(function(s){
+        var tr=document.createElement('tr');
+        tr.style.borderBottom='1px solid var(--border)';
+        tr.innerHTML='<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+s.ip+'</td>'+
+          '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:'+(s.score<=-3?'var(--red)':'var(--yellow)')+'">'+s.score+'</td>';
+        scoreTable.appendChild(tr);
+      });
+    }else{
+      var emptyTr=document.createElement('tr');
+      emptyTr.innerHTML='<td colspan="2" style="padding:6px 8px;font-size:12px;color:var(--text-dim)">No flagged IPs</td>';
+      scoreTable.appendChild(emptyTr);
+    }
+  }
+  window.refreshRepScores=function(){_repLoad();};
+  window.toggleReputation=function(){
+    var en=document.getElementById('rep-toggle').checked;
+    var thr=parseInt(document.getElementById('rep-threshold').value||-5,10);
+    fetch('/api/authentik/reputation/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:en,threshold:thr})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_applyRepState(en);_repShowToast('Reputation policy '+(en?'enabled':'disabled')+'.','success');_repLoad();}
+        else{_repShowToast(d.error||'Failed','error');_applyRepState(!en);}
+      }).catch(function(){_repShowToast('Network error','error');_applyRepState(!en);});
+  };
+  window.clearRepScores=function(){
+    if(!confirm('Clear all reputation scores?'))return;
+    fetch('/api/authentik/reputation/scores/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_repShowToast('Cleared '+d.deleted+' score(s).','success');_repLoad();}
+        else{_repShowToast(d.error||'Failed','error');}
+      }).catch(function(){_repShowToast('Network error','error');});
+  };
+  function _repShowToast(msg,type){
+    var t=document.getElementById('rep-toast');
+    if(!t){t=document.createElement('div');t.id='rep-toast';t.style.cssText='position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s';document.body.appendChild(t);}
+    t.textContent=msg;t.style.background=type==='success'?'rgba(16,185,129,0.15)':'rgba(239,68,68,0.15)';t.style.border='1px solid '+(type==='success'?'rgba(16,185,129,0.4)':'rgba(239,68,68,0.4)');t.style.color=type==='success'?'var(--green)':'var(--red)';t.style.opacity='1';setTimeout(function(){t.style.opacity='0';},3500);
+  }
+  _repLoad();
+  setInterval(_repLoad,30000);
+})();
+{% endif %}
+{% if ak.installed and ak.running %}
+(function(){
+  var AK_BASE='{{ authentik_base_url }}';
+  var D=null,dirty=false,holdRender=false;
+  function esc(s){return escapeHtml(String(s==null?'':s));}
+  // escapeHtml() serializes a text node — it escapes < > & but NOT quotes, so it is
+  // only safe in TEXT position. Group names and usernames here are pushed by the
+  // agency's remote AD/SCIM feed: a name like  Ops" autofocus onfocus="…  would break
+  // out of an attribute and run script in the console admin's session. Every
+  // attribute interpolation below goes through escAttr.
+  function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+  function agencyName(sfx){var a=((D&&D.agencies)||[]).filter(function(x){return x.suffix===sfx;})[0];return a?a.name:sfx;}
+  // Which SCIM attribute carries the agency's unique employee identifier.
+  // Agencies do not all put it in the same place, and we write the spec their
+  // IT implements — so this is configured, never guessed.
+  function fieldOptions(selected){
+    var fields=(D&&D.username_fields)||{};
+    var out='';
+    Object.keys(fields).forEach(function(k){
+      out+='<option value="'+escAttr(k)+'"'+(k===selected?' selected':'')+'>'+esc(k)+' — '+esc(fields[k])+'</option>';
+    });
+    if(selected&&!fields[selected]){
+      out+='<option value="'+escAttr(selected)+'" selected>'+esc(selected)+' (custom)</option>';
+    }
+    return out;
+  }
+  function tplOptions(sfx,selected,emptyLabel){
+    var out='<option value="">'+esc(emptyLabel)+'</option>';
+    ((D&&D.templates)||[]).filter(function(t){return t.agencySuffix===sfx;}).forEach(function(t){
+      out+='<option value="'+escAttr(t.name)+'"'+(t.name===selected?' selected':'')+'>'+esc(t.name)+'</option>';
+    });
+    return out;
+  }
+  function statusStrip(st){
+    if(!st||!st.ts){return '<span style="font-size:12px;color:var(--text-dim)">Never synced &mdash; waiting for the agency to push users (or hit Sync Now).</span>';}
+    var bits=[(st.users_seen||0)+' users',(st.converged||0)+' converged'];
+    if(st.unmapped){bits.push(st.unmapped+' unmapped&rarr;default');}
+    if(st.pinned){bits.push(st.pinned+' pinned');}
+    if(st.renamed){bits.push(st.renamed+' renamed');}
+    if(st.removed){bits.push(st.removed+' channel(s) removed');}
+    if(st.rename_skipped&&st.rename_skipped.length){bits.push(st.rename_skipped.length+' rename skipped');}
+    bits.push((st.changed||0)+' changed last run');
+    var s='<span style="color:var(--cyan);font-family:JetBrains Mono,monospace;font-size:11px">'+bits.join(' &middot; ')+'</span> <span style="color:var(--text-dim);font-size:10px">last sync '+esc(st.ts)+'</span>';
+    if(st.username_preview){s+='<div style="font-size:11px;color:var(--text-dim);margin-top:4px">'+esc(st.username_preview)+'</div>';}
+    if(st.multi_role&&st.multi_role.length){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">multi-role (group union applied): '+esc(st.multi_role.join(', '))+'</div>';}
+    (st.rename_detail||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--green);margin-top:3px">renamed '+esc(r)+'</div>';});
+    // Removals only ever touch channels this bridge granted — a role change
+    // must MOVE someone, not add to what they already had.
+    (st.removed_detail||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--text-dim);margin-top:3px">role change '+esc(r)+'</div>';});
+    // A skipped rename is the guard doing its job: the username is the LDAP bind
+    // identity, so we never rename someone who has already signed in.
+    (st.rename_skipped||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--yellow);margin-top:3px">&#9888; not renamed: '+esc(r)+' &mdash; renaming would break their EUD login; fix by hand if needed</div>';});
+    (st.collisions||[]).forEach(function(c){s+='<div style="font-size:11px;color:var(--red);margin-top:3px">&#9888; username collision: '+esc(c)+'</div>';});
+    (st.warnings||[]).forEach(function(w){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">&#9888; '+esc(w)+'</div>';});
+    return s;
+  }
+  function _idpbToast(msg,type){
+    var t=document.getElementById('idpb-toast');
+    if(!t){t=document.createElement('div');t.id='idpb-toast';t.style.cssText='position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s';document.body.appendChild(t);}
+    t.textContent=msg;t.style.background=type==='success'?'rgba(16,185,129,0.15)':'rgba(239,68,68,0.15)';t.style.border='1px solid '+(type==='success'?'rgba(16,185,129,0.4)':'rgba(239,68,68,0.4)');t.style.color=type==='success'?'var(--green)':'var(--red)';t.style.opacity='1';setTimeout(function(){t.style.opacity='0';},3500);
+  }
+  var btnStyle='padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:JetBrains Mono,monospace';
+  var btnStyleRed='padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:JetBrains Mono,monospace';
+  var thStyle='text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em';
+  function render(){
+    var list=document.getElementById('idpb-list');if(!list||!D)return;
+    var sel=document.getElementById('idpb-agency');
+    if(sel){
+      var cur=sel.value;
+      // An agency that already has a bridge is not offered again — connecting
+      // it twice would just re-show its token and confuse who owns what.
+      var taken={};
+      Object.keys(D.bridges||{}).forEach(function(k){taken[(D.bridges[k]||{}).agency_suffix]=1;});
+      var opts='<option value="">- pick agency -</option>';
+      var avail=0;
+      (D.agencies||[]).forEach(function(a){
+        if(taken[a.suffix])return;
+        avail++;
+        opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';
+      });
+      if(!avail){opts='<option value="">- all agencies connected -</option>';}
+      sel.innerHTML=opts;if(cur){sel.value=cur;}
+      idpbPreview();
+    }
+    if(!D.portal_ok){list.innerHTML='<div style="font-size:12px;color:var(--yellow)">TAK Portal is not reachable &mdash; agencies and templates live there. Install/start TAK Portal first.</div>';return;}
+    var slugs=Object.keys(D.bridges||{});
+    if(!slugs.length){list.innerHTML='<div style="font-size:12px;color:var(--text-dim)">No bridges yet. Pick an agency above and Connect.</div>';return;}
+    var html='';
+    slugs.sort().forEach(function(slug){
+      var b=D.bridges[slug];var st=b.last_status||{};
+      var groups=(st.incoming_groups||[]).slice();
+      var seen={};groups.forEach(function(g){seen[g.name]=1;});
+      Object.keys(b.map||{}).forEach(function(n){if(!seen[n]){groups.push({name:n,members:null});}});
+      groups.sort(function(a,c){return a.name<c.name?-1:1;});
+      var rows='';
+      groups.forEach(function(g){
+        var mapped=(b.map||{})[g.name]||'';
+        rows+='<tr style="border-bottom:1px solid var(--border)">'
+          +'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+esc(g.name)
+          +(mapped?'':' <span style="font-size:9px;color:var(--yellow);background:rgba(234,179,8,0.1);padding:1px 6px;border-radius:4px;border:1px solid rgba(234,179,8,0.3)">unmapped</span>')
+          +'</td>'
+          +'<td style="padding:5px 8px;font-size:12px;color:var(--text-dim)">'+(g.members==null?'-':g.members)+'</td>'
+          +'<td style="padding:5px 8px"><select class="form-input idpb-map-'+escAttr(slug)+'" data-group="'+escAttr(g.name)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,mapped,'- default -')+'</select></td>'
+          +'</tr>';
+      });
+      if(!rows){rows='<tr><td colspan="3" style="padding:6px 8px;font-size:12px;color:var(--text-dim)">No incoming groups yet &mdash; the agency has not pushed groups (or run Sync Now).</td></tr>';}
+      html+='<div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:12px">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px">'
+        +'<div><span style="font-size:13px;font-weight:600;color:var(--text-primary)">'+esc(agencyName(b.agency_suffix))+'</span> '
+        +'<span style="font-size:11px;color:var(--text-dim);font-family:JetBrains Mono,monospace">'+esc(slug)+'</span> '
+        +(b.enabled?'<span class="badge badge-green"><span class="dot dot-pulse"></span>Enabled</span>':'<span class="badge badge-red"><span class="dot"></span>Disabled</span>')
+        +'</div>'
+        +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+        +'<button data-idpb-act="toggle" data-idpb-slug="'+escAttr(slug)+'" data-idpb-en="'+(b.enabled?'0':'1')+'" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
+        +'<button data-idpb-act="sync" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Sync Now</button>'
+        +'<button data-idpb-act="instructions" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Instructions</button>'
+        +'<button data-idpb-act="rotate" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'" title="Issue a new SCIM token. The old one stops working immediately.">New Token</button>'
+        +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0" title="Unticked, Remove only disconnects the console: the SCIM source stays in Authentik and the agency keeps pushing. Ticked, the source is deleted too and their provisioning stops. Either way, users already created are never deleted."><input type="checkbox" id="idpb-delsrc-'+escAttr(slug)+'"> also delete Authentik source <span style="color:var(--text-dim);border:1px solid var(--border);border-radius:50%;width:13px;height:13px;display:inline-flex;align-items:center;justify-content:center;font-size:9px">?</span></label>'
+        +'<button data-idpb-act="delete" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyleRed+'">Remove</button>'
+        +'</div></div>'
+        +'<div id="idpb-out-'+escAttr(slug)+'" style="display:none;margin-bottom:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,0.02)"></div>'
+        +'<div style="margin-bottom:10px">'+statusStrip(st)+'</div>'
+        +'<table style="width:100%;border-collapse:collapse;margin-bottom:10px"><thead><tr>'
+        +'<th style="'+thStyle+'">Incoming group</th><th style="'+thStyle+'">Members</th><th style="'+thStyle+'">TAK template</th>'
+        +'</tr></thead><tbody>'+rows+'</tbody></table>'
+        +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+        +'<label style="font-size:12px;color:var(--text-dim);margin:0">Username field:</label>'
+        +'<select class="form-input" id="idpb-field-'+escAttr(slug)+'" style="width:auto;min-width:200px">'+fieldOptions(b.username_field)+'</select>'
+        +'<label style="font-size:12px;color:var(--text-dim);margin:0">Default template (unmapped groups):</label>'
+        +'<select class="form-input" id="idpb-default-'+escAttr(slug)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,b.default_template,'- none -')+'</select>'
+        +'<button class="btn-primary" data-idpb-act="save" data-idpb-slug="'+escAttr(slug)+'">Save Mapping</button>'
+        +'</div></div>';
+    });
+    list.innerHTML=html;
+  }
+  // Never leave the card sitting on "Loading..." — a silent return here made a
+  // failed status call indistinguishable from a slow one, which cost a real
+  // debugging session on the NUC. Any failure now names itself in the card.
+  function _idpbFail(msg,detail){
+    var list=document.getElementById('idpb-list');
+    if(!list)return;
+    var sel=document.getElementById('idpb-agency');
+    if(sel&&/Loading/.test(sel.innerHTML)){sel.innerHTML='<option value="">- unavailable -</option>';}
+    list.innerHTML='<div style="font-size:12px;color:var(--red)">&#9888; '+esc(msg)+'</div>'
+      +(detail?'<div style="font-size:11px;color:var(--text-dim);margin-top:4px;font-family:JetBrains Mono,monospace">'+esc(detail)+'</div>':'')
+      +'<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Retrying every 30s. If this persists, check '
+      +'<code>journalctl -u takwerx-console</code> and reload the page (an expired SSO session shows up here as 401).</div>';
+  }
+  function load(force){
+    fetch('/api/authentik/idp-bridge/status').then(function(r){
+      if(!r.ok){throw new Error('HTTP '+r.status+(r.status===401?' — not authenticated; reload the page':''));}
+      return r.json();
+    }).then(function(d){
+      if(!d||!d.ok){_idpbFail('Identity Bridge status unavailable.',(d&&d.error)||'server returned ok=false');return;}
+      D=d;
+      if((force||!dirty)&&!holdRender){dirty=false;render();}
+    }).catch(function(e){_idpbFail('Could not load Identity Bridge status.',e&&e.message);});
+  }
+  var _listEl=document.getElementById('idpb-list');
+  if(_listEl){_listEl.addEventListener('change',function(){dirty=true;});}
+  // Buttons carry data-idpb-act and are dispatched here rather than via an
+  // inline onclick that interpolates slug. Building such an onclick needs an
+  // escaped quote, and this template is a Python triple-quoted literal, so a
+  // source-level backslash-quote collapses to a bare quote before the browser
+  // ever sees it: two adjacent string literals, SyntaxError, and EVERY script
+  // on the page dies. That is what broke this card on the NUC 2026-08-01.
+  // Nothing here needs escaping, so it cannot recur, and slug never lands in
+  // executable position.
+  if(_listEl){_listEl.addEventListener('click',function(e){
+    var t=e.target;
+    while(t&&t!==_listEl&&!t.getAttribute('data-idpb-act')){t=t.parentElement;}
+    if(!t||t===_listEl)return;
+    var act=t.getAttribute('data-idpb-act'),slug=t.getAttribute('data-idpb-slug');
+    if(!act||!slug)return;
+    if(act==='toggle'){idpbToggle(slug,t.getAttribute('data-idpb-en')==='1');}
+    else if(act==='sync'){idpbSync(slug);}
+    else if(act==='instructions'){idpbInstructions(slug);}
+    else if(act==='delete'){idpbDelete(slug);}
+    else if(act==='save'){idpbSave(slug);}
+    else if(act==='rotate'){idpbRotate(slug);}
+  });}
+  // Placement + token are immutable once a portal agency exists (no edit path),
+  // so showing the resulting username shape here is the operator's only chance
+  // to notice a wrong one before officers start landing under it.
+  window.idpbPreview=function(){
+    var el=document.getElementById('idpb-preview');
+    var sfx=(document.getElementById('idpb-agency')||{}).value;
+    if(!el)return;
+    var a=((D&&D.agencies)||[]).filter(function(x){return x.suffix===sfx;})[0];
+    if(!sfx||!a){el.style.display='none';return;}
+    el.style.display='block';
+    if(!a.token){
+      el.innerHTML='<span style="color:var(--yellow)">&#9888; '+esc(a.name)+' has no Username Agency Identifier set in TAK Portal, so usernames cannot be derived. Set it on the agency first &mdash; it cannot be changed after the agency is created.</span>';
+      return;
+    }
+    var amb=(a.ambiguous_with||[]);
+    el.innerHTML='<strong>'+esc(a.username_preview)+'</strong>'
+      +'<div style="color:var(--text-dim);margin-top:4px">Identifier <code>'+esc(a.token)+'</code> ('+esc(a.placement)+'). '
+      +'This is fixed when the agency is created and cannot be changed later &mdash; check it now.</div>'
+      +(amb.length?'<div style="color:var(--red);margin-top:6px">&#9888; This identifier is ambiguous with '+esc(amb.join(', '))
+        +'. Usernames are joined without a separator, so those agencies share a namespace and their users can collide. '
+        +'Consider a distinct identifier before connecting (it cannot be changed later).</div>':'');
+  };
+  window.idpbCreate=function(){
+    var sfx=(document.getElementById('idpb-agency')||{}).value;
+    if(!sfx){_idpbToast('Pick an agency first.','error');return;}
+    var btn=document.getElementById('idpb-create-btn');btn.disabled=true;btn.textContent='Connecting...';
+    fetch('/api/authentik/idp-bridge/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agency_suffix:sfx})})
+      .then(function(r){return r.json();}).then(function(d){
+        btn.disabled=false;btn.textContent='Connect Agency';
+        if(!d.ok){
+          _idpbToast(d.error||'Failed','error');
+          if(d.ambiguous_with&&d.ambiguous_with.length){
+            var pv=document.getElementById('idpb-preview');
+            if(pv){pv.style.display='block';pv.innerHTML='<span style="color:var(--red)">&#9888; '+esc(d.error)+'</span>';}
+          }
+          return;
+        }
+        var p=document.getElementById('idpb-token-panel');
+        p.style.display='block';
+        p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'
+          +'<div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:8px">Agency connected. Give these two values to their IT team &mdash; the token is shown ONCE, copy it now:</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token||'(could not fetch token - check Authentik)')+'</div>'
+          +(d.mapping_warning?'<div style="font-size:12px;color:var(--red);margin-bottom:10px">&#9888; '+esc(d.mapping_warning)+'</div>':'')
+          +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'+esc(d.instructions||'')+'</pre>';
+        dirty=false;setTimeout(function(){load(true);},1200);
+      }).catch(function(){btn.disabled=false;btn.textContent='Connect Agency';_idpbToast('Network error','error');});
+  };
+  // The panel shows a live credential — let the operator clear it off screen
+  // once they have copied it, rather than leaving it up until a page reload.
+  // The panel sits at the TOP of the card while the buttons that fill it are in
+  // the bridge boxes below, so writing to it without scrolling reads as "the
+  // button does nothing". Every writer calls this.
+  function _idpbShowPanel(html){
+    var p=document.getElementById('idpb-token-panel');
+    if(!p)return;
+    p.style.display='block';
+    holdRender=true;
+    p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'+html;
+    if(p.scrollIntoView){p.scrollIntoView({behavior:'smooth',block:'center'});}
+  }
+  // Render a result inside the agency box the operator clicked in. The shared
+  // panel at the top of the card is only right for Connect, where the button is
+  // genuinely up there; using it for per-agency actions threw the operator to
+  // the top of the page away from what they were doing.
+  function _idpbShowIn(slug, html){
+    var el=document.getElementById('idpb-out-'+slug);
+    if(!el){_idpbShowPanel(html);return;}   // fall back if the box is not rendered
+    // The 30s refresh re-renders the whole list, which would erase a token the
+    // operator is still copying — and it is shown exactly once. Hold rendering
+    // until they dismiss it.
+    holdRender=true;
+    el.style.display='block';
+    el.innerHTML='<button onclick="idpbHideIn(&quot;'+escAttr(slug)+'&quot;)" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'+html;
+  }
+  window.idpbHideIn=function(slug){
+    var el=document.getElementById('idpb-out-'+slug);
+    if(el){el.style.display='none';el.innerHTML='';}
+    holdRender=false;
+  };
+  window.idpbHideToken=function(){
+    var p=document.getElementById('idpb-token-panel');
+    if(p){p.style.display='none';p.innerHTML='';}
+    holdRender=false;
+  };
+  window.idpbRotate=function(slug){
+    if(!confirm('Issue a NEW token for "'+slug+'"? The current token stops working immediately, and this agency roster sync will FAIL until their IT pastes the new value into Entra.'))return;
+    fetch('/api/authentik/idp-bridge/rotate-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(!d.ok){_idpbToast(d.error||'Failed','error');return;}
+        _idpbShowIn(slug,
+           '<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:8px">New token issued &mdash; shown ONCE, copy it now:</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token)+'</div>'
+          +'<div style="font-size:11px;color:var(--yellow)">'+esc(d.note||'')+'</div>');
+        _idpbToast('Token rotated.','success');
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbSave=function(slug){
+    var map={};
+    document.querySelectorAll('select.idpb-map-'+slug).forEach(function(s){
+      if(s.value){map[s.getAttribute('data-group')]=s.value;}
+    });
+    var defEl=document.getElementById('idpb-default-'+slug);
+    var fldEl=document.getElementById('idpb-field-'+slug);
+    fetch('/api/authentik/idp-bridge/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,map:map,default_template:defEl?defEl.value:'',username_field:fldEl?fldEl.value:''})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Mapping saved - syncing now.','success');dirty=false;setTimeout(function(){load(true);},2500);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbToggle=function(slug,en){
+    fetch('/api/authentik/idp-bridge/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,enabled:en})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Bridge '+(en?'enabled':'disabled')+'.','success');dirty=false;setTimeout(function(){load(true);},800);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbSync=function(slug){
+    _idpbToast('Syncing...','success');
+    fetch('/api/authentik/idp-bridge/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){
+          var st=(d.results||{})[slug]||{};
+          _idpbToast('Sync done: '+(st.users_seen||0)+' users, '+(st.changed||0)+' changed.',st.ok?'success':'error');
+          dirty=false;load(true);
+        }else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbInstructions=function(slug){
+    var b=(D&&D.bridges||{})[slug];
+    if(!b){_idpbToast('No bridge config for '+slug,'error');return;}
+    var url=AK_BASE+'/source/scim/'+(b.scim_source_slug||slug)+'/v2';
+    var shape=b.username_preview||'';
+    _idpbShowIn(slug,
+      '<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">'+esc(agencyName(b.agency_suffix))+' &mdash; instruction sheet</div>'
+      +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(url)+'</div>'
+      // The old text said "re-run Connect Agency to see the token again" — that
+      // stopped being possible when connected agencies were removed from the
+      // picker. New Token is the way now.
+      +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Token: shown once, at connect time. It cannot be read back &mdash; use <strong>New Token</strong> above to issue a replacement (that invalidates the current one).</div>'
+      +(shape?'<div style="font-size:11px;color:var(--text-primary);margin-bottom:10px">'+esc(shape)+'</div>':'')
+      +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'
+      +'In Microsoft Entra: Enterprise Applications - New application - Create your own application - Provisioning - Automatic. '
+      +'Paste the SCIM URL and the token, then assign the directory groups to send and turn provisioning On.<br><br>'
+      +'Two things their IT must get right:<br>'
+      +'  1. Send a UNIQUE employee identifier (badge or employee number) in the "'+esc(b.username_field||'employeeNumber')+'" attribute. Not names - two people called J. Smith would share one TAK account.<br>'
+      +'  2. Put each person in exactly ONE role group. Someone in two has no single template, so we flag them and assign nothing.</pre>');
+  };
+  window.idpbDelete=function(slug){
+    var delSrcEl=document.getElementById('idpb-delsrc-'+slug);
+    var delSrc=!!(delSrcEl&&delSrcEl.checked);
+    // No apostrophes in these strings on purpose — see the delegated-click note
+    // above: a source-level escaped quote collapses and breaks the whole script.
+    if(!confirm('Remove bridge "'+slug+'"?'+(delSrc?' The Authentik SCIM source will ALSO be deleted, so this agency stops pushing.':' The Authentik SCIM source is kept (agency pushes keep landing in Authentik).')+' Users and groups already in Authentik are never touched.')){return;}
+    fetch('/api/authentik/idp-bridge/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,delete_source:delSrc})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Bridge removed'+(d.source_deleted?' (source deleted).':'.'),'success');dirty=false;load(true);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  load(true);
+  setInterval(function(){load(false);},30000);
+})();
+{% endif %}
+// ── Collapsible sections ────────────────────────────────────────────────────
+// Any .section-title carrying data-collapse="<id>" becomes a toggle for the
+// element that follows it. data-collapsed="1" is the default state; the
+// operator's choice is remembered per-section so a page they collapsed stays
+// collapsed on the next visit.
+(function(){
+  function apply(h, body, open){
+    body.forEach(function(el){ el.style.display = open ? '' : 'none'; });
+    var car = h.querySelector('.sect-caret');
+    if(car){ car.textContent = open ? '▾' : '▸'; }
+    h.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  document.querySelectorAll('.section-title[data-collapse]').forEach(function(h){
+    // A section is everything between this header and the next one — Container
+    // Logs is a toolbar AND a log box, and hiding only the first element left
+    // the logs on screen with a collapsed caret above them.
+    var body = [];
+    for(var n = h.nextElementSibling; n && !n.classList.contains('section-title'); n = n.nextElementSibling){
+      body.push(n);
+    }
+    if(!body.length) return;
+    var key = 'idpb-sect2-' + h.getAttribute('data-collapse');
+    var stored = null;
+    try { stored = localStorage.getItem(key); } catch(e) {}
+    var open = stored === null ? h.getAttribute('data-collapsed') !== '1' : stored === 'open';
+    var car = document.createElement('span');
+    car.className = 'sect-caret';
+    car.style.cssText = 'display:inline-block;width:14px;color:var(--text-dim);font-size:11px';
+    h.insertBefore(car, h.firstChild);
+    h.style.cursor = 'pointer';
+    h.setAttribute('role', 'button');
+    h.setAttribute('tabindex', '0');
+    h.title = 'Click to show/hide';
+    apply(h, body, open);
+    function toggle(){
+      open = !open;
+      apply(h, body, open);
+      try { localStorage.setItem(key, open ? 'open' : 'closed'); } catch(e) {}
+    }
+    h.addEventListener('click', toggle);
+    h.addEventListener('keydown', function(e){
+      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); }
+    });
+  });
+})();
+</script>
+</body></html>

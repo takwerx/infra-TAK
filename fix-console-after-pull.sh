@@ -12,9 +12,9 @@ if [ ! -f "$SERVICE_FILE" ]; then
     exit 1
 fi
 
-# Ensure gunicorn is installed (added in v0.2.0)
-"$INSTALL_DIR/.venv/bin/pip" install --quiet gunicorn 2>/dev/null || \
-    "$INSTALL_DIR/.venv/bin/pip" install gunicorn
+# Ensure deps are installed at the pinned versions (requirements.txt since v10.1.19)
+"$INSTALL_DIR/.venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt" 2>/dev/null || \
+    "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
 # Ensure CONFIG_DIR is set in the unit so auth is always read from this install dir
 if ! grep -q 'Environment=CONFIG_DIR=' "$SERVICE_FILE" 2>/dev/null; then

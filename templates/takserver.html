@@ -1,0 +1,885 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>TAK Server — infra-TAK</title>
+<style>
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0');
+*{margin:0;padding:0;box-sizing:border-box}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;word-wrap:normal;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow:visible;line-height:1.35}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+:root{--bg-primary:#0a0e17;--bg-card:rgba(15,23,42,0.7);--bg-card-hover:rgba(15,23,42,0.9);--border:rgba(59,130,246,0.1);--border-hover:rgba(59,130,246,0.3);--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--accent-glow:rgba(59,130,246,0.15);--green:#10b981;--red:#ef4444;--yellow:#f59e0b;--cyan:#06b6d4}
+body{font-family:'DM Sans',sans-serif;background:var(--bg-primary);color:var(--text-primary);min-height:100vh}
+body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-image:linear-gradient(rgba(59,130,246,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,0.02) 1px,transparent 1px);background-size:60px 60px;pointer-events:none;z-index:0}
+.top-bar{position:fixed;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),var(--cyan),transparent);z-index:100}
+.header{position:relative;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:20px 32px;border-bottom:1px solid var(--border)}
+.header-left{display:flex;align-items:center;gap:14px}
+.header-icon{width:40px;height:40px;background:linear-gradient(135deg,#1e40af,#0891b2);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
+.header-title{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:18px}
+.header-subtitle{font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.header-right{display:flex;align-items:center;gap:16px}
+.os-badge{background:var(--bg-card);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)}
+.btn-logout,.btn-back{color:var(--text-dim);text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:12px;padding:6px 14px;border:1px solid var(--border);border-radius:8px;transition:all 0.2s}
+.btn-logout:hover,.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;font-weight:600}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
+.metric-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
+.footer{text-align:center;padding:24px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}
+.form-field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);font-weight:600;margin-bottom:6px}
+.form-field input[type="text"],.form-field input[type="password"]{width:100%;padding:10px 14px;background:rgba(15,23,42,0.6);border:1px solid rgba(59,130,246,0.2);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px}
+.form-field input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+@media(max-width:768px){.metrics-bar{grid-template-columns:repeat(2,1fr)}.modules-grid{grid-template-columns:1fr}.header{padding:16px 20px}.main{padding:20px}}
+
+@keyframes spin{to{transform:rotate(360deg)}}
+.upload-area{border:2px dashed var(--border);border-radius:12px;padding:40px;text-align:center;cursor:pointer;transition:all 0.3s;background:rgba(15,23,42,0.3);margin-bottom:20px}
+.upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:var(--accent-glow)}
+.upload-icon{font-size:40px;margin-bottom:12px}.upload-text{font-size:16px;color:var(--text-secondary);margin-bottom:8px}.upload-hint{font-size:13px;color:var(--text-dim);line-height:1.6}
+.progress-item{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px}
+.progress-bar-outer{width:100%;height:4px;background:rgba(59,130,246,0.1);border-radius:2px;margin-top:8px;overflow:hidden}
+.progress-bar-inner{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width 0.3s}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.status-banner{background:var(--bg-card);border:1px solid var(--border);border-top:none;border-radius:12px;padding:24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between}
+.status-info{display:flex;align-items:center;gap:16px}
+.status-icon{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px}
+.status-icon.running{background:rgba(16,185,129,0.1)}.status-icon.stopped{background:rgba(239,68,68,0.1)}.status-icon.not-installed{background:rgba(71,85,105,0.2)}
+.status-text{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600}
+.status-detail{font-size:13px;color:var(--text-dim);margin-top:4px}
+.status-logo-wrap{display:flex;align-items:center;gap:10px}
+.status-logo{height:36px;width:auto;max-width:100px;object-fit:contain}
+.status-name{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:18px;color:var(--text-primary)}
+.controls{display:flex;gap:10px}
+.cert-downloads{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}
+.cert-btn{padding:10px 20px;border-radius:8px;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:all 0.2s}
+.cert-btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
+.cert-btn-secondary{background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px}
+.uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+.uninstall-progress-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)}
+body{display:flex;flex-direction:row;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.page-header{margin-bottom:28px}
+.page-header h1{font-size:22px;font-weight:700}
+.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:500;font-family:'JetBrains Mono',monospace}
+.badge-green{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block;flex-shrink:0}
+.dot-pulse{animation:tak-badge-pulse 2s infinite}
+@keyframes tak-badge-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+</style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}" data-tak-container="{{ 'true' if tak_is_container else 'false' }}" data-tak-native-ext="{{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm' }}">
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header"><h1><img src="{{ tak_logo_url }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px;object-fit:contain"> TAK Server</h1><p>Team Awareness Kit Server</p></div>
+<div class="status-banner" id="status-banner">
+{% if deploying %}
+<div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">TAK Server installation in progress</div></div></div>
+<div class="controls"><button class="control-btn btn-stop" onclick="cancelDeploy()">✗ Cancel</button></div>
+{% elif tak.installed and tak.running %}
+<div class="status-info"><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">TAK Server is active{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
+{% elif tak.installed %}
+<div class="status-info"><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">TAK Server is installed but not running{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
+{% else %}
+<div class="status-info"><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Upload package files from tak.gov to deploy</div></div></div>
+{% endif %}
+</div>
+
+{% if tak.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">{% if tak.running %}<button class="control-btn" onclick="takControl('restart')">↻ Restart</button>{% if two_server_mode %}<button class="control-btn" onclick="takControl('restart','database')" title="Restart PostgreSQL on Server One ({{ s1_host }})">↻ Restart DB ({{ s1_host }})</button><button class="control-btn" onclick="takControl('restart','both')" title="Restart both TAK Server and remote PostgreSQL">↻ Restart Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn" title="Patch CoreConfig.xml with current LDAP/DB settings and restart TAK Server">🔧 Patch CoreConfig</button><button class="control-btn btn-stop" onclick="takControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="takControl('start')">▶ Start</button>{% if two_server_mode %}<button class="control-btn btn-start" onclick="takControl('start','database')" title="Start PostgreSQL on Server One ({{ s1_host }})">▶ Start DB ({{ s1_host }})</button><button class="control-btn btn-start" onclick="takControl('start','both')" title="Start both TAK Server and remote PostgreSQL">▶ Start Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}</div>
+{% if two_server_mode %}
+<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;flex-wrap:wrap;gap:8px">
+<label for="sync-db-password-input" style="font-size:12px;color:var(--text-secondary)">DB password (from Server One):</label>
+<input type="password" id="sync-db-password-input" placeholder="Paste or leave blank to use saved" autocomplete="off" style="width:200px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px" />
+<span style="font-size:11px;color:var(--text-dim)">Paste from Server One if 8443/8446 fail; leave blank to use saved.</span>
+</div>
+{% endif %}
+<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">Unattended-upgrades (each host) are controlled on the <a href="/" style="color:var(--cyan);text-decoration:none">main dashboard</a>.</div>
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">JVM heap</div>
+<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server runs 5 Java processes (API, Messaging, Config, Plugin Manager, Retention), each with its own heap limit. This button distributes your chosen total across all 5 processes proportionally (same ratios as the TAK Server defaults) via /etc/default/takserver, then restarts TAK Server.</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
+<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(total across 5 processes)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
+<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+<button type="button" id="set-heap-btn" onclick="setTakHeap()" class="control-btn">Set recommended ({{ recommended_heap_gb }} GB)</button>
+<label style="font-size:11px;color:var(--text-dim);margin-left:8px">or set to:</label>
+<input type="number" id="heap-custom-gb" min="2" max="32" value="{{ current_heap_gb or recommended_heap_gb }}" style="width:52px;padding:6px 8px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px" />
+<span style="font-size:11px;color:var(--text-dim)">GB</span>
+<button type="button" id="set-heap-apply-btn" onclick="setTakHeapCustom()" class="control-btn">Apply</button>
+</div>
+<span id="set-heap-msg" style="font-size:12px;color:var(--text-dim);display:block;margin-top:4px"></span>
+</div>
+</div>
+{% endif %}
+
+{% if deploying or deploy_done or deploy_error %}
+<div class="section-title">Deployment Log</div>
+<div id="deploy-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:500px;overflow-y:auto;line-height:1.7;white-space:pre-wrap">Reconnecting to deployment log...</div>
+<div id="deploy-log-area" style="display:block"></div>
+{% if deploy_error %}
+<div style="margin-top:16px;padding:16px 20px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--red);font-weight:600;margin-bottom:8px">✗ Deployment failed</div>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The install left a broken package state on disk. Click <strong>Clean up &amp; retry</strong> to purge it — any corrupted uploads will be deleted automatically. Then re-upload a fresh copy from <a href="https://tak.gov/products/tak-server" target="_blank" style="color:var(--cyan)">tak.gov</a> and deploy again.</p>
+<button type="button" id="tak-purge-btn" onclick="takPurgeFailed()" style="padding:10px 22px;background:linear-gradient(135deg,#7f1d1d,#b91c1c);color:#fff;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">🧹 Clean up &amp; retry</button>
+<span id="tak-purge-msg" style="margin-left:12px;font-size:13px;color:var(--text-dim)"></span>
+</div>
+<script>
+function takPurgeFailed(){
+  var btn=document.getElementById('tak-purge-btn');
+  var msg=document.getElementById('tak-purge-msg');
+  if(btn){btn.disabled=true;btn.textContent='Cleaning up…';}
+  fetch('/api/takserver/purge-failed-install',{method:'POST',headers:{'Content-Type':'application/json'}})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.success){
+        if(msg) msg.textContent='Done — page reloading…';
+        setTimeout(function(){window.location.reload();},1200);
+      } else {
+        if(btn){btn.disabled=false;btn.textContent='🧹 Clean up & retry';}
+        if(msg) msg.textContent=d.error||'Cleanup failed.';
+      }
+    })
+    .catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='🧹 Clean up & retry';}
+      if(msg) msg.textContent='Request failed.';
+    });
+}
+</script>
+{% elif deploy_done %}
+<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span id="deploy-cert-password-inline" style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
+{% endif %}
+{% elif tak.installed %}
+{% if show_connect_ldap %}
+<div class="card" style="border-color:rgba(59,130,246,.35);background:rgba(59,130,246,.06);margin-bottom:24px">
+<div class="card-title">🔗 Connect TAK Server to LDAP</div>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">Authentik is deployed. Connect TAK Server to the same LDAP so users can sign in with their Authentik accounts. This patches CoreConfig.xml and restarts TAK Server once.</p>
+<button type="button" id="connect-ldap-btn" onclick="connectLdap()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Connect TAK Server to LDAP</button>
+<div id="connect-ldap-msg" style="margin-top:12px;font-size:13px;color:var(--text-secondary)"></div>
+</div>
+{% elif ldap_connected and modules.get('authentik', {}).get('installed') %}
+<div class="card" style="border-color:rgba(16,185,129,.35);background:rgba(16,185,129,.06);margin-bottom:24px">
+<div style="display:flex;align-items:center;gap:12px">
+<span style="color:var(--green);font-size:18px">✓</span><span style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--green);font-weight:600">LDAP Connected to Authentik</span>
+</div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:8px">CoreConfig.xml patched · Service account: adm_ldapservice · Base DN: DC=takldap · Port 389</div>
+<div id="ldap-drift-banner" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.5);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#f87171">⚠ <span id="ldap-drift-msg"></span></div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px">webadmin superuser in Authentik: <span id="webadmin-superuser-status" style="color:var(--text-dim)">Checking...</span></div>
+<div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<button type="button" id="resync-ldap-btn" onclick="resyncLdap()" style="padding:8px 16px;background:rgba(16,185,129,.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Resync LDAP to TAK Server</button>
+<button type="button" id="sync-webadmin-btn" onclick="syncWebadmin()" style="padding:8px 16px;background:rgba(59,130,246,.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Sync webadmin to Authentik</button>
+<span id="sync-webadmin-msg" style="font-size:12px;color:var(--text-dim)"></span><span id="resync-ldap-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<p style="font-size:11px;color:var(--text-dim);margin-top:6px;margin-bottom:4px"><strong>Resync LDAP</strong> — Re-runs the full flow (fix blueprint if needed, restart Authentik worker, ensure service account &amp; webadmin, sync CoreConfig). Use after pulling console updates or if QR/login fails.</p>
+<p style="font-size:11px;color:var(--text-dim);margin-top:0;margin-bottom:4px"><strong>Sync webadmin</strong> — Pushes the 8446 password from settings into Authentik and recreates the LDAP outpost so the new password is honored immediately (flushes bind cache). Use after changing the webadmin password.</p>
+<div style="margin-top:14px;padding:12px 14px;background:rgba(59,130,246,.06);border:1px solid var(--border);border-radius:8px">
+<div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px"><strong>Change webadmin password</strong> (for 8446 login)</div>
+<div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
+<input type="password" id="set-webadmin-pw" placeholder="New password" style="max-width:180px;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px">
+<input type="password" id="set-webadmin-pw-confirm" placeholder="Confirm" style="max-width:180px;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px">
+<button type="button" id="set-webadmin-pw-btn" onclick="setWebadminPassword()" style="padding:8px 16px;background:rgba(59,130,246,.25);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">Save password</button>
+<span id="set-webadmin-pw-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Saving updates TAK Server flat-file (8446 login). Click <strong>Sync webadmin</strong> to also update Authentik and recreate the LDAP outpost.</div>
+</div>
+<div id="resync-notice" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--yellow)">TAK Portal user list may take a short moment to repopulate.</div>
+</div>
+{% endif %}
+<div class="section-title">Access</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
+<a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
+<a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
+<a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
+<a href="{{ authentik_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 Authentik{% if not settings.get('fqdn') %} :9090{% endif %}</a>
+</div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">8446 login: <span style="color:var(--cyan)">webadmin</span> · <button type="button" onclick="showWebadminPassword()" id="webadmin-pw-btn" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">🔑 Show Password</button> <span id="webadmin-pw-display" style="color:var(--green);user-select:all;display:none"></span></div>
+</div>
+<div class="section-title">Services</div>
+<div id="services-panel" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div id="services-list" style="font-family:'JetBrains Mono',monospace;font-size:13px">Loading services...</div>
+</div>
+{% if two_server_mode and s1_host %}
+<div style="margin-bottom:24px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:8px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="tak-remote-host-ip">{{ s1_host }}</span></div>
+<div class="section-title" style="margin-top:12px;margin-bottom:8px">REMOTE HOST HEALTH</div>
+<div class="metrics-bar" id="tak-remote-metrics-bar">
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="tak-remote-cpu-value">—</div></div>
+<div class="metric-card"><div class="metric-label">MEMORY</div><div class="metric-value" id="tak-remote-ram-value">—</div><div class="metric-detail" id="tak-remote-ram-detail"></div></div>
+<div class="metric-card"><div class="metric-label">DISK</div><div class="metric-value" id="tak-remote-disk-value">—</div><div class="metric-detail" id="tak-remote-disk-detail"></div></div>
+<div class="metric-card"><div class="metric-label">UPTIME</div><div class="metric-value" id="tak-remote-uptime-value" style="font-size:18px">—</div></div>
+</div>
+</div>
+{% endif %}
+{% if two_server_mode and s1_host and tak.installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="takToggleDbMigrate()" id="tak-db-migrate-header">
+<span class="section-title" style="margin-bottom:0">Migrate database to new Server One</span>
+<span id="tak-db-migrate-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease{% if migrating or migrate_done or migrate_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
+</div>
+<div id="tak-db-migrate-body" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px"><span style="color:var(--yellow);font-weight:600">Automated migration.</span> Copies the <code style="font-size:12px">cot</code> database from the current Server One (<span style="color:var(--cyan)">{{ s1_host }}</span>) to a <strong>new</strong> host, updates CoreConfig and saved settings, and restarts TAK Server.</p>
+<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px"><strong>Steps:</strong> (1) Enter the <em>new</em> host below. (2–3) <strong>Setup SSH key</strong> and <strong>Copy key to new host</strong> (same as Split Server Wizard). (4) <strong>Deploy Server One (DB) on new host</strong> — installs PostgreSQL + <code>takserver-database</code> on that IP using your uploaded <code>.deb</code>; your <strong>saved</strong> Server One stays the <em>current</em> DB until migration finishes. (5) <strong>Start migration</strong> copies <code>cot</code> from the current Server One to the new host and <em>then</em> switches settings + Core to the new IP. <strong>Start migration</strong> does not install packages — it only dumps/restores + reconfigures.</p>
+<div id="db-migrate-deb-panel" style="margin-bottom:14px;padding:14px;background:rgba(234,179,8,0.06);border:1px solid rgba(234,179,8,0.35);border-radius:10px">
+<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:6px">takserver-database .deb (steps 4–5)</div>
+<div id="db-migrate-deb-status" style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5;font-family:'JetBrains Mono',monospace">Loading upload status…</div>
+<div id="db-migrate-upload-area" class="upload-area" style="padding:14px 16px;cursor:pointer;margin:0" onclick="document.getElementById('db-migrate-file-input').click()" ondrop="dbMigrateUploadDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+<input type="file" id="db-migrate-file-input" accept=".deb" style="display:none" onchange="dbMigrateFileInputChange(event)" />
+<span style="font-size:12px;color:var(--text-secondary)">Drop <strong style="color:var(--cyan)">takserver-database</strong> .deb here or click to browse — same upload folder as deploy/upgrade if you already added it there.</span>
+</div>
+<div id="db-migrate-upload-progress" style="margin-top:8px"></div>
+</div>
+<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px">
+<div class="form-field" style="min-width:200px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">New Server One host (IP or DNS)</label><input type="text" id="db-migrate-new-host" placeholder="e.g. 203.0.113.50" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
+<div class="form-field" style="min-width:140px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH user (optional)</label><input type="text" id="db-migrate-ssh-user" placeholder="root" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
+<div class="form-field" style="min-width:100px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH port</label><input type="number" id="db-migrate-ssh-port" placeholder="22" min="1" max="65535" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
+</div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
+<button type="button" onclick="dbMigrateEnsureSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">2. Setup SSH key</button>
+<button type="button" onclick="dbMigrateInstallSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">3. Copy key to new host</button>
+<button type="button" onclick="dbMigrateDeployServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">4. Deploy Server One (DB) on new host</button>
+<span style="font-size:11px;color:var(--text-dim);max-width:100%">Steps 2–3: <code>sshpass</code> same as wizard. Step 4 &amp; Start migration: uploaded <code>takserver-database</code> .deb must match <code>dpkg-query</code> version on the <strong>current</strong> Server One (same release as production DB). Saved “current” Server One host is not changed until migration completes.</span>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+<button type="button" id="db-migrate-start-btn" onclick="startDbMigrate()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Start migration</button>
+<span id="db-migrate-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="db-migrate-log-wrap" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};margin-top:8px">
+<div class="section-title" style="font-size:13px">Migration log</div>
+<div id="db-migrate-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if migrating %}Starting...{% else %}{% if migrate_done %}Done.{% elif migrate_error %}Failed.{% endif %}{% endif %}</div>
+{% if migrate_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Migration complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to refresh Server One display. Decommission the old DB host when ready. Guard Dog remote DB config is synced automatically; if <strong>Remote Database</strong> still looks wrong, open <a href="/guarddog" style="color:var(--cyan)">Guard Dog</a> → <strong>Deploy health agent</strong> or <strong>Update Guard Dog</strong>.</p>{% endif %}
+</div>
+</div>
+</div>
+{% endif %}
+{% if tak.installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="takToggleUpdate()" id="tak-update-header">
+<span class="section-title" style="margin-bottom:0">Update TAK Server</span>
+<span id="tak-update-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease{% if upgrading or upgrade_done or upgrade_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
+</div>
+<div id="tak-update-body" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+{% if two_server_mode %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px"><span style="color:var(--cyan);font-weight:600">Two-server mode detected.</span> Upload <strong>both</strong> the <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} packages from tak.gov. The update will upgrade the core on this host first, then the database on Server One ({{ s1_host }}) via SSH.</p>
+{% elif tak_is_container %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-docker-X.X-RELEASE-XX.zip</span> from tak.gov, upload it below, then click Update. This rebuilds the TAK Server container image from the new bundle and restarts it &mdash; your <strong>database and certificates are preserved</strong>.</p>
+{% elif 'ubuntu' in settings.get('os_type', '') %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
+{% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-X.X-RELEASE-XX.noarch.rpm</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">dnf install ./package.rpm</span> and restarts TAK Server &mdash; your <strong>database is preserved</strong>.</p>
+{% endif %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8?</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">5.8 includes a PostgreSQL database migration (15 to 18). This console will <strong>block 5.8 installs</strong> until guided-upgrade support ships in an upcoming release. Uploading a 5.8 package is safe &mdash; the update itself is what is refused.</div>
+</div>
+<div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+<input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
+<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>
+<div id="upgrade-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
+</div>
+<div id="upgrade-progress-area" style="margin-bottom:16px"></div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<button type="button" id="tak-update-btn" onclick="startTakUpdate()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Update TAK Server</button>
+<span id="tak-update-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="upgrade-log-wrap" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};margin-top:20px">
+<div class="section-title">Update log</div>
+<div id="upgrade-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if upgrading %}Connecting...{% else %}{% if upgrade_done %}Done.{% elif upgrade_error %}Update failed.{% endif %}{% endif %}</div>
+{% if upgrade_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Update complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to see the new version.</p>{% endif %}
+</div>
+</div>
+</div>
+{% endif %}
+{% if tak.installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takTogglePlugins()" id="tak-plugins-header">
+<span class="section-title" style="margin-bottom:0">TAK Server Plugins</span>
+<span id="tak-plugins-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="tak-plugins-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Plugin JARs are loaded from <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">/opt/tak/lib/</span>. Upload a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> to install a plugin, or a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span> to install a config file. TAK Server must be restarted after any change.</p>
+<div id="tak-plugins-restart-banner" style="display:none;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.35);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:none;align-items:center;justify-content:space-between;gap:12px">
+<span style="font-size:13px;color:var(--yellow)">&#9888; Restart TAK Server to apply plugin changes.</span>
+<button type="button" id="tak-plugin-restart-btn" onclick="takPluginRestartNow(this)" style="padding:7px 16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">&#8635; Restart Now</button>
+</div>
+<div style="margin-bottom:20px">
+<div class="section-title" style="margin-bottom:10px">Installed Plugins</div>
+<div id="tak-plugins-list" style="font-size:13px;color:var(--text-dim)">Loading...</div>
+</div>
+<div class="section-title" style="margin-bottom:10px">Install Plugin</div>
+<div class="upload-area" id="tak-plugin-upload-area" style="padding:24px;margin-bottom:12px" onclick="document.getElementById('tak-plugin-file-input').click()" ondrop="takPluginDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+<input type="file" id="tak-plugin-file-input" style="display:none" accept=".jar,.yaml" multiple onchange="takPluginFileChange(event)">
+<div id="tak-plugin-upload-text" style="color:var(--text-dim);font-size:13px">Click or drag to upload a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> and/or <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span> — you can drop both at once</div>
+<div id="tak-plugin-upload-filelist" style="display:none;margin-top:10px;display:none;flex-direction:column;gap:4px"></div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+<button type="button" id="tak-plugin-install-btn" onclick="takPluginInstall()" style="padding:10px 22px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer" disabled>Install Plugin</button>
+<span id="tak-plugin-install-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="tak-plugin-log-wrap" style="display:none;margin-top:4px">
+<div class="section-title">Install log</div>
+<div id="tak-plugin-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:300px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px"></div>
+</div>
+</div>
+</div>
+{% endif %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('cot-db')">
+<span class="section-title" style="margin-bottom:0">Database Maintenance (CoT)</span>
+<span id="cot-db-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="cot-db-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px">The CoT database can grow large. Data retention deletes old rows, but <strong>PostgreSQL does not free disk until you run VACUUM</strong>. Guard Dog runs smart auto-VACUUM daily at 3am (when dead tuples exceed 1M).</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px">
+<div style="padding:10px 14px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Database size</div><span id="cot-db-size" style="font-weight:600;font-size:15px">-</span> <button type="button" onclick="refreshCotSize()" style="margin-left:6px;padding:1px 8px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:4px;font-size:10px;cursor:pointer">Refresh</button></div>
+<div style="padding:10px 14px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Estimated rows</div><span id="cot-msg-count" style="font-weight:600;font-size:15px">-</span></div>
+<div style="padding:10px 14px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Dead tuples</div><span id="cot-dead-tuples" style="font-weight:600;font-size:15px">-</span></div>
+</div>
+<p style="font-size:10px;color:var(--text-dim);margin-bottom:16px">Size: green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB. Dead tuples &gt; 1M triggers auto-VACUUM.</p>
+<div style="display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+<button type="button" id="vacuum-analyze-btn" onclick="runVacuum(false)" style="padding:10px 20px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Optimize Tables</button>
+<span style="font-size:12px;color:var(--text-secondary)">VACUUM ANALYZE — marks deleted space for reuse. Database stops growing but file size unchanged. Safe while running.</span>
+</div>
+<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+<button type="button" id="vacuum-full-btn" onclick="runVacuum(true)" style="padding:10px 20px;background:rgba(234,179,8,0.2);color:var(--yellow);border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0" title="Caution: run when TAK Server is not running">Compact Database</button>
+<span style="font-size:12px;color:var(--text-secondary)">VACUUM FULL — physically shrinks files on disk. Locks tables, <strong>stop TAK Server first</strong>. <span style="color:var(--yellow)">(caution)</span></span>
+</div>
+<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+<button type="button" id="reindex-btn" onclick="runReindex()" style="padding:10px 20px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Rebuild Indexes</button>
+<span style="font-size:12px;color:var(--text-secondary)">REINDEX — rebuilds indexes for faster queries. Safe while running but may be slow on large databases.</span>
+</div>
+</div>
+<div id="vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
+<div id="vacuum-msg" style="margin-top:8px;font-size:13px"></div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('certs')">
+<span class="section-title" style="margin-bottom:0">Certificates</span>
+<span id="certs-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="certs-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;padding-top:16px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">Certificate password: <span id="tak-cert-password-inline" style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span> &nbsp;&middot;&nbsp; /opt/tak/certs/files/</div>
+<a href="/certs" class="cert-btn cert-btn-secondary" style="text-decoration:none">📁 Browse Certificates</a>
+</div>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+<input id="tak-cert-password-input" type="text" value="{{ settings.get('tak_cert_password','atakatak') }}" placeholder="Certificate password" style="min-width:240px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px">
+<button type="button" onclick="saveTakCertPassword()" class="cert-btn cert-btn-secondary" style="padding:8px 14px;font-size:12px">Save Password</button>
+<span id="tak-cert-password-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="cert-expiry-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">Loading certificate expiry...</div>
+<div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border)">
+<div style="font-size:13px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Certificate signing (issued cert validity)</div>
+<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px">How long certs issued via enrollment (QR code) are valid. Shorten to force re-enrollment (e.g. 90 days). After a breach you can rotate the CA or revoke that client cert from TAK Server.</p>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<span style="font-size:12px;color:var(--text-secondary)">Validity (days):</span>
+<input type="number" id="security-config-validity-days" min="1" max="3652" placeholder="3650" style="width:100px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px">
+<button type="button" id="security-config-save-btn" onclick="saveSecurityConfig()" style="padding:8px 18px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Save</button>
+<span id="security-config-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+</div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('rotate-ca')">
+<span class="section-title" style="margin-bottom:0">Rotate Intermediate CA</span>
+<span id="rotate-ca-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="rotate-ca-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The server TLS cert is <strong>not</strong> replaced, so existing ATAK clients keep connecting. The old CA stays in the truststore; new client certs are signed by the new CA. When everyone has re-enrolled, use Revoke Old CA.</p>
+<div id="rotate-ca-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading CA info...</div>
+<div id="rotate-ca-controls" style="display:none">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-ca-name" placeholder="e.g. INTERMEDIATE-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New intermediate validity (days)</label><input type="number" id="rotate-ca-validity-days" placeholder="730" min="1" max="3652" style="width:120px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"> <span id="rotate-ca-validity-hint" style="font-size:11px;color:var(--text-dim)">Capped by root CA remaining</span></div>
+</div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Current certificate password</label><span id="rotate-ca-current-password" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim)">****</span></div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New password (optional; leave blank to keep current)</label><input type="password" id="rotate-ca-new-password" placeholder="Leave blank to keep" autocomplete="new-password" style="width:100%;max-width:280px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
+<button type="button" id="rotate-ca-btn" onclick="rotateIntCA()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Intermediate CA</button>
+<span id="rotate-ca-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+</div>
+<div id="rotate-ca-log" style="display:none;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-bottom:16px"></div>
+<div id="revoke-ca-section" style="display:none;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:16px">
+<div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:8px">Revoke Old CA</div>
+<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Final step: create new server cert (signed by new CA), remove the old CA from the truststore, restart. After this, only clients who re-enrolled (e.g. new CloudTAK QR) can connect. Do this when everyone has re-enrolled.</p>
+<div id="revoke-ca-list" style="margin-bottom:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
+<div id="revoke-ca-msg" style="font-size:12px;margin-top:8px"></div>
+</div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('rotate-root')">
+<span class="section-title" style="margin-bottom:0">Rotate Root CA</span>
+<span id="rotate-root-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="rotate-root-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Full PKI rebuild. Creates a new Root CA, new Intermediate CA, new server cert, and regenerates all client certificates. <strong style="color:var(--red)">All existing connections will be disconnected.</strong> Users must re-enroll via TAK Portal QR code. Schedule a maintenance window before proceeding.</p>
+<div id="rotate-root-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading Root CA info...</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Root CA Name</label><input type="text" id="rotate-root-name" placeholder="e.g. ROOT-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-root-int-name" placeholder="e.g. INT-CA-01" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+</div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Current certificate password</label><span id="rotate-root-current-password" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim)">****</span></div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New password (optional; leave blank to keep current)</label><input type="password" id="rotate-root-new-password" placeholder="Leave blank to keep" autocomplete="new-password" style="width:100%;max-width:280px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<button type="button" id="rotate-root-btn" onclick="rotateRootCA()" style="padding:12px 24px;background:linear-gradient(135deg,#991b1b,#7f1d1d);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Root CA</button>
+<span id="rotate-root-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="rotate-root-log" style="display:none;margin-top:16px;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap"></div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('client-cert')">
+<span class="section-title" style="margin-bottom:0">Create Client Certificate</span>
+<span id="client-cert-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="client-cert-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Generate a signed client certificate and assign it to groups with read/write permissions. The .p12 file can be imported into ATAK, iTAK, or WinTAK.</p>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Client Name</label><input type="text" id="cc-name" placeholder="e.g. operator1" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+<div></div>
+</div>
+<div style="margin-bottom:16px">
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Groups <span style="font-weight:400;color:var(--text-dim)">(select groups and permissions)</span></label>
+<div id="cc-groups-list" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"><button type="button" id="cc-load-groups-btn" onclick="loadGroups()" style="padding:8px 16px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">Load Groups from TAK Server</button></div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<button type="button" id="cc-create-btn" onclick="createClientCert()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Create Certificate</button>
+<span id="cc-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="cc-result" style="display:none;margin-top:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px;padding:16px">
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+<div><span style="color:var(--green);font-weight:600" id="cc-result-name"></span><span style="color:var(--text-dim);font-size:12px;margin-left:8px">Password: {{ settings.get('tak_cert_password','atakatak') }}</span></div>
+<a id="cc-download-link" href="#" class="cert-btn cert-btn-secondary" style="text-decoration:none;font-size:12px;padding:8px 16px">⬇ Download .p12</a>
+</div>
+</div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('federation')">
+<span class="section-title" style="margin-bottom:0">Federation</span>
+<span id="federation-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="federation-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Server-to-server federation lets two TAK Servers share data directly over V2 TLS (port 9001 by default). Exchange CA certificates, then one side creates an outgoing connection to the other. The receiving side needs the federation port open in the firewall.</p>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:16px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:12px">V2 Federation</div>
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+<span id="fed-v2-status" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-dim)"></span>
+<span id="fed-v2-label" style="font-size:13px;color:var(--text-secondary)">Checking...</span>
+</div>
+<div style="font-size:12px;color:var(--text-dim)" id="fed-v2-port-label"></div>
+</div>
+<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:16px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:12px">Inbound Firewall</div>
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+<span id="fed-fw-status" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-dim)"></span>
+<span id="fed-fw-label" style="font-size:13px;color:var(--text-secondary)">Checking...</span>
+</div>
+<div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+<button type="button" id="fed-fw-btn" onclick="toggleFedFirewall()" style="padding:8px 18px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer" disabled>Loading...</button>
+<span id="fed-fw-msg" style="font-size:11px;color:var(--text-dim)"></span>
+</div>
+</div>
+</div>
+<div style="margin-bottom:16px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:10px">CA Certificate</div>
+<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px">Download your CA certificate and send it to the other TAK Server operator. They upload it in Web Admin → Federation → Federate Configuration as a trusted CA. You do the same with theirs.</p>
+<a href="/api/download/ca-pem" id="fed-ca-download" class="cert-btn cert-btn-secondary" style="text-decoration:none;font-size:12px;padding:8px 16px;display:inline-block">⬇ Download ca.pem</a>
+<span id="fed-ca-msg" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
+</div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('server-log')">
+<span class="section-title" style="margin-bottom:0">Server Log <span style="font-size:11px;color:var(--text-dim);font-weight:400">takserver-messaging.log</span></span>
+<span id="server-log-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="server-log-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<div id="server-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px">Loading log...</div>
+</div>
+</div>
+{% else %}
+<div class="section-title">Deploy TAK Server</div>
+<div id="deploy-mode-first" style="margin-bottom:20px;padding:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">1. Deployment mode</div>
+<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px">
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">{% if settings.get('arch') == 'arm64' %}(takserver-docker .zip — container){% else %}(single takserver .deb/.rpm){% endif %}</span></label>
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_split" value="two_server" style="accent-color:var(--accent)"> Split Server <span style="color:var(--text-dim);font-size:12px">(takserver-database + takserver-core)</span></label>
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_external_db" value="external_db" style="accent-color:var(--accent)"> External / Managed DB <span style="color:var(--text-dim);font-size:12px">(AWS RDS, Azure, Cloud SQL)</span></label>
+</div>
+<div id="deploy-mode-first-hint" style="font-size:12px;color:var(--text-dim)">Choose One Server for a standard install. Split Server uses separate DB and core packages. External / Managed DB points TAK Server at your cloud-hosted PostgreSQL.</div>
+</div>
+<div class="upload-area" id="upload-area" data-os-type="{{ settings.get('os_type', '') }}" data-arch="{{ settings.get('arch', '') }}" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="var i=document.getElementById('file-input');i.value='';i.click()">
+<div class="upload-icon">📦</div><div class="upload-text">Drop your TAK Server files here</div>
+<div class="upload-hint" style="margin-bottom:6px"><span style="color:var(--text-dim);font-size:12px">Slow upload? Use the backdoor — open <strong>https://{{ settings.get('server_ip', 'SERVER_IP') }}:5001</strong> and upload from the TAK Server page there (skips proxy, no timeout).</span></div>
+<div class="upload-hint" id="upload-requirements-hint">
+<span style="color:var(--text-dim);font-size:12px">{% if settings.get('arch') == 'arm64' %}One server: takserver-docker .zip (container build — no native arm package) + optional .key.{% else %}One server: takserver .deb/.rpm + optional .pol and .key — Split server: takserver-core and takserver-database.{% endif %}</span>
+</div>
+<input type="file" id="file-input" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
+</div>
+<div id="progress-area"></div>
+<div id="upload-results" style="display:none">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:20px">
+<div id="upload-files-list" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary)"></div>
+<div id="add-more-area" style="margin-top:16px;text-align:center">
+<button onclick="var i=document.getElementById('file-input-more');i.value='';i.click()" style="padding:8px 20px;background:transparent;color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">+ Add more files</button>
+<input type="file" id="file-input-more" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleAddMore(event)">
+</div>
+<div id="deploy-btn-area" style="margin-top:20px;text-align:center;display:none">
+<button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>
+</div></div></div>
+{% endif %}
+
+<!-- Snapshots & Recovery -->
+{% if tak_installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('snapshots-recovery')">
+<span class="section-title" style="margin-bottom:0">Snapshots &amp; Recovery</span>
+<span id="snapshots-recovery-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="snapshots-recovery-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<div style="padding-top:16px">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <div style="font-size:13px;font-weight:600;color:var(--text-primary)">TAK Server Snapshots</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Pre-upgrade snapshots are created automatically. Restore any snapshot with one click. Download for off-box backup.</div>
+  </div>
+  <div style="display:flex;gap:8px">
+    <button onclick="takeSnapshot()" id="snap-now-btn" style="padding:8px 16px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer">📸 Take Snapshot Now</button>
+    <button id="snap-refresh-btn" onclick="loadSnapshots(true)" style="padding:8px 16px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;transition:opacity .2s">↻ Refresh</button>
+    <label id="snap-upload-label" style="padding:8px 16px;background:rgba(234,179,8,0.08);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer;user-select:none" title="Upload a previously downloaded .tar.gz snapshot to restore from it">⬆ Upload Snapshot<input type="file" id="snap-upload-input" accept=".tar.gz" style="display:none" onchange="uploadSnapshot(this)"></label>
+    <span id="snap-upload-msg" style="font-size:11px;color:var(--text-dim)"></span>
+  </div>
+</div>
+<div id="snap-progress" style="display:none;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--cyan);padding:8px 0;margin-bottom:12px"></div>
+<div id="snap-table-container">
+  <div style="color:var(--text-dim);font-size:13px">Loading snapshots…</div>
+</div>
+</div>
+
+<div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border)">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="font-size:13px;font-weight:600;color:var(--text-primary)">Scheduled Snapshots</span>
+    <span class="badge badge-red" id="sched-badge"><span class="dot"></span>Disabled</span>
+  </div>
+  <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+    <span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+    <div style="position:relative;width:40px;height:22px">
+      <input type="checkbox" id="sched-enabled" onchange="saveSchedule()" style="opacity:0;width:0;height:0;position:absolute">
+      <span id="sched-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+      <span id="sched-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+    </div>
+  </label>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <select id="sched-freq" onchange="saveSchedule()" style="background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 10px;font-size:12px;font-family:'JetBrains Mono',monospace">
+    <option value="daily">Daily</option>
+    <option value="weekly">Weekly (Saturday)</option>
+  </select>
+  <span style="font-size:12px;color:var(--text-dim)">at</span>
+  <input type="number" id="sched-hour" value="2" min="0" max="23" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
+  <span style="font-size:12px;color:var(--text-dim)">:00 local · keep last</span>
+  <input type="number" id="sched-retention" value="7" min="1" max="90" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
+  <span style="font-size:12px;color:var(--text-dim)">snapshots</span>
+  <span id="sched-status" style="font-size:11px;color:var(--text-dim)"></span>
+</div>
+</div>
+</div>
+</div>
+{% endif %}
+
+</div>
+<div class="modal-overlay" id="tak-uninstall-modal">
+<div class="modal">
+<h3>⚠ Uninstall TAK Server?</h3>
+<p>This will remove TAK Server completely: /opt/tak, all certificates, and config. You can redeploy after.</p>
+<label class="form-label">Admin Password</label>
+<input class="form-input" id="tak-uninstall-password" type="password" placeholder="Confirm your password">
+<div class="modal-actions">
+<button type="button" class="control-btn" id="tak-uninstall-cancel" onclick="document.getElementById('tak-uninstall-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="control-btn btn-stop" id="tak-uninstall-confirm" onclick="doUninstallTak()">Uninstall</button>
+</div>
+<div id="tak-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+<div id="tak-uninstall-progress" class="uninstall-progress-row" style="display:none;margin-top:10px" aria-live="polite"></div>
+</div>
+</div>
+<footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>
+// Generic collapsible toggle for TAK Server page sections.
+// Section structure: header div with onclick="takToggleSection('<id>')" +
+// body div with id="<id>-body" + arrow span with id="<id>-toggle-icon".
+window.takToggleSection = function(id) {
+  var body = document.getElementById(id + '-body');
+  var icon = document.getElementById(id + '-toggle-icon');
+  if (!body) return;
+  var show = body.style.display === 'none';
+  body.style.display = show ? 'block' : 'none';
+  if (icon) icon.style.transform = show ? 'rotate(180deg)' : '';
+  // Lazy-load snapshot table on first open
+  if (show && id === 'snapshots-recovery' && typeof loadSnapshots === 'function') {
+    loadSnapshots();
+    if (typeof loadSchedule === 'function') loadSchedule();
+  }
+};
+
+// Snapshots & Recovery
+var _snapPollTimer = null;
+function loadSnapshots(fromBtn){
+  var c=document.getElementById('snap-table-container');
+  if(!c)return;
+  var btn=document.getElementById('snap-refresh-btn');
+  if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.textContent='↻ Loading…';}
+  c.innerHTML='<div style="color:var(--text-dim);font-size:13px;display:flex;align-items:center;gap:8px"><span style="display:inline-block;width:14px;height:14px;border:2px solid var(--cyan);border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite"></span>Loading snapshots…</div>';
+  fetch('/api/takserver/snapshots',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(btn){btn.disabled=false;btn.style.opacity='1';btn.textContent='↻ Refresh';}
+    var snaps=d.snapshots||[];
+    if(!snaps.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px">No snapshots yet. Use "Take Snapshot Now" to create one.</div>';return;}
+    var rows=snaps.map(function(s){
+      var src=s.source||'manual';
+      var srcColor=src==='pre-upgrade'?'var(--cyan)':src==='scheduled'?'var(--green)':'var(--text-dim)';
+      return '<tr style="border-bottom:1px solid var(--border)">'
+        +'<td style="padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">'+s.label+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+( s.taken_at||'' ).replace('T',' ').replace('Z','')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:'+srcColor+'">'+src+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.tak_version||'?')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.size_mb||0)+' MB</td>'
+        +'<td style="padding:6px 8px;white-space:nowrap">'
++'<button onclick="restoreSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.4);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
++'<a href="/api/takserver/snapshot/'+encodeURIComponent(s.label)+'/download" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;text-decoration:none;display:inline-block;margin-right:4px">⬇ Download</a>'
++'<button onclick="deleteSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
+        +'</td></tr>';
+    }).join('');
+    c.innerHTML='<table style="width:100%;border-collapse:collapse">'
+      +'<thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'
+      +'<th style="padding:4px 8px;text-align:left">Label</th>'
+      +'<th style="padding:4px 8px;text-align:left">Taken</th>'
+      +'<th style="padding:4px 8px;text-align:left">Source</th>'
+      +'<th style="padding:4px 8px;text-align:left">TAK Version</th>'
+      +'<th style="padding:4px 8px;text-align:left">Size</th>'
+      +'<th style="padding:4px 8px;text-align:left">Actions</th>'
+      +'</tr></thead><tbody>'+rows+'</tbody></table>';
+  }).catch(function(e){
+    var btn2=document.getElementById('snap-refresh-btn');
+    if(btn2){btn2.disabled=false;btn2.style.opacity='1';btn2.textContent='↻ Refresh';}
+    c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots — '+((e&&e.message)||'network error')+'</div>';
+  });
+}
+
+function takeSnapshot(){
+  var btn=document.getElementById('snap-now-btn');
+  var prog=document.getElementById('snap-progress');
+  if(btn)btn.disabled=true;
+  if(prog){prog.style.display='';prog.textContent='Starting snapshot…';}
+  fetch('/api/takserver/snapshot/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'manual'})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        _snapPollTimer=setInterval(function(){
+          fetch('/api/takserver/snapshot/status').then(function(r){return r.json();}).then(function(s){
+            var msg=s.log&&s.log.length?s.log[s.log.length-1]:'Running…';
+            if(prog){
+              if(s.running){
+                prog.innerHTML='<span style="display:inline-block;width:12px;height:12px;border:2px solid var(--cyan);border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:6px"></span><span style="vertical-align:middle">'+msg+'</span>';
+              }else{
+                prog.textContent=msg;
+              }
+            }
+            if(!s.running){
+              clearInterval(_snapPollTimer);
+              if(btn)btn.disabled=false;
+              if(prog)setTimeout(function(){prog.style.display='none';},4000);
+              loadSnapshots();
+            }
+          });
+        },1500);
+      }else{
+        if(prog){prog.textContent='Error: '+(d.error||'failed');prog.style.color='var(--red)';}
+        if(btn)btn.disabled=false;
+      }
+    }).catch(function(){if(btn)btn.disabled=false;if(prog)prog.textContent='Network error';});
+}
+
+function restoreSnapshot(label){
+  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nCurrent data will be overwritten.'))return;
+  var prog=document.getElementById('snap-progress');
+  if(prog){prog.style.display='';prog.style.color='var(--yellow)';prog.textContent='Restoring snapshot…';}
+  fetch('/api/takserver/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        var poll=setInterval(function(){
+          fetch('/api/takserver/rollback/log').then(function(r){return r.json();}).then(function(s){
+            if(prog)prog.textContent=s.log&&s.log.length?s.log[s.log.length-1]:'Running…';
+            if(!s.running){
+              clearInterval(poll);
+              if(prog)prog.style.color=s.error?'var(--red)':'var(--green)';
+              loadSnapshots();
+            }
+          });
+        },1500);
+      }else{
+        if(prog){prog.style.color='var(--red)';prog.textContent='Error: '+(d.error||'failed');}
+      }
+    }).catch(function(){if(prog){prog.style.color='var(--red)';prog.textContent='Network error';}});
+}
+
+function deleteSnapshot(label){
+  if(!confirm('Delete snapshot "'+label+'"?'))return;
+  fetch('/api/takserver/snapshot/'+encodeURIComponent(label),{method:'DELETE'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok)loadSnapshots();
+      else alert('Delete failed: '+(d.error||'unknown'));
+    });
+}
+
+function uploadSnapshot(input){
+  var file=input&&input.files&&input.files[0];
+  var msg=document.getElementById('snap-upload-msg');
+  var lbl=document.getElementById('snap-upload-label');
+  if(!file){return;}
+  if(!file.name.endsWith('.tar.gz')){
+    if(msg){msg.style.color='var(--red)';msg.textContent='File must be a .tar.gz archive';}
+    input.value='';return;
+  }
+  function _fmtBytes(b){
+    if(b>=1073741824)return (b/1073741824).toFixed(1)+' GB';
+    if(b>=1048576)return (b/1048576).toFixed(1)+' MB';
+    if(b>=1024)return (b/1024).toFixed(0)+' KB';
+    return b+' B';
+  }
+  var totalSize=file.size;
+  // Build inline progress bar inside the msg span
+  if(msg){
+    msg.innerHTML='<span style="display:inline-flex;align-items:center;gap:8px;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--yellow)">'
+      +'<span id="snap-ul-text">Uploading… 0%</span>'
+      +'<span style="display:inline-block;width:120px;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;vertical-align:middle">'
+      +'<span id="snap-ul-bar" style="display:block;height:100%;width:0%;background:var(--cyan);border-radius:3px;transition:width .1s linear"></span>'
+      +'</span>'
+      +'<span id="snap-ul-bytes" style="color:var(--text-dim)">0 B / '+_fmtBytes(totalSize)+'</span>'
+      +'</span>';
+  }
+  if(lbl)lbl.style.opacity='0.5';
+  var fd=new FormData();
+  fd.append('file',file);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/takserver/snapshot/upload',true);
+  xhr.withCredentials=true;
+  xhr.upload.onprogress=function(e){
+    if(!e.lengthComputable)return;
+    var pct=Math.round(e.loaded/e.total*100);
+    var barEl=document.getElementById('snap-ul-bar');
+    var txtEl=document.getElementById('snap-ul-text');
+    var byteEl=document.getElementById('snap-ul-bytes');
+    if(barEl)barEl.style.width=pct+'%';
+    if(txtEl)txtEl.textContent='Uploading… '+pct+'%';
+    if(byteEl)byteEl.textContent=_fmtBytes(e.loaded)+' / '+_fmtBytes(e.total);
+  };
+  xhr.onload=function(){
+    if(lbl)lbl.style.opacity='1';
+    input.value='';
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(d.ok){
+        if(msg){msg.innerHTML='';msg.style.color='var(--green)';msg.textContent='✓ Uploaded ('+d.label+', '+d.size_mb+' MB)';}
+        loadSnapshots();
+        setTimeout(function(){if(msg)msg.textContent='';},8000);
+      }else{
+        if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Upload failed: '+(d.error||'unknown');}
+      }
+    }catch(e){
+      if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Server error (bad response)';}
+    }
+  };
+  xhr.onerror=function(){
+    if(lbl)lbl.style.opacity='1';
+    input.value='';
+    if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Network error';}
+  };
+  xhr.send(fd);
+}
+
+function _applySchedState(enabled){
+  var badge=document.getElementById('sched-badge');
+  var track=document.getElementById('sched-toggle-track');
+  var thumb=document.getElementById('sched-toggle-thumb');
+  var cb=document.getElementById('sched-enabled');
+  if(cb)cb.checked=!!enabled;
+  if(track)track.style.background=enabled?'var(--green)':'var(--border)';
+  if(thumb)thumb.style.transform=enabled?'translateX(18px)':'translateX(0)';
+  if(badge){
+    badge.className=enabled?'badge badge-green':'badge badge-red';
+    badge.innerHTML=enabled?'<span class="dot dot-pulse"></span>Active':'<span class="dot"></span>Disabled';
+  }
+}
+
+function loadSchedule(){
+  fetch('/api/takserver/snapshot/schedule').then(function(r){return r.json();}).then(function(d){
+    var freq=document.getElementById('sched-freq');
+    var hour=document.getElementById('sched-hour');
+    var ret=document.getElementById('sched-retention');
+    var stat=document.getElementById('sched-status');
+    _applySchedState(!!d.enabled);
+    if(freq)freq.value=d.frequency||'daily';
+    if(hour)hour.value=d.hour!==undefined?d.hour:2;
+    if(ret)ret.value=d.retention||7;
+    if(stat)stat.textContent=d.timer_active?'● Timer active':'';
+  }).catch(function(){});
+}
+
+var _schedSaveTimer=null;
+function saveSchedule(){
+  clearTimeout(_schedSaveTimer);
+  _schedSaveTimer=setTimeout(function(){
+    var enabled=!!(document.getElementById('sched-enabled')&&document.getElementById('sched-enabled').checked);
+    var body={
+      enabled:enabled,
+      frequency:(document.getElementById('sched-freq')||{}).value||'daily',
+      hour:parseInt((document.getElementById('sched-hour')||{}).value||2,10),
+      minute:0,
+      retention:parseInt((document.getElementById('sched-retention')||{}).value||7,10)
+    };
+    _applySchedState(enabled);
+    fetch('/api/takserver/snapshot/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        var stat=document.getElementById('sched-status');
+        if(d.ok){_applySchedState(d.config.enabled);if(stat)stat.textContent=d.config.enabled?'● Timer active':'';}
+        else{if(stat)stat.textContent='✗ Save failed';}
+      });
+  },600);
+}
+
+loadSnapshots();
+loadSchedule();
+</script>
+<script src="/takserver.js"></script></body></html>

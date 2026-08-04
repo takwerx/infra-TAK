@@ -1,0 +1,182 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Node-RED — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
+.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-success{background:var(--green);color:#fff}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn-danger{background:var(--red);color:#fff}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-size:11px;color:var(--text-dim);margin-bottom:4px}
+.metric-value{font-size:20px;font-weight:600;color:var(--text-primary)}
+.metric-detail{font-size:11px;color:var(--text-dim);margin-top:4px}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header"><h1 style="display:flex;flex-direction:column;align-items:flex-start;gap:6px"><img src="{{ nodered_logo_url }}" alt="" style="height:32px;width:auto;object-fit:contain"><span>Node-RED</span></h1><p>Flow-based automation and integrations</p></div>
+  {% if nr.running %}<div class="status-banner running"><div class="dot"></div>Node-RED is running</div>
+  {% elif nr.installed %}<div class="status-banner stopped"><div class="dot"></div>Node-RED is installed but stopped</div>
+  {% else %}<div class="status-banner not-installed"><div class="dot"></div>Node-RED is not installed</div>{% endif %}
+  {% if not nr.installed %}
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="noderedToggleSection('nodered-target')">
+    <span class="card-title" style="margin-bottom:0">Deployment Target</span>
+    <span id="nodered-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(0deg)">&#9662;</span>
+  </div>
+  <div id="nodered-target-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+    <div class="form-group">
+      <label class="form-label">Where should Node-RED run?</label>
+      <select id="nodered-target-mode" class="form-input">
+        <option value="local" {% if nodered_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
+        <option value="remote" {% if nodered_deploy_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (SSH)</option>
+      </select>
+    </div>
+    <div id="nodered-remote-fields" style="display:{% if nodered_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+      <div class="info-grid" style="margin-top:12px">
+        <div class="form-group"><label class="form-label">Remote Host/IP</label><input id="nodered-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ nodered_deploy_cfg.remote.host or '' }}"></div>
+        <div class="form-group"><label class="form-label">SSH Port</label><input id="nodered-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ nodered_deploy_cfg.remote.port or 22 }}"></div>
+      </div>
+      <div class="info-grid" style="margin-top:12px">
+        <div class="form-group"><label class="form-label">SSH Username</label><input id="nodered-remote-user" class="form-input" type="text" placeholder="root" value="{{ nodered_deploy_cfg.remote.username or 'root' }}"></div>
+        <div class="form-group"><label class="form-label">SSH Key Path</label><input id="nodered-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-nodered" value="{{ nodered_deploy_cfg.remote.ssh_key_path or '' }}"></div>
+      </div>
+      <div class="form-group" style="margin-top:12px">
+        <label class="form-label">One-time password (for Install SSH Key only)</label>
+        <input id="nodered-remote-password" class="form-input" type="password" placeholder="Used only for ssh-copy-id">
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost" type="button" onclick="ensureNoderedSshKey()">Generate SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="installNoderedSshKey()">Install SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="testNoderedRemoteSsh()">Test SSH</button>
+      </div>
+      <div id="nodered-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+      <div class="form-group" style="margin-top:12px">
+        <label class="form-label">Public key (manual copy fallback)</label>
+        <textarea id="nodered-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key"></textarea>
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <button class="btn btn-ghost" type="button" onclick="saveNoderedTarget()">Save target settings</button>
+      <span id="nodered-target-save-msg" style="font-size:12px;color:var(--text-dim);margin-left:8px"></span>
+    </div>
+  </div>
+  </div>
+  {% endif %}
+  {% if nr.installed %}
+  <div class="section-title" style="margin-top:20px">Controls</div>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+  <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+  {% if nr.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  </div>
+  <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+  {% if nodered_remote_host %}
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+  <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="nodered-remote-host-ip">{{ nodered_remote_host }}</span></div>
+  <div class="card-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+  <div class="metrics-bar" id="nodered-remote-metrics-bar">
+  <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="nodered-remote-cpu-value">—</div></div>
+  <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="nodered-remote-ram-value">—</div><div class="metric-detail" id="nodered-remote-ram-detail"></div></div>
+  <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="nodered-remote-disk-value">—</div><div class="metric-detail" id="nodered-remote-disk-detail"></div></div>
+  <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="nodered-remote-uptime-value" style="font-size:18px">—</div></div>
+  </div>
+  </div>
+  {% endif %}
+  {% if authentik_installed and settings.fqdn %}<div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)"><div class="card-title">&#128274; Protected by Authentik</div><p style="font-size:13px;color:var(--text-secondary);line-height:1.5">Node-RED is behind Authentik. The application and proxy provider are created automatically when you deploy Authentik or Node-RED.</p></div>{% endif %}
+  <div class="card"><div class="card-title">Access</div><div class="info-grid">
+    {% if settings.fqdn %}<div class="info-item"><div class="info-label">Flow editor</div><div class="info-value"><a href="https://nodered.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">https://nodered.{{ settings.fqdn }}</a> &#8599;</div></div>
+    {% else %}<div class="info-item"><div class="info-label">Flow editor</div><div class="info-value"><a href="http://{{ settings.server_ip }}:1880" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">http://{{ settings.server_ip }}:1880</a> &#8599;</div></div>{% endif %}
+    <div class="info-item"><div class="info-label">Install dir</div><div class="info-value">~/node-red</div></div>
+  </div></div>
+  <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
+  {% else %}
+  <div class="card"><div class="card-title">Deploy Node-RED</div>
+  <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">Runs Node-RED in Docker with a persistent volume. With a domain set, the flow editor is at <code style="color:var(--cyan)">https://nodered.{{ settings.fqdn if settings.fqdn else '&lt;your-domain&gt;' }}</code> (behind Authentik when enabled).</p>
+  {% if settings.fqdn %}<p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Open <a href="https://nodered.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">nodered.{{ settings.fqdn }}</a> to use the flow editor. If you upgraded from console.*/nodered/ and the link does not load, redeploy Node-RED once from this page.</p>{% endif %}
+  <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()">&#x1f680; Deploy Node-RED</button></div>
+  {% endif %}
+  {% if deploying %}<div class="card" id="deploy-log-card"><div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">Deploy log<button class="btn btn-ghost" id="nodered-cancel-btn-static" onclick="cancelNoderedDeploy()" style="display:none">&#x2717; Cancel</button></div><div class="log-box" id="deploy-log">Initializing...</div></div>{% endif %}
+  <div class="card" id="log-card" style="display:none"><div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">Deploy log<button class="btn btn-ghost" id="nodered-cancel-btn-dyn" onclick="cancelNoderedDeploy()" style="display:none">&#x2717; Cancel</button></div><div class="log-box" id="deploy-log-dyn">Waiting...</div></div>
+</div>
+<div class="modal-overlay" id="uninstall-modal"><div class="modal">
+  <h3>&#x26a0; Uninstall Node-RED?</h3><p>This will stop and remove the container and data volume. Flows will be deleted.</p>
+  <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
+  <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
+<script>
+var logIndex=0,logInterval=null;
+function collectNoderedDeployConfig(){var mode=document.getElementById('nodered-target-mode');var host=document.getElementById('nodered-remote-host');var port=document.getElementById('nodered-remote-port');var user=document.getElementById('nodered-remote-user');var key=document.getElementById('nodered-remote-key');return{target_mode:(mode&&mode.value)||'local',remote:{host:host?host.value.trim():'',port:port?parseInt(port.value,10)||22:22,username:user?user.value.trim()||'root':'root',ssh_key_path:key?key.value.trim():''}};}
+function noderedToggleSection(id){var body=document.getElementById(id+'-body');var icon=document.getElementById(id+'-toggle-icon');if(body){body.style.display=body.style.display==='none'?'block':'none';}if(icon){icon.style.transform=(body&&body.style.display==='none')?'rotate(0deg)':'rotate(180deg)';}}
+function saveNoderedTarget(){var cfg=collectNoderedDeployConfig();var msg=document.getElementById('nodered-target-save-msg');if(msg)msg.textContent='Saving...';fetch('/api/nodered/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg}),credentials:'same-origin'}).then(function(r){return r.ok?r.json():r.json().then(function(d){throw new Error(d.error||'Failed');});}).then(function(d){if(msg){msg.textContent=(d&&(d.target_mode!==undefined||d.remote!==undefined))?'Saved.':'Failed';msg.style.color=(d&&(d.target_mode!==undefined||d.remote!==undefined))?'var(--green)':'var(--red)';}}).catch(function(e){if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}});}
+function ensureNoderedSshKey(){var st=document.getElementById('nodered-ssh-status');var k=document.getElementById('nodered-remote-key');if(st)st.textContent='Generating SSH key...';st&&(st.style.color='var(--text-dim)');fetch('/api/nodered/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig()}),credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Key generation failed');return d;});}).then(function(d){if(k&&d.key_path)k.value=d.key_path;var ta=document.getElementById('nodered-public-key');if(ta)ta.value=d.public_key||'';if(st){st.textContent=(d.success!==false)?('✓ '+(d.message||'SSH key ready')+(d.fingerprint?' | '+d.fingerprint:'')):(d.error||'Failed');st.style.color=(d.success!==false)?'var(--green)':'var(--red)';}}).catch(function(e){if(st){st.textContent='Key generation failed: '+(e&&e.message?e.message:String(e));st.style.color='var(--red)';}});}
+function installNoderedSshKey(){var pw=document.getElementById('nodered-remote-password')&&document.getElementById('nodered-remote-password').value;if(!pw){var s=document.getElementById('nodered-ssh-status');if(s)s.textContent='Enter one-time password for ssh-copy-id';return;}fetch('/api/nodered/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig(),password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){var s=document.getElementById('nodered-ssh-status');if(s)s.textContent=d.success?'SSH key installed.':(d.error||'Failed');s.style.color=d.success?'var(--green)':'var(--red)';});}
+function testNoderedRemoteSsh(){var s=document.getElementById('nodered-ssh-status');if(s){s.textContent='Testing SSH...';s.style.color='var(--text-dim)';}fetch('/api/nodered/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig()}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(s){if(d&&d.success){s.textContent='✓ Test passed';s.style.color='var(--green)';}else{s.textContent=(d&&d.error)?d.error:(d&&d.output)||'Test failed';s.style.color='var(--red)';}}}).catch(function(e){if(s){s.textContent='Test failed: '+(e&&e.message?e.message:String(e));s.style.color='var(--red)';}});}
+var noderedTargetMode=document.getElementById('nodered-target-mode');if(noderedTargetMode){noderedTargetMode.onchange=function(){var f=document.getElementById('nodered-remote-fields');if(f)f.style.display=noderedTargetMode.value==='remote'?'block':'none';};}
+async function loadNoderedRemoteMetrics(){var bar=document.getElementById('nodered-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/nodered/remote-metrics');if(!r.ok){document.getElementById('nodered-remote-cpu-value').textContent='—';document.getElementById('nodered-remote-ram-value').textContent='—';document.getElementById('nodered-remote-disk-value').textContent='—';document.getElementById('nodered-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('nodered-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('nodered-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('nodered-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('nodered-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('nodered-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var uptime=document.getElementById('nodered-remote-uptime-value');if(uptime)uptime.textContent=d.uptime||'—';}catch(e){var cpu=document.getElementById('nodered-remote-cpu-value');if(cpu)cpu.textContent='—';}}
+if(document.getElementById('nodered-remote-metrics-bar')){loadNoderedRemoteMetrics();setInterval(loadNoderedRemoteMetrics,5000);}
+function startDeploy(){var btn=document.getElementById('deploy-btn');btn.disabled=true;document.getElementById('log-card').style.display='block';document.getElementById('deploy-log-dyn').textContent='Starting...';logIndex=0;
+var config=typeof collectNoderedDeployConfig==='function'?collectNoderedDeployConfig():{};
+fetch('/api/nodered/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:config}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(d.error){var lg=document.getElementById('log-card');var dyn=document.getElementById('deploy-log-dyn');if(dyn)dyn.textContent='Error: '+d.error;if(lg&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};b.appendChild(_ub);lg.insertBefore(b,lg.querySelector('.log-box')||lg.firstChild);}btn.disabled=false;btn.textContent='✗ Deployment failed — Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='🚀 Deploy Node-RED';btn.style.background='';startDeploy();};return;}pollLog();});}
+function pollLog(){function pickLogEl(){var lc=document.getElementById('log-card');return (lc&&lc.style.display!=='none'?document.getElementById('deploy-log-dyn'):null)||document.getElementById('deploy-log')||document.getElementById('deploy-log-dyn');}
+var logEl=pickLogEl();function showCancel(show){var s=document.getElementById('nodered-cancel-btn-static'),d=document.getElementById('nodered-cancel-btn-dyn');if(s)s.style.display=show?'inline-block':'none';if(d)d.style.display=show?'inline-block':'none';}
+function doPoll(){logEl=pickLogEl();fetch('/api/nodered/deploy/log?index='+logIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(d.entries&&d.entries.length){if(logIndex===0&&logEl)logEl.textContent='';if(logEl){logEl.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);logEl.scrollTop=logEl.scrollHeight;}logIndex+=d.entries.length;}
+showCancel(d.running);
+if(!d.running){clearInterval(logInterval);var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=false;
+if(d.cancelled){if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'Cancelled.';}
+else if(d.error){var lc=document.getElementById('log-card');if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'✗ Deployment failed (see log above).';if(lc&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};b.appendChild(_ub);lc.insertBefore(b,lc.querySelector('.log-box')||lc.firstChild);}if(btn){btn.textContent='✗ Deployment failed — Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='🚀 Deploy Node-RED';btn.style.background='';startDeploy();};}}
+else if(d.complete){if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'Deploy complete - page will reload in 15s (or refresh now).';setTimeout(function(){location.reload();},15000);}}});}doPoll();logInterval=setInterval(doPoll,800);}
+function cancelNoderedDeploy(){if(!confirm('Cancel the deployment? You can deploy again after.'))return;fetch('/api/nodered/deploy/cancel',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin'}).then(function(){/* next poll will show cancelled */});}
+if(document.getElementById('deploy-log-card')){logIndex=0;pollLog();}
+function control(action){document.getElementById('control-status').textContent=action+'...';
+fetch('/api/nodered/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){document.getElementById('control-status').textContent=d.running?'Running':'Stopped';setTimeout(function(){window.location.href=window.location.pathname+'?t='+Date.now();},1500);});}
+function loadLogs(){document.getElementById('logs-card').style.display='block';fetch('/api/nodered/logs?lines=80').then(function(r){return r.json();}).then(function(d){document.getElementById('container-logs').textContent=(d.entries||[]).join(String.fromCharCode(10))||'(no output)';});}
+function doUninstall(){var pw=document.getElementById('uninstall-password').value,msg=document.getElementById('uninstall-msg');msg.textContent='';fetch('/api/nodered/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
+</script>
+</body></html>

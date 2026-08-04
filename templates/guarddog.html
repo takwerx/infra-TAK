@@ -1,0 +1,402 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Guard Dog — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow:visible;line-height:1.35}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;max-width:400px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
+.guard-list{display:flex;flex-direction:column;gap:0}
+.guard-service-row{border-bottom:1px solid var(--border);background:#0a0e1a}
+.guard-service-row:last-child{border-bottom:none}
+.guard-service-header{display:flex;align-items:center;gap:10px;padding:12px 16px;cursor:pointer;font-size:13px;font-weight:600;color:var(--text-primary);user-select:none}
+.guard-service-header:hover{background:rgba(255,255,255,.04)}
+.guard-service-health{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.guard-service-health.ok{background:var(--green)}
+.guard-service-health.caution{background:var(--yellow)}
+.guard-service-health.fail{background:var(--red)}
+.guard-service-health.pending{background:var(--text-dim)}
+.guard-monitor-health{display:inline-block;width:7px;min-width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:5px}
+.guard-monitor-health.ok{background:var(--green);box-shadow:0 0 4px var(--green)}
+.guard-monitor-health.fail{background:var(--red);box-shadow:0 0 4px var(--red)}
+.guard-monitor-health.pending{background:var(--text-dim)}
+.guard-service-expand{margin-left:auto;transition:transform .2s}
+.guard-service-row.open .guard-service-expand{transform:rotate(180deg)}
+.guard-service-body{display:none;padding:0 16px 12px 16px}
+.guard-service-row.open .guard-service-body{display:block}
+.gd-collapse-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none;margin:0 0 0 0;font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em}
+.gd-collapse-header:hover{color:var(--text-secondary)}
+.gd-collapse-toggle{font-size:18px;color:var(--text-dim);transition:transform .2s ease;flex-shrink:0;margin-left:8px}
+.gd-collapse-body{display:none;padding-top:16px;border-top:1px solid var(--border);margin-top:16px}
+.gd-collapse-body.open{display:block}
+.guard-item{display:flex;align-items:flex-start;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border);background:var(--bg-deep);font-size:13px;border-radius:8px;margin-bottom:4px}
+.guard-item:last-child{border-bottom:none;margin-bottom:0}
+.guard-item-name{font-weight:600;color:var(--cyan);min-width:120px;flex-shrink:0}
+.guard-item-interval{color:var(--text-dim);font-size:11px;min-width:70px;flex-shrink:0}
+.guard-item-desc{color:var(--text-secondary);line-height:1.5;flex:1}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.gd-toggle-spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:gd-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes gd-spin{to{transform:rotate(360deg)}}
+</style></head>
+<body data-gd-deploying="{{ 'true' if deploying else 'false' }}">
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span></h1><p>TAK Server health monitoring and auto-recovery. Runs automatically after TAK Server deploy; configure notifications below.</p></div>
+  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running{% if not gd_needs_update and gd_deployed_version %}<span style="margin-left:8px;font-size:12px;color:var(--green);opacity:0.8">✓ up to date (v{{ gd_deployed_version }})</span>{% elif gd_needs_update %}<span style="margin-left:8px;font-size:12px;color:var(--yellow);opacity:0.9">⚠ settings changed — update needed</span>{% endif %}</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{% if gd_needs_update %}<button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers with your updated settings" style="border-color:var(--yellow);color:var(--yellow)">↻ Update Guard Dog</button>{% endif %}<button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled{% if gd_needs_update %}<span style="margin-left:8px;font-size:12px;color:var(--yellow);opacity:0.9">⚠ settings changed</span>{% endif %}</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{% if gd_needs_update %}<button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" style="border-color:var(--yellow);color:var(--yellow)">↻ Update Guard Dog</button>{% endif %}<button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% else %}<div class="status-banner not-installed"><div class="dot"></div>Guard Dog is not installed (it will install automatically when you deploy TAK Server)</div>{% endif %}
+
+  <div class="card">
+    <div class="card-title">Docker container log limits</div>
+    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">Prevents container logs (e.g. Node-RED, Authentik LDAP) from filling the disk. Apply once per server or after updating infra-TAK — no need to redeploy a module.</p>
+    <button type="button" class="btn btn-ghost" id="gd-docker-limits-btn" onclick="gdApplyDockerLogLimits()">Apply limits</button>
+    <span id="gd-docker-limits-msg" style="margin-left:12px;font-size:12px"></span>
+  </div>
+
+  {% if not tak.installed %}
+  <div class="card" style="border-color:var(--yellow)">
+    <div class="card-title">Requirement</div>
+    <p style="color:var(--text-secondary);font-size:13px">TAK Server must be installed first. Deploy TAK Server from the TAK Server module, then return here to deploy Guard Dog.</p>
+  </div>
+  {% endif %}
+
+  {% if gd.installed %}
+  <div class="card"><div class="card-title">Monitors</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Per-service health and checks. Expand a row to see what Guard Dog is monitoring.</p>
+    <div class="guard-list">
+      {% for svc in guarddog_services %}
+      {% if svc.monitored %}
+      <div class="guard-service-row" id="gd-svc-{{ svc.id }}" data-service-id="{{ svc.id }}">
+        <div class="guard-service-header" onclick="gdToggleService('{{ svc.id }}')">
+          <span class="guard-service-health pending" id="gd-health-{{ svc.id }}" title="Health"></span>
+          <span>{{ svc.name }}</span>
+          <span class="guard-service-expand material-symbols-outlined" style="font-size:20px">expand_more</span>
+        </div>
+        <div class="guard-service-body">
+          {% for m in svc.monitors %}
+          <div class="guard-item" data-monitor-id="{{ m.id }}">
+            <span class="guard-item-name" style="display:flex;align-items:center;gap:8px"><span class="guard-monitor-health pending" id="gd-mh-{{ m.id }}" title="Monitor health"></span>{{ m.name }}</span>
+            <span class="guard-item-interval">{{ m.interval }}</span>
+            <span class="guard-item-desc">{{ m.desc }}</span>
+          </div>
+          {% if svc.id == 'remotedb' and m.id == 'remotedb_agent' %}
+          <div class="guard-item" style="align-items:center;gap:8px;padding-left:28px;margin-top:-4px;margin-bottom:8px">
+            <span class="guard-item-desc" style="flex:1">Install or reinstall the health agent on the remote database server (use if the Health Agent check above is red):</span>
+            <button type="button" class="btn btn-ghost gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px;flex-shrink:0">Deploy health agent to Server One / remote server</button>
+            <span class="gd-deploy-agent-msg-inline" style="font-size:12px;min-width:80px"></span>
+          </div>
+          {% endif %}
+          {% if m.id == 'buildcache' and buildcache_last %}
+          <div class="guard-item" style="padding-left:28px;margin-top:-4px;margin-bottom:8px">
+            <span class="guard-item-desc" style="flex:1;color:var(--text-dim)">Last run: <span style="color:var(--cyan)">{{ buildcache_last }}</span></span>
+          </div>
+          {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+      {% endfor %}
+    </div>
+    {% for svc in guarddog_services %}
+    {% if svc.id == 'remotedb' %}
+    <p style="margin-top:12px;font-size:12px;color:var(--text-secondary)">If <strong>Health Agent</strong> is red, the agent may not be installed on Server One / remote server. <button type="button" class="btn btn-ghost" id="gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px">Deploy health agent to Server One / remote server</button> <span id="gd-deploy-agent-msg"></span></p>
+    {% endif %}
+    {% endfor %}
+    <p style="margin-top:14px;font-size:12px;color:var(--text-dim)">Health endpoint (for Uptime Robot): <code style="color:var(--cyan);word-break:break-all">{{ health_url }}</code></p>
+    <p style="margin-top:10px;font-size:12px;color:var(--text-dim)"><a href="{{ guarddog_docs_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none;font-weight:500">How Guard Dog works</a> (delays, soft start, restart-loop protection) → docs</p>
+    
+  </div>
+
+  <div class="card" id="gd-diskio-card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <span>Disk I/O Performance</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <select id="gd-dio-range-sel" class="form-input" style="width:auto;min-width:100px;padding:4px 8px;font-size:11px" onchange="gdRefreshDiskIO()">
+          <option value="24">Last 24 hours</option>
+          <option value="72" selected>Last 3 days</option>
+          <option value="120">Last 5 days</option>
+          <option value="168">Last 7 days</option>
+          <option value="720">Last 30 days</option>
+        </select>
+        <button id="gd-dio-refresh-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);cursor:pointer;user-select:none">
+          <input type="checkbox" id="gd-dio-enabled" {% if guarddog_diskio_monitor_enabled %}checked{% endif %} onchange="gdSaveDiskioSettings()"/>
+          Run disk I/O benchmark (systemd timer, CSV + dashboard)
+        </label>
+        <span id="gd-dio-enabled-msg" style="font-size:11px;color:var(--text-dim);min-height:14px"></span>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);cursor:pointer;user-select:none;margin-left:0">
+        <input type="checkbox" id="gd-dio-email" {% if guarddog_diskio_email_enabled %}checked{% endif %} onchange="gdSaveDiskioSettings()"/>
+        Send email &amp; SMS for disk I/O degradation (other Guard Dog alerts unchanged)
+      </label>
+    </div>
+    {% if not gd.running %}
+    <p style="font-size:11px;color:var(--text-dim);margin:-4px 0 10px 0">Preference is saved. The timer runs only when Guard Dog is enabled above.</p>
+    {% endif %}
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">When the benchmark runs: samples every 15 minutes. Notifications (if enabled above) when the last-hour average drops below 50 MB/s or falls 70%+ from the 24h average. Scripts still update with <strong>Update Guard Dog</strong> or console restart.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:16px">
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Current</div><span id="gd-dio-current" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">1h avg</div><span id="gd-dio-1h" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">24h avg</div><span id="gd-dio-24h" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Min / Max</div><span id="gd-dio-range" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center">
+      <button class="btn btn-ghost" style="padding:6px 14px;font-size:11px" onclick="gdDownloadDiskIOReport()">Download CSV report</button>
+      <span id="gd-dio-dl-msg" style="font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div style="position:relative;height:120px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-dio-chart" style="width:100%;height:100%"></canvas>
+      <div id="gd-dio-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — first sample in ~15 min after Guard Dog deploy</div>
+    </div>
+  </div>
+
+  <div class="card" id="gd-netfanout-card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <span>Network &amp; Fanout</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <select id="gd-net-range-sel" class="form-input" style="width:auto;min-width:100px;padding:4px 8px;font-size:11px" onchange="gdRefreshNetMetrics()">
+          <option value="1" selected>Last 1 hour</option>
+          <option value="24">Last 24 hours</option>
+        </select>
+        <button id="gd-net-refresh-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshNetMetrics()">Refresh</button>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Live TAK Server CoT-fanout load. The <strong>:8089 send-queue</strong> is the leading indicator of fanout backpressure &mdash; if it climbs while CPU stays flat, the bottleneck is the NIC / TCP send path, not compute. Sampled every 30&ndash;60s by the Guard Dog metrics collector.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:16px">
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Connected clients</div><span id="gd-net-clients" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">:8089 send-queue (live)</div><span id="gd-net-txq" style="font-weight:600;font-size:14px">—</span><span id="gd-net-stalled" style="font-size:10px;color:var(--text-dim);margin-left:6px"></span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Host TX</div><span id="gd-net-tx" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">JVM heap (used)</div><span id="gd-net-heap" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <div style="font-size:11px;color:var(--text-secondary);margin:4px 0 4px">TAK fanout send-queue &mdash; :8089 (<span style="color:#06b6d4">sum</span> / <span style="color:#ef4444">max one client</span>, bytes queued to clients)</div>
+    <div style="position:relative;height:130px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-net-chart-txq" style="width:100%;height:100%"></canvas>
+      <div id="gd-net-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — collector produces its first sample within ~1 min</div>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45"><strong style="color:var(--text-secondary)">How to read:</strong> flat and near the bottom = the server is keeping up with fanout. A line that <strong>climbs and stays up</strong> = TAK is producing position updates faster than the network can send them (clients start lagging or dropping) — your fanout ceiling, even if CPU/RAM look fine. If the <span style="color:#ef4444">red dashed</span> line is high but <span style="color:#06b6d4">cyan</span> is low, it's <em>one</em> slow client, not the whole server. <strong>Stalled</strong> connections (a queue that hasn't moved across samples — e.g. an idle Node-RED feed or a dropped client still holding a buffer) are <em>excluded</em> from this line and counted in the tile above, so leftover sockets don't masquerade as live backpressure.</div>
+    <div style="font-size:11px;color:var(--text-secondary);margin:14px 0 4px">External network throughput &mdash; <span style="color:#06b6d4">TX</span> / <span style="color:#f59e0b">RX</span> (bytes/s)</div>
+    <div style="position:relative;height:100px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-net-chart-thru" style="width:100%;height:100%"></canvas>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45"><strong style="color:var(--text-secondary)">How to read:</strong> on a fanout server <span style="color:#06b6d4">TX</span> (out) should be much larger than <span style="color:#f59e0b">RX</span> (in) — one position comes in, a copy goes out to every other client. Watch whether TX grows <em>in step</em> with the client count (normal) or <em>faster</em> than it (you're approaching the network ceiling).</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px">
+      <div>
+        <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">Connected clients</div>
+        <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <canvas id="gd-net-chart-clients" style="width:100%;height:100%"></canvas>
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45">Live streaming clients right now. The baseline you compare everything else against — TX and the send-queue should scale with this.</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-secondary);margin:0 0 4px">JVM heap &mdash; used (MB)</div>
+        <div style="position:relative;height:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <canvas id="gd-net-chart-heap" style="width:100%;height:100%"></canvas>
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin:6px 2px 0;line-height:1.45">TAK Server's Java memory. A <strong>sawtooth</strong> (climbs, then drops on garbage collection) is healthy. A line that climbs toward the top and never drops back = memory pressure.</div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Notifications</span><span class="gd-collapse-toggle">&#9662;</span></div>
+    <div class="gd-collapse-body">
+    {% if notifications_configured %}
+    <div id="gd-notify-banner" class="status-banner running" style="margin-bottom:12px"><div class="dot"></div>Notifications configured</div>
+    {% endif %}
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Configure email, Uptime Robot, and optional SMS (Twilio or Brevo) for Guard Dog alerts. The same email receives <strong>update notifications</strong> when a newer version of infra-TAK, Authentik, MediaMTX, CloudTAK, or TAK Portal is available (checked every 6 hours; one email per change so you are not spammed).</p>
+    <div class="gd-section" style="margin-bottom:20px">
+      <div class="form-label">Server nickname</div>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Optional. Shown in alert subject and body so you can tell which server when monitoring multiple (e.g. Production, Staging).</p>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px">
+        <input class="form-input" type="text" id="gd-server-nickname" placeholder="e.g. Production, Staging" value="{{ guarddog_server_nickname | e }}" style="max-width:220px" maxlength="64">
+        <button class="btn btn-ghost" id="gd-save-notify-btn" onclick="gdSaveNotifications()">Save email &amp; nickname</button>
+      </div>
+      <div class="form-label">Email</div>
+      {% if email_relay_configured %}<p style="font-size:12px;color:var(--green);margin-bottom:8px">Using Email Relay (e.g. Brevo SMTP). Alerts are sent through your configured relay.</p>{% endif %}
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <input class="form-input" type="email" id="gd-notify-email" placeholder="Alert email" value="{{ guarddog_alert_email | e }}" style="max-width:280px">
+        <button class="btn btn-ghost" id="gd-test-email-btn" onclick="gdTestEmail()">Send test email</button>
+      </div>
+      <div id="gd-test-email-msg" style="margin-top:8px;font-size:12px"></div>
+      <div id="gd-save-notify-msg" style="margin-top:8px;font-size:12px"></div>
+    </div>
+    <div class="gd-section" style="margin-bottom:20px">
+      <div class="form-label">Uptime Robot (outside-in monitoring)</div>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Create a free account at <a href="https://uptimerobot.com" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">uptimerobot.com</a>, add your email for alerts, then add an HTTP(S) monitor with this URL:</p>
+      <p style="font-size:13px;margin-bottom:4px"><code style="word-break:break-all;background:var(--bg-deep);padding:8px 12px;border-radius:6px;display:inline-block">{{ health_url }}</code></p>
+      <p style="font-size:11px;color:var(--text-dim)">Copy and paste this into Uptime Robot when creating a new monitor.</p>
+    </div>
+    <div class="gd-section">
+      <div class="form-label">SMS (optional)</div>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Use Twilio or Brevo to send SMS for critical alerts. No SMS? Alerts still go to the email address above; set up push notifications in your email app on your phone to get alerts on the go.</p>
+      <select class="form-input" id="gd-sms-provider" style="max-width:120px;margin-bottom:10px" onchange="gdSmsProviderChange()">
+        <option value="">Off</option>
+        <option value="twilio" {{ 'selected' if guarddog_sms.get('provider')=='twilio' else '' }}>Twilio</option>
+        <option value="brevo" {{ 'selected' if guarddog_sms.get('provider')=='brevo' else '' }}>Brevo</option>
+      </select>
+      <div id="gd-sms-twilio" style="display:{{ 'block' if guarddog_sms.get('provider')=='twilio' else 'none' }};margin-bottom:10px">
+        <input class="form-input" type="text" id="gd-sms-tw-account" placeholder="Account SID" value="{{ guarddog_sms.get('account_sid','') | e }}" style="margin-bottom:6px">
+        <input class="form-input" type="password" id="gd-sms-tw-auth" placeholder="Auth Token" value="{{ guarddog_sms.get('auth_token','') | e }}" style="margin-bottom:6px" autocomplete="off">
+        <input class="form-input" type="text" id="gd-sms-tw-from" placeholder="From number (e.g. +15551234567)" value="{{ guarddog_sms.get('from_number','') | e }}" style="margin-bottom:6px">
+        <input class="form-input" type="text" id="gd-sms-tw-to" placeholder="To number(s), comma-separated" value="{{ guarddog_sms.get('to_numbers','') | e }}" style="margin-bottom:6px">
+      </div>
+      <div id="gd-sms-brevo" style="display:{{ 'block' if guarddog_sms.get('provider')=='brevo' else 'none' }};margin-bottom:10px">
+        <input class="form-input" type="password" id="gd-sms-br-api" placeholder="Brevo API key" value="{{ guarddog_sms.get('api_key','') | e }}" style="margin-bottom:6px" autocomplete="off">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <input class="form-input" type="text" id="gd-sms-br-sender" placeholder="Sender (max 11 chars)" value="{{ guarddog_sms.get('sender','') | e }}" style="flex:1;margin-bottom:0" maxlength="11" oninput="gdSenderCheck()">
+          <span id="gd-sms-sender-check" style="font-size:18px;color:var(--green);display:none" title="11 characters or less">&#10003;</span>
+          <span id="gd-sms-sender-warn" style="font-size:12px;color:var(--text-dim);display:none"></span>
+        </div>
+        <input class="form-input" type="text" id="gd-sms-br-to" placeholder="To: digits + country code, e.g. 15551234567" value="{{ guarddog_sms.get('to_numbers','') | e }}" style="margin-bottom:6px">
+        <p style="font-size:11px;color:var(--text-dim);margin-top:0">To: digits + country code (e.g. 15551234567). Sender: up to 11 letters/numbers (Brevo has no separate SMS sender page — we send it in the API). If test fails, Brevo’s error appears below. If test says sent but you get no text, check Brevo → Campaigns → SMS or Statistics for delivery status.</p>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <button class="btn btn-ghost" onclick="gdSmsSave()">Save SMS settings</button>
+        <button class="btn btn-ghost" id="gd-test-sms-btn" onclick="gdTestSms()">Send test SMS</button>
+        <button class="btn btn-ghost" id="gd-brevo-events-btn" onclick="gdBrevoSmsEvents()" style="display:none">Check delivery status</button>
+      </div>
+      <div id="gd-sms-msg" style="margin-top:8px;font-size:12px"></div>
+      <div id="gd-sms-events" style="display:none;margin-top:10px;padding:10px;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;font-size:12px;max-height:180px;overflow-y:auto"></div>
+    </div>
+    </div>
+  </div>
+
+  {% if tak.installed %}
+  <div class="card">
+    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Database maintenance (CoT)</span><span class="gd-collapse-toggle">&#9662;</span></div>
+    <div class="gd-collapse-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The CoT database can grow large. Data retention deletes rows but <strong>PostgreSQL does not free disk until you run VACUUM</strong>. Smart auto-VACUUM runs daily at 3am (triggers when dead tuples &gt; 1M).</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px">
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Database size</div><span id="gd-cot-db-size" style="font-weight:600;font-size:14px">—</span> <button type="button" onclick="gdRefreshCotSize()" class="btn btn-ghost" style="margin-left:4px;padding:2px 8px;font-size:10px">Refresh</button></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Estimated rows</div><span id="gd-cot-msg-count" style="font-weight:600;font-size:14px">—</span></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Dead tuples</div><span id="gd-cot-dead-tuples" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <p style="font-size:10px;color:var(--text-dim);margin-bottom:14px">Size: green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB</p>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+        <button type="button" id="gd-vacuum-analyze-btn" onclick="gdRunVacuum(false)" class="btn" style="background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;flex-shrink:0">Optimize Tables</button>
+        <span style="font-size:12px;color:var(--text-secondary)">VACUUM ANALYZE — marks deleted space for reuse. Safe while running.</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+        <button type="button" id="gd-vacuum-full-btn" onclick="gdRunVacuum(true)" class="btn btn-ghost" style="color:var(--yellow);border-color:var(--yellow);flex-shrink:0" title="Caution: run when TAK Server is not running">Compact Database</button>
+        <span style="font-size:12px;color:var(--text-secondary)">VACUUM FULL — physically shrinks files on disk. <strong>Stop TAK Server first</strong>. <span style="color:var(--yellow)">(caution)</span></span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+        <button type="button" id="gd-reindex-btn" onclick="gdRunReindex()" class="btn btn-ghost" style="color:var(--cyan);border-color:var(--cyan);flex-shrink:0">Rebuild Indexes</button>
+        <span style="font-size:12px;color:var(--text-secondary)">REINDEX — rebuilds indexes for faster queries. Safe while running.</span>
+      </div>
+    </div>
+    <div id="gd-vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
+    <div id="gd-vacuum-msg" style="margin-top:8px;font-size:13px"></div>
+    {% if autovacuum_last %}<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Auto-VACUUM last run: <span style="color:var(--cyan)">{{ autovacuum_last }}</span></div>{% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if ak_tasklog_installed %}
+  <div class="card">
+    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Database maintenance (Authentik)</span><span class="gd-collapse-toggle">&#9662;</span></div>
+    <div class="gd-collapse-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Authentik writes a record to <code>authentik_tasks_task</code> and <code>authentik_tasks_tasklog</code> on every background task. These tables are never automatically purged — after ~1 month of normal operation they can grow to 500–900 MB (88%+ of the Authentik DB), causing autovacuum lag and background writer CPU spikes. Guard Dog runs a weekly cleanup (Sunday 03:00) that deletes rows older than 30 days and runs <code>VACUUM ANALYZE</code>.</p>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div style="font-size:12px;color:var(--text-dim)">Schedule: <span style="color:var(--cyan)">Weekly — Sunday 03:00</span></div>
+      {% if ak_tasklog_last %}
+      <div style="font-size:12px;color:var(--text-dim)">Last run: <span style="color:var(--green)">{{ ak_tasklog_last }}</span></div>
+      {% else %}
+      <div style="font-size:12px;color:var(--text-dim)">Last run: <span style="color:var(--text-dim)">Not yet run</span></div>
+      {% endif %}
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">Log: <code>/var/log/takguard/authentik-tasklog-purge.log</code></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if gd.installed %}
+  <div class="card">
+    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Activity log</span><span class="gd-collapse-toggle">&#9662;</span></div>
+    <div class="gd-collapse-body">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Restarts, alerts, and monitor events from Guard Dog. Filter by date or leave blank for all.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px">
+      <label style="font-size:12px;color:var(--text-secondary)">From <input type="date" id="gd-log-from" class="form-input" style="width:140px;display:inline-block;margin-left:6px"></label>
+      <label style="font-size:12px;color:var(--text-secondary)">To <input type="date" id="gd-log-to" class="form-input" style="width:140px;display:inline-block;margin-left:6px"></label>
+      <button type="button" class="btn btn-ghost" onclick="gdLoadActivityLog()">Refresh</button>
+      <button type="button" class="btn btn-ghost" style="color:var(--text-dim)" onclick="document.getElementById('gd-log-from').value='';document.getElementById('gd-log-to').value='';gdLoadActivityLog()">Clear filter</button>
+    </div>
+    <div class="log-box" id="gd-activity-log" style="max-height:320px">Loading…</div>
+    <p style="font-size:11px;color:var(--text-dim);margin-top:8px">Log file: <code>/var/log/takguard/restarts.log</code></p>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if gd.installed %}
+  <div class="modal-overlay" id="gd-uninstall-modal"><div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw">
+    <h3 style="font-size:16px;margin-bottom:8px;color:var(--red)">Uninstall Guard Dog?</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">This will stop all timers and the health endpoint, and remove scripts and systemd units. Alert history in /var/lib/takguard and /var/log/takguard is left in place.</p>
+    <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-uninstall-password" placeholder="Confirm password"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="document.getElementById('gd-uninstall-modal').classList.remove('open')">Cancel</button><button class="btn" style="background:var(--red);color:#fff" onclick="gdUninstall()">Uninstall</button></div>
+    <div id="gd-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+  </div></div>
+  <div class="modal-overlay" id="gd-rollback-modal"><div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw">
+    <h3 style="font-size:16px;margin-bottom:8px;color:var(--yellow)">↩ Roll Back Console?</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">This will revert the console to <strong>{{ settings.get('console_rollback', {}).get('tag', 'previous version') }}</strong>. The console will restart briefly. This cannot be undone.</p>
+    <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-rollback-password" placeholder="Confirm password" onkeydown="if(event.key==='Enter')doConsoleRollbackSubmit()"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="document.getElementById('gd-rollback-modal').classList.remove('open');document.getElementById('gd-rollback-password').value=''">Cancel</button><button class="btn" style="background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.4)" onclick="doConsoleRollbackSubmit()">↩ Roll Back</button></div>
+    <div id="gd-rollback-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+  </div></div>
+  <div class="card">
+    <div class="card-title">Console Rollback</div>
+    {% if settings.get('console_rollback', {}).get('available') %}
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">A snapshot was taken before the last update. You can roll back the console to the previous version if the update caused issues.</p>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--yellow)">↩ {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
+      </div>
+      <button onclick="doConsoleRollback()" style="padding:7px 16px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">↩ Roll Back to {{ settings.get('console_rollback', {}).get('tag', '') }}</button>
+    </div>
+    {% else %}
+    <p style="font-size:13px;color:var(--text-dim)">No previous version available — fresh install or settings cleared.</p>
+    {% endif %}
+  </div>
+
+  {% else %}
+  <div class="card"><div class="card-title">Deploy Guard Dog</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">Guard Dog usually installs automatically when you deploy TAK Server. If you skipped that or need to reinstall, use this. Installs monitors (port 8089, processes, PostgreSQL, CoT DB size, OOM, disk, network, certificate expiry) and a health endpoint. Alert email is optional — set it in Notifications above to receive alerts (or add it later).</p>
+    <button class="btn btn-primary" id="gd-deploy-btn" onclick="startGuarddogDeploy()" {% if not tak.installed %}disabled{% endif %}>🐕 Deploy Guard Dog</button>
+  </div>
+  {% endif %}
+
+  <div class="card" id="gd-log-card" style="display:none"><div class="card-title">Deploy log</div><div class="log-box" id="gd-deploy-log">Initializing...</div></div>
+</div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script src="/guarddog.js?v={{ version }}"></script>
+</body></html>

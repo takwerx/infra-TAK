@@ -1,0 +1,369 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cesium 3D Tiles — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;font-weight:600}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px;font-family:'JetBrains Mono',monospace}
+.status-row{display:flex;align-items:center;gap:12px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite;flex-shrink:0}
+.status-dot.off{background:var(--text-dim);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:32px;text-align:center;cursor:pointer;transition:all .3s;background:rgba(15,23,42,.3)}
+.upload-area:hover,.upload-area.drag{border-color:var(--accent);background:rgba(59,130,246,.06)}
+.progress-bar-outer{width:100%;height:6px;background:rgba(59,130,246,.1);border-radius:3px;margin-top:10px;overflow:hidden;display:none}
+.progress-bar-inner{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--cyan));width:0%;transition:width .3s}
+.dataset-table{width:100%;border-collapse:collapse}
+.dataset-table th{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
+.dataset-table td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(30,39,54,.6);vertical-align:middle}
+.dataset-table tr:last-child td{border-bottom:none}
+.btn{display:inline-flex;align-items:center;padding:8px 16px;border-radius:7px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}.btn-ghost:hover{border-color:var(--accent);background:rgba(59,130,246,.15)}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-sm{padding:5px 10px;font-size:11px}
+.url-chip{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.15);border-radius:5px;padding:3px 8px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle;cursor:pointer}
+.url-chip:hover{background:rgba(6,182,212,.12)}
+.sample-box{background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px}
+.sample-box a{color:var(--cyan);text-decoration:none}.sample-box a:hover{text-decoration:underline}
+.step-item{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(30,39,54,.5)}
+.step-item:last-child{border-bottom:none}
+.step-num{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step-text{font-size:13px;color:var(--text-secondary);line-height:1.5}
+.step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
+.details-toggle{width:100%;text-align:left;background:none;border:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:0;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.details-toggle:hover{color:var(--text-primary)}
+.chevron{transition:transform .2s;font-size:16px;color:var(--text-dim)}
+.chevron.open{transform:rotate(180deg)}
+.collapsed{display:none}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace}
+.form-input:focus{outline:none;border-color:var(--accent)}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;z-index:999;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
+.empty-state{text-align:center;padding:32px;color:var(--text-dim);font-size:13px}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div style="margin-bottom:20px"><img src="/static/3DTiles_light_color.svg" alt="Cesium 3D Tiles" style="height:40px;width:auto;object-fit:contain"></div>
+
+{% if not ct.get('installed') %}
+<!-- Deploy state -->
+<div class="card" style="max-width:600px">
+<div style="display:flex;align-items:flex-start;gap:20px">
+<span style="font-size:48px;line-height:1;flex-shrink:0">🌍</span>
+<div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:8px">Cesium 3D Tiles</div>
+<div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px">
+Serve 3D terrain, building models, and point clouds directly to ATAK and WinTAK clients.
+Any dataset in <a href="https://github.com/CesiumGS/3d-tiles" style="color:var(--cyan);text-decoration:none" target="_blank">Cesium 3D Tiles format</a> works — upload it as a zip and give field users a single <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">tileset.json</code> URL.
+No new container — served directly by Caddy over HTTPS.
+</div>
+{% if not settings.get('fqdn') %}
+<div style="background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.25);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--yellow)">
+A domain must be configured before enabling Cesium 3D Tiles (Caddy needs it for the <code style="font-size:11px">3dtiles.&lt;domain&gt;</code> vhost).
+<a href="/caddy" style="color:var(--cyan);text-decoration:none;margin-left:6px">Configure domain →</a>
+</div>
+{% endif %}
+<button class="btn btn-primary" onclick="enableModule()" {% if not settings.get('fqdn') %}disabled style="opacity:.5;cursor:not-allowed"{% endif %} id="enable-btn">
+Enable Cesium 3D Tiles
+</button>
+<div id="enable-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+</div>
+</div>
+
+{% else %}
+<!-- Management state -->
+{% set ct_domain = settings.get('cesium_tiles_domain') or ('3dtiles.' + settings.get('fqdn','')) %}
+<div class="card" style="margin-bottom:20px">
+<div class="status-row">
+<div class="status-dot {% if not ct.get('running') %}off{% endif %}"></div>
+<div>
+<span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--text-primary)">{% if ct.get('running') %}Active{% else %}Not running{% endif %}</span>
+{% if settings.get('fqdn') %}
+<span style="font-size:12px;color:var(--text-dim);margin-left:12px">Base URL: <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">https://{{ ct_domain }}</code></span>
+{% endif %}
+</div>
+<div style="display:flex;gap:8px;margin-left:auto">
+<button class="btn btn-danger btn-sm" onclick="disableModule()">Disable</button>
+<button class="btn btn-danger btn-sm" onclick="document.getElementById('ct-remove-modal').style.display='flex'" style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4)">Remove</button>
+</div>
+</div>
+</div>
+
+<!-- Remove modal -->
+<div id="ct-remove-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:900;align-items:center;justify-content:center">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:440px;width:90%">
+<div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:var(--red);margin-bottom:12px">Remove Cesium 3D Tiles?</div>
+<div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:20px">
+This will disable the module and <strong>permanently delete all tile datasets</strong> from <code style="font-size:11px;color:var(--cyan)">~/cesium-tiles/</code>.<br><br>
+This cannot be undone. Back up any datasets you want to keep before continuing.
+</div>
+<div style="display:flex;gap:10px;justify-content:flex-end">
+<button class="btn btn-ghost btn-sm" onclick="document.getElementById('ct-remove-modal').style.display='none'">Cancel</button>
+<button class="btn btn-danger btn-sm" id="ct-remove-btn" onclick="removeModule()">Delete everything &amp; remove</button>
+</div>
+<div id="ct-remove-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+</div>
+
+<!-- How to upload instructions -->
+<div class="card" style="margin-bottom:20px">
+<button class="details-toggle" onclick="toggleUploadHelp(this)">
+<span>How to prepare &amp; upload a dataset</span>
+<span class="material-symbols-outlined chevron" id="upload-help-chevron">expand_more</span>
+</button>
+<div id="upload-help-body" class="collapsed" style="margin-top:16px">
+<div class="step-item">
+<div class="step-num">1</div>
+<div class="step-text"><strong>Get a 3D Tiles dataset.</strong> Any directory that contains a <span class="step-code">tileset.json</span> file at its root is a valid Cesium 3D Tiles dataset. The folder also contains the tile files (<span class="step-code">.b3dm</span>, <span class="step-code">.pnts</span>, <span class="step-code">.i3dm</span>, etc.) referenced by that JSON.</div>
+</div>
+<div class="step-item">
+<div class="step-num">2</div>
+<div class="step-text"><strong>Choose a descriptive name.</strong> In the <em>Dataset Name</em> field below, enter a name that matches what the data represents — e.g. <span class="step-code">downtown-san-diego</span> or <span class="step-code">incident-alpha-buildings</span>. Use lowercase with hyphens, no spaces. This name becomes part of the ATAK URL and appears in the TAK client overlay manager, so field users can identify it at a glance.</div>
+</div>
+<div class="step-item">
+<div class="step-num">3</div>
+<div class="step-text"><strong>Option A — Upload via browser.</strong> Enter a dataset name, then either:<br>
+• <strong>Select Folder</strong> — pick the dataset folder directly from your computer.<br>
+• <strong>Select .zip</strong> — zip the dataset folder first so the <span class="step-code">tileset.json</span> is at the top level inside the zip (not nested inside a sub-folder), then upload the zip.</div>
+</div>
+<div class="step-item">
+<div class="step-num">4</div>
+<div class="step-text"><strong>Option B — Place via SFTP.</strong> Copy the dataset folder directly to the server at:<br>
+<span class="step-code">~/cesium-tiles/&lt;dataset-name&gt;/tileset.json</span><br>
+<span style="font-size:12px;color:var(--text-dim)">The dataset will appear in the list below automatically — no upload needed.</span></div>
+</div>
+<div class="step-item" style="border-bottom:none">
+<div class="step-num">5</div>
+<div class="step-text"><strong>Copy the ATAK URL.</strong> Once the dataset appears in the table below, click its URL chip to copy it. Paste that URL into ATAK's Map Manager (see <em>How to Connect in ATAK</em> below).</div>
+</div>
+</div>
+</div>
+
+<!-- Upload section -->
+<div class="card">
+<div class="card-title">Upload Dataset</div>
+<div style="margin-bottom:16px">
+<label class="form-label">Dataset Name</label>
+<input type="text" id="dataset-name" class="form-input" placeholder="e.g. san-diego-buildings" maxlength="80" oninput="updateUrlPreview(this.value)">
+<div style="margin-top:7px;min-height:18px">
+<span style="font-size:11px;color:var(--text-dim)">ATAK URL: </span>
+<span id="url-preview" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">type a name above to preview</span>
+</div>
+</div>
+<div class="upload-area" id="upload-area">
+<input type="file" id="folder-input" webkitdirectory multiple style="display:none" onchange="handleFolderSelect(this.files)">
+<input type="file" id="zip-input" accept=".zip" style="display:none" onchange="handleZipSelect(this.files[0])">
+<span class="material-symbols-outlined" style="font-size:36px;color:var(--text-dim);display:block;margin-bottom:10px">drive_folder_upload</span>
+<div style="font-size:14px;color:var(--text-secondary);margin-bottom:10px" id="file-label">Select your dataset folder or a .zip file</div>
+<div style="display:flex;gap:10px;justify-content:center">
+<button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation();document.getElementById('folder-input').click()">
+<span class="material-symbols-outlined" style="font-size:14px">folder_open</span> Select Folder
+</button>
+<button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation();document.getElementById('zip-input').click()">
+<span class="material-symbols-outlined" style="font-size:14px">folder_zip</span> Select .zip
+</button>
+</div>
+</div>
+<div class="progress-bar-outer" id="progress-outer">
+<div class="progress-bar-inner" id="progress-bar"></div>
+</div>
+<div id="upload-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+<button class="btn btn-primary" onclick="doUpload()" id="upload-btn" style="margin-top:14px" disabled>Upload Dataset</button>
+</div>
+
+<!-- Dataset list -->
+<div class="card">
+<div class="card-title">Installed Datasets ({{ datasets|length }})</div>
+{% if datasets %}
+<table class="dataset-table">
+<thead><tr>
+<th>Name</th><th>Size</th><th>Tiles</th><th>ATAK URL</th><th></th>
+</tr></thead>
+<tbody id="dataset-tbody">
+{% for ds in datasets %}
+<tr id="row-{{ ds.name }}">
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-primary)">{{ ds.name }}</td>
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">{{ ds.size }}</td>
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">{{ ds.tile_count }}</td>
+<td>
+{% if ds.url %}
+<span class="url-chip" onclick="copyUrl('{{ ds.url }}')" title="Click to copy">{{ ds.url }}</span>
+{% else %}
+<span style="font-size:11px;color:var(--text-dim)">Configure domain first</span>
+{% endif %}
+</td>
+<td><button class="btn btn-danger btn-sm" onclick="deleteDataset('{{ ds.name }}')">Delete</button></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<div class="empty-state">No datasets yet — upload a zip above or place datasets in <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">~/cesium-tiles/&lt;name&gt;/</code> via SFTP.</div>
+{% endif %}
+</div>
+
+<!-- ATAK Instructions -->
+<div class="card">
+<button class="details-toggle" onclick="toggleInstructions(this)">
+<span>How to Connect in ATAK / WinTAK</span>
+<span class="material-symbols-outlined chevron" id="instr-chevron">expand_more</span>
+</button>
+<div id="instr-body" class="collapsed" style="margin-top:16px">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Source: TAK Developers Confluence — Cesium 3D Tiles</div>
+<div class="steps-list">
+<div class="step-item"><div class="step-num">1</div><div class="step-text">Open ATAK and launch the <strong>Map Manager</strong></div></div>
+<div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>MOBILE</strong> tab</div></div>
+<div class="step-item"><div class="step-num">3</div><div class="step-text">Select the <strong>Down Arrow</strong>, then the <strong>Add (+)</strong> button</div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Type in the URL to the dataset's <span class="step-code">tileset.json</span> — e.g. <span class="step-code">https://{{ ct_domain }}/my-dataset/tileset.json</span><br><span style="font-size:12px;color:var(--text-dim)">ATAK will send a request to the URL to check for available services and confirm it is Cesium 3D Tiles content.</span></div></div>
+<div class="step-item"><div class="step-num">5</div><div class="step-text">If the connection succeeds, a window shows available services. <strong>Click the checkbox</strong> next to the tileset to import it.</div></div>
+<div class="step-item"><div class="step-num">6</div><div class="step-text">The dataset is now available under the <strong>Overlay Manager</strong> as a 3D layer. ATAK caches tiles locally in <span class="step-code">atak/3dtilescache/</span>.</div></div>
+</div>
+</div>
+</div>
+
+{% endif %}
+</div>
+<div id="toast" class="toast"></div>
+<script>
+var _pendingFiles=null,_pendingZip=null,_uploadMode=null;
+var _ctBaseUrl='{% if settings.get("fqdn") %}https://{{ ct_domain }}{% else %}{% endif %}';
+function enableModule(){
+    document.getElementById('enable-btn').disabled=true;
+    document.getElementById('enable-status').textContent='Enabling…';
+    fetch('/api/cesium-tiles/enable',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success)window.location.reload();
+        else{document.getElementById('enable-status').textContent='Error: '+(d.error||'unknown');document.getElementById('enable-btn').disabled=false;}
+    }).catch(e=>{document.getElementById('enable-status').textContent='Network error: '+e.message;document.getElementById('enable-btn').disabled=false;});
+}
+function disableModule(){
+    if(!confirm('Disable Cesium 3D Tiles? The tile files will not be deleted.'))return;
+    fetch('/api/cesium-tiles/disable',{method:'POST'}).then(()=>window.location.reload());
+}
+function removeModule(){
+    var btn=document.getElementById('ct-remove-btn');
+    var st=document.getElementById('ct-remove-status');
+    btn.disabled=true;btn.textContent='Removing…';st.textContent='';
+    fetch('/api/cesium-tiles/uninstall',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.href='/console';}
+        else{st.textContent='Error: '+(d.error||'unknown');btn.disabled=false;btn.textContent='Delete everything & remove';}
+    }).catch(e=>{st.textContent='Network error';btn.disabled=false;btn.textContent='Delete everything & remove';});
+}
+function cleanName(v){return v.replace(/[^A-Za-z0-9_\-]/g,'-').replace(/^-+|-+$/g,'');}
+function updateUrlPreview(v){
+    var n=cleanName(v||'');
+    var el=document.getElementById('url-preview');
+    if(!el)return;
+    if(n&&_ctBaseUrl){el.textContent=_ctBaseUrl+'/'+n+'/tileset.json';el.style.color='var(--cyan)';}
+    else if(n){el.textContent='/'+n+'/tileset.json';el.style.color='var(--text-secondary)';}
+    else{el.textContent='type a name above to preview';el.style.color='var(--text-dim)';}
+}
+function handleFolderSelect(files){
+    if(!files||!files.length)return;
+    _pendingFiles=Array.from(files);_pendingZip=null;_uploadMode='folder';
+    var hasJson=_pendingFiles.some(function(f){var p=f.webkitRelativePath||f.name;return p.split('/').slice(1).join('/')==='tileset.json';});
+    var lbl=document.getElementById('file-label');
+    if(hasJson){lbl.innerHTML='<span style="color:var(--green)">✓ '+_pendingFiles.length+' files — tileset.json found</span>';document.getElementById('upload-btn').disabled=false;}
+    else{lbl.innerHTML='<span style="color:var(--red)">✗ No tileset.json found in this folder</span>';document.getElementById('upload-btn').disabled=true;}
+}
+function handleZipSelect(file){
+    if(!file)return;
+    _pendingZip=file;_pendingFiles=null;_uploadMode='zip';
+    document.getElementById('file-label').innerHTML='<span style="color:var(--green)">✓ '+file.name+' ('+formatBytes(file.size)+')</span>';
+    document.getElementById('upload-btn').disabled=false;
+}
+function formatBytes(b){if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';}
+var _uploadArea=document.getElementById('upload-area');
+if(_uploadArea){
+    _uploadArea.addEventListener('dragover',function(e){e.preventDefault();_uploadArea.classList.add('drag');});
+    _uploadArea.addEventListener('dragleave',function(){_uploadArea.classList.remove('drag');});
+    _uploadArea.addEventListener('drop',function(e){
+        e.preventDefault();_uploadArea.classList.remove('drag');
+        var f=e.dataTransfer.files[0];
+        if(!f)return;
+        if(f.name.toLowerCase().endsWith('.zip')){document.getElementById('zip-input').files=e.dataTransfer.files;handleZipSelect(f);}
+        else{showToast('Drop a .zip file here. To upload a folder, use the Select Folder button.');}
+    });
+}
+function doUpload(){
+    var raw=(document.getElementById('dataset-name').value||'').trim();
+    var name=cleanName(raw);
+    if(!name){showToast('Enter a dataset name first.');return;}
+    if(_uploadMode==='folder'&&_pendingFiles){_doFolderUpload(name);}
+    else if(_uploadMode==='zip'&&_pendingZip){_doZipUpload(name);}
+    else{showToast('Select a folder or zip file first.');}
+}
+function _sendXhr(url,fd,onDone){
+    var btn=document.getElementById('upload-btn');
+    var outer=document.getElementById('progress-outer');
+    var bar=document.getElementById('progress-bar');
+    var st=document.getElementById('upload-status');
+    btn.disabled=true;outer.style.display='block';bar.style.width='0%';st.textContent='Uploading…';
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST',url);
+    xhr.upload.onprogress=function(e){if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);bar.style.width=pct+'%';st.textContent='Uploading… '+pct+'%';}};
+    xhr.onload=function(){
+        var d;try{d=JSON.parse(xhr.responseText);}catch(ex){d={success:false,error:'Invalid response'};}
+        if(d.success){bar.style.width='100%';st.textContent='';showToast('Dataset "'+d.dataset+'" uploaded.');setTimeout(function(){window.location.reload();},1200);}
+        else{st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'Upload failed')+'</span>';btn.disabled=false;outer.style.display='none';}
+    };
+    xhr.onerror=function(){st.innerHTML='<span style="color:var(--red)">Network error</span>';btn.disabled=false;outer.style.display='none';};
+    xhr.send(fd);
+}
+function _doFolderUpload(name){
+    var fd=new FormData();
+    fd.append('name',name);
+    for(var i=0;i<_pendingFiles.length;i++){
+        var f=_pendingFiles[i];
+        var rel=(f.webkitRelativePath||f.name).split('/').slice(1).join('/');
+        if(!rel)continue;
+        fd.append('files[]',f,rel);
+    }
+    _sendXhr('/api/cesium-tiles/upload-folder',fd);
+}
+function _doZipUpload(name){
+    var fd=new FormData();fd.append('name',name);fd.append('file',_pendingZip);
+    _sendXhr('/api/cesium-tiles/upload',fd);
+}
+function copyUrl(url){
+    navigator.clipboard.writeText(url).then(function(){showToast('URL copied to clipboard.');}).catch(function(){showToast(url);});
+}
+function deleteDataset(name){
+    if(!confirm('Delete dataset "'+name+'"? This cannot be undone.'))return;
+    fetch('/api/cesium-tiles/datasets/'+encodeURIComponent(name),{method:'DELETE'}).then(r=>r.json()).then(d=>{
+        if(d.success){var row=document.getElementById('row-'+name);if(row)row.remove();showToast('Deleted "'+name+'".');}
+        else showToast('Error: '+(d.error||'Delete failed'));
+    });
+}
+function toggleInstructions(btn){
+    var body=document.getElementById('instr-body');
+    var chev=document.getElementById('instr-chevron');
+    if(body.classList.contains('collapsed')){body.classList.remove('collapsed');chev.classList.add('open');}
+    else{body.classList.add('collapsed');chev.classList.remove('open');}
+}
+function toggleUploadHelp(btn){
+    var body=document.getElementById('upload-help-body');
+    var chev=document.getElementById('upload-help-chevron');
+    if(body.classList.contains('collapsed')){body.classList.remove('collapsed');chev.classList.add('open');}
+    else{body.classList.add('collapsed');chev.classList.remove('open');}
+}
+function showToast(msg){
+    var t=document.getElementById('toast');
+    t.textContent=msg;t.classList.add('show');
+    setTimeout(function(){t.classList.remove('show');},3000);
+}
+</script></body></html>
