@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.19-alpha"
+VERSION = "10.1.20-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -25673,8 +25673,14 @@ takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 # Portal's UI. _portal_email_settings() always emits them as "" — without preserve,
 # every settings push (deploy, update-config, post-update guardrail) wiped them
 # (field report, fixed v10.1.19). Preserve-if-set: fresh installs still get "".
+# EMAIL_FAIL_HARD (v10.1.20): operator POLICY, not transport — preserve-if-set too.
 PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL', 'TAK_SSH_ONBOARDED', 'TAK_SSH_LAST_HANDSHAKE_AT',
-                                     'EMAIL_ALWAYS_CC', 'EMAIL_SEND_COPY_TO'])
+                                     'EMAIL_ALWAYS_CC', 'EMAIL_SEND_COPY_TO', 'EMAIL_FAIL_HARD'])
+
+# Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
+# SEED-ONLY (write-if-absent) when it is not — see _takportal_merged_settings_json().
+EMAIL_TRANSPORT_KEYS = frozenset(['EMAIL_ENABLED', 'EMAIL_PROVIDER', 'SMTP_HOST', 'SMTP_PORT',
+                                  'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'])
 
 
 def _takportal_get_existing_settings():
@@ -25807,14 +25813,60 @@ def _takportal_merged_settings_json(settings):
         'TAK_SSH_USER': {'root', (our.get('TAK_SSH_USER') or '')},
         'TAK_SSH_PORT': {'22'},
     }
+    # v10.1.20 email ownership: when the Email Relay module IS configured, infra-TAK is
+    # authoritative for the portal's email TRANSPORT keys. When it is NOT, those keys are
+    # SEED-ONLY — written once on a portal whose settings lack them (fresh install), never
+    # overwritten after, so a manually-configured portal SMTP survives every settings push.
+    _relay = settings.get('email_relay') or {}
+    _relay_configured = bool(_relay.get('relay_host') and _relay.get('smtp_user'))
     for k, v in our.items():
         cur = (merged.get(k) or '').strip() if isinstance(merged.get(k), str) else ''
         if k in PRESERVE_TAKPORTAL_KEYS and cur:
             continue
+        if k in EMAIL_TRANSPORT_KEYS and not _relay_configured and k in merged:
+            continue  # no relay to speak for — portal's email transport is operator-owned
         if k in _ssh_managed and cur and cur not in _ssh_managed[k]:
             continue  # operator-customized SSH target — never overwrite
         merged[k] = v
     return json.dumps(merged, indent=2)
+
+
+def _takportal_push_settings(plog=None, restart=True):
+    """v10.1.20: push the current merged settings.json into the running tak-portal
+    container (docker cp + restart). Single push path shared by the admin guardrail,
+    the token heal, and the Email Relay flows. Returns True on success; False when the
+    portal isn't running or the push failed. Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'tak-portal']),
+                           capture_output=True, text=True, timeout=8)
+        if (r.stdout or '').strip() != 'true':
+            return False
+        settings = load_settings()
+        settings_json = _takportal_merged_settings_json(settings)
+        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-push-')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(settings_json)
+            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
+                                capture_output=True, text=True, timeout=20)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if cp.returncode != 0:
+            _log(f"  takportal settings push: docker cp failed: {((cp.stderr or cp.stdout) or '').strip()[:200]}")
+            return False
+        if restart:
+            rs = subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
+                                capture_output=True, text=True, timeout=30)
+            if rs.returncode != 0:
+                _log(f"  takportal settings push: restart returned {rs.returncode}")
+        return True
+    except Exception as e:
+        _log(f"  takportal settings push error (non-fatal): {e}")
+        return False
 
 
 def _heal_takportal_authentik_token(plog=None):
@@ -25847,22 +25899,8 @@ def _heal_takportal_authentik_token(plog=None):
             _log("  takportal: AUTHENTIK_TOKEN blank but none readable from Authentik .env yet — skip heal")
             return False
         _log("  takportal: AUTHENTIK_TOKEN blank in settings.json — re-pushing valid token (non-root flip-window heal)")
-        settings_json = _takportal_merged_settings_json(settings)
-        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-heal-')
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(settings_json)
-            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
-                                capture_output=True, text=True, timeout=20)
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        if cp.returncode != 0:
-            _log(f"  takportal: heal docker cp failed: {(cp.stderr or cp.stdout or '').strip()[:200]}")
+        if not _takportal_push_settings(plog=_log):
             return False
-        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         _log("  ✓ takportal: AUTHENTIK_TOKEN restored + container restarted")
         return True
     except Exception as e:
@@ -31947,6 +31985,12 @@ smtp_generic_maps = hash:/etc/postfix/generic
             plog("")
             plog("📋 Configure apps to use SMTP:")
             plog("   Host: localhost   Port: 25   No auth required")
+
+        # v10.1.20: the relay is authoritative for TAK Portal's email transport — push the
+        # updated settings now so the portal Email panel reflects the new provider without
+        # a manual "Update config & reconnect" (operator request 2026-08-04).
+        if _takportal_push_settings(plog):
+            plog("✓ TAK Portal email settings updated from relay config")
 
         status.update({'running': False, 'complete': True, 'error': False})
 
@@ -47579,30 +47623,10 @@ def _takportal_admin_guardrail(plog_fn=None):
             return  # Idempotent — no log spam on healthy boot
 
         _log(f"takportal admin guardrail: current hidden={_hidden!r} actions_hidden={_locked!r} — re-asserting")
-        _settings = load_settings()
-        _settings_json = _takportal_merged_settings_json(_settings)
-        _fd, _tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-guard-')
-        try:
-            with os.fdopen(_fd, 'w') as _tf:
-                _tf.write(_settings_json)
-            _cp = subprocess.run(
-                _sudo_wrap(['docker', 'cp', _tmp, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=20
-            )
-        finally:
-            try:
-                os.remove(_tmp)
-            except OSError:
-                pass
-        if _cp.returncode != 0:
-            _log(f"takportal admin guardrail: docker cp failed: {((_cp.stderr or _cp.stdout) or '').strip()[:200]}")
+        if not _takportal_push_settings(plog=_log):
+            _log("takportal admin guardrail: settings push failed — will retry next boot")
             return
-        _rs = subprocess.run(
-            _sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30
-        )
-        if _rs.returncode == 0:
-            _log("takportal admin guardrail: restarted — akadmin/webadmin hidden + action-locked")
-        else:
-            _log(f"takportal admin guardrail: restart returned {_rs.returncode}")
+        _log("takportal admin guardrail: restarted — akadmin/webadmin hidden + action-locked")
     except Exception as _e:
         _log(f"takportal admin guardrail error (non-fatal): {_e}")
 
