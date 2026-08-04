@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.19-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.19-alpha)**
+**Current release: [v10.1.20-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.20-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.20-alpha — 2026-08-04 — Email settings flow where they should, and "Forgot password?" appears on every installation
+
+**Headline: this release finishes the email-configuration story started in v10.1.19, and fixes a quietly missing login-page feature.** First, **configuring or switching your Email Relay provider now updates TAK Portal automatically** — the portal's Email panel picks up the new SMTP settings the moment the relay deploy finishes, with no "Update config & reconnect" click. Second, **ownership rules are now explicit**: when the Email Relay module manages your email, it stays authoritative for the SMTP transport settings; when you have no relay and configure SMTP directly in TAK Portal instead, infra-TAK now leaves that configuration completely alone (previously every update overwrote it with blanks — same family as the v10.1.19 BCC bug, now fixed at the root). Your CC/BCC addresses and fail-hard policy remain yours in all cases. Third, **the "Forgot password?" link now exists on every installation**. Installations deployed without the Email Relay module never got a password-recovery flow — the login page silently had no recovery link, and nothing could create one without configuring the relay. The recovery flow is now created on every Authentik deploy regardless of email setup, **and existing installations self-heal automatically on their next console update** — no clicks, no reconfiguration. (Recovery emails send using whatever SMTP Authentik has configured, from any source.) **Who should update:** everyone using TAK Portal or Authentik — especially anyone who set up SMTP directly in either without our Email Relay module. **Upgrade:** automatic on the next console update; the recovery-flow heal runs as part of the update itself.
+
+Full notes: [v10.1.20-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.20-alpha).
 
 ### v10.1.19-alpha — 2026-08-04 — Every installation now gets identical software, and TAK Portal stops losing your email settings
 
