@@ -2,7 +2,7 @@
 {% block title %}Email Relay — infra-TAK{% endblock %}
 {% block page_css %}<style>
 
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:'DM Sans',sans-serif;background:var(--bg-deep);color:var(--text-primary);min-height:100vh}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:'JetBrains Mono',monospace;background:var(--bg-deep);color:var(--text-primary);min-height:100vh}
 .top-bar{height:3px;background:linear-gradient(90deg,var(--accent),var(--cyan),var(--green))}
 .header{padding:20px 40px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:var(--bg-surface)}
 .header-left{display:flex;align-items:center;gap:16px}.header-icon{font-size:28px}.header-title{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;letter-spacing:-0.5px}.header-subtitle{font-size:13px;color:var(--text-dim)}
@@ -214,7 +214,7 @@ Switching providers later requires only updating Postfix credentials — no chan
 <div><label class="input-label">Port</label><input type="text" id="deploy-custom_port" class="input-field" placeholder="587" value="587"></div>
 </div></div>
 <div style="margin-top:20px;text-align:center">
-<button onclick="deployRelay()" id="deploy-btn" style="padding:14px 40px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:16px;font-weight:600;cursor:pointer">{% if deploy_error %}&#x2717; Deployment failed — Retry{% else %}📧 Deploy Email Relay{% endif %}</button>
+<button onclick="deployRelay()" id="deploy-btn" style="padding:14px 40px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;cursor:pointer">{% if deploy_error %}&#x2717; Deployment failed — Retry{% else %}📧 Deploy Email Relay{% endif %}</button>
 </div>
 </div>
 {% if deploy_error %}

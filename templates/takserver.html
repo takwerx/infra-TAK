@@ -10,7 +10,7 @@
 .sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
 .sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
 
-body{font-family:'DM Sans',sans-serif;background:var(--bg-primary);color:var(--text-primary);min-height:100vh}
+body{font-family:'JetBrains Mono',monospace;background:var(--bg-primary);color:var(--text-primary);min-height:100vh}
 body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-image:linear-gradient(rgba(59,130,246,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,0.02) 1px,transparent 1px);background-size:60px 60px;pointer-events:none;z-index:0}
 .top-bar{position:fixed;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),var(--cyan),transparent);z-index:100}
 .header{position:relative;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:20px 32px;border-bottom:1px solid var(--border)}
@@ -150,7 +150,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="margin-top:16px;padding:16px 20px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--red);font-weight:600;margin-bottom:8px">✗ Deployment failed</div>
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The install left a broken package state on disk. Click <strong>Clean up &amp; retry</strong> to purge it — any corrupted uploads will be deleted automatically. Then re-upload a fresh copy from <a href="https://tak.gov/products/tak-server" target="_blank" style="color:var(--cyan)">tak.gov</a> and deploy again.</p>
-<button type="button" id="tak-purge-btn" onclick="takPurgeFailed()" style="padding:10px 22px;background:linear-gradient(135deg,#7f1d1d,#b91c1c);color:#fff;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">🧹 Clean up &amp; retry</button>
+<button type="button" id="tak-purge-btn" onclick="takPurgeFailed()" style="padding:10px 22px;background:linear-gradient(135deg,#7f1d1d,#b91c1c);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">🧹 Clean up &amp; retry</button>
 <span id="tak-purge-msg" style="margin-left:12px;font-size:13px;color:var(--text-dim)"></span>
 </div>
 <script>
@@ -183,7 +183,7 @@ function takPurgeFailed(){
 <div class="card" style="border-color:rgba(59,130,246,.35);background:rgba(59,130,246,.06);margin-bottom:24px">
 <div class="card-title">🔗 Connect TAK Server to LDAP</div>
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">Authentik is deployed. Connect TAK Server to the same LDAP so users can sign in with their Authentik accounts. This patches CoreConfig.xml and restarts TAK Server once.</p>
-<button type="button" id="connect-ldap-btn" onclick="connectLdap()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Connect TAK Server to LDAP</button>
+<button type="button" id="connect-ldap-btn" onclick="connectLdap()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">Connect TAK Server to LDAP</button>
 <div id="connect-ldap-msg" style="margin-top:12px;font-size:13px;color:var(--text-secondary)"></div>
 </div>
 {% elif ldap_connected and modules.get('authentik', {}).get('installed') %}
@@ -264,13 +264,13 @@ function takPurgeFailed(){
 <div class="form-field" style="min-width:100px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH port</label><input type="number" id="db-migrate-ssh-port" placeholder="22" min="1" max="65535" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
 </div>
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
-<button type="button" onclick="dbMigrateEnsureSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">2. Setup SSH key</button>
-<button type="button" onclick="dbMigrateInstallSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">3. Copy key to new host</button>
-<button type="button" onclick="dbMigrateDeployServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">4. Deploy Server One (DB) on new host</button>
+<button type="button" onclick="dbMigrateEnsureSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'JetBrains Mono',monospace">2. Setup SSH key</button>
+<button type="button" onclick="dbMigrateInstallSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'JetBrains Mono',monospace">3. Copy key to new host</button>
+<button type="button" onclick="dbMigrateDeployServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'JetBrains Mono',monospace">4. Deploy Server One (DB) on new host</button>
 <span style="font-size:11px;color:var(--text-dim);max-width:100%">Steps 2–3: <code>sshpass</code> same as wizard. Step 4 &amp; Start migration: uploaded <code>takserver-database</code> .deb must match <code>dpkg-query</code> version on the <strong>current</strong> Server One (same release as production DB). Saved “current” Server One host is not changed until migration completes.</span>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
-<button type="button" id="db-migrate-start-btn" onclick="startDbMigrate()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Start migration</button>
+<button type="button" id="db-migrate-start-btn" onclick="startDbMigrate()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">Start migration</button>
 <span id="db-migrate-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <div id="db-migrate-log-wrap" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};margin-top:8px">
@@ -304,7 +304,7 @@ function takPurgeFailed(){
 </div>
 <div id="upgrade-progress-area" style="margin-bottom:16px"></div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-<button type="button" id="tak-update-btn" onclick="startTakUpdate()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Update TAK Server</button>
+<button type="button" id="tak-update-btn" onclick="startTakUpdate()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">Update TAK Server</button>
 <span id="tak-update-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <div id="upgrade-log-wrap" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};margin-top:20px">
@@ -338,7 +338,7 @@ function takPurgeFailed(){
 <div id="tak-plugin-upload-filelist" style="display:none;margin-top:10px;display:none;flex-direction:column;gap:4px"></div>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
-<button type="button" id="tak-plugin-install-btn" onclick="takPluginInstall()" style="padding:10px 22px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer" disabled>Install Plugin</button>
+<button type="button" id="tak-plugin-install-btn" onclick="takPluginInstall()" style="padding:10px 22px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer" disabled>Install Plugin</button>
 <span id="tak-plugin-install-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <div id="tak-plugin-log-wrap" style="display:none;margin-top:4px">
@@ -363,15 +363,15 @@ function takPurgeFailed(){
 <p style="font-size:10px;color:var(--text-dim);margin-bottom:16px">Size: green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB. Dead tuples &gt; 1M triggers auto-VACUUM.</p>
 <div style="display:flex;flex-direction:column;gap:12px">
 <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
-<button type="button" id="vacuum-analyze-btn" onclick="runVacuum(false)" style="padding:10px 20px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Optimize Tables</button>
+<button type="button" id="vacuum-analyze-btn" onclick="runVacuum(false)" style="padding:10px 20px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Optimize Tables</button>
 <span style="font-size:12px;color:var(--text-secondary)">VACUUM ANALYZE — marks deleted space for reuse. Database stops growing but file size unchanged. Safe while running.</span>
 </div>
 <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
-<button type="button" id="vacuum-full-btn" onclick="runVacuum(true)" style="padding:10px 20px;background:rgba(234,179,8,0.2);color:var(--yellow);border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0" title="Caution: run when TAK Server is not running">Compact Database</button>
+<button type="button" id="vacuum-full-btn" onclick="runVacuum(true)" style="padding:10px 20px;background:rgba(234,179,8,0.2);color:var(--yellow);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0" title="Caution: run when TAK Server is not running">Compact Database</button>
 <span style="font-size:12px;color:var(--text-secondary)">VACUUM FULL — physically shrinks files on disk. Locks tables, <strong>stop TAK Server first</strong>. <span style="color:var(--yellow)">(caution)</span></span>
 </div>
 <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
-<button type="button" id="reindex-btn" onclick="runReindex()" style="padding:10px 20px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Rebuild Indexes</button>
+<button type="button" id="reindex-btn" onclick="runReindex()" style="padding:10px 20px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Rebuild Indexes</button>
 <span style="font-size:12px;color:var(--text-secondary)">REINDEX — rebuilds indexes for faster queries. Safe while running but may be slow on large databases.</span>
 </div>
 </div>
@@ -423,7 +423,7 @@ function takPurgeFailed(){
 <div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Current certificate password</label><span id="rotate-ca-current-password" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim)">****</span></div>
 <div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New password (optional; leave blank to keep current)</label><input type="password" id="rotate-ca-new-password" placeholder="Leave blank to keep" autocomplete="new-password" style="width:100%;max-width:280px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
-<button type="button" id="rotate-ca-btn" onclick="rotateIntCA()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Intermediate CA</button>
+<button type="button" id="rotate-ca-btn" onclick="rotateIntCA()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">Rotate Intermediate CA</button>
 <span id="rotate-ca-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 </div>
@@ -451,7 +451,7 @@ function takPurgeFailed(){
 <div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Current certificate password</label><span id="rotate-root-current-password" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim)">****</span></div>
 <div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New password (optional; leave blank to keep current)</label><input type="password" id="rotate-root-new-password" placeholder="Leave blank to keep" autocomplete="new-password" style="width:100%;max-width:280px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-<button type="button" id="rotate-root-btn" onclick="rotateRootCA()" style="padding:12px 24px;background:linear-gradient(135deg,#991b1b,#7f1d1d);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Root CA</button>
+<button type="button" id="rotate-root-btn" onclick="rotateRootCA()" style="padding:12px 24px;background:linear-gradient(135deg,#991b1b,#7f1d1d);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">Rotate Root CA</button>
 <span id="rotate-root-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <div id="rotate-root-log" style="display:none;margin-top:16px;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap"></div>
@@ -473,7 +473,7 @@ function takPurgeFailed(){
 <div id="cc-groups-list" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"><button type="button" id="cc-load-groups-btn" onclick="loadGroups()" style="padding:8px 16px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">Load Groups from TAK Server</button></div>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-<button type="button" id="cc-create-btn" onclick="createClientCert()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Create Certificate</button>
+<button type="button" id="cc-create-btn" onclick="createClientCert()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">Create Certificate</button>
 <span id="cc-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <div id="cc-result" style="display:none;margin-top:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px;padding:16px">
@@ -557,7 +557,7 @@ function takPurgeFailed(){
 <input type="file" id="file-input-more" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleAddMore(event)">
 </div>
 <div id="deploy-btn-area" style="margin-top:20px;text-align:center;display:none">
-<button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>
+<button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>
 </div></div></div>
 {% endif %}
 
