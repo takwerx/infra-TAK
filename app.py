@@ -49186,6 +49186,36 @@ def _authentik_spiral_monitor():
 
 
 @_with_authentik_deploy_guard
+def _ensure_recovery_flow_standalone(env_path, plog, wait_attempts=60):
+    """v10.1.20: ensure the password-recovery flow exists and is linked to the default
+    authentication flow, using the bootstrap token directly — independent of the Email
+    Relay module. Recovery email stages use use_global_settings=true, so the flow works
+    with whatever SMTP is in Authentik's env (or none yet). Idempotent; never raises.
+    Called from BOTH the full-deploy no-relay branch and the reconfigure branch (which
+    the post-update auto-reconfigure runs) so field boxes self-heal on console update."""
+    try:
+        tok = ''
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
+                        tok = line.strip().split('=', 1)[1].strip()
+                        break
+        if not tok:
+            plog("  ⚠ No bootstrap token readable — recovery flow not ensured")
+            return False
+        hdr = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
+        if not _wait_for_authentik_api('http://127.0.0.1:9090', hdr, max_attempts=wait_attempts, plog=plog):
+            plog("  ⚠ Authentik API not ready — recovery flow not ensured (retries on next update/deploy)")
+            return False
+        ok, msg, _slug = _ensure_authentik_recovery_flow('http://127.0.0.1:9090', hdr)
+        plog(f"  {'✓' if ok else '⚠'} {msg}")
+        return ok
+    except Exception as e:
+        plog(f"  ⚠ Recovery-flow setup failed (non-fatal): {e}")
+        return False
+
+
 def run_authentik_deploy(reconfigure=False):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -49375,6 +49405,12 @@ def run_authentik_deploy(reconfigure=False):
                             plog("  \u26a0 API not ready — run Update config again after Authentik is up")
                 except Exception as e:
                     plog(f"  \u26a0 No-FQDN LDAP heal skipped: {str(e)[:80]}")
+            # v10.1.20: the recovery flow must exist regardless of Email Relay \u2014 and the
+            # reconfigure branch is what the post-update auto-reconfigure runs, so this is
+            # the self-heal that fixes field boxes deployed without the relay ("Forgot
+            # password?" missing) on their next console update.
+            plog("  Ensuring password-recovery flow...")
+            _ensure_recovery_flow_standalone(env_path, plog)
             plog("")
             plog("\u2713 Reconfigure complete.")
             _sync_webadmin_after_authentik_reconfigure(plog)
@@ -50654,32 +50690,9 @@ entries:
             # v10.1.20: no Email Relay — the recovery flow must still exist, or the login page
             # never shows "Forgot password?" (field report: fresh deploys without the relay left
             # recovery_flow=null on the identification stage, with no console action to fix it).
-            # Recovery email stages use use_global_settings=true, so the flow works with whatever
-            # SMTP is in Authentik's env (e.g. AUTHENTIK_EMAIL__* set directly), or none yet.
             plog("")
             plog("🔑 Ensuring password-recovery flow (no Email Relay configured)...")
-            try:
-                _ak_token = ''
-                if os.path.exists(env_path):
-                    with open(env_path) as f:
-                        for line in f:
-                            if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                                _ak_token = line.strip().split('=', 1)[1].strip()
-                                break
-                if not _ak_token:
-                    plog("  ⚠ No bootstrap token readable — recovery flow not ensured (configure Email Relay to retry)")
-                elif _wait_for_authentik_api('http://127.0.0.1:9090',
-                                             {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'},
-                                             max_attempts=60, plog=plog):
-                    _ok, _rmsg, _rslug = _ensure_authentik_recovery_flow(
-                        'http://127.0.0.1:9090',
-                        {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'})
-                    plog(f"  {'✓' if _ok else '⚠'} {_rmsg}")
-                else:
-                    plog("  ⚠ Authentik API not ready — recovery flow not ensured (re-run deploy or configure Email Relay later)")
-            except Exception as e:
-                plog(f"  ⚠ Recovery-flow setup failed (non-fatal): {e}")
-                plog("  You can run it from Email Relay → 'Configure Authentik to use these settings'.")
+            _ensure_recovery_flow_standalone(env_path, plog)
         # Final LDAP restart: ensure container has the injected token and internal URL (after SMTP/recreate)
         try:
             subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
