@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.18-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.18-alpha)**
+**Current release: [v10.1.19-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.19-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.19-alpha — 2026-08-04 — Every installation now gets identical software, and TAK Portal stops losing your email settings
+
+**Headline: two invisible-but-important reliability fixes.** First, the console's own Python components (the web framework and its supporting libraries) were installed as "whatever version is newest today" — so two servers installed a month apart could quietly run different software, and a future upstream release could break new installations while old ones kept working. The dependency list is now **pinned to exact, field-validated versions** in a `requirements.txt` shipped with the console: every install, on every platform, gets identical components (including holding the application server at the newest version that supports both Ubuntu's and Rocky/RHEL 9's system Python). Second, **TAK Portal no longer loses the CC/BCC email addresses you configure** — a field-reported bug where every TAK Portal update or configuration push wiped the "Always CC" / "Always BCC" fields back to empty. Root cause was on our side (the console's settings sync treated those fields as its own and always wrote them blank); they're now preserved whenever you've set them. **Also fixed:** the TAK Server page could crash with a server error on its failed-install recovery screen (the "Clean up & retry" path) due to a corrupted character in the page — latent since May, only visible after a failed TAK Server deploy, now repaired. **Under the hood**, this release also completes the first phase of a codebase reorganization: all 25 console pages moved out of the main application file into standard template files, verified byte-for-byte identical — nothing changes in what you see, but page-related fixes land faster and a whole class of page-corruption bugs is now structurally impossible. **Who should update:** everyone — low-risk, no visible changes, no service restarts beyond the console itself. **Upgrade:** automatic on the next console update.
+
+Full notes: [v10.1.19-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.19-alpha).
 
 ### v10.1.18-alpha — 2026-08-03 — CloudTAK Events actually reach the field, and a one-click certificate that makes them work
 
