@@ -23,6 +23,18 @@
 .log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
 .url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
 .url-row:last-child{border-bottom:none}
+/* v10.1.24: standard uninstall modal (takserver reference pattern) */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px}
+.uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+.uninstall-progress-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)}
 .url-label{width:80px;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;flex-shrink:0}
 .url-val{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);word-break:break-all;flex:1}
 </style>{% endblock %}
@@ -125,6 +137,24 @@
   <div class="log-box" id="logBox">Loading...</div>
 </div>
 
+<div class="modal-overlay" id="tvr-uninstall-modal">
+<div class="modal">
+<h3>⚠ Uninstall TAK Video Restreamer?</h3>
+<p>This will stop and remove the TAK Video Restreamer containers, remove its Caddy subdomain, and deregister its Authentik proxy app. Stream configs and recordings under the install directory stay on disk. You can redeploy after.</p>
+<label class="form-label">Admin Password</label>
+<div style="position:relative">
+<input class="form-input" id="tvr-uninstall-password" type="password" placeholder="Confirm your password" autocomplete="off" style="padding-right:56px">
+<button type="button" onclick="tvrTogglePw()" id="tvr-uninstall-reveal" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px">show</button>
+</div>
+<div class="modal-actions">
+<button type="button" class="btn btn-secondary" id="tvr-uninstall-cancel" onclick="document.getElementById('tvr-uninstall-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="btn btn-danger" id="tvr-uninstall-confirm" onclick="doUninstallTvr()">Uninstall</button>
+</div>
+<div id="tvr-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+<div id="tvr-uninstall-progress" class="uninstall-progress-row" style="display:none;margin-top:10px" aria-live="polite"></div>
+</div>
+</div>
+
 {% endif %}
 
 </div>
@@ -186,10 +216,41 @@ function submitChangePw(){
     });
 }
 function doUninstall(){
-  let pw=prompt('Enter infra-TAK admin password to confirm removal:');
-  if(!pw) return;
-  fetch('/api/tak-video-restreamer/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
-    .then(r=>r.json()).then(d=>{ if(d.success){ location.href='/marketplace'; } else{ alert(d.error||'Uninstall failed'); } });
+  document.getElementById('tvr-uninstall-msg').textContent='';
+  document.getElementById('tvr-uninstall-password').value='';
+  document.getElementById('tvr-uninstall-modal').classList.add('open');
+}
+function tvrTogglePw(){
+  let i=document.getElementById('tvr-uninstall-password'), b=document.getElementById('tvr-uninstall-reveal');
+  if(i.type==='password'){ i.type='text'; b.textContent='hide'; } else { i.type='password'; b.textContent='show'; }
+}
+async function doUninstallTvr(){
+  var pw=document.getElementById('tvr-uninstall-password').value;
+  var msgEl=document.getElementById('tvr-uninstall-msg');
+  if(!pw){ msgEl.textContent='Please enter your password'; return; }
+  var progressEl=document.getElementById('tvr-uninstall-progress');
+  var cancelBtn=document.getElementById('tvr-uninstall-cancel');
+  var confirmBtn=document.getElementById('tvr-uninstall-confirm');
+  msgEl.textContent='';
+  progressEl.style.display='flex';
+  progressEl.innerHTML='<span class="uninstall-spinner"></span><span>Uninstalling...</span>';
+  confirmBtn.disabled=true; cancelBtn.disabled=true;
+  try{
+    var r=await fetch('/api/tak-video-restreamer/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'});
+    var d=await r.json();
+    if(d.success){
+      progressEl.innerHTML='<span class="uninstall-spinner"></span><span>Done. Redirecting...</span>';
+      setTimeout(function(){window.location.href='/marketplace';},800);
+    }else{
+      msgEl.textContent=d.error||'Uninstall failed';
+      progressEl.style.display='none'; progressEl.innerHTML='';
+      confirmBtn.disabled=false; cancelBtn.disabled=false;
+    }
+  }catch(e){
+    msgEl.textContent='Request failed: '+e.message;
+    progressEl.style.display='none'; progressEl.innerHTML='';
+    confirmBtn.disabled=false; cancelBtn.disabled=false;
+  }
 }
 let updatePolling=false;
 function startUpdate(){

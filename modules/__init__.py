@@ -48,6 +48,12 @@ def _validate_descriptor(desc):
             raise ValueError(f"module descriptor {key!r}: {f} must be callable")
     if not isinstance(desc['control_map'], dict):
         raise ValueError(f"module descriptor {key!r}: control_map must be a dict verb -> argv")
+    for verb, argv in desc['control_map'].items():
+        # v10.1.24: values may be a static argv list OR a callable (ctx) -> argv,
+        # resolved per request — for modules whose commands depend on runtime
+        # state (e.g. TVR's compose dir: ~ on fresh installs, /root on flipped boxes).
+        if not (callable(argv) or isinstance(argv, (list, tuple))):
+            raise ValueError(f"module descriptor {key!r}: control_map[{verb!r}] must be an argv list or a callable (ctx) -> argv")
     if not isinstance(desc['priority'], int):
         raise ValueError(f"module descriptor {key!r}: priority must be an int")
     for f in ('conflicts', 'ports', 'service_units', 'settings_keys',
@@ -173,6 +179,8 @@ def _make_views(desc, ctx):
         if argv is None:
             # canonical contract: unknown verb is a client error, not a 200-false
             return jsonify({'success': False, 'error': 'Unknown action'}), 400
+        if callable(argv):
+            argv = argv(ctx)  # runtime argv (v10.1.24 — see _validate_descriptor)
         r = subprocess.run(ctx['_sudo_wrap'](list(argv)), stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, timeout=90)
         return jsonify({'success': r.returncode == 0, 'output': (r.stdout or '').strip()})

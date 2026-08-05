@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.23-alpha"
+VERSION = "10.1.24-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -804,9 +804,7 @@ CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZ
 MEDIAMTX_LOGO_URL = "/static/mediamtx-logo.png"
 # Cesium 3D Tiles logo (bundled SVG — includes wordmark, no separate label needed)
 CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
-# TAK Video Restreamer (mutually exclusive with local mediamtx — same stream ports)
-TVR_REPO = "https://github.com/raytheonbbn/tak-video-restreamer.git"
-TVR_INSTALL_DIR = os.path.expanduser("~/tak-video-restreamer")
+# TAK Video Restreamer constants live in modules/tvr.py (registry-resident since v10.1.24)
 NETBIRD_INSTALL_DIR = os.path.expanduser("~/netbird")
 # EUD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
@@ -2725,42 +2723,27 @@ def detect_modules():
         'route': '/webodm',
         'priority': 12,
     }
-    # TAK Video Restreamer — Docker, mutually exclusive with local mediamtx (same stream ports)
-    tvr_enabled = settings.get('tak_video_restreamer_enabled', False)
-    tvr_running = False
-    if tvr_enabled:
-        try:
-            _tvr_r = _run(
-                ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
-                capture_output=True, text=True, timeout=3)
-            tvr_running = _tvr_r.stdout.strip() == 'true'
-        except Exception:
-            pass
+    # TAK Video Restreamer — registry-resident since v10.1.24 (modules/tvr.py):
+    # tile identity + probes (incl. the enabled-flag self-heal) come from the
+    # descriptor, not an inline block. Conflict metadata carried, not redesigned.
+    _tvr_desc = mod_registry.MODULES.get('tvr')
+    try:
+        _tvr_state = _tvr_desc['detect'](mod_registry.get_ctx()) if _tvr_desc else {}
+    except Exception:
+        _tvr_state = {}
+    if _tvr_desc:
+        modules['tak_video_restreamer'] = {'name': _tvr_desc['name'],
+            'installed': bool(_tvr_state.get('installed')), 'running': bool(_tvr_state.get('running')),
+            'description': _tvr_desc['description'], 'icon': _tvr_desc['icon'],
+            'icon_url': _tvr_desc.get('icon_url'), 'route': _tvr_desc['route'],
+            'priority': _tvr_desc['priority'], 'conflicts': list(_tvr_desc.get('conflicts') or [])}
     else:
-        # Self-heal: container is running but flag got cleared
-        try:
-            _tvr_r = _run(
-                ['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer'],
-                capture_output=True, text=True, timeout=3)
-            if _tvr_r.stdout.strip() == 'true':
-                _s = load_settings()
-                _s['tak_video_restreamer_enabled'] = True
-                save_settings(_s)
-                tvr_enabled = True
-                tvr_running = True
-        except Exception:
-            pass
-    modules['tak_video_restreamer'] = {
-        'name': 'TAK Video Restreamer',
-        'installed': bool(tvr_enabled),
-        'running': tvr_running,
-        'description': 'Flask + MediaMTX restreamer — RTSP, RTSPS, SRT, HLS, KLV',
-        'icon': '🎥',
-        'icon_url': 'https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png',
-        'route': '/tak-video-restreamer',
-        'priority': 13,
-        'conflicts': ['mediamtx'],
-    }
+        # boot race only: the registry loads at the bottom of app.py — an early
+        # daemon-thread poll in that window reports the tile not-installed once.
+        modules['tak_video_restreamer'] = {'name': 'TAK Video Restreamer', 'installed': False, 'running': False,
+            'description': 'Flask + MediaMTX restreamer — RTSP, RTSPS, SRT, HLS, KLV', 'icon': '\U0001F3A5',
+            'icon_url': 'https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png',
+            'route': '/tak-video-restreamer', 'priority': 13, 'conflicts': ['mediamtx']}
 
     # NetBird VPN
     netbird_enabled = settings.get('netbird_enabled', False)
@@ -25332,33 +25315,7 @@ def _get_webodm_version_info():
     return info
 
 
-_tvr_release_cache = {'sha': None, 'ts': 0}
-
-
-def _get_tvr_latest_commit_sha(use_cache=True):
-    """Latest commit SHA (full) on main for raytheonbbn/tak-video-restreamer.
-    The repo ships off main with no releases, so the commit SHA is the only
-    version signal. Cached 4h — like CloudTAK/Authentik — because this lookup
-    runs on every dashboard poll AND every TVR page load; unauthenticated GitHub
-    is 60 req/hr/IP, and a 403 would otherwise silently blank the update badge.
-    Returns stale cache on failure rather than None so a rate-limit doesn't hide
-    a known-available update. Pass use_cache=False to force a fresh check."""
-    import time as _time
-    if use_cache and _tvr_release_cache['sha'] and (_time.time() - _tvr_release_cache['ts'] < 14400):
-        return _tvr_release_cache['sha']
-    try:
-        import urllib.request as _ur
-        req = _ur.Request('https://api.github.com/repos/raytheonbbn/tak-video-restreamer/commits/main',
-                          headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=10) as resp:
-            sha = (json.loads(resp.read().decode()).get('sha') or '').strip() or None
-            if sha:
-                _tvr_release_cache['sha'] = sha
-                _tvr_release_cache['ts'] = _time.time()
-            return sha
-    except Exception as e:
-        print(f"version-info: tvr latest-commit check failed (non-fatal): {e}", flush=True)
-        return _tvr_release_cache.get('sha') or None
+# TVR release cache + SHA lookup live in modules/tvr.py (registry-resident since v10.1.24)
 
 
 def _broker_compose(dirpath, action, timeout=300):
@@ -25386,48 +25343,9 @@ def _module_git(repo_dir, *git_args, **kw):
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
-def _tvr_dir():
-    """Resolve the real TAK Video Restreamer install dir. Fresh born-non-root installs live at
-    ~/tak-video-restreamer; a box FLIPPED from root keeps it at /root/tak-video-restreamer (TVR is
-    NOT auto-re-homed — its compose has ABSOLUTE /root binds + a bind-mounted data dir, like WebODM).
-    Returns whichever holds a compose (broker-checked, since takwerx can't stat /root), else ~."""
-    home = os.path.expanduser('~/tak-video-restreamer')
-    if os.path.exists(os.path.join(home, 'docker-compose.yml')):
-        return home
-    try:
-        if subprocess.run(_sudo_wrap(['test', '-f', '/root/tak-video-restreamer/docker-compose.yml']),
-                          capture_output=True, timeout=10).returncode == 0:
-            return '/root/tak-video-restreamer'
-    except Exception:
-        pass
-    return home
-
-def _tvr_compose(tvr_dir, action, timeout=120):
-    """Run `docker compose <action>` in the TVR dir via the broker — root reaches /root on a
-    flipped box; --project-directory replaces the old bash-cd (denied by the rulebook)."""
-    return _broker_compose(tvr_dir, action, timeout=timeout)
-
-def _get_tvr_version_info():
-    """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based).
-    Compares FULL local vs remote SHAs — git's --short length is adaptive (7+ as the repo
-    grows) so the old short-vs-[:7] compare could mismatch; display values stay 7 chars."""
-    import subprocess as _sp
-    info = {'version': '', 'update_available': False, 'latest': None}
-    tvr_dir = _tvr_dir()
-    local_full = ''
-    try:
-        r = _module_git(tvr_dir, 'rev-parse', 'HEAD', timeout=8)
-        if r.returncode == 0:
-            local_full = r.stdout.strip()
-            info['version'] = local_full[:7]
-    except Exception as e:
-        print(f"version-info: tvr local SHA lookup failed (non-fatal): {e}", flush=True)
-    latest_full = _get_tvr_latest_commit_sha()
-    if latest_full:
-        info['latest'] = latest_full[:7]
-        if local_full and local_full != latest_full:
-            info['update_available'] = True
-    return info
+# _tvr_dir / _tvr_compose / _get_tvr_version_info live in modules/tvr.py
+# (registry-resident since v10.1.24 — _broker_compose/_module_git stay here as
+# shared seams: CloudTAK, WebODM and NetBird use them too).
 
 
 _netbird_release_cache = {}
@@ -25592,7 +25510,8 @@ def get_all_module_versions():
     if modules.get('webodm', {}).get('installed'):
         _set('webodm', _get_webodm_version_info)
     if modules.get('tak_video_restreamer', {}).get('installed'):
-        _set('tak_video_restreamer', _get_tvr_version_info)
+        # registry-resident since v10.1.24 — modules/tvr.py owns the SHA compare
+        _set('tak_video_restreamer', lambda: mod_registry.tvr.get_version_info(mod_registry.get_ctx()))
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
@@ -33018,7 +32937,8 @@ def tvr_page():
     tvr_commit = settings.get('tak_video_restreamer_commit_sha', '')
     fqdn = settings.get('fqdn', '')
     server_ip = settings.get('server_ip', '')
-    tvr_vinfo = _get_tvr_version_info() if tvr.get('installed') else {}
+    tvr_vinfo = mod_registry.tvr.get_version_info(mod_registry.get_ctx()) if tvr.get('installed') else {}
+    _tvr_job = mod_registry.job_state('tvr')
     r = make_response(render_template('tvr.html',
         settings=settings, modules=modules, tvr=tvr,
         tvr_host=tvr_host, tvr_url=tvr_url,
@@ -33027,211 +32947,17 @@ def tvr_page():
         tvr_vinfo=tvr_vinfo,
         mediamtx_conflict=mediamtx_conflict,
         fqdn=fqdn, server_ip=server_ip,
-        deploying=_tvr_deploy_status.get('running', False),
-        deploy_log=_tvr_deploy_status.get('log', []),
-        deploy_error=_tvr_deploy_status.get('error', False),
+        deploying=_tvr_job.get('running', False),
+        deploy_log=_tvr_job.get('log', []),
+        deploy_error=_tvr_job.get('error', False),
         metrics=get_system_metrics(), version=VERSION))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
 
 
-@app.route('/api/tak-video-restreamer/deploy', methods=['POST'])
-@login_required
-def tvr_deploy():
-    import threading
-    if _tvr_deploy_status.get('running'):
-        return jsonify({'success': False, 'error': 'Deploy already in progress'})
-    _tvr_deploy_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
-    settings = load_settings()
-    t = threading.Thread(target=_run_tvr_deploy, args=(settings,), daemon=True)
-    t.start()
-    return jsonify({'success': True})
-
-
-@app.route('/api/tak-video-restreamer/deploy-status')
-@login_required
-def tvr_deploy_status_api():
-    return jsonify(_tvr_deploy_status)
-
-
-@app.route('/api/tak-video-restreamer/control', methods=['POST'])
-@login_required
-def tvr_control():
-    import subprocess as _sp
-    data = request.get_json() or {}
-    action = data.get('action', '').strip().lower()
-    if action not in ('start', 'stop', 'restart'):
-        return jsonify({'success': False, 'error': 'Invalid action'}), 400
-    tvr_dir = _tvr_dir()   # ~/tak-video-restreamer OR (flipped box) /root/tak-video-restreamer
-    if subprocess.run(_sudo_wrap(['test', '-f', os.path.join(tvr_dir, 'docker-compose.yml')]), capture_output=True, timeout=10).returncode != 0:
-        return jsonify({'success': False, 'error': 'Compose file not found — deploy first'}), 404
-    _act = {'start': 'up -d', 'stop': 'stop', 'restart': 'restart'}[action]
-    r = _tvr_compose(tvr_dir, _act, timeout=60)
-    if r.returncode != 0:
-        return jsonify({'success': False, 'error': (r.stderr or r.stdout)[:300]})
-    return jsonify({'success': True})
-
-
-@app.route('/api/tak-video-restreamer/logs')
-@login_required
-def tvr_logs():
-    import subprocess as _sp
-    try:
-        r = _sp.run(_sudo_wrap(['docker', 'logs', '--tail', '200', 'tak-video-restreamer']),
-                    capture_output=True, text=True, timeout=15)
-        raw = (r.stdout + r.stderr).splitlines()
-        return jsonify({'lines': raw[-200:]})
-    except Exception as e:
-        return jsonify({'lines': [], 'error': str(e)})
-
-
-@app.route('/api/tak-video-restreamer/uninstall', methods=['POST'])
-@login_required
-def tvr_uninstall():
-    import subprocess as _sp
-    data = request.json or {}
-    password = data.get('password', '')
-    auth = load_auth()
-    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
-        return jsonify({'error': 'Invalid admin password'}), 403
-    tvr_dir = _tvr_dir()
-    if subprocess.run(_sudo_wrap(['test', '-f', os.path.join(tvr_dir, 'docker-compose.yml')]), capture_output=True, timeout=10).returncode == 0:
-        _tvr_compose(tvr_dir, 'down', timeout=60)
-    s = load_settings()
-    s['tak_video_restreamer_enabled'] = False
-    save_settings(s)
-    generate_caddyfile(s)
-    _sp.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, capture_output=True)
-    _deregister_authentik_proxy_app(s, 'tak-video-restreamer', 'TAK Video Restreamer Proxy')
-    return jsonify({'success': True})
-
-
-@app.route('/api/tak-video-restreamer/set-password', methods=['POST'])
-@login_required
-def tvr_set_password():
-    import subprocess as _sp
-    data = request.json or {}
-    new_password = (data.get('password') or '').strip()
-    if len(new_password) < 6:
-        return jsonify({'error': 'Password must be at least 6 characters'}), 400
-    # v10.1.4 (WS4): the password is written verbatim into a root-run compose file —
-    # reject newlines/control chars outright (a newline in `.*` re.sub survives and
-    # injects an extra compose line; control chars have no business in a password).
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in new_password):
-        return jsonify({'error': 'Password must not contain newlines or control characters'}), 400
-    s = load_settings()
-    s['tak_video_restreamer_admin_password'] = new_password
-    save_settings(s)
-    # Rewrite docker-compose.yml with the new password and restart (no rebuild)
-    tvr_dir = _tvr_dir()
-    compose_path = os.path.join(tvr_dir, 'docker-compose.yml')
-    if subprocess.run(_sudo_wrap(['test', '-f', compose_path]), capture_output=True, timeout=10).returncode == 0:
-        try:
-            content = _read_priv(compose_path)   # v10.0.5 non-root: broker (root-owned on flipped box)
-            import re as _re
-            # Callable replacement — a plain f-string replacement lets re.sub interpret
-            # backslash escapes in the password (`\1`, `\g<0>` corrupt the write).
-            content = _re.sub(r'(- ADMIN_PASSWORD=).*',
-                              lambda m: m.group(1) + new_password, content)
-            _write_priv(compose_path, content)
-            _tvr_compose(tvr_dir, 'up -d', timeout=60)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return jsonify({'success': True})
-
-
-_tvr_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
-
-
-def _run_tvr_update():
-    import subprocess as _sp
-    import secrets as _sec
-    global _tvr_update_status
-    log = []
-    def plog(msg):
-        log.append(msg)
-        _tvr_update_status['log'] = list(log)
-    try:
-        tvr_dir = _tvr_dir()   # ~/tak-video-restreamer OR (flipped box) /root/tak-video-restreamer
-        plog('━━━ Step 1/4: Pulling latest source ━━━')
-        # infra-TAK OWNS docker-compose.yml + mediaMTX.yml (rewritten from templates at deploy)
-        # and patches the Dockerfile on arm64, so the clone is permanently dirty on tracked
-        # files — a plain pull aborts with "local changes would be overwritten by merge" the
-        # moment upstream touches them. Discard the console-written overlay, pull, then
-        # regenerate it in Step 2 (nothing user-authored lives in tracked files).
-        r = _module_git(tvr_dir, 'checkout', '--', '.', timeout=60)
-        if r.returncode == 0:
-            r = _module_git(tvr_dir, 'pull', '--ff-only', timeout=120)
-        plog((r.stdout + r.stderr).strip() or '(no output)')
-        if r.returncode != 0:
-            raise RuntimeError(f'git pull failed: {r.stderr[:300]}')
-        r2 = _module_git(tvr_dir, 'rev-parse', '--short', 'HEAD', timeout=8)
-        new_sha = r2.stdout.strip()
-        plog(f'✓ Now at commit {new_sha}')
-
-        plog('')
-        plog('━━━ Step 2/4: Re-applying infra-TAK configuration ━━━')
-        s = load_settings()
-        admin_pass = s.get('tak_video_restreamer_admin_password') or _sec.token_hex(16)
-        secret_key = s.get('tak_video_restreamer_secret_key') or _sec.token_hex(32)
-        if (s.get('tak_video_restreamer_admin_password') != admin_pass
-                or s.get('tak_video_restreamer_secret_key') != secret_key):
-            s['tak_video_restreamer_admin_password'] = admin_pass
-            s['tak_video_restreamer_secret_key'] = secret_key
-            save_settings(s)
-        fqdn = (s.get('fqdn') or '').strip()
-        cors_origins = f'https://{fqdn}' if fqdn else 'http://localhost:3100'
-        _write_priv(os.path.join(tvr_dir, 'docker-compose.yml'),
-                    TVR_DOCKER_COMPOSE.format(tvr_dir=tvr_dir, admin_pass=admin_pass,
-                                              secret_key=secret_key, cors_origins=cors_origins))
-        _write_priv(os.path.join(tvr_dir, 'mediaMTX.yml'), TVR_MEDIAMTX_YML)
-        plog('✓ docker-compose.yml + mediaMTX.yml regenerated (loopback binds, admin password preserved)')
-        if _host_arch() == 'arm64':
-            _tvr_dockerfile = os.path.join(tvr_dir, 'Dockerfile')
-            try:
-                _dfc = _read_priv(_tvr_dockerfile)
-                if '_linux_amd64' in _dfc and 'mediamtx_' in _dfc:
-                    _write_priv(_tvr_dockerfile, _dfc.replace('_linux_amd64', '_linux_arm64'))
-                    plog('✓ arm64: re-patched Dockerfile MediaMTX binary linux_amd64 → linux_arm64')
-                else:
-                    plog('⚠ arm64: Dockerfile MediaMTX amd64 pattern not found — bundled mediamtx may be wrong-arch')
-            except Exception as _de:
-                plog(f'⚠ arm64: could not re-patch Dockerfile (mediamtx may fail): {_de}')
-
-        plog('')
-        plog('━━━ Step 3/4: Rebuilding Docker image ━━━')
-        r = _tvr_compose(tvr_dir, 'up -d --build', timeout=600)
-        plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
-        if r.returncode != 0:
-            raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
-
-        plog('')
-        plog('━━━ Step 4/4: Saving new SHA ━━━')
-        s = load_settings()
-        s['tak_video_restreamer_commit_sha'] = new_sha
-        save_settings(s)
-        plog(f'✓ TAK Video Restreamer updated to {new_sha}')
-        _tvr_update_status.update({'running': False, 'complete': True, 'error': False})
-    except Exception as exc:
-        plog(f'ERROR: {exc}')
-        _tvr_update_status.update({'running': False, 'complete': False, 'error': str(exc)})
-
-
-@app.route('/api/tak-video-restreamer/update', methods=['POST'])
-@login_required
-def tvr_update():
-    global _tvr_update_status
-    if _tvr_update_status.get('running'):
-        return jsonify({'started': False, 'error': 'Update already in progress'})
-    _tvr_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
-    threading.Thread(target=_run_tvr_update, daemon=True).start()
-    return jsonify({'started': True})
-
-
-@app.route('/api/tak-video-restreamer/update-status')
-@login_required
-def tvr_update_status_api():
-    return jsonify(_tvr_update_status)
+# TAK Video Restreamer API routes (deploy/deploy-status/control/logs/uninstall/
+# set-password/update/update-status) are registry-registered at the SAME URLs
+# by modules/tvr.py since v10.1.24 — only the page route above remains here.
 
 
 def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, settings, plog=None):
@@ -33807,332 +33533,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
 
 # ── TAK Video Restreamer ──────────────────────────────────────────────────────
-
-# infra-TAK overrides two addresses from the upstream mediaMTX.yml:
-#   apiAddress  0.0.0.0:8889 → 127.0.0.1:8889  (API must never be public)
-#   hlsAddress  :8888        → 127.0.0.1:8888   (HLS reached via Caddy /hls-proxy/)
-TVR_MEDIAMTX_YML = '''\
-# TAK Video Restreamer - MediaMTX configuration (generated by infra-TAK)
-readTimeout: 10s
-writeTimeout: 10s
-writeQueueSize: 512
-udpMaxPayloadSize: 1452
-
-authMethod: internal
-authInternalUsers:
-  - user: any
-    ips: []
-    permissions:
-      - action: publish
-      - action: read
-      - action: playback
-  - user: any
-    ips: ['127.0.0.1', '::1']
-    permissions:
-      - action: api
-      - action: metrics
-      - action: pprof
-
-# v0.9.42: API bound to loopback — must never be publicly exposed
-api: yes
-apiAddress: 127.0.0.1:8889
-
-rtsp: yes
-rtspAddress: 0.0.0.0:8554
-rtspTransports: [tcp]
-rtspEncryption: optional
-rtspsAddress: 0.0.0.0:8555
-rtspServerCert: /opt/app/certs/server.crt
-rtspServerKey: /opt/app/certs/server.key
-
-rtmp: yes
-rtmpAddress: 0.0.0.0:1935
-
-# v0.9.42: HLS bound to loopback — Caddy proxies /hls-proxy/* to this port
-hls: yes
-hlsAddress: 127.0.0.1:8888
-hlsEncryption: no
-hlsTrustedProxies: ['127.0.0.1']
-hlsVariant: fmp4
-hlsSegmentCount: 3
-hlsSegmentDuration: 500ms
-hlsPartDuration: 200ms
-hlsSegmentMaxSize: 50M
-hlsMuxerCloseAfter: 60s
-hlsAlwaysRemux: yes
-
-webrtc: no
-webrtcAddress: :9898
-
-srt: yes
-srtAddress: 0.0.0.0:8890
-
-pathDefaults:
-  source: publisher
-  record: no
-  recordPath: /opt/app/streams/%path/%Y-%m-%d_%H-%M-%S
-  overridePublisher: yes
-  srtPublishPassphrase: ""
-  srtReadPassphrase: ""
-
-paths:
-  ~^tak-.*$:
-    source: publisher
-    record: no
-
-  ~^drone.*$:
-    source: publisher
-    record: no
-
-  ~^uas.*$:
-    source: publisher
-    record: no
-
-  ~^(.+)_hls$:
-    runOnDemand: ffmpeg -rtsp_transport tcp -analyzeduration 2000000 -probesize 2000000 -i rtsp://localhost:8554/$G1 -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -level 3.1 -pix_fmt yuv420p -b:v 2M -maxrate 2.5M -bufsize 5M -g 30 -keyint_min 30 -sc_threshold 0 -c:a aac -b:a 128k -ar 48000 -ac 2 -err_detect ignore_err -fflags +genpts+discardcorrupt -f rtsp -rtsp_transport tcp rtsp://localhost:8554/$MTX_PATH
-    runOnDemandStartTimeout: 10s
-    runOnDemandCloseAfter: 10s
-    runOnDemandRestart: yes
-
-  ~^.*$:
-    source: publisher
-'''
-
-# infra-TAK docker-compose for TAK Video Restreamer.
-# Key bindings vs upstream:
-#   3000  → 127.0.0.1 only  (web UI, Caddy proxies)
-#   8888  → 127.0.0.1 only  (native HLS, Caddy /hls-proxy/)
-#   8554/8555/8890/1935 → 0.0.0.0 (streaming clients access directly)
-#   8889  NOT published     (MediaMTX API stays inside container)
-TVR_DOCKER_COMPOSE = '''\
-version: '3.8'
-services:
-  media:
-    build:
-      context: {tvr_dir}
-      dockerfile: Dockerfile
-    container_name: tak-video-restreamer
-    ports:
-      - "127.0.0.1:3100:3000"
-      - "0.0.0.0:8554:8554"
-      - "0.0.0.0:8555:8555"
-      - "0.0.0.0:1935:1935"
-      - "0.0.0.0:8890:8890/udp"
-      - "127.0.0.1:8888:8888"
-    volumes:
-      - {tvr_dir}/mediaMTX.yml:/opt/app/mediamtx.yml:ro
-      - {tvr_dir}/data/streams:/opt/app/streams
-      - {tvr_dir}/data/logs:/opt/app/logs
-      - {tvr_dir}/data/hls:/opt/app/hls
-      - {tvr_dir}/data:/opt/app/data
-      - {tvr_dir}/data/certs:/opt/app/certs
-    environment:
-      - PORT=3000
-      - MEDIAMTX_API_URL=http://localhost:8889
-      - MEDIAMTX_RTSP_URL=rtsp://127.0.0.1:8554
-      - MEDIAMTX_HLS_URL=http://127.0.0.1:8888
-      - PYTHONUNBUFFERED=1
-      - STREAMS_DIR=/opt/app/streams
-      - DATA_DIR=/opt/app/data
-      - ACTIVE_CERTS_DIR=/opt/app/certs
-      - LOGS_DIR=/opt/app/logs
-      - HLS_OUTPUT_DIR=/opt/app/hls
-      - ADMIN_USERNAME=admin
-      - ADMIN_PASSWORD={admin_pass}
-      - SECRET_KEY={secret_key}
-      - CORS_ORIGINS={cors_origins}
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/login"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-'''
-
-_tvr_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
-
-
-def _tvr_deploy_log(msg, status=None):
-    _tvr_deploy_status['log'].append(msg)
-    if status:
-        _tvr_deploy_status.update(status)
-
-
-def _run_tvr_deploy(settings):
-    import subprocess as _sp
-    import secrets as _sec
-    import shutil as _sh
-    plog = _tvr_deploy_log
-    tvr_dir = TVR_INSTALL_DIR
-    compose_path = os.path.join(tvr_dir, 'docker-compose.yml')
-    mtx_yml_path = os.path.join(tvr_dir, 'mediaMTX.yml')
-    try:
-        # Guard: refuse if standalone mediamtx is installed (same stream ports)
-        modules = detect_modules()
-        if modules.get('mediamtx', {}).get('installed'):
-            plog('✗ Cannot deploy: standalone MediaMTX is installed and uses the same ports (8554/8555/8888/8890).')
-            plog('  Uninstall MediaMTX first, then deploy TAK Video Restreamer.')
-            _tvr_deploy_status.update({'running': False, 'error': True})
-            return
-
-        # Step 1: Ensure Docker is present
-        plog('━━━ Step 1/6: Checking Docker ━━━')
-        _rc, _dv = _docker_probe()
-        if _rc != 0:
-            plog('  Docker not found — installing...')
-            if not _install_docker_engine(plog):
-                raise RuntimeError('Docker install failed — see log above')
-            plog('✓ Docker installed')
-        else:
-            plog(f'✓ Docker present: {_dv}')
-
-        # Step 2: Clone or update repo
-        plog('')
-        plog('━━━ Step 2/6: Cloning Repository ━━━')
-        if os.path.isdir(os.path.join(tvr_dir, '.git')):
-            plog(f'  Repo already cloned at {tvr_dir} — pulling latest...')
-            # Discard the console-written overlay (compose/mediaMTX.yml/arm64 Dockerfile) so the
-            # pull can't abort on "local changes" — Step 3 regenerates all of it anyway.
-            _sp.run(['git', '-C', tvr_dir, 'checkout', '--', '.'],
-                    capture_output=True, text=True, timeout=30)
-            r = _sp.run(['git', '-C', tvr_dir, 'pull', '--ff-only'],
-                        capture_output=True, text=True, timeout=60)
-            plog(f'  git pull: {r.stdout.strip() or r.stderr.strip()}')
-        else:
-            os.makedirs(tvr_dir, exist_ok=True)
-            plog(f'  Cloning {TVR_REPO} → {tvr_dir}')
-            r = _sp.run(['git', 'clone', '--depth=1', TVR_REPO, tvr_dir],
-                        capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                raise RuntimeError(f'git clone failed: {r.stderr[:300]}')
-            plog(f'✓ Repository cloned')
-
-        # Record the commit SHA for audit
-        sha_r = _sp.run(['git', '-C', tvr_dir, 'rev-parse', '--short', 'HEAD'],
-                        capture_output=True, text=True)
-        commit_sha = sha_r.stdout.strip() or 'unknown'
-        plog(f'  Commit SHA: {commit_sha}')
-
-        # v10.0.1 (arm64): the upstream TVR Dockerfile hardcodes the MediaMTX
-        # linux_amd64 release tarball, so on aarch64 the bundled mediamtx binary is
-        # wrong-arch and crash-loops with "exec format error" at runtime (the
-        # python:3.11-slim base is multi-arch, so the image itself builds fine).
-        # Rewrite the embedded download to linux_arm64 (bluenviron's arm64 asset is
-        # named `_linux_arm64`, NOT `_linux_arm64v8` — matches infra-TAK's own
-        # aarch64→arm64 map for the standalone MediaMTX module) before the build.
-        # No-op on amd64 — the upstream Dockerfile is used unchanged.
-        if _host_arch() == 'arm64':
-            _tvr_dockerfile = os.path.join(tvr_dir, 'Dockerfile')
-            try:
-                with open(_tvr_dockerfile) as _df:
-                    _dfc = _df.read()
-                if '_linux_amd64' in _dfc and 'mediamtx_' in _dfc:
-                    with open(_tvr_dockerfile, 'w') as _df:
-                        _df.write(_dfc.replace('_linux_amd64', '_linux_arm64'))
-                    plog('  ✓ arm64: patched TVR Dockerfile MediaMTX binary linux_amd64 → linux_arm64')
-                else:
-                    plog('  ⚠ arm64: TVR Dockerfile MediaMTX amd64 pattern not found — bundled mediamtx may be wrong-arch')
-            except Exception as _de:
-                plog(f'  ⚠ arm64: could not patch TVR Dockerfile for arm64 (mediamtx may fail): {_de}')
-
-        # Step 3: Write infra-TAK compose + mediaMTX.yml
-        plog('')
-        plog('━━━ Step 3/6: Writing Configuration ━━━')
-        for sub in ['data', 'data/streams', 'data/logs', 'data/hls', 'data/certs']:
-            os.makedirs(os.path.join(tvr_dir, sub), exist_ok=True)
-
-        admin_pass = settings.get('tak_video_restreamer_admin_password') or _sec.token_hex(16)
-        secret_key = settings.get('tak_video_restreamer_secret_key') or _sec.token_hex(32)
-        fqdn = settings.get('fqdn', '').strip()
-        cors_origins = f'https://{fqdn}' if fqdn else 'http://localhost:3100'
-
-        compose_content = TVR_DOCKER_COMPOSE.format(
-            tvr_dir=tvr_dir,
-            admin_pass=admin_pass,
-            secret_key=secret_key,
-            cors_origins=cors_origins,
-        )
-        with open(compose_path, 'w') as f:
-            f.write(compose_content)
-        plog(f'✓ docker-compose.yml written')
-
-        with open(mtx_yml_path, 'w') as f:
-            f.write(TVR_MEDIAMTX_YML)
-        plog(f'✓ mediaMTX.yml written (HLS + API bound to loopback)')
-
-        # Step 4: Build and start container
-        # First-build can take 5–10 min on a cold host — warn operator
-        plog('')
-        plog('━━━ Step 4/6: Building & Starting Container ━━━')
-        plog('  ⏳ First build downloads + compiles dependencies — allow 5–10 min...')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d', '--build']),
-                    capture_output=True, text=True, timeout=900, cwd=tvr_dir)
-        if r.returncode != 0:
-            raise RuntimeError(f'docker compose up --build failed:\n{r.stderr[-500:]}')
-        plog('✓ Container built and started')
-
-        # Step 5: UFW rules
-        plog('')
-        plog('━━━ Step 5/6: Configuring Firewall ━━━')
-        if _distro_family() == 'rhel':
-            # No ufw on RHEL — a bare argv `ufw` call raises FileNotFoundError and
-            # aborts the deploy. Stream ports reach the box via the cloud SG; the web
-            # UI / HLS are blocked from direct access by firewalld default-deny / SG
-            # (Caddy is the entry point). Proper firewalld allow/deny = firewall-parity track.
-            plog('  (RHEL: ufw absent — stream ports via SG; web UI/HLS Caddy-only via firewalld default-deny/SG)')
-        else:
-            for port_proto in ['8554/tcp', '8555/tcp', '1935/tcp', '8890/udp']:
-                _sp.run(_sudo_wrap(['ufw', 'allow', port_proto]), capture_output=True)
-                plog(f'  ✓ ufw allow {port_proto}')
-            # Block direct access to web UI and HLS — Caddy is the only entry point
-            # TVR web UI is on host port 3100 (not 3000 — that's TAK Portal)
-            for port_proto in ['3100/tcp', '8888/tcp']:
-                _sp.run(_sudo_wrap(['ufw', 'deny', port_proto]), capture_output=True)
-                plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
-
-        # Step 6: Save settings + regenerate Caddyfile
-        plog('')
-        plog('━━━ Step 6/6: Registering Module ━━━')
-        s = load_settings()
-        s['tak_video_restreamer_enabled'] = True
-        s['tak_video_restreamer_admin_password'] = admin_pass
-        s['tak_video_restreamer_secret_key'] = secret_key
-        s['tak_video_restreamer_commit_sha'] = commit_sha
-        save_settings(s)
-        generate_caddyfile(s)
-        try:
-            _sp.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, check=True)
-            plog('✓ Caddy reloaded')
-        except Exception as ce:
-            plog(f'  Caddy reload warning: {ce}')
-
-        # Optional: register Authentik proxy provider
-        ak_token = (_get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or
-                    _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
-        if fqdn and ak_token:
-            plog('  Configuring Authentik for TAK Video Restreamer...')
-            _ensure_authentik_tvr_app(fqdn, ak_token, plog=plog, settings=s)
-        else:
-            plog('  Authentik not configured — skipping proxy provider setup.')
-
-        plog('')
-        plog('✓ TAK Video Restreamer deployed successfully.')
-        plog(f'  Web UI: https://{fqdn}/  (admin / {admin_pass})' if fqdn else
-             f'  Web UI: http://localhost:3100/  (admin / {admin_pass})')
-        plog('  RTSP:   rtsp://<host>:8554/<stream>')
-        plog('  RTSPS:  rtsps://<host>:8555/<stream>')
-        plog('  SRT:    srt://<host>:8890?streamid=publish:<stream>')
-        plog('  RTMP:   rtmp://<host>:1935/<stream>')
-        _tvr_deploy_status.update({'running': False, 'complete': True, 'error': False})
-    except Exception as exc:
-        plog(f'ERROR: {exc}')
-        _tvr_deploy_status.update({'running': False, 'complete': False, 'error': str(exc)})
+# Compose/mediaMTX templates + deploy runner live in modules/tvr.py
+# (registry-resident since v10.1.24).
 
 
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
@@ -61410,6 +60812,16 @@ def run_full_uninstall():
         mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
         plog("✓ MediaMTX removed")
 
+        # 1b. TAK Video Restreamer — v10.1.24: registry uninstall path (modules/tvr.py).
+        # Was absent here entirely — full console removal left TVR containers running
+        # (PLAN v10.1.24 §4-W4, second drift-kill).
+        plog("━━━ TAK Video Restreamer ━━━")
+        try:
+            mod_registry.uninstall_module('tvr', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ TAK Video Restreamer removal error (non-fatal): {e}")
+        plog("✓ TAK Video Restreamer removed")
+
         # 2. TAK Portal
         plog("━━━ TAK Portal ━━━")
         portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -68067,6 +67479,16 @@ _MODULE_CTX = {
     '_get_module_deployment_config': _get_module_deployment_config,
     '_configure_authentik_smtp_and_recovery': _configure_authentik_smtp_and_recovery,
     '_configure_authentik_smtp_and_recovery_remote': _configure_authentik_smtp_and_recovery_remote,
+    # tvr seams (v10.1.24) — shared infra helpers stay in app.py: compose/git go
+    # through the broker (CloudTAK/WebODM/NetBird use the same two), the Docker
+    # installer and the Authentik proxy-app hooks are entangled with their families
+    '_broker_compose': _broker_compose,
+    '_module_git': _module_git,
+    '_docker_probe': _docker_probe,
+    '_install_docker_engine': _install_docker_engine,
+    '_get_authentik_env_value': _get_authentik_env_value,
+    '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
+    '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
 # import with a clear message (smoke.py py_compiles modules/*.py pre-pull), not
