@@ -59696,12 +59696,13 @@ def run_takserver_deploy(config):
         # exit 4 and X.509 auth / truststore / cert-enrollment / WebTAK were never
         # applied (TAK installs but is misconfigured). Do ONE broker read-modify-write.
         issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
+        ca_cfg_line = ('<TAKServerCAConfig keystore="JKS" '
+            f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
+            f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />')
         cert_block = ('<certificateSigning CA="TAKServer"><certificateConfig>\n'
             f'<nameEntries>\n<nameEntry name="O" value="{config["cert_org"]}"/>\n'
             f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\n</nameEntries>\n'
-            '</certificateConfig>\n<TAKServerCAConfig keystore="JKS" '
-            f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
-            f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />\n'
+            f'</certificateConfig>\n{ca_cfg_line}\n'
             '</certificateSigning>\n<vbm enabled="false"/>')
         try:
             _cc = _read_priv('/opt/tak/CoreConfig.xml')
@@ -59718,7 +59719,14 @@ def run_takserver_deploy(config):
             _cc = _cc.replace('truststoreFile="certs/files/truststore-root.jks',
                               f'truststoreFile="certs/files/truststore-{int_ca}.jks')
             log_step("Enabling certificate enrollment...")
-            _cc = _cc.replace('<vbm enabled="false"/>', cert_block)
+            # RELEASE43+ artifacts write `<vbm enabled="false" />` (space before the
+            # self-close); older ones have no space. Normalize so one replace serves
+            # both artifact generations. Guarded so a re-run over an already-patched
+            # file can't insert a duplicate certificateSigning block (cert_block
+            # re-appends the vbm anchor).
+            if ca_cfg_line not in _cc:
+                _cc = _cc.replace('<vbm enabled="false" />', '<vbm enabled="false"/>')
+                _cc = _cc.replace('<vbm enabled="false"/>', cert_block)
             _cc = _cc.replace('<auth>', '<auth x509useGroupCache="true">')
             if config.get('enable_admin_ui') or config.get('enable_webtak'):
                 admin_ui = str(config.get('enable_admin_ui', False)).lower()
@@ -59738,7 +59746,11 @@ def run_takserver_deploy(config):
                 _cc_check = _cc_check.decode('utf-8', 'replace')
             _missing = [_m for _m, _ok in (
                 (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in _cc_check),
-                ('certificateSigning enrollment block', 'TAKServerCAConfig' in _cc_check),
+                # v10.1.23: match OUR single-line inserted block, not the bare element
+                # name — RELEASE43's stock example ships a commented-out multi-line
+                # certificateSigning template containing "TAKServerCAConfig" and
+                # "intermediate-signing.jks", which spoofed this check on unpatched files.
+                ('certificateSigning enrollment block', ca_cfg_line in _cc_check),
                 ('x509 auth input on 8089', 'auth="x509"' in _cc_check),
             ) if not _ok]
             if _missing:
