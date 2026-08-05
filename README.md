@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.22-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.22-alpha)**
+**Current release: [v10.1.23-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.23-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.23-alpha — 2026-08-05 — Fresh TAK Server installs work again with current tak.gov downloads
+
+**Headline: if you tried to deploy TAK Server from a recently-downloaded 5.7 package and the deploy aborted with a CoreConfig verification error — this release fixes it.** TAK Server's stock configuration template ships its connection settings in a form our configuration step didn't fully anticipate, and the strict safety check added in v10.1.14 (which correctly refuses to leave a misconfigured TAK Server running) rejected otherwise-good fresh installs. This release makes the configuration step handle every known template generation of the TAK Server packages (verified against 5.4 through 5.7, both .deb and .rpm), makes the certificate-enrollment setup independent of TAK Server's own config-rewriting timing, and strengthens the safety check so it verifies the real configuration rather than being satisfied by boilerplate text in the stock file. Also in this release: a failed TAK Server deploy now stops the half-configured service instead of leaving it running with a healthy-looking status tile, and the Email Relay module's "Configure Authentik to use these settings" button now works on locally-deployed Authentik installations (it previously reported "Authentik is not installed"). Validated end-to-end with a fresh TAK Server install and a real ATAK device enrollment. **Who should update:** anyone deploying TAK Server fresh, and any Email Relay + local-Authentik user — existing working TAK installations are unaffected. **Upgrade:** automatic on the next console update; no service restarts beyond the console.
+
+Full notes: [v10.1.23-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.23-alpha).
 
 ### v10.1.22-alpha — 2026-08-05 — A cleaner engine under the hood, and two Email Relay security fixes
 
