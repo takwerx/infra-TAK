@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.20-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.20-alpha)**
+**Current release: [v10.1.21-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.21-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.21-alpha — 2026-08-04 — The console becomes one product: a unified design across every page
+
+**Headline: all console pages now share a single, deliberate design.** Over three years of development the console's 25 pages had drifted into two visibly different style families with independently-evolved copies of the layout, fonts, and colors on every page. This release converges everything on one look — the terminal-inspired theme of the TAK Server page: JetBrains Mono typography throughout, translucent glowing cards, amber accents — implemented as a single shared template (`base.html`) that every page inherits. What you'll notice: the console feels like one application instead of a collection of related tools, and light/dark mode now applies consistently everywhere. What you won't notice (by design): every button, form, log viewer, and control works exactly as before — each page conversion passed a structural-preservation check guaranteeing the page's working parts are byte-for-byte intact. Prefer a different font? The Customization page's font selection still works and now applies more consistently. **Under the hood** this completes SOLID Wave 1: chrome fixes that used to require editing up to 25 files now happen in one, and the styling drift that produced this situation is structurally impossible going forward. **Who should update:** everyone — purely visual + maintainability; no functional changes, no service restarts beyond the console. **Upgrade:** automatic on the next console update; do a hard refresh (Ctrl/Cmd-Shift-R) in your browser afterward to clear cached styling.
+
+Full notes: [v10.1.21-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.21-alpha).
 
 ### v10.1.20-alpha — 2026-08-04 — Email settings flow where they should, and "Forgot password?" appears on every installation
 
