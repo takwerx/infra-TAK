@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.23-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.23-alpha)**
+**Current release: [v10.1.24-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.24-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -341,6 +341,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.24-alpha — 2026-08-05 — TAK Video Restreamer joins the registry engine; two fixes you'll feel
+
+**Headline: TAK Video Restreamer now runs on the shared module registry introduced in v10.1.22 — same pages, same behavior — and the migration closes two real gaps.** First, **"Uninstall all services" now actually removes TAK Video Restreamer**: previously a full console reset removed every other service but left the restreamer's containers running and bound to their ports, invisible to a console that thought the box was clean. Second, **removing the restreamer now uses a proper confirmation dialog** (warning, blast-radius description, in-dialog password with show/hide) instead of a bare browser prompt, matching the TAK Server module. Also fixed, after a field report: **the console password reset script (`reset-console-password.sh`) now refuses to run from the wrong directory.** On servers carrying more than one copy of infra-TAK (an old clone next to the live install), the script would happily "reset" a password file the running console never reads — it now detects where the console actually runs from, tells you exactly where to go, and prefers the exact config path the console is configured to use. Passwords containing backslashes are also no longer mangled at the prompt. The recovery instructions in this README now derive the correct directory from the system service instead of assuming a fixed path. **Who should update:** everyone using TAK Video Restreamer or the factory-reset feature, and anyone who may someday need the password reset script — which is everyone. **Upgrade:** automatic on the next console update; no service restarts beyond the console.
+
+Full notes: [v10.1.24-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.24-alpha).
 
 ### v10.1.23-alpha — 2026-08-05 — Fresh TAK Server installs work again with current tak.gov downloads
 
