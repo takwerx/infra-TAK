@@ -267,9 +267,13 @@ def register(ctx):
         if not relay.get('from_addr'):
             return jsonify({'success': False, 'error': 'Email Relay not configured. Deploy the relay first.'}), 400
         deploy_cfg = ctx['_get_module_deployment_config'](settings, 'authentik_deployment')
-        if not deploy_cfg.get('deployed'):
-            return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
+        # v10.1.23: only remote mode gates on the deployed flag — local deploys never set
+        # it historically (only _run_authentik_deploy_remote did), which left this button
+        # dead 400-ing "Authentik is not installed" on every locally-deployed box. Local
+        # mode trusts the on-disk compose check below instead.
         if deploy_cfg.get('target_mode') == 'remote':
+            if not deploy_cfg.get('deployed'):
+                return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
             try:
                 message = ctx['_configure_authentik_smtp_and_recovery_remote'](
                     deploy_cfg, relay.get('from_addr', ''), settings)

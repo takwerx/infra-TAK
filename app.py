@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.22-alpha"
+VERSION = "10.1.23-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -50538,6 +50538,13 @@ entries:
         except Exception as _ilc_e:
             plog(f"  ⚠ idle-load converge skipped (next console restart retries): {str(_ilc_e)[:160]}")
         plog("  ✓ Deploy complete.")
+        # v10.1.23: mark deployed like the remote path (app.py ~40797) does — consumers
+        # such as Email Relay's Configure-Authentik button gate on this flag.
+        _s = load_settings()
+        _akc = _normalize_module_deployment_config(_get_module_deployment_config(_s, 'authentik_deployment'))
+        _akc['deployed'] = True
+        _s['authentik_deployment'] = _akc
+        save_settings(_s)
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -59699,8 +59706,14 @@ def run_takserver_deploy(config):
         try:
             _cc = _read_priv('/opt/tak/CoreConfig.xml')
             log_step("Enabling X.509 auth on 8089...")
+            # Pre-RELEASE43 5.7 artifacts ship an anonymous 8087 tcp input — flip it.
             _cc = _cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
                               '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
+            # 5.7-RELEASE43+ stock CoreConfig ships the 8089 tls input directly (the 8087
+            # line survives only as a comment) — add auth="x509" to the live input. Both
+            # replaces no-op when their pattern is absent, so this is version-agnostic.
+            _cc = _cc.replace('<input _name="stdssl" protocol="tls" port="8089"',
+                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"')
             log_step("Setting intermediate CA truststore...")
             _cc = _cc.replace('truststoreFile="certs/files/truststore-root.jks',
                               f'truststoreFile="certs/files/truststore-{int_ca}.jks')
@@ -59734,6 +59747,10 @@ def run_takserver_deploy(config):
             log_step(f"  ✗ CoreConfig patch FAILED: {_cce}")
             log_step("  ✗ TAK would run MISCONFIGURED (X.509 auth / truststore / enrollment) — aborting deploy.")
             log_step("    Re-run the deploy; if this repeats, check broker health (journalctl -u takwerx-console).")
+            # A stock-config TAK must not keep serving (and showing a green tile) after
+            # an aborted deploy — stop it so the module status reflects the failure.
+            log_step("  Stopping TAK Server (stock CoreConfig, deploy incomplete)...")
+            run_cmd('systemctl stop takserver', check=False)
             deploy_status.update({'error': True, 'running': False}); return
         _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
         # For two-server and external_db: ensure JDBC URL and password point to the remote DB host
