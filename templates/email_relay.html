@@ -316,9 +316,11 @@ async function emailControl(action){
 
 async function emailUninstall(){
     if(!confirm('Remove Postfix email relay? Apps will need to be reconfigured.')){return}
-    var r=await fetch('/api/emailrelay/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    var pw=prompt('Enter infra-TAK admin password to confirm removal:');
+    if(!pw){return}
+    var r=await fetch('/api/emailrelay/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
     var d=await r.json();
-    if(d.success){location.reload()}else{alert('Error removing Postfix')}
+    if(d.success){location.reload()}else{alert(d.error||'Error removing Postfix')}
 }
 </script>
 {% endblock %}

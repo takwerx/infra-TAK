@@ -65,6 +65,12 @@ import urllib.parse
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
+# v10.1.22 SOLID Wave 3: the module registry package (modules/__init__.py).
+# Aliased because many functions here use a local `modules` dict. The package
+# imports nothing from app.py — seams flow the other way, via the ctx dict
+# built at the bottom of this file (mod_registry.load_all/init_registry).
+import modules as mod_registry
+
 # v0.9.12: ensure $HOME is set so child shells can expand ~/ in
 # subprocess.run('cd ~/authentik ...', shell=True). systemd does NOT inherit
 # HOME from login env, and takwerx-console.service historically did not pin
@@ -768,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.21-alpha"
+VERSION = "10.1.22-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2455,26 +2461,30 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+def _probe_run(*a, **kw):
+    """v0.9.48: probe subprocess that NEVER raises. detect_modules() is polled by
+    /api/modules, /api/modules/version and the guarddog health endpoint; a slow or
+    wedged docker/systemctl probe on a busy box must degrade to 'not running', not
+    raise TimeoutExpired and 500 the caller (caught in T&E: `docker compose ps` for
+    node-red timed out at 5s under load). Default timeout, swallow all errors.
+    v10.1.22: hoisted out of detect_modules() — also the registry ctx `probe_run`
+    seam, so registry-resident detect() implementations share the same armor."""
+    kw.setdefault("timeout", 8)
+    kw.setdefault("capture_output", True)
+    # v10.0.5 non-root: the status probes here run bare shell strings like
+    # `docker ps --filter ... --format ...` (and `docker inspect`, systemctl).
+    # As the non-root console, takwerx can't reach the docker socket directly,
+    # so without the broker shim PATH every probe returns empty -> every
+    # docker-backed module is misreported "Stopped" (containers are actually
+    # Up). Route through the shims. No-op as root / when shims absent.
+    kw["env"] = _broker_shim_env(kw.get("env"))
+    try:
+        return subprocess.run(*a, **kw)
+    except Exception:
+        return subprocess.CompletedProcess(a[0] if a else "", 124, "", "")
+
 def detect_modules():
-    def _run(*a, **kw):
-        """v0.9.48: probe subprocess that NEVER raises. detect_modules() is polled by
-        /api/modules, /api/modules/version and the guarddog health endpoint; a slow or
-        wedged docker/systemctl probe on a busy box must degrade to 'not running', not
-        raise TimeoutExpired and 500 the caller (caught in T&E: `docker compose ps` for
-        node-red timed out at 5s under load). Default timeout, swallow all errors."""
-        kw.setdefault("timeout", 8)
-        kw.setdefault("capture_output", True)
-        # v10.0.5 non-root: the status probes here run bare shell strings like
-        # `docker ps --filter ... --format ...` (and `docker inspect`, systemctl).
-        # As the non-root console, takwerx can't reach the docker socket directly,
-        # so without the broker shim PATH every probe returns empty -> every
-        # docker-backed module is misreported "Stopped" (containers are actually
-        # Up). Route through the shims. No-op as root / when shims absent.
-        kw["env"] = _broker_shim_env(kw.get("env"))
-        try:
-            return subprocess.run(*a, **kw)
-        except Exception:
-            return subprocess.CompletedProcess(a[0] if a else "", 124, "", "")
+    _run = _probe_run
     modules = {}
     settings = load_settings()
     has_fqdn = bool(settings.get('fqdn', ''))
@@ -2645,14 +2655,23 @@ def detect_modules():
         fh_running = bool(ok_fh and out_fh and out_fh.strip() == 'active')
     modules['fedhub'] = {'name': 'Federation Hub', 'installed': fh_installed, 'running': fh_running,
         'description': 'TAK Federation Hub on a dedicated Ubuntu host (SSH)', 'icon': '🌐', 'route': '/federation-hub', 'priority': 8}
-    # Email Relay (Postfix)
-    email_installed = _run(['which', 'postfix'], capture_output=True).returncode == 0
-    email_running = False
-    if email_installed:
-        r = _run(_sudo_wrap(['systemctl', 'is-active', 'postfix']), capture_output=True, text=True)
-        email_running = r.stdout.strip() == 'active'
-    modules['emailrelay'] = {'name': 'Email Relay', 'installed': email_installed, 'running': email_running,
-        'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
+    # Email Relay (Postfix) — registry-resident since v10.1.22 (modules/emailrelay.py):
+    # tile identity + probes come from the descriptor, not an inline block.
+    _em_desc = mod_registry.MODULES.get('emailrelay')
+    try:
+        _em_state = _em_desc['detect'](mod_registry.get_ctx()) if _em_desc else {}
+    except Exception:
+        _em_state = {}
+    if _em_desc:
+        modules['emailrelay'] = {'name': _em_desc['name'],
+            'installed': bool(_em_state.get('installed')), 'running': bool(_em_state.get('running')),
+            'description': _em_desc['description'], 'icon': _em_desc['icon'],
+            'route': _em_desc['route'], 'priority': _em_desc['priority']}
+    else:
+        # boot race only: the registry loads at the bottom of app.py — an early
+        # daemon-thread poll in that window reports the tile not-installed once.
+        modules['emailrelay'] = {'name': 'Email Relay', 'installed': False, 'running': False,
+            'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
     # Cesium 3D Tiles — pure static file serving via Caddy; no container needed
     ct_enabled = settings.get('cesium_tiles_enabled', False)
     ct_dir = _cesium_dir()
@@ -26742,8 +26761,6 @@ def certs_page():
                 files.append({'name': fn, 'size': sz_d, 'icon': icon, 'ext': ext})
     return render_template('certs.html', settings=settings, files=files, version=VERSION)
 
-# === Email Relay (Postfix) ===
-
 # ── MediaMTX ──────────────────────────────────────────────────────────────────
 mediamtx_deploy_log = []
 mediamtx_deploy_status = {'running': False, 'complete': False, 'error': False}
@@ -31826,178 +31843,10 @@ def run_cloudtak_update():
 
 
 # ── Email Relay ────────────────────────────────────────────────────────────────
-email_deploy_log = []
-email_deploy_status = {'running': False, 'complete': False, 'error': False}
-
-PROVIDERS = {
-    'brevo':   {'name': 'Brevo',   'host': 'smtp-relay.brevo.com', 'port': '587', 'url': 'https://app.brevo.com/settings/keys/smtp'},
-    'smtp2go': {'name': 'SMTP2GO', 'host': 'mail.smtp2go.com',     'port': '587', 'url': 'https://app.smtp2go.com/settings/users/smtp'},
-    'mailgun': {'name': 'Mailgun', 'host': 'smtp.mailgun.org',      'port': '587', 'url': 'https://app.mailgun.com/mg/sending/domains'},
-    'custom':  {'name': 'Custom',  'host': '',                      'port': '587', 'url': ''},
-}
-
-def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
-    log = email_deploy_log
-    status = email_deploy_status
-
-    def plog(msg):
-        log.append(msg)
-
-    try:
-        settings = load_settings()
-        pkg_mgr = settings.get('pkg_mgr', 'apt')
-        provider = PROVIDERS.get(provider_key, PROVIDERS['brevo'])
-
-        plog(f"📧 Step 1/5 — Installing Postfix...")
-        if pkg_mgr == 'apt':
-            wait_for_apt_lock(plog, log)
-            # Resolve mailname: prefer saved FQDN, fall back to hostname -f, hard-fallback to hostname
-            # hostname -f can return an unresolvable name on some VPS configs, causing
-            # mydomain to be derived as "0" and postfix install to fail with
-            # "meter mydomain: bad parameter value: 0"
-            fqdn_result = subprocess.run('hostname -f 2>/dev/null || hostname', shell=True, capture_output=True, text=True)
-            fqdn = (settings.get('fqdn') or fqdn_result.stdout.strip() or 'localhost').strip()
-            if not fqdn or fqdn == '0':
-                fqdn = settings.get('fqdn', 'localhost')
-            subprocess.run(
-                f'echo "postfix postfix/mailname string {fqdn}" | debconf-set-selections && '
-                'echo "postfix postfix/main_mailer_type string Internet Site" | debconf-set-selections',
-                shell=True, capture_output=True, timeout=30)
-            r = subprocess.run(
-                _sudo_wrap(['apt-get', 'install', '-y', 'postfix', 'libsasl2-modules']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
-            if r.returncode != 0:
-                # Attempt recovery: set myhostname/mydomain explicitly then retry dpkg --configure
-                plog(f"⚠ Postfix install hit error, attempting recovery (mydomain fix)...")
-                subprocess.run(
-                    f'postconf -e "myhostname={fqdn}" 2>/dev/null; '
-                    f'postconf -e "mydomain={fqdn.split(".", 1)[-1] if "." in fqdn else fqdn}" 2>/dev/null; '
-                    'dpkg --configure postfix 2>&1 || true',
-                    shell=True, capture_output=True, timeout=60)
-                r = subprocess.run('dpkg -l postfix 2>&1', shell=True, capture_output=True, text=True)
-                if 'ii' not in r.stdout:
-                    plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
-                    status.update({'running': False, 'error': True})
-                    return
-        else:
-            r = subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'postfix', 'cyrus-sasl-plain']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
-            if r.returncode != 0:
-                plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
-                status.update({'running': False, 'error': True})
-                return
-        plog("✓ Postfix installed")
-
-        plog(f"📧 Step 2/5 — Configuring main.cf...")
-        relay_host = provider['host']
-        relay_port = provider['port']
-        main_cf_additions = f"""
-# TAKWERX Email Relay — managed by TAK-infra
-inet_interfaces = all
-mynetworks = 127.0.0.0/8 [::1]/128 172.16.0.0/12
-# Send-only smarthost: never treat the base domain as a local destination
-# (default mydestination includes $mydomain -> 550 "User unknown in local
-# recipient table" for any address at the TAK base domain, GH #48)
-mydestination = $myhostname, localhost.localdomain, localhost
-relayhost = [{relay_host}]:{relay_port}
-smtp_sasl_auth_enable = yes
-smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
-smtp_sasl_security_options = noanonymous
-smtp_tls_security_level = may
-smtp_use_tls = yes
-header_size_limit = 4096000
-smtp_generic_maps = hash:/etc/postfix/generic
-"""
-        # Read existing main.cf and strip any previous TAKWERX block. v10.0.5
-        # non-root: /etc/postfix is root-owned — read+write via the broker (raw
-        # open(...,'w') EPERM'd as the takwerx console: [Errno 13] /etc/postfix/main.cf).
-        main_cf_path = '/etc/postfix/main.cf'
-        try:
-            existing = _read_priv(main_cf_path)
-        except Exception:
-            existing = ''
-        if existing:
-            # Remove previous TAKWERX block if present
-            import re
-            existing = re.sub(r'\n# TAKWERX Email Relay.*', '', existing, flags=re.DOTALL)
-            # Remove any existing relayhost line (Ubuntu default has a blank one)
-            existing = re.sub(r'^\s*relayhost\s*=.*$', '', existing, flags=re.MULTILINE)
-            # Remove any existing mynetworks (we set it in our block for Docker relay)
-            existing = re.sub(r'^\s*mynetworks\s*=.*$', '', existing, flags=re.MULTILINE)
-            # Remove any existing mydestination (package default includes $mydomain,
-            # which makes same-domain mail bounce locally — GH #48; ours wins)
-            existing = re.sub(r'^\s*mydestination\s*=.*$', '', existing, flags=re.MULTILINE)
-            existing = existing.rstrip()
-        _write_priv(main_cf_path, existing + '\n' + main_cf_additions)
-        plog("✓ main.cf configured")
-
-        plog(f"📧 Step 3/5 — Writing credentials...")
-        sasl_line = f"[{relay_host}]:{relay_port}    {smtp_user}:{smtp_pass}"
-        _write_priv('/etc/postfix/sasl_passwd', sasl_line + '\n')
-        subprocess.run('postmap /etc/postfix/sasl_passwd', shell=True, capture_output=True)
-        subprocess.run(_sudo_wrap(['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
-
-        # Generic map for from address rewriting
-        hostname = subprocess.run('hostname -f', shell=True, capture_output=True, text=True).stdout.strip()
-        generic_line = f"root@{hostname}    {from_addr}"
-        _write_priv('/etc/postfix/generic', generic_line + '\n')
-        subprocess.run('postmap /etc/postfix/generic', shell=True, capture_output=True)
-        plog("✓ Credentials written and hashed")
-
-        plog(f"📧 Step 4/5 — Enabling and starting Postfix...")
-        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-        if r.returncode != 0:
-            plog(f"✗ Postfix restart failed: {r.stdout}")
-            status.update({'running': False, 'error': True})
-            return
-        plog("✓ Postfix running")
-
-        plog(f"📧 Step 5/5 — Saving configuration...")
-        settings['email_relay'] = {
-            'provider': provider_key,
-            'relay_host': relay_host,
-            'relay_port': relay_port,
-            'smtp_user': smtp_user,
-            'from_addr': from_addr,
-            'from_name': from_name,
-        }
-        # Store password separately (still in settings.json, local only)
-        settings['email_relay']['smtp_pass'] = smtp_pass
-        save_settings(settings)
-        plog("✓ Configuration saved")
-        plog("")
-        plog("✅ Email Relay deployed successfully!")
-        plog(f"   Provider: {provider['name']}")
-        plog(f"   Relay:    {relay_host}:{relay_port}")
-        plog(f"   From:     {from_name} <{from_addr}>")
-
-        # Auto-configure Authentik if installed (SMTP + recovery flow)
-        ak_dir = os.path.expanduser('~/authentik')
-        if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
-            plog("")
-            plog("🔑 Step 6/6 — Configuring Authentik (SMTP + password recovery)...")
-            try:
-                ak_msg = _configure_authentik_smtp_and_recovery(from_addr, plog)
-                plog(f"✓ {ak_msg}")
-            except Exception as e:
-                plog(f"⚠ Authentik auto-config failed: {e}")
-                plog("  You can configure it manually via the 'Configure Authentik' button.")
-        else:
-            plog("")
-            plog("📋 Configure apps to use SMTP:")
-            plog("   Host: localhost   Port: 25   No auth required")
-
-        # v10.1.20: the relay is authoritative for TAK Portal's email transport — push the
-        # updated settings now so the portal Email panel reflects the new provider without
-        # a manual "Update config & reconnect" (operator request 2026-08-04).
-        if _takportal_push_settings(plog):
-            plog("✓ TAK Portal email settings updated from relay config")
-
-        status.update({'running': False, 'complete': True, 'error': False})
-
-    except Exception as e:
-        plog(f"✗ Deploy failed: {str(e)}")
-        status.update({'running': False, 'error': True})
-
+# v10.1.22 SOLID Wave 3: the Email Relay family (globals, PROVIDERS, deploy
+# runner, route quintet) lives in modules/emailrelay.py — its routes are
+# registered by mod_registry.init_registry() at the SAME URLs. Only the page
+# route and the Authentik-SMTP helpers remain here.
 
 def _authentik_smtp_configured():
     """True if Authentik .env has email settings (SMTP was pushed by Configure Authentik or deploy)."""
@@ -32022,135 +31871,15 @@ def emailrelay_page():
     settings = load_settings()
     relay_config = settings.get('email_relay', {})
     authentik_smtp_configured = modules.get('authentik', {}).get('installed') and _authentik_smtp_configured()
+    _em_job = mod_registry.job_state('emailrelay')
     return render_template('email_relay.html',
         settings=settings, modules=modules, email=email,
-        relay_config=relay_config, providers=PROVIDERS,
+        relay_config=relay_config, providers=mod_registry.emailrelay.PROVIDERS,
         authentik_smtp_configured=authentik_smtp_configured,
         metrics=get_system_metrics(), version=VERSION,
-        deploying=email_deploy_status.get('running', False),
-        deploy_done=email_deploy_status.get('complete', False),
-        deploy_error=email_deploy_status.get('error', False))
-
-@app.route('/api/emailrelay/deploy', methods=['POST'])
-@login_required
-def emailrelay_deploy():
-    if email_deploy_status['running']:
-        return jsonify({'success': False, 'error': 'Deployment already in progress'})
-    data = request.get_json()
-    provider = data.get('provider', 'brevo')
-    smtp_user = data.get('smtp_user', '').strip()
-    smtp_pass = data.get('smtp_pass', '').strip()
-    from_addr = data.get('from_addr', '').strip()
-    from_name = data.get('from_name', '').strip()
-    if not smtp_user or not smtp_pass or not from_addr:
-        return jsonify({'success': False, 'error': 'SMTP username, password, and from address are required'})
-    if provider == 'custom':
-        custom_host = data.get('custom_host', '').strip()
-        custom_port = data.get('custom_port', '587').strip()
-        if not custom_host:
-            return jsonify({'success': False, 'error': 'Custom host is required'})
-        PROVIDERS['custom']['host'] = custom_host
-        PROVIDERS['custom']['port'] = custom_port
-    email_deploy_log.clear()
-    email_deploy_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_email_deploy,
-        args=(provider, smtp_user, smtp_pass, from_addr, from_name), daemon=True).start()
-    return jsonify({'success': True})
-
-@app.route('/api/emailrelay/log')
-@login_required
-def emailrelay_log():
-    return jsonify({
-        'running': email_deploy_status['running'],
-        'complete': email_deploy_status['complete'],
-        'error': email_deploy_status['error'],
-        'entries': list(email_deploy_log)})
-
-@app.route('/api/emailrelay/test', methods=['POST'])
-@login_required
-def emailrelay_test():
-    data = request.get_json()
-    to_addr = data.get('to', '').strip()
-    if not to_addr:
-        return jsonify({'success': False, 'error': 'Recipient address required'})
-    settings = load_settings()
-    relay_config = settings.get('email_relay', {})
-    from_addr = relay_config.get('from_addr', 'noreply@localhost')
-    from_name = relay_config.get('from_name', 'TAK-infra')
-    try:
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.mime.multipart import MIMEMultipart
-        msg = MIMEMultipart()
-        msg['From'] = f'{from_name} <{from_addr}>'
-        msg['To'] = to_addr
-        msg['Subject'] = 'TAK-infra Test Email'
-        msg.attach(MIMEText('Test email from TAK-infra Email Relay.\n\nIf you received this, your email relay is working correctly.', 'plain'))
-        with smtplib.SMTP('localhost', 25, timeout=15) as s:
-            s.sendmail(from_addr, [to_addr], msg.as_string())
-        return jsonify({'success': True, 'output': f'Test email sent to {to_addr}'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:200]})
-
-@app.route('/api/emailrelay/swap', methods=['POST'])
-@login_required
-def emailrelay_swap():
-    """Swap provider — reconfigure Postfix with new credentials"""
-    if email_deploy_status['running']:
-        return jsonify({'success': False, 'error': 'Deployment already in progress'})
-    data = request.get_json()
-    provider = data.get('provider', 'brevo')
-    smtp_user = data.get('smtp_user', '').strip()
-    smtp_pass = data.get('smtp_pass', '').strip()
-    from_addr = data.get('from_addr', '').strip()
-    from_name = data.get('from_name', '').strip()
-    if not smtp_user or not smtp_pass or not from_addr:
-        return jsonify({'success': False, 'error': 'All fields required'})
-    if provider == 'custom':
-        custom_host = data.get('custom_host', '').strip()
-        custom_port = data.get('custom_port', '587').strip()
-        if not custom_host:
-            return jsonify({'success': False, 'error': 'Custom host is required'})
-        PROVIDERS['custom']['host'] = custom_host
-        PROVIDERS['custom']['port'] = custom_port
-    email_deploy_log.clear()
-    email_deploy_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_email_deploy,
-        args=(provider, smtp_user, smtp_pass, from_addr, from_name), daemon=True).start()
-    return jsonify({'success': True})
-
-@app.route('/api/emailrelay/control', methods=['POST'])
-@login_required
-def emailrelay_control():
-    data = request.get_json()
-    action = data.get('action', '')
-    if action == 'restart':
-        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-    elif action == 'stop':
-        r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-    elif action == 'start':
-        r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-    else:
-        return jsonify({'success': False, 'error': 'Unknown action'})
-    return jsonify({'success': r.returncode == 0, 'output': r.stdout.strip()})
-
-@app.route('/api/emailrelay/uninstall', methods=['POST'])
-@login_required
-def emailrelay_uninstall():
-    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'postfix']), capture_output=True, timeout=90)
-    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'postfix']), capture_output=True, timeout=90)
-    settings = load_settings()
-    pkg_mgr = settings.get('pkg_mgr', 'apt')
-    if pkg_mgr == 'apt':
-        subprocess.run(_sudo_wrap(['apt-get', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
-    else:
-        subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
-    settings.pop('email_relay', None)
-    save_settings(settings)
-    email_deploy_log.clear()
-    email_deploy_status.update({'running': False, 'complete': False, 'error': False})
-    return jsonify({'success': True, 'steps': ['Postfix stopped and removed', 'Configuration cleared']})
-
+        deploying=_em_job.get('running', False),
+        deploy_done=_em_job.get('complete', False),
+        deploy_error=_em_job.get('error', False))
 
 # ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
 
@@ -34075,34 +33804,6 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         return False, _err(e), None
     except Exception as e:
         return False, str(e)[:200], None
-
-
-@app.route('/api/emailrelay/configure-authentik', methods=['POST'])
-@login_required
-def emailrelay_configure_authentik():
-    """Push Email Relay settings into Authentik and set up recovery flow (SMTP + Forgot password?)."""
-    settings = load_settings()
-    relay = settings.get('email_relay') or {}
-    if not relay.get('from_addr'):
-        return jsonify({'success': False, 'error': 'Email Relay not configured. Deploy the relay first.'}), 400
-    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
-    if not deploy_cfg.get('deployed'):
-        return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
-    if deploy_cfg.get('target_mode') == 'remote':
-        try:
-            message = _configure_authentik_smtp_and_recovery_remote(
-                deploy_cfg, relay.get('from_addr', ''), settings)
-            return jsonify({'success': True, 'message': message})
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)[:300]}), 500
-    ak_dir = os.path.expanduser('~/authentik')
-    if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
-        return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
-    try:
-        message = _configure_authentik_smtp_and_recovery(relay.get('from_addr', ''))
-        return jsonify({'success': True, 'message': message})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
 # ── TAK Video Restreamer ──────────────────────────────────────────────────────
@@ -59045,8 +58746,19 @@ def log_step(msg):
     deploy_log.append(entry)
     print(entry, flush=True)
 
-def run_cmd(cmd, desc=None, check=True, quiet=False):
-    if desc: log_step(desc)
+def run_cmd(cmd, desc=None, check=True, quiet=False, log=None):
+    # v10.1.22 (Wave 2b ride-along): optional `log` sink — the module-registry
+    # job runner passes the module's job log; default stays the TAK deploy_log
+    # (the ~72 existing TAK-deploy call sites are byte-identical in behavior).
+    sink = deploy_log if log is None else log
+    def _step(msg):
+        if sink is deploy_log:
+            log_step(msg)
+        else:
+            entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+            sink.append(entry)
+            print(entry, flush=True)
+    if desc: _step(desc)
     try:
         # v10.0.5 non-root: this helper drives the ENTIRE TAK Server deploy (native
         # + container) as bare shell strings. As the non-root console it must route
@@ -59058,13 +58770,13 @@ def run_cmd(cmd, desc=None, check=True, quiet=False):
         if not quiet and r.stdout.strip():
             for line in r.stdout.strip().split('\n'):
                 if 'NEEDRESTART' not in line:
-                    deploy_log.append(f"  {line}")
+                    sink.append(f"  {line}")
         if not quiet and r.returncode == 0 and r.stderr.strip():
             for line in r.stderr.strip().split('\n'):
                 if 'NEEDRESTART' not in line and 'error' in line.lower():
-                    deploy_log.append(f"  ✗ {line}")
+                    sink.append(f"  ✗ {line}")
         if check and r.returncode != 0:
-            log_step(f"✗ Command failed (exit {r.returncode})")
+            _step(f"✗ Command failed (exit {r.returncode})")
             # v10.0.5 non-root: surface the FULL stderr on failure. The broker
             # PATH-shim writes its reason to stderr as `takwerx_broker: DENIED: …`
             # / `ERROR: …` and returns 126; the 'error'-substring filter above
@@ -59074,11 +58786,11 @@ def run_cmd(cmd, desc=None, check=True, quiet=False):
             err = (r.stderr or '').strip()
             for line in err.split('\n')[-15:]:
                 if line.strip() and 'NEEDRESTART' not in line:
-                    deploy_log.append(f"  ✗ {line}")
+                    sink.append(f"  ✗ {line}")
             return False
         return True
     except Exception as e:
-        log_step(f"✗ {str(e)}")
+        _step(f"✗ {str(e)}")
         return False
 
 def wait_for_package_lock():
@@ -61753,19 +61465,13 @@ def run_full_uninstall():
         deploy_status.update({'running': False, 'complete': False, 'error': False})
         plog("✓ TAK Server removed")
 
-        # 6. Email Relay
+        # 6. Email Relay — v10.1.22: registry uninstall path (modules/emailrelay.py).
+        # Kills the inline copy that had already drifted from the module uninstall.
         plog("━━━ Email Relay ━━━")
-        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'postfix']), capture_output=True, timeout=90)
-        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'postfix']), capture_output=True, timeout=90)
-        if pkg_mgr == 'apt':
-            subprocess.run(_sudo_wrap(['apt-get', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
-        else:
-            subprocess.run(_sudo_wrap(['dnf', 'remove', '-y', 'postfix']), capture_output=True, timeout=120)
-        settings = load_settings()
-        settings.pop('email_relay', None)
-        save_settings(settings)
-        email_deploy_log.clear()
-        email_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        try:
+            mod_registry.uninstall_module('emailrelay', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ Email Relay removal error (non-fatal): {e}")
         plog("✓ Email Relay removed")
 
         # 7. Authentik
@@ -68301,6 +68007,45 @@ except Exception as _e:
 # start.sh, so their unit lacks that ExecStartPre — here we run the SAME stdlib-only
 # heal once in a daemon thread so settings + firewall are corrected immediately and
 # the cert is right on the next restart. Idempotent (no-op when the IP is unchanged).
+# === Module registry bootstrap (SOLID Wave 3, v10.1.22) ======================
+# ONE plain dict of the sanctioned seams (the Dependency Rule boundary): module
+# files under modules/ receive this and import NOTHING from app.py. A module can
+# only touch the seams it is handed — the enforced version of the ARCHITECTURE.md
+# seams table. Registered routes go live before gunicorn serves (import-time).
+_MODULE_CTX = {
+    # core seams (PLAN v10.1.22 §4-W2)
+    'load_settings': load_settings,
+    'save_settings': save_settings,
+    'load_auth': load_auth,
+    '_read_priv': _read_priv,
+    '_write_priv': _write_priv,
+    '_pkg_install': _pkg_install,
+    '_pkg_remove': _pkg_remove,
+    '_fw_allow': _fw_allow,
+    '_fw_remove': _fw_remove,
+    '_sudo_wrap': _sudo_wrap,
+    'run_cmd': run_cmd,
+    'os_type': _distro_family,      # callable -> 'debian' | 'rhel'
+    '_host_arch': _host_arch,
+    '_ssh_probe': _ssh_probe,
+    'generate_caddyfile': generate_caddyfile,
+    'detect_modules': detect_modules,
+    'probe_run': _probe_run,        # never-raise status probe (broker-shimmed)
+    # emailrelay seams — these helpers stay in app.py this release (the Authentik
+    # SMTP hook + portal push are entangled with the Authentik family)
+    'wait_for_apt_lock': wait_for_apt_lock,
+    '_takportal_push_settings': _takportal_push_settings,
+    '_get_module_deployment_config': _get_module_deployment_config,
+    '_configure_authentik_smtp_and_recovery': _configure_authentik_smtp_and_recovery,
+    '_configure_authentik_smtp_and_recovery_remote': _configure_authentik_smtp_and_recovery_remote,
+}
+# Deliberately NOT wrapped in try/except: a broken module file must fail fast at
+# import with a clear message (smoke.py py_compiles modules/*.py pre-pull), not
+# silently drop its routes.
+_registry_loaded = mod_registry.load_all(_MODULE_CTX)
+mod_registry.init_registry(app, _MODULE_CTX, login_required)
+print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
+
 try:
     import threading as _threading_sh
 
