@@ -93,7 +93,7 @@ Then open your browser to the URL shown and log in.
 
 **Upgrading from v0.1.x to v0.2.0:** v0.2.0 switches from Flask dev server to gunicorn (production server). The upgrade is automatic — just `git pull` and restart. On first restart, the console installs gunicorn, rewrites the systemd service, and starts the production server transparently. No manual steps needed.
 
-**Password not working after update?** Use the **backdoor**: **https://&lt;VPS_IP&gt;:5001**. If login spins or fails, on the server run (from the directory where you do `git pull`, e.g. `/home/takwerx/infra-TAK`): **`sudo ./fix-console-after-pull.sh`** — it pins the config path in the systemd unit and prompts you to set a new password so you can log in again. Alternatively run `sudo ./reset-console-password.sh` from that same directory. After pulling, open the Caddy module and re-save your domain once so the Caddyfile (login bypass) is applied.
+**Password not working after update?** Use the **backdoor**: **https://&lt;VPS_IP&gt;:5001**. If login spins or fails, on the server run (from the directory the console runs from — shown by **`systemctl cat takwerx-console | grep WorkingDirectory`**, e.g. `/opt/infratak`): **`sudo ./fix-console-after-pull.sh`** — it pins the config path in the systemd unit and prompts you to set a new password so you can log in again. Alternatively run `sudo ./reset-console-password.sh` from that same directory. After pulling, open the Caddy module and re-save your domain once so the Caddyfile (login bypass) is applied.
 
 ## Recovery / backdoor (when Authentik or Caddy is broken)
 
@@ -103,10 +103,11 @@ If Authentik or Caddy is down and you can't reach **https://infratak.yourdomain.
 
 - **Backdoor:** Open **https://&lt;VPS_IP&gt;:5001** in your browser (use the server's real IP, not the domain). Log in with the **console password** you set when you ran `start.sh`. That path skips Caddy and Authentik, so you can get back into the console and fix things.
 
-The console password is stored as a **hash** in the install directory at `.config/auth.json` (e.g. `/home/takwerx/infra-TAK/.config/auth.json`). You **cannot** recover the plaintext password from that file. If you forget it:
+The console password is stored as a **hash** in the install directory at `.config/auth.json` (e.g. `/opt/infratak/.config/auth.json`). You **cannot** recover the plaintext password from that file. If you forget it, run the reset script **from the directory the console runs from** — a server can carry more than one clone, and only the one in the systemd unit counts (the script refuses to run from the wrong one):
 
 ```bash
-cd /home/takwerx/infra-TAK   # or your install path
+systemctl cat takwerx-console | grep WorkingDirectory   # shows the live install dir
+cd /opt/infratak   # ← use the directory the line above shows
 sudo ./reset-console-password.sh
 ```
 
