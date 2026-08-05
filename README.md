@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.21-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.21-alpha)**
+**Current release: [v10.1.22-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.22-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -340,6 +340,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.22-alpha — 2026-08-05 — A cleaner engine under the hood, and two Email Relay security fixes
+
+**Headline: infra-TAK's modules now run on a shared registry engine, proven first on Email Relay — plus two security fixes for that module.** For months, every module (Email Relay, MediaMTX, Node-RED, …) carried its own copy of the same deploy/status/control plumbing, and each copy could drift out of sync with the others. This release introduces a single module registry that provides that machinery once — one job runner, one route family, one uninstall confirmation — and migrates Email Relay onto it as the proving ground. Every Email Relay page and endpoint behaves exactly as before, with two deliberate exceptions, both security fixes: **removing the Email Relay now requires your admin password** (it was the one module that didn't ask), and **uninstalling now deletes the stored SMTP credentials from disk** (previously `/etc/postfix/sasl_passwd` survived removal with your relay password in it — if you uninstalled Email Relay on an earlier version and never redeployed it, delete that file). Future modules build on the registry instead of copying plumbing, which means fewer places for bugs to hide and faster module development. **Who should update:** everyone — the security fixes apply to any installation that has ever used Email Relay. **Upgrade:** automatic on the next console update; no service restarts beyond the console.
+
+Full notes: [v10.1.22-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.22-alpha).
 
 ### v10.1.21-alpha — 2026-08-04 — The console becomes one product: a unified design across every page
 
