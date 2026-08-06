@@ -427,7 +427,11 @@ if _ctx_is_valid "$NR_CTX_GLOBAL"; then
 elif _ctx_is_valid "$PERSISTENT_CTX_BACKUP"; then
   echo "    WARNING: live context has no saved configs — falling back to persistent snapshot"
   echo "    Snapshot keys: $(_ctx_summary "$PERSISTENT_CTX_BACKUP")"
-  cp "$PERSISTENT_CTX_BACKUP" "$NR_CTX_GLOBAL"
+  # v10.1.25: REAL cp, never the broker shim — on non-root boxes a bare `cp` resolves to
+  # the shim, the broker denies /tmp/nr_ctx_global.json, and set -e killed the WHOLE deploy
+  # (nuc, exit 126: fresh container left with no flows and no restore). This branch only
+  # runs on volume-wipe redeploys, which is why root boxes never surfaced it.
+  "$_TKX_REALCP" "$PERSISTENT_CTX_BACKUP" "$NR_CTX_GLOBAL"
 else
   # Neither live context nor persistent snapshot has real config data.
   # Check if this is a fresh install (Node-RED has never had configs) vs
