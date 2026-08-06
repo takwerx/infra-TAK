@@ -14371,6 +14371,209 @@ def _f2b_dead_jails():
     return dead
 
 
+# Log files infra-TAK ITSELF produces and one of our jails then reads. These we may
+# create: an empty file is harmless (the jail tails it and matches nothing until the
+# real writer appends), and its ABSENCE is fatal to the whole daemon.
+#
+# Everything NOT on this list belongs to another program — TAK Server's log4j owns
+# /opt/tak/logs/*, Caddy owns its access logs — and those run as their own
+# unprivileged users. Creating one of those root-owned would break the real writer,
+# which is the failure `_f2b_prepare_portal_caddy_log()` was written for. A jail
+# pointing at a missing FOREIGN log gets parked instead (see below).
+_F2B_SELF_OWNED_LOGS = ('/var/log/authentik/auth.log', '/var/log/fail2ban.log')
+
+# Suffix for a jail parked because its logpath does not exist. Parking (rather than
+# editing `enabled`) keeps the existence-based _f2b_*_jail_enabled() checks honest,
+# so the console reports the jail as off instead of showing a control that is not
+# running.
+_F2B_PARK_SUFFIX = '.parked-missing-log'
+
+
+def _f2b_ensure_ak_logfile(plog=None):
+    """Create /var/log/authentik/auth.log when it is missing. NEVER truncates.
+
+    The Authentik jail hard-codes `logpath = /var/log/authentik/auth.log`, but the only
+    thing that has ever created that file is the append redirect inside
+    authentik-log-forwarder.service — and the installer starts that unit ONLY when an
+    Authentik container is already running (migration step 6, and the same conditional
+    in the jail-toggle route). Set fail2ban up before Authentik is deployed, or during
+    a redeploy/upgrade window, and the jail is written pointing at a file nothing will
+    ever create. Install only ever made the DIRECTORY.
+
+    fail2ban does not skip such a jail — it aborts config parsing, so the whole daemon
+    dies and EVERY jail stops, sshd included. What made this survive so long is that
+    `fail2ban-client reload` (what almost all of our code calls) merely logs the bad
+    jail and leaves the running daemon up: the box looks healthy for weeks, until a
+    reboot or a package upgrade cold-starts fail2ban and it can never come back.
+
+        ERROR Failed during configuration: Have not found any log file for authentik jail
+        fail2ban.service: Main process exited, code=exited, status=255/EXCEPTION
+
+    Field report yfdtak-2, 2026-08-06, on v10.1.25 — every jail on that box was down
+    and no `systemctl start` would fix it.
+
+    Same guard the other three jails already had, and the one this jail never got:
+    sshd falls back to `backend = systemd` (_f2b_sshd_logpath), the portal log is
+    created and chowned up front (_f2b_prepare_portal_caddy_log), recidive's
+    /var/log/fail2ban.log is touched before the daemon starts."""
+    _log = plog or (lambda m: None)
+    path = '/var/log/authentik/auth.log'
+    if os.path.exists(path):
+        return False
+    try:
+        _makedirs_priv('/var/log/authentik', exist_ok=True)
+        subprocess.run(_sudo_wrap(['touch', path]), capture_output=True, timeout=15)
+        _chmod_priv(path, 0o640)
+    except Exception as e:
+        _log(f'fail2ban: could not create {path} (non-fatal): {e}')
+        return False
+    if not os.path.exists(path):
+        _log('fail2ban: %s is STILL missing after create — the Authentik jail will keep '
+             'fail2ban from starting. Check the log forwarder.' % path)
+        return False
+    _log('fail2ban: created the missing %s. The Authentik jail reads it, and a missing '
+         'logpath aborts the ENTIRE fail2ban daemon at config parse — not just that '
+         'jail — so this box had no fail2ban protection at all after its next restart.'
+         % path)
+    return True
+
+
+def _f2b_guard_jail_logpaths(plog=None):
+    """One jail's missing logpath must never take down every jail. Enforce that.
+
+    Runs before anything (re)starts fail2ban, over every enabled infratak-* jail:
+
+      1. RE-ARM first — a jail parked by an earlier pass whose log now exists comes
+         back. Without this the guard would be a one-way door: install TAK Server the
+         day after the takserver jail got parked and it would stay parked forever.
+      2. CREATE the logs we own (_F2B_SELF_OWNED_LOGS), plus the portal access log via
+         its owner-aware helper — Caddy must be able to write it, so it cannot just be
+         touched root-owned.
+      3. PARK what is left — a jail whose logpath belongs to another program and does
+         not exist. Renaming it aside costs that ONE jail; leaving it costs all of
+         them, because the daemon refuses to start at all. Real case: the takserver
+         jail on a split-box deploy, where TAK Server runs on the other server and
+         /opt/tak/logs/ does not exist here.
+      4. RESTART a daemon that is down, once, and report what state it reached.
+
+    Jails with `backend = systemd` are skipped — they read the journal and have no
+    logpath to lose (mediamtx, and sshd on a box with no rsyslog).
+
+    Parking is deliberately louder than it is clever: it logs the jail, the path, and
+    the reason, and _f2b_dead_jails() keeps reporting the gap, so a parked jail shows
+    up as missing protection instead of quietly passing as configured."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return False
+    import glob as _glob
+    changed = False
+
+    # ── 1. Re-arm jails whose log has come back ───────────────────────────────
+    for parked in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf' + _F2B_PARK_SUFFIX))):
+        try:
+            with open(parked) as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r'^\s*logpath\s*=\s*(\S+)', text, re.M)
+        if not m or not os.path.exists(m.group(1)):
+            continue
+        live = parked[:-len(_F2B_PARK_SUFFIX)]
+        try:
+            subprocess.run(_sudo_wrap(['mv', parked, live]), capture_output=True, timeout=15)
+            if os.path.exists(live):
+                changed = True
+                _log('fail2ban: re-armed %s — its log %s exists again.'
+                     % (os.path.basename(live), m.group(1)))
+        except Exception as e:
+            _log(f'fail2ban: could not re-arm {os.path.basename(parked)} (non-fatal): {e}')
+
+    # ── 2/3. Create what we own, park what we do not ──────────────────────────
+    for name, filt, jpath in _f2b_enabled_jail_files():
+        try:
+            with open(jpath) as f:
+                jt = f.read()
+        except OSError:
+            continue
+        if re.search(r'^\s*backend\s*=\s*systemd', jt, re.M):
+            continue                      # journal-fed — no logpath to lose
+        lm = re.search(r'^\s*logpath\s*=\s*(\S+)', jt, re.M)
+        if not lm:
+            continue
+        lp = lm.group(1)
+        if os.path.exists(lp):
+            continue
+        # fail2ban accepts a GLOB as logpath. None of our jails ship one, but an
+        # operator-edited jail may, and os.path.exists() is always False for a glob —
+        # which would park a jail that is working perfectly. Never park a pattern:
+        # act only on literal paths, where "missing" is unambiguous.
+        if any(ch in lp for ch in '*?['):
+            continue
+        # Ours to create?
+        if lp == '/var/log/authentik/auth.log':
+            changed |= bool(_f2b_ensure_ak_logfile(_log))
+        elif lp in _F2B_SELF_OWNED_LOGS:
+            try:
+                _makedirs_priv(os.path.dirname(lp), exist_ok=True)
+                subprocess.run(_sudo_wrap(['touch', lp]), capture_output=True, timeout=15)
+                _chmod_priv(lp, 0o640)
+                if os.path.exists(lp):
+                    changed = True
+                    _log('fail2ban: created the missing %s that the %s jail reads — its '
+                         'absence stops the whole daemon.' % (lp, name))
+            except Exception as e:
+                _log(f'fail2ban: could not create {lp} (non-fatal): {e}')
+        elif lp == TAKPORTAL_CADDY_LOG:
+            try:
+                _f2b_prepare_portal_caddy_log()   # owner-aware: Caddy must write it
+            except Exception:
+                pass
+        if os.path.exists(lp):
+            continue
+        # Not ours, still missing → park this jail so the others can run.
+        try:
+            subprocess.run(_sudo_wrap(['mv', jpath, jpath + _F2B_PARK_SUFFIX]),
+                           capture_output=True, timeout=15)
+            if not os.path.exists(jpath):
+                changed = True
+                _log('fail2ban: PARKED the %s jail — its logpath %s does not exist on '
+                     'this box, and fail2ban aborts the ENTIRE daemon over one missing '
+                     'log file. That jail is now off (it was never able to run); every '
+                     'other jail keeps working. It re-arms automatically once %s '
+                     'appears.' % (name, lp, lp))
+        except Exception as e:
+            _log(f'fail2ban: could not park {os.path.basename(jpath)} (non-fatal): {e}')
+
+    if not changed:
+        return False
+
+    # ── 4. Bring the daemon back ──────────────────────────────────────────────
+    try:
+        act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        if act == 'active':
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+            _log('fail2ban: reloaded after logpath repair.')
+        else:
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']),
+                           capture_output=True, timeout=60)
+            now = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                                 capture_output=True, text=True, timeout=15).stdout.strip()
+            if now == 'active':
+                _log('fail2ban: was %s and is now ACTIVE after the logpath repair — jails '
+                     'are protecting this box again.' % (act or 'not running'))
+            else:
+                _log('fail2ban: still %s after the logpath repair — something else is '
+                     'wrong; check `systemctl status fail2ban`.' % (now or 'not running'))
+    except Exception as e:
+        _log(f'fail2ban: restart after logpath repair failed ({e}) — check '
+             '`systemctl status fail2ban`')
+    return True
+
+
 def _f2b_selfheal_filters(plog=None):
     """Write any MISSING filter file for an enabled jail whose filter we own.
 
@@ -14870,6 +15073,11 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Rewrite the infratak-authentik jail config with new thresholds and ignoreip whitelist."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+    # Never write this jail without its log file present: a missing logpath aborts the
+    # WHOLE fail2ban daemon at config parse, not just this jail. The forwarder that
+    # normally creates it is started only when Authentik is already running, so on any
+    # box where it is not, this is the difference between fail2ban starting and not.
+    _f2b_ensure_ak_logfile()
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
@@ -63172,8 +63380,12 @@ def _fail2ban_install_and_configure(plog):
         return False
     plog("fail2ban migration: fail2ban installed")
 
-    # Step 2: Create log directory
+    # Step 2: Create log directory AND the log file itself. The file — not just the
+    # directory — is what the jail written in step 5 requires: step 6 starts the
+    # forwarder that would create it only if Authentik is already running, and
+    # fail2ban aborts the entire daemon over a logpath that does not resolve.
     _makedirs_priv('/var/log/authentik', exist_ok=True)
+    _f2b_ensure_ak_logfile(plog)
     plog("fail2ban migration: created /var/log/authentik/")
 
     # Step 3: Write log forwarder systemd service
@@ -63947,6 +64159,19 @@ def _startup_migrations():
             _f2b_selfheal_sshd_backend(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e2:
             print(f"Startup migration: fail2ban sshd-backend self-heal error (non-fatal): {_f2b_e2}", flush=True)
+
+        # v10.1.26 — the same class, generalised: ANY enabled jail whose logpath does
+        # not exist aborts the WHOLE daemon at config parse, so one missing file takes
+        # every jail down (field report yfdtak-2, 2026-08-06 — fail2ban dead, no
+        # `systemctl start` would fix it). Creates the logs we own (the Authentik jail's
+        # auth.log had no creator at all unless the forwarder happened to be running),
+        # parks a jail pointing at a foreign log that does not exist, and restarts a
+        # daemon left dead by this. Runs after the sshd-backend repair so both
+        # parse-fatal shapes are fixed before anything starts fail2ban.
+        try:
+            _f2b_guard_jail_logpaths(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e2b:
+            print(f"Startup migration: fail2ban logpath guard error (non-fatal): {_f2b_e2b}", flush=True)
 
         # v10.1.9 — never let fail2ban ban the road in. v10.1.11 — nor the road between
         # our own services. Adds the WireGuard/NetBird management subnets AND the docker
