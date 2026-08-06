@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.24-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.24-alpha)**
+**Current release: [v10.1.25-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.25-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -341,6 +341,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.25-alpha — 2026-08-06 — Node-RED feeds survive anything; multi-state TFR fixed; CloudTAK cert password shown
+
+**Headline: reinstalling the Node-RED module no longer costs you anything — and two field-reported bugs are gone.** Until now, uninstalling and redeploying Node-RED (or any redeploy that recreated its storage) silently wiped the CoT connector's certificate password and server address: your feed configs came back, but the connection was dead until you retyped both by hand. Now the console re-seeds them automatically from what it already knows — a full uninstall→reinstall produces a working CoT connector with zero re-entry. Second field fix: **TFR feeds covering multiple states work again.** On TAK Server 5.7, creating a new mission from the Configurator failed with an unhelpful 500 error, which surfaced exactly when a new multi-state TFR config used a fresh mission name; alongside the fix, the Configurator now documents the recommended workflow (create the Data Sync feed in TAK Portal first — Subscriber role, channel assigned — then enter that exact name), and the mission auto-create button has been removed in favor of that Portal-first flow. Third: **the CloudTAK bootstrap-certificate button now shows the actual certificate password** instead of a template placeholder (fixes issue [#57](https://github.com/takwerx/infra-TAK/issues/57)), with corrected wording about what the admin cert does. Under the hood, this release also hardens the feed engines against TAK Server 5.7's stricter mission API (mission writes are rate-limited and self-tuning, so one bad entry can no longer starve a whole feed), backs up your Configurator saves on every deploy instead of only some, tells the truth in the logs when a TFR has no drawable geometry (the standing DC-area security NOTAM is a reference to permanent airspace, not a drawable shape), preserves operator customizations to Node-RED's settings file across redeploys, and fixes a bug where reinstalling Node-RED on a non-root (hardened) installation could leave the module empty. **Who should update:** everyone running Node-RED feeds — especially anyone who has ever had to retype a cert password after a redeploy, or seen a multi-state TFR feed fail with a 500. **Upgrade:** automatic on the next console update; after any future reinstall, open each restored feed config and hit Save once to regenerate its flow.
+
+Full notes: [v10.1.25-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.25-alpha).
 
 ### v10.1.24-alpha — 2026-08-05 — TAK Video Restreamer joins the registry engine; two fixes you'll feel
 
