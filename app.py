@@ -36306,7 +36306,27 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird', REMOTE_ASSIST_OIDC_SLUG]
         user_visible_slugs = ['mediamtx', 'stream', 'tak-portal', 'ldap']  # no policy = visible to all authenticated users (LDAP needed for QR registration)
 
-        all_apps = _api_get('core/applications/?page_size=100')['results']
+        # superuser_full_list=true is MANDATORY here, not a nicety. Authentik's
+        # ApplicationViewSet.list() runs the POLICY ENGINE against the REQUESTING user and
+        # returns only the apps that user passes — see upstream
+        # authentik/core/api/applications.py::list() ("Custom list method that checks
+        # Policy based access instead of guardian"); only `superuser_full_list=true` +
+        # is_superuser short-circuits to the unfiltered queryset.
+        #
+        # We call this as akadmin (bootstrap token). Once the Cyber Controls W1 policy
+        # `infratak-require-mfa` (`return ak_user_has_authenticator(request.user)`) was
+        # bound to every application, akadmin — which has no MFA device — FAILED it, so
+        # this list came back nearly EMPTY and the binding loop below iterated almost
+        # nothing. Measured on the fleet 2026-08-06: without the param test6=1 app,
+        # test8=0 apps, test12=1 app; with it, 9/10/9. That is why Node-RED on test8 was
+        # never restricted and TAK Portal AGENCY admins could see it — the function that
+        # was supposed to lock it down could not see the application at all.
+        all_apps = _api_get('core/applications/?page_size=100&superuser_full_list=true')['results']
+        if not all_apps:
+            _log("  ✗ Authentik returned 0 applications — cannot verify or apply access "
+                 "policies. Check the token is a superuser (akadmin) token.")
+            return False
+        _log(f"  ✓ {len(all_apps)} applications visible for policy binding")
 
         def _bind_policy_to_app(app_pk, app_name, pol_pk, pol_name):
             """Returns 'already' | 'bound' | 'FAILED'. A failed bind must never be
