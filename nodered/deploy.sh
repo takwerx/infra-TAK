@@ -717,16 +717,21 @@ done
 # After a volume-wipe redeploy the CoT connector's host comes back empty, and an
 # fqdn default breaks when DNS doesn't resolve from inside the container — the
 # operator had to type the box IP by hand (Charles/NC 2026-08-05). When TAK
-# Server is local (host certs present) and the console passed its server_ip
-# (NR_TAK_SERVER_IP env), seed serverUrl into the restored context ONLY if it is
-# absent/empty. A present value — operator-set or restored — is never touched.
-# Runs after the safety gate + union, before the context is written/pushed, so
-# both the global.json file copy and the API restore carry the seed.
-if [ -n "${NR_TAK_SERVER_IP:-}" ] && { [ -f "$CERT_HOST_DIR/admin.pem" ] || [ -f "$CERT_HOST_DIR/nodered.pem" ]; }; then
+# Server is local (host certs present), seed serverUrl into the restored context
+# ONLY if it is absent/empty. A present value — operator-set or restored — is
+# never touched. Runs after the safety gate + union, before the context is
+# written/pushed, so both the global.json file copy and the API restore carry it.
+#
+# Value is the FLEET CONSTANT host.docker.internal, NOT the console's server_ip:
+# first soak night (nuc 2026-08-06) proved server_ip wrong on NAT'd boxes — it is
+# the router's WAN address there, and the container dialing it needs NAT hairpin
+# (ETIMEDOUT on nuc), while host.docker.internal reaches the local TAK on every
+# topology (compose adds the host-gateway mapping). Cloud boxes work either way.
+if [ -f "$CERT_HOST_DIR/admin.pem" ] || [ -f "$CERT_HOST_DIR/nodered.pem" ]; then
   if [ ! -f "$NR_CTX_GLOBAL" ]; then
     echo '{}' > "$NR_CTX_GLOBAL"
   fi
-  python3 - "$NR_CTX_GLOBAL" "$NR_TAK_SERVER_IP" <<'PYEOF' || echo "    serverUrl seed: FAILED (non-fatal)"
+  python3 - "$NR_CTX_GLOBAL" "host.docker.internal" <<'PYEOF' || echo "    serverUrl seed: FAILED (non-fatal)"
 import json, sys
 f, ip = sys.argv[1], sys.argv[2]
 try:
@@ -757,8 +762,8 @@ else:
     json.dump(d, open(f, 'w'))
     print('    serverUrl seed: tak_settings.serverUrl <- %s (was absent)' % ip)
 PYEOF
-elif [ -z "${NR_TAK_SERVER_IP:-}" ]; then
-  echo "    serverUrl seed skipped: NR_TAK_SERVER_IP not in env (manual run?)"
+else
+  echo "    serverUrl seed skipped: no local TAK certs (remote/two-server TAK)"
 fi
 
 # ── Patch settings.js on the HOST before the stop/start cycle ────────────────

@@ -36710,13 +36710,14 @@ volumes:
         _deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
         if os.path.isfile(_deploy_sh):
             try:
-                # v10.1.25 W3: hand deploy.sh the known TAK cert password + box IP so it
-                # can self-seed the CoT connector's tls_tak passphrase and serverUrl
-                # (only-when-empty) — zero manual re-entry after a volume-wipe redeploy.
+                # v10.1.25 W3: hand deploy.sh the known TAK cert password so it can
+                # self-seed the CoT connector's tls_tak passphrase (only-when-empty) —
+                # zero manual re-entry after a volume-wipe redeploy. serverUrl seeds to
+                # the fleet constant host.docker.internal inside deploy.sh (server_ip
+                # proved wrong on NAT'd boxes — nuc soak night, 2026-08-06).
                 _nr_env = dict(os.environ)
                 try:
                     _nr_env['NR_TAK_CERT_PASS'] = _get_tak_cert_password(settings)
-                    _nr_env['NR_TAK_SERVER_IP'] = str(settings.get('server_ip') or '').strip()
                 except Exception:
                     pass
                 r_nr = subprocess.run(
@@ -66192,9 +66193,7 @@ def _post_update_auto_deploy():
                     # fleet-wide path (post-update auto-sync redeploys flows on EVERY update).
                     _nr_env = dict(os.environ)
                     try:
-                        _nr_settings = load_settings()
-                        _nr_env['NR_TAK_CERT_PASS'] = _get_tak_cert_password(_nr_settings)
-                        _nr_env['NR_TAK_SERVER_IP'] = str(_nr_settings.get('server_ip') or '').strip()
+                        _nr_env['NR_TAK_CERT_PASS'] = _get_tak_cert_password(load_settings())
                     except Exception:
                         pass
                     result = subprocess.run(f'bash {shlex.quote(deploy_sh)} --no-pull',
