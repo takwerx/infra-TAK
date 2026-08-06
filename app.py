@@ -36391,30 +36391,58 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
                     except Exception:
                         pass
                     break
-        # Remove "Allow authentik Admins" binding from LDAP if present (blocks QR registration / device bind for non-admin users)
-        for app in all_apps:
-            app_slug = app.get('slug', '')
-            if app_slug != 'ldap':
-                continue
-            app_pk = app.get('pk', '')
-            app_name = app.get('name', '')
-            bindings = _api_get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
-            for b in bindings:
-                if (b.get('policy_obj', {}) or {}).get('name') == policy_name:
-                    try:
-                        _api_delete(f'policies/bindings/{b["pk"]}/')
-                        _log(f"  ✓ {app_name}: removed restrictive policy — now open to all authenticated users")
-                    except Exception:
-                        pass
-                    break
+        # ── LDAP apps must carry NO restrictive policy at all.
+        # Identified by PROVIDER, not by the slug 'ldap' — same rule as _w1_login_apps(),
+        # which is fleet-robust against a differently-named LDAP application.
+        #
+        # Two policies get stripped:
+        #   `Allow authentik Admins` — would block QR registration / device bind for
+        #      non-admin users.
+        #   W1_MFA_POLICY_NAME       — "the LDAP app is the TAK EUD bind path and MUST stay
+        #      MFA-free, else ATAK/iTAK auth breaks" (_w1_login_apps docstring, app.py:4749).
+        #      W1 already EXCLUDES ldap-provider apps when it binds the MFA policy, but it
+        #      only ever adds and never removes, so a box that picked the binding up from an
+        #      earlier W1 pass kept it forever. Found on test8 2026-08-06: `ldap` carried
+        #      `infratak-require-mfa` while test6/test12 did not — a user who has not enrolled
+        #      MFA yet saw ZERO applications, so the EUD bind path they need in order to
+        #      enroll was itself gated behind MFA. Enforcing the invariant here (rather than
+        #      in W1) means every boot heals it.
+        ldap_provider_pks = set()
+        try:
+            for p in _api_get('providers/ldap/?page_size=100').get('results', []):
+                ldap_provider_pks.add(p.get('pk'))
+        except Exception as e:
+            _log(f"  ⚠ Could not list LDAP providers ({str(e)[:60]}) — falling back to slug 'ldap'")
+        ldap_app_pks = {a.get('pk') for a in all_apps
+                        if (a.get('provider') and a.get('provider') in ldap_provider_pks)
+                        or (not ldap_provider_pks and a.get('slug') == 'ldap')}
 
         ok = True
         for app in all_apps:
+            if app.get('pk') not in ldap_app_pks:
+                continue
+            app_name = app.get('name', '')
+            for b in _api_get(f'policies/bindings/?target={app["pk"]}&page_size=100')['results']:
+                bname = (b.get('policy_obj', {}) or {}).get('name')
+                if bname not in (policy_name, W1_MFA_POLICY_NAME):
+                    continue
+                try:
+                    _api_delete(f'policies/bindings/{b["pk"]}/')
+                    _log(f"  ✓ {app_name}: removed {bname!r} — LDAP bind path must stay open "
+                         f"(EUD enrollment / ATAK-iTAK auth)")
+                except Exception as e:
+                    ok = False
+                    _log(f"  ✗ {app_name}: could NOT remove {bname!r} ({str(e)[:60]}) — "
+                         f"EUD enrollment may fail for users without MFA")
+
+        for app in all_apps:
             app_slug = app.get('slug', '')
             app_pk = app.get('pk', '')
             app_name = app.get('name', '')
 
-            if app_slug in user_visible_slugs:
+            # LDAP apps are matched by provider (above), so keep them out of default-deny
+            # even when the slug is not the literal 'ldap'.
+            if app_slug in user_visible_slugs or app_pk in ldap_app_pks:
                 _log(f"  ✓ {app_name}: open to all authenticated users (no restrictive binding)")
                 continue
 
