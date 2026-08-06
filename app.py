@@ -36302,9 +36302,33 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         else:
             _log(f"  ✓ Policy exists: {policy_name}")
 
-        # 3) Admin-only apps: bind the admin policy (infra-TAK, Node-RED, NetBird, Remote Assist). LDAP must be open to all authenticated users (QR registration, device bind). TAK Portal and MediaMTX: no binding = all authenticated users.
-        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird', REMOTE_ASSIST_OIDC_SLUG]
-        user_visible_slugs = ['mediamtx', 'stream', 'tak-portal', 'ldap']  # no policy = visible to all authenticated users (LDAP needed for QR registration)
+        # 3) DEFAULT-DENY. The access model (operator, 2026-08-06):
+        #      global admin (`authentik Admins`)  -> every application
+        #      agency admin / regular user        -> TAK Portal + Stream ONLY
+        #                                            (Stream's regular-user view = the
+        #                                             active-streams page; MediaMTX then
+        #                                             scopes by vid_* LDAP group)
+        # So the allowlist below is the COMPLETE set of applications a non-global-admin may
+        # see, and everything else gets the admin policy — including any app slug this code
+        # has never heard of.
+        #
+        # It is default-DENY on purpose. The old code bound the policy only to a hardcoded
+        # admin_only_slugs list, so every module added later (webodm, webodm-oidc, fedhub,
+        # tak-video-restreamer) landed in NEITHER list and was therefore visible to every
+        # authenticated user. Enumerating what must be locked down is a losing game; the
+        # user-visible set is small, stable, and reviewable. A new user-facing module must be
+        # added to the allowlist explicitly — the default-deny log line below makes that
+        # obvious the first time it fires.
+        #
+        # LDAP MUST stay open: QR registration and EUD device bind authenticate non-admin
+        # users against it (see the removal loop below, and HANDOFF-LDAP-AUTHENTIK).
+        user_visible_slugs = ['tak-portal', 'stream', 'mediamtx', 'ldap']
+        # Known admin-only slugs — kept only so the log says "restricted" rather than
+        # "default-deny" for the ones we ship deliberately. Not a gate: the gate is the
+        # allowlist above.
+        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird',
+                            'webodm', 'webodm-oidc', 'fedhub', 'federation-hub',
+                            'tak-video-restreamer', REMOTE_ASSIST_OIDC_SLUG]
 
         # superuser_full_list=true is MANDATORY here, not a nicety. Authentik's
         # ApplicationViewSet.list() runs the POLICY ENGINE against the REQUESTING user and
@@ -36390,20 +36414,25 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
             app_pk = app.get('pk', '')
             app_name = app.get('name', '')
 
-            if app_slug in admin_only_slugs:
-                res = _bind_policy_to_app(app_pk, app_name, policy_pk, policy_name)
-                if res == 'bound':
-                    _log(f"  ✓ {app_name}: restricted to authentik Admins")
-                elif res == 'already':
-                    _log(f"  ✓ {app_name}: already restricted to authentik Admins")
-                else:
-                    ok = False
-                    _log(f"  ✗ {app_name}: NOT restricted — still visible to all "
-                         f"authenticated users (incl. TAK Portal agency admins). Re-run "
-                         f"Authentik → Reconfigure, or bind 'Allow authentik Admins' by hand.")
-
-            elif app_slug in user_visible_slugs:
+            if app_slug in user_visible_slugs:
                 _log(f"  ✓ {app_name}: open to all authenticated users (no restrictive binding)")
+                continue
+
+            # Everything else is admin-only, whether or not we recognise the slug.
+            res = _bind_policy_to_app(app_pk, app_name, policy_pk, policy_name)
+            known = app_slug in admin_only_slugs
+            if res == 'bound':
+                _log(f"  ✓ {app_name}: restricted to authentik Admins"
+                     + ('' if known else f" (default-deny — slug {app_slug!r} is not on the "
+                                         f"user-visible allowlist; add it there if regular "
+                                         f"users are meant to see this app)"))
+            elif res == 'already':
+                _log(f"  ✓ {app_name}: already restricted to authentik Admins")
+            else:
+                ok = False
+                _log(f"  ✗ {app_name}: NOT restricted — still visible to all "
+                     f"authenticated users (incl. TAK Portal agency admins). Re-run "
+                     f"Authentik → Reconfigure, or bind 'Allow authentik Admins' by hand.")
 
         return ok
 
