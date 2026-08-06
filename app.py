@@ -14725,6 +14725,65 @@ def _f2b_selfheal_authentik_log_level(plog=None):
     return True
 
 
+# Hard ceiling for /var/log/authentik/auth.log. Same number as the `maxsize 50M` in
+# the logrotate rule below, so both mechanisms converge on the same operational state.
+_F2B_AK_LOG_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _f2b_bound_ak_logfile(plog=None):
+    """Cap auth.log from the console, because logrotate CANNOT be installed on a
+    non-root box — and never has been.
+
+    `_f2b_ensure_authentik_logrotate()` writes /etc/logrotate.d/infratak-authentik.
+    That prefix is not on the broker's allow-list, so on every non-root box the write is
+    denied and the rule has simply never existed. Measured 2026-08-06: test6 (non-root)
+    sat at 25 MB with no rotation of any kind, and nuc logs the denial at every boot —
+    `broker write denied (/etc/logrotate.d/infratak-authentik): path not in allow-list`.
+    The v10.1.11 release believed it had fitted a drain before turning up the tap; on
+    the non-root half of the fleet it had not.
+
+    **Widening the broker is NOT the fix.** logrotate executes `prerotate`/`postrotate`
+    blocks as root, so write access to /etc/logrotate.d/ is a console->root escalation
+    primitive — precisely what the broker exists to prevent. Same reasoning that kept
+    /etc/tmpfiles.d/ off the list. The ceiling is enforced here instead, using verbs the
+    console already holds. Mechanism differs by box; the outcome does not — a root box
+    rotates and keeps 7 days, a non-root box hard-truncates at the same 50 MB, and
+    neither can grow without bound.
+
+    TRUNCATION, not deletion or rename, is required. The forwarder is a long-lived
+    `docker logs -f ... >> auth.log` holding an open append fd. Every write path here
+    opens O_TRUNC on the SAME inode — broker `_do_write()`, root `open(path,'w')`,
+    legacy `sudo tee` — so the fd stays valid and the forwarder keeps appending at the
+    new EOF. Rename-and-create would leave it writing to an unlinked inode forever and
+    the jail would starve silently, which is the failure the logrotate rule's
+    `copytruncate` was chosen to avoid. Nothing of value is lost: this file is the
+    jail's private feed and `docker logs` still holds the complete stream.
+
+    (`truncate -s 0` is deliberately not used — that binary is not on the broker's exec
+    allow-list, which is also why the existing call in `_f2b_selfheal_ak_forwarder()` is
+    a silent no-op on non-root boxes.)"""
+    _log = plog or (lambda m: None)
+    path = '/var/log/authentik/auth.log'
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size <= _F2B_AK_LOG_MAX_BYTES:
+        return False
+    try:
+        _write_priv(path, '', perm=0o640)
+    except Exception as e:
+        _log('fail2ban: could not cap %s (non-fatal): %s' % (path, e))
+        return False
+    _log('fail2ban: %s had grown to %.1f MB unrotated, so the console truncated it in '
+         'place (same inode — the forwarder keeps appending, the jail reads from the new '
+         'EOF, and the full stream is still in `docker logs`). logrotate cannot be '
+         'installed on this box: /etc/logrotate.d/ is off the broker allow-list by '
+         'design, because logrotate runs postrotate scripts as root.'
+         % (path, size / 1048576.0))
+    return True
+
+
 def _f2b_ensure_authentik_logrotate(plog=None):
     """Bound /var/log/authentik/auth.log. It has NEVER been rotated.
 
@@ -14768,7 +14827,12 @@ def _f2b_ensure_authentik_logrotate(plog=None):
              'rotation at all and was growing without bound.')
         return True
     except Exception as e:
-        _log(f'fail2ban: could not write the Authentik logrotate rule (non-fatal): {e}')
+        # Expected on every non-root box: /etc/logrotate.d/ is off the broker allow-list
+        # by design (postrotate runs as root). _f2b_bound_ak_logfile() enforces the same
+        # 50 MB ceiling from the console, so the log is still bounded.
+        _log('fail2ban: logrotate rule not installed (%s). Expected on a non-root box — '
+             'the console enforces the same %d MB ceiling directly instead.'
+             % (str(e)[:120], _F2B_AK_LOG_MAX_BYTES // (1024 * 1024)))
         return False
 
 
@@ -64208,6 +64272,15 @@ def _startup_migrations():
             _f2b_ensure_authentik_logrotate(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e8:
             print(f"Startup migration: Authentik logrotate error (non-fatal): {_f2b_e8}", flush=True)
+        # v10.1.26 — the drain the logrotate rule was supposed to be. That rule has NEVER
+        # installed on a non-root box (/etc/logrotate.d/ is off the broker allow-list, and
+        # widening it would hand the console root via postrotate), so auth.log grew
+        # unbounded there — 25 MB on test6, measured 2026-08-06. Enforce the same ceiling
+        # from here, on every box, with verbs the console already has.
+        try:
+            _f2b_bound_ak_logfile(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e8b:
+            print(f"Startup migration: Authentik log cap error (non-fatal): {_f2b_e8b}", flush=True)
         try:
             _f2b_selfheal_authentik_log_level(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e9:
