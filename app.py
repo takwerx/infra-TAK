@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.25-alpha"
+VERSION = "10.1.26-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -33931,6 +33931,16 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             # 5) Add to embedded outpost
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
             _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'node-red', plog=log)
+            # 6) Restrict to authentik Admins — MUST run here, not only in the
+            # Authentik deploy/reconfigure paths. Fleet deploy order is
+            # Caddy → Authentik → … → Node-RED, so at Authentik-deploy time
+            # `_is_module_deployed(settings,'nodered')` is False and the app does
+            # not exist yet; the Node-RED deploy then created it with NO policy
+            # binding, which in Authentik means "visible to every authenticated
+            # user". TAK Portal AGENCY admins (members of
+            # `authentik-<ABBR>-AgencyAdmin`, not `authentik Admins`) therefore
+            # saw the Node-RED tile — only GLOBAL admins should. Idempotent.
+            _ensure_app_access_policies(_ak_url, _ak_headers, plog=log)
         else:
             log("  ⚠ Could not create or find Node-RED proxy provider")
     except Exception as e:
@@ -36299,6 +36309,9 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         all_apps = _api_get('core/applications/?page_size=100')['results']
 
         def _bind_policy_to_app(app_pk, app_name, pol_pk, pol_name):
+            """Returns 'already' | 'bound' | 'FAILED'. A failed bind must never be
+            reported as 'already restricted' — this is an access control, and a silent
+            failure here is what let unbound admin-only apps stay world-visible."""
             bindings = _api_get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
             already = any(
                 str(b.get('policy')) == str(pol_pk) or
@@ -36306,17 +36319,16 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
                 for b in bindings
             )
             if already:
-                return False
+                return 'already'
             try:
                 _api_post('policies/bindings/', {
                     'target': app_pk, 'policy': pol_pk,
                     'order': 0, 'negate': False, 'enabled': True, 'timeout': 30,
                 })
-                return True
+                return 'bound'
             except urllib.error.HTTPError as e:
-                if e.code != 400:
-                    _log(f"  ⚠ {app_name}: binding error: {e}")
-                return False
+                _log(f"  ⚠ {app_name}: binding error: {e.code} {e.reason}")
+                return 'FAILED'
 
         # Remove "Allow MediaMTX users" binding from stream/mediamtx if present (so they become visible to all authenticated users)
         mtx_policy_name = 'Allow MediaMTX users'
@@ -36352,21 +36364,28 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
                         pass
                     break
 
+        ok = True
         for app in all_apps:
             app_slug = app.get('slug', '')
             app_pk = app.get('pk', '')
             app_name = app.get('name', '')
 
             if app_slug in admin_only_slugs:
-                if _bind_policy_to_app(app_pk, app_name, policy_pk, policy_name):
+                res = _bind_policy_to_app(app_pk, app_name, policy_pk, policy_name)
+                if res == 'bound':
                     _log(f"  ✓ {app_name}: restricted to authentik Admins")
-                else:
+                elif res == 'already':
                     _log(f"  ✓ {app_name}: already restricted to authentik Admins")
+                else:
+                    ok = False
+                    _log(f"  ✗ {app_name}: NOT restricted — still visible to all "
+                         f"authenticated users (incl. TAK Portal agency admins). Re-run "
+                         f"Authentik → Reconfigure, or bind 'Allow authentik Admins' by hand.")
 
             elif app_slug in user_visible_slugs:
                 _log(f"  ✓ {app_name}: open to all authenticated users (no restrictive binding)")
 
-        return True
+        return ok
 
     except urllib.error.HTTPError as e:
         _log_http_err(e)
@@ -62964,6 +62983,59 @@ def _startup_authentik_idle_load_converge(log=None):
 
 threading.Thread(target=_startup_authentik_idle_load_converge, daemon=True,
                  name='startup-ak-idle-load-converge').start()
+
+
+def _startup_app_access_policy_converge(log=None):
+    """Re-assert the application access policies (`Allow authentik Admins` bound to
+    every admin-only app) at every boot, so a console update heals field boxes.
+
+    Why this needs a boot converge rather than living only in the deploy paths:
+    `_ensure_app_access_policies()` used to run only from the Authentik
+    deploy/reconfigure paths, the NetBird install, the Remote Assist OIDC setup and
+    the LDAP fix button. The fleet deploy order is Caddy → Authentik → … → Node-RED,
+    so at Authentik-deploy time Node-RED is not installed and its Authentik
+    application does not exist; the later Node-RED deploy created the app with NO
+    policy binding, and in Authentik an unbound application is visible to EVERY
+    authenticated user. TAK Portal AGENCY admins (membership in
+    `authentik-<ABBR>-AgencyAdmin`, per the portal's access.service.js) therefore saw
+    the Node-RED tile even though only GLOBAL admins (`authentik Admins`, the
+    portal's PORTAL_AUTH_REQUIRED_GROUP) should. Existing boxes cannot be told to
+    "redeploy Node-RED", so the heal has to ride the console update.
+
+    Runs in a daemon thread; bounded wait on the Authentik API; idempotent; never
+    raises. Silent no-op when Authentik/forward-auth is not configured."""
+    def _l(m):
+        line = f'App access policy converge: {m}'
+        if log:
+            log(f'  {line}')
+        print(line, flush=True)
+
+    try:
+        # Don't race the synchronous startup migrations (or an Authentik recreate).
+        if not _STARTUP_IMPORT_DONE.wait(timeout=1200):
+            _l('startup import still not done after 20 min — proceeding anyway (backstop)')
+        settings = load_settings()
+        if not (settings.get('fqdn') or '').strip():
+            return  # no forward auth → no proxy apps to police
+        ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                    or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        if not ak_token:
+            return  # Authentik absent / token unreadable — silent skip
+        ak_url = _get_authentik_api_url(settings)
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        if not _wait_for_authentik_api(ak_url, ak_headers, max_attempts=90):
+            _l('Authentik API not ready — retries on next restart/deploy')
+            return
+        _ensure_app_access_policies(ak_url, ak_headers, plog=_l)
+    except Exception as _e:
+        try:
+            _l(f'error (non-fatal): {str(_e)[:200]}')
+        except Exception:
+            pass
+
+
+threading.Thread(target=_startup_app_access_policy_converge, daemon=True,
+                 name='startup-app-access-policy-converge').start()
 
 
 def _fail2ban_install_and_configure(plog):
