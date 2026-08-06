@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.25-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.25-alpha)**
+**Current release: [v10.1.26-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.26-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -341,6 +341,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.26-alpha — 2026-08-06 — Apps are admin-only by default; one missing log file no longer stops all of Fail2Ban
+
+**Headline: two security fixes you cannot see from the outside — a set of admin tools that were visible to ordinary users, and a brute-force protection service that could silently be switched off entirely.** First, **applications in the Authentik portal are now admin-only by default.** Agency admins and regular users were seeing tiles they should never have had — Node-RED most visibly, but also WebODM, Federation Hub and TAK Video Restreamer where installed. The cause was two-fold: the console was reading the application list through a filter that hid most applications from it, so its own attempt to lock them down quietly did nothing; and any module added after the original allow-list was written landed in neither list and inherited no restriction at all. Both are fixed, and the logic is inverted — a short list of applications is user-visible (TAK Portal, Stream, MediaMTX) and **everything else, including modules that do not exist yet, is restricted to global admins automatically.** Related: **new users can enroll their devices again on servers where that had broken.** The LDAP application that EUDs authenticate through had, on some servers, picked up a stale multi-factor requirement it was always meant to be exempt from — so a brand-new user could not reach the login path they needed *in order to* set up their second factor. That binding is now removed automatically wherever it drifted in. Second, **Fail2Ban can no longer be taken down by a single missing log file.** If the Authentik log file was absent — which happened whenever Fail2Ban was set up before Authentik was running — the service refused to start *at all*, taking every jail with it, including SSH brute-force protection. Worse, it stayed hidden until the next reboot or package upgrade, and then no amount of restarting would bring it back. The console now guarantees that file exists, and enforces a broader rule: if any jail points at a log that is missing, only **that** jail is set aside and the rest keep protecting the box — and a service left dead by this is brought back automatically. It also caps the Authentik log, which on some installations had never been rotated and was growing without limit. **Who should update:** everyone. Anyone whose Fail2Ban is currently stopped and will not start is fixed by this release with no manual steps. Anyone running TAK Portal with agency admins should update promptly. **Upgrade:** automatic on the next console update — no SSH, no commands, no service reconfiguration.
+
+Full notes: [v10.1.26-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.26-alpha).
 
 ### v10.1.25-alpha — 2026-08-06 — Node-RED feeds survive anything; multi-state TFR fixed; CloudTAK cert password shown
 
