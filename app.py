@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.24-alpha"
+VERSION = "10.1.25-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -28726,6 +28726,7 @@ def cloudtak_generate_bootstrap_cert_api():
             'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': True,
             'created': 'P12_EXISTS' not in out,
             'admin_flip_ok': 'CERTMOD_OK' in out,
+            'cert_password': _get_tak_cert_password(settings),
             'download_url': '/api/cloudtak/bootstrap-cert/download',
             'note': ('' if 'CERTMOD_OK' in out else
                      'Cert exists but the ROLE_ADMIN flip (certmod -A) failed on the remote core — '
@@ -28776,6 +28777,7 @@ def cloudtak_generate_bootstrap_cert_api():
             'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': False,
             'created': created,
             'admin_flip_ok': bool(certmod_ok and uaf_has_entry),
+            'cert_password': _get_tak_cert_password(settings),
             'download_url': '/api/cloudtak/bootstrap-cert/download',
             'note': note,
         })
@@ -36703,12 +36705,22 @@ volumes:
         _deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
         if os.path.isfile(_deploy_sh):
             try:
+                # v10.1.25 W3: hand deploy.sh the known TAK cert password + box IP so it
+                # can self-seed the CoT connector's tls_tak passphrase and serverUrl
+                # (only-when-empty) — zero manual re-entry after a volume-wipe redeploy.
+                _nr_env = dict(os.environ)
+                try:
+                    _nr_env['NR_TAK_CERT_PASS'] = _get_tak_cert_password(settings)
+                    _nr_env['NR_TAK_SERVER_IP'] = str(settings.get('server_ip') or '').strip()
+                except Exception:
+                    pass
                 r_nr = subprocess.run(
                     ['bash', _deploy_sh, '--no-pull'],
                     cwd=BASE_DIR,
                     capture_output=True,
                     text=True,
                     timeout=240,
+                    env=_nr_env,
                 )
                 for line in (r_nr.stdout or '').splitlines():
                     plog(f"  {line}")
@@ -37298,12 +37310,12 @@ window.ctGenBootstrapCert = function(btn) {
       return;
     }
     var html = '<div style="color:var(--green);font-weight:600">✓ ' + esc(d.cn) + '.p12 ' + (d.created ? 'generated' : 'already exists') +
-               (d.admin_flip_ok ? ' — ROLE_ADMIN applied (all channels via assignAdminAllGroups)' : '') + '</div>';
+               (d.admin_flip_ok ? ' — ROLE_ADMIN applied (admin cert: bypasses channel selection, resolves every group incl. future channels)' : '') + '</div>';
     if (!d.admin_flip_ok) {
       html += '<div style="color:var(--yellow);margin-top:6px">⚠ ' + esc(d.note || 'ROLE_ADMIN flip did not verify.') + '</div>';
     }
     html += '<div style="margin-top:8px"><a href="' + d.download_url + '" style="color:var(--cyan);font-weight:600">⬇ Download ' + d.cn + '.p12</a>' +
-            ' <span style="color:var(--text-dim);font-size:12px;margin-left:10px">certificate password: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">{{ cloudtak_cert_password }}</code></span></div>';
+            ' <span style="color:var(--text-dim);font-size:12px;margin-left:10px">certificate password: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">' + esc(d.cert_password) + '</code></span></div>';
     out.innerHTML = html;
   }).catch(function(e) {
     btn.disabled = false; btn.textContent = orig;
@@ -66171,9 +66183,18 @@ def _post_update_auto_deploy():
                     return
                 try:
                     print("Post-update: syncing infra-TAK flows into Node-RED (merge)")
+                    # v10.1.25 W3: same self-seed env as run_nodered_deploy — this is the
+                    # fleet-wide path (post-update auto-sync redeploys flows on EVERY update).
+                    _nr_env = dict(os.environ)
+                    try:
+                        _nr_settings = load_settings()
+                        _nr_env['NR_TAK_CERT_PASS'] = _get_tak_cert_password(_nr_settings)
+                        _nr_env['NR_TAK_SERVER_IP'] = str(_nr_settings.get('server_ip') or '').strip()
+                    except Exception:
+                        pass
                     result = subprocess.run(f'bash {shlex.quote(deploy_sh)} --no-pull',
                         shell=True, capture_output=True, text=True, timeout=180,
-                        cwd=BASE_DIR)
+                        cwd=BASE_DIR, env=_nr_env)
                     for line in (result.stdout or '').strip().splitlines():
                         print(f"  nodered-deploy: {line}")
                     if result.returncode == 0:

@@ -709,6 +709,54 @@ for _NR_CERT in "$CERT_HOST_DIR/nodered.pem" "$CERT_HOST_DIR/nodered.key"; do
   fi
 done
 
+# ── Seed tak_settings.serverUrl when ABSENT (v10.1.25 W3) ────────────────────
+# After a volume-wipe redeploy the CoT connector's host comes back empty, and an
+# fqdn default breaks when DNS doesn't resolve from inside the container — the
+# operator had to type the box IP by hand (Charles/NC 2026-08-05). When TAK
+# Server is local (host certs present) and the console passed its server_ip
+# (NR_TAK_SERVER_IP env), seed serverUrl into the restored context ONLY if it is
+# absent/empty. A present value — operator-set or restored — is never touched.
+# Runs after the safety gate + union, before the context is written/pushed, so
+# both the global.json file copy and the API restore carry the seed.
+if [ -n "${NR_TAK_SERVER_IP:-}" ] && { [ -f "$CERT_HOST_DIR/admin.pem" ] || [ -f "$CERT_HOST_DIR/nodered.pem" ]; }; then
+  if [ ! -f "$NR_CTX_GLOBAL" ]; then
+    echo '{}' > "$NR_CTX_GLOBAL"
+  fi
+  python3 - "$NR_CTX_GLOBAL" "$NR_TAK_SERVER_IP" <<'PYEOF' || echo "    serverUrl seed: FAILED (non-fatal)"
+import json, sys
+f, ip = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(f))
+    if not isinstance(d, dict): d = {}
+except Exception:
+    d = {}
+tgt = d['default'] if isinstance(d.get('default'), dict) else d
+def uw(v):
+    if isinstance(v, dict) and 'msg' in v:
+        m = v['msg']
+        if isinstance(m, str):
+            try: return json.loads(m)
+            except Exception: return m
+        return m
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except Exception: return v
+    return v
+ts = uw(tgt.get('tak_settings'))
+if not isinstance(ts, dict): ts = {}
+cur = ts.get('serverUrl')
+if isinstance(cur, str) and cur.strip():
+    print('    serverUrl seed: present (%s) - untouched' % cur.strip())
+else:
+    ts['serverUrl'] = ip
+    tgt['tak_settings'] = ts
+    json.dump(d, open(f, 'w'))
+    print('    serverUrl seed: tak_settings.serverUrl <- %s (was absent)' % ip)
+PYEOF
+elif [ -z "${NR_TAK_SERVER_IP:-}" ]; then
+  echo "    serverUrl seed skipped: NR_TAK_SERVER_IP not in env (manual run?)"
+fi
+
 # ── Patch settings.js on the HOST before the stop/start cycle ────────────────
 # settings.js is volume-mounted into the container at /data/settings.js.  We patch
 # the host file (no docker exec needed) so Node-RED reads contextStorage:localfilesystem
@@ -876,6 +924,89 @@ if [ -f "/tmp/flows_cred_backup.json" ]; then
   _cp_into "/tmp/flows_cred_backup.json" /data/flows_cred.json
   echo "    Credentials: restored"
 fi
+
+# ── Seed the tls_tak key passphrase when MISSING (v10.1.25 W3) ────────────────
+# A module uninstall -> redeploy (compose down -v) destroys flows_cred.json AND
+# the _credentialSecret in .config.runtime.json — every node credential silently
+# dies; the context restore brings configs back but credentials are NOT context
+# (Charles/NC 2026-08-05: had to re-enter the cert password by hand). When TAK
+# Server is local and the console passed the known cert password
+# (NR_TAK_CERT_PASS env, ground-truthed by _get_tak_cert_password), seed the
+# tls_tak passphrase into flows_cred.json ONLY when it has no passphrase —
+# operator-set custom passphrases are never overwritten. Password travels via
+# stdin (never on a command line). Runs before the restart so Node-RED loads it.
+if [ -n "${NR_TAK_CERT_PASS:-}" ] && { [ -f "$CERT_HOST_DIR/admin.key" ] || [ -f "$CERT_HOST_DIR/nodered.key" ]; }; then
+  cat > /tmp/_nr_seed_cred.js <<'JSEOF'
+var fs = require('fs');
+var crypto = require('crypto');
+var pw = '';
+process.stdin.on('data', function(c){ pw += c; });
+process.stdin.on('end', function(){
+  pw = pw.replace(/\r?\n+$/, '');
+  if (!pw) { console.log('tls_tak passphrase seed skipped: empty password on stdin'); return; }
+  var CRED = '/data/flows_cred.json';
+  var RUNTIME = '/data/.config.runtime.json';
+  // Secret resolution mirrors Node-RED: settings credentialSecret (env
+  // NR_CREDENTIAL_SECRET via settings.js) wins, else _credentialSecret from
+  // .config.runtime.json, else generate one and persist it for Node-RED to adopt.
+  var secret = process.env.NR_CREDENTIAL_SECRET || null;
+  var runtime = {};
+  try { runtime = JSON.parse(fs.readFileSync(RUNTIME, 'utf8')) || {}; } catch(e) {}
+  if (!secret) secret = runtime._credentialSecret || null;
+  var generated = false;
+  if (!secret) {
+    secret = crypto.randomBytes(32).toString('hex');
+    runtime._credentialSecret = secret;
+    try { fs.unlinkSync(RUNTIME); } catch(e) {}
+    fs.writeFileSync(RUNTIME, JSON.stringify(runtime));
+    generated = true;
+  }
+  var key = crypto.createHash('sha256').update(secret).digest();
+  var raw = null;
+  try { raw = JSON.parse(fs.readFileSync(CRED, 'utf8')); } catch(e) { raw = null; }
+  var creds = {};
+  var undecryptable = false;
+  var plaintext = false;
+  if (raw && typeof raw === 'object') {
+    if (typeof raw['$'] === 'string') {
+      // aes-256-ctr, key=sha256(secret), iv=first 32 hex chars — Node-RED's own format
+      try {
+        var iv = Buffer.from(raw['$'].substring(0, 32), 'hex');
+        var dec = crypto.createDecipheriv('aes-256-ctr', key, iv);
+        creds = JSON.parse(dec.update(raw['$'].substring(32), 'base64', 'utf8') + dec.final('utf8'));
+      } catch(e) { undecryptable = true; creds = {}; }
+    } else {
+      plaintext = true;
+      creds = raw;
+    }
+  }
+  var existing = (creds && creds.tls_tak) || {};
+  if (existing.passphrase) { console.log('tls_tak passphrase: present - untouched (only-when-empty)'); return; }
+  creds.tls_tak = Object.assign({}, existing, { passphrase: pw });
+  var out;
+  if (plaintext && !undecryptable) {
+    out = creds;  // keep the unencrypted format this box already uses
+  } else {
+    var iv2 = crypto.randomBytes(16);
+    var enc = crypto.createCipheriv('aes-256-ctr', key, iv2);
+    out = { '$': iv2.toString('hex') + enc.update(JSON.stringify(creds), 'utf8', 'base64') + enc.final('base64') };
+  }
+  try { fs.unlinkSync(CRED); } catch(e) {}  // prior docker cp may have left it root-owned
+  fs.writeFileSync(CRED, JSON.stringify(out));
+  console.log('tls_tak passphrase: SEEDED from console settings' +
+    (generated ? ' (new credential secret persisted)' : '') +
+    (undecryptable ? ' (old flows_cred.json undecryptable with current secret - re-created; its credentials were already unrecoverable)' : ''));
+});
+JSEOF
+  _cp_into /tmp/_nr_seed_cred.js /tmp/_nr_seed_cred.js
+  printf '%s' "$NR_TAK_CERT_PASS" | docker exec -i "$CONTAINER" node /tmp/_nr_seed_cred.js 2>&1 | sed 's/^/    /' \
+    || echo "    tls_tak passphrase seed FAILED (non-fatal — credential can be entered in the Configurator)"
+  docker exec "$CONTAINER" rm -f /tmp/_nr_seed_cred.js 2>/dev/null || true
+  rm -f /tmp/_nr_seed_cred.js
+elif [ -z "${NR_TAK_CERT_PASS:-}" ]; then
+  echo "    tls_tak passphrase seed skipped: NR_TAK_CERT_PASS not in env (manual run?)"
+fi
+
 rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json
 
 docker restart -t 30 "$CONTAINER"
@@ -915,33 +1046,7 @@ if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
   if echo "$_RESTORE_RESP" | grep -q '"ok":true'; then
     _KEYS=$(echo "$_RESTORE_RESP" | grep -o '"restored":\[[^]]*\]' || echo "")
     echo "    Context restored via API ✓  $_KEYS"
-    # Also write /data/config-backups/latest.json so Emergency Restore has an entry
-    docker exec "$CONTAINER" sh -c '
-      mkdir -p /data/config-backups
-      node -e "
-        var g=global;
-        var fs=require(\"fs\");
-        var http=require(\"http\");
-        http.get(\"http://localhost:1880/context/global\",function(r){
-          var b=\"\";r.on(\"data\",function(c){b+=c;});
-          r.on(\"end\",function(){
-            try{
-              var d=JSON.parse(b);
-              if(d.default)d=d.default;
-              function uw(v){if(v&&typeof v===\"object\"&&!Array.isArray(v)&&\"msg\"in v){var i=v.msg;if(typeof i===\"string\"){try{return JSON.parse(i);}catch(e){return i;}}return i;}if(typeof v===\"string\"){try{return JSON.parse(v);}catch(e){return v;}}return v;}
-              var snap={timestamp:new Date().toISOString(),
-                arcgis_configs:uw(d.arcgis_configs)||[],
-                tc_configs:uw(d.tc_configs)||[],
-                tak_settings:uw(d.tak_settings)||{},
-                ipaws_config:uw(d.ipaws_config)||{},
-                pp_configs:uw(d.pp_configs)||[]};
-              fs.writeFileSync(\"/data/config-backups/latest.json\",JSON.stringify(snap,null,2));
-              console.log(\"    Backup: wrote /data/config-backups/latest.json\");
-            }catch(e){console.log(\"    Backup write failed: \"+e.message);}
-          });
-        });
-      " 2>/dev/null || true
-    ' 2>/dev/null || true
+    # latest.json snapshot moved OUT of this branch (v10.1.25 W2) — see below.
   else
     echo "    WARNING: API restore returned: $_RESTORE_RESP"
     echo "    Context may still be loaded from the file written above — check the UI."
@@ -950,6 +1055,84 @@ elif [ "$NR_READY" = "false" ]; then
   echo "    WARNING: Node-RED did not become ready within 30s — skipping API restore"
   echo "    Config file was already written to /data/context/global/global.json"
 fi
+
+# ── Unconditional latest.json snapshot (v10.1.25 W2) ──────────────────────────
+# The old write lived inside the API-restore "ok":true branch only, so deploys
+# taking any other path never wrote it — boxes with no Configurator saves had an
+# EMPTY /data/config-backups (test12: empty since Apr 24 while deploys ran
+# green) → Emergency Restore had no entry and the next deploy's union lost an
+# input. Now it runs at the end of EVERY deploy that reached a ready container,
+# reading LIVE post-restore context (delete-authoritative), with NEVER-SHRINK:
+# if the new snapshot has fewer configs in any of arcgis/tc/pp than the existing
+# latest.json, union by configName instead of overwrite (v0.9.50 rules — this
+# never resurrects a delete, because saves AND deletes rewrite latest.json
+# synchronously via CFG_BACKUP_SNIPPET). Every outcome is logged — silence was
+# the bug. Shape stays identical to CFG_BACKUP_SNIPPET's write.
+if [ "$NR_READY" = "true" ]; then
+  cat > /tmp/_nr_write_latest.js <<'JSEOF'
+var fs = require('fs');
+var http = require('http');
+var KEYS = ['arcgis_configs', 'tc_configs', 'pp_configs'];
+function uw(v){ if (v && typeof v === 'object' && !Array.isArray(v) && ('msg' in v)) { var m = v.msg; if (typeof m === 'string') { try { return JSON.parse(m); } catch(e) { return m; } } return m; } if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }
+http.get('http://localhost:1880/context/global', function(r){
+  var b = ''; r.on('data', function(c){ b += c; });
+  r.on('end', function(){
+    try {
+      var d = JSON.parse(b);
+      if (d.default) d = d.default;
+      var snap = {
+        timestamp: new Date().toISOString(),
+        arcgis_configs: uw(d.arcgis_configs) || [],
+        tc_configs:     uw(d.tc_configs)     || [],
+        tak_settings:   uw(d.tak_settings)   || {},
+        ipaws_config:   uw(d.ipaws_config)   || {},
+        pp_configs:     uw(d.pp_configs)     || []
+      };
+      KEYS.forEach(function(k){ if (!Array.isArray(snap[k])) snap[k] = []; });
+      if (typeof snap.tak_settings !== 'object' || Array.isArray(snap.tak_settings) || !snap.tak_settings) snap.tak_settings = {};
+      if (typeof snap.ipaws_config !== 'object' || Array.isArray(snap.ipaws_config) || !snap.ipaws_config) snap.ipaws_config = {};
+      var prev = null;
+      try { prev = JSON.parse(fs.readFileSync('/data/config-backups/latest.json', 'utf8')); } catch(e) { prev = null; }
+      var mode = 'overwrite';
+      if (prev && typeof prev === 'object') {
+        KEYS.forEach(function(k){
+          var oldL = Array.isArray(prev[k]) ? prev[k] : [];
+          if (snap[k].length < oldL.length) {
+            // NEVER-SHRINK: union by configName, live (new) wins on name conflict
+            var seen = {}; var out = [];
+            snap[k].concat(oldL).forEach(function(c){
+              var name = (c && typeof c === 'object') ? (c.configName || c.name) : null;
+              var kk = (name == null) ? ('__noname__' + out.length) : String(name);
+              if (seen[kk]) return;
+              seen[kk] = 1; out.push(c);
+            });
+            snap[k] = out;
+            mode = 'union(never-shrink)';
+          }
+        });
+        if (!Object.keys(snap.tak_settings).length && prev.tak_settings && Object.keys(prev.tak_settings).length) { snap.tak_settings = prev.tak_settings; mode = 'union(never-shrink)'; }
+        if (!Object.keys(snap.ipaws_config).length && prev.ipaws_config && Object.keys(prev.ipaws_config).length) { snap.ipaws_config = prev.ipaws_config; mode = 'union(never-shrink)'; }
+      }
+      fs.mkdirSync('/data/config-backups', { recursive: true });
+      try { fs.unlinkSync('/data/config-backups/latest.json'); } catch(e) {}
+      fs.writeFileSync('/data/config-backups/latest.json', JSON.stringify(snap, null, 2));
+      console.log('Backup: wrote /data/config-backups/latest.json [' + mode + '] arcgis=' +
+        snap.arcgis_configs.length + ' tc=' + snap.tc_configs.length + ' pp=' + snap.pp_configs.length);
+    } catch(e) {
+      console.log('Backup: latest.json write SKIPPED: ' + e.message);
+    }
+  });
+}).on('error', function(e){ console.log('Backup: latest.json write SKIPPED: context fetch failed: ' + e.message); });
+JSEOF
+  _cp_into /tmp/_nr_write_latest.js /tmp/_nr_write_latest.js
+  docker exec "$CONTAINER" node /tmp/_nr_write_latest.js 2>&1 | sed 's/^/    /' \
+    || echo "    Backup: latest.json write FAILED (non-fatal)"
+  docker exec "$CONTAINER" rm -f /tmp/_nr_write_latest.js 2>/dev/null || true
+  rm -f /tmp/_nr_write_latest.js
+else
+  echo "    Backup: latest.json write skipped: Node-RED not ready"
+fi
+
 # Always clean up host temp files
 rm -f "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
 
