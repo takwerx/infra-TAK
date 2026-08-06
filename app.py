@@ -36586,8 +36586,13 @@ def run_nodered_deploy():
         # When NR_ADMIN_USER + NR_ADMIN_PASSWORD_HASH are set in ~/node-red/.env, Node-RED requires
         # local credentials in addition to whatever Caddy is already enforcing. Default: off (Caddy only).
         # NR_CREDENTIAL_SECRET enables stable cred encryption; otherwise Node-RED auto-generates per restart.
-        with open(settings_js, 'w') as f:
-            f.write("""module.exports = (function () {
+        # v10.1.25 R3: written ONLY when missing — the wholesale rewrite on every module
+        # redeploy clobbered operator customizations (Josh/VA: custom contextStorage store).
+        # Existing files get required keys via the additive patchers (post-update
+        # _auto_nodered_settings + deploy.sh contextStorage/fs patch, canary-verified).
+        if not os.path.exists(settings_js):
+            with open(settings_js, 'w') as f:
+                f.write("""module.exports = (function () {
   var conf = {
     flowFile: 'flows.json',
     flowFilePretty: true,
