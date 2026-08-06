@@ -865,7 +865,10 @@
       </div>
     </div>
     <div class="field-grid" style="margin-top:0.75rem">
-      <div>
+      <!-- v10.1.25: stream-port override hidden (operator 2026-08-06) — a niche knob that
+           read as "choose streaming vs DataSync". Element stays in the DOM so save/restore
+           JS and existing configs with a saved cotStreamPort keep working unchanged. -->
+      <div style="display:none">
         <label for="tfrCotStreamPort">CoT TCP stream port <span style="color:#64748b;font-weight:400">(optional)</span></label>
         <input type="number" id="tfrCotStreamPort" min="1" max="65535" placeholder="leave blank = TAK Settings default">
         <div style="font-size:0.72rem;color:#64748b;margin-top:0.25rem">Discrete port for TFR CoT on TAK Server. Falls back to global streaming port if blank.</div>
