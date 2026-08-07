@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.26-alpha"
+VERSION = "10.1.27-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -7705,6 +7705,36 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     return True, log, db_password, tls_pem
 
 
+# ==========================================================================
+# v10.1.27 (item C) — ONE spelling of the PGDG apt source, product-wide
+# ==========================================================================
+# The two-server Server One path used to write
+#   /etc/apt/sources.list.d/postgresql.list  signed-by=/etc/apt/keyrings/postgresql.asc
+# while the single-box TAK deploy wrote
+#   /etc/apt/sources.list.d/pgdg.list        signed-by=/usr/share/keyrings/pgdg.asc
+# A box that was ever a Server One (or where the operator ran our runbook) then
+# BRICKED apt on a later single-box deploy: apt normalises the URL difference,
+# sees one repo configured two ways with different Signed-By values, and refuses
+# to read ANY source — every apt operation on the box fails, not just ours.
+# Same filename, same keyring, everywhere — and skip entirely when the box
+# already has PGDG configured by someone else.
+_PGDG_APT_HOST = 'apt.postgresql.org'
+_PGDG_LIST = '/etc/apt/sources.list.d/pgdg.list'
+_PGDG_KEYRING = '/usr/share/keyrings/pgdg.asc'
+_PGDG_KEY_URL = 'https://www.postgresql.org/media/keys/ACCC4CF8.asc'
+
+# Shell fragment for the REMOTE (Server One over SSH) path. Ends with '&& ' so it
+# drops into the existing && chains. Idempotent and conflict-aware.
+_PGDG_REMOTE_SETUP_SH = (
+    'sudo mkdir -p /usr/share/keyrings && '
+    f'if ! grep -rqs "{_PGDG_APT_HOST}" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then '
+    f'sudo curl -sL {_PGDG_KEY_URL} --output {_PGDG_KEYRING} && '
+    f'echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt $(lsb_release -cs)-pgdg main" '
+    f'| sudo tee {_PGDG_LIST} >/dev/null; '
+    'else echo "PGDG apt source already configured on this host - reusing it"; fi && '
+)
+
+
 def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     """Full Server One setup: optionally install DB .deb, configure PG for remote access, open UFW.
     Returns (ok, log_lines, db_password).
@@ -7761,10 +7791,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
             install_cmd = (
                 'cd /tmp && sudo apt-get update -qq && '
                 'sudo apt-get install -y lsb-release && '
-                'sudo mkdir -p /etc/apt/keyrings && '
-                'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
-                'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" '
-                '| sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
+                + _PGDG_REMOTE_SETUP_SH +
                 'sudo apt-get update -qq && '
                 f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{db_pkg_name}'
             )
@@ -7799,10 +7826,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
             pg_install = (
                 'sudo apt-get update -qq && '
                 'sudo apt-get install -y lsb-release && '
-                'sudo mkdir -p /etc/apt/keyrings && '
-                'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
-                'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" '
-                '| sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
+                + _PGDG_REMOTE_SETUP_SH +
                 'sudo apt-get update -qq && '
                 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-15 postgresql-15-postgis-3'
             )
@@ -8734,9 +8758,13 @@ def takserver_two_server_runbook():
     server_one_steps = [
         '# Server One: Database Server',
         'sudo apt-get update && sudo apt-get install -y lsb-release',
-        'sudo mkdir -p /etc/apt/keyrings',
-        'sudo curl https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc',
-        'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null',
+        # v10.1.27: same filename + keyring path the console itself uses, and skip
+        # if this box already has PGDG configured — two sources for one repo with
+        # different signed-by paths make apt refuse to read ANY source (exit 100).
+        f'grep -rqs "{_PGDG_APT_HOST}" /etc/apt/sources.list /etc/apt/sources.list.d/ && echo "PGDG already configured - skip the next two commands"',
+        'sudo mkdir -p /usr/share/keyrings',
+        f'sudo curl {_PGDG_KEY_URL} --output {_PGDG_KEYRING}',
+        f'echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee {_PGDG_LIST} >/dev/null',
         'sudo apt update',
         f'sudo apt install -y ./{db_pkg}' if db_pkg else 'sudo apt install -y ./takserver-database_x.x-RELEASExx_all.deb',
         # v0.9.12 hardening: source-scope only, deny everything else on db_port.
@@ -13337,6 +13365,14 @@ PORT_EXPOSURE_POLICY = [
     {'module': 'mediamtx',   'label': 'MediaMTX web-editor','port': 5080, 'tier': 3, 'why': 'Reached via Caddy 443'},
     {'module': 'remote_assist', 'label': 'CoTURN STUN/TURN', 'port': 3479, 'tier': 1, 'why': 'WebRTC NAT traversal — peers connect directly (public by design)'},
     {'module': 'guarddog',   'label': 'Guard Dog health agent', 'port': 8080, 'tier': 5, 'why': 'Reachable from console only (two-server)'},
+    # v10.1.27 — host ports the stack CLAIMS at deploy time but that the exposure
+    # auditor deliberately never rated. preflight_only=True keeps them out of
+    # _exposure_report() (the /firewall drift report stays byte-identical) while
+    # making them visible to _preflight_port_conflicts() below.
+    {'module': 'authentik',  'label': 'Authentik LDAP outpost',      'port': 389,  'tier': 3, 'preflight_only': True, 'why': 'Native TAK binds LDAP at 127.0.0.1:389'},
+    {'module': 'authentik',  'label': 'Authentik LDAPS outpost',     'port': 636,  'tier': 3, 'preflight_only': True, 'why': 'LDAPS side of the same outpost'},
+    {'module': 'caddy',      'label': 'Caddy admin API',             'port': 9997, 'tier': 3, 'preflight_only': True, 'why': 'Local admin/config socket (loopback)'},
+    {'module': 'takserver',  'label': 'PostgreSQL (TAK database)',   'port': 5432, 'tier': 3, 'preflight_only': True, 'why': 'TAK Server database'},
 ]
 
 # Every host port the stack may LEGITIMATELY open publicly — used only to decide
@@ -13527,6 +13563,8 @@ def _exposure_report(force=False):
     except Exception:
         coturn_port = 3478
     for ent in PORT_EXPOSURE_POLICY:
+        if ent.get('preflight_only'):
+            continue  # claimed at deploy time, not exposure-rated — see _preflight_port_conflicts()
         mod = ent['module']
         if mod is not None and mod not in installed:
             continue
@@ -13604,6 +13642,279 @@ def firewall_exposure_api():
 @login_required
 def firewall_exposure_summary_api():
     return jsonify(_exposure_report().get('summary', {'status': 'unknown', 'issue_count': 0, 'warn_count': 0}))
+
+
+# ==========================================================================
+# v10.1.27 — Pre-flight port-conflict detection
+# ==========================================================================
+# The table above is a POST-HOC auditor ("is anything we opened exposed too
+# widely?"). This section repoints the same data at the opposite question:
+# "is anything ALREADY holding what we are about to claim?"
+#
+# Field evidence 2026-08-06 (non-clean Ubuntu host): the box's own OpenLDAP
+# (slapd) already owned 127.0.0.1:389, so the Authentik LDAP outpost could
+# never bind. The operator got a raw docker "failed to bind host port …
+# address already in use", "Resync LDAP" hung forever waiting on an outpost
+# that would never answer, and the TAK deploy's LDAP sync quietly didn't
+# happen. Same class: Caddy would not start because a third party held :443,
+# and the console just showed "stopped".
+#
+# REPORT-ONLY by design: we name the port, the holder and its PID and refuse
+# our own deploy. We never stop, kill or reconfigure the operator's software.
+
+# module key -> (native process names, our container-name fragments) that
+# LEGITIMATELY hold the module's ports — a redeploy finds its own listener
+# there. The bias is deliberate: a missed conflict just reverts to today's
+# behaviour, a FALSE conflict would block a legitimate redeploy.
+# module key -> (native process names, our container-name fragments, our systemd
+# units) that LEGITIMATELY hold the module's ports — a redeploy finds its own
+# listener there. The bias is deliberate: a missed conflict just reverts to
+# today's behaviour, a FALSE conflict would block a legitimate redeploy.
+_PREFLIGHT_OWN = {
+    'caddy':         (('caddy',), ('caddy',), ('caddy',)),
+    'authentik':     ((), ('authentik',), ()),
+    'takserver':     (('java', 'postgres', 'postmaster'), ('takserver',), ('takserver', 'postgresql')),
+    'takportal':     ((), ('takportal', 'tak-portal'), ()),
+    'nodered':       ((), ('nodered', 'node-red'), ()),
+    'cloudtak':      ((), ('cloudtak',), ()),
+    'mediamtx':      ((), ('mediamtx',), ('mediamtx',)),
+    'remote_assist': (('turnserver',), ('coturn', 'remote-assist'), ('coturn',)),
+    'guarddog':      (('python3',), ('guarddog',), ('takwerx-health-agent',)),
+}
+
+
+def _preflight_unit_active(unit):
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', unit]),
+                           capture_output=True, text=True, timeout=10)
+        return (r.stdout or '').strip() == 'active'
+    except Exception:
+        return False
+
+
+# A conflicting process's command line is the most useful thing we can show the
+# operator — and it belongs to THEIR software, which may carry credentials in
+# argv (`--password=…`, `--token=…`). It lands in the deploy log, the UI and
+# journald, so redact before it leaves /proc.
+_CMDLINE_SECRET_RE = re.compile(
+    r'((?:--?)?(?:pass(?:word|wd)?|secret|token|api[-_]?key|auth|credential)s?[=\s:])\S+', re.I)
+
+
+def _preflight_cmdline(pid):
+    """Command line of a PID (read-only, /proc), secrets redacted. '' when unreadable."""
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            raw = f.read().replace(b'\x00', b' ').decode('utf-8', 'ignore').strip()
+    except Exception:
+        return ''
+    return _CMDLINE_SECRET_RE.sub(r'\1<redacted>', raw)[:200]
+
+
+def _preflight_docker_publishers():
+    """host port -> container name, from `docker ps`. Lets the checker tell OUR
+    container holding a port (a redeploy) from a stranger's, and gives the
+    operator a container name instead of the useless 'docker-proxy'."""
+    m = {}
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--format', '{{.Names}}\t{{.Ports}}']),
+                           capture_output=True, text=True, timeout=10)
+        for ln in (r.stdout or '').splitlines():
+            name, _sep, ports = ln.partition('\t')
+            name = name.strip()
+            if not name:
+                continue
+            for mm in re.finditer(r':(\d{1,5})->', ports):
+                m.setdefault(int(mm.group(1)), name)
+    except Exception:
+        pass
+    return m
+
+
+def _preflight_port_holder(port):
+    """{'holder','pid','cmd','addr'} for whoever is LISTENING on tcp <port>, or
+    None if the port is free / undeterminable.
+
+    `ss -lptnH` through _sudo_wrap first (PID + process name need privilege —
+    unprivileged ss shows the socket but not its owner), then `lsof`, then bare
+    unprivileged `ss` which still proves the port is TAKEN even when it cannot
+    say by whom. ss ships on Ubuntu (iproute2) and RHEL 9 (iproute) alike and
+    is already broker-allowlisted (read-only) — no new package, no ARM concern."""
+    filt = f'sport = :{port}'
+    for argv, privileged in ((['ss', '-lptnH', filt], True), (['ss', '-ltnH', filt], False)):
+        try:
+            cmd = _sudo_wrap(argv) if privileged else argv
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        for ln in (r.stdout or '').splitlines():
+            cols = ln.split()
+            if len(cols) < 4:
+                continue
+            local = cols[3]
+            _addr, sep, p = local.rpartition(':')
+            if not sep or p != str(port):
+                continue
+            mp = re.search(r'users:\(\("([^"]+)",pid=(\d+)', ln)
+            if mp:
+                pid = int(mp.group(2))
+                return {'holder': mp.group(1), 'pid': pid, 'cmd': _preflight_cmdline(pid), 'addr': local}
+            return {'holder': '', 'pid': None, 'cmd': '', 'addr': local}
+        if privileged:
+            # ss ran fine and reported nothing on this port — genuinely free.
+            return None
+    # ss unusable entirely (both forms failed) — try lsof before giving up.
+    try:
+        r = subprocess.run(_sudo_wrap(['lsof', '-nP', '-iTCP:%d' % port, '-sTCP:LISTEN']),
+                           capture_output=True, text=True, timeout=8)
+        for ln in (r.stdout or '').splitlines()[1:]:
+            cols = ln.split()
+            if len(cols) < 2 or not cols[1].isdigit():
+                continue
+            pid = int(cols[1])
+            return {'holder': cols[0], 'pid': pid, 'cmd': _preflight_cmdline(pid),
+                    'addr': cols[-1] if cols else ''}
+    except Exception:
+        pass
+    return None
+
+
+def _preflight_port_conflicts(module_key, extra_ports=None, only_ports=None):
+    """Ports this module is about to claim that something ELSE already holds.
+
+    Returns [{'port','label','holder','pid','cmd','addr'}] — empty list means
+    clear to deploy. Never raises: a checker that throws must not be the reason
+    a deploy fails, so any internal error degrades to "no conflict found".
+
+    extra_ports: optional [port, …] or [(port, label), …] beyond the table.
+    only_ports:  optional [port, …] — narrow the check to these ports while
+                 keeping the module's ownership rules (used when a single
+                 sub-service is being restarted, not the whole module)."""
+    try:
+        targets = []
+        try:
+            console_port = int((load_settings() or {}).get('console_port') or 5001)
+        except Exception:
+            console_port = 5001
+        for ent in PORT_EXPOSURE_POLICY:
+            if ent.get('module') != module_key:
+                continue
+            # port None = resolved live (the console's own port, 5001 by default)
+            targets.append((ent['port'] if ent['port'] is not None else console_port, ent['label']))
+        for p in (extra_ports or []):
+            if isinstance(p, (list, tuple)):
+                targets.append((int(p[0]), str(p[1])))
+            else:
+                targets.append((int(p), f'port {p}'))
+        if only_ports is not None:
+            keep = {int(p) for p in only_ports}
+            targets = [t for t in targets if t[0] in keep]
+        if not targets:
+            return []
+        own_procs, own_containers, own_units = _PREFLIGHT_OWN.get(module_key, ((), (), ()))
+        publishers = _preflight_docker_publishers()
+        conflicts, seen = [], set()
+        unit_active = None  # resolved lazily, at most once
+        for port, label in targets:
+            if port in seen:
+                continue
+            seen.add(port)
+            h = _preflight_port_holder(port)
+            if not h:
+                continue
+            holder = (h.get('holder') or '')
+            container = publishers.get(port, '')
+            if container:
+                # A docker-published port belongs to its container, not to the
+                # docker-proxy shim — report (and match ownership on) the container.
+                low = container.lower()
+                if any(frag in low for frag in own_containers):
+                    continue
+                if holder in ('', 'docker-proxy'):
+                    holder = container
+            elif holder == 'docker-proxy':
+                # Some container publishes it but `docker ps` told us nothing — we
+                # cannot tell whose. Never refuse on a guess.
+                continue
+            elif holder:
+                if any(pn in holder.lower() for pn in own_procs):
+                    continue
+            else:
+                # Port is taken but the owner is not visible (unprivileged ss).
+                # Ours if one of our own units is up; otherwise a real conflict we
+                # can name only by port.
+                if unit_active is None:
+                    unit_active = any(_preflight_unit_active(u) for u in own_units)
+                if unit_active:
+                    continue
+                holder = 'unknown (process owner not visible — run the command below as root)'
+            conflicts.append({'port': port, 'label': label, 'holder': holder,
+                              'pid': h.get('pid'), 'cmd': h.get('cmd') or '',
+                              'addr': h.get('addr') or ''})
+        return conflicts
+    except Exception:
+        return []
+
+
+def _preflight_conflict_message(module_label, conflicts):
+    """Operator-actionable refusal text for a list from _preflight_port_conflicts()."""
+    lines = [f'{module_label} cannot deploy — {len(conflicts)} port(s) already in use on this host:']
+    for c in conflicts:
+        who = c['holder']
+        if c.get('pid'):
+            who += f" (PID {c['pid']})"
+        lines.append(f"  • {c['port']}/tcp — {c['label']} — held by {who}")
+        if c.get('cmd'):
+            lines.append(f"      {c['cmd']}")
+    lines.append('')
+    lines.append('infra-TAK does not stop other software on your box. Free the port(s) — '
+                 f"`sudo ss -lptn 'sport = :{conflicts[0]['port']}'` shows the holder — then retry.")
+    return '\n'.join(lines)
+
+
+# v10.1.27 (item E) — daemon errors, translated. A raw
+# `failed to bind host port 127.0.0.1:389/tcp: address already in use` tells an
+# operator nothing about what to DO. These translations are always APPENDED to
+# the raw output, never substituted for it: the operator needs plain English and
+# we need the original text when they paste the log back to us.
+def _translate_known_failure(text):
+    """Operator-actionable line(s) for known failure signatures, or []."""
+    out, t = [], (text or '')
+    port = None
+    m = re.search(r'failed to bind host port (?:for )?[0-9a-fA-F:.\[\]]*?:(\d{1,5})', t)
+    if m:
+        port = m.group(1)
+    elif re.search(r'address already in use', t, re.I):
+        m2 = re.search(r':(\d{2,5})\b', t)
+        port = m2.group(1) if m2 else None
+    if port:
+        out.append(f"→ Port {port} is already in use on this host by another process.")
+        out.append(f"   Find the holder:  sudo ss -lptn 'sport = :{port}'")
+        out.append("   Free that port and retry — infra-TAK will not stop other software on your box.")
+    elif re.search(r'address already in use', t, re.I):
+        out.append("→ A port infra-TAK needs is already in use on this host.")
+        out.append("   Find the holder:  sudo ss -lptn   — free the port and retry.")
+    if 'Conflicting values set for option Signed-By' in t:
+        out.append("→ Another apt source already configures this repository with a different "
+                   "signing-key path.")
+        out.append("   Remove the duplicate under /etc/apt/sources.list.d/ (keep exactly ONE), then retry.")
+        out.append("   Until that is fixed EVERY apt operation on this box fails — not just ours.")
+    if 'The list of sources could not be read' in t:
+        out.append("→ apt cannot read its source list — a repository entry is malformed or conflicting.")
+        out.append("   All package operations on this box are blocked until it is fixed.")
+    return out
+
+
+@app.route('/api/firewall/preflight/<module_key>')
+@login_required
+def firewall_preflight_api(module_key):
+    """Read-only: what would block <module_key> from claiming its ports right now."""
+    if not re.match(r'^[a-z0-9_]{1,32}$', module_key or ''):
+        return jsonify({'success': False, 'error': 'Invalid module key'}), 400
+    conflicts = _preflight_port_conflicts(module_key)
+    return jsonify({'success': True, 'module': module_key, 'conflicts': conflicts,
+                    'clear': not conflicts})
 
 
 @app.route('/api/firewall/status')
@@ -20474,6 +20785,8 @@ def caddy_page():
         cert_days_fmt=cert_days_fmt,
         caddy_update_available=caddy_update_available,
         caddy_version=caddy_version,
+        caddy_last_action=_caddy_last_action_summary(),
+        service_subdomains=_service_subdomain_labels(settings),
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
 
@@ -20509,6 +20822,14 @@ def caddy_deploy():
         return jsonify({'success': False, 'error': 'Domain is required'})
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
         return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'})
+
+    # v10.1.27 — pre-flight: refuse BEFORE we write settings/certs if something
+    # else on this box already owns 80/443/9997. Previously Caddy just failed to
+    # bind at the end, the card said "stopped", and Start did nothing visible.
+    conflicts = _preflight_port_conflicts('caddy')
+    if conflicts:
+        return jsonify({'success': False, 'error': _preflight_conflict_message('Caddy', conflicts),
+                        'port_conflicts': conflicts}), 409
 
     settings = load_settings()
     settings['fqdn'] = domain
@@ -20558,7 +20879,10 @@ def caddy_cert_days():
 def caddy_log():
     return jsonify({
         'running': caddy_deploy_status['running'], 'complete': caddy_deploy_status['complete'],
-        'error': caddy_deploy_status['error'], 'entries': list(caddy_deploy_log)})
+        'error': caddy_deploy_status['error'], 'entries': list(caddy_deploy_log),
+        # v10.1.27 — outcome of the last DEFERRED restart/start/reload. Without this
+        # a failed deferred action left no trace anywhere the operator could see.
+        'last_action': _caddy_last_action_summary()})
 
 
 # === v0.9.51 — Custom certificate (bring-your-own-cert) ===
@@ -21235,36 +21559,117 @@ def caddy_get_caddyfile():
             return jsonify({'success': True, 'content': f.read()})
     return jsonify({'success': False, 'content': ''})
 
-def _caddy_restart_after_response():
-    """Run in background: write Caddyfile and restart Caddy after a short delay so the HTTP response can be sent first (console is often behind Caddy)."""
+# v10.1.27 — outcome of the last DEFERRED Caddy action. The deferral itself is
+# load-bearing (the console usually sits behind Caddy, so restarting before the
+# HTTP response is sent kills the reply) — but until now the result was thrown
+# away three times over: the CompletedProcess was discarded, `except Exception:
+# pass` ate the rest, and caddy_control() had already answered {'success': True}
+# before the thread ran. Field result: Caddy could not bind :443, the card said
+# "Stopped", and Start appeared to do nothing. Now every one of the deferred
+# call sites records what actually happened here.
+caddy_last_action = {'ok': None, 'action': '', 'rc': None, 'output': '', 'ts': 0}
+
+
+def _caddy_failure_detail():
+    """First operator-meaningful line explaining why caddy is not running.
+    `systemctl restart` only ever says "Job for caddy.service failed…"; the real
+    reason (bind conflict, bad config, SELinux-rejected log dir) is in the
+    journal."""
+    try:
+        r = subprocess.run(_sudo_wrap(['journalctl', '-u', 'caddy', '-n', '40', '--no-pager']),
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+        lines = [l.strip() for l in (r.stdout or '').splitlines() if l.strip()]
+    except Exception:
+        lines = []
+    for ln in reversed(lines):
+        low = ln.lower()
+        if ('address already in use' in low or 'bind:' in low or '"level":"error"' in low
+                or 'error' in low or 'cannot' in low or 'permission denied' in low):
+            return ln[-400:]
+    return lines[-1][-400:] if lines else ''
+
+
+def _caddy_restart_after_response(action='restart'):
+    """Run in background: write Caddyfile and restart Caddy after a short delay so
+    the HTTP response can be sent first (console is often behind Caddy).
+
+    Records the outcome in caddy_last_action so a failure is visible on the Caddy
+    card and in /api/caddy/log instead of vanishing."""
     time.sleep(2)
+    rc, out, ok = None, '', False
     try:
         generate_caddyfile(load_settings())
-        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-    except Exception:
-        pass
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, timeout=90)
+        rc = r.returncode
+        out = (r.stdout or '').strip()
+        ok = (rc == 0)
+        if ok:
+            # `restart` can return 0 and the unit still die a moment later.
+            time.sleep(2)
+            try:
+                act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']),
+                                     capture_output=True, text=True, timeout=15)
+                ok = (act.stdout or '').strip() == 'active'
+            except Exception:
+                pass
+        if not ok:
+            detail = _caddy_failure_detail()
+            out = (out + ('\n' + detail if detail else '')).strip()
+    except subprocess.TimeoutExpired:
+        rc, ok, out = -1, False, 'systemctl restart caddy timed out after 90s'
+    except Exception as e:
+        rc, ok, out = -1, False, f'{type(e).__name__}: {e}'
+    caddy_last_action.update({'ok': ok, 'action': action, 'rc': rc,
+                              'output': out[-2000:], 'ts': time.time()})
+    if not ok:
+        print(f"[caddy] deferred {action} FAILED (rc={rc}): {out[:400]}", flush=True)
+
+
+def _caddy_last_action_summary():
+    """{'ok','action','detail','ts'} for the UI, or None if nothing deferred has
+    run yet. detail = the first meaningful failure line, not the systemd boilerplate."""
+    if not caddy_last_action.get('ts'):
+        return None
+    out = (caddy_last_action.get('output') or '').strip()
+    detail = ''
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if not ln or ln.lower().startswith(('job for ', 'see "systemctl', 'see \'systemctl')):
+            continue
+        detail = ln
+        break
+    if not detail:
+        detail = out.splitlines()[0].strip() if out else ''
+    return {'ok': bool(caddy_last_action.get('ok')), 'action': caddy_last_action.get('action') or 'restart',
+            'rc': caddy_last_action.get('rc'), 'detail': detail[:300],
+            'output': out[-2000:], 'ts': caddy_last_action.get('ts')}
 
 @app.route('/api/caddy/control', methods=['POST'])
 @login_required
 def caddy_control():
     data = request.get_json()
     action = data.get('action', '')
-    if action == 'restart':
+    # v10.1.27 — the restart is deliberately deferred (see _caddy_restart_after_response),
+    # so this response can only ever say "scheduled". Word it that way and clear the
+    # previous outcome so the page's poll can tell a fresh result from a stale one.
+    if action in ('restart', 'start', 'reload'):
+        conflicts = _preflight_port_conflicts('caddy')
+        if conflicts:
+            return jsonify({'success': False, 'error': _preflight_conflict_message('Caddy', conflicts),
+                            'port_conflicts': conflicts}), 409
         generate_caddyfile(load_settings())
-        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
-        return jsonify({'success': True, 'output': 'Caddy restart scheduled; connection may drop briefly.'})
+        if action == 'start':
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True, timeout=5)
+        caddy_last_action.update({'ok': None, 'action': action, 'rc': None, 'output': '', 'ts': 0})
+        threading.Thread(target=_caddy_restart_after_response, args=(action,), daemon=True).start()
+        enabled = ' (and enabled for boot)' if action == 'start' else ''
+        return jsonify({'success': True, 'deferred': True,
+                        'output': f'Caddy {action} scheduled{enabled} — check status in a few seconds; '
+                                  'connection may drop briefly.'})
     elif action == 'stop':
         r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         return jsonify({'success': r.returncode == 0, 'output': (r.stdout or r.stderr or '').strip()})
-    elif action == 'start':
-        generate_caddyfile(load_settings())
-        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True, timeout=5)
-        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
-        return jsonify({'success': True, 'output': 'Caddy start scheduled (and enabled for boot); connection may drop briefly.'})
-    elif action == 'reload':
-        generate_caddyfile(load_settings())
-        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
-        return jsonify({'success': True, 'output': 'Caddy restart scheduled; connection may drop briefly.'})
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
 
@@ -21429,6 +21834,35 @@ def _get_service_domain(settings, service_key):
 def _get_all_service_domains(settings):
     """Return dict of service_key → current domain for all services."""
     return {k: _get_service_domain(settings, k) for k in SERVICE_DOMAIN_DEFAULTS}
+
+
+def _service_subdomain_labels(settings):
+    """The subdomain labels this box will actually use, honouring per-service
+    {service}_domain overrides — e.g. ['infratak','takserver','tak','takportal',…].
+
+    v10.1.27 (item D): the Caddy setup page hardcoded
+      infratak · console · tak · authentik · portal · nodered · map · tiles.map · video
+    which had drifted badly — it said `portal` where the code uses `takportal`
+    (an operator created portal.<domain> A records that pointed at nothing),
+    omitted `takserver` entirely, listed `console` and a second `authentik`
+    (phantoms — authentik's own subdomain IS `tak`), and could never reflect a
+    per-box override. Derive it from SERVICE_DOMAIN_DEFAULTS instead; a static
+    string cannot stay true."""
+    fqdn = (settings.get('fqdn') or '').strip()
+    labels, seen = [], set()
+    for key, default_prefix in SERVICE_DOMAIN_DEFAULTS.items():
+        dom = _get_service_domain(settings, key)
+        if dom and fqdn and dom.endswith('.' + fqdn):
+            label = dom[:-(len(fqdn) + 1)]
+        elif dom:
+            label = dom  # override points at a different base domain — show it whole
+        else:
+            label = (settings.get(f'{key}_domain') or '').strip() or default_prefix
+        # mediamtx and tak_video_restreamer both default to 'stream'
+        if label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return labels
 
 
 def _cloudtak_deployment_defaults():
@@ -48726,6 +49160,25 @@ def run_authentik_deploy(reconfigure=False):
             _run_authentik_deploy_remote(settings, deploy_cfg, plog)
             return
 
+        # v10.1.27 — pre-flight: the LDAP outpost publishes 127.0.0.1:389/636 and
+        # the server 9000/9443. A host slapd (or anything else) already holding
+        # one of those used to surface as a raw docker "failed to bind host port"
+        # deep in the log — or worse, as a "Resync LDAP" that hung forever.
+        conflicts = _preflight_port_conflicts('authentik')
+        if conflicts:
+            plog("✗ FATAL: port conflict — Authentik cannot claim the ports it needs")
+            for c in conflicts:
+                who = c['holder'] + (f" (PID {c['pid']})" if c.get('pid') else '')
+                plog(f"    {c['port']}/tcp — {c['label']} — held by {who}")
+                if c.get('cmd'):
+                    plog(f"      {c['cmd']}")
+            plog("")
+            plog("  infra-TAK will not stop other software on your box. Free the port(s) and retry.")
+            plog(f"  Find the holder: sudo ss -lptn 'sport = :{conflicts[0]['port']}'")
+            plog("  If it is the host OpenLDAP (slapd), 'sudo systemctl disable --now slapd' frees 389/636.")
+            authentik_deploy_status.update({'running': False, 'error': True})
+            return
+
         if reconfigure:
             if not os.path.exists(ak_dir) or not os.path.exists(env_path) or not os.path.exists(compose_path):
                 ak_dir, env_path, compose_path = _find_authentik_install_dir()
@@ -52536,12 +52989,32 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                     _msg += '  ' + _stamp_line
             except Exception:
                 pass
+            # v10.1.27 (item E) — translate known daemon failures. Field case: a host
+            # slapd already owned 127.0.0.1:389, so the outpost could never bind and
+            # the operator got only docker's raw "failed to bind host port … address
+            # already in use". Translation is APPENDED, never substituted — we still
+            # want the raw text when the log comes back to us.
+            _xlate = _translate_known_failure(_err)
+            if _xlate:
+                _msg += '  ' + '  '.join(_xlate)
+                if 'address already in use' in _err_low:
+                    _msg += ('  On this stack 389/636 are the Authentik LDAP outpost; if the '
+                             'holder is the host OpenLDAP, `sudo systemctl disable --now slapd` '
+                             'frees them.')
             return _msg
         if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
             ok_ldap, out_ldap = _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
             if not ok_ldap:
                 return False, _format_ldap_restart_err(True, out_ldap)
         elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+            # v10.1.27 (item A) — the outpost publishes 127.0.0.1:389/636. If a host
+            # slapd (or anything else) already owns one, the recreate cannot bind and
+            # the operator used to get only docker's raw error. Say so up front, by
+            # name. Our own running ldap container is not a conflict (see
+            # _preflight_port_conflicts) so a normal resync is unaffected.
+            _pf = _preflight_port_conflicts('authentik', only_ports=[389, 636])
+            if _pf:
+                return False, _preflight_conflict_message('The Authentik LDAP outpost', _pf).replace('\n', '  ')
             r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
             # v0.9.25 hotfix #3: retry-after-heal. If the first recreate
             # failed with a YAML parse error (most commonly the duplicate-
@@ -58469,6 +58942,7 @@ def deploy_takserver():
         if cert_password:
             _s = load_settings(); _s['tak_cert_password'] = cert_password; save_settings(_s)
         deploy_log.clear()
+        deploy_warnings.clear()
         deploy_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=run_takserver_deploy, args=(c_config,), daemon=True).start()
         return jsonify({'success': True})
@@ -58532,14 +59006,47 @@ def deploy_takserver():
         settings['tak_cert_password'] = cert_password
         save_settings(settings)
     deploy_log.clear()
+    deploy_warnings.clear()
     deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_takserver_deploy, args=(config,), daemon=True).start()
     return jsonify({'success': True})
 
+# v10.1.27 (item B3) — non-fatal warnings collected during a TAK deploy.
+# "⚠ LDAP service-account bind: …" was already printed, but it scrolls past inside
+# a 9-step log and the deploy still reports success — the operator's takeaway was
+# "it didn't sync LDAP", i.e. functionally silent. Every ⚠ log_step() emits is
+# collected here and replayed at the END of the run, so the last thing read is
+# what actually needs attention. Capture is flag-gated so replaying the summary
+# (whose lines contain ⚠ themselves) does not re-collect it.
+deploy_warnings = []
+_deploy_warn_capture = {'on': True}
+
+
 def log_step(msg):
     entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
     deploy_log.append(entry)
+    if _deploy_warn_capture['on'] and '⚠' in str(msg) and len(deploy_warnings) < 200:
+        deploy_warnings.append(str(msg).strip())
     print(entry, flush=True)
+
+
+def log_deploy_warning_summary():
+    """Replay every non-fatal ⚠ from this run as the last thing in the log."""
+    warns = list(deploy_warnings)
+    if not warns:
+        return
+    _deploy_warn_capture['on'] = False
+    try:
+        log_step("")
+        log_step(f"━━━ Completed with {len(warns)} warning(s) ━━━")
+        for w in warns:
+            log_step(f"  {w.lstrip()}")
+        log_step("")
+        log_step("  These did not stop the deploy, but they are what will bite you later.")
+        log_step("  LDAP warnings in particular mean TAK cannot see Authentik groups —")
+        log_step("  fix them from the console (TAK Server → Resync LDAP) before handing over.")
+    finally:
+        _deploy_warn_capture['on'] = True
 
 def run_cmd(cmd, desc=None, check=True, quiet=False, log=None):
     # v10.1.22 (Wave 2b ride-along): optional `log` sink — the module-registry
@@ -58593,6 +59100,164 @@ def wait_for_package_lock():
     NO TIMEOUT - waits as long as needed. Ticks every 10 seconds."""
     return wait_for_unattended_upgrade_worker(
         log_step, deploy_log, lambda: deploy_status.get('cancelled'))
+
+
+# ==========================================================================
+# v10.1.27 — PGDG apt source: de-conflict, verify, roll back (items B2 + C)
+# ==========================================================================
+# Field 2026-08-06: a box already carrying /etc/apt/sources.list.d/postgresql.list
+# (signed-by=/etc/apt/keyrings/postgresql.asc) got our pgdg.list written next to it
+# (signed-by=/usr/share/keyrings/pgdg.asc). apt normalises the scheme/trailing-slash
+# difference, sees ONE repo configured TWO ways, and refuses to read ANY source:
+#   E: Conflicting values set for option Signed-By … E: The list of sources could
+#   not be read.  → exit 100 → EVERY apt operation on the box fails.
+# Step 2 then printed "✓ PostgreSQL repository configured" anyway, because the
+# run_cmd return value was discarded and the stderr had been sent to /dev/null.
+#
+# This is SELF-INFLICTED: infra-TAK used to ship both spellings (single-box deploy
+# vs two-server Server One). Both are now standardised on _PGDG_LIST/_PGDG_KEYRING
+# (defined with _PGDG_REMOTE_SETUP_SH above _setup_server_one); here we additionally
+# reuse whatever a third party already configured.
+def _pgdg_existing_apt_sources():
+    """Files under /etc/apt that already configure apt.postgresql.org, EXCLUDING
+    our own pgdg.list. Covers sources.list, *.list and *.sources (deb822 — 24.04
+    is migrating to it)."""
+    paths = ['/etc/apt/sources.list']
+    try:
+        d = '/etc/apt/sources.list.d'
+        paths += [os.path.join(d, f) for f in sorted(os.listdir(d))
+                  if f.endswith('.list') or f.endswith('.sources')]
+    except Exception:
+        pass
+    hits = []
+    for p in paths:
+        if os.path.abspath(p) == _PGDG_LIST:
+            continue
+        try:
+            with open(p, 'r', errors='replace') as f:
+                body = f.read()
+        except Exception:
+            continue
+        for ln in body.splitlines():
+            s = ln.strip()
+            if s and not s.startswith('#') and _PGDG_APT_HOST in s:
+                hits.append(p)
+                break
+    return hits
+
+
+def _apt_update_capture(timeout=600):
+    """`apt-get update` with the output KEPT. Returns (ok, combined_output).
+
+    The old call was `apt-get update -qq > /dev/null 2>&1`, which threw away the
+    only thing that could have explained the failure. -qq keeps the noise down
+    but still emits E: lines on stderr."""
+    try:
+        r = subprocess.run('apt-get update -qq', shell=True, capture_output=True, text=True,
+                           timeout=timeout, env=_broker_shim_env())
+        return r.returncode == 0, ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
+    except Exception as e:
+        return False, f'{type(e).__name__}: {e}'
+
+
+def _setup_pgdg_apt_source():
+    """Configure (or reuse) the PGDG apt repo. True = apt is healthy and PGDG is
+    reachable; False = hard stop, the caller must abort the deploy (Step 4 cannot
+    succeed without it).
+
+    Never leaves the operator's apt worse than we found it: if WE added the source
+    and the subsequent update fails, we remove our file and re-check.
+
+    DEBIAN FAMILY ONLY — RHEL gets PGDG from the pgdg-redhat-repo rpm in the other
+    branch of Step 2. Guarded so a future caller can't run apt on a dnf box."""
+    if _distro_family() == 'rhel':
+        log_step("  (RHEL family — PGDG comes from the pgdg-redhat-repo rpm, skipping apt setup)")
+        return True
+    log_step("Configuring the PostgreSQL (PGDG) apt repository...")
+    existing = _pgdg_existing_apt_sources()
+    wrote_ours = False
+
+    if existing:
+        log_step(f"  Existing PGDG source detected at {existing[0]} — reusing it")
+        if len(existing) > 1:
+            for p in existing[1:]:
+                log_step(f"  ⚠ Another PGDG source is also present: {p}")
+            log_step("  ⚠ Two sources for one repo will break apt if their signed-by paths differ.")
+        # If a PREVIOUS infra-TAK deploy left our spelling next to theirs, that pair
+        # IS the conflict — and ours is the one we are allowed to remove.
+        if os.path.exists(_PGDG_LIST):
+            log_step(f"  Removing our duplicate {_PGDG_LIST} (theirs is authoritative)")
+            subprocess.run(_sudo_wrap(['rm', '-f', _PGDG_LIST]), capture_output=True, timeout=60)
+    else:
+        log_step("  Adding PostgreSQL GPG key...")
+        # v10.0.5 non-root: fetch the key as takwerx, then write key + list through
+        # the broker into already-allowlisted dirs (/usr/share/keyrings, /etc/apt).
+        key = b''
+        rc = -1
+        try:
+            _k = subprocess.run(['curl', '-fsSL', _PGDG_KEY_URL], capture_output=True, timeout=60)
+            rc, key = _k.returncode, (_k.stdout or b'')
+        except Exception as e:
+            log_step(f"  ✗ Key fetch raised: {type(e).__name__}: {e}")
+        # An unchecked curl used to write a 0-byte keyring here, and the next
+        # apt-get update then failed with the useless "not signed" error.
+        if rc != 0 or len(key) < 100 or b'BEGIN PGP PUBLIC KEY BLOCK' not in key:
+            log_step("")
+            log_step("✗ FATAL: could not fetch the PostgreSQL signing key")
+            log_step(f"    URL: {_PGDG_KEY_URL}")
+            log_step(f"    curl exit {rc}, {len(key)} bytes received"
+                     + ("" if b'BEGIN PGP PUBLIC KEY BLOCK' in key else " (not a PGP key block)"))
+            log_step("  TAK Server's PostgreSQL/PostGIS packages come from this repo — Step 4")
+            log_step("  cannot succeed without it. Check egress/DNS/proxy to www.postgresql.org, then retry:")
+            log_step(f"    curl -fsSL {_PGDG_KEY_URL} | head -1")
+            # Never leave a truncated/empty keyring behind for the next run to trip on.
+            try:
+                if os.path.exists(_PGDG_KEYRING) and os.path.getsize(_PGDG_KEYRING) < 100:
+                    subprocess.run(_sudo_wrap(['rm', '-f', _PGDG_KEYRING]), capture_output=True, timeout=60)
+                    log_step(f"  Removed the unusable {_PGDG_KEYRING}")
+            except Exception:
+                pass
+            return False
+        try:
+            _cn = subprocess.run(['lsb_release', '-cs'], capture_output=True, text=True,
+                                 timeout=10).stdout.strip() or 'jammy'
+        except Exception:
+            _cn = 'jammy'
+        _write_priv(_PGDG_KEYRING, key, perm=0o644)
+        _write_priv(_PGDG_LIST,
+                    f'deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt {_cn}-pgdg main\n')
+        wrote_ours = True
+        log_step(f"  Wrote {_PGDG_LIST} ({_cn}-pgdg)")
+
+    wait_for_package_lock()
+    log_step("  Updating package lists...")
+    ok, out = _apt_update_capture()
+    if ok:
+        log_step("✓ PostgreSQL repository configured (apt-get update clean)")
+        return True
+
+    for line in (out or 'no output').splitlines()[-15:]:
+        if line.strip():
+            log_step(f"  ✗ {line.strip()}")
+
+    if wrote_ours:
+        log_step("  ⚠ apt broke after WE added the PGDG source — rolling our change back")
+        subprocess.run(_sudo_wrap(['rm', '-f', _PGDG_LIST]), capture_output=True, timeout=60)
+        wait_for_package_lock()
+        back_ok, _back_out = _apt_update_capture()
+        if back_ok:
+            log_step(f"  ✓ Removed {_PGDG_LIST} — this box's apt is healthy again")
+        else:
+            log_step("  ✗ apt is STILL failing with our source removed — the pre-existing")
+            log_step("    configuration on this box is broken independently of infra-TAK.")
+
+    log_step("")
+    log_step("✗ FATAL: apt-get update failed — the PostgreSQL repository is not usable")
+    for line in _translate_known_failure(out):
+        log_step(f"  {line}")
+    log_step("  TAK Server's PostgreSQL/PostGIS packages come from this repo — Step 4 cannot")
+    log_step("  succeed. Fix apt, confirm `sudo apt-get update` exits 0, then retry the deploy.")
+    return False
 
 def _tak_container_running(name):
     """True if the named docker container exists and is in the running state."""
@@ -59051,6 +59716,7 @@ def _deploy_takserver_container(config):
         log_step(f"  Admin UI:  https://{settings.get('fqdn') or ip}:8446")
         log_step(f"  Clients:   {settings.get('fqdn') or ip}:8089 (TLS/x509)")
         log_step("=" * 50)
+        log_deploy_warning_summary()
         deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
         log_step(f"✗ Container deploy error: {str(e)[:300]}")
@@ -59155,23 +59821,20 @@ def run_takserver_deploy(config):
             run_cmd('dnf makecache 2>&1', "Refreshing package metadata...", check=False, quiet=True)
             log_step("✓ EPEL + PostgreSQL (PGDG) repo + Java 17 + CRB configured")
         else:
+            wait_for_package_lock()
             run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y lsb-release > /dev/null 2>&1', "Installing prerequisites...", check=False)
-            # v10.0.5 non-root: the PGDG key (curl -o /usr/share/...) and the repo
-            # list (echo > /etc/apt/...) wrote to root paths as the non-root console
-            # and failed. Fetch the key as takwerx, then write key + list through the
-            # broker into already-allowlisted dirs (/usr/share/keyrings, /etc/apt).
-            log_step("Adding PostgreSQL GPG key...")
+            # v10.1.27 — this whole block used to print "✓ PostgreSQL repository
+            # configured" unconditionally: run_cmd's False was discarded, stderr went
+            # to /dev/null, and the key fetch's returncode was never checked. See
+            # _setup_pgdg_apt_source() — it de-conflicts, verifies, rolls back its own
+            # change on failure, and hard-stops instead of lying.
             try:
-                _cn = subprocess.run(['lsb_release', '-cs'], capture_output=True, text=True, timeout=10).stdout.strip() or 'jammy'
-                _pgkey = subprocess.run(['curl', '-fsSL', 'https://www.postgresql.org/media/keys/ACCC4CF8.asc'],
-                                        capture_output=True, timeout=30).stdout
-                _write_priv('/usr/share/keyrings/pgdg.asc', _pgkey, perm=0o644)
-                _write_priv('/etc/apt/sources.list.d/pgdg.list',
-                            f'deb [signed-by=/usr/share/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt {_cn}-pgdg main\n')
-                run_cmd('apt-get update -qq > /dev/null 2>&1', "Updating package lists...")
-                log_step("✓ PostgreSQL repository configured")
+                _pgdg_ok = _setup_pgdg_apt_source()
             except Exception as _e:
-                log_step(f"✗ PostgreSQL repo setup failed: {_e}")
+                log_step(f"✗ FATAL: PostgreSQL repo setup raised: {type(_e).__name__}: {_e}")
+                _pgdg_ok = False
+            if not _pgdg_ok:
+                deploy_status.update({'error': True, 'running': False}); return
 
         log_step(""); log_step("━━━ Step 3/9: Package Verification ━━━")
         if _distro_family() == 'rhel':
@@ -59814,6 +60477,7 @@ def run_takserver_deploy(config):
             log_step(f"  Username: webadmin")
         log_step(f"  Certificate Password: {cert_pass}")
         log_step(f"  Admin cert: /opt/tak/certs/files/admin.p12")
+        log_deploy_warning_summary()
         deploy_status.update({'complete': True, 'running': False})
 
         # v10.1.9 W1: close the split-deploy cleartext window immediately.

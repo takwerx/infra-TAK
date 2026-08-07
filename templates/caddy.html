@@ -56,7 +56,7 @@
 {% if caddy.installed and caddy.running %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}{% if caddy_version %} · {{ caddy_version }}{% endif %}{% if caddy_update_available %} · <span style="color:var(--cyan)">update available</span>{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:{% if cert_days_fmt %}{% if cert_days_color == 'green' %}var(--green){% elif cert_days_color == 'yellow' %}var(--yellow){% elif cert_days_color == 'red' %}var(--red){% else %}var(--text-dim){% endif %}{% else %}var(--text-dim){% endif %}">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% elif caddy.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running{% if caddy_version %} · {{ caddy_version }}{% endif %}{% if caddy_update_available %} · <span style="color:var(--cyan)">update available</span>{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:var(--text-dim)">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">{% if caddy_last_action and not caddy_last_action.ok %}{{ caddy_last_action.action|capitalize }} failed{% else %}Stopped{% endif %}</div><div class="status-detail">Caddy is installed but not running{% if caddy_version %} · {{ caddy_version }}{% endif %}{% if caddy_update_available %} · <span style="color:var(--cyan)">update available</span>{% endif %}</div>{% if caddy_last_action and not caddy_last_action.ok %}<div id="caddy-last-action" style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:6px;color:var(--red);white-space:pre-wrap;word-break:break-word">{{ caddy_last_action.detail }}</div><details style="margin-top:4px"><summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)">full output · journalctl -u caddy -n 50</summary><pre style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-word;margin:6px 0 0;max-height:220px;overflow:auto">{{ caddy_last_action.output }}</pre></details>{% endif %}<div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:var(--text-dim)">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Set up a domain for full functionality</div></div></div>
 {% endif %}
@@ -83,7 +83,7 @@
 <input type="text" id="domain-input" class="input-field" value="{{ settings.get('fqdn', '') }}" placeholder="yourdomain.com"></div>
 <button onclick="updateDomain()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Update & Reload</button>
 </div>
-<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">Create DNS A records for *.{{ settings.get('fqdn', '') }} or individual subdomains pointing to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span></div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">Create DNS A records for *.{{ settings.get('fqdn', '') }} or individual subdomains pointing to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span><br>Subdomains in use on this box: {{ service_subdomains|join(' · ') }}<br>A wildcard record covers all of them; with individual A records you need one per subdomain listed.</div>
 </div>
 <details id="service-domains-section" style="margin-bottom:24px">
 <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;color:var(--text-secondary);padding:12px 0;user-select:none">Service Domains <span style="font-size:11px;color:var(--text-dim);font-weight:400">— customize per-service domains</span></summary>
@@ -169,7 +169,7 @@
 <div style="max-width:680px;margin:0 auto">
 <label class="input-label">Base Domain</label>
 <input type="text" id="domain-input" class="input-field" placeholder="yourdomain.com" style="margin-bottom:8px">
-<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:20px">Subdomains auto-configured: infratak · console · tak · authentik · portal · nodered · map · tiles.map · video<br>Point a wildcard DNS (*.yourdomain.com) or individual A records to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span></div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:20px">Subdomains auto-configured: {{ service_subdomains|join(' · ') }}<br>Point a wildcard DNS (*.yourdomain.com) or individual A records to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span><br>A wildcard record covers all of them at once — with individual A records you must create one per subdomain above.</div>
 <label class="input-label">SSL Certificate</label>
 <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 0">
 <input type="radio" name="setup-ssl-mode" value="fqdn" checked onchange="toggleSetupSslMode()" style="margin-top:3px">
@@ -268,11 +268,36 @@ function pollCaddyLog(){
         }catch(e){}
     },1000);
 }
+// v10.1.27 — start/restart/reload are DEFERRED (the console sits behind Caddy, so
+// the restart must happen after this response is sent). The old code reloaded the
+// page at +1.5s — before the restart at +2s had even run — so a failed start looked
+// like the button did nothing. Poll /api/caddy/log for the recorded outcome instead.
+function _caddyStatusLine(text,color){
+    var el=document.getElementById('caddy-update-status');
+    if(!el)return;
+    el.style.display='block';el.style.color=color||'var(--text-secondary)';el.textContent=text;
+}
 async function caddyControl(action){
     try{var r=await fetch('/api/caddy/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
     var d=await r.json();
-    if(d.success){setTimeout(()=>location.reload(),1500)}
-    else{alert('Caddy '+action+' failed: '+(d.output||d.error||'unknown'))}
+    if(!d.success){_caddyStatusLine('','');alert('Caddy '+action+' failed:\n\n'+(d.error||d.output||'unknown'));return}
+    if(!d.deferred){setTimeout(()=>location.reload(),1500);return}
+    _caddyStatusLine('Caddy '+action+' scheduled — waiting for the result…','var(--text-secondary)');
+    var waited=0;
+    var iv=setInterval(async()=>{
+        waited+=1500;
+        var la=null;
+        try{var lr=await fetch('/api/caddy/log');var ld=await lr.json();la=ld.last_action}catch(e){}
+        if(la&&la.ts){
+            clearInterval(iv);
+            if(la.ok){_caddyStatusLine('✓ Caddy '+la.action+' succeeded','var(--green)');location.reload()}
+            else{_caddyStatusLine('✗ Caddy '+la.action+' failed: '+(la.detail||'no detail'),'var(--red)');
+                 alert('Caddy '+la.action+' FAILED:\n\n'+(la.detail||'no detail')+'\n\n'+(la.output||''));
+                 location.reload()}
+            return;
+        }
+        if(waited>=30000){clearInterval(iv);location.reload()}
+    },1500);
     }catch(e){alert('Error: '+e.message)}
 }
 async function updateDomain(){

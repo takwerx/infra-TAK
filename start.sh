@@ -245,6 +245,15 @@ detect_os() {
                 OS_TYPE="ubuntu-22.04"
                 PKG_MGR="apt"
             elif [[ "$OS_VERSION" == "24.04"* ]]; then
+                # v10.1.27: 24.04 was accepted SILENTLY — the "not tested" warning only
+                # fired for versions we don't name, so operators reasonably read the
+                # quiet install as "supported". It is not: infra-TAK is pinned to 22.04
+                # (TAK's cert tooling depends on the OpenSSL 3.0 defaults 24.04 changes).
+                # Install still proceeds — this only makes the status honest.
+                echo -e "${YELLOW}WARNING: Ubuntu 24.04 is NOT yet validated for infra-TAK.${NC}"
+                echo -e "${YELLOW}         Ubuntu 22.04 LTS is the supported baseline — see the release notes.${NC}"
+                echo -e "${YELLOW}         Known risk: TAK Server certificate tooling depends on OpenSSL 3.0${NC}"
+                echo -e "${YELLOW}         defaults that changed in 24.04. Continuing anyway.${NC}"
                 OS_TYPE="ubuntu-24.04"
                 PKG_MGR="apt"
             else
