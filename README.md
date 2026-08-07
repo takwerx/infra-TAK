@@ -318,6 +318,39 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 **FQDN Mode** — Caddy + Let's Encrypt for proper SSL. Required for TAK client QR enrollment. Can upgrade from IP mode through the web console without SSH.
 
+### Subdomains (DNS)
+
+You give infra-TAK **one base domain**; it derives a subdomain per service and gets a
+Let's Encrypt certificate for each one Caddy is fronting.
+
+**A wildcard `*.yourdomain.com` A record covers all of them and is the recommended
+setup.** If your DNS provider or policy requires individual A records, you must create
+one **per subdomain below** — every record points at the same server IP.
+
+| Subdomain | Service | What it is |
+|---|---|---|
+| `infratak` | infra-TAK Console | The management console (behind Authentik when SSO is enabled) |
+| `takserver` | TAK Server | Admin WebGUI + Marti API |
+| `tak` | Authentik | Identity provider / SSO login |
+| `takportal` | TAK Portal | User & certificate management |
+| `nodered` | Node-RED | Flow editor (behind Authentik when SSO is enabled) |
+| `map` | CloudTAK | Browser TAK client |
+| `tiles.map` | CloudTAK | Tile server |
+| `video` | CloudTAK | Map video / HLS |
+| `stream` | MediaMTX *or* TAK Video Restreamer | Stream web console & HLS (whichever of the two is installed) |
+| `fedhub` | Federation Hub | Hub web UI (TLS terminated at Caddy) |
+| `3dtiles` | Cesium 3D Tiles | 3D terrain / photogrammetry tile server |
+| `webodm` | WebODM | Drone photogrammetry processing |
+| `netbird` | NetBird | Overlay-network management UI |
+| `remote` | EUD Remote Assist | Remote-assist portal |
+
+Only the subdomains for modules you actually deploy need to resolve — but a wildcard
+record means you never have to come back and add one when you deploy something new.
+
+**Renaming a subdomain:** Caddy page → *Service Domains* → set a per-service override.
+The Caddy page always lists the subdomains **this box** is really using, including your
+overrides, so treat that list as authoritative over this table.
+
 ## QR Code Enrollment
 
 | Client | Status | Notes |
