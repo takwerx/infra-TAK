@@ -59057,7 +59057,20 @@ def log_step(msg):
 
 
 def log_deploy_warning_summary():
-    """Replay every non-fatal ⚠ from this run as the last thing in the log."""
+    """Replay every non-fatal ⚠ from this run as the last thing in the log.
+
+    Cosmetic by definition — it only re-prints lines already logged. It runs
+    INSIDE the deploy's try block, so it must never raise: an exception here
+    would propagate to the deploy's `except` and report a SUCCESSFUL deploy as
+    failed. Belt-and-braces because this path ships without a live deploy test
+    (operator decision 2026-08-07); the whole body is guarded."""
+    try:
+        _log_deploy_warning_summary_inner()
+    except Exception as e:
+        print(f"[deploy] warning-summary failed (non-fatal, ignored): {e}", flush=True)
+
+
+def _log_deploy_warning_summary_inner():
     warns = list(deploy_warnings)
     if not warns:
         return
