@@ -13371,7 +13371,12 @@ PORT_EXPOSURE_POLICY = [
     # making them visible to _preflight_port_conflicts() below.
     {'module': 'authentik',  'label': 'Authentik LDAP outpost',      'port': 389,  'tier': 3, 'preflight_only': True, 'why': 'Native TAK binds LDAP at 127.0.0.1:389'},
     {'module': 'authentik',  'label': 'Authentik LDAPS outpost',     'port': 636,  'tier': 3, 'preflight_only': True, 'why': 'LDAPS side of the same outpost'},
-    {'module': 'caddy',      'label': 'Caddy admin API',             'port': 9997, 'tier': 3, 'preflight_only': True, 'why': 'Local admin/config socket (loopback)'},
+    # NB: Caddy's admin API (9997) is deliberately NOT pre-flighted. Caddy binds it
+    # on the box's LAN IP (the nonlocal_bind drop-in from the :9997 reboot-race fix)
+    # while cloudtak-media-1 publishes MediaMTX's own 9997 on 127.0.0.1 — two
+    # listeners on one port number, different addresses, no collision. Treating it
+    # as exclusively Caddy's produced a false conflict that blocked Caddy restarts
+    # on every box running CloudTAK (found in T&E, v10.1.27).
     {'module': 'takserver',  'label': 'PostgreSQL (TAK database)',   'port': 5432, 'tier': 3, 'preflight_only': True, 'why': 'TAK Server database'},
 ]
 
@@ -13730,9 +13735,13 @@ def _preflight_docker_publishers():
     return m
 
 
-def _preflight_port_holder(port):
-    """{'holder','pid','cmd','addr'} for whoever is LISTENING on tcp <port>, or
-    None if the port is free / undeterminable.
+def _preflight_port_holders(port):
+    """EVERY listener on tcp <port> — [{'holder','pid','cmd','addr'}, …], or [].
+
+    Plural on purpose. One port number can carry several listeners on different
+    addresses and they do not collide: on a CloudTAK box, Caddy holds
+    <lan-ip>:9997 while cloudtak-media-1 publishes 127.0.0.1:9997. Looking at
+    only the first row misattributes the port and refuses a legitimate deploy.
 
     `ss -lptnH` through _sudo_wrap first (PID + process name need privilege —
     unprivileged ss shows the socket but not its owner), then `lsof`, then bare
@@ -13748,6 +13757,7 @@ def _preflight_port_holder(port):
             continue
         if r.returncode != 0:
             continue
+        found = []
         for ln in (r.stdout or '').splitlines():
             cols = ln.split()
             if len(cols) < 4:
@@ -13759,12 +13769,17 @@ def _preflight_port_holder(port):
             mp = re.search(r'users:\(\("([^"]+)",pid=(\d+)', ln)
             if mp:
                 pid = int(mp.group(2))
-                return {'holder': mp.group(1), 'pid': pid, 'cmd': _preflight_cmdline(pid), 'addr': local}
-            return {'holder': '', 'pid': None, 'cmd': '', 'addr': local}
+                found.append({'holder': mp.group(1), 'pid': pid,
+                              'cmd': _preflight_cmdline(pid), 'addr': local})
+            else:
+                found.append({'holder': '', 'pid': None, 'cmd': '', 'addr': local})
+        if found:
+            return found
         if privileged:
             # ss ran fine and reported nothing on this port — genuinely free.
-            return None
+            return []
     # ss unusable entirely (both forms failed) — try lsof before giving up.
+    holders = []
     try:
         r = subprocess.run(_sudo_wrap(['lsof', '-nP', '-iTCP:%d' % port, '-sTCP:LISTEN']),
                            capture_output=True, text=True, timeout=8)
@@ -13773,11 +13788,11 @@ def _preflight_port_holder(port):
             if len(cols) < 2 or not cols[1].isdigit():
                 continue
             pid = int(cols[1])
-            return {'holder': cols[0], 'pid': pid, 'cmd': _preflight_cmdline(pid),
-                    'addr': cols[-1] if cols else ''}
+            holders.append({'holder': cols[0], 'pid': pid, 'cmd': _preflight_cmdline(pid),
+                            'addr': cols[-1] if cols else ''})
     except Exception:
         pass
-    return None
+    return holders
 
 
 def _preflight_port_conflicts(module_key, extra_ports=None, only_ports=None):
@@ -13820,36 +13835,47 @@ def _preflight_port_conflicts(module_key, extra_ports=None, only_ports=None):
             if port in seen:
                 continue
             seen.add(port)
-            h = _preflight_port_holder(port)
-            if not h:
+            holders = _preflight_port_holders(port)
+            if not holders:
                 continue
-            holder = (h.get('holder') or '')
             container = publishers.get(port, '')
-            if container:
-                # A docker-published port belongs to its container, not to the
-                # docker-proxy shim — report (and match ownership on) the container.
-                low = container.lower()
-                if any(frag in low for frag in own_containers):
+            container_is_ours = bool(container) and any(f in container.lower() for f in own_containers)
+            # A port can carry SEVERAL listeners on different addresses. If ANY of
+            # them is ours, the port is ours — a redeploy legitimately finds its own
+            # listener. Only refuse when EVERY holder is foreign. Bias is deliberate:
+            # a missed conflict just reverts to the old behaviour, a false conflict
+            # blocks a legitimate deploy (which is exactly what 9997 did in T&E).
+            ours, foreign = False, []
+            for h in holders:
+                name = (h.get('holder') or '')
+                low = name.lower()
+                if low and any(pn in low for pn in own_procs):
+                    ours = True
+                    break
+                if low == 'docker-proxy':
+                    if container_is_ours or not container:
+                        # ours, or `docker ps` could not tell us whose container it
+                        # is — never refuse on a guess.
+                        ours = True
+                        break
+                    foreign.append({**h, 'holder': container})
                     continue
-                if holder in ('', 'docker-proxy'):
-                    holder = container
-            elif holder == 'docker-proxy':
-                # Some container publishes it but `docker ps` told us nothing — we
-                # cannot tell whose. Never refuse on a guess.
+                if not low:
+                    # Taken, but the owner is not visible (unprivileged ss). Ours if
+                    # one of our own units is up.
+                    if unit_active is None:
+                        unit_active = any(_preflight_unit_active(u) for u in own_units)
+                    if unit_active:
+                        ours = True
+                        break
+                    foreign.append({**h, 'holder': 'unknown (process owner not visible '
+                                                   '— run the command below as root)'})
+                    continue
+                foreign.append(h)
+            if ours or not foreign:
                 continue
-            elif holder:
-                if any(pn in holder.lower() for pn in own_procs):
-                    continue
-            else:
-                # Port is taken but the owner is not visible (unprivileged ss).
-                # Ours if one of our own units is up; otherwise a real conflict we
-                # can name only by port.
-                if unit_active is None:
-                    unit_active = any(_preflight_unit_active(u) for u in own_units)
-                if unit_active:
-                    continue
-                holder = 'unknown (process owner not visible — run the command below as root)'
-            conflicts.append({'port': port, 'label': label, 'holder': holder,
+            h = foreign[0]
+            conflicts.append({'port': port, 'label': label, 'holder': h['holder'],
                               'pid': h.get('pid'), 'cmd': h.get('cmd') or '',
                               'addr': h.get('addr') or ''})
         return conflicts
