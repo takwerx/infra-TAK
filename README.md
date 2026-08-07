@@ -93,7 +93,7 @@ Then open your browser to the URL shown and log in.
 
 **Upgrading from v0.1.x to v0.2.0:** v0.2.0 switches from Flask dev server to gunicorn (production server). The upgrade is automatic — just `git pull` and restart. On first restart, the console installs gunicorn, rewrites the systemd service, and starts the production server transparently. No manual steps needed.
 
-**Password not working after update?** Use the **backdoor**: **https://&lt;VPS_IP&gt;:5001**. If login spins or fails, on the server run (from the directory the console runs from — shown by **`systemctl cat takwerx-console | grep WorkingDirectory`**, e.g. `/opt/infratak`): **`sudo ./fix-console-after-pull.sh`** — it pins the config path in the systemd unit and prompts you to set a new password so you can log in again. Alternatively run `sudo ./reset-console-password.sh` from that same directory. After pulling, open the Caddy module and re-save your domain once so the Caddyfile (login bypass) is applied.
+**Password not working after update?** Use the **backdoor**: **https://&lt;VPS_IP&gt;:5001** (on a **hardened** server that port is closed — tunnel in with `ssh -L 5001:localhost:5001 <user>@<VPS_IP>` and use `https://localhost:5001` instead; see [Recovery](#recovery--backdoor-when-authentik-or-caddy-is-broken)). If login spins or fails, on the server run (from the directory the console runs from — shown by **`systemctl cat takwerx-console | grep WorkingDirectory`**, e.g. `/opt/infratak`): **`sudo ./fix-console-after-pull.sh`** — it pins the config path in the systemd unit and prompts you to set a new password so you can log in again. Alternatively run `sudo ./reset-console-password.sh` from that same directory. After pulling, open the Caddy module and re-save your domain once so the Caddyfile (login bypass) is applied.
 
 ## Recovery / backdoor (when Authentik or Caddy is broken)
 
@@ -101,7 +101,27 @@ Git / version / **Update Now** issues: use **[Universal recovery (SSH)](#univers
 
 If Authentik or Caddy is down and you can't reach **https://infratak.yourdomain.com**:
 
-- **Backdoor:** Open **https://&lt;VPS_IP&gt;:5001** in your browser (use the server's real IP, not the domain). Log in with the **console password** you set when you ran `start.sh`. That path skips Caddy and Authentik, so you can get back into the console and fix things.
+- **Backdoor:** Open **https://&lt;VPS_IP&gt;:5001** in your browser (use the server's real IP, not the domain). Log in with the **console password** you set when you ran `start.sh`. That path skips Caddy and Authentik, so you can get back into the console and fix things. **If you have applied Hardening (W1), this port is closed — see the next section.**
+
+### If you have applied Hardening (Cyber Controls W1 — SSO + MFA)
+
+**The direct-IP backdoor above is closed on purpose once W1 is applied.** That control's whole point is that the console must not be reachable from the internet with only a password — otherwise anyone could bypass SSO and MFA entirely. So on a hardened server, `https://<VPS_IP>:5001` will simply time out.
+
+On those servers the recovery path is an **SSH tunnel**. From your own computer:
+
+```bash
+ssh -L 5001:localhost:5001 <user>@<VPS_IP>
+```
+
+Leave that session open, then browse to **https://localhost:5001** and log in with the **console password**. The tunnel reaches the console directly, so it works even when Caddy is completely down — and the password login is deliberately preserved for exactly this case.
+
+> **This means SSH access is your only way back in on a hardened server.** If you lose both the console password and SSH access to the box, there is no remote recovery. Keep the console password in a password manager and make sure at least one SSH key still works.
+
+Not sure whether a server is hardened? Check on the box:
+
+```bash
+sudo grep -o '"posture": *"[a-z]*"' /opt/infratak/.config/hardening.json 2>/dev/null || echo "not hardened"
+```
 
 The console password is stored as a **hash** in the install directory at `.config/auth.json` (e.g. `/opt/infratak/.config/auth.json`). You **cannot** recover the plaintext password from that file. If you forget it, run the reset script **from the directory the console runs from** — a server can carry more than one clone, and only the one in the systemd unit counts (the script refuses to run from the wrong one):
 
@@ -111,7 +131,7 @@ cd /opt/infratak   # ← use the directory the line above shows
 sudo ./reset-console-password.sh
 ```
 
-Enter a new password twice; the script updates `.config/auth.json` and restarts the console. Then use **https://&lt;VPS_IP&gt;:5001** with the new password. Store the console password somewhere safe (e.g. password manager); it's your only way in when the domain or Authentik is broken.
+Enter a new password twice; the script updates `.config/auth.json` and restarts the console. Then log in with the new password — at **https://&lt;VPS_IP&gt;:5001**, or at **https://localhost:5001** through the SSH tunnel above if the server is hardened. Store the console password somewhere safe (e.g. password manager); it's your only way in when the domain or Authentik is broken.
 
 ## Deployment Order
 
@@ -215,7 +235,7 @@ platform-abstraction seams, and where the decomposition is headed:
 
 | Service | Port | Protocol | Description |
 |---------|------|----------|-------------|
-| infra-TAK Console | 5001 | HTTPS | Management web UI (backdoor: direct IP access) |
+| infra-TAK Console | 5001 | HTTPS | Management web UI (backdoor: direct IP access). **Closed to the internet once Hardening W1 is applied** — reach it via SSH tunnel, see [Recovery](#recovery--backdoor-when-authentik-or-caddy-is-broken). |
 | Caddy | 80 | HTTP | Redirect to HTTPS |
 | Caddy | 443 | HTTPS | Reverse proxy for all services (Let's Encrypt) |
 | TAK Server | 8089 | TLS | TAK client connections (ATAK, iTAK, WinTAK) |
