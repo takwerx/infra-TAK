@@ -59145,9 +59145,17 @@ def wait_for_package_lock():
 # (defined with _PGDG_REMOTE_SETUP_SH above _setup_server_one); here we additionally
 # reuse whatever a third party already configured.
 def _pgdg_existing_apt_sources():
-    """Files under /etc/apt that already configure apt.postgresql.org, EXCLUDING
-    our own pgdg.list. Covers sources.list, *.list and *.sources (deb822 — 24.04
-    is migrating to it)."""
+    """Every file under /etc/apt that configures apt.postgresql.org, as
+    [(path, is_ours), …]. Covers sources.list, *.list and *.sources (deb822 —
+    24.04 is migrating to it).
+
+    `is_ours` is decided by CONTENT, not filename: a file is ours only if it
+    points at _PGDG_KEYRING. Filename is not ownership — Debian's
+    postgresql-common ships its own /etc/apt/sources.list.d/pgdg.list pointing at
+    /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc (found on a live box
+    during v10.1.27 T&E). Treating that name as ours would (a) hide it from the
+    duplicate scan and (b) make us DELETE a file we never wrote — the exact thing
+    this release promises never to do."""
     paths = ['/etc/apt/sources.list']
     try:
         d = '/etc/apt/sources.list.d'
@@ -59157,8 +59165,6 @@ def _pgdg_existing_apt_sources():
         pass
     hits = []
     for p in paths:
-        if os.path.abspath(p) == _PGDG_LIST:
-            continue
         try:
             with open(p, 'r', errors='replace') as f:
                 body = f.read()
@@ -59167,7 +59173,7 @@ def _pgdg_existing_apt_sources():
         for ln in body.splitlines():
             s = ln.strip()
             if s and not s.startswith('#') and _PGDG_APT_HOST in s:
-                hits.append(p)
+                hits.append((p, _PGDG_KEYRING in body))
                 break
     return hits
 
@@ -59204,16 +59210,24 @@ def _setup_pgdg_apt_source():
     wrote_ours = False
 
     if existing:
-        log_step(f"  Existing PGDG source detected at {existing[0]} — reusing it")
+        theirs = [p for p, ours in existing if not ours]
+        ours_files = [p for p, ours in existing if ours]
+        primary = (theirs or ours_files)[0]
+        log_step(f"  Existing PGDG source detected at {primary} — reusing it")
         if len(existing) > 1:
-            for p in existing[1:]:
-                log_step(f"  ⚠ Another PGDG source is also present: {p}")
-            log_step("  ⚠ Two sources for one repo will break apt if their signed-by paths differ.")
-        # If a PREVIOUS infra-TAK deploy left our spelling next to theirs, that pair
-        # IS the conflict — and ours is the one we are allowed to remove.
-        if os.path.exists(_PGDG_LIST):
-            log_step(f"  Removing our duplicate {_PGDG_LIST} (theirs is authoritative)")
-            subprocess.run(_sudo_wrap(['rm', '-f', _PGDG_LIST]), capture_output=True, timeout=60)
+            for p, _o in existing:
+                if p != primary:
+                    log_step(f"  ⚠ Another PGDG source is also present: {p}")
+            log_step("  ⚠ Two sources for one repo break apt outright if their signed-by paths differ.")
+        # A duplicate pair is the conflict. We may only remove a file WE wrote —
+        # ownership by content (points at our keyring), never by filename.
+        if theirs and ours_files:
+            for p in ours_files:
+                log_step(f"  Removing our duplicate {p} (the pre-existing one is authoritative)")
+                subprocess.run(_sudo_wrap(['rm', '-f', p]), capture_output=True, timeout=60)
+        elif len(theirs) > 1:
+            log_step("  ⚠ Both duplicates belong to this box, not to infra-TAK — we will NOT")
+            log_step("    remove either. Delete the one you do not want, then retry.")
     else:
         log_step("  Adding PostgreSQL GPG key...")
         # v10.0.5 non-root: fetch the key as takwerx, then write key + list through
