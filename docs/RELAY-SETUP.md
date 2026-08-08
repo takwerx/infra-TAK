@@ -145,8 +145,12 @@ touch a command line.
 ### The fast way — Cloud Shell (recommended)
 
 First get your security list's OCID. **☰ menu → Networking → Virtual Cloud Networks →
-TAK-RELAY-VCN → Security tab → Default Security List for TAK-RELAY-VCN.** The **OCID** is right
-there on the page that opens, with a **Copy** button next to it.
+TAK-RELAY-VCN → Security tab → click "Default Security List for TAK-RELAY-VCN".** The **OCID** is on
+that page with a **Copy** button next to it.
+
+> ⚠️ **Make sure you're one level deep.** The VCN page also shows an OCID, and copying that one is an
+> easy mistake — the command then fails with `NotAuthorizedOrNotFound` / 404. Check the prefix: you
+> want the one starting **`ocid1.securitylist.`**, not `ocid1.vcn.`
 
 Then open **Cloud Shell** — the `>_` icon in the top bar of the Oracle console. It comes with the OCI
 CLI already signed in as you; there is no API key to set up.
