@@ -117,6 +117,26 @@ Leave that session open, then browse to **https://localhost:5001** and log in wi
 
 > **This means SSH access is your only way back in on a hardened server.** If you lose both the console password and SSH access to the box, there is no remote recovery. Keep the console password in a password manager and make sure at least one SSH key still works.
 
+### If your box is behind a relay (no public inbound)
+
+Both paths above assume you can reach the box's own address. A **relayed** box — behind CGNAT, Starlink or cellular — doesn't have one, and the relay's public IP is the relay, not your box. So `https://<VPS_IP>:5001` and a plain `ssh <user>@<VPS_IP>` both have nothing to connect to.
+
+You don't need to open any ports for this. The relay is already an SSH server you can reach, and your box always sits at **`172.31.99.2`** at the other end of the tunnel. Hop through the relay and forward the console's port back to yourself. From your own computer:
+
+```bash
+ssh-add ~/Downloads/your-relay-key.key
+ssh -J ubuntu@<RELAY_IP> -L 5001:localhost:5001 <user>@172.31.99.2
+```
+
+Leave that session open and browse to **https://localhost:5001**, exactly as above.
+
+- `ubuntu` is the relay's login (Oracle's Ubuntu images use it). `172.31.99.2` is the same on every infra-TAK box — it's the box's address inside the tunnel, not something you set.
+- **`ssh-add` matters:** `-i` applies only to the box at the far end, not to the hop through the relay, so a `-i`-only command fails with `Permission denied (publickey)` at the relay.
+- If the relay refuses your key, check its permissions — a `.key` file left at `0644` is ignored with only a warning. `chmod 600` it.
+- Works whether or not the box is hardened: the traffic arrives over the tunnel as if you were next to the box, and nothing is exposed to the internet.
+
+Full relay documentation: [docs/RELAY-SETUP.md](docs/RELAY-SETUP.md).
+
 Not sure whether a server is hardened? Check on the box:
 
 ```bash
