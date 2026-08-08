@@ -310,6 +310,41 @@ The console SSHes into the relay, installs and configures everything, and brings
 the status line reads **● Tunnel UP**, your box is reachable through the relay from anywhere — no
 further steps, and it re-connects on its own every time your box changes networks.
 
+## Getting in when the web side is broken
+
+Normally you reach the console at `https://your-domain` with SSO in front of it. If Caddy or
+Authentik is down, that door is shut — and on a relayed box there's no direct-IP fallback either.
+
+You don't need to open anything for this. Your relay is already an SSH server you can reach, and
+your box sits at the fixed address **`172.31.99.2`** on the other end of the tunnel. So you hop
+through the relay and forward the console's port back to your own machine.
+
+First load the relay key into your SSH agent — `-i` on its own does **not** apply to the hop through
+the relay, only to the box at the far end:
+
+```bash
+chmod 600 ~/Downloads/your-relay-key.key      # once, if you haven't already
+ssh-add ~/Downloads/your-relay-key.key
+```
+
+Then, in one command:
+
+```bash
+ssh -J ubuntu@<relay-ip> -L 5001:localhost:5001 <your-box-user>@172.31.99.2
+```
+
+Leave that session open and browse to **https://localhost:5001**. That's the console, reached
+directly, with the password login that exists for exactly this situation.
+
+- `ubuntu` is the relay's login (Oracle's Ubuntu images use it); `<your-box-user>` is whatever you
+  log into your box with.
+- `172.31.99.2` is the same on every infra-TAK box — it's the box's address inside the tunnel, not
+  something you configure.
+- This works whether or not the box is hardened, because the traffic arrives over the tunnel as if
+  you were sitting next to it. Nothing is exposed to the internet.
+- If SSH to the relay is refused, check the key file's permissions first — `0644` makes SSH ignore
+  it silently apart from a warning.
+
 ## Free Tier vs Pay As You Go — read this before you rely on a relay
 
 Oracle reclaims **idle** Always Free compute instances. An instance counts as idle if, over a 7-day
