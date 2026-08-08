@@ -33,12 +33,19 @@ Virtual Cloud Networks → Actions → Start VCN Wizard**.)
 
 That one wizard builds the VCN, a public subnet, a private subnet, an internet gateway, a NAT
 gateway, a service gateway, and the route tables. The relay only uses the public subnet; the rest is
-harmless. The amber "Resource availability checked successfully" box is informational — close it.
+harmless. The amber "Resource availability checked successfully" box along the way is informational,
+not a problem.
+
+When it finishes it offers **View VCN** — you don't need to look at anything, so go straight on to
+1b.
 
 ### 1b. The VM (about 3 minutes)
 
-Home page → **Build** → **Create a VM instance**. The wizard runs across four sections — *Basics →
-Security → Networking → Storage*.
+Click the **Cloud** logo at the top-left to get back to the home page, then scroll down to the
+**Build** section and click **Create a VM instance**. (Build is a panel on the home page, not a menu.
+Long way round: ☰ menu → **Compute → Instances → Create instance**.)
+
+The wizard runs across four sections — *Basics → Security → Networking → Storage*.
 
 **Basics**
 
