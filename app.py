@@ -10336,8 +10336,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '6bb58f2a9469dd5c3ce112b7f6f986de2fee4b62'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'be1ef1eb98561395e7a454ec5db10a5d3215dae89b871fb9d6f16e672b40418c'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '4c50902764bd6d1ab1dbad371c1b46f1c6cb6dc6'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = '0e82fed7626d6ff90d7f9e7b349f0489d6d5b6e4876d523524a5ef0a4370cca6'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
