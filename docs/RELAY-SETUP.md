@@ -12,7 +12,10 @@ relay's IP and upload the key file.
 
 ## 1. Create the VM
 
-In the [Oracle Cloud console](https://cloud.oracle.com) → **Compute → Instances → Create instance**.
+Sign in to the [Oracle Cloud console](https://cloud.oracle.com). On the home page, find the **Build**
+section and click **Create a VM instance**. (Same place the long way round: the ☰ menu →
+**Compute → Instances → Create instance**.)
+
 Oracle's wizard runs across four pages — *Basics → Security → Networking → Storage* — with a **Next**
 button at the bottom of each. Only two pages need anything from you.
 
