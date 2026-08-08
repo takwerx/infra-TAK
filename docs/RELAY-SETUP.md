@@ -144,8 +144,9 @@ touch a command line.
 
 ### The fast way — Cloud Shell (recommended)
 
-First get your security list's OCID: **your VCN → Security tab → Default Security List for
-TAK-RELAY-VCN**, copy the **OCID** from the Details tab.
+First get your security list's OCID. **☰ menu → Networking → Virtual Cloud Networks →
+TAK-RELAY-VCN → Security tab → Default Security List for TAK-RELAY-VCN.** On its **Details** tab
+there's an **OCID** row with a **Copy** button — that's what you need.
 
 Then open **Cloud Shell** — the `>_` icon in the top bar of the Oracle console. It comes with the OCI
 CLI already signed in as you; there is no API key to set up.
@@ -203,8 +204,9 @@ Refresh the **Security rules** page and you should see 16 ingress rules.
 
 ### The manual way — Oracle's dialog
 
-**Your VCN → Security tab → Default Security List for TAK-RELAY-VCN → Security rules tab → Add
-Ingress Rules.** There's a **+ Another Ingress Rule** button, so you can enter them all in one pass.
+**☰ menu → Networking → Virtual Cloud Networks → TAK-RELAY-VCN → Security tab → Default Security
+List for TAK-RELAY-VCN → Security rules tab → Add Ingress Rules.** There's a **+ Another Ingress
+Rule** button, so you can enter them all in one pass.
 For each rule: *Stateless* unchecked, **Source Type** CIDR, **Source CIDR** `0.0.0.0/0`, the protocol,
 and the port in **Destination Port Range**.
 
