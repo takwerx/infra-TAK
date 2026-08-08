@@ -279,61 +279,7 @@ anything else.
 > and data packages you've already handed to clients, so rebuilding the relay means re-issuing
 > configuration to every device in the field. With a domain name it's one DNS edit.
 
-## 5. Going beyond the defaults (optional)
-
-**A firewall rule is only half of a forward.** The security list decides what reaches the relay's
-network card; the relay's own forwarding table decides what actually gets carried down the tunnel to
-your box. Adding a rule for a port the relay doesn't forward is harmless but does nothing — the
-packet arrives and is dropped. This catches people out, because the security rules page then *looks*
-like the port is open.
-
-These two are worth adding, and each needs both halves. SSH to the relay
-(`ssh -i <your.key> ubuntu@<relay-ip>`) and run the matching command, then add the ingress rule:
-
-| Port | Gives you | On the relay |
-|---|---|---|
-| TCP **2222** | SSH to the box behind the relay, on 2222 → the box's 22 | `sudo iptables -t nat -I PREROUTING -p tcp --dport 2222 -j DNAT --to-destination 172.31.99.2:22` then `sudo iptables -I FORWARD -d 172.31.99.2 -p tcp --dport 22 -j ACCEPT` |
-| TCP **5001** | The infra-TAK console on the relay's public IP — see the warning below | same two commands with `5001` in place of both `2222` and `22` |
-
-Both commands use `-I` (insert), not `-A` (append) — that matters. Oracle's images ship a FORWARD
-chain that ends in a blanket REJECT, so an appended ACCEPT lands *after* the REJECT and never
-matches. The rule looks present in `iptables -S` and does nothing.
-
-Run `sudo netfilter-persistent save` afterwards so the rules survive a reboot. Re-running **Set Up
-Relay** from the console will not remove them — the setup script only ever adds rules, it never
-flushes.
-
-> **⚠️ Think before forwarding 5001.** That is the admin console, and it is deliberately a
-> direct-IP backdoor with no Caddy and no SSO in front of it — that design is fine on a LAN, and a
-> different proposition on a public Oracle address where anyone can reach the login page. The
-> supported path to the console from outside is HTTPS on 443 through Caddy, with Authentik in front.
-
-### Video through a relay
-
-All three MediaMTX streaming options work through a relay and are forwarded automatically — **RTSP**
-(8554), **RTSPS** (8322) and **SRT** (8890). The step-3 rules already cover all three.
-
-**If an SRT stream stutters, try a smaller packet size.** The tunnel runs at an MTU of 1280 bytes
-(deliberate — cellular carriers add IPv6 translation overhead, and anything larger silently breaks
-big packets on those networks), while SRT defaults to 1316. Streams generally play fine as-is on a
-clean connection; if yours breaks up over cellular or a lossy link, send at 1200:
-
-```
-srt://<relay-ip>:8890?streamid=<stream>&pkt_size=1200
-```
-
-Encoders expose this as *packet size*, *payload size* or `pkt_size`.
-
-RTSP needs nothing special — our MediaMTX ships `rtspTransports: [tcp]`, which is what a relay
-carries cleanly, and players negotiate it automatically.
-
-**Remote Assist screen sharing is the one thing still outside this** — CoTURN needs UDP 3479 plus a
-wide range of media ports, which isn't forwarded.
-
-Watching a stream *inside* the CloudTAK or MediaMTX web player works regardless of any of the above,
-because that's HTTPS on 443 rather than a raw video port.
-
-## 6. Finish in the console — automatically
+## 5. Finish in the console — automatically
 
 That's all the manual work. Back in infra-TAK → **Connectivity → Connect a Relay**:
 
@@ -382,6 +328,11 @@ stopped relay surfaces as an alert rather than a silent outage.
   some hotel and guest Wi-Fi permits *only* 443. The relay listens on whichever you picked and
   redirects the other to it, so you can switch in the console without touching Oracle again — as
   long as both UDP rules are open.
+- **If an SRT video stream stutters, send smaller packets.** The tunnel runs at an MTU of 1280 bytes
+  (deliberate — cellular carriers add IPv6 translation overhead, and anything larger silently breaks
+  big packets on those networks) while SRT defaults to 1316. Most streams play fine as-is; if yours
+  breaks up, add `&pkt_size=1200` to the URL — `srt://<relay-ip>:8890?streamid=<stream>&pkt_size=1200`.
+  Encoders call this *packet size*, *payload size* or `pkt_size`. RTSP needs nothing special.
 - **Privacy:** the relay is a packet forwarder with no TLS stack in the path, so it never terminates
   or decrypts a connection. TAK's mutual-TLS, HTTPS, and RTSPS all run end-to-end between the client
   and your box — the relay can't read any of it. Note that this cuts both ways: traffic that isn't
