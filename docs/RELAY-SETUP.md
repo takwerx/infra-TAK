@@ -145,10 +145,17 @@ the only part you do by hand.
 
 That list is exactly what the relay forwards — nothing else would get through even if you opened it.
 
-### The fast way — Cloud Shell (recommended)
+**There are two ways to enter them. Pick one, not both:**
 
-Oracle's rule dialog takes one entry per rule and has a trap in it (below). One paste does the lot
-instead, with no way to fat-finger it.
+- **Paste them all at once** — one command in Oracle's Cloud Shell sets every rule in the table.
+  Takes about a minute and can't be typed wrong. Carry on reading below.
+- **Type them in by hand** — Oracle's rule dialog, one row at a time. Skip ahead to
+  *[The manual way](#the-manual-way--oracles-dialog)*.
+
+Same result either way. The paste is recommended; the manual route is there if you'd rather not
+touch a command line.
+
+### The fast way — Cloud Shell (recommended)
 
 First get your security list's OCID: **your VCN → Security tab → Default Security List for
 TAK-RELAY-VCN**, copy the **OCID** from the Details tab.
