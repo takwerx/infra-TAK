@@ -161,8 +161,16 @@ First get your security list's OCID: **your VCN → Security tab → Default Sec
 TAK-RELAY-VCN**, copy the **OCID** from the Details tab.
 
 Then open **Cloud Shell** — the `>_` icon in the top bar of the Oracle console. It comes with the OCI
-CLI already signed in as you; there is no API key to set up. Paste this whole block, replacing the
-OCID on the last command with yours:
+CLI already signed in as you; there is no API key to set up.
+
+**Paste 1 — your OCID.** Type `SL=`, paste the OCID straight after it (no spaces, no quotes, no
+angle brackets), press Enter:
+
+```bash
+SL=ocid1.securitylist.oc1.phx.aaaaaaaaEXAMPLEEXAMPLEEXAMPLE
+```
+
+**Paste 2 — the rules.** Nothing in this one needs editing, so paste the whole block as-is:
 
 ```bash
 cat > ingress.json <<'EOF'
@@ -187,12 +195,17 @@ cat > ingress.json <<'EOF'
 EOF
 
 oci network security-list update \
-  --security-list-id <PASTE-YOUR-SECURITY-LIST-OCID> \
+  --security-list-id "$SL" \
   --ingress-security-rules file://ingress.json \
   --force
 ```
 
 Refresh the **Security rules** page and you should see 16 ingress rules.
+
+> **Why two pastes?** Editing a long command in a terminal is miserable — the arrow keys scroll
+> through command history instead of moving the cursor, so a mis-paste is easier to start over than
+> to fix. Putting the OCID in `SL` on its own line means the big block never needs touching. (If you
+> do need to move around a line: **Ctrl+A** jumps to the start, **Ctrl+E** to the end.)
 
 > **⚠️ This REPLACES the ingress list, it doesn't append.** That's why the first three entries
 > re-state the SSH and ICMP rules Oracle created with the VCN. Don't trim them — dropping the SSH row
