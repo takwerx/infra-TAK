@@ -410,6 +410,15 @@ PATH_ALLOW_EXACT = (
     '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
                                                  # the console, run by the gated systemd-run)
     '/etc/default/takserver',                    # TAK Server JVM heap (snapshot/restore + deploy)
+    # Relay tunnel config (Connectivity → Connect a Relay). _CONN_WG_IF is the
+    # fleet constant 'wg0', so this is one fixed file — NOT the /etc/wireguard/
+    # prefix, which would let the console plant configs for arbitrary interfaces.
+    # Inherent power: wg-quick(8) runs a config's PostUp/PostDown as root, so this
+    # is a root-exec primitive — but no broader than `systemctl start` of a unit
+    # the console already writes into /etc/systemd/system/ (see the note at the
+    # top of EXEC_ALLOW). Granted deliberately: without it the relay setup dies at
+    # `install ... /etc/wireguard/wg0.conf` on every born-non-root box (issue #58).
+    '/etc/wireguard/wg0.conf',
 )
 
 # NEVER, even inside an allowed prefix — the escalation / credential surface and
