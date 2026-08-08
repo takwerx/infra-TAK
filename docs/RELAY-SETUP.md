@@ -103,24 +103,24 @@ you terminate the instance.
 > tells you so ("This VCN already has an internet gateway", "already has the needed route rule").
 > Running it anyway just creates a stray network security group.
 
-### Should you reserve it?
+### Do you need to make the IP permanent?
 
-**Running one box? Yes — do it.** A *reserved* address survives rebuilding the VM, and Oracle
-doesn't charge for it (your tenancy includes one). It costs a few clicks now and saves you a mess
-later, because a relay's address ends up inside enrollment packages and data packages you've already
-handed to clients.
+**No — use a domain name instead.** Point an A record at the relay (step 4) and put *that name*,
+never the raw address, in enrollment packages and data packages. If you ever rebuild the relay and
+get a new address, you edit one DNS record and every client in the field keeps working. You need
+that A record anyway — it's how Let's Encrypt reaches port 80 to issue your certificate.
 
-- Click your VNIC name → **IP administration** tab → the primary IP row → **⋮ → Edit**.
-- Set **Public IP type: Reserved public IP** → create a new one → **Update**.
+The address you have now is *ephemeral*, which is less fragile than it sounds: it survives reboots
+and stop/start, and is only released if you **terminate** the instance.
 
-**Running several relays, or just testing? Don't bother.** The included allowance is one address, and
-relays don't get rebuilt in normal operation. If you ever do rebuild one, changing a DNS A record
-takes ten seconds.
-
-> **Either way, hand clients a domain name, not the raw IP.** Point an A record at the relay and use
-> that name in enrollment and data packages. Then a rebuilt relay is one DNS edit instead of
-> re-issuing configuration to every client in the field. You need that A record anyway — it's how
-> Let's Encrypt reaches port 80 to issue your certificate.
+> **Ignore the ⋮ → "Reserve IPv4 address" menu item on the IP administration tab.** Despite the
+> name, it reserves the VM's **private** `10.0.0.x` address — the confirmation dialog says "Reserve
+> private IPv4 address". It does nothing for your public address.
+>
+> Oracle's *Edit* dialog on that row offers only **No public IP** and **Ephemeral public IP** — there
+> is no "Reserved public IP" option there, whatever older guides (including earlier versions of this
+> one) say. Reserved public addresses are now their own resource under **Networking → IP
+> Management → Reserved public IPs**. You don't need one for a relay.
 
 ## 3. Open the ports
 
@@ -242,7 +242,8 @@ In the instance wizard's **Networking** section choose **Select existing virtual
 
 That's all. Because the port rules live on a *security list attached to the subnet*, the new VM
 inherits every one of them the moment it launches — nothing to opt into, no NSG to select. **You can
-skip steps 1a and 3 entirely**, apart from giving the new VM its own Reserved public IP.
+skip steps 1a and 3 entirely**. Give the new relay its own DNS name pointing at its own
+public address and you're done.
 
 Two relays in one VCN don't interfere: each gets its own private and public address, and each one's
 WireGuard overlay (`172.31.99.x`) exists only on its own machine.
@@ -381,7 +382,7 @@ stopped relay surfaces as an alert rather than a silent outage.
 
 ## Notes
 
-- **Cost:** Oracle's Always Free tier covers this VM and a reserved IP at no charge.
+- **Cost:** Oracle's Always Free tier covers this VM at no charge.
 - **Why two tunnel ports:** 51820 is WireGuard's standard port and the carrier-safe default —
   cellular networks run QUIC-aware middleboxes that sometimes eat non-QUIC traffic on UDP 443. But
   some hotel and guest Wi-Fi permits *only* 443. The relay listens on whichever you picked and
