@@ -88,39 +88,15 @@ packets and stores nothing. Don't attach a block volume.
 
 Then **Create**, and wait for the instance to show **Running**.
 
-## 2. Give it a public IP
+## 2. Note the relay's IP
 
-Your VM already has a public address — it's on the instance's **Networking** tab as **Public IPv4
-address**. That address is *ephemeral*: it survives reboots and stop/start, and is only released if
-you terminate the instance.
+Your VM already has a public address. On the instance page → **Details** tab → **Public IP
+address**. **Write it down — that's your relay's IP**, and it's the one thing the console asks you
+for in step 6.
 
-- On the instance page → **Details** tab → **Public IP address** (also on the **Networking** tab as
-  *Public IPv4 address*). **Note it down — this is your relay's IP.**
-
-> **You do NOT need the "Connect public subnet to internet" quick action.** Older versions of this
-> guide told you to run it. The VCN wizard in step 1a already created the internet gateway and the
-> route rule, so that quick action has nothing left to do — open it on a wizard-built VCN and it
-> tells you so ("This VCN already has an internet gateway", "already has the needed route rule").
-> Running it anyway just creates a stray network security group.
-
-### Do you need to make the IP permanent?
-
-**No — use a domain name instead.** Point an A record at the relay (step 4) and put *that name*,
-never the raw address, in enrollment packages and data packages. If you ever rebuild the relay and
-get a new address, you edit one DNS record and every client in the field keeps working. You need
-that A record anyway — it's how Let's Encrypt reaches port 80 to issue your certificate.
-
-The address you have now is *ephemeral*, which is less fragile than it sounds: it survives reboots
-and stop/start, and is only released if you **terminate** the instance.
-
-> **Ignore the ⋮ → "Reserve IPv4 address" menu item on the IP administration tab.** Despite the
-> name, it reserves the VM's **private** `10.0.0.x` address — the confirmation dialog says "Reserve
-> private IPv4 address". It does nothing for your public address.
->
-> Oracle's *Edit* dialog on that row offers only **No public IP** and **Ephemeral public IP** — there
-> is no "Reserved public IP" option there, whatever older guides (including earlier versions of this
-> one) say. Reserved public addresses are now their own resource under **Networking → IP
-> Management → Reserved public IPs**. You don't need one for a relay.
+That's the whole step. The address stays put through reboots and stop/start; it only changes if you
+terminate the instance and build a new one. In step 4 you'll point a domain name at it, so even that
+is a one-line DNS edit rather than a problem.
 
 ## 3. Open the ports
 
