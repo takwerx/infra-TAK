@@ -21,9 +21,12 @@ This is two parts — **the network first, then the VM.**
 
 ### 1a. The network (about 2 minutes)
 
-Sign in to the [Oracle Cloud console](https://cloud.oracle.com). On the home page, find the **Build**
-section and click **Set up a network with a wizard**. (Long way round: ☰ menu → **Networking →
-Virtual Cloud Networks → Actions → Start VCN Wizard**.)
+Sign in to the [Oracle Cloud console](https://cloud.oracle.com), then get to the home page: **☰ menu
+(top-left) → Home → Infrastructure**. Scroll down to the **Build** panel and click **Set up a network
+with a wizard**.
+
+(Long way round if you prefer menus: ☰ → **Networking → Virtual Cloud Networks → Actions → Start VCN
+Wizard**.)
 
 1. Choose **Create VCN with internet connectivity** → **Start VCN Wizard**.
 2. **VCN name:** `TAK-RELAY-VCN`. **Compartment:** your root/tenancy compartment.
@@ -41,9 +44,10 @@ When it finishes it offers **View VCN** — you don't need to look at anything, 
 
 ### 1b. The VM (about 3 minutes)
 
-Click the **Cloud** logo at the top-left to get back to the home page, then scroll down to the
-**Build** section and click **Create a VM instance**. (Build is a panel on the home page, not a menu.
-Long way round: ☰ menu → **Compute → Instances → Create instance**.)
+Back to the home page the same way — **☰ menu → Home → Infrastructure** — then scroll to the **Build**
+panel and click **Create a VM instance**.
+
+(Long way round: ☰ → **Compute → Instances → Create instance**.)
 
 The wizard runs across four sections — *Basics → Security → Networking → Storage*.
 
