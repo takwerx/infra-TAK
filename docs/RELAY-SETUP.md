@@ -216,11 +216,9 @@ Both do the same job — allow or deny traffic. The difference is what they atta
 list** attaches to the *subnet*, so it covers everything launched into it. A **network security
 group** attaches to individual *VNICs* and has to be opted into per instance.
 
-The VCN wizard gives you a security list and no NSG, which is why this guide uses one. (Older
-versions of this guide referenced `ig-quick-action-NSG` — that group only existed as a side effect of
-the "Connect public subnet to internet" quick action, which step 2 no longer uses.) The subnet
-attachment is also why a second relay needs no firewall work at all: launch it into the same public
-subnet and it inherits every rule above.
+Your relay has a security list and no NSG — that's what the VCN wizard builds. The subnet attachment
+is also why a second relay needs no firewall work at all: launch it into the same public subnet and
+it inherits every rule above.
 
 ### What about all the other ports?
 
