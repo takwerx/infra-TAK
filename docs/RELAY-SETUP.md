@@ -67,8 +67,10 @@ Your VM already has a public address — it's on the instance's **Networking** t
 address**. That address is *ephemeral*: it survives reboots and stop/start, and is only released if
 you terminate the instance.
 
-- On the instance page → **Networking** tab. If you see a **"Connect public subnet to internet"**
-  quick action, click **Connect** and apply it (this adds the internet gateway).
+- On the instance page → **Networking** tab, **scroll to the bottom** to **Quick actions** → click
+  **Connect** under *Connect public subnet to internet*. This is expected on a new relay, not an
+  error — it adds the internet gateway, a network security group, and the route rule the subnet
+  needs to be reachable.
   - **Skip this if you reused an existing relay's subnet** — it already has a gateway, and clicking
     it creates a second NSG and rewrites the route table for nothing.
 - **Note the address down — this is your relay's IP.**

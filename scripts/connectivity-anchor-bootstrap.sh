@@ -46,14 +46,21 @@ WEB_PORTS="${WEB_PORTS:-80 443}"           # Caddy: Let's Encrypt ACME challenge
 # v10.1.10: MediaMTX video. The configurator offers RTSP, RTSPS and SRT, so a relayed
 # box carries all three.
 MEDIA_PORTS="${MEDIA_PORTS:-8554 8322}"    # 8554 RTSP · 8322 RTSPS
-FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS"   # TCP forwards
+# v10.1.28: EUD Remote Assist. CoTURN listens on 3479 (the Remote-Assist fleet
+# constant — 3478 is NetBird's) for TCP and UDP, and relays the actual media over
+# the UDP range pinned in our turnserver.conf (min-port=50000/max-port=50050).
+# Without these a relayed box can run Remote Assist locally but no remote peer can
+# ever complete NAT traversal through the relay.
+RA_PORTS="${RA_PORTS:-3479}"               # CoTURN STUN/TURN control channel
+RA_UDP_RANGE="${RA_UDP_RANGE:-50000:50050}"  # CoTURN relayed media (pinned range)
+FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS $RA_PORTS"   # TCP forwards
 # UDP forwards. SRT is UDP by protocol design, and until v10.1.10 this script only ever
 # wrote `-p tcp` rules — which made SRT look like something a relay fundamentally could
 # not carry. It isn't: DNAT handles UDP, the MASQUERADE and ESTABLISHED/RELATED rules
 # below are protocol-agnostic, and WireGuard carries UDP natively. It was simply never
 # written. RTSP's UDP transport (8000/8001) stays out on purpose — our MediaMTX ships
 # `rtspTransports: [tcp]`, so no client negotiates it.
-UDP_FWD_PORTS="${UDP_FWD_PORTS:-8890}"     # 8890 SRT
+UDP_FWD_PORTS="${UDP_FWD_PORTS:-8890 3479}"   # 8890 SRT · 3479 CoTURN control
 PROBER_PORT="5099"
 PROBER_DIR="/opt/takwerx-prober"
 PROBER_TOKEN_FILE="/etc/takwerx-prober.token"
@@ -111,6 +118,15 @@ apply_forward_rules() {
         ipt_ensure nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "${BOX_WG_IP}:${p}"
         ipt_ensure filter FORWARD -d "$BOX_WG_IP" -p udp --dport "$p" -j ACCEPT
     done
+    # UDP RANGE forwards (CoTURN relayed media). A range needs a PORT-LESS DNAT
+    # target: `--to-destination IP:min-max` remaps to an arbitrary port inside the
+    # range, which breaks TURN — the peer must reach the exact port CoTURN handed
+    # out in its allocation. `--to-destination IP` with no port preserves the
+    # original destination port, which is what a media relay requires.
+    for r in $RA_UDP_RANGE; do
+        ipt_ensure nat PREROUTING -p udp --dport "$r" -j DNAT --to-destination "$BOX_WG_IP"
+        ipt_ensure filter FORWARD -d "$BOX_WG_IP" -p udp --dport "$r" -j ACCEPT
+    done
     ipt_ensure nat POSTROUTING -o "$WG_IF" -d "$BOX_WG_IP" -j MASQUERADE
     ipt_ensure filter FORWARD -s "$BOX_WG_IP" -m state --state ESTABLISHED,RELATED -j ACCEPT
     # Anchor-local inbound: WireGuard dial-in (Oracle INPUT chain also ends in REJECT).
@@ -135,6 +151,7 @@ apply_forward_rules() {
         for p in $UDP_FWD_PORTS; do
             [ "$p" = "$WG_PORT" ] || [ "$p" = "$WG_ALT_PORT" ] || ufw allow "${p}/udp" >/dev/null
         done
+        for r in $RA_UDP_RANGE; do ufw allow "${r}/udp" >/dev/null; done
     fi
     persist_iptables
 }
