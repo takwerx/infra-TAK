@@ -34031,10 +34031,22 @@ def _ak_api_call(url, data=None, method='GET', headers=None, max_retries=3, time
 # with supported config only: a `static` prompt field emitting the checkbox, and brand CSS that
 # unmasks siblings when it is checked. Marker string _AK_SHOWPW_MARKER makes the CSS idempotent.
 _AK_SHOWPW_MARKER = 'infra-TAK-showpw'
+# The checkbox flips the inputs' type via an inline onchange handler. Field-verified on
+# ops1: authentik serves flow pages with NO Content-Security-Policy header, so an inline
+# handler runs (a <script> tag would NOT — this HTML lands via innerHTML, which never
+# executes script elements). Walking shadowRoot too, because the CSS-only version below
+# could not reach the inputs. Toggling `type` also works in Firefox, which the CSS
+# fallback cannot (no -webkit-text-security there). data-pw marks what we flipped so
+# unchecking restores only those inputs.
 _AK_SHOWPW_FIELD_HTML = (
     '<label style="display:flex;gap:8px;align-items:center;font-size:13px;'
     'cursor:pointer;margin:-8px 0 4px">'
-    '<input type="checkbox" id="showpw" style="cursor:pointer"> Show password</label>'
+    '<input type="checkbox" id="showpw" style="cursor:pointer" onchange="'
+    "var c=this.checked;var f=function(r){r.querySelectorAll('input').forEach("
+    "function(i){if(c){if(i.type==='password'){i.type='text';i.setAttribute('data-pw','1')}}"
+    "else{if(i.getAttribute('data-pw')){i.type='password'}}});"
+    "r.querySelectorAll('*').forEach(function(e){if(e.shadowRoot){f(e.shadowRoot)}})};f(document)"
+    '"> Show password</label>'
 )
 _AK_SHOWPW_CSS = (
     '/* ' + _AK_SHOWPW_MARKER + ': reveal toggle for the password reset prompt.\n'
