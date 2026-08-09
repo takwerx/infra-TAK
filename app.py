@@ -11548,7 +11548,12 @@ def connectivity_setup_ap_start_api():
                        capture_output=True, text=True, timeout=15)
     except Exception:
         pass
-    r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'takwerx-setup-ap.service']),
+    # restart, not start. The unit is Type=oneshot RemainAfterExit=yes, so if it is
+    # left stale-active (the watcher used to stop the AP by calling the engine behind
+    # systemd's back) `start` silently does NOTHING and this button appears dead —
+    # exactly what ops1 showed on 2026-08-09: unit "active (exited)", AP down, press
+    # Start, no AP, no error. restart always runs ExecStart.
+    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-setup-ap.service']),
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         try:

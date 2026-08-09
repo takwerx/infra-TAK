@@ -100,7 +100,13 @@ if uplink_ok; then
     # it was gone (ops1 2026-08-09: up 18:04:05, stopped 18:04:12). Only the console's
     # Stop button, or `tak-setup-ap.sh stop`, clears MANUAL_FLAG.
     if AP_UP && [ ! -f "$MANUAL_FLAG" ]; then
-        "$ENGINE" stop >/dev/null 2>&1
+        # Go through systemd, NOT the engine directly. takwerx-setup-ap.service is
+        # Type=oneshot RemainAfterExit=yes, so calling "$ENGINE" behind systemd's back
+        # left the unit reading "active (exited)" while the AP was actually down —
+        # and systemd then treats every later `systemctl start` as a no-op, silently
+        # killing the console's Start button until someone issues a manual stop
+        # (ops1 2026-08-09: unit active(exited), AP down, start did nothing).
+        systemctl stop takwerx-setup-ap.service >/dev/null 2>&1
     fi
     exit 0
 fi
@@ -127,5 +133,8 @@ ELAPSED=$(( $(now) - SINCE ))
 # Fresh-boot-with-no-wifi ⇒ immediate (we're just past BOOT_GRACE, no client
 # connected). Runtime drop ⇒ require RUN_GRACE of sustained no-uplink.
 if [ "$UPTIME_S" -le $(( BOOT_GRACE + 60 )) ] || [ "$ELAPSED" -ge "$RUN_GRACE" ]; then
-    "$ENGINE" start >/dev/null 2>&1
+    # restart, not start: if a previous teardown left the unit stale-active, `start`
+    # is a no-op and the AP would never come up again. restart always runs ExecStart
+    # (and ExecStop first, which is harmless when already down).
+    systemctl restart takwerx-setup-ap.service >/dev/null 2>&1
 fi
