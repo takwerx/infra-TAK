@@ -65431,6 +65431,47 @@ def _startup_migrations():
                 # (bare 400 on a cross-browser reset landing) persists until then.
                 print(f"Startup migration: callback-rescue regen not applied: {_cbr_err}", flush=True)
 
+        # v10.1.28: Authentik-side convergence, same one-button rule. The cookie_domain sweep
+        # (2acf95f) and the recovery-flow changes (show-password field, dedicated identification
+        # stage) are CODE — the live Authentik objects on an existing box keep the old values
+        # until something re-runs those ensures, and today they only run from a deploy or
+        # "Update config". Without this, a box that presses Update gets new code and a still-broken
+        # reset flow, which is exactly the trap the Caddyfile migration above exists to avoid.
+        # Both ensures are idempotent (normalize-if-different / find-or-create + re-assert).
+        if not s.get('ak_cookie_recovery_converge_v1'):
+            _akc_done = False
+            _akc_err = None
+            try:
+                _ak_tok = (_get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                           or _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or '').strip()
+            except Exception:
+                _ak_tok = ''
+            if not _ak_tok:
+                # No Authentik on this box (or no token yet) → nothing to converge. Stamp:
+                # a later Authentik deploy runs both ensures itself as part of its own flow.
+                _akc_done = True
+            else:
+                _ak_hdr = {'Authorization': f'Bearer {_ak_tok}', 'Content-Type': 'application/json'}
+                for _akc_try in range(3):
+                    try:
+                        _ensure_proxy_providers_cookie_domain(
+                            'http://127.0.0.1:9090', _ak_hdr, (s.get('fqdn') or '').strip())
+                        _ensure_authentik_recovery_flow('http://127.0.0.1:9090', _ak_hdr)
+                        _akc_done = True
+                        break
+                    except Exception as _akc_e:
+                        _akc_err = str(_akc_e)[:160]
+                    time.sleep(5)
+            if _akc_done:
+                s['ak_cookie_recovery_converge_v1'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow converged", flush=True)
+            else:
+                # Authentik containers may still be starting on a fresh boot — leave the flag
+                # unset so the next restart retries rather than silently skipping forever.
+                print(f"Startup migration: Authentik converge deferred (retries next restart): {_akc_err}", flush=True)
+
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
         # Update/Uninstall buttons now target eud paths and can no longer see an old cfd stack,
