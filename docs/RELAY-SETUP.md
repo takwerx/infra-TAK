@@ -129,8 +129,15 @@ the only part you do by hand.
 | UDP | 8890 | MediaMTX **SRT** video |
 | TCP + UDP | 3479 | CoTURN control channel — EUD Remote Assist |
 | UDP | 50000–50050 | CoTURN relayed media — EUD Remote Assist |
+| **TCP** | **5001** | The infra-TAK console's direct-IP backdoor — see the note below |
 
 That list is exactly what the relay forwards — nothing else would get through even if you opened it.
+
+> **About 5001.** That's the console's direct-IP backdoor, the same one every infra-TAK box has and
+> the one the README's recovery section tells you to use. It's a password login with no SSO in front
+> of it, which is the deal on any box with a public address — and applying **Hardening (Cyber
+> Controls W1)** closes it, on a relayed box exactly as on any other, because W1 shuts the port at
+> the box's own firewall no matter which way the packet came in.
 
 **There are two ways to enter them. Pick one, not both:**
 
@@ -182,7 +189,8 @@ cat > ingress.json <<'EOF'
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"MediaMTX SRT video","udpOptions":{"destinationPortRange":{"min":8890,"max":8890}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CoTURN control (Remote Assist)","tcpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CoTURN control (Remote Assist)","udpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
-  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CoTURN relayed media (Remote Assist)","udpOptions":{"destinationPortRange":{"min":50000,"max":50050}}}
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CoTURN relayed media (Remote Assist)","udpOptions":{"destinationPortRange":{"min":50000,"max":50050}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"infra-TAK console backdoor (closed by Hardening W1)","tcpOptions":{"destinationPortRange":{"min":5001,"max":5001}}}
 ]
 EOF
 
@@ -192,7 +200,7 @@ oci network security-list update \
   --force
 ```
 
-Refresh the **Security rules** page and you should see 16 ingress rules.
+Refresh the **Security rules** page and you should see 17 ingress rules.
 
 > **Why two pastes?** Editing a long command in a terminal is miserable — the arrow keys scroll
 > through command history instead of moving the cursor, so a mis-paste is easier to start over than

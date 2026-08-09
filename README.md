@@ -119,9 +119,11 @@ Leave that session open, then browse to **https://localhost:5001** and log in wi
 
 ### If your box is behind a relay (no public inbound)
 
-Both paths above assume you can reach the box's own address. A **relayed** box — behind CGNAT, Starlink or cellular — doesn't have one, and the relay's public IP is the relay, not your box. So `https://<VPS_IP>:5001` and a plain `ssh <user>@<VPS_IP>` both have nothing to connect to.
+Both paths above assume you can reach the box's own address. A **relayed** box — behind CGNAT, Starlink or cellular — doesn't have one, so use the **relay's** address instead of the box's.
 
-You don't need to open any ports for this. The relay is already an SSH server you can reach, and your box always sits at **`172.31.99.2`** at the other end of the tunnel. Hop through the relay and forward the console's port back to yourself. From your own computer:
+**Backdoor:** open **https://&lt;RELAY_IP&gt;:5001**. The relay forwards that port to your box, so this is the same direct-IP backdoor described above, reached at the relay's address. Log in with the console password.
+
+**On a hardened box (W1), that port is closed** — same as any other server, because W1 shuts it at the box's own firewall no matter which way the packet arrives. The tunnel version of the SSH recovery path is below. You don't need to open any ports for it: the relay is already an SSH server you can reach, and your box always sits at **`172.31.99.2`** at the other end of the tunnel. From your own computer:
 
 ```bash
 ssh-add ~/Downloads/your-relay-key.key
@@ -133,7 +135,8 @@ Leave that session open and browse to **https://localhost:5001**, exactly as abo
 - `ubuntu` is the relay's login (Oracle's Ubuntu images use it). `172.31.99.2` is the same on every infra-TAK box — it's the box's address inside the tunnel, not something you set.
 - **`ssh-add` matters:** `-i` applies only to the box at the far end, not to the hop through the relay, so a `-i`-only command fails with `Permission denied (publickey)` at the relay.
 - If the relay refuses your key, check its permissions — a `.key` file left at `0644` is ignored with only a warning. `chmod 600` it.
-- Works whether or not the box is hardened: the traffic arrives over the tunnel as if you were next to the box, and nothing is exposed to the internet.
+- Works whether or not the box is hardened: the traffic arrives over the tunnel as if you were sitting next to the box, and nothing is exposed to the internet.
+- **Relays built before v10.1.28 don't forward 5001.** The console re-runs the relay setup by itself on the next restart after the update, so this comes right on its own — no action needed. The SSH path above works either way.
 
 Full relay documentation: [docs/RELAY-SETUP.md](docs/RELAY-SETUP.md).
 
