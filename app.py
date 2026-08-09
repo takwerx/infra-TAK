@@ -36652,7 +36652,26 @@ def _run_netbird_deploy(settings):
 
 
 def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
-    """Set cookie_domain on all proxy providers so session is shared across subdomains (avoids stream. redirect loop)."""
+    """Normalize cookie_domain on proxy providers: parent domain for forward_domain, EMPTY
+    for forward_single.
+
+    v10.1.28: this used to set '.<fqdn>' on EVERY provider "so session is shared across
+    subdomains (avoids stream. redirect loop)". That is only correct for domain-level forward
+    auth. On forward_single providers a shared parent cookie makes every proxy app share one
+    cookie scope, so traffic to one app rotates the session another app has an in-flight OAuth
+    state pinned to — the victim's callback dies with "mismatched session ID" / "invalid state"
+    and a bare HTTP 400. Field-diagnosed on ops1: password reset from TAK Portal failed every
+    time while the Console (another proxy app on the same parent domain) was open in a tab.
+    Upstream documents cookie_domain for forward_domain only:
+    https://docs.goauthentik.io/add-secure-apps/providers/proxy/forward_auth
+
+    This function is why the first cut of the fix would not hold: the domain-sync path cleared
+    cookie_domain and this re-asserted it on the next console action.
+
+    NOT-YET-VERIFIED: whether the original "stream. redirect loop" returns for TVR. If it does,
+    the answer is to put the apps that genuinely need a shared session on forward_domain mode
+    (which is what cookie_domain is for), NOT to reinstate a shared cookie on forward_single.
+    """
     if not fqdn:
         return
     import urllib.request as _req
@@ -36663,18 +36682,36 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
     try:
         r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=100', headers=ak_headers)
         data = json.loads(_req.urlopen(r, timeout=15).read().decode())
+        _cleared = _shared = 0
         for prov in data.get('results', []):
             pk = prov.get('pk')
             if not pk:
                 continue
+            mode = prov.get('mode') or 'proxy'
+            want = cookie_domain if mode == 'forward_domain' else ''
+            if (prov.get('cookie_domain') or '') == want:
+                continue
             try:
+                # mode/external_host/internal_host are resent because this serializer
+                # cross-validates the whole object on PATCH and otherwise rejects with
+                # "Internal host cannot be empty when forward auth is disabled."
                 patch = _req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
-                    data=json.dumps({'cookie_domain': cookie_domain}).encode(),
+                    data=json.dumps({
+                        'cookie_domain': want,
+                        'mode': mode,
+                        'external_host': prov.get('external_host') or '',
+                        'internal_host': prov.get('internal_host') or '',
+                    }).encode(),
                     headers=ak_headers, method='PATCH')
                 _req.urlopen(patch, timeout=10)
+                if want:
+                    _shared += 1
+                else:
+                    _cleared += 1
             except urllib.error.HTTPError:
                 pass
-        _log("  ✓ Proxy providers cookie_domain set for shared session")
+        _log(f"  ✓ Proxy cookie_domain normalized ({_cleared} cleared for forward_single, "
+             f"{_shared} shared for forward_domain)")
     except Exception as e:
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
 
