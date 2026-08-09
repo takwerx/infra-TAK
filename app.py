@@ -34173,17 +34173,25 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
                 pass
 
         def _find_or_create_prompt(name, field_key, label, order,
-                                   ftype='password', required=True, placeholder=None):
+                                   ftype='password', required=True, placeholder=None,
+                                   initial_value=None):
             results = _api_get(f'stages/prompt/prompts/?search={_req.quote(name)}').get('results', [])
             for p in results:
                 if p.get('name') == name:
                     return p['pk']
+            body = {
+                'name': name, 'field_key': field_key, 'label': label,
+                'type': ftype, 'required': required,
+                'placeholder': label if placeholder is None else placeholder,
+                'order': order, 'placeholder_expression': False}
+            if initial_value is not None:
+                # A `static` field renders its INITIAL VALUE, not its placeholder
+                # (placeholder is placeholder text / choice list) — per
+                # https://docs.goauthentik.io/add-secure-apps/flows-stages/stages/prompt/
+                body['initial_value'] = initial_value
+                body['initial_value_expression'] = False
             try:
-                return _api_post('stages/prompt/prompts/', {
-                    'name': name, 'field_key': field_key, 'label': label,
-                    'type': ftype, 'required': required,
-                    'placeholder': label if placeholder is None else placeholder,
-                    'order': order, 'placeholder_expression': False})['pk']
+                return _api_post('stages/prompt/prompts/', body)['pk']
             except urllib.error.HTTPError as e:
                 if e.code == 400:
                     results = _api_get(f'stages/prompt/prompts/?search={_req.quote(name)}').get('results', [])
@@ -34204,7 +34212,18 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         # unsupported in Firefox, where the fields simply stay masked (no error, no toggle).
         showpw_field_pk = _find_or_create_prompt(
             'recovery-field-show-password', 'showpw_toggle', 'Show password', 50,
-            ftype='static', required=False, placeholder=_AK_SHOWPW_FIELD_HTML)
+            ftype='static', required=False, placeholder='',
+            initial_value=_AK_SHOWPW_FIELD_HTML)
+        if showpw_field_pk:
+            # Self-heal: boxes that got the first cut of this (markup in `placeholder`,
+            # which a static field ignores — it renders nothing at all) are repaired here,
+            # since _find_or_create_prompt returns an existing prompt untouched.
+            try:
+                _api_patch(f'stages/prompt/prompts/{showpw_field_pk}/', {
+                    'initial_value': _AK_SHOWPW_FIELD_HTML,
+                    'initial_value_expression': False})
+            except Exception:
+                pass
         _recovery_fields = [pw_field_pk, pw_repeat_field_pk]
         if showpw_field_pk:
             _recovery_fields.append(showpw_field_pk)
