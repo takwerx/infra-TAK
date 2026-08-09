@@ -156,6 +156,10 @@ restore_client(){
         # NM re-autoconnects known profiles on its own.
     else
         [ -n "$IFACE" ] && ip link set "$IFACE" up 2>/dev/null
+        # Bring the global D-Bus wpa_supplicant back (stopped in start_ap so it could
+        # not reclaim the radio out from under hostapd). netplan apply alone does not
+        # reliably restart it, and without it saved wifi never reconnects.
+        systemctl start wpa_supplicant.service 2>/dev/null || true
         netplan apply 2>>"$LOG" || log "restore_client: netplan apply returned non-zero"
     fi
 }
@@ -446,9 +450,26 @@ EOF
         systemctl disable --now hostapd.service 2>/dev/null || true
         systemctl mask dnsmasq.service hostapd.service 2>/dev/null || true
         set -e
-        # release the client so hostapd can own the radio
+        # Release the client stack so hostapd can own the radio — COMPLETELY.
+        #
+        # ops1 2026-08-09, root cause of "the AP is up but nobody can see it": Ubuntu
+        # server also runs a GLOBAL D-Bus wpa_supplicant:
+        #     /sbin/wpa_supplicant -u -s -O /run/wpa_supplicant
+        # Its command line contains no interface name, so BOTH lines below missed it —
+        # the per-interface unit was never running, and the pkill pattern
+        # "wpa_supplicant.*wlp1s0" cannot match it. It kept managing wlp1s0 underneath
+        # hostapd and reclaimed the radio seconds after every bring-up. dmesg showed
+        # "wlp1s0: link becomes ready" every ~30-40s and hostapd's PID changed between
+        # two snapshots 20s apart: the AP was FLAPPING, alive only in short windows, so
+        # a laptop scan almost always missed it. The one time it looked stable was a
+        # manual start that happened to be caught inside a live window.
+        #
+        # Stop the global unit too, then kill by process name (not cmdline) as the
+        # backstop. Both are restored in restore_client.
         systemctl stop "wpa_supplicant@${IFACE}.service" 2>/dev/null || true
-        pkill -f "wpa_supplicant.*${IFACE}" 2>/dev/null || true
+        systemctl stop wpa_supplicant.service 2>/dev/null || true
+        pkill -x wpa_supplicant 2>/dev/null || true
+        sleep 1
         ip addr flush dev "$IFACE"
         ip link set "$IFACE" down; ip link set "$IFACE" up
         ip addr add "${AP_IP}/${AP_CIDR}" dev "$IFACE"
@@ -456,6 +477,7 @@ EOF
         cat > "$HOSTAPD_CONF" <<EOF
 interface=$IFACE
 driver=nl80211
+ctrl_interface=/var/run/hostapd
 ssid=$AP_SSID
 hw_mode=g
 channel=6
