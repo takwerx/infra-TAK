@@ -697,9 +697,19 @@ async function refreshWifiSaved(){
               : (inRange
                   ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
                   : '<span style="color:var(--text-dim);font-size:11px">not in range</span>'));
-        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--bg-deep);border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+        // Point at the exact next step. Provisioning over the Setup AP, "Add" only
+        // SAVES — the box does not move until Use is pressed — and an operator who
+        // has just typed a network blind (no scan list in AP mode) has no way to know
+        // that (ops1 2026-08-09). Highlight the row they just added and label the
+        // button, so the next action is unmissable rather than buried in the banner.
+        const justAdded = (s === justAddedSsid && !isCur);
+        const rowBorder = justAdded ? 'rgba(59,130,246,.55)' : (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)');
+        const nextHint = justAdded
+          ? '<span style="color:var(--accent);font-size:11px;margin-left:6px">← press Use to join it now</span>'
+          : '';
+        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:' + (justAdded ? 'rgba(59,130,246,.07)' : 'var(--bg-deep)') + ';border:1px solid ' + rowBorder + ';border-radius:8px;margin-bottom:6px">'
           + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : (inRange ? 'var(--green)' : 'var(--text-dim)')) + ';flex-shrink:0"></span>'
-          + '<span style="flex:1;min-width:0;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px;overflow:hidden;text-overflow:ellipsis">' + esc(s) + ' ' + badge + '</span>'
+          + '<span style="flex:1;min-width:0;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px;overflow:hidden;text-overflow:ellipsis">' + esc(s) + ' ' + badge + nextHint + '</span>'
           + (isCur ? '' : '<button type="button" onclick="useWifi(' + j + ')"' + (inRange ? '' : ' disabled') + ' title="' + (inRange ? 'Switch the box to this network now' : 'Not in range right now') + '" style="background:rgba(59,130,246,' + (inRange ? '.12' : '.04') + ');color:var(--accent);border:1px solid rgba(59,130,246,' + (inRange ? '.3' : '.12') + ');border-radius:6px;padding:4px 12px;font-size:12px;cursor:' + (inRange ? 'pointer' : 'default') + ';opacity:' + (inRange ? '1' : '.45') + '">Use</button>')
           + '<button type="button" onclick="forgetWifi(' + j + ',' + isCur + ')" title="Remove this saved network" style="background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">Remove</button>'
           + '</div>';
@@ -780,6 +790,10 @@ async function scanWifi(){
   refreshWifiSaved();
 }
 let savedWifiSet = [];
+// SSID the operator added in this session — highlighted in Known Networks with a
+// "press Use" pointer until they act on it. Cleared once it becomes the current
+// network (Use worked) or on a fresh Use/Stop.
+let justAddedSsid = '';
 function pickWifi(ssid){
   // If the box already knows this network, switch to it with the stored password
   // (no re-typing). Otherwise prefill the add form so the operator enters the key.
@@ -792,6 +806,7 @@ function pickWifi(ssid){
 }
 async function useWifi(ssid){
   const st = document.getElementById('wifi-add-status');
+  justAddedSsid = '';   // acted on — drop the "press Use" pointer
   st.style.color = 'var(--text-dim)';
   st.textContent = 'Switching to “' + ssid + '”…';
   try{
@@ -845,8 +860,10 @@ async function addWifi(){
       body: JSON.stringify({ssid: ssid, password: psk})});
     const d = await r.json();
     if(d.success){
+      justAddedSsid = ssid;
       st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '” to this box’s WiFi list.</span> Nothing disconnected — adding only saves it. '
-        + 'To switch to it now, press <b>Use</b> next to “' + esc(ssid) + '” under Known Networks above; otherwise it joins on its own when in range.';
+        + '<b style="color:var(--accent)">Next step:</b> press <b>Use</b> next to “' + esc(ssid) + '” under Known Networks above — that joins it and turns the setup WiFi off. '
+        + 'Otherwise it joins on its own when in range.';
       document.getElementById('wifi-psk').value = '';
       refreshWifiSaved();
     } else { st.textContent = d.error || 'Could not add network.'; }
