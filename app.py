@@ -65394,6 +65394,43 @@ def _startup_migrations():
                     print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
                           f"(strip-only defense until next restart): {_pa_err}", flush=True)
 
+        # v10.1.28: outpost-callback rescue page (572f6c4). A code-only change to
+        # generate_caddyfile does nothing until the file is regenerated, and a manual
+        # git pull + restart skips the Update-Now regen path — so converge here, the
+        # same one-shot-flag shape as the migrations above. Regenerate, verify the
+        # rescue route is in the output, reload Caddy, stamp the flag.
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v1'):
+            _cbr_applied = False
+            _cbr_err = None
+            for _cbr_try in range(6):
+                try:
+                    _cf = generate_caddyfile(s)
+                    if not _cf:
+                        _cbr_err = 'generate returned empty'
+                    elif 'reverse_proxy /outpost.goauthentik.io/' not in _cf:
+                        # No vhost proxies the outpost (Authentik not installed) — nothing
+                        # to rescue; the regen itself is still the converge. Stamp and stop.
+                        _cbr_applied = True
+                        break
+                    elif 'route /outpost.goauthentik.io/callback*' in _cf:
+                        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                        _cbr_applied = True
+                        break
+                    else:
+                        _cbr_err = 'rescue route absent from generated Caddyfile'
+                except Exception as _cbr_e:
+                    _cbr_err = str(_cbr_e)[:160]
+                time.sleep(4)
+            if _cbr_applied:
+                s['caddy_cb_rescue_v1'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: Caddyfile regenerated with outpost-callback rescue page", flush=True)
+            else:
+                # Flag not set → retried on next restart. Non-security: the old behavior
+                # (bare 400 on a cross-browser reset landing) persists until then.
+                print(f"Startup migration: callback-rescue regen not applied: {_cbr_err}", flush=True)
+
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
         # Update/Uninstall buttons now target eud paths and can no longer see an old cfd stack,
