@@ -293,6 +293,27 @@ socketserver.TCPServer((IP, PORT), H).serve_forever()
 PY" >>"$LOG" 2>&1 &
 }
 
+# Radio snapshot written to $LOG. Everything here is read-only and best-effort —
+# never let a missing tool break an AP bring-up.
+ap_diag(){
+    _when="${1:-now}"
+    {
+        echo "===== ap_diag[$_when] $(date -u +%FT%TZ) ====="
+        echo "[iw info]";        iw dev "$IFACE" info 2>&1
+        echo "[reg]";            iw reg get 2>&1 | head -14
+        echo "[hostapd status]"; command -v hostapd_cli >/dev/null 2>&1 \
+                                   && hostapd_cli -i "$IFACE" status 2>&1 | head -20 \
+                                   || echo "(no hostapd_cli)"
+        echo "[link]";           ip -brief link show "$IFACE" 2>&1
+        echo "[addr]";           ip -brief addr show "$IFACE" 2>&1
+        echo "[procs]";          pgrep -a 'hostapd|wpa_supplicant|dnsmasq' 2>&1
+        echo "[rfkill]";         (rfkill list 2>/dev/null || grep -H . /sys/class/rfkill/*/soft /sys/class/rfkill/*/hard 2>/dev/null)
+        echo "[stations]";       iw dev "$IFACE" station dump 2>&1 | grep -c '^Station' 2>/dev/null
+        echo "[driver msgs]";    dmesg 2>/dev/null | grep -iE 'iwlwifi|wlp1s0|regulatory|cfg80211' | tail -12
+        echo "===== end ap_diag[$_when] ====="
+    } >>"$LOG" 2>&1
+}
+
 start_ap(){
     [ -f "$ACTIVE_FLAG" ] && { log "start: AP already active"; echo "already-active"; return 0; }
     if [ -z "$IFACE" ]; then log "start: no wifi interface"; echo "no-wifi-interface"; return 2; fi
@@ -477,6 +498,19 @@ EOF
     trap - ERR
     touch "$ACTIVE_FLAG"
     log "start: AP UP ssid='$AP_SSID' ip=$AP_IP"
+    # hostapd can report AP-ENABLED while nothing actually reaches the air. ops1
+    # 2026-08-09: the AP was "up" for 4 minutes with the operator watching the
+    # laptop wifi list — neighbouring SSIDs all present, infra-TAK absent. Twice,
+    # both on an AUTO start (no ethernet, no saved client wifi). The one time it
+    # WAS visible was a manual start on a box that had both. Suspicion is the
+    # regulatory domain never leaving world/00 without a client association, so
+    # the driver accepts the AP but suppresses beacons — unproven.
+    #
+    # We lose remote access at precisely the moment it fails, so snapshot the
+    # radio here and again shortly after (catches "came up then went quiet")
+    # instead of needing someone at the box with a keyboard.
+    ap_diag now
+    ( sleep 20; ap_diag t+20s ) >/dev/null 2>&1 &
     echo "started"
 }
 

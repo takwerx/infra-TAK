@@ -57,7 +57,39 @@ uplink_ok(){
 # uplink_ok already covers "can we reach the internet by ANY means", so we just
 # use it — an ethernet uplink makes uplink_ok true and suppresses the AP.
 
-AP_UP(){ [ -f "$ACTIVE_FLAG" ]; }
+# Is an AP ACTUALLY broadcasting right now? Ask the radio, not a file.
+#
+# This used to be `[ -f "$ACTIVE_FLAG" ]` alone. The flag is written on start and
+# removed on stop, so any path that takes the AP down without going through the
+# engine's stop — a crash, a kill, a reboot mid-AP, a netplan/NM reclaim of the
+# radio — leaves it behind. The no-uplink branch below then reads "already
+# broadcasting, nothing to do" and silently never starts the AP again. The box
+# sits with no network and no AP, forever, saying nothing (ops1 2026-08-09: after
+# several manual start/stop/join cycles the auto-broadcast stopped firing).
+#
+# Truth = the interface is in AP mode, or hostapd is running against our conf.
+# If the flag disagrees with reality, the flag is wrong: clear it and carry on so
+# the normal start path can run.
+ap_really_up(){
+    _if="$(command -v iw >/dev/null 2>&1 && iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')"
+    if [ -n "$_if" ] && iw dev "$_if" info 2>/dev/null | grep -q "type AP"; then
+        return 0
+    fi
+    pgrep -f "takwerx-hostapd.conf" >/dev/null 2>&1 && return 0
+    return 1
+}
+AP_UP(){
+    if ap_really_up; then
+        [ -f "$ACTIVE_FLAG" ] || touch "$ACTIVE_FLAG" 2>/dev/null   # reality wins
+        return 0
+    fi
+    if [ -f "$ACTIVE_FLAG" ]; then
+        # Stale marker from an AP that is no longer up. Drop it (and any manual
+        # claim it was carrying) so auto-broadcast is not wedged off.
+        rm -f "$ACTIVE_FLAG" "$MANUAL_FLAG" 2>/dev/null
+    fi
+    return 1
+}
 
 if uplink_ok; then
     rm -f "$NOUP_SINCE"
