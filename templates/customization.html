@@ -201,11 +201,13 @@ If no logo is uploaded, the infra-TAK mark is used instead.
 </div>
 <div class="toast" id="toast"></div>
 <script>
-// Load Orbitron from Google Fonts so it renders correctly in font buttons
+// Orbitron for the font-preview buttons. Served locally — a box with no route to
+// the internet (Setup AP, air-gapped install) would otherwise render the preview
+// in a fallback face, i.e. show you the wrong thing before you pick it.
 (function(){
   var l = document.createElement('link');
   l.rel = 'stylesheet';
-  l.href = 'https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;800&display=swap';
+  l.href = '/static/fonts/fonts.css';
   document.head.appendChild(l);
 })();
 
