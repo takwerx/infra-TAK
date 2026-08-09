@@ -65403,7 +65403,7 @@ def _startup_migrations():
         # git pull + restart skips the Update-Now regen path — so converge here, the
         # same one-shot-flag shape as the migrations above. Regenerate, verify the
         # rescue route is in the output, reload Caddy, stamp the flag.
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v1'):
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v2'):
             _cbr_applied = False
             _cbr_err = None
             for _cbr_try in range(6):
@@ -65426,7 +65426,7 @@ def _startup_migrations():
                     _cbr_err = str(_cbr_e)[:160]
                 time.sleep(4)
             if _cbr_applied:
-                s['caddy_cb_rescue_v1'] = True
+                s['caddy_cb_rescue_v2'] = True
                 save_settings(s)
                 s = load_settings()
                 print("Startup migration: Caddyfile regenerated with outpost-callback rescue page", flush=True)
