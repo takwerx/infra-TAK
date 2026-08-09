@@ -202,11 +202,6 @@
   <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
 </div>
 {% elif ak.installed %}
-<div class="section-title">Access</div>
-<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:24px">
-<div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);line-height:1.7">Containers are stopped — start Authentik above to sign in. The admin credential is still on disk and retrievable here:</div>
-<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:10px">Admin user: <span style="color:var(--cyan)">akadmin</span> · <button type="button" onclick="showAkPassword()" id="ak-pw-btn" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Show Password</button> <span id="ak-pw-display" style="color:var(--green);user-select:all;display:none"></span></div>
-</div>
 <div class="card" id="ak-log-card" style="display:none;margin-top:24px">
   <div class="card-title">Update config & reconnect — Log</div>
   <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
@@ -312,13 +307,11 @@ It provides centralized user authentication and management for all your services
 4. <strong>TAK Portal</strong> — <a href="/takportal" style="color:var(--cyan)">TAK Portal</a> when ready.<br>
 Additional admins: Authentik → Groups → authentik Admins → Users.
 </div>
-<div id="ak-deploy-creds"></div>
-<div style="height:12px"></div>
 <a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;margin-right:10px">Authentik</a>
 <a href="/emailrelay" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">Email Relay</a>
 <a href="/takserver" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">TAK Server</a>
 <a href="/takportal" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">TAK Portal</a>
-<button onclick="goConsoleModulePage()" title="Reloads this console module page (containers, status, controls) on the console port — not the Authentik login" style="padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">↻ Reload this module page</button>
+<button onclick="window.location.href='/authentik'" style="padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Refresh Page</button>
 </div>
 {% endif %}
 {% if ak.installed and ak.running %}
@@ -405,50 +398,6 @@ async function showAkPassword(){
         if(d.password){display.textContent=d.password;display.style.display='inline';btn.textContent='🔑 Hide'}
         else{display.textContent='Not found';display.style.display='inline'}
     }catch(e){display.textContent='Error';display.style.display='inline'}
-}
-
-// v10.1.28: console pages reached through Caddy sit behind Authentik forward_auth the
-// moment Authentik is installed (generate_caddyfile, app.py ~24049). Only /login* and
-// /api/* are exempt — so the deploy log keeps streaming over XHR while a page
-// NAVIGATION to '/authentik' 302s into the Authentik login on tak.<fqdn>. Refreshing
-// this module page must therefore target the console's OWN port, which never passes
-// through Caddy. (Filming session 2026-08-08: the old refresh dumped the operator on
-// the SSO login with no akadmin password in hand.)
-var CONSOLE_PORT='{{ settings.get("console_port", 5001) }}';
-function consoleModuleUrl(){
-    if(!CONSOLE_PORT||window.location.port===CONSOLE_PORT)return '/authentik';
-    return window.location.protocol+'//'+window.location.hostname+':'+CONSOLE_PORT+'/authentik';
-}
-function goConsoleModulePage(){window.location.href=consoleModuleUrl();}
-
-// akadmin's password is generated at deploy time and only ever written to the deploy
-// log MASKED (app.py:41130), so the page itself must hand it over — otherwise the
-// first navigation into the SSO gate leaves the operator with no credential to get in.
-function copyAkDeployPw(){
-    var el=document.getElementById('ak-deploy-pw');
-    if(el&&navigator.clipboard)navigator.clipboard.writeText(el.textContent);
-}
-async function renderAkCredentials(target){
-    if(!target)return;
-    target.style.cssText='margin-top:12px;padding:12px 14px;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.3);border-radius:8px;font-family:JetBrains Mono,monospace;font-size:12px;text-align:left;line-height:1.7';
-    target.innerHTML='<div style="color:var(--yellow)">Authentik admin login</div><div style="color:var(--text-dim)">Loading…</div>';
-    var pw='';
-    try{
-        var r=await fetch('/api/authentik/password',{credentials:'same-origin'});
-        var d=await r.json();
-        pw=d.password||'';
-    }catch(e){}
-    var direct=window.location.protocol+'//'+window.location.hostname+(CONSOLE_PORT?':'+CONSOLE_PORT:'');
-    var body='<div style="color:var(--yellow);margin-bottom:6px"><strong>Save the Authentik admin login now</strong></div>'+
-        '<div>User: <span style="color:var(--cyan);user-select:all">akadmin</span></div>';
-    if(pw){
-        body+='<div>Password: <span id="ak-deploy-pw" style="color:var(--green);user-select:all">'+escapeHtml(pw)+'</span> '+
-              '<button type="button" onclick="copyAkDeployPw()" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:1px 8px;border-radius:4px;font-family:inherit;font-size:11px;cursor:pointer">Copy</button></div>';
-    }else{
-        body+='<div style="color:var(--red)">Could not read the password from ~/authentik/.env. Get it with: <span style="color:var(--cyan);user-select:all">grep AUTHENTIK_BOOTSTRAP_PASSWORD ~/authentik/.env</span></div>';
-    }
-    body+='<div style="color:var(--text-dim);margin-top:6px">With Authentik deployed, the console on your domain is behind Authentik SSO — this is the login that gets you in. It stays retrievable with <strong>Show Password</strong> on this page, and the console is always reachable directly at <span style="color:var(--cyan);user-select:all">'+escapeHtml(direct)+'</span> using your console password.</div>';
-    target.innerHTML=body;
 }
 
 async function refreshAdminAccounts(){
@@ -562,9 +511,7 @@ async function akControl(action){
     try{
         var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
         var d=await r.json();
-        // Stop/restart takes the forward_auth upstream down with it — reload on the
-        // console port so the module page is reachable while Authentik is off.
-        if(d.success)goConsoleModulePage();
+        if(d.success)window.location.href='/authentik';
         else alert('Error: '+(d.error||'Unknown'));
     }catch(e){alert('Error: '+e.message)}
     btns.forEach(function(b){b.disabled=false;b.style.opacity='1'});
@@ -674,11 +621,6 @@ function pollDeployLog(){
             inst.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);margin-top:16px;margin-bottom:8px;text-align:left;line-height:1.6';
             inst.innerHTML='<strong>Typical order</strong> (SMTP may already be set):<br>1. <strong>Authentik</strong> — deploy log showed LDAP SA bind OK.<br>2. <strong>Email Relay</strong> if you still need SMTP / &quot;Configure Authentik&quot;.<br>3. <strong>TAK Server</strong>, then <strong>TAK Portal</strong> when ready.';
             el.appendChild(inst);
-            // Credentials FIRST: the operator must have akadmin's password in hand
-            // before any link on this panel can send them into the SSO gate.
-            var creds=document.createElement('div');
-            el.appendChild(creds);
-            renderAkCredentials(creds);
             var authUrl=el.getAttribute('data-authentik-url')||'';
             var launchLink=document.createElement('a');
             launchLink.href=authUrl;launchLink.target='_blank';launchLink.rel='noopener noreferrer';
@@ -686,10 +628,9 @@ function pollDeployLog(){
             launchLink.style.cssText='display:block;width:100%;padding:12px;margin-top:8px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box';
             el.appendChild(launchLink);
             var refreshBtn=document.createElement('button');
-            refreshBtn.textContent='↻ Reload this module page';
-            refreshBtn.title='Reloads the console Authentik page (containers, status, controls) on the console port — not the Authentik login';
+            refreshBtn.textContent='↻ Refresh Authentik Page';
             refreshBtn.style.cssText='display:block;width:100%;padding:10px;margin-top:8px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:13px;cursor:pointer;';
-            refreshBtn.onclick=goConsoleModulePage;
+            refreshBtn.onclick=function(){window.location.href='/authentik';};
             el.appendChild(refreshBtn);
             el.scrollTop=el.scrollHeight;
         }
@@ -798,7 +739,7 @@ async function doUninstallAk(){
         var d=await r.json();
         if(d.success){
             progressEl.innerHTML='<span class="uninstall-spinner"></span><span>Done. Reloading…</span>';
-            setTimeout(goConsoleModulePage,800);
+            setTimeout(function(){window.location.href='/authentik';},800);
         }else{
             msgEl.textContent=d.error||'Uninstall failed';
             progressEl.style.display='none';
@@ -895,7 +836,6 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 {% if deploying %}pollDeployLog();{% endif %}
-{% if deploy_done %}renderAkCredentials(document.getElementById('ak-deploy-creds'));{% endif %}
 {% if ak.installed and ak.running %}
 (function(){
   function _applyRepState(enabled){
