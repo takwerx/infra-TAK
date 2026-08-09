@@ -24062,6 +24062,33 @@ def generate_caddyfile(settings=None):
     def _emit_ak_header_strip(indent):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
+
+    def _emit_outpost_callback_rescue(root_url):
+        # v10.1.28: the outpost's OAuth callback answers a bare 400 whenever the state in
+        # the URL doesn't match a session in THIS browser — most commonly a password-reset
+        # email opened in a different browser/window than the one that started the flow
+        # (outpost log: 'mismatched session ID' with should="", then 'invalid state').
+        # The flow's real work (password_set) already succeeded by then; only the landing
+        # dies. There is no Authentik knob for this — the state genuinely cannot follow
+        # the email across browsers — so the edge converts the dead end into one click:
+        # a fresh visit to the app root starts a clean forward_auth round-trip that works.
+        # Emitted at 8-space depth: all four callers sit inside a top-level `route {`.
+        lines.append(f"        route /outpost.goauthentik.io/callback* {{")
+        lines.append(f"            reverse_proxy {ak_up} {{")
+        lines.append(f"                @cb400 status 400")
+        lines.append(f"                handle_response @cb400 {{")
+        lines.append(f"                    header Content-Type \"text/html; charset=utf-8\"")
+        lines.append(f"                    respond <<CBRESCUE")
+        lines.append(f"                        <!doctype html>")
+        lines.append(f"                        <html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Continue to sign in</title>")
+        lines.append(f"                        <style>body{{font-family:system-ui,sans-serif;background:#0f1420;color:#e6e8ee;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}main{{max-width:26rem;padding:2rem;text-align:center}}h1{{font-size:1.25rem}}p{{color:#9aa3b2;line-height:1.6}}a{{display:inline-block;margin-top:1rem;padding:.7rem 1.6rem;background:#2b6cb0;color:#fff;border-radius:.5rem;text-decoration:none;font-weight:600}}</style></head>")
+        lines.append(f"                        <body><main><h1>Almost there</h1>")
+        lines.append(f"                        <p>If you just set or reset your password, it was saved. This page couldn't finish signing you in automatically &mdash; that happens when the email link opens in a different browser or window.</p>")
+        lines.append(f"                        <a href=\"{root_url}\">Continue to sign in</a></main></body></html>")
+        lines.append(f"                        CBRESCUE 200")
+        lines.append(f"                }}")
+        lines.append(f"            }}")
+        lines.append(f"        }}")
     if ak.get('installed'):
         # W1 (Hardened posture): drop the unauthenticated /login bypass so the
         # shared-password page is no longer a network ingress — SSO+MFA only.
@@ -24080,6 +24107,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         lines.append(f"    route {{")
         _emit_ak_header_strip("        ")
+        _emit_outpost_callback_rescue(f"https://{infratak_host}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         # v0.9.58: background /api XHR must NOT go through forward_auth. An unauthenticated
         # XHR gets 302-redirected to the cross-origin Authentik OAuth URL (tak.<fqdn>), which
@@ -24138,6 +24166,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"{nodered_host} {{")
         if ak.get('installed'):
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{nodered_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        @nodered_public {{")
             lines.append(f"            path /ipaws/alerts.kml /icons/ipaws/*")
@@ -24224,6 +24253,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{portal_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"")
             lines.append(f"        @public {{")
@@ -24354,6 +24384,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        reverse_proxy {mtx_up}")
             lines.append(f"    }}")
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{mtx_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
@@ -24409,6 +24440,7 @@ def generate_caddyfile(settings=None):
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
                 lines.append(f"        handle {{")
+                _emit_outpost_callback_rescue(f"https://{fh_host}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
                 lines.append(f"            forward_auth {ak_up} {{")
                 lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
@@ -24455,6 +24487,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"{wo_host} {{")
         if ak.get('installed'):
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{wo_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
