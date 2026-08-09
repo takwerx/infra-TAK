@@ -21402,30 +21402,14 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                                 new_host = f'{subdomain}.{fqdn}'
                                 url = 'https://' + new_host + ('/' + '/'.join(rest.split('/')[1:]) if '/' in rest else '')
                         new_uris.append({'url': url, 'matching_mode': uri.get('matching_mode', 'strict')})
-                    # v10.1.28: cookie_domain belongs ONLY to domain-level forward auth.
-                    # Upstream documents it solely for forward_domain ("set Cookie domain to
-                    # the parent domain shared by the protected applications"); the
-                    # single-application section never mentions it.
-                    # https://docs.goauthentik.io/add-secure-apps/providers/proxy/forward_auth
-                    #
-                    # Setting '.<fqdn>' on every forward_single provider made each proxy app
-                    # share one cookie scope across the parent domain, so traffic to one app
-                    # rotated the session another app's OAuth state was pinned to. The victim
-                    # got "mismatched session ID" + "invalid state" from the outpost and a bare
-                    # HTTP 400 in the browser. Field-diagnosed on ops1: a password reset started
-                    # from TAK Portal failed every time while the Console (a second proxy app on
-                    # the same parent domain) sat open in another tab churning forward_auth.
-                    # Same signature as upstream #17033 / #12008. Clearing it on the portal
-                    # provider fixed the reset flow immediately.
-                    _prov_mode = full_prov.get('mode', 'proxy')
                     patch = {
                         'external_host': ext_host,
-                        'cookie_domain': cookie_domain if _prov_mode == 'forward_domain' else '',
+                        'cookie_domain': cookie_domain,
                         'redirect_uris': new_uris,
                         # Required fields to pass cross-field validators
                         'name': full_prov.get('name', ''),
                         'authorization_flow': full_prov.get('authorization_flow'),
-                        'mode': _prov_mode,
+                        'mode': full_prov.get('mode', 'proxy'),
                         'internal_host': full_prov.get('internal_host') or '',
                         'internal_host_ssl_validation': full_prov.get('internal_host_ssl_validation', False),
                     }
@@ -27325,16 +27309,12 @@ def run_takportal_deploy():
                 if flow_pk and inv_flow_pk:
                     try:
                         _tp_host = f'https://{_get_service_domain(settings, "takportal") or f"takportal.{fqdn}"}'
-                        # v10.1.28: NO cookie_domain on a forward_single provider. A shared
-                        # parent-domain cookie let every proxy app on the box collide, breaking
-                        # whichever one had an OAuth state in flight ("mismatched session ID" ->
-                        # bare HTTP 400). Upstream documents cookie_domain for forward_domain
-                        # only. See the matching note in the domain-sync patch above.
+                        _tp_cookie = f'.{fqdn.split(":")[0]}'
                         req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                             data=json_mod.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk,
                                 'external_host': _tp_host, 'mode': 'forward_single',
-                                'token_validity': 'hours=24'}).encode(),
+                                'token_validity': 'hours=24', 'cookie_domain': _tp_cookie}).encode(),
                             headers=_ak_headers, method='POST')
                         resp = _urlreq.urlopen(req, timeout=10)
                         provider_pk = json_mod.loads(resp.read().decode())['pk']
@@ -27348,7 +27328,7 @@ def run_takportal_deploy():
                                 provider_pk = results[0]['pk']
                                 try:
                                     req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                                        data=json_mod.dumps({'external_host': _tp_host, 'cookie_domain': ''}).encode(),
+                                        data=json_mod.dumps({'external_host': _tp_host, 'cookie_domain': _tp_cookie}).encode(),
                                         headers=_ak_headers, method='PATCH')
                                     _urlreq.urlopen(req, timeout=10)
                                 except Exception:
@@ -34786,7 +34766,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
         provider_pk = None
         try:
             _nr_host = f'https://{_get_service_domain(settings, "nodered") if settings else f"nodered.{fqdn}"}'
-            _cookie = ''  # v10.1.28: forward_single gets NO shared cookie (see _ensure_proxy_providers_cookie_domain)
+            _cookie = f'.{fqdn.split(":")[0]}'
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'Node-RED Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
@@ -34896,7 +34876,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
         provider_pk = None
         try:
             _wo_host = f'https://{_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}"}'
-            _cookie = ''  # v10.1.28: forward_single gets NO shared cookie (see _ensure_proxy_providers_cookie_domain)
+            _cookie = f'.{fqdn.split(":")[0]}'
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'WebODM Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
@@ -35136,7 +35116,7 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
         provider_pk = None
         try:
             _tvr_host = f'https://{_get_service_domain(settings, "tak_video_restreamer") if settings else f"stream.{fqdn}"}'
-            _cookie = ''  # v10.1.28: forward_single gets NO shared cookie (see _ensure_proxy_providers_cookie_domain)
+            _cookie = f'.{fqdn.split(":")[0]}'
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'TAK Video Restreamer Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
@@ -35239,7 +35219,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                 data=json.dumps({'name': 'Federation Hub Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': f'https://{fedhub_domain}', 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': ''}).encode(),
+                    'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -35253,7 +35233,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                     provider_pk = results[0]['pk']
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                            data=json.dumps({'external_host': f'https://{fedhub_domain}', 'cookie_domain': ''}).encode(),
+                            data=json.dumps({'external_host': f'https://{fedhub_domain}', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -35338,7 +35318,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             pass
         provider_pks = []
         base_domain = fqdn.split(':')[0]
-        cookie_domain = ''  # v10.1.28: forward_single gets NO shared cookie (see _ensure_proxy_providers_cookie_domain)
+        cookie_domain = f'.{base_domain}'
         # Fetch all existing proxy providers once — avoids POST→catch-400→search dance
         try:
             _list_req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?page_size=200', headers=_ak_headers)
@@ -36689,26 +36669,7 @@ def _run_netbird_deploy(settings):
 
 
 def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
-    """Normalize cookie_domain on proxy providers: parent domain for forward_domain, EMPTY
-    for forward_single.
-
-    v10.1.28: this used to set '.<fqdn>' on EVERY provider "so session is shared across
-    subdomains (avoids stream. redirect loop)". That is only correct for domain-level forward
-    auth. On forward_single providers a shared parent cookie makes every proxy app share one
-    cookie scope, so traffic to one app rotates the session another app has an in-flight OAuth
-    state pinned to — the victim's callback dies with "mismatched session ID" / "invalid state"
-    and a bare HTTP 400. Field-diagnosed on ops1: password reset from TAK Portal failed every
-    time while the Console (another proxy app on the same parent domain) was open in a tab.
-    Upstream documents cookie_domain for forward_domain only:
-    https://docs.goauthentik.io/add-secure-apps/providers/proxy/forward_auth
-
-    This function is why the first cut of the fix would not hold: the domain-sync path cleared
-    cookie_domain and this re-asserted it on the next console action.
-
-    NOT-YET-VERIFIED: whether the original "stream. redirect loop" returns for TVR. If it does,
-    the answer is to put the apps that genuinely need a shared session on forward_domain mode
-    (which is what cookie_domain is for), NOT to reinstate a shared cookie on forward_single.
-    """
+    """Set cookie_domain on all proxy providers so session is shared across subdomains (avoids stream. redirect loop)."""
     if not fqdn:
         return
     import urllib.request as _req
@@ -36719,36 +36680,18 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
     try:
         r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=100', headers=ak_headers)
         data = json.loads(_req.urlopen(r, timeout=15).read().decode())
-        _cleared = _shared = 0
         for prov in data.get('results', []):
             pk = prov.get('pk')
             if not pk:
                 continue
-            mode = prov.get('mode') or 'proxy'
-            want = cookie_domain if mode == 'forward_domain' else ''
-            if (prov.get('cookie_domain') or '') == want:
-                continue
             try:
-                # mode/external_host/internal_host are resent because this serializer
-                # cross-validates the whole object on PATCH and otherwise rejects with
-                # "Internal host cannot be empty when forward auth is disabled."
                 patch = _req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
-                    data=json.dumps({
-                        'cookie_domain': want,
-                        'mode': mode,
-                        'external_host': prov.get('external_host') or '',
-                        'internal_host': prov.get('internal_host') or '',
-                    }).encode(),
+                    data=json.dumps({'cookie_domain': cookie_domain}).encode(),
                     headers=ak_headers, method='PATCH')
                 _req.urlopen(patch, timeout=10)
-                if want:
-                    _shared += 1
-                else:
-                    _cleared += 1
             except urllib.error.HTTPError:
                 pass
-        _log(f"  ✓ Proxy cookie_domain normalized ({_cleared} cleared for forward_single, "
-             f"{_shared} shared for forward_domain)")
+        _log("  ✓ Proxy providers cookie_domain set for shared session")
     except Exception as e:
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
 
@@ -37001,7 +36944,7 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
     ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     base = fqdn.split(':')[0].split('/')[0]
     desired_host = f'https://{_get_service_domain(settings, "takportal") or f"takportal.{base}"}'
-    desired_cookie = ''  # v10.1.28: forward_single gets NO shared cookie; '' here makes the diff-check below CLEAR stale ones
+    desired_cookie = f'.{base}'
     provider_pk = None
     try:
         r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=100', headers=ak_headers)
@@ -46076,7 +46019,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
         ak_url = _get_authentik_api_url(settings)
         ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
         base_fqdn = fqdn.split(':')[0].split('/')[0]
-        desired_cookie = ''  # v10.1.28: forward_single gets NO shared cookie (see _ensure_proxy_providers_cookie_domain)
+        desired_cookie = f'.{base_fqdn}'
 
         # Discover flows once (shared across all services). Use _ak_api_call's
         # retry/backoff so transient 502/timeout doesn't abort the entire heal.
@@ -46476,7 +46419,7 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
             """Fallback patch path when Authentik REST API is unavailable or PATCH fails.
             Returns (ok: bool, fixed_count: int, err: str)."""
             try:
-                _cookie = ''  # v10.1.28: forward_single gets NO shared cookie
+                _cookie = f'.{base}'
                 # v0.9.31 (post-field-debug 2026-05-18): write WITHOUT trailing
                 # slash. Previously `want_clean + '/'` produced
                 # `external_host = 'https://takportal.lutak.net/'`, which made
@@ -46578,7 +46521,7 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                 _current = (_full.get('external_host') or '')
                 _want_clean = _want.rstrip('/')
                 _full_cookie = (_full.get('cookie_domain') or '').strip()
-                _cookie_domain = ''  # v10.1.28: forward_single gets NO shared cookie
+                _cookie_domain = f'.{base}'
                 if _current == _want_clean and _full_cookie == _cookie_domain:
                     continue  # already canonical
 
@@ -50676,7 +50619,7 @@ entries:
                                 'external_host': f"https://{_get_service_domain(settings, 'takportal')}",
                                 'mode': 'forward_single',
                                 'token_validity': 'hours=24',
-                                'cookie_domain': ''
+                                'cookie_domain': f'.{base_domain}'
                             }
                             req = urllib.request.Request(f'{ak_url}/api/v3/providers/proxy/',
                                 data=json.dumps(provider_data).encode(),
