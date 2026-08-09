@@ -200,6 +200,7 @@ textarea.form-input{resize:vertical}
     <div id="wifi-saved" style="font-size:12px;color:var(--text-dim);margin-bottom:14px"></div>
     <div id="wifi-ap-note" style="display:none;margin-bottom:14px;padding:11px 13px;background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:12px;color:var(--text-secondary)">
       <b style="color:var(--accent)">Setup mode:</b> this box is broadcasting its own WiFi right now, so it can&#39;t scan for other networks. Just <b>type the network name and password</b> below and Add it — the box will join that network and turn the setup WiFi off.
+      <br><b style="color:var(--yellow)">Type it exactly, capitals included</b> — there&#39;s no scan list to pick from here, and <b>OXFORD</b> and <b>oxford</b> are different networks.
     </div>
     <div id="wifi-scan-row" style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
       <button class="control-btn" id="wifi-scan-btn" onclick="scanWifi()">Scan for networks</button>
@@ -207,7 +208,12 @@ textarea.form-input{resize:vertical}
     </div>
     <div id="wifi-scan-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px"></div>
     <label class="form-label">Network name (SSID)</label>
-    <input class="form-input" id="wifi-ssid" placeholder="exact network name" style="margin-bottom:12px;max-width:320px">
+    <input class="form-input" id="wifi-ssid" placeholder="exact network name" oninput="checkWifiSsidCase()" style="margin-bottom:6px;max-width:320px">
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;max-width:430px;line-height:1.5">
+      Capitals matter. <b style="color:var(--text-secondary)">OXFORD</b> and <b style="color:var(--text-secondary)">oxford</b> are two
+      different networks to WiFi — only the one your router actually broadcasts will connect. Same for the password.
+    </div>
+    <div id="wifi-ssid-warn" style="display:none;font-size:11px;color:var(--yellow);margin-bottom:6px;max-width:430px;line-height:1.5"></div>
     <label class="form-label">WiFi password <span style="color:var(--text-dim);font-weight:400">(leave blank for an open network)</span></label>
     <div style="position:relative;max-width:320px;margin-bottom:16px">
       <input class="form-input" id="wifi-psk" type="password" placeholder="8–63 characters" style="max-width:none;padding-right:44px">
@@ -556,6 +562,21 @@ function toggleSetupPass(){
 async function refreshSetupAp(){
   try{
     const r = await fetch('/api/connectivity/setup-ap/status');
+    // You reach this page over the AP (10.42.0.1) on a different address than you
+    // logged in on. If the session doesn't carry, @login_required redirects this to
+    // the login HTML, r.json() throws, and the old empty catch swallowed it — the
+    // card kept showing stale state, so the Stop button (revealed only when
+    // active===true) NEVER appeared and the AP could not be turned off from the UI
+    // (ops1 2026-08-09). Same failure the Stop handler was hardened against twice;
+    // it was still live here. Say so instead of going quiet.
+    if (r.redirected || (r.headers.get('content-type') || '').indexOf('json') === -1){
+      const s = document.getElementById('setupap-status');
+      if (s){
+        s.style.color = 'var(--red, #f87171)';
+        s.innerHTML = 'Your session expired — <a href="/login?next=/connectivity" style="color:var(--cyan)">log in again</a> to see the Setup WiFi controls.';
+      }
+      return;
+    }
     const d = await r.json();
     const ssid = document.getElementById('setupap-ssid');
     if(document.activeElement !== ssid && !ssid.value){ ssid.placeholder = d.ssid || 'infraTAK-setup-…'; }
@@ -685,6 +706,9 @@ async function refreshWifiSaved(){
     } else {
       el.textContent = 'No saved WiFi networks yet.';
     }
+    // Re-evaluate the case-collision hint against the list we just loaded (the
+    // operator may have typed the SSID before the saved list arrived).
+    checkWifiSsidCase();
   }catch(e){}
 }
 async function loadReach(){
@@ -776,12 +800,43 @@ async function useWifi(ssid){
   }catch(e){ st.style.color='var(--red)'; st.textContent='Switch failed'; }
   setTimeout(refreshWifiSaved, 4000);
 }
+// Returns a saved SSID that differs from `ssid` ONLY by capitalisation, else ''.
+// WiFi names are case-sensitive per 802.11, so OXFORD and oxford really are two
+// different networks — but nobody means to save both. ops1 2026-08-09: in Setup AP
+// mode the radio IS the AP, so there is no scan list to pick from and the operator
+// types the name by hand; a stray lowercase entry sat in Known Networks next to the
+// real one, permanently unable to connect, with nothing in the UI hinting why.
+function wifiCaseTwin(ssid){
+  const t = (ssid || '').trim();
+  if(!t) return '';
+  for(const s of (savedWifiSet || [])){
+    if(s !== t && String(s).toLowerCase() === t.toLowerCase()) return s;
+  }
+  return '';
+}
+function checkWifiSsidCase(){
+  const el = document.getElementById('wifi-ssid-warn');
+  if(!el) return;
+  const twin = wifiCaseTwin(document.getElementById('wifi-ssid').value);
+  if(twin){
+    el.style.display = 'block';
+    el.innerHTML = '⚠ You already have <b>' + esc(twin) + '</b> saved. Capitals matter, so this adds a '
+      + '<b>second, different</b> network — only one of them can ever connect. Did you mean <b>' + esc(twin) + '</b>?';
+  } else {
+    el.style.display = 'none'; el.innerHTML = '';
+  }
+}
 async function addWifi(){
   const btn = document.getElementById('wifi-add-btn');
   const st = document.getElementById('wifi-add-status');
   const ssid = document.getElementById('wifi-ssid').value.trim();
   const psk = document.getElementById('wifi-psk').value;
   if(!ssid){ st.textContent = 'Enter a network name first.'; return; }
+  const twin = wifiCaseTwin(ssid);
+  if(twin && !confirm('You already have “' + twin + '” saved.\n\nWiFi names are case-sensitive, so “' + ssid
+      + '” is a DIFFERENT network — only the one your router really broadcasts can connect.\n\nAdd it anyway?')){
+    return;
+  }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Adding…'; st.textContent = '';
   try{
     const r = await fetch('/api/connectivity/wifi/add', {method:'POST', headers:{'Content-Type':'application/json'},
