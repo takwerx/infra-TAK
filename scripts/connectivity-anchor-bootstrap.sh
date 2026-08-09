@@ -53,7 +53,15 @@ MEDIA_PORTS="${MEDIA_PORTS:-8554 8322}"    # 8554 RTSP · 8322 RTSPS
 # ever complete NAT traversal through the relay.
 RA_PORTS="${RA_PORTS:-3479}"               # CoTURN STUN/TURN control channel
 RA_UDP_RANGE="${RA_UDP_RANGE:-50000:50050}"  # CoTURN relayed media (pinned range)
-FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS $RA_PORTS"   # TCP forwards
+# v10.1.28: the console's own port, so a relayed box has the SAME direct-IP
+# backdoor every other box has (README "Recovery / backdoor"). Not forwarding it
+# gave relayed boxes a quietly different security posture from the rest of the
+# fleet — and made the documented recovery path impossible on exactly the boxes
+# least able to fall back on anything else. Parity is the rule: open on a Standard
+# box, closed by Hardening W1, which drops it at the box's own firewall whether it
+# arrives over the tunnel or off the LAN.
+CONSOLE_PORT="${CONSOLE_PORT:-5001}"       # infra-TAK console (W1 closes it box-side)
+FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS $RA_PORTS $CONSOLE_PORT"   # TCP forwards
 # UDP forwards. SRT is UDP by protocol design, and until v10.1.10 this script only ever
 # wrote `-p tcp` rules — which made SRT look like something a relay fundamentally could
 # not carry. It isn't: DNAT handles UDP, the MASQUERADE and ESTABLISHED/RELATED rules
