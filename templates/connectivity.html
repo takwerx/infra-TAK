@@ -704,8 +704,10 @@ async function refreshWifiSaved(){
         // button, so the next action is unmissable rather than buried in the banner.
         const justAdded = (s === justAddedSsid && !isCur);
         const rowBorder = justAdded ? 'rgba(59,130,246,.55)' : (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)');
+        // Arrow points RIGHT: this hint renders to the LEFT of the Use button, so a
+        // left arrow aimed at the network name instead of the thing to press.
         const nextHint = justAdded
-          ? '<span style="color:var(--accent);font-size:11px;margin-left:6px">← press Use to join it now</span>'
+          ? '<span style="color:var(--accent);font-size:11px;margin-left:6px">press Use to join it now →</span>'
           : '';
         return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:' + (justAdded ? 'rgba(59,130,246,.07)' : 'var(--bg-deep)') + ';border:1px solid ' + rowBorder + ';border-radius:8px;margin-bottom:6px">'
           + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : (inRange ? 'var(--green)' : 'var(--text-dim)')) + ';flex-shrink:0"></span>'
