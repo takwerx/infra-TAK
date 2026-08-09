@@ -21402,14 +21402,30 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                                 new_host = f'{subdomain}.{fqdn}'
                                 url = 'https://' + new_host + ('/' + '/'.join(rest.split('/')[1:]) if '/' in rest else '')
                         new_uris.append({'url': url, 'matching_mode': uri.get('matching_mode', 'strict')})
+                    # v10.1.28: cookie_domain belongs ONLY to domain-level forward auth.
+                    # Upstream documents it solely for forward_domain ("set Cookie domain to
+                    # the parent domain shared by the protected applications"); the
+                    # single-application section never mentions it.
+                    # https://docs.goauthentik.io/add-secure-apps/providers/proxy/forward_auth
+                    #
+                    # Setting '.<fqdn>' on every forward_single provider made each proxy app
+                    # share one cookie scope across the parent domain, so traffic to one app
+                    # rotated the session another app's OAuth state was pinned to. The victim
+                    # got "mismatched session ID" + "invalid state" from the outpost and a bare
+                    # HTTP 400 in the browser. Field-diagnosed on ops1: a password reset started
+                    # from TAK Portal failed every time while the Console (a second proxy app on
+                    # the same parent domain) sat open in another tab churning forward_auth.
+                    # Same signature as upstream #17033 / #12008. Clearing it on the portal
+                    # provider fixed the reset flow immediately.
+                    _prov_mode = full_prov.get('mode', 'proxy')
                     patch = {
                         'external_host': ext_host,
-                        'cookie_domain': cookie_domain,
+                        'cookie_domain': cookie_domain if _prov_mode == 'forward_domain' else '',
                         'redirect_uris': new_uris,
                         # Required fields to pass cross-field validators
                         'name': full_prov.get('name', ''),
                         'authorization_flow': full_prov.get('authorization_flow'),
-                        'mode': full_prov.get('mode', 'proxy'),
+                        'mode': _prov_mode,
                         'internal_host': full_prov.get('internal_host') or '',
                         'internal_host_ssl_validation': full_prov.get('internal_host_ssl_validation', False),
                     }
@@ -27272,12 +27288,16 @@ def run_takportal_deploy():
                 if flow_pk and inv_flow_pk:
                     try:
                         _tp_host = f'https://{_get_service_domain(settings, "takportal") or f"takportal.{fqdn}"}'
-                        _tp_cookie = f'.{fqdn.split(":")[0]}'
+                        # v10.1.28: NO cookie_domain on a forward_single provider. A shared
+                        # parent-domain cookie let every proxy app on the box collide, breaking
+                        # whichever one had an OAuth state in flight ("mismatched session ID" ->
+                        # bare HTTP 400). Upstream documents cookie_domain for forward_domain
+                        # only. See the matching note in the domain-sync patch above.
                         req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                             data=json_mod.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk,
                                 'external_host': _tp_host, 'mode': 'forward_single',
-                                'token_validity': 'hours=24', 'cookie_domain': _tp_cookie}).encode(),
+                                'token_validity': 'hours=24'}).encode(),
                             headers=_ak_headers, method='POST')
                         resp = _urlreq.urlopen(req, timeout=10)
                         provider_pk = json_mod.loads(resp.read().decode())['pk']
@@ -27291,7 +27311,7 @@ def run_takportal_deploy():
                                 provider_pk = results[0]['pk']
                                 try:
                                     req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                                        data=json_mod.dumps({'external_host': _tp_host, 'cookie_domain': _tp_cookie}).encode(),
+                                        data=json_mod.dumps({'external_host': _tp_host, 'cookie_domain': ''}).encode(),
                                         headers=_ak_headers, method='PATCH')
                                     _urlreq.urlopen(req, timeout=10)
                                 except Exception:
