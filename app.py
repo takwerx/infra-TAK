@@ -1172,18 +1172,18 @@ MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
     "with open(f,'w') as h: h.write(c)\n"
 )
 # Node-RED official icons (https://nodered.org/about/resources/media/)
-NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
-NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
+NODERED_LOGO_URL = "/static/logos/node-red-icon.png"       # icon only (e.g. small nav)
+NODERED_LOGO_URL_2 = "/static/logos/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
 # Authentik official brand icon (external URL)
 # Pinned to an immutable tag, NOT `main`: goauthentik moved this asset out of
 # website/static/img on main → the old `.../main/...` URL now 404s (broken logo
 # everywhere, all platforms — browser-loaded so arch-independent). A tag ref can't move.
-AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/version-2024.12/website/static/img/icon_left_brand_colour.svg"
+AUTHENTIK_LOGO_URL = "/static/logos/authentik-icon.svg"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
-CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
-FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/1087378?s=128&v=4"
+CADDY_LOGO_URL = "/static/logos/caddy-logo.svg"
+FAIL2BAN_LOGO_URL = "/static/logos/fail2ban-icon.png"
 # TAK (Team Awareness Kit) official brand logo from tak.gov
-TAK_LOGO_URL = "https://tak.gov/assets/logos/brand-06b80939.svg"
+TAK_LOGO_URL = "/static/logos/tak-brand.svg"
 # Login page logo: put your TAKWERX logo at static/takwerx-logo.png
 # For sharp display (no fuzz): export at 2x display size — e.g. 960px wide or 400–500px height (PNG, transparent).
 LOGIN_LOGO_FILENAME = "takwerx-logo.png"
@@ -2719,7 +2719,7 @@ def detect_modules():
         'running': wo_running,
         'description': 'Drone photo processing → 3D Tiles & TAK overlays',
         'icon': '📡',
-        'icon_url': 'https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png',
+        'icon_url': '/static/logos/webodm-logo.png',
         'route': '/webodm',
         'priority': 12,
     }
@@ -2742,7 +2742,7 @@ def detect_modules():
         # daemon-thread poll in that window reports the tile not-installed once.
         modules['tak_video_restreamer'] = {'name': 'TAK Video Restreamer', 'installed': False, 'running': False,
             'description': 'Flask + MediaMTX restreamer — RTSP, RTSPS, SRT, HLS, KLV', 'icon': '\U0001F3A5',
-            'icon_url': 'https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png',
+            'icon_url': '/static/logos/tak-video-restreamer-logo.png',
             'route': '/tak-video-restreamer', 'priority': 13, 'conflicts': ['mediamtx']}
 
     # NetBird VPN
@@ -3056,7 +3056,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         parts.append(link('/mediamtx', f'<img src="{html.escape(MEDIAMTX_LOGO_URL)}" alt="MediaMTX" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'MediaMTX'))
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
-        parts.append(link('/tak-video-restreamer', '<img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
+        parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -3068,7 +3068,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         parts.append(link('/cesium-tiles', f'<img src="{html.escape(CESIUM_TILES_LOGO_URL)}" alt="Cesium 3D Tiles" class="nav-icon" style="height:24px;width:auto;max-width:100px;object-fit:contain;display:block">', 'Cesium 3D Tiles'))
     wo = modules.get('webodm', {})
     if wo.get('installed'):
-        parts.append(link('/webodm', '<img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="WebODM" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block;filter:brightness(0) invert(1)"><span>WebODM</span>', 'WebODM'))
+        parts.append(link('/webodm', '<img src="/static/logos/webodm-logo.png" alt="WebODM" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block;filter:brightness(0) invert(1)"><span>WebODM</span>', 'WebODM'))
     nb = modules.get('netbird', {})
     if nb.get('installed'):
         parts.append(link('/netbird', '<img src="https://netbird.io/favicon.ico" alt="NetBird" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>NetBird VPN</span>', 'NetBird VPN'))

@@ -51,7 +51,7 @@ body.light-mode
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<div class="main">
-<div class="section-title"><img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)">WebODM</div>
+<div class="section-title"><img src="/static/logos/webodm-logo.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)">WebODM</div>
 
 {% if not wo.get('installed') or deploying or deploy_error %}
 <!-- Deploy state (also shown for an in-place Reapply on an installed box) -->

@@ -804,9 +804,31 @@ function pickWifi(ssid){
   document.getElementById('wifi-ssid').value = ssid;
   document.getElementById('wifi-psk').focus();
 }
+// Pressing Use kills the page — the box leaves the Setup AP for the target
+// network, so this browser loses its route mid-request. The old feedback was a
+// line of text down by the Add form, nowhere near the Use button you just
+// pressed, so the tap looked like it did nothing right before everything went
+// away (ops1 2026-08-09). Put an unmissable full-width banner up instead, and
+// say what is about to happen so a dead page reads as expected, not broken.
+function showSwitchOverlay(ssid){
+  let o = document.getElementById('switch-overlay');
+  if(!o){
+    o = document.createElement('div');
+    o.id = 'switch-overlay';
+    o.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;padding:16px 20px;'
+      + 'background:rgba(59,130,246,.97);color:#fff;font-size:14px;line-height:1.6;'
+      + 'box-shadow:0 4px 24px rgba(0,0,0,.5);text-align:center';
+    document.body.appendChild(o);
+  }
+  o.innerHTML = '<b>Switching to “' + esc(ssid) + '”…</b><br>'
+    + 'The setup WiFi is shutting down, so this page will stop responding — that is expected. '
+    + 'Reconnect your laptop to its normal network; the box will be on “' + esc(ssid) + '”.';
+  window.scrollTo(0, 0);
+}
 async function useWifi(ssid){
   const st = document.getElementById('wifi-add-status');
   justAddedSsid = '';   // acted on — drop the "press Use" pointer
+  showSwitchOverlay(ssid);
   st.style.color = 'var(--text-dim)';
   st.textContent = 'Switching to “' + ssid + '”…';
   try{

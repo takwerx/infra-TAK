@@ -17,8 +17,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
 
-ICONS=$(grep -rhoE 'material-symbols-outlined[^>]*>[^<]{1,40}' app.py templates/ static/ 2>/dev/null \
-  | sed 's/.*>//' | tr -d ' \t' | grep -E '^[a-z0-9_]+$' | sort -u)
+# Names set from JavaScript (el.textContent = 'visibility_off') are invisible to a
+# markup scan — the password toggle rendered an eye followed by the literal text
+# "_off" because of exactly this. Keep such names here, explicitly.
+EXTRA_ICONS='visibility_off'
+
+ICONS=$( { grep -rhoE 'material-symbols-outlined[^>]*>[^<]{1,40}' app.py templates/ static/ 2>/dev/null \
+    | sed 's/.*>//'
+  # any string assigned to .textContent that looks like an icon ligature
+  grep -rhoE "textContent\s*=\s*(show \? )?'[a-z0-9_]{3,30}'" app.py templates/ static/ 2>/dev/null \
+    | grep -oE "'[a-z0-9_]+'" | tr -d "'"
+  printf '%s\n' $EXTRA_ICONS
+  } | tr -d ' \t' | grep -E '^[a-z0-9_]+$' | sort -u)
 COUNT=$(printf '%s\n' "$ICONS" | wc -l | tr -d ' ')
 echo "Found $COUNT distinct icons:"; printf '%s\n' "$ICONS" | tr '\n' ' '; echo
 CSV=$(printf '%s\n' "$ICONS" | tr '\n' ',' | sed 's/,$//')
