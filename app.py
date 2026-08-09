@@ -24083,7 +24083,11 @@ def generate_caddyfile(settings=None):
         lines.append(f"                        <html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Continue to sign in</title>")
         lines.append(f"                        <style>body{{font-family:system-ui,sans-serif;background:#0f1420;color:#e6e8ee;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}main{{max-width:26rem;padding:2rem;text-align:center}}h1{{font-size:1.25rem}}p{{color:#9aa3b2;line-height:1.6}}a{{display:inline-block;margin-top:1rem;padding:.7rem 1.6rem;background:#2b6cb0;color:#fff;border-radius:.5rem;text-decoration:none;font-weight:600}}</style></head>")
         lines.append(f"                        <body><main><h1>Almost there</h1>")
-        lines.append(f"                        <p>If you just set or reset your password, it was saved. This page couldn't finish signing you in automatically &mdash; that happens when the email link opens in a different browser or window.</p>")
+        # Cause-neutral on purpose: the 400 has several triggers (no outpost session at the
+        # callback, a state minted in another browser, an expired flow). Naming one of them
+        # is wrong for the other cases — field-checked 2026-08-08, where the message blamed a
+        # different browser but the operator had stayed in a single incognito window.
+        lines.append(f"                        <p>Your password was saved. This last step couldn't complete on its own, so sign in below to finish.</p>")
         lines.append(f"                        <a href=\"{root_url}\">Continue to sign in</a></main></body></html>")
         lines.append(f"                        CBRESCUE 200")
         lines.append(f"                }}")
