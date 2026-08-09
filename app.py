@@ -34025,6 +34025,54 @@ def _ak_api_call(url, data=None, method='GET', headers=None, max_retries=3, time
         raise last_exc
 
 
+# v10.1.28: "Show password" on the recovery (reset) prompt. authentik's PromptStage has no
+# allow_show_password (that setting exists only on PasswordStage, which is why the LOGIN page
+# already has an eyeball) — upstream goauthentik/authentik#12550. These two pieces reproduce it
+# with supported config only: a `static` prompt field emitting the checkbox, and brand CSS that
+# unmasks siblings when it is checked. Marker string _AK_SHOWPW_MARKER makes the CSS idempotent.
+_AK_SHOWPW_MARKER = 'infra-TAK-showpw'
+_AK_SHOWPW_FIELD_HTML = (
+    '<label style="display:flex;gap:8px;align-items:center;font-size:13px;'
+    'cursor:pointer;margin:-8px 0 4px">'
+    '<input type="checkbox" id="showpw" style="cursor:pointer"> Show password</label>'
+)
+_AK_SHOWPW_CSS = (
+    '/* ' + _AK_SHOWPW_MARKER + ': reveal toggle for the password reset prompt.\n'
+    '   PromptStage has no allow_show_password (upstream #12550), so the checkbox in the\n'
+    '   static prompt field drives this rule. Firefox lacks -webkit-text-security, so the\n'
+    '   fields stay masked there — degrades quietly, never errors. */\n'
+    'form:has(#showpw:checked) input[type="password"],\n'
+    'div:has(#showpw:checked) input[type="password"] {\n'
+    '    -webkit-text-security: none !important;\n'
+    '}\n'
+)
+
+
+def _ensure_authentik_showpw_css(ak_url, ak_headers):
+    """Append the show-password CSS to every Authentik brand, idempotently.
+
+    Keyed on _AK_SHOWPW_MARKER rather than an exact-string compare so an operator's own
+    custom CSS in the same field is preserved instead of being overwritten.
+    Returns the number of brands changed.
+    """
+    import urllib.request as _ur
+    changed = 0
+    req = _ur.Request(f'{ak_url}/api/v3/core/brands/', headers=ak_headers)
+    brands = json.loads(_ur.urlopen(req, timeout=15).read().decode()).get('results', [])
+    for b in brands:
+        cur = (b.get('branding_custom_css') or '')
+        if _AK_SHOWPW_MARKER in cur:
+            continue
+        new_css = (cur.rstrip() + '\n\n' + _AK_SHOWPW_CSS) if cur.strip() else _AK_SHOWPW_CSS
+        pr = _ur.Request(
+            f'{ak_url}/api/v3/core/brands/{b["brand_uuid"]}/',
+            data=json.dumps({'branding_custom_css': new_css}).encode(),
+            headers=ak_headers, method='PATCH')
+        _ur.urlopen(pr, timeout=15)
+        changed += 1
+    return changed
+
+
 def _ensure_authentik_recovery_flow(ak_url, ak_headers):
     """Create recovery flow + stages + bindings and link to default authentication flow.
     Matches official Authentik blueprint: Identification -> Email -> Prompt (new pw) -> User Write -> User Login.
@@ -34124,7 +34172,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             except Exception:
                 pass
 
-        def _find_or_create_prompt(name, field_key, label, order):
+        def _find_or_create_prompt(name, field_key, label, order,
+                                   ftype='password', required=True, placeholder=None):
             results = _api_get(f'stages/prompt/prompts/?search={_req.quote(name)}').get('results', [])
             for p in results:
                 if p.get('name') == name:
@@ -34132,7 +34181,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             try:
                 return _api_post('stages/prompt/prompts/', {
                     'name': name, 'field_key': field_key, 'label': label,
-                    'type': 'password', 'required': True, 'placeholder': label,
+                    'type': ftype, 'required': required,
+                    'placeholder': label if placeholder is None else placeholder,
                     'order': order, 'placeholder_expression': False})['pk']
             except urllib.error.HTTPError as e:
                 if e.code == 400:
@@ -34144,13 +34194,27 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
         pw_field_pk = _find_or_create_prompt('recovery-field-password', 'password', 'Password', 0)
         pw_repeat_field_pk = _find_or_create_prompt('recovery-field-password-repeat', 'password_repeat', 'Password (repeat)', 1)
+        # v10.1.28: the reset page had no way to see what you were typing, while the LOGIN
+        # page does (PasswordStage.allow_show_password=True). PromptStage has no such
+        # setting — upstream goauthentik/authentik#12550 is open with no PR — so the toggle
+        # is built from parts authentik already supports: a `static` prompt field carrying a
+        # checkbox, plus brand CSS that unmasks the password inputs when it is checked.
+        # No JS (authentik's CSP blocks inline handlers) and no patched container, so it
+        # survives Authentik upgrades. Chrome/Safari/Edge only: -webkit-text-security is
+        # unsupported in Firefox, where the fields simply stay masked (no error, no toggle).
+        showpw_field_pk = _find_or_create_prompt(
+            'recovery-field-show-password', 'showpw_toggle', 'Show password', 50,
+            ftype='static', required=False, placeholder=_AK_SHOWPW_FIELD_HTML)
+        _recovery_fields = [pw_field_pk, pw_repeat_field_pk]
+        if showpw_field_pk:
+            _recovery_fields.append(showpw_field_pk)
 
         prompt_stage_pk = _find_stage('stages/prompt/stages/', 'Recovery Password Change')
         if not prompt_stage_pk:
             try:
                 prompt_stage_pk = _api_post('stages/prompt/stages/', {
                     'name': 'Recovery Password Change',
-                    'fields': [pw_field_pk, pw_repeat_field_pk]})['pk']
+                    'fields': _recovery_fields})['pk']
             except urllib.error.HTTPError as e:
                 if e.code == 400:
                     prompt_stage_pk = _find_stage('stages/prompt/stages/', 'Recovery Password Change')
@@ -34159,9 +34223,15 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         else:
             try:
                 _api_patch(f'stages/prompt/stages/{prompt_stage_pk}/', {
-                    'fields': [pw_field_pk, pw_repeat_field_pk]})
+                    'fields': _recovery_fields})
             except Exception:
                 pass
+
+        # The checkbox is inert without the CSS that acts on it — apply both or neither.
+        try:
+            _ensure_authentik_showpw_css(ak_url, ak_headers)
+        except Exception:
+            pass
 
         user_write_pk = _find_or_create_stage('stages/user_write/', 'Recovery User Write',
             {'user_creation_mode': 'never_create'})
