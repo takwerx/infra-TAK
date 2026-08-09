@@ -23,6 +23,7 @@ set -u
 STATE_DIR="/var/lib/takguard"
 CONF="$STATE_DIR/setup-ap.conf"
 ACTIVE_FLAG="$STATE_DIR/setup-ap.active"
+MANUAL_FLAG="$STATE_DIR/setup-ap.manual"
 NOUP_SINCE="$STATE_DIR/setup-ap.nouplink-since"
 BOOT_GRACE=45          # seconds after boot to let a known wifi connect
 RUN_GRACE=90           # seconds of sustained no-uplink while running before AP
@@ -60,7 +61,13 @@ AP_UP(){ [ -f "$ACTIVE_FLAG" ]; }
 
 if uplink_ok; then
     rm -f "$NOUP_SINCE"
-    if AP_UP; then
+    # Never tear down an AP the operator raised on purpose. The Start button exists
+    # precisely so it can be used while the box still has a working uplink (that is
+    # how you reach the console to press it), and this watcher used to kill it within
+    # 30s — the AP came up, the operator's laptop had not even finished a scan, and
+    # it was gone (ops1 2026-08-09: up 18:04:05, stopped 18:04:12). Only the console's
+    # Stop button, or `tak-setup-ap.sh stop`, clears MANUAL_FLAG.
+    if AP_UP && [ ! -f "$MANUAL_FLAG" ]; then
         "$ENGINE" stop >/dev/null 2>&1
     fi
     exit 0

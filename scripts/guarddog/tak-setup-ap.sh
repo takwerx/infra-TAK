@@ -24,6 +24,11 @@ set -u
 STATE_DIR="/var/lib/takguard"
 CONF="$STATE_DIR/setup-ap.conf"          # written by the console: SSID_SUFFIX/PASS/etc.
 ACTIVE_FLAG="$STATE_DIR/setup-ap.active"
+# Set by the console's Start button; tells the auto-watcher this AP was raised
+# DELIBERATELY and must not be torn down just because the box still has internet
+# (ops1 2026-08-09: manual Start lived 7s before the 30s watcher stopped it — the
+# operator saw the UI say "starting" and then nothing). Cleared on any stop.
+MANUAL_FLAG="$STATE_DIR/setup-ap.manual"
 AP_IP="10.42.0.1"
 AP_CIDR="24"
 AP_RANGE_LO="10.42.0.50"
@@ -112,7 +117,12 @@ ap_capable(){
 restore_client(){
     log "restore_client: handing radio back to the client stack"
     rm -f "$ACTIVE_FLAG"
-    pkill -f "hostapd $HOSTAPD_CONF" 2>/dev/null
+    # Match on the conf path ALONE. hostapd is launched as `hostapd -B <conf>`, so
+    # the old pattern "hostapd $HOSTAPD_CONF" never matched (the -B sits between the
+    # two words) and hostapd was NEVER killed on stop — it leaked, kept holding the
+    # radio, and is the long-standing "Stop button never fires" bug (ops1 2026-08-09:
+    # a stray `hostapd -B /tmp/takwerx-hostapd.conf` still running after "stop: done").
+    pkill -f "$HOSTAPD_CONF" 2>/dev/null
     pkill -f "dnsmasq.*$DNSMASQ_CONF" 2>/dev/null
     # drop the captive :80 redirect responder + firewall rule
     pkill -f 'takwerx-captive' 2>/dev/null
@@ -472,7 +482,7 @@ EOF
 
 case "${1:-}" in
     start)  start_ap ;;
-    stop)   restore_client; log "stop: done"; echo "stopped" ;;
+    stop)   rm -f "$MANUAL_FLAG"; restore_client; log "stop: done"; echo "stopped" ;;
     status)
         if [ -f "$ACTIVE_FLAG" ]; then
             echo "active ssid=$AP_SSID ip=$AP_IP"

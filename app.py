@@ -11296,6 +11296,9 @@ def connectivity_wifi_forget_api():
 # root systemd unit takwerx-setup-ap.service (engine tak-setup-ap.sh); the console
 # only start/stops that unit through the broker — no new broker privilege.
 _SETUP_AP_CONF = '/var/lib/takguard/setup-ap.conf'
+# Marks an AP raised by the console's Start button, so tak-setup-ap-watch.sh does
+# not tear it down for the crime of the box still having internet.
+_SETUP_AP_MANUAL_FLAG = '/var/lib/takguard/setup-ap.manual'
 _SETUP_AP_ACTIVE_FLAG = '/var/lib/takguard/setup-ap.active'
 
 
@@ -11536,9 +11539,23 @@ def connectivity_setup_ap_start_api():
     # Start the root service through the broker. This SEVERS any wifi uplink (the
     # radio becomes the AP), so the HTTP response is sent before the switch lands;
     # the operator reconnects locally to the setup wifi.
+    # Claim this AP as operator-initiated BEFORE starting it, so the 30s auto-watcher
+    # cannot race in and stop it (ops1 2026-08-09: manual start survived 7 seconds on
+    # a box with a healthy uplink — the watcher's "internet is fine, AP should be
+    # down" rule could not tell a deliberate start from a stale one).
+    try:
+        subprocess.run(_sudo_wrap(['touch', _SETUP_AP_MANUAL_FLAG]),
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
     r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'takwerx-setup-ap.service']),
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
+        try:
+            subprocess.run(_sudo_wrap(['rm', '-f', _SETUP_AP_MANUAL_FLAG]),
+                           capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
         return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'start failed').strip()[:200]}), 500
     return jsonify({'success': True})
 
@@ -11649,6 +11666,13 @@ def _conn_join_best_saved():
 @app.route('/api/connectivity/setup-ap/stop', methods=['POST'])
 @login_required
 def connectivity_setup_ap_stop_api():
+    # Release the operator claim first, so the AP cannot be re-protected from the
+    # watcher if the service stop below is partial. The engine clears it too.
+    try:
+        subprocess.run(_sudo_wrap(['rm', '-f', _SETUP_AP_MANUAL_FLAG]),
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
     r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
