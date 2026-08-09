@@ -562,7 +562,9 @@ async function akControl(action){
     try{
         var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
         var d=await r.json();
-        if(d.success)window.location.href='/authentik';
+        // Stop/restart takes the forward_auth upstream down with it — reload on the
+        // console port so the module page is reachable while Authentik is off.
+        if(d.success)goConsoleModulePage();
         else alert('Error: '+(d.error||'Unknown'));
     }catch(e){alert('Error: '+e.message)}
     btns.forEach(function(b){b.disabled=false;b.style.opacity='1'});
@@ -796,7 +798,7 @@ async function doUninstallAk(){
         var d=await r.json();
         if(d.success){
             progressEl.innerHTML='<span class="uninstall-spinner"></span><span>Done. Reloading…</span>';
-            setTimeout(function(){window.location.href='/authentik';},800);
+            setTimeout(goConsoleModulePage,800);
         }else{
             msgEl.textContent=d.error||'Uninstall failed';
             progressEl.style.display='none';
