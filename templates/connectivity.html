@@ -199,7 +199,9 @@ textarea.form-input{resize:vertical}
     </p>
     <div id="wifi-saved" style="font-size:12px;color:var(--text-dim);margin-bottom:14px"></div>
     <div id="wifi-ap-note" style="display:none;margin-bottom:14px;padding:11px 13px;background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:12px;color:var(--text-secondary)">
-      <b style="color:var(--accent)">Setup mode:</b> this box is broadcasting its own WiFi right now, so it can&#39;t scan for other networks. Just <b>type the network name and password</b> below and Add it — the box will join that network and turn the setup WiFi off.
+      <b style="color:var(--accent)">Setup mode:</b> this box is broadcasting its own WiFi right now, so it can&#39;t scan for other networks.
+      <b>Type the network name and password</b> below and press Add — then press <b>Use</b> next to it under Known Networks.
+      Use is what joins the network and turns the setup WiFi off; Add on its own only saves it.
       <br><b style="color:var(--yellow)">Type it exactly, capitals included</b> — there&#39;s no scan list to pick from here, and <b>OXFORD</b> and <b>oxford</b> are different networks.
     </div>
     <div id="wifi-scan-row" style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
@@ -843,7 +845,8 @@ async function addWifi(){
       body: JSON.stringify({ssid: ssid, password: psk})});
     const d = await r.json();
     if(d.success){
-      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '” to this box’s WiFi list.</span> Nothing else disconnects. It joins automatically when in range — or, if you’re on the Setup WiFi, turn it off below to switch to it now.';
+      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '” to this box’s WiFi list.</span> Nothing disconnected — adding only saves it. '
+        + 'To switch to it now, press <b>Use</b> next to “' + esc(ssid) + '” under Known Networks above; otherwise it joins on its own when in range.';
       document.getElementById('wifi-psk').value = '';
       refreshWifiSaved();
     } else { st.textContent = d.error || 'Could not add network.'; }
