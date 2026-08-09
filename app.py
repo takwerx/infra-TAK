@@ -11385,9 +11385,77 @@ def _conn_setup_ap_write_conf(ssid, password, auto):
                 pass
 
 
+def _conn_setup_ap_have_nm():
+    """True when NetworkManager drives the radio (RHEL, and Ubuntu Desktop)."""
+    try:
+        if not shutil.which('nmcli'):
+            return False
+        r = subprocess.run(['systemctl', 'is-active', '--quiet', 'NetworkManager'], timeout=8)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _conn_setup_ap_deps_ready():
+    """Can this box actually bring the Setup AP up RIGHT NOW, offline?
+
+    NetworkManager boxes need nothing extra (`nmcli device wifi hotspot`).
+    Everything else (Ubuntu Server = netplan/systemd-networkd, the fleet default)
+    goes down tak-setup-ap.sh's hostapd path and needs hostapd + dnsmasq ON DISK."""
+    if _conn_setup_ap_have_nm():
+        return True
+    return bool(shutil.which('hostapd')) and bool(shutil.which('dnsmasq'))
+
+
+def _conn_setup_ap_ensure_deps(log_fn=None):
+    """Pre-install the Setup AP's offline dependencies WHILE THE BOX IS ONLINE.
+
+    v10.1.28 (ops1 2026-08-09, field): tak-setup-ap.sh installed hostapd/dnsmasq
+    lazily at AP-start time — which is by definition the one moment the box has no
+    internet. apt-get could not resolve, start failed, the client radio was
+    restored, and the 30s watcher retried the identical failure forever (176 KB of
+    log, no AP, nothing surfaced to the operator). The box shipped with a Setup AP
+    that could never once come up on Ubuntu Server.
+
+    Arming has to happen while connectivity still exists: on config save, and via
+    the startup converge for boxes already configured. Idempotent and cheap when
+    the packages are already present. Returns True when the box is armed."""
+    _log = log_fn or (lambda m: None)
+    if _conn_setup_ap_deps_ready():
+        return True
+    missing = [p for p in ('hostapd', 'dnsmasq') if not shutil.which(p)]
+    if not missing:
+        return True
+    _log('Setup AP: installing offline dependencies (%s)' % ', '.join(missing))
+    try:
+        ok, out = _pkg_install(missing, timeout=300)
+    except Exception as e:
+        _log('Setup AP: dependency install error: %s' % str(e)[:160])
+        return False
+    if not ok:
+        _log('Setup AP: dependency install FAILED: %s' % (out or '')[-300:])
+        return False
+    # Debian ENABLES dnsmasq.service on install; it would bind :53 on every
+    # interface at next boot and collide with the AP's own script-managed dnsmasq
+    # (which uses bind-interfaces). The engine masks these at start too — do it
+    # here so a reboot between arming and first use cannot break the AP.
+    for _u in ('dnsmasq.service', 'hostapd.service'):
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', 'disable', '--now', _u]),
+                           capture_output=True, text=True, timeout=30)
+        except Exception:
+            pass
+    _log('Setup AP: armed — hostapd + dnsmasq installed')
+    return True
+
+
 def _conn_setup_ap_status():
     st = {'active': os.path.exists(_SETUP_AP_ACTIVE_FLAG), 'ap_capable': None, 'has_wifi': bool(_conn_wifi_iface())}
     st.update(_conn_setup_ap_read_conf())
+    # Surface arming state so the page can never again promise an automatic
+    # broadcast the box is physically unable to perform (ops1 2026-08-09).
+    st['deps_ready'] = _conn_setup_ap_deps_ready()
+    st['uses_nm'] = _conn_setup_ap_have_nm()
     return st
 
 
@@ -11434,7 +11502,17 @@ def connectivity_setup_ap_config_api():
         return jsonify({'success': False, 'error': 'Name/password may not contain quotes, newlines, or any of ` $ ( ) ; & | < > \\'}), 400
     if not _conn_setup_ap_write_conf(ssid, password, auto):
         return jsonify({'success': False, 'error': 'Could not save Setup AP config.'}), 500
-    return jsonify({'success': True, 'status': _conn_setup_ap_status()})
+    # ARM IT NOW, while the box still has internet. The AP itself only ever runs
+    # when connectivity is gone, so this is the last moment the dependencies can
+    # be fetched (ops1 2026-08-09: lazy install at start time = never).
+    _armed = _conn_setup_ap_ensure_deps()
+    st = _conn_setup_ap_status()
+    resp = {'success': True, 'status': st}
+    if not _armed:
+        resp['warning'] = ('Saved, but this box could not install the Setup WiFi components '
+                           '(hostapd/dnsmasq). Automatic broadcast will NOT work until it can '
+                           'reach the internet once — reconnect and press Save settings again.')
+    return jsonify(resp)
 
 
 @app.route('/api/connectivity/setup-ap/start', methods=['POST'])
@@ -65421,6 +65499,34 @@ def _startup_migrations():
                 # Authentik containers may still be starting on a fresh boot — leave the flag
                 # unset so the next restart retries rather than silently skipping forever.
                 print(f"Startup migration: Authentik converge deferred (retries next restart): {_akc_err}", flush=True)
+
+        # v10.1.28: arm the Setup AP's offline dependencies on boxes that were already
+        # configured before this fix. tak-setup-ap.sh installed hostapd/dnsmasq lazily at
+        # AP-start time — the one moment the box has no internet — so on every Ubuntu
+        # Server box (no NetworkManager; the fleet baseline) the automatic broadcast has
+        # NEVER once come up. ops1 2026-08-09: 176 KB of setup-ap.log, all the same
+        # "Temporary failure resolving us.archive.ubuntu.com" every 30s. Rocky boxes were
+        # unaffected (NetworkManager makes the hotspot with no extra packages), which is
+        # why this hid. Console update runs while the box is online — that is the fix
+        # window. Only arms boxes that actually have a radio and have configured the AP.
+        if not s.get('setup_ap_deps_armed_v1'):
+            try:
+                if _conn_wifi_iface() and os.path.exists(_SETUP_AP_CONF):
+                    if _conn_setup_ap_ensure_deps(
+                            log_fn=lambda m: print('Startup migration: %s' % m, flush=True)):
+                        s['setup_ap_deps_armed_v1'] = True
+                        save_settings(s)
+                        s = load_settings()
+                    else:
+                        print('Startup migration: Setup AP not armed (retries next restart)', flush=True)
+                else:
+                    # No radio, or AP never configured → nothing to arm. Stamp so we
+                    # don't re-probe every boot; a later config save arms it directly.
+                    s['setup_ap_deps_armed_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+            except Exception as _sae:
+                print('Startup migration: Setup AP arming error: %s' % str(_sae)[:160], flush=True)
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console

@@ -574,7 +574,13 @@ async function refreshSetupAp(){
       stateEl.innerHTML = '<span class="dot" style="background:var(--green)"></span> <b style="color:var(--green)">Setup WiFi is broadcasting</b> as “' + esc(d.ssid) + '”. Join it from a device to configure a network.';
       startBtn.style.display = 'none'; stopBtn.style.display = 'inline-flex';
     }else{
-      stateEl.innerHTML = '<span class="dot" style="background:var(--text-dim)"></span> Setup WiFi is off — the box is using its normal connection.' + (d.has_password ? '' : ' <span style="color:var(--yellow)">Set a password below before you rely on it.</span>');
+      // deps_ready: on boxes without NetworkManager (Ubuntu Server) the AP is built
+      // from hostapd + dnsmasq, which can only be fetched while the box is ONLINE.
+      // If they are missing, the automatic broadcast physically cannot fire — say so
+      // here rather than let the page keep promising it (ops1 2026-08-09).
+      stateEl.innerHTML = '<span class="dot" style="background:var(--text-dim)"></span> Setup WiFi is off — the box is using its normal connection.'
+        + (d.has_password ? '' : ' <span style="color:var(--yellow)">Set a password below before you rely on it.</span>')
+        + (d.deps_ready === false ? '<br><span style="color:var(--yellow)">⚠ Not armed — the Setup WiFi components aren’t installed yet, so it can’t broadcast automatically. While this box has internet, press <b>Save settings</b> below to arm it.</span>' : '');
       startBtn.style.display = 'inline-flex'; stopBtn.style.display = 'none';
     }
   }catch(e){}

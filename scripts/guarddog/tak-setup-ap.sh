@@ -287,6 +287,40 @@ start_ap(){
     [ -f "$ACTIVE_FLAG" ] && { log "start: AP already active"; echo "already-active"; return 0; }
     if [ -z "$IFACE" ]; then log "start: no wifi interface"; echo "no-wifi-interface"; return 2; fi
     if ! ap_capable; then log "start: radio has no AP mode"; echo "no-ap-mode"; return 3; fi
+
+    # v10.1.28 (ops1 2026-08-09, field): on a non-NM box (Ubuntu Server = the fleet
+    # baseline) the AP is built from hostapd + dnsmasq, and those must already be ON
+    # DISK. They are installed by the console while the box is ONLINE ("arming" — on
+    # Setup AP config save and via the startup converge).
+    #
+    # This check must run BEFORE the ERR trap and before the radio is touched. The
+    # old code installed them lazily further down, past the trap: when the AP was
+    # actually needed the box had no internet by definition, apt-get failed to
+    # resolve, the trap fired, restore_client tore the client stack down, and the
+    # 30s watcher retried the identical failure forever — 176 KB of log, no AP, and
+    # a radio being reset every half minute. Fail early, loudly, and leave the radio
+    # alone. If we DO have connectivity (manual start, or arming), install here.
+    if ! have_nm; then
+        _missing=""
+        command -v hostapd >/dev/null 2>&1 || _missing="hostapd"
+        command -v dnsmasq >/dev/null 2>&1 || _missing="${_missing:+$_missing }dnsmasq"
+        if [ -n "$_missing" ]; then
+            log "start: missing $_missing — attempting install (needs internet)"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $_missing >>"$LOG" 2>&1
+            _still=""
+            command -v hostapd >/dev/null 2>&1 || _still="hostapd"
+            command -v dnsmasq >/dev/null 2>&1 || _still="${_still:+$_still }dnsmasq"
+            if [ -n "$_still" ]; then
+                log "start: NOT ARMED — $_still missing and no internet to fetch it. Radio left untouched."
+                log "start: fix — connect this box to the internet once, then press Save settings on the Connectivity page."
+                echo "not-armed"; return 4
+            fi
+            systemctl disable --now dnsmasq.service 2>/dev/null || true
+            systemctl disable --now hostapd.service 2>/dev/null || true
+            log "start: armed — $_missing installed"
+        fi
+    fi
+
     log "start: bringing up AP ssid='$AP_SSID' iface='$IFACE' nm=$(have_nm && echo yes || echo no)"
 
     # ANY failure past this point restores the client and reports failure.
@@ -367,8 +401,9 @@ EOF
         nmcli connection up takwerx-hotspot
         set +e
     else
-        command -v hostapd  >/dev/null 2>&1 || { log "start: installing hostapd";  DEBIAN_FRONTEND=noninteractive apt-get install -y hostapd  >>"$LOG" 2>&1; }
-        command -v dnsmasq  >/dev/null 2>&1 || { log "start: installing dnsmasq";  DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq  >>"$LOG" 2>&1; }
+        # (hostapd/dnsmasq presence is guaranteed by the arming check at the top of
+        # start_ap — the lazy install that used to live here is what made the AP
+        # unstartable offline. Do not reintroduce it.)
         # Mask the packaged units so they never auto-start on boot and fight our
         # script-managed instances. Debian ENABLES dnsmasq.service on install — on
         # the next reboot it would bind :53 on all interfaces before/against our
