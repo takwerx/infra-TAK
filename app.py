@@ -5026,31 +5026,15 @@ def _w1_revert_mfa(h, log):
             log('W1: force-enroll restored to prior (%s)' % (fe.get('prior_not_configured_action') or 'skip'))
         except Exception as e:
             log('W1: force-enroll restore error: %s' % str(e)[:120])
-    # WS3c: remove the recovery flow's Session Logout binding — with the User Login
-    # binding restored below, the reset ends logged-in AS THE RESET USER again, and
-    # a trailing logout would immediately destroy that session.
-    for _lb in (w1.get('ak_recovery_logout') or []):
-        try:
-            if _lb.get('binding_pk'):
-                _ak_api_call(f'{ak_url}/api/v3/flows/bindings/{_lb["binding_pk"]}/',
-                             method='DELETE', headers=ak_headers)
-                log('W1: recovery-flow Session Logout binding removed')
-        except Exception as e:
-            log('W1: recovery logout-binding remove error: %s' % str(e)[:100])
+    # v10.1.28: the recovery flow now ends SIGNED OUT on every box, hardened or not
+    # (see _ensure_authentik_recovery_flow). A W1 revert must therefore NOT strip the
+    # Session Logout binding, and must NOT restore the User Login binding — either one
+    # re-arms the post-reset callback 400 (cross-site click-tracker + SameSite=Lax) and
+    # re-opens the WS3c privilege-handoff hazard. Both are now no-ops; the recorded pks
+    # are dropped so a later re-apply re-records cleanly.
     w1.pop('ak_recovery_logout', None)
-    # WS3: restore the recovery flow's User Login binding — non-hardened boxes keep
-    # today's convenience behavior (reset ends logged-in).
-    for _rb in (w1.get('ak_recovery_login') or []):
-        try:
-            _ak_api_call(f'{ak_url}/api/v3/flows/bindings/',
-                         data=json.dumps({'target': _rb.get('flow_pk'), 'stage': _rb.get('stage_pk'),
-                                          'order': _rb.get('order', 100), 'evaluate_on_plan': True,
-                                          're_evaluate_policies': False, 'policy_engine_mode': 'any',
-                                          'invalid_response_action': 'retry'}).encode(),
-                         method='POST', headers=ak_headers)
-            log('W1: recovery-flow User Login binding restored')
-        except Exception as e:
-            log('W1: recovery login-binding restore error: %s' % str(e)[:100])
+    w1.pop('ak_recovery_login', None)
+    log('W1: recovery flow left ending signed-out (fleet-uniform since v10.1.28)')
     for slug, info in (w1.get('ak_apps') or {}).items():
         try:
             if info.get('binding_pk'):
@@ -34124,7 +34108,10 @@ def _ensure_authentik_showpw_css(ak_url, ak_headers):
 
 def _ensure_authentik_recovery_flow(ak_url, ak_headers):
     """Create recovery flow + stages + bindings and link to default authentication flow.
-    Matches official Authentik blueprint: Identification -> Email -> Prompt (new pw) -> User Write -> User Login.
+    Identification -> Email -> Prompt (new pw) -> User Write -> Session Logout.
+    Deliberately diverges from the stock Authentik blueprint, which ends in User Login:
+    the reset ALWAYS ends signed out so the pre-reset OAuth state is never redeemed
+    (see the v10.1.28 note below on the click-tracker / SameSite=Lax callback 400).
     Fetches ALL bindings and filters client-side (the flow__pk server filter is unreliable).
     Returns (success: bool, message: str, recovery_slug: str|None)."""
     import urllib.request as _req
@@ -34322,19 +34309,28 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         user_write_pk = _find_or_create_stage('stages/user_write/', 'Recovery User Write',
             {'user_creation_mode': 'never_create'})
 
-        user_login_pk = _find_or_create_stage('stages/user_login/', 'Recovery User Login')
-
-        # v10.1.4 (WS3, load-bearing): when W1 hardening is applied, the recovery flow
-        # must NOT end in a session — drop the user_login stage from the desired set so
-        # step 4 below also DELETES any existing binding. Without this gate, every Email
-        # Relay deploy / "Configure Authentik" press re-created the binding and silently
-        # resurrected the reset-email MFA bypass on hardened boxes. Both local and
-        # split-box paths funnel through this function.
-        try:
-            if ((load_hardening().get('applied') or {}).get('W1_sso') or {}).get('ak_apps'):
-                user_login_pk = None
-        except Exception:
-            pass
+        # v10.1.28: the recovery flow ALWAYS ends signed OUT, on every box — hardened or
+        # not. user_login_pk stays None so step 4 below DELETES any existing User Login
+        # binding, and a user_logout stage is bound LAST (order 110) instead.
+        #
+        # Why (field-confirmed on nuc 2026-08-09): a trailing User Login makes Authentik
+        # resume the pending authorization and bounce the browser to the outpost callback
+        # carrying the state minted BEFORE the reset. Every mail provider rewrites the
+        # reset link through a click tracker (Brevo -> sendibt2.com), so that callback is
+        # reached via a CROSS-SITE redirect chain and Chrome withholds the outpost's
+        # SameSite=Lax session cookie. The outpost then logs "mismatched session ID" with
+        # should="" and returns a bare 400. Ending signed out means the stale state is
+        # never redeemed, so the 400 cannot occur — which is exactly why W1-hardened
+        # boxes (test12/test8, WS3c) never reproduced it while nuc/ops1 did.
+        #
+        # This also closes the WS3c privilege-handoff hazard (test8 2026-07-18) on
+        # non-hardened boxes: finishing someone else's reset can no longer leave the
+        # browser sitting inside whatever session it already held.
+        #
+        # Trade-off, deliberate: after a reset the user signs in with the new password.
+        # Field-proven — it is what test12/test8 have done since v10.1.4.
+        user_login_pk = None
+        logout_stage_pk = _find_or_create_stage('stages/user_logout/', 'Recovery Session Logout')
 
         # 3) Fetch ALL bindings, filter client-side by target == recovery flow PK.
         #    The server-side flow__pk filter is unreliable and returns bindings from other flows.
@@ -34350,7 +34346,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         recovery_bindings = [b for b in all_bindings if str(b.get('target')) == str(recovery_flow_pk)]
 
         desired_stage_pks = set()
-        for pk in [id_stage_pk, email_stage_pk, prompt_stage_pk, user_write_pk, user_login_pk]:
+        for pk in [id_stage_pk, email_stage_pk, prompt_stage_pk, user_write_pk, user_login_pk,
+                   logout_stage_pk]:
             if pk:
                 desired_stage_pks.add(str(pk))
 
@@ -34370,6 +34367,7 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             (30, prompt_stage_pk),
             (40, user_write_pk),
             (100, user_login_pk),
+            (110, logout_stage_pk),
         ]
         for order, stage_pk in desired_bindings:
             if not stage_pk or str(stage_pk) in already_bound:
@@ -65385,7 +65383,11 @@ def _startup_migrations():
         # "Update config". Without this, a box that presses Update gets new code and a still-broken
         # reset flow, which is exactly the trap the Caddyfile migration above exists to avoid.
         # Both ensures are idempotent (normalize-if-different / find-or-create + re-assert).
-        if not s.get('ak_cookie_recovery_converge_v1'):
+        # v10.1.28: flag bumped v1 -> v2. Boxes that already converged under v10.1.28 have
+        # the v1 stamp set, so without a new key the recovery-flow change below (reset now
+        # ends SIGNED OUT on every box, not just W1-hardened ones) would never reach them —
+        # the exact "new code, still-broken flow" trap this block exists to prevent.
+        if not s.get('ak_cookie_recovery_converge_v2'):
             _akc_done = False
             _akc_err = None
             try:
@@ -65410,10 +65412,11 @@ def _startup_migrations():
                         _akc_err = str(_akc_e)[:160]
                     time.sleep(5)
             if _akc_done:
-                s['ak_cookie_recovery_converge_v1'] = True
+                s['ak_cookie_recovery_converge_v2'] = True
                 save_settings(s)
                 s = load_settings()
-                print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow converged", flush=True)
+                print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow "
+                      "converged (reset now ends signed-out on every box)", flush=True)
             else:
                 # Authentik containers may still be starting on a fresh boot — leave the flag
                 # unset so the next restart retries rather than silently skipping forever.
