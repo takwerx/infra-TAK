@@ -34181,9 +34181,27 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
         # 2) Create all required stages
 
-        id_stage_pk = _find_stage('stages/identification/', 'default-authentication-identification')
+        # v10.1.28: the recovery flow gets its OWN identification stage. Reusing the login
+        # page's default-authentication-identification put a "Forgot username or password?"
+        # link on the reset page itself — that stage carries recovery_flow, and the link is a
+        # dead-end loop for someone who is already resetting. Editing the shared stage instead
+        # would strip the link off the real login page, where it belongs.
+        id_stage_pk = _find_or_create_stage('stages/identification/', 'Recovery Identification', {
+            'user_fields': ['email', 'username'],
+            'case_insensitive_matching': True,
+            'pretend_user_exists': True,
+            'show_matched_user': True})
+        if id_stage_pk:
+            # Assert the links are off even when the stage already existed. user_fields is
+            # resent because this serializer cross-validates the whole object on PATCH.
+            try:
+                _api_patch(f'stages/identification/{id_stage_pk}/', {
+                    'user_fields': ['email', 'username'],
+                    'recovery_flow': None, 'enrollment_flow': None, 'passwordless_flow': None})
+            except Exception:
+                pass
         if not id_stage_pk:
-            id_stage_pk = _find_stage('stages/identification/', 'Recovery Identification')
+            id_stage_pk = _find_stage('stages/identification/', 'default-authentication-identification')
         if not id_stage_pk:
             all_id_stages = _api_get('stages/identification/').get('results', [])
             if all_id_stages:
