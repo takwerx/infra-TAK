@@ -33,7 +33,7 @@ gdCotApplyFacts(d.facts||{});}catch(e){el.textContent='Error';}}
 // v10.1.29 W1 — CoT database diagnosis. One read-only fetch decides which of the
 // four failure modes the box is in and highlights the button that actually helps.
 var GD_COT_BTNS={purge:'gd-cot-purge-btn',retention_run:'gd-cot-retention-btn',repack:'gd-cot-repack-btn',vacuum_full:'gd-vacuum-full-btn',vacuum_analyze:'gd-vacuum-analyze-btn'};
-var GD_COT_COLORS={no_disk:'var(--red)',retention_stalled:'var(--red)',no_bloat:'var(--yellow)',bloat:'var(--cyan)',stats_stale:'var(--yellow)',healthy:'var(--green)'};
+var GD_COT_COLORS={no_disk:'var(--red)',retention_stalled:'var(--red)',no_bloat:'var(--yellow)',bloat:'var(--cyan)',stats_stale:'var(--yellow)',no_retention:'var(--red)',healthy:'var(--green)'};
 function gdCotHighlight(rec){for(var k in GD_COT_BTNS){var b=document.getElementById(GD_COT_BTNS[k]);if(b)b.style.boxShadow='';}
 (rec||[]).forEach(function(k,i){var id=GD_COT_BTNS[k];if(!id)return;var b=document.getElementById(id);if(b)b.style.boxShadow=i===0?'0 0 0 2px var(--cyan)':'0 0 0 1px var(--cyan)';});}
 async function gdCotDiagnose(){var out=document.getElementById('gd-vacuum-output');var msg=document.getElementById('gd-vacuum-msg');var btn=document.getElementById('gd-cot-diagnose-btn');
@@ -66,7 +66,7 @@ var lt=document.getElementById('gd-cot-largest');if(lt)lt.textContent=(f.largest
 var rt=document.getElementById('gd-cot-retention');if(rt){var txt,col;
 if(!f.guard_timer_ok){txt='timer '+(f.guard_timer_enabled||'unknown');col='var(--red)';}
 else if(f.retention_stalled){txt='STALLED';col='var(--red)';}
-else{txt=(f.retention_hours?f.retention_hours+' h':'TTL not set')+(f.guard_timer_last_human?' · guard '+f.guard_timer_last_human:'');col=f.retention_hours?'var(--green)':'var(--yellow)';}
+else{txt=(f.retention_hours?f.retention_hours+' h':'TTL not set')+(f.guard_timer_last_human?' · guard '+f.guard_timer_last_human:'');col=f.retention_hours?'var(--green)':'var(--red)';}
 rt.textContent=txt;rt.style.color=col;}}
 // v10.1.29 W6 — run Guard Dog's retention guard on demand. The unit is oneshot
 // and started --no-block, so progress comes from polling its unit state plus the

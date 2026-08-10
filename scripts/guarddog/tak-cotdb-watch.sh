@@ -32,6 +32,7 @@ FS_CRIT_PCT=8
 RETENTION_STALE_FACTOR=2   # oldest row older than N x the configured TTL
 FS_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.freespace"
 RET_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.retention"
+NOTTL_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.nottl"
 
 # Check if two-server mode (remote DB)
 GD_CONF="/opt/tak-guarddog/guarddog.conf"
@@ -151,7 +152,11 @@ fi
 # ── Condition B: retention stalled ────────────────────────────────────────
 # The alert that would have reached the 2026-08-10 reporter WEEKS before the
 # disk filled: retention configured at 1 day, yet 48.3M rows resident.
-RETENTION_HOURS=24
+# v10.1.29: distinguish "no TTL configured" from "TTL configured but not
+# deleting". They are different faults with different fixes, and defaulting to 24
+# when nothing is set made this script assert a policy that does not exist.
+RETENTION_HOURS=""
+RETENTION_SET=0
 if [ -f /opt/tak/CoreConfig.xml ]; then
   RH=$(python3 -c "
 import xml.etree.ElementTree as ET, sys
@@ -169,12 +174,44 @@ except Exception:
     pass
 print('')
 " 2>/dev/null)
-  [ -n "$RH" ] && [ "$RH" -gt 0 ] 2>/dev/null && RETENTION_HOURS=$RH
+  if [ -n "$RH" ] && [ "$RH" -gt 0 ] 2>/dev/null; then
+    RETENTION_HOURS=$RH
+    RETENTION_SET=1
+  fi
 fi
 OLDEST_SECS=$(cotdb_scalar "SET statement_timeout='20s'; SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(servertime)))::bigint, 0) FROM cot_router;" cot | tr -d '[:space:]')
 OLDEST_SECS=$(cotdb_numeric "$OLDEST_SECS")
-STALE_SECS=$(( RETENTION_HOURS * 3600 * RETENTION_STALE_FACTOR ))
-if [ -n "$OLDEST_SECS" ] && [ "$OLDEST_SECS" -gt "$STALE_SECS" ]; then
+
+if [ "$RETENTION_SET" = "0" ]; then
+  # ── Condition B1: no retention policy AT ALL ──────────────────────────────
+  # Not a footnote: with no TTL, TAK Server never deletes a CoT row, so the
+  # database grows without bound until the filesystem fills. That is the
+  # 2026-08-10 failure in slow motion, and it is silent until the disk is gone.
+  rm -f "$RET_ALERT_FILE"          # can't be "stalled" if it was never configured
+  if cot_latch_ready "$NOTTL_ALERT_FILE"; then
+    touch "$NOTTL_ALERT_FILE"
+    send_cot_alert "TAK Server has NO CoT retention policy on $SERVER_IDENTIFIER" \
+"No CoT data-retention policy is configured on this TAK Server.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS_NOW
+CoT database: $((COT_SIZE / 1024 / 1024)) MB
+Oldest CoT row: $(( ${OLDEST_SECS:-0} / 86400 )) days old
+
+Nothing is deleting old position reports, so this database grows for as long as
+the server runs. Neither VACUUM nor Online Compact can help — they reclaim space
+from DELETED rows, and no rows are being deleted. The end state is a full disk,
+at which point compacting is no longer possible either.
+
+Fix (takes a minute): TAK Server Web Admin at :8443 -> Data Retention Policies,
+set a CoT (non-chat) retention period. infra-TAK reads this setting but
+deliberately does not write it — the policy is TAK Server's to own.
+
+Guard Dog's 15-minute retention guard enforces whatever TTL you set there."
+    echo "$(date): CoT no-retention-policy alert sent (db $((COT_SIZE / 1024 / 1024))MB)" >> /var/log/takguard/restarts.log
+  fi
+elif [ -n "$OLDEST_SECS" ] && [ "$OLDEST_SECS" -gt "$(( RETENTION_HOURS * 3600 * RETENTION_STALE_FACTOR ))" ]; then
+  rm -f "$NOTTL_ALERT_FILE"
   OLDEST_DAYS=$(( OLDEST_SECS / 86400 ))
   if cot_latch_ready "$RET_ALERT_FILE"; then
     touch "$RET_ALERT_FILE"
@@ -201,7 +238,7 @@ Run Retention Now (it also re-arms the timer)."
     echo "$(date): CoT retention-stalled alert sent (oldest row ${OLDEST_DAYS}d, retention ${RETENTION_HOURS}h)" >> /var/log/takguard/restarts.log
   fi
 else
-  rm -f "$RET_ALERT_FILE"
+  rm -f "$RET_ALERT_FILE" "$NOTTL_ALERT_FILE"
 fi
 
 # ── Condition C: absolute database size (original behaviour, own latch) ────

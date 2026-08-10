@@ -12871,7 +12871,7 @@ def guarddog_page():
             {'name': 'PostgreSQL', 'id': 'postgresql', 'interval': '5 min', 'desc': 'Checks that the PostgreSQL service is running. Attempts restart if down; sends alert.'},
         ])
     guarddog_monitors_tak.extend([
-        {'name': 'CoT database health', 'id': 'cotdb', 'interval': '6 hours', 'desc': 'Three independent alerts, each with its own latch. (1) DB size — warning at 25GB, critical at 40GB. (2) Free space on the filesystem holding the database — warning below 15%, critical below 8%; absolute GB thresholds cannot tell a 43GB database on a 500GB disk from the same database on a 96GB one. (3) Retention stalled — the oldest CoT row is older than twice the retention TTL, meaning the database is growing from live rows that were never deleted, so VACUUM would free nothing. Works for local, containerized and remote databases.'},
+        {'name': 'CoT database health', 'id': 'cotdb', 'interval': '6 hours', 'desc': 'Four independent alerts, each with its own latch so one firing never masks another. (1) DB size — warning at 25GB, critical at 40GB. (2) Free space on the filesystem holding the database — warning below 15%, critical below 8%; absolute GB thresholds cannot tell a 43GB database on a 500GB disk from the same database on a 96GB one. (3) No retention policy configured at all — TAK Server then never deletes a CoT row and the database grows until the disk fills; set a TTL in TAK Server\'s own Web Admin (:8443 → Data Retention Policies). (4) Retention stalled — a TTL IS set but the oldest CoT row is older than twice it, so the database is growing from live rows that were never deleted and VACUUM would free nothing. Works for local, containerized and remote databases.'},
         {'name': 'Auto-VACUUM', 'id': 'autovacuum', 'interval': 'Daily (3am)', 'desc': 'Checks dead tuple count daily. Runs VACUUM ANALYZE automatically if dead tuples exceed 1M. Prevents database bloat from data retention.'},
     ])
     guarddog_monitors_tak.extend([
@@ -55287,6 +55287,25 @@ def _cotdb_verdict(facts):
         or facts.get('retention_stalled')
     )
 
+    # 2b. No retention policy configured AT ALL. Distinct from "stalled": nothing
+    #     is broken, nothing was ever set up, and the fix is a different screen.
+    #     This is not a footnote on a healthy verdict — with no TTL, TAK Server
+    #     never deletes a CoT row, so the database grows until the filesystem
+    #     fills, at which point compacting is impossible too. It is the 2026-08-10
+    #     failure in slow motion, and it is silent right up until the disk is gone.
+    if not rh:
+        detail = ("No CoT retention policy is configured, so TAK Server never deletes old "
+                  "position reports and this database grows for as long as the server runs. "
+                  "VACUUM and Online Compact cannot help - they reclaim space from DELETED "
+                  "rows, and nothing is being deleted. Set a CoT (non-chat) retention period "
+                  "in TAK Server's own Web Admin at :8443 > Data Retention Policies; infra-TAK "
+                  "reads that setting but deliberately does not write it. Guard Dog's "
+                  "15-minute retention guard then enforces whatever you set.")
+        if facts.get('oldest_age_secs'):
+            detail += f" Oldest row here is already {facts.get('oldest_age_human')} old."
+        return ('no_retention', 'No retention policy - this database grows forever',
+                detail, [])
+
     # 2c. The dead-tuple count is the input to both remaining branches. If ANALYZE
     #     has never run, that count is not a measurement and "nothing to reclaim"
     #     would be an unearned claim — the opposite mistake to recommending a
@@ -55321,14 +55340,8 @@ def _cotdb_verdict(facts):
     detail = (f"{dead_phrase}, "
               f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
               f"{facts.get('oldest_age_human', '-')} old. Nothing to do.")
-    if not rh:
-        # No TTL means nothing is ever deleted. Harmless on an idle box, and the
-        # road to a 48M-row table on a busy one — so say it, but as a note on a
-        # healthy verdict rather than an alarm, and point at the surface that
-        # actually owns the policy. We read this setting; we never write it.
-        detail += ("\n\nNote: no CoT retention TTL is set in CoreConfig.xml, so old rows are "
-                   "never deleted automatically. Set one in TAK Server's own Web Admin "
-                   "(:8443 > Data Retention Policies) before this box carries real traffic.")
+    # (No "TTL not set" note here any more — that case returns its own red
+    #  no_retention verdict above instead of riding along on a green one.)
     return ('healthy', 'Database looks healthy', detail, [])
 
 
