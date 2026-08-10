@@ -54913,6 +54913,15 @@ _COTDB_NOISE_RE = re.compile(r'^.*could not change directory to.*$\n?', re.MULTI
 _COTDB_COMPACT_HEADROOM = 1.1        # free space needed vs largest table
 _COTDB_BLOAT_FLOOR = 100000          # below this, VACUUM FULL reclaims ~nothing
 _COTDB_BLOAT_CEIL = 1000000          # above this, compacting is worth it
+# "Is there actually a problem to solve?" Cases 3/4 of the verdict tree answer
+# WHICH remedy to reach for when a database is big or a disk is tight. Without
+# this gate, a small idle box gets told "only N dead tuples -> Purge Old CoT",
+# which points a perfectly healthy box at a destructive button (seen on nuc,
+# 219 MB database with 177 GB free, 2026-08-10). Thresholds match what the rest
+# of the card already uses: the cotdb-watch size warning, and the free-disk
+# tile's green boundary.
+_COTDB_PRESSURE_DB_BYTES = 25 * 1024 ** 3
+_COTDB_PRESSURE_FREE_PCT = 20
 
 
 def _cotdb_clean(text):
@@ -55249,8 +55258,16 @@ def _cotdb_verdict(facts):
                   f"Cause: {'; '.join(causes)}.")
         return ('retention_stalled', 'Retention is stalled', detail, ['retention_run', 'purge'])
 
+    # Only advise on a remedy when there is something to remedy. A small database
+    # with plenty of free disk has no problem for either branch below to solve.
+    pressure = bool(
+        (facts.get('db_bytes') or 0) >= _COTDB_PRESSURE_DB_BYTES
+        or (facts.get('fs_pct') is not None and facts['fs_pct'] < _COTDB_PRESSURE_FREE_PCT)
+        or facts.get('retention_stalled')
+    )
+
     # 3. Nothing for VACUUM to reclaim. This is the reporter's actual case.
-    if dead is not None and dead < _COTDB_BLOAT_FLOOR:
+    if pressure and dead is not None and dead < _COTDB_BLOAT_FLOOR:
         detail = (f"Only {dead:,} dead tuples - there is almost nothing for VACUUM to reclaim. "
                   f"This database is {facts.get('db_human', '-')} of live rows. "
                   "Deleting rows (Purge Old CoT) is what frees space here, not compacting.")
@@ -55265,6 +55282,14 @@ def _cotdb_verdict(facts):
     detail = (f"{(dead if dead is not None else 0):,} dead tuples, "
               f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
               f"{facts.get('oldest_age_human', '-')} old. Nothing to do.")
+    if not rh:
+        # No TTL means nothing is ever deleted. Harmless on an idle box, and the
+        # road to a 48M-row table on a busy one — so say it, but as a note on a
+        # healthy verdict rather than an alarm, and point at the surface that
+        # actually owns the policy. We read this setting; we never write it.
+        detail += ("\n\nNote: no CoT retention TTL is set in CoreConfig.xml, so old rows are "
+                   "never deleted automatically. Set one in TAK Server's own Web Admin "
+                   "(:8443 > Data Retention Policies) before this box carries real traffic.")
     return ('healthy', 'Database looks healthy', detail, [])
 
 
