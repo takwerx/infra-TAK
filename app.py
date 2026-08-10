@@ -55395,6 +55395,15 @@ def guarddog_cotdb_repack():
     if refusal:
         return jsonify(dict(refusal, success=False)), 400
     audit('cotdb:repack', 'start requested')
+    # W4c: tell the script this is an operator-initiated run so it bypasses the
+    # 10 GB size threshold that exists for the weekly timer. Without this the
+    # button silently no-ops on any box with a small CoT database — a button that
+    # decides not to do what you asked is the failure this release is about.
+    try:
+        _write_priv('/var/lib/takguard/repack_force', '1')
+    except Exception as e:
+        # Non-fatal: the repack still runs, it just honours the size threshold.
+        print(f'cotdb repack: could not set force flag ({e})', flush=True)
     # Clear any previous failure so job-status reports THIS run's outcome.
     try:
         subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'takdbrepack.service']),

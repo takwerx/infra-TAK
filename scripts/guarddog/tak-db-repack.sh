@@ -128,7 +128,20 @@ fi
 COT_SIZE=$((COT_SIZE_RAW + 0))
 COT_GB=$((COT_SIZE / 1024 / 1024 / 1024))
 
-if [ "$COT_SIZE" -lt "$REPACK_THRESHOLD_BYTES" ]; then
+# v10.1.29 (W4c): the size threshold exists so the WEEKLY TIMER doesn't repack a
+# small database for nothing. It must NOT apply when a human pressed Online
+# Compact — a button that quietly decides not to do the thing you asked is the
+# exact failure this release exists to remove. The console writes this sentinel
+# before starting the unit; the timer never does.
+FORCE_RUN=0
+FORCE_FLAG="/var/lib/takguard/repack_force"
+if [ -f "$FORCE_FLAG" ]; then
+  FORCE_RUN=1
+  rm -f "$FORCE_FLAG"
+  log_line "DB-REPACK: operator-initiated run — size threshold bypassed"
+fi
+
+if [ "$FORCE_RUN" = "0" ] && [ "$COT_SIZE" -lt "$REPACK_THRESHOLD_BYTES" ]; then
   log_line "DB-REPACK: cot database is ${COT_GB}GB, below ${REPACK_THRESHOLD_GB}GB threshold, skipped"
   exit 0
 fi
