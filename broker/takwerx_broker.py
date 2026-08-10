@@ -782,15 +782,33 @@ def _check_nmcli(argv):
 
     def _free(a):
         return bool(a) and not a.startswith('-')
-    if (len(rest) in (12, 16)
+    # v10.1.28: the console ALSO pins `ipv4.may-fail no` on the profile (added
+    # 10.1.2 / 6a89690 — without it an IPv6-only associate that never gets a v4
+    # lease reports success). The broker was never taught that shape, so the argv
+    # became 14/18 long against a 12/16 allowlist and EVERY "Add Network" has been
+    # denied on a non-root NetworkManager box since. Shipped that way since v10.1.2;
+    # caught by T&E on nuc 2026-08-09 — the only born-non-root box, which is the
+    # entire reason that box is a required part of the quorum.
+    #
+    # Parsed positionally rather than by length so the two optional tails can
+    # appear independently, and so the next knob does not silently re-break it.
+    # Everything matched here is a fixed literal except ssid/iface/psk, each of
+    # which still goes through _free() — no option injection.
+    if (len(rest) >= 12
             and rest[0:5] == ['connection', 'add', 'type', 'wifi', 'con-name']
             and _free(rest[5]) and rest[6] == 'ifname'
             and (rest[7] == '*' or _IFACE_RE.match(rest[7]))
             and rest[8] == 'ssid' and _free(rest[9])
-            and rest[10:12] == ['connection.autoconnect', 'yes']
-            and (len(rest) == 12 or (rest[12:15] == ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk']
-                                     and _free(rest[15])))):
-        return
+            and rest[10:12] == ['connection.autoconnect', 'yes']):
+        tail = rest[12:]
+        if tail[0:2] == ['ipv4.may-fail', 'no']:      # optional, fixed literals
+            tail = tail[2:]
+        if not tail:                                   # open network
+            return
+        if (len(tail) == 4
+                and tail[0:3] == ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk']
+                and _free(tail[3])):                   # WPA-PSK network
+            return
     if (len(rest) == 5 and rest[0:2] == ['connection', 'modify']
             and _free(rest[2]) and rest[3] == 'wifi-sec.psk' and _free(rest[4])):
         return
