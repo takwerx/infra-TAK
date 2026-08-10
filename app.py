@@ -55024,11 +55024,40 @@ def _cotdb_df(tak_cfg, path):
         return 0, 0
 
 
-def _cotdb_retention_hours():
-    """CoT retention TTL in hours from CoreConfig.xml <repository retentionDays>.
+TAK_RETENTION_POLICY_YML = '/opt/tak/conf/retention/retention-policy.yml'
 
-    Same parse as tak-retention-guard.sh Step 3. We only READ this — the policy
-    is owned by TAK Server's own Web Admin (:8443) and we never write it."""
+
+def _cotdb_retention_hours():
+    """CoT retention TTL in hours, from where TAK Server 5.x ACTUALLY stores it.
+
+    The policy set in TAK's Web Admin (:8443 > Data Retention Policies) lives in
+    /opt/tak/conf/retention/retention-policy.yml under `dataRetentionMap.cot`,
+    in SECONDS. It is NOT CoreConfig.xml's `retentionDays` — 5.x does not use
+    that attribute at all. Verified 2026-08-10: on test6/test8/test12 the
+    <repository> element carries no retentionDays whatsoever, yet the retention
+    service logs `deleteCotByTtl, Number of rows deleted 78` every hour, driven
+    by `cot: 86400` in the YAML. Reading the wrong file made every correctly
+    configured box look like it had no retention policy at all.
+
+    `cot: null` means no policy is set (nuc). CoreConfig remains a fallback for
+    older servers. We only READ this — the policy is TAK Server's to own."""
+    try:
+        with open(TAK_RETENTION_POLICY_YML, 'r', encoding='utf-8') as fh:
+            pol = fh.read()
+    except Exception:
+        try:
+            pol = _read_priv(TAK_RETENTION_POLICY_YML)
+        except Exception:
+            pol = ''
+    if pol:
+        blk = pol.split('dataRetentionMap:', 1)
+        m = re.search(r'^\s+cot:\s*(\S+)\s*$', blk[1] if len(blk) > 1 else pol, re.M)
+        if m:
+            raw = m.group(1).strip()
+            if raw.isdigit() and int(raw) > 0:
+                # seconds -> hours, never rounding a real policy down to zero
+                return max(1, int(raw) // 3600)
+            return None            # null / ~ / 0 -> explicitly no policy
     try:
         cc = _read_coreconfig()
     except Exception:

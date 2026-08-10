@@ -115,7 +115,7 @@ if [ "$TWO_SERVER_MODE" = "1" ]; then
 fi
 
 # ── Step 1: Find and kill stuck DELETE queries on cot_router ──
-STUCK_PIDS=$(psql_scalar "SELECT pid FROM pg_stat_activity WHERE query ILIKE '%delete%cot_router%' AND state = 'active' AND now() - query_start > interval '${KILL_THRESHOLD_MIN} minutes';")
+STUCK_PIDS=$(psql_scalar "SELECT pid FROM pg_stat_activity WHERE query ILIKE '%delete%cot_router%' AND state = 'active' AND pid != pg_backend_pid() AND now() - query_start > interval '${KILL_THRESHOLD_MIN} minutes';")
 
 KILLED=0
 if [ -n "$STUCK_PIDS" ]; then
@@ -152,7 +152,15 @@ If this keeps happening, increase TAK Server retention run frequency
 fi
 
 # ── Step 2: Check if TAK retention is running normally (short DELETE, under threshold) ──
-ACTIVE_DELETES=$(psql_scalar "SELECT COUNT(*) FROM pg_stat_activity WHERE query ILIKE '%delete%cot_router%' AND state = 'active';")
+# v10.1.29: `pid != pg_backend_pid()` is NOT optional here. pg_stat_activity
+# includes the querying backend's own query text, and this statement contains the
+# substrings 'delete' and 'cot_router' inside its own ILIKE pattern — so without
+# the exclusion it MATCHES ITSELF, the count is never zero, and the batched
+# cleanup below is skipped on every run. nuc's log showed "1 active DELETE(s)
+# running ... skipping batched cleanup" every 15 minutes indefinitely: this
+# safety net had never once performed a delete on any box. (Step 1 is immune only
+# because its 30-minute age bound excludes a query that just started.)
+ACTIVE_DELETES=$(psql_scalar "SELECT COUNT(*) FROM pg_stat_activity WHERE query ILIKE '%delete%cot_router%' AND state = 'active' AND pid != pg_backend_pid();")
 ACTIVE_DELETES=$((${ACTIVE_DELETES:-0} + 0))
 
 if [ "$ACTIVE_DELETES" -gt 0 ]; then
@@ -160,26 +168,45 @@ if [ "$ACTIVE_DELETES" -gt 0 ]; then
   exit 0
 fi
 
-# ── Step 3: Determine retention hours from CoreConfig.xml ──
-RETENTION_HOURS=24
-if [ "$TWO_SERVER_MODE" = "0" ] && [ -f /opt/tak/CoreConfig.xml ]; then
-  RH=$(python3 -c "
-import xml.etree.ElementTree as ET, sys
+# ── Step 3: Determine retention hours from TAK's ACTUAL policy file ──
+# v10.1.29: this read CoreConfig.xml's `retentionDays`, which TAK Server 5.x does
+# NOT use — no 5.x box has that attribute, so RETENTION_HOURS silently fell back
+# to the 24-hour default on every install. The real policy set in the Web Admin
+# lives in /opt/tak/conf/retention/retention-policy.yml as dataRetentionMap.cot,
+# in SECONDS (test6: `cot: 86400`).
+#
+# That default was a DATA-LOSS risk, not just a wrong number: on a box whose
+# operator chose, say, 7 days, this script would have batch-deleted everything
+# older than 24 hours — destroying six days of CoT they deliberately retained.
+# It never bit the fleet only because our boxes happen to run a 1-day policy,
+# which equals the default. If NO policy is set (`cot: null`, as on nuc), TAK
+# deletes nothing by design, so the guard must delete nothing either.
+RETENTION_HOURS=""
+POLICY_YML="/opt/tak/conf/retention/retention-policy.yml"
+if [ "$TWO_SERVER_MODE" = "0" ] && [ -f "$POLICY_YML" ]; then
+  RH=$(python3 - "$POLICY_YML" <<'PY' 2>/dev/null
+import re, sys
 try:
-    t = ET.parse('/opt/tak/CoreConfig.xml')
-    ns = {'m': 'http://bbn.com/marti/xml/config'}
-    for repo in t.findall('.//m:repository', ns) + t.findall('.//repository'):
-        rd = repo.get('retentionDays')
-        if rd:
-            h = int(float(rd) * 24)
-            if h > 0:
-                print(h)
-                sys.exit(0)
+    t = open(sys.argv[1]).read()
+    blk = t.split('dataRetentionMap:', 1)
+    m = re.search(r'^\s+cot:\s*(\S+)\s*$', blk[1] if len(blk) > 1 else t, re.M)
+    if m and m.group(1).isdigit() and int(m.group(1)) > 0:
+        print(max(1, int(m.group(1)) // 3600))
+    else:
+        print('')
 except Exception:
-    pass
-print('')
-" 2>/dev/null)
+    print('')
+PY
+)
   [ -n "$RH" ] && [ "$RH" -gt 0 ] 2>/dev/null && RETENTION_HOURS=$RH
+fi
+
+if [ -z "$RETENTION_HOURS" ]; then
+  # No CoT retention policy configured (or unreadable). TAK deletes nothing in
+  # that state; deleting anyway would destroy data the operator never asked us
+  # to remove. Skip cleanly — the console's Diagnose reports the missing policy.
+  log_line "RETENTION-GUARD: no CoT retention policy set in ${POLICY_YML}, nothing to enforce, skipped (clean)"
+  exit 0
 fi
 
 # ── Step 4: Quick count of expired rows ──

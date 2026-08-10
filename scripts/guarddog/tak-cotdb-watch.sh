@@ -155,25 +155,26 @@ fi
 # v10.1.29: distinguish "no TTL configured" from "TTL configured but not
 # deleting". They are different faults with different fixes, and defaulting to 24
 # when nothing is set made this script assert a policy that does not exist.
+# v10.1.29: read TAK 5.x's ACTUAL policy file, not CoreConfig.xml's retentionDays
+# (which 5.x does not use — see tak-retention-guard.sh Step 3). Value is SECONDS.
 RETENTION_HOURS=""
 RETENTION_SET=0
-if [ -f /opt/tak/CoreConfig.xml ]; then
-  RH=$(python3 -c "
-import xml.etree.ElementTree as ET, sys
+POLICY_YML="/opt/tak/conf/retention/retention-policy.yml"
+if [ -f "$POLICY_YML" ]; then
+  RH=$(python3 - "$POLICY_YML" <<'PY' 2>/dev/null
+import re, sys
 try:
-    t = ET.parse('/opt/tak/CoreConfig.xml')
-    ns = {'m': 'http://bbn.com/marti/xml/config'}
-    for repo in t.findall('.//m:repository', ns) + t.findall('.//repository'):
-        rd = repo.get('retentionDays')
-        if rd:
-            h = int(float(rd) * 24)
-            if h > 0:
-                print(h)
-                sys.exit(0)
+    t = open(sys.argv[1]).read()
+    blk = t.split('dataRetentionMap:', 1)
+    m = re.search(r'^\s+cot:\s*(\S+)\s*$', blk[1] if len(blk) > 1 else t, re.M)
+    if m and m.group(1).isdigit() and int(m.group(1)) > 0:
+        print(max(1, int(m.group(1)) // 3600))
+    else:
+        print('')
 except Exception:
-    pass
-print('')
-" 2>/dev/null)
+    print('')
+PY
+)
   if [ -n "$RH" ] && [ "$RH" -gt 0 ] 2>/dev/null; then
     RETENTION_HOURS=$RH
     RETENTION_SET=1
