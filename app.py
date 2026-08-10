@@ -54745,7 +54745,11 @@ def takserver_vacuum():
         if refusal:
             return jsonify(dict(refusal, success=False)), 400
         dead = facts.get('dead_tuples')
-        if dead is not None and dead < _COTDB_BLOAT_FLOOR and data.get('force') is not True:
+        # Only claim "no bloat" when the dead-tuple count is actually a
+        # measurement. If ANALYZE has never run it reads ~0 on a badly bloated
+        # database, and refusing here would block the very box that needs this.
+        if (dead is not None and dead < _COTDB_BLOAT_FLOOR
+                and not facts.get('stats_stale') and data.get('force') is not True):
             # Not a hard refuse: it is legal, just pointless. Say so and steer.
             return jsonify({
                 'success': False, 'warn_no_bloat': True, 'verdict': 'no_bloat',
@@ -55095,6 +55099,8 @@ def _cotdb_facts(tak_cfg=None):
         'guard_timer_enabled': None, 'guard_timer_last': None,
         'repack_timer_enabled': None,
         'fk_dependents': [], 'two_server': tak_cfg.get('mode') == 'two_server',
+        'reltuples': None, 'stats_stale': None, 'stats_never_analyzed': None,
+        'stats_tables': None,
         'errors': [],
     }
 
@@ -55111,15 +55117,30 @@ def _cotdb_facts(tak_cfg=None):
     elif not ok:
         f['errors'].append(f'db size: {out[:200]}')
 
+    # n_live_tup/n_dead_tup are counters maintained since the last stats reset and
+    # are only reconciled with reality by (auto)ANALYZE. On a box where analyze has
+    # NEVER run they are not measurements: nuc 2026-08-10 reported n_live_tup=821
+    # and n_dead_tup=0 for a cot_router actually holding 80,236 rows. So collect
+    # reltuples (the planner's own estimate) and whether anything has ever been
+    # analyzed, and let the verdict refuse to reason about bloat when it hasn't.
     ok, out = _cotdb_psql(
         tak_cfg,
-        'SELECT COALESCE((SELECT SUM(n_live_tup) FROM pg_stat_user_tables), 0), '
-        'COALESCE((SELECT SUM(n_dead_tup) FROM pg_stat_user_tables), 0);', timeout=15)
+        'SELECT COALESCE(SUM(s.n_live_tup), 0), COALESCE(SUM(s.n_dead_tup), 0), '
+        'COALESCE(SUM(c.reltuples)::bigint, 0), '
+        'COUNT(*) FILTER (WHERE s.last_analyze IS NULL AND s.last_autoanalyze IS NULL), '
+        'COUNT(*) '
+        'FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid;', timeout=15)
     if ok:
-        parts = out.strip().split('|')
-        if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
-            f['live_rows'] = int(parts[0])
-            f['dead_tuples'] = int(parts[1])
+        parts = [p.strip() for p in out.strip().split('|')]
+        if len(parts) == 5 and all(p.lstrip('-').isdigit() for p in parts):
+            live, dead, reltup, never, total = (int(p) for p in parts)
+            # Prefer whichever row estimate is not obviously stale.
+            f['live_rows'] = max(live, reltup)
+            f['dead_tuples'] = dead
+            f['reltuples'] = reltup
+            f['stats_never_analyzed'] = never
+            f['stats_tables'] = total
+            f['stats_stale'] = bool(never)
     elif out:
         f['errors'].append(f'row stats: {out[:200]}')
 
@@ -55265,6 +55286,19 @@ def _cotdb_verdict(facts):
         or (facts.get('fs_pct') is not None and facts['fs_pct'] < _COTDB_PRESSURE_FREE_PCT)
         or facts.get('retention_stalled')
     )
+
+    # 2c. The dead-tuple count is the input to both remaining branches. If ANALYZE
+    #     has never run, that count is not a measurement and "nothing to reclaim"
+    #     would be an unearned claim — the opposite mistake to recommending a
+    #     purge on a healthy box, and equally wrong. Say so, and point at the one
+    #     button that fixes it (VACUUM ANALYZE refreshes the statistics).
+    if pressure and facts.get('stats_stale'):
+        detail = (f"{facts.get('stats_never_analyzed')} of {facts.get('stats_tables')} tables have "
+                  "never been analyzed, so the dead-tuple count is not trustworthy and this card "
+                  "cannot tell reclaimable bloat from live data. Press Optimize Tables (VACUUM "
+                  "ANALYZE) - it is safe while TAK Server is running - then press Diagnose again.")
+        return ('stats_stale', 'Statistics are stale - cannot judge bloat yet',
+                detail, ['vacuum_analyze'])
 
     # 3. Nothing for VACUUM to reclaim. This is the reporter's actual case.
     if pressure and dead is not None and dead < _COTDB_BLOAT_FLOOR:

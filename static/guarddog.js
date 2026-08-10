@@ -32,8 +32,8 @@ if(!d.success){el.textContent=d.error||'Error';el.style.color='var(--red)';retur
 gdCotApplyFacts(d.facts||{});}catch(e){el.textContent='Error';}}
 // v10.1.29 W1 — CoT database diagnosis. One read-only fetch decides which of the
 // four failure modes the box is in and highlights the button that actually helps.
-var GD_COT_BTNS={purge:'gd-cot-purge-btn',retention_run:'gd-cot-retention-btn',repack:'gd-cot-repack-btn',vacuum_full:'gd-vacuum-full-btn'};
-var GD_COT_COLORS={no_disk:'var(--red)',retention_stalled:'var(--red)',no_bloat:'var(--yellow)',bloat:'var(--cyan)',healthy:'var(--green)'};
+var GD_COT_BTNS={purge:'gd-cot-purge-btn',retention_run:'gd-cot-retention-btn',repack:'gd-cot-repack-btn',vacuum_full:'gd-vacuum-full-btn',vacuum_analyze:'gd-vacuum-analyze-btn'};
+var GD_COT_COLORS={no_disk:'var(--red)',retention_stalled:'var(--red)',no_bloat:'var(--yellow)',bloat:'var(--cyan)',stats_stale:'var(--yellow)',healthy:'var(--green)'};
 function gdCotHighlight(rec){for(var k in GD_COT_BTNS){var b=document.getElementById(GD_COT_BTNS[k]);if(b)b.style.boxShadow='';}
 (rec||[]).forEach(function(k,i){var id=GD_COT_BTNS[k];if(!id)return;var b=document.getElementById(id);if(b)b.style.boxShadow=i===0?'0 0 0 2px var(--cyan)':'0 0 0 1px var(--cyan)';});}
 async function gdCotDiagnose(){var out=document.getElementById('gd-vacuum-output');var msg=document.getElementById('gd-vacuum-msg');var btn=document.getElementById('gd-cot-diagnose-btn');
@@ -55,8 +55,11 @@ if(out){out.style.color=GD_COT_COLORS[d.verdict]||'var(--text-dim)';out.textCont
 function gdCotApplyFacts(f){if(!f)return;var n=function(v){return typeof v==='number'?v.toLocaleString():'—';};
 var el=document.getElementById('gd-cot-db-size');
 if(el){el.textContent=f.db_human||'—';var b=f.db_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024,gb40=40*1024*1024*1024;el.style.color=b<gb25?'var(--green)':b<gb40?'var(--yellow)':'var(--red)';}else{el.style.color='';}}
-var mc=document.getElementById('gd-cot-msg-count');if(mc)mc.textContent=n(f.live_rows);
-var dt=document.getElementById('gd-cot-dead-tuples');if(dt){dt.textContent=n(f.dead_tuples);if(typeof f.dead_tuples==='number')dt.style.color=f.dead_tuples>1000000?'var(--red)':f.dead_tuples>100000?'var(--yellow)':'var(--green)';}
+// Stale planner stats are not measurements — say so rather than render a
+// confident number. nuc reported 821 live / 0 dead for a table holding 80,236.
+var stale=!!f.stats_stale;
+var mc=document.getElementById('gd-cot-msg-count');if(mc){mc.textContent=n(f.live_rows)+(stale?' (est)':'');mc.style.color=stale?'var(--yellow)':'';}
+var dt=document.getElementById('gd-cot-dead-tuples');if(dt){dt.textContent=stale?'unknown':n(f.dead_tuples);dt.title=stale?'ANALYZE has never run on this database, so the dead-tuple count is not trustworthy. Press Optimize Tables, then Diagnose again.':'';if(stale){dt.style.color='var(--yellow)';}else if(typeof f.dead_tuples==='number'){dt.style.color=f.dead_tuples>1000000?'var(--red)':f.dead_tuples>100000?'var(--yellow)':'var(--green)';}}
 var fd=document.getElementById('gd-cot-free-disk');if(fd){var p=f.fs_pct;fd.textContent=(f.fs_free_human||'—')+(typeof p==='number'?' ('+p+'%)':'');fd.style.color=typeof p!=='number'?'':p<10?'var(--red)':p<20?'var(--yellow)':'var(--green)';}
 var od=document.getElementById('gd-cot-oldest');if(od){od.textContent=f.oldest_age_human||'—';od.style.color=f.retention_stalled?'var(--red)':(f.oldest_age_secs?'var(--green)':'');}
 var lt=document.getElementById('gd-cot-largest');if(lt)lt.textContent=(f.largest_table?f.largest_table+' · ':'')+(f.largest_table_human||'—');
