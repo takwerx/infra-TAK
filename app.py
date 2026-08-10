@@ -55313,7 +55313,12 @@ def _cotdb_verdict(facts):
                   "lock, so TAK Server can stay up; Compact Database is faster but needs TAK stopped.")
         return ('bloat', 'Reclaimable bloat found', detail, ['repack', 'vacuum_full'])
 
-    detail = (f"{(dead if dead is not None else 0):,} dead tuples, "
+    # Keep this consistent with the tiles: if the stats have never been collected,
+    # do not quote a dead-tuple count here that the tile is reporting as unknown.
+    dead_phrase = ('dead tuples unknown (statistics have never been collected on this database)'
+                   if facts.get('stats_stale')
+                   else f"{(dead if dead is not None else 0):,} dead tuples")
+    detail = (f"{dead_phrase}, "
               f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
               f"{facts.get('oldest_age_human', '-')} old. Nothing to do.")
     if not rh:
