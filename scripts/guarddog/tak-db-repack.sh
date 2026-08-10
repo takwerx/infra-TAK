@@ -107,16 +107,23 @@ remote_cmd() {
 # Pre-flight: check SSH connectivity for two-server mode
 if [ "$TWO_SERVER_MODE" = "1" ]; then
   if [ -z "$SSH_TARGET" ] || [ ! -f "$SSH_KEY" ]; then
-    log_line "DB-REPACK: two_server mode but SSH target/key unavailable, skipped"
-    exit 1
+    # v10.1.29 (W4b): a clean skip, not a failure — exit 0 so `systemctl --failed`
+    # doesn't list this unit forever on a split box without a substituted key.
+    # Mirrors the same decision already made in tak-retention-guard.sh (v10.1.4 WS5).
+    log_line "DB-REPACK: two_server mode but SSH target/key unavailable, skipped (clean)"
+    exit 0
   fi
 fi
 
 # Check database size — skip repack if below threshold
 COT_SIZE_RAW=$(psql_scalar "$SIZE_SQL")
 if [ -z "$COT_SIZE_RAW" ]; then
-  log_line "DB-REPACK: could not read database size, skipped"
-  exit 1
+  # v10.1.29 (W4b): the DB simply isn't up yet — seen on container-TAK boxes right
+  # after a reboot, where the weekly timer fired before takserver-db was accepting
+  # connections and left the unit sitting `failed` until someone noticed. Not
+  # reachable != broken; skip cleanly and let the next run do the work.
+  log_line "DB-REPACK: could not read database size (database not reachable yet), skipped (clean)"
+  exit 0
 fi
 COT_SIZE=$((COT_SIZE_RAW + 0))
 COT_GB=$((COT_SIZE / 1024 / 1024 / 1024))
@@ -131,12 +138,31 @@ INSTALL_CHECK=$(remote_cmd "command -v pg_repack >/dev/null 2>&1 && echo 'ok' ||
 if [ "$INSTALL_CHECK" = "missing" ]; then
   log_line "DB-REPACK: pg_repack CLI not found, attempting install"
   PG_VER=$(remote_cmd "pg_config --version 2>/dev/null | grep -oP '\\d+' | head -1" || echo "")
+  DB_ARCH=$(remote_cmd "uname -m 2>/dev/null" || echo "unknown")
   if [ -n "$PG_VER" ]; then
-    remote_cmd "apt-get update -qq && apt-get install -y -qq postgresql-${PG_VER}-repack 2>&1" >/dev/null
+    # v10.1.29 (W4a) MULTIPLATFORM: this was a bare `apt-get`, which is a hard
+    # failure on RHEL/Rocky. Both the package manager AND the package name differ
+    # by family:
+    #   Debian/Ubuntu : postgresql-<ver>-repack   (apt-get)
+    #   RHEL/Rocky    : pg_repack_<ver>           (dnf, from PGDG)
+    # The family is detected WHERE THE INSTALL RUNS — the remote box in
+    # two-server mode, inside takserver-db in container mode — not from the
+    # console's os_type, which describes a different machine in both of those.
+    remote_cmd "if command -v apt-get >/dev/null 2>&1; then \
+  apt-get update -qq && apt-get install -y -qq postgresql-${PG_VER}-repack 2>&1; \
+elif command -v dnf >/dev/null 2>&1; then \
+  dnf install -y -q pg_repack_${PG_VER} 2>&1; \
+elif command -v yum >/dev/null 2>&1; then \
+  yum install -y -q pg_repack_${PG_VER} 2>&1; \
+else echo 'DB-REPACK: no supported package manager (apt-get/dnf/yum)'; fi" >/dev/null
   fi
   INSTALL_CHECK=$(remote_cmd "command -v pg_repack >/dev/null 2>&1 && echo 'ok' || echo 'missing'")
   if [ "$INSTALL_CHECK" = "missing" ]; then
-    log_line "DB-REPACK: pg_repack could not be installed, skipped"
+    # Deliberately a FAILURE, not a clean skip (unlike the not-ready cases above):
+    # the operator pressed Online Compact and must be told it cannot run here —
+    # pg_repack has no package on every arch/PG combination — so they reach for
+    # Purge Old CoT or Compact Database instead of waiting on a silent no-op.
+    log_line "DB-REPACK: pg_repack is not available on this platform (arch=${DB_ARCH:-unknown}, pg=${PG_VER:-unknown}) — Online Compact cannot run here. Use Purge Old CoT to free space, or Compact Database during a maintenance window."
     exit 1
   fi
   log_line "DB-REPACK: pg_repack installed successfully"

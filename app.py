@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.28-alpha"
+VERSION = "10.1.29-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -6099,6 +6099,33 @@ def _repo_ownership_selfheal(trigger=''):
 @app.route('/api/update/apply', methods=['POST'])
 @login_required
 def update_apply():
+    # v10.1.29 (W10): free-space preflight, deliberately BEFORE the single-flight
+    # lock is written so a refused update does not sit on the 20-minute lock.
+    #
+    # Verified 2026-08-10: nothing in this path checked free space. On a nearly
+    # full box `git fetch` + `git checkout --force` fail with "No space left on
+    # device" and can leave a half-applied tree — the "wrong version / failed
+    # Update Now" state the README's universal-recovery section exists to clean
+    # up. It is also why a full box cannot self-rescue: the release that adds
+    # Purge Old CoT cannot be installed without the free space Purge recovers.
+    # Same class of guard as the VACUUM FULL preflight: refuse legibly instead of
+    # letting the underlying tool emit ENOSPC.
+    _update_min_free = 1024 ** 3
+    try:
+        _st = os.statvfs(os.path.dirname(os.path.abspath(__file__)))
+        _free_b = _st.f_bavail * _st.f_frsize
+    except Exception:
+        _free_b = None
+    if _free_b is not None and _free_b < _update_min_free:
+        return jsonify({
+            'success': False,
+            'needed_bytes': _update_min_free,
+            'free_bytes': _free_b,
+            'error': (f'Update Now needs ~1 GB free to fetch and check out; this filesystem '
+                      f'has {_free_b // (1024 * 1024)} MB. Free disk first — see Guard Dog '
+                      '> Database maintenance (CoT) > Diagnose.'),
+        }), 400
+
     # v0.9.24 Item 1: Update Now single-flight lock.
     # Field incident on test8 (2026-05-16): operator double-clicked "Update Now"
     # from two browser tabs. Both POSTs to /api/update/apply ran concurrently
@@ -12844,7 +12871,7 @@ def guarddog_page():
             {'name': 'PostgreSQL', 'id': 'postgresql', 'interval': '5 min', 'desc': 'Checks that the PostgreSQL service is running. Attempts restart if down; sends alert.'},
         ])
     guarddog_monitors_tak.extend([
-        {'name': 'CoT database size', 'id': 'cotdb', 'interval': '6 hours', 'desc': 'CoT DB size. Alert at 25GB (warning) or 40GB (critical). Retention deletes rows; run VACUUM to reclaim disk. Works for both local and remote databases.'},
+        {'name': 'CoT database health', 'id': 'cotdb', 'interval': '6 hours', 'desc': 'Three independent alerts, each with its own latch. (1) DB size — warning at 25GB, critical at 40GB. (2) Free space on the filesystem holding the database — warning below 15%, critical below 8%; absolute GB thresholds cannot tell a 43GB database on a 500GB disk from the same database on a 96GB one. (3) Retention stalled — the oldest CoT row is older than twice the retention TTL, meaning the database is growing from live rows that were never deleted, so VACUUM would free nothing. Works for local, containerized and remote databases.'},
         {'name': 'Auto-VACUUM', 'id': 'autovacuum', 'interval': 'Daily (3am)', 'desc': 'Checks dead tuple count daily. Runs VACUUM ANALYZE automatically if dead tuples exceed 1M. Prevents database bloat from data retention.'},
     ])
     guarddog_monitors_tak.extend([
@@ -54704,6 +54731,31 @@ def takserver_vacuum():
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'success': False, 'error': 'Server One host not configured'}), 400
+
+    # v10.1.29 W3 — preflight VACUUM FULL before the thread starts.
+    # VACUUM FULL rewrites each table into a NEW file before dropping the old
+    # one, so on a full filesystem it is arithmetically impossible and PostgreSQL
+    # answers with `could not extend file … Check free disk space.` — an error the
+    # operator cannot act on, and the one that dead-ended mg1921 on 2026-08-10.
+    # Refuse legibly instead of letting PostgreSQL hit ENOSPC. VACUUM ANALYZE
+    # (full=false) is safe and cheap and stays completely ungated.
+    if use_full:
+        facts = _cotdb_facts(tak_cfg)
+        refusal = _cotdb_space_refusal(facts)
+        if refusal:
+            return jsonify(dict(refusal, success=False)), 400
+        dead = facts.get('dead_tuples')
+        if dead is not None and dead < _COTDB_BLOAT_FLOOR and data.get('force') is not True:
+            # Not a hard refuse: it is legal, just pointless. Say so and steer.
+            return jsonify({
+                'success': False, 'warn_no_bloat': True, 'verdict': 'no_bloat',
+                'dead_tuples': dead, 'db_human': facts.get('db_human', '-'),
+                'recommend': ['purge'],
+                'error': (f"This will reclaim almost nothing - {dead:,} dead tuples. "
+                          f"Your {facts.get('db_human', '-')} is live data, and VACUUM FULL only "
+                          "recovers space held by DELETED rows. Purge Old CoT is what you want."),
+            }), 409
+
     threading.Thread(target=_run_vacuum_background, args=(use_full, tak_cfg), daemon=True).start()
     return jsonify({'success': True, 'status': 'started', 'full': use_full})
 
@@ -54829,6 +54881,769 @@ def takserver_cot_db_size():
         return jsonify({'size_bytes': size, 'size_human': human, 'message_count': msg_count, 'dead_tuples': dead_tuples})
     except Exception as e:
         return jsonify({'size_bytes': 0, 'size_human': 'N/A', 'error': str(e)[:200]})
+
+
+# ==========================================================================
+# v10.1.29 — Guard Dog CoT database rescue (W1)
+# ==========================================================================
+# Field case (mg1921, 2026-08-10): 96 GB root disk 100% full, 43 GB CoT DB,
+# 48.3M rows, 147 dead tuples. Every button on the Database maintenance card
+# was either impossible to run (VACUUM FULL / repack need free space roughly
+# equal to the largest table) or would have reclaimed nothing (the space was
+# LIVE rows that retention had never deleted). PostgreSQL emitted a raw
+# `could not extend file … Check free disk space.` and the operator concluded
+# the database was corrupt. It was not.
+#
+# _cotdb_facts() is the single read-only fact-gatherer behind the Diagnose
+# verdict, the stat tiles and every preflight gate, so the diagnosis and the
+# gates can never disagree.
+#
+# SECURITY INVARIANT: every statement here is console-authored FIXED SQL. No
+# request value is ever interpolated as a string — see _pg_exec()'s docstring.
+# Table names come from the fixed allowlist below, never from a request.
+_COTDB_TABLES = ('cot_router',)
+
+# psql prints this when it runs as the postgres OS user from a cwd that user
+# cannot read — e.g. a console installed under /home/<operator>/infra-TAK on a
+# non-root box. Harmless, unrelated to the query, and on 2026-08-10 it was
+# printed in red directly above the real ENOSPC error and cost diagnostic time.
+_COTDB_NOISE_RE = re.compile(r'^.*could not change directory to.*$\n?', re.MULTILINE)
+
+# Verdict thresholds. Fleet constants — no per-box tuning, no operator override.
+_COTDB_COMPACT_HEADROOM = 1.1        # free space needed vs largest table
+_COTDB_BLOAT_FLOOR = 100000          # below this, VACUUM FULL reclaims ~nothing
+_COTDB_BLOAT_CEIL = 1000000          # above this, compacting is worth it
+
+
+def _cotdb_clean(text):
+    """Strip psql's benign 'could not change directory' warning from output."""
+    return _COTDB_NOISE_RE.sub('', text or '').strip()
+
+
+def _cotdb_fmt_bytes(n):
+    try:
+        n = int(n or 0)
+    except Exception:
+        return '-'
+    for unit, div in (('TB', 1024 ** 4), ('GB', 1024 ** 3), ('MB', 1024 ** 2), ('KB', 1024)):
+        if n >= div:
+            v = n / div
+            return f'{v:.1f} {unit}' if v < 10 else f'{int(round(v))} {unit}'
+    return f'{n} B'
+
+
+def _cotdb_fmt_age(seconds):
+    """Human age for the oldest CoT row: '4 hours' / '3 days' / '8 months'."""
+    try:
+        s = int(seconds or 0)
+    except Exception:
+        return '-'
+    if s <= 0:
+        return '-'
+    if s < 3600:
+        return f'{max(1, s // 60)} min'
+    if s < 172800:
+        return f'{s // 3600} hours'
+    d = s // 86400
+    if d < 60:
+        return f'{d} days'
+    if d < 730:
+        return f'{d // 30} months'
+    return f'{d // 365} years'
+
+
+def _cotdb_psql(tak_cfg, sql, db='cot', timeout=25):
+    """Run ONE console-authored statement against the CoT cluster.
+
+    Returns (ok, text). Covers local native, containerized TAK and the non-root
+    broker (all via _pg_exec, which already picks runuser vs docker exec) plus
+    the two-server SSH path used by the existing DB routes."""
+    if tak_cfg.get('mode') == 'two_server':
+        s1 = tak_cfg.get('server_one', {})
+        if not (s1.get('host') or '').strip():
+            return False, 'Server One host not configured'
+        # cd / first: SSH lands in a home dir that `sudo -u postgres` cannot read.
+        cmd = f'cd / && sudo -u postgres psql -t -A -d {db} -c {shlex.quote(sql)}'
+        ok, out = _ssh_probe(s1, cmd, timeout=timeout)
+        return ok, _cotdb_clean(out)
+    try:
+        r = _pg_exec(['psql', '-t', '-A', '-d', db, '-c', sql], timeout=timeout)
+        if r.returncode == 0:
+            return True, _cotdb_clean(r.stdout or '')
+        return False, _cotdb_clean((r.stdout or '') + (r.stderr or ''))
+    except subprocess.TimeoutExpired:
+        return False, 'query timed out'
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def _cotdb_df(tak_cfg, path):
+    """(free_bytes, total_bytes) for the filesystem holding `path`, measured
+    where the DATA actually lives — over SSH in two-server mode, INSIDE the DB
+    container for container TAK (its named volume is a different filesystem than
+    the console's cwd), natively otherwise. Reporting `/` instead of the data
+    directory is exactly the kind of wrong number this card is meant to kill."""
+    out = ''
+    try:
+        if tak_cfg.get('mode') == 'two_server':
+            s1 = tak_cfg.get('server_one', {})
+            ok, raw = _ssh_probe(s1, f'df -P -B1 {shlex.quote(path)}', timeout=15)
+            out = raw if ok else ''
+        elif _tak_is_container():
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_DB_CONTAINER, 'df', '-P', '-B1', path]),
+                               capture_output=True, text=True, timeout=15)
+            out = (r.stdout or '') if r.returncode == 0 else ''
+        else:
+            # df on a mounted filesystem is unprivileged — run it unwrapped so an
+            # enforcing broker never needlessly denies it.
+            r = subprocess.run(['df', '-P', '-B1', path], capture_output=True, text=True, timeout=15)
+            out = (r.stdout or '') if r.returncode == 0 else ''
+    except Exception:
+        out = ''
+    for line in reversed([l for l in (out or '').splitlines() if l.strip()]):
+        parts = line.split()
+        if len(parts) >= 4 and parts[1].isdigit() and parts[3].isdigit():
+            return int(parts[3]), int(parts[1])
+    try:
+        st = os.statvfs(path if os.path.isdir(path) else '/')
+        return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+    except Exception:
+        return 0, 0
+
+
+def _cotdb_retention_hours():
+    """CoT retention TTL in hours from CoreConfig.xml <repository retentionDays>.
+
+    Same parse as tak-retention-guard.sh Step 3. We only READ this — the policy
+    is owned by TAK Server's own Web Admin (:8443) and we never write it."""
+    try:
+        cc = _read_coreconfig()
+    except Exception:
+        return None
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(cc)
+    except Exception:
+        return None
+    ns = {'m': 'http://bbn.com/marti/xml/config'}
+    try:
+        repos = list(root.findall('.//m:repository', ns)) + list(root.findall('.//repository'))
+    except Exception:
+        return None
+    for repo in repos:
+        rd = repo.get('retentionDays')
+        if not rd:
+            continue
+        try:
+            h = int(float(rd) * 24)
+        except Exception:
+            continue
+        if h > 0:
+            return h
+    return None
+
+
+def _cotdb_systemctl(args, timeout=6):
+    """systemctl stdout (ignoring exit status — `is-enabled` exits non-zero for a
+    disabled unit but still prints the state). Verb-gated by the broker."""
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl'] + list(args)),
+                           capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or '').strip()
+    except Exception:
+        return ''
+
+
+def _cotdb_retention_proc_alive():
+    """Is TAK's retention Java process running? (the 5th TAK process). None when
+    it cannot be determined."""
+    try:
+        if _tak_is_container():
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER,
+                                           'pgrep', '-f', 'takserver-retention.jar']),
+                               capture_output=True, text=True, timeout=10)
+        else:
+            r = subprocess.run(['pgrep', '-f', 'takserver-retention.jar'],
+                               capture_output=True, text=True, timeout=6)
+        return bool((r.stdout or '').strip())
+    except Exception:
+        return None
+
+
+def _cotdb_facts(tak_cfg=None):
+    """Read-only fact-gatherer behind Diagnose (W1), the stat tiles (W2) and the
+    preflight gates. Never raises: a fact we cannot read comes back as None and
+    the caller degrades, because a card that 500s on a full disk is worse than
+    one that says 'unknown'."""
+    if tak_cfg is None:
+        tak_cfg = _get_tak_deployment_config(load_settings())
+    f = {
+        'db_bytes': None, 'live_rows': None, 'dead_tuples': None,
+        'largest_table': None, 'largest_table_bytes': None,
+        'data_directory': None, 'fs_free_bytes': None, 'fs_total_bytes': None, 'fs_pct': None,
+        'oldest_cot': None, 'newest_cot': None, 'oldest_age_secs': None,
+        'retention_hours': None, 'retention_proc_alive': None,
+        'guard_timer_enabled': None, 'guard_timer_last': None,
+        'repack_timer_enabled': None,
+        'fk_dependents': [], 'two_server': tak_cfg.get('mode') == 'two_server',
+        'errors': [],
+    }
+
+    # Both are cluster-level and fail together if the cluster is unreachable, so
+    # merging them costs no robustness and saves an SSH round trip on split boxes.
+    ok, out = _cotdb_psql(tak_cfg,
+                          "SELECT COALESCE(pg_database_size('cot'), 0), current_setting('data_directory');",
+                          db='postgres', timeout=15)
+    if ok and '|' in out:
+        size_s, _, dd = out.strip().partition('|')
+        if size_s.strip().isdigit():
+            f['db_bytes'] = int(size_s.strip())
+        f['data_directory'] = dd.strip() or None
+    elif not ok:
+        f['errors'].append(f'db size: {out[:200]}')
+
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        'SELECT COALESCE((SELECT SUM(n_live_tup) FROM pg_stat_user_tables), 0), '
+        'COALESCE((SELECT SUM(n_dead_tup) FROM pg_stat_user_tables), 0);', timeout=15)
+    if ok:
+        parts = out.strip().split('|')
+        if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+            f['live_rows'] = int(parts[0])
+            f['dead_tuples'] = int(parts[1])
+    elif out:
+        f['errors'].append(f'row stats: {out[:200]}')
+
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        'SELECT relname, pg_total_relation_size(relid) FROM pg_statio_user_tables '
+        'ORDER BY pg_total_relation_size(relid) DESC LIMIT 1;', timeout=20)
+    if ok and '|' in out:
+        name, _, size = out.strip().partition('|')
+        f['largest_table'] = name.strip()
+        if size.strip().isdigit():
+            f['largest_table_bytes'] = int(size.strip())
+    elif out:
+        f['errors'].append(f'largest table: {out[:200]}')
+
+    free_b, total_b = _cotdb_df(tak_cfg, f['data_directory'] or '/')
+    f['fs_free_bytes'] = free_b
+    f['fs_total_bytes'] = total_b
+    if total_b:
+        f['fs_pct'] = round(free_b * 100.0 / total_b, 1)
+
+    # A seq-scan min() on a 48M-row table would hang the card on exactly the box
+    # that needs it, so bound the statement rather than the HTTP request.
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SET statement_timeout = '20s'; "
+        "SELECT COALESCE(min(servertime)::text, ''), COALESCE(max(servertime)::text, ''), "
+        'COALESCE(EXTRACT(EPOCH FROM (now() - min(servertime)))::bigint, 0) FROM cot_router;',
+        timeout=30)
+    if ok and '|' in out:
+        parts = out.strip().split('|')
+        if len(parts) >= 3:
+            f['oldest_cot'] = parts[0].strip() or None
+            f['newest_cot'] = parts[1].strip() or None
+            if parts[2].strip().lstrip('-').isdigit():
+                f['oldest_age_secs'] = int(parts[2].strip())
+    elif out:
+        f['errors'].append(f'cot_router age: {out[:200]}')
+
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SELECT conrelid::regclass::text, conname FROM pg_constraint "
+        "WHERE confrelid = 'cot_router'::regclass;", timeout=20)
+    if ok:
+        for line in (out or '').splitlines():
+            if '|' in line:
+                tbl, _, con = line.partition('|')
+                if tbl.strip():
+                    f['fk_dependents'].append({'table': tbl.strip(), 'constraint': con.strip()})
+
+    f['retention_hours'] = _cotdb_retention_hours()
+    f['retention_proc_alive'] = _cotdb_retention_proc_alive()
+    f['guard_timer_enabled'] = _cotdb_systemctl(['is-enabled', 'takretentionguard.timer']) or 'unknown'
+    f['repack_timer_enabled'] = _cotdb_systemctl(['is-enabled', 'takdbrepack.timer']) or 'unknown'
+    # --timestamp=unix (systemd >= 247, so both Ubuntu 22.04 and RHEL 9) gives an
+    # epoch we can turn into "14 min ago" without parsing a localized date string.
+    last = _cotdb_systemctl(['show', 'takretentionguard.timer', '-p', 'LastTriggerUSec',
+                             '--value', '--timestamp=unix'])
+    if not last:
+        last = _cotdb_systemctl(['show', 'takretentionguard.timer', '-p', 'LastTriggerUSec', '--value'])
+    f['guard_timer_last'] = last if last and last not in ('n/a', '0') else None
+    f['guard_timer_last_secs'] = None
+    f['guard_timer_last_human'] = None
+    if last.startswith('@') and last[1:].isdigit() and last != '@0':
+        f['guard_timer_last_secs'] = max(0, int(time.time()) - int(last[1:]))
+        f['guard_timer_last_human'] = _cotdb_fmt_age(f['guard_timer_last_secs']) + ' ago'
+
+    # Formatted once, here, so the tiles and the verdict text cannot drift apart.
+    f['db_human'] = _cotdb_fmt_bytes(f['db_bytes']) if f['db_bytes'] is not None else '-'
+    f['fs_free_human'] = _cotdb_fmt_bytes(f['fs_free_bytes'])
+    f['largest_table_human'] = (_cotdb_fmt_bytes(f['largest_table_bytes'])
+                                if f['largest_table_bytes'] is not None else '-')
+    f['oldest_age_human'] = _cotdb_fmt_age(f['oldest_age_secs'])
+    f['compact_needed_bytes'] = (int(f['largest_table_bytes'] * _COTDB_COMPACT_HEADROOM)
+                                 if f['largest_table_bytes'] else None)
+    f['compact_needed_human'] = (_cotdb_fmt_bytes(f['compact_needed_bytes'])
+                                 if f['compact_needed_bytes'] else '-')
+    f['retention_stalled'] = bool(f['retention_hours'] and f['oldest_age_secs']
+                                  and f['oldest_age_secs'] > f['retention_hours'] * 3600 * 2)
+    f['guard_timer_ok'] = (f['guard_timer_enabled'] or '') in ('enabled', 'enabled-runtime', 'static')
+    return f
+
+
+def _cotdb_space_refusal(facts):
+    """Shared W3/W4 preflight: VACUUM FULL and pg_repack BOTH rewrite each table
+    into a new file before dropping the old one, so both need free space ~= the
+    largest table. Returns a refusal dict when there is not enough, else None."""
+    need = facts.get('compact_needed_bytes')
+    free = facts.get('fs_free_bytes')
+    if not need or free is None:
+        return None            # unknown -> do not block; the DB will report
+    if free >= need:
+        return None
+    msg = (f"Cannot compact - VACUUM FULL and Online Compact need about "
+           f"{facts['compact_needed_human']} free (the size of the largest table, "
+           f"{facts.get('largest_table') or 'unknown'}) and this filesystem has "
+           f"{facts['fs_free_human']}. Free disk first.")
+    layout = {}
+    try:
+        layout = _detect_disk_layout()
+    except Exception:
+        layout = {}
+    if layout.get('mode') and layout.get('mode') != 'ok' and layout.get('reclaimable_gb'):
+        msg += (f" {layout['reclaimable_gb']} GB is reclaimable on this box - "
+                "see Reclaim disk on the Console page.")
+    return {'error': msg, 'verdict': 'no_disk',
+            'needed_bytes': need, 'free_bytes': free,
+            'recommend': ['purge'] + (['reclaim_disk'] if layout.get('mode', 'ok') != 'ok' else [])}
+
+
+def _cotdb_verdict(facts):
+    """The W1 decision tree, in order. Returns (verdict, headline, detail, recommend)."""
+    free = facts.get('fs_free_bytes')
+    need = facts.get('compact_needed_bytes')
+    dead = facts.get('dead_tuples')
+    rh = facts.get('retention_hours')
+
+    # 1. No room to compact. Checked first: it is the only case where the button
+    #    the card offers is arithmetically impossible.
+    if need and free is not None and free < need:
+        ref = _cotdb_space_refusal(facts) or {}
+        return ('no_disk', 'Not enough free disk to compact', ref.get('error', ''),
+                ref.get('recommend') or ['purge'])
+
+    # 2. Retention is not deleting. The space is live rows; compacting frees nothing.
+    if facts.get('retention_stalled'):
+        causes = []
+        if facts.get('retention_proc_alive') is False:
+            causes.append("TAK Server's retention process is not running")
+        if not facts.get('guard_timer_ok'):
+            causes.append(f"the Guard Dog retention timer is {facts.get('guard_timer_enabled') or 'unknown'}")
+        if not causes:
+            causes.append('retention is configured but has not been deleting')
+        detail = (f"Retention is set to {rh} h but the oldest CoT row is {facts['oldest_age_human']} old - "
+                  f"retention is not deleting. Compacting will not help; the space is live data. "
+                  f"Cause: {'; '.join(causes)}.")
+        return ('retention_stalled', 'Retention is stalled', detail, ['retention_run', 'purge'])
+
+    # 3. Nothing for VACUUM to reclaim. This is the reporter's actual case.
+    if dead is not None and dead < _COTDB_BLOAT_FLOOR:
+        detail = (f"Only {dead:,} dead tuples - there is almost nothing for VACUUM to reclaim. "
+                  f"This database is {facts.get('db_human', '-')} of live rows. "
+                  "Deleting rows (Purge Old CoT) is what frees space here, not compacting.")
+        return ('no_bloat', 'Nothing to reclaim - this is live data', detail, ['purge'])
+
+    # 4. Real bloat, and room to compact it.
+    if dead is not None and dead > _COTDB_BLOAT_CEIL:
+        detail = (f"{dead:,} dead tuples - reclaimable. Online Compact runs without an exclusive "
+                  "lock, so TAK Server can stay up; Compact Database is faster but needs TAK stopped.")
+        return ('bloat', 'Reclaimable bloat found', detail, ['repack', 'vacuum_full'])
+
+    detail = (f"{(dead if dead is not None else 0):,} dead tuples, "
+              f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
+              f"{facts.get('oldest_age_human', '-')} old. Nothing to do.")
+    return ('healthy', 'Database looks healthy', detail, [])
+
+
+@app.route('/api/guarddog/cotdb/diagnose')
+@login_required
+def guarddog_cotdb_diagnose():
+    """W1 - read-only CoT database diagnosis. Safe to spam: no writes, no locks.
+
+    Answers the question the card could not: WHICH failure am I in, and which
+    button actually helps? Also feeds the W2 stat tiles from the same payload so
+    one fetch drives the whole card."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    try:
+        tak_cfg = _get_tak_deployment_config(load_settings())
+        facts = _cotdb_facts(tak_cfg)
+        verdict, headline, detail, recommend = _cotdb_verdict(facts)
+        return jsonify({'success': True, 'verdict': verdict, 'headline': headline,
+                        'detail': detail, 'recommend': recommend, 'facts': facts})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+
+
+# Guard Dog units this card can drive, and the log tag each one writes. A FIXED
+# map — the request supplies a job key, never a unit name.
+_COTDB_JOBS = {
+    'retention': {'unit': 'takretentionguard.service', 'tag': 'RETENTION-GUARD:'},
+    'repack': {'unit': 'takdbrepack.service', 'tag': 'DB-REPACK:'},
+}
+_COTDB_GUARD_LOG = '/var/log/takguard/restarts.log'
+
+
+def _cotdb_log_tail(tag, limit=40):
+    """Last `limit` Guard Dog log lines carrying `tag`. The scripts already log
+    their row counts there — surfacing them beats inventing a second channel."""
+    text = ''
+    try:
+        with open(_COTDB_GUARD_LOG, 'r', errors='replace') as fh:
+            text = fh.read()
+    except Exception:
+        try:
+            text = _read_priv(_COTDB_GUARD_LOG)
+        except Exception:
+            return []
+    return [l for l in (text or '').splitlines() if tag in l][-limit:]
+
+
+def _cotdb_heal_timers():
+    """Re-arm the Guard Dog DB timers if they are not enabled.
+
+    v10.1.1 (F8): run_guarddog_deploy WROTE takretentionguard.timer but never
+    added it to the enable list, so on every box installed before that fix it has
+    sat loaded-but-disabled and has never fired once — our own test6 bloated
+    cot_router to 53 GB from exactly this. The startup migration re-arms it, but
+    only on Update Now; this makes the same remedy reachable from the page.
+    Returns the list of units that were enabled."""
+    healed = []
+    for unit in ('takretentionguard.timer', 'takdbrepack.timer'):
+        if not os.path.exists(f'/etc/systemd/system/{unit}'):
+            continue
+        if _cotdb_systemctl(['is-enabled', unit]) in ('enabled', 'enabled-runtime', 'static'):
+            continue
+        try:
+            r = subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', unit]),
+                               capture_output=True, text=True, timeout=45)
+            if r.returncode == 0:
+                healed.append(unit)
+        except Exception:
+            pass
+    return healed
+
+
+@app.route('/api/guarddog/cotdb/retention-run', methods=['POST'])
+@login_required
+def guarddog_cotdb_retention_run():
+    """W6 - run the Guard Dog retention guard NOW, and re-arm its timer.
+
+    The guard performs the SAFE automatic batched delete; it is what should have
+    kept the reporter's box from ever filling. Started with --no-block because
+    takretentionguard.service is Type=oneshot with TimeoutStartSec=1800 - a
+    blocking start would hold a gunicorn thread (1 worker / 4 threads) for up to
+    half an hour. The client polls /api/guarddog/cotdb/job-status."""
+    if not os.path.exists('/etc/systemd/system/takretentionguard.service'):
+        return jsonify({'success': False,
+                        'error': 'Guard Dog retention guard is not installed on this box. '
+                                 'Deploy or update Guard Dog first.'}), 400
+    audit('cotdb:retention-run', 'start requested')
+    healed = _cotdb_heal_timers()
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'start', '--no-block',
+                                       'takretentionguard.service']),
+                           capture_output=True, text=True, timeout=45)
+    except Exception as e:
+        audit('cotdb:retention-run', f'start failed: {str(e)[:120]}')
+        return jsonify({'success': False, 'error': f'Could not start retention guard: {str(e)[:200]}'}), 500
+    if r.returncode != 0:
+        err = ((r.stderr or '') + (r.stdout or '')).strip()[:300] or f'Exit code {r.returncode}'
+        audit('cotdb:retention-run', f'start failed: {err[:120]}')
+        return jsonify({'success': False, 'error': err}), 400
+    msg = 'Retention guard started.'
+    if healed:
+        msg += (' Re-enabled ' + ', '.join(healed) +
+                ' - the timer was not armed, so the automatic 15-minute safety net had never run.')
+    audit('cotdb:retention-run', f'started; healed={",".join(healed) or "none"}')
+    return jsonify({'success': True, 'job': 'retention', 'healed_timers': healed, 'message': msg})
+
+
+@app.route('/api/guarddog/cotdb/repack', methods=['POST'])
+@login_required
+def guarddog_cotdb_repack():
+    """W4 - Online Compact. Reclaims bloat WITHOUT an exclusive lock, so unlike
+    VACUUM FULL it does not require stopping TAK Server.
+
+    Drives the existing, already-audited takdbrepack.service through the
+    already-allowed `systemctl start` verb. pg_repack is deliberately NOT in the
+    broker's _PG_AS_POSTGRES allowlist, so running it through _pg_exec() would be
+    DENIED - driving the unit is what makes this work on the non-root fleet with
+    no new broker privilege and no new CJIS review surface."""
+    if not os.path.exists('/etc/systemd/system/takdbrepack.service'):
+        return jsonify({'success': False,
+                        'error': 'Guard Dog online repack is not installed on this box. '
+                                 'Deploy or update Guard Dog first.'}), 400
+    tak_cfg = _get_tak_deployment_config(load_settings())
+    # pg_repack builds a full copy of each table before swapping it in, exactly
+    # like VACUUM FULL - so it gets the same free-space refusal (W3).
+    facts = _cotdb_facts(tak_cfg)
+    refusal = _cotdb_space_refusal(facts)
+    if refusal:
+        return jsonify(dict(refusal, success=False)), 400
+    audit('cotdb:repack', 'start requested')
+    # Clear any previous failure so job-status reports THIS run's outcome.
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'takdbrepack.service']),
+                       capture_output=True, text=True, timeout=20)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'start', '--no-block', 'takdbrepack.service']),
+                           capture_output=True, text=True, timeout=45)
+    except Exception as e:
+        audit('cotdb:repack', f'start failed: {str(e)[:120]}')
+        return jsonify({'success': False, 'error': f'Could not start online repack: {str(e)[:200]}'}), 500
+    if r.returncode != 0:
+        err = ((r.stderr or '') + (r.stdout or '')).strip()[:300] or f'Exit code {r.returncode}'
+        audit('cotdb:repack', f'start failed: {err[:120]}')
+        return jsonify({'success': False, 'error': err}), 400
+    audit('cotdb:repack', f"started; db={facts.get('db_human')} dead={facts.get('dead_tuples')}")
+    return jsonify({'success': True, 'job': 'repack',
+                    'message': 'Online compact started. TAK Server can stay up; '
+                               'pg_repack works without an exclusive lock.'})
+
+
+@app.route('/api/guarddog/cotdb/job-status')
+@login_required
+def guarddog_cotdb_job_status():
+    """Poll a Guard Dog DB job (retention guard / online repack): unit state plus
+    the tail of the lines that job writes to the Guard Dog log."""
+    spec = _COTDB_JOBS.get((request.args.get('job') or '').strip())
+    if not spec:
+        return jsonify({'success': False, 'error': 'Unknown job.'}), 400
+    state = _cotdb_systemctl(['is-active', spec['unit']]) or 'unknown'
+    return jsonify({'success': True, 'state': state,
+                    'active': state in ('active', 'activating', 'reloading'),
+                    'failed': state == 'failed',
+                    'lines': _cotdb_log_tail(spec['tag'])})
+
+
+# --------------------------------------------------------------------------
+# W5 — Purge Old CoT (DESTRUCTIVE)
+# --------------------------------------------------------------------------
+# The only action that recovers a box at 441 MB free. Two modes:
+#   age — batched ctid DELETE by cutoff. WAL-light, runs while TAK is up, but
+#         needs headroom for the WAL it writes.
+#   all — TRUNCATE. Drops the old relfilenode instead of rewriting it, so it is
+#         near-instant and needs essentially no free space. The escape hatch.
+_COTDB_PURGE_BATCH = 50000              # same chunk the retention guard proved
+_COTDB_PURGE_MAX_BATCHES = 200          # 50k x 200 = 10M rows per press
+_COTDB_PURGE_SLEEP = 2
+_COTDB_PURGE_WAL_FLOOR = 2 * 1024 ** 3  # a multi-million-row DELETE writes GBs of WAL
+_COTDB_PURGE_MAX_HOURS = 8760           # 1 year
+
+_cotdb_purge_status = {'running': False, 'mode': None, 'started': None, 'hours': None,
+                       'deleted': 0, 'batches': 0, 'capped': False,
+                       'result': None, 'error': None}
+
+
+def _cotdb_cascade_set(tak_cfg):
+    """Every table a `TRUNCATE cot_router CASCADE` would reach, transitively.
+
+    The plain fk_dependents probe finds DIRECT dependents only, but CASCADE
+    follows the chain — so listing only the direct ones would show the operator a
+    smaller blast radius than the statement actually has. Confirmation is
+    worthless if it confirms the wrong set."""
+    sql = ("WITH RECURSIVE d AS ("
+           "  SELECT conrelid FROM pg_constraint WHERE confrelid = 'cot_router'::regclass "
+           "  UNION "
+           "  SELECT c.conrelid FROM pg_constraint c JOIN d ON c.confrelid = d.conrelid"
+           ") SELECT DISTINCT conrelid::regclass::text FROM d;")
+    ok, out = _cotdb_psql(tak_cfg, sql, timeout=20)
+    if not ok:
+        return None                    # unknown -> caller must refuse, not guess
+    return sorted({l.strip() for l in (out or '').splitlines() if l.strip()})
+
+
+def _run_cotdb_purge_background(hours, tak_cfg):
+    """Batched delete by cutoff, using the ctid pattern proven in
+    tak-retention-guard.sh Step 5 (small chunks, sleep between, hard iteration
+    cap) so PostgreSQL never attempts one massive transaction."""
+    table = _COTDB_TABLES[0]
+    # `hours` is an int() already range-checked by the caller; the table name is a
+    # module constant. No request STRING ever reaches this statement.
+    sql = (f"DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} "
+           f"WHERE servertime < now() - interval '{hours} hours' "
+           f"LIMIT {_COTDB_PURGE_BATCH});")
+    total = 0
+    batches = 0
+    try:
+        while batches < _COTDB_PURGE_MAX_BATCHES:
+            ok, out = _cotdb_psql(tak_cfg, sql, timeout=600)
+            if not ok:
+                _cotdb_purge_status.update({'running': False, 'error': (out or 'DELETE failed')[:400],
+                                            'deleted': total, 'batches': batches})
+                audit('cotdb:purge', f'mode=age hours={hours} rows={total} FAILED: {(out or "")[:120]}',
+                      force=True)
+                return
+            m = re.search(r'DELETE\s+(\d+)', out or '')
+            n = int(m.group(1)) if m else 0
+            total += n
+            batches += 1
+            _cotdb_purge_status.update({'deleted': total, 'batches': batches})
+            if n < _COTDB_PURGE_BATCH:
+                break
+            time.sleep(_COTDB_PURGE_SLEEP)
+        else:
+            _cotdb_purge_status['capped'] = True
+        msg = f'Deleted {total:,} rows older than {hours} h in {batches} batches.'
+        if _cotdb_purge_status['capped']:
+            msg += (f' Stopped at the {_COTDB_PURGE_MAX_BATCHES}-batch safety cap - '
+                    'press Purge Old CoT again to continue.')
+        msg += (' DELETE does not shrink the database file: follow with Online Compact '
+                'to hand the space back to the filesystem.')
+        _cotdb_purge_status.update({'running': False, 'result': msg, 'deleted': total,
+                                    'batches': batches})
+        audit('cotdb:purge', f'mode=age hours={hours} rows={total} batches={batches}', force=True)
+    except Exception as e:
+        _cotdb_purge_status.update({'running': False, 'error': str(e)[:300], 'deleted': total})
+        audit('cotdb:purge', f'mode=age hours={hours} rows={total} EXCEPTION: {str(e)[:120]}',
+              force=True)
+
+
+@app.route('/api/guarddog/cotdb/purge', methods=['POST'])
+@login_required
+def guarddog_cotdb_purge():
+    """W5 - DESTRUCTIVE. Delete CoT position history to recover a full box.
+
+    Authorization follows the fold_home precedent exactly: @login_required, PLUS
+    a re-verified console password, PLUS a literal confirmation string the caller
+    must echo. Destructive CoT deletion stays operator-initiated - there is no
+    automatic or scheduled path into this route."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    data = request.get_json(silent=True) or {}
+    mode = (data.get('mode') or '').strip()
+    if mode not in ('age', 'all'):
+        return jsonify({'success': False, 'error': 'mode must be "age" or "all".'}), 400
+    if _cotdb_purge_status['running']:
+        return jsonify({'success': False, 'error': 'A purge is already running.',
+                        'status': 'running'}), 409
+
+    # The one-copy admin-password gate (modules/__init__.py, allowlisted in
+    # smoke.py AUTH_FUNCS) rather than a 19th inline check_password_hash.
+    if mod_registry._check_admin_password({'load_auth': load_auth}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+
+    table = _COTDB_TABLES[0]
+    confirm = (data.get('confirm') or '').strip()
+    hours = None
+    if mode == 'age':
+        # HARD int coercion + range check. A request STRING must never reach the
+        # statement — this is the one place a request value influences SQL at all.
+        try:
+            hours = int(str(data.get('hours', '')).strip())
+        except Exception:
+            return jsonify({'success': False,
+                            'error': f'hours must be a whole number between 1 and '
+                                     f'{_COTDB_PURGE_MAX_HOURS}.'}), 400
+        if not (1 <= hours <= _COTDB_PURGE_MAX_HOURS):
+            return jsonify({'success': False,
+                            'error': f'hours must be between 1 and {_COTDB_PURGE_MAX_HOURS}.'}), 400
+        if confirm != str(hours):
+            return jsonify({'success': False,
+                            'error': f"confirm must be exactly '{hours}' (the cutoff in hours).",
+                            'expected_confirm': str(hours)}), 400
+    else:
+        if confirm != table:
+            return jsonify({'success': False,
+                            'error': f"confirm must be exactly '{table}'.",
+                            'expected_confirm': table}), 400
+
+    audit('cotdb:purge', f'mode={mode} hours={hours} requested', force=True)
+    tak_cfg = _get_tak_deployment_config(load_settings())
+    facts = _cotdb_facts(tak_cfg)
+
+    if mode == 'age':
+        free = facts.get('fs_free_bytes')
+        if free is not None and free < _COTDB_PURGE_WAL_FLOOR:
+            # A multi-million-row DELETE writes GBs of WAL onto this same
+            # filesystem and can drive PostgreSQL to PANIC / read-only. Mode
+            # `all` exists precisely for this situation.
+            return jsonify({
+                'success': False, 'verdict': 'no_wal_room',
+                'free_bytes': free, 'needed_bytes': _COTDB_PURGE_WAL_FLOOR,
+                'error': (f"Only {facts.get('fs_free_human')} free - a batched DELETE writes "
+                          "gigabytes of write-ahead log onto this same filesystem and could "
+                          "drive PostgreSQL read-only. At least 2 GB free is required. Use "
+                          "Purge everything (TRUNCATE), which needs essentially no free space."),
+            }), 400
+        _cotdb_purge_status.update({'running': True, 'mode': 'age', 'hours': hours,
+                                    'started': datetime.now().isoformat(), 'deleted': 0,
+                                    'batches': 0, 'capped': False, 'result': None, 'error': None})
+        threading.Thread(target=_run_cotdb_purge_background, args=(hours, tak_cfg),
+                         daemon=True).start()
+        return jsonify({'success': True, 'status': 'started', 'mode': 'age', 'hours': hours})
+
+    # ---- mode 'all': TRUNCATE ------------------------------------------------
+    cascade = False
+    deps = facts.get('fk_dependents') or []
+    if deps:
+        full_set = _cotdb_cascade_set(tak_cfg)
+        if full_set is None:
+            return jsonify({'success': False, 'fk_dependents': deps,
+                            'error': f'{table} has foreign-key dependents but the full CASCADE '
+                                     'set could not be read. Refusing to TRUNCATE blind.'}), 400
+        want = data.get('cascade_tables')
+        want_set = sorted({str(t).strip() for t in want}) if isinstance(want, list) else None
+        if want_set != full_set:
+            return jsonify({
+                'success': False, 'fk_dependents': deps, 'cascade_tables': full_set,
+                'error': (f'{table} has foreign-key dependents, so TRUNCATE would CASCADE into: '
+                          + ', '.join(full_set) + '. Those tables would be emptied too. Confirm '
+                          'the exact list to proceed, or cancel and use Purge by age instead.'),
+            }), 400
+        cascade = True
+
+    # Bounded lock wait: TRUNCATE needs ACCESS EXCLUSIVE, and TAK Server holds the
+    # table while it is up. Report that plainly instead of hanging the request.
+    sql = f"SET lock_timeout = '10s'; TRUNCATE TABLE {table}" + (' CASCADE;' if cascade else ';')
+    before = facts.get('db_bytes')
+    ok, out = _cotdb_psql(tak_cfg, sql, timeout=120)
+    if not ok:
+        low = (out or '').lower()
+        if 'lock timeout' in low or 'canceling statement' in low:
+            audit('cotdb:purge', 'mode=all BLOCKED by lock', force=True)
+            return jsonify({'success': False, 'verdict': 'locked',
+                            'error': 'TAK Server is holding the table - stop TAK Server and retry.'}), 409
+        audit('cotdb:purge', f'mode=all FAILED: {(out or "")[:120]}', force=True)
+        return jsonify({'success': False, 'error': (out or 'TRUNCATE failed')[:400]}), 400
+
+    after = _cotdb_facts(tak_cfg)
+    freed = None
+    if before is not None and after.get('db_bytes') is not None:
+        freed = max(0, before - after['db_bytes'])
+    audit('cotdb:purge',
+          f"mode=all cascade={cascade} before={before} after={after.get('db_bytes')}", force=True)
+    msg = f'{table} truncated.'
+    if cascade:
+        msg += ' CASCADE also emptied: ' + ', '.join(full_set) + '.'
+    if freed:
+        msg += f' Reclaimed {_cotdb_fmt_bytes(freed)} immediately - TRUNCATE drops the old files.'
+    return jsonify({'success': True, 'mode': 'all', 'message': msg,
+                    'freed_bytes': freed, 'facts': after})
+
+
+@app.route('/api/guarddog/cotdb/purge/status')
+@login_required
+def guarddog_cotdb_purge_status():
+    """Poll the batched (mode=age) purge."""
+    return jsonify({'success': True, **_cotdb_purge_status})
 
 
 @app.route('/api/takserver/cert-expiry')

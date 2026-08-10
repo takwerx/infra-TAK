@@ -290,25 +290,45 @@
   <div class="card">
     <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Database maintenance (CoT)</span><span class="gd-collapse-toggle">&#9662;</span></div>
     <div class="gd-collapse-body">
-    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The CoT database can grow large. Data retention deletes rows but <strong>PostgreSQL does not free disk until you run VACUUM</strong>. Smart auto-VACUUM runs daily at 3am (triggers when dead tuples &gt; 1M).</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The CoT database grows from live rows <em>and</em> from deleted-but-not-reclaimed space. <strong>VACUUM only reclaims space from deleted rows</strong> — if retention isn't deleting, compacting frees nothing. <strong>VACUUM FULL and Online Compact both need free disk roughly equal to the largest table</strong>, so neither can run on a full filesystem. Press <strong>Diagnose</strong> and it will tell you which case you're in. Smart auto-VACUUM runs daily at 3am (triggers when dead tuples &gt; 1M).</p>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px">
     <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Database size</div><span id="gd-cot-db-size" style="font-weight:600;font-size:14px">—</span> <button type="button" onclick="gdRefreshCotSize()" class="btn btn-ghost" style="margin-left:4px;padding:2px 8px;font-size:10px">Refresh</button></div>
     <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Estimated rows</div><span id="gd-cot-msg-count" style="font-weight:600;font-size:14px">—</span></div>
     <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Dead tuples</div><span id="gd-cot-dead-tuples" style="font-weight:600;font-size:14px">—</span></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px" title="Free space on the filesystem holding the PostgreSQL data directory — not necessarily /"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Free disk</div><span id="gd-cot-free-disk" style="font-weight:600;font-size:14px">—</span></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px" title="Age of the oldest row in cot_router. Older than twice the retention TTL means retention is not deleting."><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Oldest CoT row</div><span id="gd-cot-oldest" style="font-weight:600;font-size:14px">—</span></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px" title="Compacting needs roughly this much free disk"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Largest table</div><span id="gd-cot-largest" style="font-weight:600;font-size:14px">—</span></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px" title="TAK Server's retention TTL (set in its own Web Admin on :8443) and the Guard Dog retention timer"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Retention</div><span id="gd-cot-retention" style="font-weight:600;font-size:14px">—</span></div>
     </div>
-    <p style="font-size:10px;color:var(--text-dim);margin-bottom:14px">Size: green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB</p>
+    <p style="font-size:10px;color:var(--text-dim);margin-bottom:14px">Size: green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB · Free disk: green &gt; 20% · yellow 10–20% · red &lt; 10%</p>
     <div style="display:flex;flex-direction:column;gap:12px">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+        <button type="button" id="gd-cot-diagnose-btn" onclick="gdCotDiagnose()" class="btn" style="background:linear-gradient(135deg,#0e7490,#0891b2);color:#fff;flex-shrink:0">Diagnose</button>
+        <span style="font-size:12px;color:var(--text-secondary)">Read-only. Tells you which problem you actually have and highlights the button that fixes it. Safe to run any time.</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+        <button type="button" id="gd-cot-retention-btn" onclick="gdCotRetentionRun()" class="btn btn-ghost" style="color:var(--green);border-color:var(--green);flex-shrink:0">Run Retention Now</button>
+        <span style="font-size:12px;color:var(--text-secondary)">Runs Guard Dog's batched retention cleanup immediately and re-arms its 15-minute timer if it was never enabled. Safe while TAK Server is running. Deletes only rows past the TTL set in TAK Server's own Web Admin.</span>
+      </div>
       <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
         <button type="button" id="gd-vacuum-analyze-btn" onclick="gdRunVacuum(false)" class="btn" style="background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;flex-shrink:0">Optimize Tables</button>
         <span style="font-size:12px;color:var(--text-secondary)">VACUUM ANALYZE — marks deleted space for reuse. Safe while running.</span>
       </div>
       <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+        <button type="button" id="gd-cot-repack-btn" onclick="gdCotRepack()" class="btn btn-ghost" style="color:var(--cyan);border-color:var(--cyan);flex-shrink:0">Online Compact</button>
+        <span style="font-size:12px;color:var(--text-secondary)">pg_repack — reclaims disk <strong>without an exclusive lock</strong>, so TAK Server can stay up. Also needs free disk roughly equal to the largest table. Refused if there isn't room.</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
         <button type="button" id="gd-vacuum-full-btn" onclick="gdRunVacuum(true)" class="btn btn-ghost" style="color:var(--yellow);border-color:var(--yellow);flex-shrink:0" title="Caution: run when TAK Server is not running">Compact Database</button>
-        <span style="font-size:12px;color:var(--text-secondary)">VACUUM FULL — physically shrinks files on disk. <strong>Stop TAK Server first</strong>. <span style="color:var(--yellow)">(caution)</span></span>
+        <span style="font-size:12px;color:var(--text-secondary)">VACUUM FULL — physically shrinks files on disk. <strong>Stop TAK Server first</strong>, and it <strong>needs free disk roughly equal to the largest table</strong> (see the tiles above) because it rewrites each table before dropping the old copy. Refused if there isn't room. <span style="color:var(--yellow)">(caution)</span></span>
       </div>
       <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
         <button type="button" id="gd-reindex-btn" onclick="gdRunReindex()" class="btn btn-ghost" style="color:var(--cyan);border-color:var(--cyan);flex-shrink:0">Rebuild Indexes</button>
         <span style="font-size:12px;color:var(--text-secondary)">REINDEX — rebuilds indexes for faster queries. Safe while running.</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;border-top:1px solid var(--border);padding-top:12px">
+        <button type="button" id="gd-cot-purge-btn" onclick="gdCotPurgeOpen()" class="btn btn-ghost" style="color:var(--red);border-color:var(--red);flex-shrink:0">Purge Old CoT</button>
+        <span style="font-size:12px;color:var(--text-secondary)"><strong style="color:var(--red)">Destructive.</strong> Deletes CoT position history — by age, or everything. This is the only action that recovers a box whose disk is already full. Password-confirmed.</span>
       </div>
     </div>
     <div id="gd-vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
@@ -316,6 +336,26 @@
     {% if autovacuum_last %}<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Auto-VACUUM last run: <span style="color:var(--cyan)">{{ autovacuum_last }}</span></div>{% endif %}
     </div>
   </div>
+
+  <div class="modal-overlay" id="gd-cot-purge-modal"><div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:560px;max-width:92vw">
+    <h3 style="font-size:16px;margin-bottom:8px;color:var(--red)">Purge Old CoT</h3>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:14px">This permanently deletes <strong>CoT position history</strong> from <code>cot_router</code>. Connected clients repopulate their own tracks as they report in; mission content, files and user accounts live in separate tables and are <strong>not</strong> touched. There is no undo.</p>
+    <div style="margin-bottom:12px">
+      <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;margin-bottom:8px;cursor:pointer"><input type="radio" name="gd-cot-purge-mode" value="age" checked onchange="gdCotPurgeModeChange()" style="margin-top:3px"><span><strong>Delete rows older than a cutoff</strong> — batched, WAL-light, safe while TAK Server is running. Needs at least 2 GB free.</span></label>
+      <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;cursor:pointer"><input type="radio" name="gd-cot-purge-mode" value="all" onchange="gdCotPurgeModeChange()" style="margin-top:3px"><span><strong>Delete everything (TRUNCATE)</strong> — near-instant, reclaims disk immediately and needs essentially no free space. Requires TAK Server to be stopped. <span style="color:var(--red)">The emergency escape hatch for a full disk.</span></span></label>
+    </div>
+    <div id="gd-cot-purge-age-box" style="margin-bottom:14px">
+      <label class="form-label">Delete rows older than (hours)</label>
+      <input class="form-input" type="number" id="gd-cot-purge-hours" min="1" max="8760" value="48" oninput="gdCotPurgeModeChange()">
+    </div>
+    <div style="margin-bottom:14px">
+      <label class="form-label">Type <code id="gd-cot-purge-expect">48</code> to confirm</label>
+      <input class="form-input" type="text" id="gd-cot-purge-confirm" placeholder="confirmation" autocomplete="off">
+    </div>
+    <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-cot-purge-password" placeholder="Confirm password" autocomplete="current-password"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="gdCotPurgeClose()">Cancel</button><button class="btn" id="gd-cot-purge-go" style="background:var(--red);color:#fff" onclick="gdCotPurgeSubmit()">Purge</button></div>
+    <div id="gd-cot-purge-msg" style="margin-top:12px;font-size:12px;white-space:pre-wrap"></div>
+  </div></div>
   {% endif %}
 
   {% if ak_tasklog_installed %}

@@ -22,10 +22,132 @@ function gdSmsSave(){var el=document.getElementById('gd-sms-msg');var p=document
 function gdTestSms(){var el=document.getElementById('gd-sms-msg');var btn=document.getElementById('gd-test-sms-btn');if(!el)return;el.textContent='Sending test SMS...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/test-sms',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Test SMS sent.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
 function gdBrevoSmsEvents(){var box=document.getElementById('gd-sms-events');var btn=document.getElementById('gd-brevo-events-btn');if(!box)return;box.style.display='block';box.textContent='Loading...';if(btn)btn.disabled=true;fetch('/api/guarddog/brevo-sms-events?days=1',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.error){box.innerHTML='<span style="color:var(--red)">'+d.error+'</span>';return;}var ev=d.events||[];if(ev.length===0){box.textContent='No SMS events in the last 24h (tag: GuardDog). Send a test SMS and try again.';return;}var lines=ev.map(function(e){var d=e.date?new Date(e.date):null;var t=d?d.toLocaleString():e.date||'-';var evt=e.event||'-';var ph=e.phoneNumber||'';var r=e.reason?(' - '+e.reason):'';return t+' | '+evt+(ph?' | '+ph:'')+r;});box.textContent=lines.join('\n');}).catch(function(e){if(btn)btn.disabled=false;box.innerHTML='<span style="color:var(--red)">Request failed</span>';});}
 function gdLoadActivityLog(){var el=document.getElementById('gd-activity-log');if(!el)return;el.textContent='Loading...';var fromVal=document.getElementById('gd-log-from')?document.getElementById('gd-log-from').value:'';var toVal=document.getElementById('gd-log-to')?document.getElementById('gd-log-to').value:'';var q='';if(fromVal)q+='from='+encodeURIComponent(fromVal)+'&';if(toVal)q+='to='+encodeURIComponent(toVal)+'&';fetch('/api/guarddog/activity-log?'+q,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){el.textContent='Error: '+d.error;return;}if(!d.entries||d.entries.length===0){el.textContent='No entries'+(fromVal||toVal?' for this date range':'')+'.';return;}el.textContent=d.entries.map(function(e){return e.raw;}).join(String.fromCharCode(10));}).catch(function(e){el.textContent='Request failed: '+(e.message||'Unknown error');});}
-async function gdRefreshCotSize(){var el=document.getElementById('gd-cot-db-size');if(!el)return;el.textContent='...';el.style.color='';var mc=document.getElementById('gd-cot-msg-count');var dt=document.getElementById('gd-cot-dead-tuples');try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();el.textContent=d.error?d.error:(d.size_human||'-');var b=d.size_bytes;if(typeof b==='number'&&!d.error){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}if(mc){mc.textContent=typeof d.message_count==='number'?d.message_count.toLocaleString():'—';}if(dt){var dtv=d.dead_tuples;dt.textContent=typeof dtv==='number'?dtv.toLocaleString():'—';if(typeof dtv==='number'){dt.style.color=dtv>1000000?'var(--red)':dtv>100000?'var(--yellow)':'var(--green)';}}}catch(e){el.textContent='Error';}}
+// v10.1.29 W2 — the Guard Dog card is driven by /api/guarddog/cotdb/diagnose so
+// one fetch fills every tile and can never disagree with the verdict or the
+// preflight gates. /api/takserver/cot-db-size is deliberately left untouched:
+// the TAK Server page (the primary surface) still owns it.
+async function gdRefreshCotSize(){var el=document.getElementById('gd-cot-db-size');if(!el)return;el.textContent='...';el.style.color='';
+try{var r=await fetch('/api/guarddog/cotdb/diagnose',{credentials:'same-origin'});var d=await r.json();
+if(!d.success){el.textContent=d.error||'Error';el.style.color='var(--red)';return;}
+gdCotApplyFacts(d.facts||{});}catch(e){el.textContent='Error';}}
+// v10.1.29 W1 — CoT database diagnosis. One read-only fetch decides which of the
+// four failure modes the box is in and highlights the button that actually helps.
+var GD_COT_BTNS={purge:'gd-cot-purge-btn',retention_run:'gd-cot-retention-btn',repack:'gd-cot-repack-btn',vacuum_full:'gd-vacuum-full-btn'};
+var GD_COT_COLORS={no_disk:'var(--red)',retention_stalled:'var(--red)',no_bloat:'var(--yellow)',bloat:'var(--cyan)',healthy:'var(--green)'};
+function gdCotHighlight(rec){for(var k in GD_COT_BTNS){var b=document.getElementById(GD_COT_BTNS[k]);if(b)b.style.boxShadow='';}
+(rec||[]).forEach(function(k,i){var id=GD_COT_BTNS[k];if(!id)return;var b=document.getElementById(id);if(b)b.style.boxShadow=i===0?'0 0 0 2px var(--cyan)':'0 0 0 1px var(--cyan)';});}
+async function gdCotDiagnose(){var out=document.getElementById('gd-vacuum-output');var msg=document.getElementById('gd-vacuum-msg');var btn=document.getElementById('gd-cot-diagnose-btn');
+if(btn)btn.disabled=true;if(msg){msg.textContent='';}
+if(out){out.style.display='block';out.style.color='var(--text-dim)';out.textContent='Diagnosing… (reading database size, free disk, oldest CoT row, retention state)';}
+try{var r=await fetch('/api/guarddog/cotdb/diagnose',{credentials:'same-origin'});var d=await r.json();
+if(btn)btn.disabled=false;
+if(!d.success){if(out){out.style.color='var(--red)';out.textContent=d.error||'Diagnose failed';}return;}
+gdCotApplyFacts(d.facts||{});gdCotHighlight(d.recommend);
+var lines=[d.headline,'',d.detail];
+var f=d.facts||{};
+lines.push('');
+lines.push('Database '+(f.db_human||'-')+' · free disk '+(f.fs_free_human||'-')+(f.fs_pct!==null&&f.fs_pct!==undefined?' ('+f.fs_pct+'%)':'')+' on '+(f.data_directory||'the data directory'));
+lines.push('Largest table '+(f.largest_table||'-')+' '+(f.largest_table_human||'-')+' · compacting needs about '+(f.compact_needed_human||'-')+' free');
+lines.push('Oldest CoT row '+(f.oldest_age_human||'-')+' · retention '+(f.retention_hours?f.retention_hours+' h':'not set in CoreConfig.xml')+' · dead tuples '+(typeof f.dead_tuples==='number'?f.dead_tuples.toLocaleString():'-'));
+if(f.errors&&f.errors.length)lines.push('Could not read: '+f.errors.join(' | '));
+if(out){out.style.color=GD_COT_COLORS[d.verdict]||'var(--text-dim)';out.textContent=lines.join(String.fromCharCode(10));}
+}catch(e){if(btn)btn.disabled=false;if(out){out.style.color='var(--red)';out.textContent='Request failed';}}}
+function gdCotApplyFacts(f){if(!f)return;var n=function(v){return typeof v==='number'?v.toLocaleString():'—';};
+var el=document.getElementById('gd-cot-db-size');
+if(el){el.textContent=f.db_human||'—';var b=f.db_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024,gb40=40*1024*1024*1024;el.style.color=b<gb25?'var(--green)':b<gb40?'var(--yellow)':'var(--red)';}else{el.style.color='';}}
+var mc=document.getElementById('gd-cot-msg-count');if(mc)mc.textContent=n(f.live_rows);
+var dt=document.getElementById('gd-cot-dead-tuples');if(dt){dt.textContent=n(f.dead_tuples);if(typeof f.dead_tuples==='number')dt.style.color=f.dead_tuples>1000000?'var(--red)':f.dead_tuples>100000?'var(--yellow)':'var(--green)';}
+var fd=document.getElementById('gd-cot-free-disk');if(fd){var p=f.fs_pct;fd.textContent=(f.fs_free_human||'—')+(typeof p==='number'?' ('+p+'%)':'');fd.style.color=typeof p!=='number'?'':p<10?'var(--red)':p<20?'var(--yellow)':'var(--green)';}
+var od=document.getElementById('gd-cot-oldest');if(od){od.textContent=f.oldest_age_human||'—';od.style.color=f.retention_stalled?'var(--red)':(f.oldest_age_secs?'var(--green)':'');}
+var lt=document.getElementById('gd-cot-largest');if(lt)lt.textContent=(f.largest_table?f.largest_table+' · ':'')+(f.largest_table_human||'—');
+var rt=document.getElementById('gd-cot-retention');if(rt){var txt,col;
+if(!f.guard_timer_ok){txt='timer '+(f.guard_timer_enabled||'unknown');col='var(--red)';}
+else if(f.retention_stalled){txt='STALLED';col='var(--red)';}
+else{txt=(f.retention_hours?f.retention_hours+' h':'TTL not set')+(f.guard_timer_last_human?' · guard '+f.guard_timer_last_human:'');col=f.retention_hours?'var(--green)':'var(--yellow)';}
+rt.textContent=txt;rt.style.color=col;}}
+// v10.1.29 W6 — run Guard Dog's retention guard on demand. The unit is oneshot
+// and started --no-block, so progress comes from polling its unit state plus the
+// RETENTION-GUARD: lines the script already writes.
+var gdCotJobTimer=null;
+function gdCotPollJob(job,label,onDone){var out=document.getElementById('gd-vacuum-output');var msg=document.getElementById('gd-vacuum-msg');
+clearTimeout(gdCotJobTimer);
+fetch('/api/guarddog/cotdb/job-status?job='+encodeURIComponent(job),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(!d.success){if(msg){msg.textContent=d.error||'Status unavailable';msg.style.color='var(--red)';}return;}
+if(out){out.style.display='block';out.style.color='var(--text-dim)';out.textContent=(d.lines&&d.lines.length)?d.lines.join(String.fromCharCode(10)):(label+' running… no log lines yet.');out.scrollTop=out.scrollHeight;}
+if(d.active){if(msg){msg.textContent=label+' running…';msg.style.color='var(--text-dim)';}gdCotJobTimer=setTimeout(function(){gdCotPollJob(job,label,onDone);},4000);return;}
+if(msg){msg.textContent=d.failed?(label+' failed — see the log above.'):(label+' finished.');msg.style.color=d.failed?'var(--red)':'var(--green)';}
+if(out&&d.failed)out.style.color='var(--red)';
+if(typeof onDone==='function')onDone(d);
+gdRefreshCotSize();
+}).catch(function(){gdCotJobTimer=setTimeout(function(){gdCotPollJob(job,label,onDone);},8000);});}
+async function gdCotRetentionRun(){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');var btn=document.getElementById('gd-cot-retention-btn');
+if(btn)btn.disabled=true;if(msg){msg.textContent='Starting retention guard…';msg.style.color='var(--text-dim)';}
+if(out){out.style.display='block';out.style.color='var(--text-dim)';out.textContent='';}
+try{var r=await fetch('/api/guarddog/cotdb/retention-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});var d=await r.json();
+if(btn)btn.disabled=false;
+if(!d.success){if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(out)out.style.display='none';return;}
+if(d.healed_timers&&d.healed_timers.length&&out){out.textContent=d.message+String.fromCharCode(10,10);}
+gdCotPollJob('retention','Retention guard');
+}catch(e){if(btn)btn.disabled=false;if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}}}
+// v10.1.29 W4 — Online Compact (pg_repack) via the audited takdbrepack.service.
+async function gdCotRepack(){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');var btn=document.getElementById('gd-cot-repack-btn');
+if(!confirm('Online Compact (pg_repack) rewrites each table without an exclusive lock. TAK Server can stay up, but it needs free disk roughly equal to the largest table and can take a while. Continue?'))return;
+if(btn)btn.disabled=true;if(msg){msg.textContent='Starting online compact…';msg.style.color='var(--text-dim)';}
+if(out){out.style.display='block';out.style.color='var(--text-dim)';out.textContent='';}
+try{var r=await fetch('/api/guarddog/cotdb/repack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});var d=await r.json();
+if(btn)btn.disabled=false;
+if(!d.success){gdCotHighlight(d.recommend);if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(out){out.style.display='block';out.style.color='var(--red)';out.textContent=d.error||'Failed';}return;}
+if(msg){msg.textContent=d.message||'Online compact started.';msg.style.color='var(--text-dim)';}
+gdCotPollJob('repack','Online compact');
+}catch(e){if(btn)btn.disabled=false;if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}}}
+// v10.1.29 W5 — Purge Old CoT (DESTRUCTIVE). Password + literal confirmation, and
+// on a FK-dependent refusal the operator has to echo the exact CASCADE set.
+var gdCotPurgeTimer=null,gdCotPurgeCascade=null;
+function gdCotPurgeMode(){var el=document.querySelector('input[name="gd-cot-purge-mode"]:checked');return el?el.value:'age';}
+function gdCotPurgeModeChange(){var mode=gdCotPurgeMode();var box=document.getElementById('gd-cot-purge-age-box');var exp=document.getElementById('gd-cot-purge-expect');var h=document.getElementById('gd-cot-purge-hours');
+if(box)box.style.display=(mode==='age')?'block':'none';
+if(exp)exp.textContent=(mode==='age')?((h&&h.value)?String(parseInt(h.value,10)||''):''):'cot_router';
+gdCotPurgeCascade=null;}
+function gdCotPurgeOpen(){var m=document.getElementById('gd-cot-purge-modal');if(!m)return;
+document.getElementById('gd-cot-purge-confirm').value='';document.getElementById('gd-cot-purge-password').value='';
+var msg=document.getElementById('gd-cot-purge-msg');if(msg){msg.textContent='';msg.style.color='';}
+gdCotPurgeCascade=null;gdCotPurgeModeChange();m.classList.add('open');}
+function gdCotPurgeClose(){var m=document.getElementById('gd-cot-purge-modal');if(m)m.classList.remove('open');clearTimeout(gdCotPurgeTimer);}
+async function gdCotPurgeSubmit(){var msg=document.getElementById('gd-cot-purge-msg');var go=document.getElementById('gd-cot-purge-go');var mode=gdCotPurgeMode();
+var body={mode:mode,confirm:document.getElementById('gd-cot-purge-confirm').value.trim(),password:document.getElementById('gd-cot-purge-password').value};
+if(mode==='age')body.hours=document.getElementById('gd-cot-purge-hours').value;
+if(mode==='all'&&gdCotPurgeCascade)body.cascade_tables=gdCotPurgeCascade;
+if(msg){msg.textContent='Working…';msg.style.color='var(--text-dim)';}if(go)go.disabled=true;
+try{var r=await fetch('/api/guarddog/cotdb/purge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});var d=await r.json();
+if(go)go.disabled=false;
+if(!d.success){if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}
+// FK dependents present: remember the exact set so a second press is an explicit,
+// informed opt-in to the named cascade rather than a silent CASCADE.
+if(d.cascade_tables&&d.cascade_tables.length){gdCotPurgeCascade=d.cascade_tables;if(msg)msg.textContent+=String.fromCharCode(10,10)+'Press Purge again to proceed and empty those tables too.';}
+return;}
+if(mode==='all'){if(msg){msg.textContent=d.message||'Done.';msg.style.color='var(--green)';}gdRefreshCotSize();return;}
+if(msg){msg.textContent='Batched delete started — you can close this window; progress shows on the card.';msg.style.color='var(--text-dim)';}
+gdCotPurgePoll();
+}catch(e){if(go)go.disabled=false;if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}}}
+function gdCotPurgePoll(){var out=document.getElementById('gd-vacuum-output');var msg=document.getElementById('gd-vacuum-msg');clearTimeout(gdCotPurgeTimer);
+fetch('/api/guarddog/cotdb/purge/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(out){out.style.display='block';out.style.color=d.error?'var(--red)':'var(--text-dim)';
+out.textContent='Purge: '+(d.deleted||0).toLocaleString()+' rows deleted in '+(d.batches||0)+' batches'+(d.running?'…':'')+(d.result?String.fromCharCode(10,10)+d.result:'')+(d.error?String.fromCharCode(10,10)+d.error:'');}
+if(d.running){if(msg){msg.textContent='Purging…';msg.style.color='var(--text-dim)';}gdCotPurgeTimer=setTimeout(gdCotPurgePoll,3000);return;}
+if(msg){msg.textContent=d.error?'Purge failed.':'Purge finished.';msg.style.color=d.error?'var(--red)':'var(--green)';}
+gdRefreshCotSize();}).catch(function(){gdCotPurgeTimer=setTimeout(gdCotPurgePoll,8000);});}
 function _gdVacuumSetUI(running,full,secs){var msg=document.getElementById('gd-vacuum-msg');var btnA=document.getElementById('gd-vacuum-analyze-btn');var btnF=document.getElementById('gd-vacuum-full-btn');var btnR=document.getElementById('gd-reindex-btn');[btnA,btnF,btnR].forEach(function(b){if(b){b.disabled=running;b.style.opacity=running?'0.4':'1';b.style.pointerEvents=running?'none':'auto';}});if(running&&msg){var elapsed='';if(secs>0){var m=Math.floor(secs/60);elapsed=m>0?' ('+m+'m '+secs%60+'s)':' ('+secs+'s)';}msg.textContent=(full?'Running VACUUM FULL':'Running VACUUM ANALYZE')+'...'+elapsed;msg.style.color='var(--text-dim)';}}
 async function _gdPollVacuumStatus(){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');try{var r=await fetch('/api/takserver/vacuum/status');var d=await r.json();if(d.running){_gdVacuumSetUI(true,d.full,d.elapsed_secs||0);setTimeout(_gdPollVacuumStatus,5000);}else{if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}}else if(d.result!==null){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.result){out.textContent=d.result;out.style.display='block';}gdRefreshCotSize();}_gdVacuumSetUI(false,false,0);}}catch(e){setTimeout(_gdPollVacuumStatus,10000);}}
-async function gdRunVacuum(full){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');if(full&&!confirm('VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?'))return;if(out){out.style.display='none';out.textContent='';}_gdVacuumSetUI(true,full,0);try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full})});var d=await r.json();if(d.success||d.status==='running'){_gdPollVacuumStatus();}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}_gdVacuumSetUI(false,false,0);}}catch(e){if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}_gdVacuumSetUI(false,false,0);}}
+// v10.1.29 W3 — the preflight refusals (400 no_disk / 409 warn_no_bloat) carry the
+// guidance that makes the box understandable, so render them in full instead of
+// collapsing everything to a bare "Failed".
+async function gdRunVacuum(full,force){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');if(full&&!force&&!confirm('VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?'))return;if(out){out.style.display='none';out.textContent='';out.style.color='';}if(msg){msg.textContent='';msg.style.color='';}_gdVacuumSetUI(true,full,0);
+try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full,force:force===true}),credentials:'same-origin'});var d=await r.json();
+if(d.success||d.status==='running'){_gdPollVacuumStatus();return;}
+_gdVacuumSetUI(false,false,0);gdCotHighlight(d.recommend);
+if(out){out.style.display='block';out.style.color=d.warn_no_bloat?'var(--yellow)':'var(--red)';out.textContent=d.error||'Failed';}
+if(msg){if(d.warn_no_bloat){msg.style.color='var(--yellow)';msg.textContent='Compacting will not help here. ';var b=document.createElement('button');b.className='btn btn-ghost';b.style.cssText='padding:2px 10px;font-size:11px;margin-left:6px';b.textContent='Run anyway';b.onclick=function(){gdRunVacuum(true,true);};msg.appendChild(b);}else{msg.style.color='var(--red)';msg.textContent=d.error||'Failed';}}
+}catch(e){if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}_gdVacuumSetUI(false,false,0);}}
 async function gdRunReindex(){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');var btn=document.getElementById('gd-reindex-btn');if(!confirm('Rebuild all indexes on the CoT database? Safe while running but may take a while.'))return;if(msg){msg.textContent='Running REINDEX...';msg.style.color='var(--text-dim)';}if(out){out.style.display='none';out.textContent='';}if(btn){btn.disabled=true;}try{var r=await fetch('/api/takserver/reindex',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});var d=await r.json();if(d.success){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.output){out.textContent=d.output;out.style.display='block';}}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}}if(btn){btn.disabled=false;}}catch(e){if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}if(btn){btn.disabled=false;}}}
 function gdToggleService(id){var row=document.getElementById('gd-svc-'+id);if(row)row.classList.toggle('open');}
 function gdDeployHealthAgent(){var btns=document.querySelectorAll('#gd-deploy-agent-btn, .gd-deploy-agent-btn');var msgEls=document.querySelectorAll('#gd-deploy-agent-msg, .gd-deploy-agent-msg-inline');btns.forEach(function(b){b.disabled=true;});msgEls.forEach(function(m){m.textContent=' Deploying...';m.style.color='var(--text-dim)';});fetch('/api/guarddog/deploy-health-agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){btns.forEach(function(b){b.disabled=false;});msgEls.forEach(function(m){m.textContent=d.success?(d.message||' Done. Refreshing...'):(' '+d.error);m.style.color=d.success?'var(--green)':'var(--red)';});if(d.success)setTimeout(function(){location.reload();},1500);}).catch(function(e){btns.forEach(function(b){b.disabled=false;});msgEls.forEach(function(m){m.textContent=' Request failed';m.style.color='var(--red)';});});}
@@ -35,7 +157,8 @@ function gdFirewallClosePort(){var p=document.getElementById('gd-fw-port');var p
 function gdRefreshHealth(){fetch('/api/guarddog/health?_='+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(h){for(var id in h){var el=document.getElementById('gd-health-'+id);if(!el)continue;var s=h[id];el.className='guard-service-health '+(s||'fail');el.title=s==='ok'?'Healthy':s==='caution'?'Some checks failing': 'Unhealthy';}}).catch(function(){});}
 function gdRefreshMonitorHealth(){var items=document.querySelectorAll('[data-monitor-id]');if(!items.length)return;var ids=[];items.forEach(function(el){var mid=el.getAttribute('data-monitor-id');if(mid)ids.push(mid);});if(!ids.length)return;fetch('/api/guarddog/monitor-health?ids='+ids.join(','),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(h){for(var mid in h){var el=document.getElementById('gd-mh-'+mid);if(!el)continue;el.className='guard-monitor-health '+(h[mid]?'ok':'fail');el.title=h[mid]?'Healthy':'Unhealthy';}}).catch(function(){});}
 if (document.getElementById('gd-activity-log')) gdLoadActivityLog();
-if (document.getElementById('gd-cot-db-size')){gdRefreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_gdVacuumSetUI(true,d.full,d.elapsed_secs||0);_gdPollVacuumStatus();}}).catch(function(){});}
+if (document.getElementById('gd-cot-db-size')){gdRefreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_gdVacuumSetUI(true,d.full,d.elapsed_secs||0);_gdPollVacuumStatus();}}).catch(function(){});
+fetch('/api/guarddog/cotdb/purge/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.running)gdCotPurgePoll();}).catch(function(){});}
 if (document.getElementById('gd-fw-rules')) gdFirewallRefresh();
 if (document.querySelector('.guard-service-row')){gdRefreshHealth();gdRefreshMonitorHealth();setInterval(gdRefreshHealth,30000);setInterval(gdRefreshMonitorHealth,30000);}
 if (document.getElementById('gd-sms-provider')) gdSmsProviderChange();
