@@ -133,18 +133,41 @@ if [ "$COT_SIZE" -lt "$REPACK_THRESHOLD_BYTES" ]; then
   exit 0
 fi
 
-# Ensure pg_repack is installed (extension + CLI)
-INSTALL_CHECK=$(remote_cmd "command -v pg_repack >/dev/null 2>&1 && echo 'ok' || echo 'missing'")
-if [ "$INSTALL_CHECK" = "missing" ]; then
-  log_line "DB-REPACK: pg_repack CLI not found, attempting install"
-  PG_VER=$(remote_cmd "pg_config --version 2>/dev/null | grep -oP '\\d+' | head -1" || echo "")
-  DB_ARCH=$(remote_cmd "uname -m 2>/dev/null" || echo "unknown")
+# ── pg_repack discovery / install (v10.1.29 W4a) ─────────────────────────────
+# PATH IS NOT USABLE HERE. Debian exposes the PG client binaries on PATH via
+# postgresql-common, but RHEL/PGDG installs them under /usr/pgsql-<v>/bin and
+# does NOT add that to PATH — and this script runs from a systemd unit, whose
+# default PATH is /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin, so the
+# versioned dir is never on it. Measured on nuc (Rocky 9.8, 2026-08-10):
+# `command -v pg_config` empty, real binary at /usr/pgsql-15/bin/pg_config.
+# Consequences if we relied on PATH (both were live bugs):
+#   1. PG_VER came back EMPTY, so the whole install block below was skipped and
+#      the apt/dnf branch never executed on the one family it exists for.
+#   2. Even after a successful install, `command -v pg_repack` would still miss,
+#      and `sudo -u postgres pg_repack` would fail anyway because sudo discards
+#      an exported PATH via secure_path. The path must be ABSOLUTE.
+DB_ARCH=$(remote_cmd "uname -m 2>/dev/null" || echo "unknown")
+# pg_config on PATH (Debian) -> versioned dir (RHEL) -> psql as last resort.
+PG_VER=$(remote_cmd "{ pg_config --version 2>/dev/null \
+  || /usr/pgsql-*/bin/pg_config --version 2>/dev/null \
+  || psql --version 2>/dev/null; } | grep -oP '\\d+' | head -1" || echo "")
+
+# Absolute path to the pg_repack CLI, or empty when it is not installed.
+pg_repack_path() {
+  remote_cmd "command -v pg_repack 2>/dev/null \
+    || ls -1 /usr/pgsql-${PG_VER:-*}/bin/pg_repack /usr/lib/postgresql/${PG_VER:-*}/bin/pg_repack 2>/dev/null \
+       | sort -V | tail -1"
+}
+
+PG_REPACK_BIN=$(pg_repack_path)
+if [ -z "$PG_REPACK_BIN" ]; then
+  log_line "DB-REPACK: pg_repack CLI not found, attempting install (pg=${PG_VER:-unknown}, arch=${DB_ARCH:-unknown})"
   if [ -n "$PG_VER" ]; then
-    # v10.1.29 (W4a) MULTIPLATFORM: this was a bare `apt-get`, which is a hard
-    # failure on RHEL/Rocky. Both the package manager AND the package name differ
-    # by family:
+    # MULTIPLATFORM: this was a bare `apt-get`, a hard failure on RHEL/Rocky.
+    # Both the package manager AND the package name differ by family:
     #   Debian/Ubuntu : postgresql-<ver>-repack   (apt-get)
-    #   RHEL/Rocky    : pg_repack_<ver>           (dnf, from PGDG)
+    #   RHEL/Rocky    : pg_repack_<ver>           (dnf, from PGDG — verified
+    #                   present for rhel9 on BOTH x86_64 and aarch64)
     # The family is detected WHERE THE INSTALL RUNS — the remote box in
     # two-server mode, inside takserver-db in container mode — not from the
     # console's os_type, which describes a different machine in both of those.
@@ -155,9 +178,19 @@ elif command -v dnf >/dev/null 2>&1; then \
 elif command -v yum >/dev/null 2>&1; then \
   yum install -y -q pg_repack_${PG_VER} 2>&1; \
 else echo 'DB-REPACK: no supported package manager (apt-get/dnf/yum)'; fi" >/dev/null
+    PG_REPACK_BIN=$(pg_repack_path)
+    if [ -z "$PG_REPACK_BIN" ] && [ -n "$(remote_cmd 'command -v dnf 2>/dev/null')" ]; then
+      # Known PGDG signature: a tty-less dnf run can die on an untrusted per-repo
+      # keyring ("Bad GPG signature" even though the signature is fine) — and a
+      # systemd oneshot is exactly that. Refresh metadata once and retry before
+      # declaring the platform unsupported. GPG checking stays ON.
+      log_line "DB-REPACK: dnf install did not yield pg_repack, refreshing repo metadata and retrying"
+      remote_cmd "dnf clean all -q >/dev/null 2>&1; dnf -y -q makecache >/dev/null 2>&1; \
+dnf install -y -q pg_repack_${PG_VER} 2>&1" >/dev/null
+      PG_REPACK_BIN=$(pg_repack_path)
+    fi
   fi
-  INSTALL_CHECK=$(remote_cmd "command -v pg_repack >/dev/null 2>&1 && echo 'ok' || echo 'missing'")
-  if [ "$INSTALL_CHECK" = "missing" ]; then
+  if [ -z "$PG_REPACK_BIN" ]; then
     # Deliberately a FAILURE, not a clean skip (unlike the not-ready cases above):
     # the operator pressed Online Compact and must be told it cannot run here —
     # pg_repack has no package on every arch/PG combination — so they reach for
@@ -165,7 +198,7 @@ else echo 'DB-REPACK: no supported package manager (apt-get/dnf/yum)'; fi" >/dev
     log_line "DB-REPACK: pg_repack is not available on this platform (arch=${DB_ARCH:-unknown}, pg=${PG_VER:-unknown}) — Online Compact cannot run here. Use Purge Old CoT to free space, or Compact Database during a maintenance window."
     exit 1
   fi
-  log_line "DB-REPACK: pg_repack installed successfully"
+  log_line "DB-REPACK: pg_repack installed successfully (${PG_REPACK_BIN})"
 fi
 
 # Ensure extension is created in the database
@@ -182,10 +215,11 @@ SIZE_BEFORE=$COT_GB
 # Run pg_repack on the cot database
 log_line "DB-REPACK: starting online repack of cot database (${SIZE_BEFORE}GB)"
 if [ "$TWO_SERVER_MODE" = "1" ]; then
-  REPACK_OUTPUT=$(remote_cmd "sudo -u postgres pg_repack -d cot --no-superuser-check --wait-timeout=30 2>&1")
+  # Absolute path (see the PATH note above) — `sudo -u postgres` drops secure_path.
+  REPACK_OUTPUT=$(remote_cmd "sudo -u postgres ${PG_REPACK_BIN} -d cot --no-superuser-check --wait-timeout=30 2>&1")
 else
-  # native-local → sudo -u postgres pg_repack; container → docker exec -u postgres
-  REPACK_OUTPUT=$(gd_db_pg pg_repack -d cot --no-superuser-check --wait-timeout=30)
+  # native-local → sudo -u postgres <abs path>; container → docker exec -u postgres
+  REPACK_OUTPUT=$(gd_db_pg "$PG_REPACK_BIN" -d cot --no-superuser-check --wait-timeout=30)
 fi
 REPACK_RC=$?
 
