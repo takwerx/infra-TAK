@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.27-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.27-alpha)**
+**Current release: [v10.1.28-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.28-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.28-alpha — 2026-08-10 — password resets finish, the setup WiFi actually appears, and the console works with no internet
+
+**Headline: three things that reported success while doing nothing at all.** First, **password resets now finish.** Clicking the link in a reset email could land you on a blank error page — the password was saved, but the trip back to the app died. The cause is that mail providers rewrite links in email through their own click-tracking domain, so your browser arrives from somewhere else and the browser withholds the sign-in cookie for security. Resets now end at the sign-in page, where you log in with your new password. That is the same behaviour hardened installs have had since v10.1.4, and it removes the dead end entirely regardless of which mail provider you use. Second, **the Setup WiFi now works on Ubuntu.** When a box has no internet it is meant to broadcast its own network so you can connect a laptop and configure it on site — but on Ubuntu it downloaded the software it needed to do that *at the moment it tried to broadcast*, which is precisely when there is no internet to download anything. It never once succeeded. The components are now installed while the box is still online, so the network appears when you need it. Along the way: the setup network no longer shuts itself down seconds after you start it, stopping it actually stops it, and the page now tells you what to do next instead of leaving you guessing — including a warning that WiFi names are case-sensitive, so `OXFORD` and `oxford` are different networks. Third, **the console renders correctly with no internet.** Every page fetched its fonts and logos from the internet, so on the setup network — where the box *is* the network — icons showed up as raw words like `visibility` and logos as broken images. Everything is now served from the box itself, which also fixes air-gapped installs. Also fixed: **relay tunnel setup on servers running as a non-root user** ([#58](https://github.com/takwerx/infra-TAK/issues/58)), and adding a WiFi network on those same servers, which was silently refused. **Who should update:** everyone, and especially anyone using password resets, portable boxes, or air-gapped installs. **Upgrade:** automatic on the next console update — no configuration changes required.
+
+Full notes: [v10.1.28-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.28-alpha).
 
 ### v10.1.27-alpha — 2026-08-07 — infra-TAK stops assuming it is the only thing on your server
 
