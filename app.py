@@ -55281,6 +55281,26 @@ def _cotdb_space_refusal(facts):
 
 
 def _cotdb_verdict(facts):
+    """The W1 decision tree plus an honesty pass over its recommendation.
+
+    Purge Old CoT deletes from cot_router ONLY (the fixed _COTDB_TABLES
+    allowlist). On a box whose bulk sits in a different table it would reclaim
+    almost nothing, so recommending it without saying that would be the very
+    failure this card exists to remove. Seen on test8, 2026-08-10: 5.7 GB
+    database of which data_feed_cot is 5.6 GB, verdict retention_stalled,
+    recommendation Purge."""
+    verdict, headline, detail, recommend = _cotdb_verdict_tree(facts)
+    if 'purge' in (recommend or []):
+        lt = facts.get('largest_table')
+        if lt and lt not in _COTDB_TABLES:
+            detail += (f" NOTE: the largest table here is {lt} "
+                       f"({facts.get('largest_table_human', '-')}), which Purge Old CoT does "
+                       f"NOT touch - it only deletes from {_COTDB_TABLES[0]}. Purging will not "
+                       f"reclaim that space.")
+    return verdict, headline, detail, recommend
+
+
+def _cotdb_verdict_tree(facts):
     """The W1 decision tree, in order. Returns (verdict, headline, detail, recommend)."""
     free = facts.get('fs_free_bytes')
     need = facts.get('compact_needed_bytes')
