@@ -617,11 +617,18 @@ def inject_cloudtak_icon():
     d = {'cloudtak_icon': CLOUDTAK_ICON, 'mediamtx_logo_url': MEDIAMTX_LOGO_URL, 'nodered_logo_url': NODERED_LOGO_URL, 'authentik_logo_url': AUTHENTIK_LOGO_URL, 'caddy_logo_url': CADDY_LOGO_URL, 'tak_logo_url': TAK_LOGO_URL}
     if not request.path.startswith('/api') and not request.path.startswith('/cloudtak/page.js'):
         _settings = load_settings()
-        _banner = render_custom_banner(_settings)
-        _cert_pw_nag = render_default_cert_password_warning(_settings)
-        _notices = render_notice_bars(_settings)
+        # Banners are decoration; the sidebar is navigation. If any banner raises,
+        # degrade to a console with no banner rather than a console with no pages —
+        # this context processor runs on EVERY non-API request.
+        try:
+            _chrome = (render_custom_banner(_settings)
+                       + render_default_cert_password_warning(_settings)
+                       + render_notice_bars(_settings))
+        except Exception as _be:
+            print(f'top banners: suppressed render error ({_be})', flush=True)
+            _chrome = ''
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
-        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _notices + _sidebar)
+        d['sidebar_html'] = Markup(_chrome + _sidebar)
         # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
         # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
         d['service_domain'] = lambda key: _get_service_domain(_settings, key)
@@ -3068,9 +3075,18 @@ def render_notice_bars(settings):
     Bars are dismissible; dismissal is keyed to the condition, so a NEW or
     DIFFERENT problem re-shows rather than inheriting an old silence."""
     try:
-        specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings)) if b]
-    except Exception:
+        return _render_notice_bars_inner(settings)
+    except Exception as e:
+        # A notice bar must NEVER be able to take the console down. This renders
+        # inside the context processor on EVERY non-API page, which has no guard
+        # of its own, so an exception here would 500 every page in every module —
+        # the worst possible failure mode for a warning banner.
+        print(f'notice bars: suppressed render error ({e})', flush=True)
         return ''
+
+
+def _render_notice_bars_inner(settings):
+    specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
