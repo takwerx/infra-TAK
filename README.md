@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.28-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.28-alpha)**
+**Current release: [v10.1.29-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.29-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.29-alpha — 2026-08-10 — the CoT database page now tells you the truth, and the cleanup that never ran now runs
+
+**Headline: a user's disk filled up, every button that could have saved him was either impossible to press or did nothing, and the page told him to press the wrong one.** He concluded his database was corrupt and came close to rebuilding it. It was not corrupt: his data retention had never actually deleted anything, so 43 GB of live position reports had piled up, and *compacting* — the button the page pointed at — only reclaims space from rows that were already deleted. On top of that, compacting needs free disk roughly equal to the largest table, so on a full disk it cannot run at all. This release replaces the guesswork with a **Diagnose** button that reads the database and tells you which of those situations you are actually in, then highlights the button that fixes it. It adds the actions that can genuinely recover a full server: **Online Compact** (reclaims space without taking the server down), **Purge Old CoT** (deletes position history by age, or everything, and is the only thing that works when the disk is already full), and **Run Retention Now**. Compacting is now *refused* with a plain explanation when there is not enough free disk, instead of letting the database fail with an error nobody can act on, and **Update Now** refuses below 1 GB free rather than half-applying an update — the reason a full server previously could not even install its own fix. Two long-standing faults were found and fixed along the way, and both affected servers already in the field: **the automatic retention cleanup had never run once since it shipped** — a flaw in how it checked for work made it skip every single time — and when it could not read your retention setting it fell back to assuming one day, which on a server configured to keep a week would have deleted six days of history nobody asked it to remove. It now reads the real setting and deletes nothing at all when no policy is set. The console also **warns on every page when TAK Server has no retention policy configured**, because in that state nothing ever deletes old data and the disk will eventually fill with no warning at all — and Guard Dog now alerts on low free space and on retention that has silently stopped deleting, neither of which it previously watched. **Who should update:** everyone running TAK Server, and urgently if you have never set a data retention policy or have a database over 25 GB. **Upgrade:** automatic on the next console update. After updating, open Guard Dog → Database maintenance (CoT) and press **Diagnose** — it will tell you where you stand in one click.
+
+Full notes: [v10.1.29-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.29-alpha).
 
 ### v10.1.28-alpha — 2026-08-10 — password resets finish, the setup WiFi actually appears, and the console works with no internet
 
