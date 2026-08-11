@@ -183,7 +183,15 @@ fi
 # deletes nothing by design, so the guard must delete nothing either.
 RETENTION_HOURS=""
 POLICY_YML="/opt/tak/conf/retention/retention-policy.yml"
-if [ "$TWO_SERVER_MODE" = "0" ] && [ -f "$POLICY_YML" ]; then
+# NOT gated on TWO_SERVER_MODE. Guard Dog runs on the TAK Server box in both
+# deployment shapes — only the DATABASE is remote in two-server mode — so
+# /opt/tak/conf/retention/ is local either way. The old CoreConfig read carried a
+# `TWO_SERVER_MODE = 0` condition and I copied it across without questioning it,
+# which combined with the new "no policy -> skip" path to disable the retention
+# guard entirely on split boxes. Confirmed on test8 (two_server: true) 2026-08-10:
+# the policy file is present locally with cot: 86400, yet the guard logged "no CoT
+# retention policy set ... skipped" every 15 minutes.
+if [ -f "$POLICY_YML" ]; then
   RH=$(python3 - "$POLICY_YML" <<'PY' 2>/dev/null
 import re, sys
 try:
