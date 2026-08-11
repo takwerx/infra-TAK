@@ -620,8 +620,11 @@ def inject_cloudtak_icon():
         _banner = render_custom_banner(_settings)
         _cert_pw_nag = render_default_cert_password_warning(_settings)
         _gd_gap = render_gd_delivery_gap_banner(_settings)
+        # Stacks UNDER the Guard Dog bar when both are up. Emitted after it, so its
+        # body{padding-top} — which accounts for both bars — is the one that applies.
+        _no_ttl = render_no_retention_banner(_settings, stack_below=34 if _gd_gap else 0)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
-        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _gd_gap + _sidebar)
+        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _gd_gap + _no_ttl + _sidebar)
         # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
         # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
         d['service_domain'] = lambda key: _get_service_domain(_settings, key)
@@ -3008,6 +3011,65 @@ def render_gd_delivery_gap_banner(settings):
         '⚠ Guard Dog has an active alert but no notification email is configured — '
         'this alert has nowhere to go. '
         '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure notifications →</a>'
+        '</div>'
+    )
+
+
+def render_no_retention_banner(settings, stack_below=0):
+    """v10.1.29: standing warning when TAK Server has NO CoT retention policy.
+
+    With no TTL, TAK never deletes a position report, so the CoT database grows
+    for as long as the server runs and ends at a full disk — at which point
+    VACUUM FULL and Online Compact are both impossible (they need free space
+    roughly equal to the largest table) and Update Now refuses too. It is
+    completely silent until then, which is why it belongs at the top of every
+    page rather than three clicks into Guard Dog.
+
+    Unlike the cert-password nag removed in v0.9.35, this is not alarmism about a
+    defensible choice: there is no configuration in which "nothing ever deletes
+    CoT" is the intent on a server carrying traffic. It clears the moment a TTL
+    is set, because it reads the live policy every render.
+
+    Gated on TAK being installed AND the policy file existing, so it cannot fire
+    part-way through a deployment. Cheap: one small local file read, no database
+    query and no subprocess, on a path that renders every page.
+
+    `stack_below` is the height already consumed by other fixed bars — this one
+    sits under them (see render_gd_delivery_gap_banner for the same treatment)."""
+    try:
+        s = settings or {}
+        if not os.path.exists('/opt/tak') or not os.path.exists(TAK_RETENTION_POLICY_YML):
+            return ''
+        if _cotdb_retention_hours() is not None:
+            return ''            # a policy is set — nothing to say
+    except Exception:
+        return ''
+    try:
+        # _get_takserver_base_url() deliberately returns no port; Data Retention
+        # Policies lives in TAK's own Web Admin on :8443, so name it explicitly
+        # rather than dropping the operator on the wrong surface.
+        _admin = _get_takserver_base_url(s) or ''
+    except Exception:
+        _admin = ''
+    _href = f'{_admin}:8443' if _admin.startswith('https://') else '/guarddog'
+    _top = _custom_banner_height(s) + int(stack_below or 0)
+    _h = 34
+    return (
+        '<style>'
+        f'body{{padding-top:{_top + _h}px!important}}'
+        '.notl-banner{'
+        f'position:fixed;top:{_top}px;left:0;right:0;height:{_h}px;z-index:205;'
+        'display:flex;align-items:center;justify-content:center;gap:6px;'
+        'box-sizing:border-box;padding:0 16px;overflow:hidden;'
+        'background:rgba(239,68,68,.12);border-bottom:1px solid rgba(239,68,68,.4);'
+        'color:#ef4444;font-size:13px;font-weight:600;line-height:1.2;text-align:center'
+        '}'
+        '</style>'
+        '<div class="notl-banner">'
+        '⚠ TAK Server has no CoT retention policy — old position reports are never '
+        'deleted and this database will grow until the disk is full. '
+        f'<a href="{html.escape(_href)}" target="_blank" rel="noopener" '
+        'style="color:#ef4444;text-decoration:underline">Set a retention period →</a>'
         '</div>'
     )
 
