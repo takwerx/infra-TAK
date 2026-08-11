@@ -2982,10 +2982,17 @@ def _gd_alert_bar(settings):
         s = settings or {}
         if not (s.get('guarddog_deployed_version') or '').strip():
             return None                      # Guard Dog not deployed here
-        mon = _guarddog_page_cache.get('monitor_result') or {}
-        down = sorted(k for k, v in mon.items() if v is False)
-        if not down:
+        # Use the SAME signal the Console card's badge uses. The badge calls
+        # _guarddog_overall_from_result() on the per-service health dict; this
+        # banner used to read a different cache (monitor_result), so on 2026-08-10
+        # aws-arm showed a "Caution" badge and no banner at the same time. One
+        # source, one verdict — the same rule applied to the CoT card.
+        health = _guarddog_page_cache.get('health')
+        if not health:
+            return None                      # cache not warm yet — say nothing
+        if _guarddog_overall_from_result(health) == 'ok':
             return None
+        down = sorted(k for k, v in health.items() if v != 'ok')
         has_email = bool((s.get('guarddog_alert_email') or '').strip()
                          or (s.get('guarddog_deployed_email') or '').strip())
         has_sms = bool((s.get('guarddog_sms') or {}).get('provider'))
@@ -63728,6 +63735,36 @@ def _auto_update_guarddog():
         print(f"Guard Dog auto-update skipped: {e}")
 
 _auto_update_guarddog()
+
+
+def _start_guarddog_background_at_boot():
+    """Warm the Guard Dog health cache from startup, not from the first visit to
+    the Guard Dog page.
+
+    The refresher used to be kicked off by /api/guarddog/health, which only the
+    Guard Dog page calls. So after any console restart the cache was empty until
+    someone opened that page — and the top-of-page alert banner, whose entire job
+    is to catch your eye somewhere ELSE, could not appear until you had already
+    gone to the page it points at. Worst right after an update, when the console
+    has just restarted and you are least likely to look.
+
+    Costs a daemon thread running the monitor checks every 25s. On any box where
+    someone has ever opened the Guard Dog page that thread is already running for
+    the life of the process, so this makes it universal rather than new."""
+    global _guarddog_background_started
+    try:
+        if not os.path.exists('/opt/tak-guarddog'):
+            return
+        with _guarddog_background_lock:
+            if _guarddog_background_started:
+                return
+            _guarddog_background_started = True
+            threading.Thread(target=_guarddog_background_loop, daemon=True).start()
+    except Exception as e:
+        print(f'Guard Dog background warm-up not started: {e}', flush=True)
+
+
+_start_guarddog_background_at_boot()
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
 
