@@ -48,7 +48,11 @@ var f=d.facts||{};
 lines.push('');
 lines.push('Database '+(f.db_human||'-')+' · free disk '+(f.fs_free_human||'-')+(f.fs_pct!==null&&f.fs_pct!==undefined?' ('+f.fs_pct+'%)':'')+' on '+(f.data_directory||'the data directory'));
 lines.push('Largest table '+(f.largest_table||'-')+' '+(f.largest_table_human||'-')+' · compacting needs about '+(f.compact_needed_human||'-')+' free');
-lines.push('Oldest CoT row '+(f.oldest_age_human||'-')+' · retention '+(f.retention_hours?f.retention_hours+' h':'not set in CoreConfig.xml')+' · dead tuples '+(typeof f.dead_tuples==='number'?f.dead_tuples.toLocaleString():'-'));
+// Name the file we ACTUALLY read (retention-policy.yml). Saying CoreConfig.xml
+// here sends the next person debugging to the wrong file — the exact wrong turn
+// that cost a session on 2026-08-10. And don't quote a dead-tuple count the tile
+// beside it is reporting as unknown.
+lines.push('Oldest CoT row '+(f.oldest_age_human||'-')+' · retention '+(f.retention_hours?f.retention_hours+' h':'no CoT policy set (retention-policy.yml)')+' · dead tuples '+(f.stats_stale?'unknown (never analyzed)':(typeof f.dead_tuples==='number'?f.dead_tuples.toLocaleString():'-')));
 if(f.errors&&f.errors.length)lines.push('Could not read: '+f.errors.join(' | '));
 if(out){out.style.color=GD_COT_COLORS[d.verdict]||'var(--text-dim)';out.textContent=lines.join(String.fromCharCode(10));}
 }catch(e){if(btn)btn.disabled=false;if(out){out.style.color='var(--red)';out.textContent='Request failed';}}}
