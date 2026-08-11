@@ -353,7 +353,7 @@
       <input class="form-input" type="text" id="gd-cot-purge-confirm" placeholder="confirmation" autocomplete="off">
     </div>
     <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-cot-purge-password" placeholder="Confirm password" autocomplete="current-password"></div>
-    <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="gdCotPurgeClose()">Cancel</button><button class="btn" id="gd-cot-purge-go" style="background:var(--red);color:#fff" onclick="gdCotPurgeSubmit()">Purge</button></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" id="gd-cot-purge-cancel" onclick="gdCotPurgeClose()">Cancel</button><button class="btn" id="gd-cot-purge-go" style="background:var(--red);color:#fff" onclick="gdCotPurgeSubmit()">Purge</button></div>
     <div id="gd-cot-purge-msg" style="margin-top:12px;font-size:12px;white-space:pre-wrap"></div>
   </div></div>
   {% endif %}

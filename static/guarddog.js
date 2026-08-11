@@ -118,8 +118,20 @@ gdCotPurgeCascade=null;}
 function gdCotPurgeOpen(){var m=document.getElementById('gd-cot-purge-modal');if(!m)return;
 document.getElementById('gd-cot-purge-confirm').value='';document.getElementById('gd-cot-purge-password').value='';
 var msg=document.getElementById('gd-cot-purge-msg');if(msg){msg.textContent='';msg.style.color='';}
-gdCotPurgeCascade=null;gdCotPurgeModeChange();m.classList.add('open');}
-function gdCotPurgeClose(){var m=document.getElementById('gd-cot-purge-modal');if(m)m.classList.remove('open');clearTimeout(gdCotPurgeTimer);}
+gdCotPurgeCascade=null;gdCotPurgeResetButtons();gdCotPurgeModeChange();m.classList.add('open');}
+// Closing the dialog must NOT stop the progress poll — the message tells the
+// operator progress continues on the card, and clearing the shared timer here
+// made that a lie for any purge long enough to still be running.
+function gdCotPurgeClose(){var m=document.getElementById('gd-cot-purge-modal');if(m)m.classList.remove('open');}
+// Once a destructive run has STARTED there must be an obvious way out, and
+// "Cancel" is the wrong word for it — it reads as "abort the delete" when it
+// only dismisses the dialog. Relabel, and retire the Purge button.
+function gdCotPurgeStarted(){var c=document.getElementById('gd-cot-purge-cancel');var go=document.getElementById('gd-cot-purge-go');
+if(c){c.textContent='Close';c.className='btn';c.style.cssText='background:var(--cyan);color:#0a0e1a';}
+if(go)go.style.display='none';}
+function gdCotPurgeResetButtons(){var c=document.getElementById('gd-cot-purge-cancel');var go=document.getElementById('gd-cot-purge-go');
+if(c){c.textContent='Cancel';c.className='btn btn-ghost';c.style.cssText='';}
+if(go){go.style.display='';go.disabled=false;}}
 async function gdCotPurgeSubmit(){var msg=document.getElementById('gd-cot-purge-msg');var go=document.getElementById('gd-cot-purge-go');var mode=gdCotPurgeMode();
 var body={mode:mode,confirm:document.getElementById('gd-cot-purge-confirm').value.trim(),password:document.getElementById('gd-cot-purge-password').value};
 if(mode==='age')body.hours=document.getElementById('gd-cot-purge-hours').value;
@@ -132,9 +144,9 @@ if(!d.success){if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--
 // informed opt-in to the named cascade rather than a silent CASCADE.
 if(d.cascade_tables&&d.cascade_tables.length){gdCotPurgeCascade=d.cascade_tables;if(msg)msg.textContent+=String.fromCharCode(10,10)+'Press Purge again to proceed and empty those tables too.';}
 return;}
-if(mode==='all'){if(msg){msg.textContent=d.message||'Done.';msg.style.color='var(--green)';}gdRefreshCotSize();return;}
-if(msg){msg.textContent='Batched delete started — you can close this window; progress shows on the card.';msg.style.color='var(--text-dim)';}
-gdCotPurgePoll();
+if(mode==='all'){if(msg){msg.textContent=d.message||'Done.';msg.style.color='var(--green)';}gdCotPurgeStarted();gdRefreshCotSize();return;}
+if(msg){msg.textContent='Batched delete started. Press Close — progress continues on the card.';msg.style.color='var(--text-dim)';}
+gdCotPurgeStarted();gdCotPurgePoll();
 }catch(e){if(go)go.disabled=false;if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}}}
 function gdCotPurgePoll(){var out=document.getElementById('gd-vacuum-output');var msg=document.getElementById('gd-vacuum-msg');clearTimeout(gdCotPurgeTimer);
 fetch('/api/guarddog/cotdb/purge/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
