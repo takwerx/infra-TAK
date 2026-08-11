@@ -14644,6 +14644,36 @@ def _f2b_banaction():
     return 'iptables-allports' if _distro_family() == 'rhel' else 'ufw'
 
 
+# MediaMTX / TAK Video Restreamer listeners, from the mediamtx.yml we generate
+# (~line 28620) plus the TVR ports in _FW_PORTS. Kept beside the writer that uses
+# them so a new listener in the config is an obvious two-line change here too.
+_F2B_MEDIA_PORTS_TCP = '1935,8322,8554,8555,8888,8889,8892'  # rtmp, rtsps, rtsp, tvr-rtsp, hls, webrtc, aux
+_F2B_MEDIA_PORTS_UDP = '8000,8001,8189,8890'                 # rtp, rtcp, webrtc-ice, srt
+
+
+def _f2b_banaction_media():
+    """Ban action for the mediamtx-rtsp jail ONLY: block the media ports, nothing else.
+
+    Deliberate exception to the fleet-uniform all-ports `_f2b_banaction()`, taken
+    2026-08-11 after a field ban (Ryan F., NY) severed an operator's TAK Server
+    connection during a live SWAT exercise. `ufw`/`iptables-allports` drop the IP on
+    EVERY port, so one strike on a video listener also cuts 8089/8443/8446 and the
+    console at 5001 — and `recidive` escalates a repeat to a permanent ban. Video
+    abuse must never be able to take away command and control.
+
+    The blast radius that remains is exactly the surface the jail watches. An attacker
+    brute-forcing RTSP credentials is stopped from streaming; they are not handed a
+    lever on the TAK stack. iptables-multiport is available on both families (it is
+    Debian fail2ban's own default banaction, and RHEL already runs the iptables-*
+    actions via nft-backed iptables), so this needs no per-family branch.
+
+    Two action instances because one iptables-multiport instance carries a single
+    protocol — UDP matters here (SRT 8890, RTP/RTCP, WebRTC ICE), so a TCP-only ban
+    would leave a banned publisher still pushing media."""
+    return (f'iptables-multiport[name=mediamtx-tcp, port="{_F2B_MEDIA_PORTS_TCP}", protocol=tcp]\n'
+            f'         iptables-multiport[name=mediamtx-udp, port="{_F2B_MEDIA_PORTS_UDP}", protocol=udp]')
+
+
 def _f2b_sshd_logpath():
     """sshd auth log path, or '' when this box has no syslog file to tail.
 
@@ -14819,10 +14849,29 @@ _F2B_OWNED_FILTERS = {
     ),
     'mediamtx-rtsp': (
         "[Definition]\n"
-        "# Match RTSP connection opens per source IP.\n"
-        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
-        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
-        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "# Match MediaMTX AUTHENTICATION FAILURES per source IP.\n"
+        "#\n"
+        "# v10.1.30 rewrite. The previous filter matched\n"
+        "#     \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "# which is a SUCCESS event — every RTSP connection open, regardless of whether\n"
+        "# the caller authenticated. At the shipped default (10 opens / 30 s) that bans\n"
+        "# any client that legitimately opens several streams at once. Field-hit\n"
+        "# 2026-08-11 (Ryan F., NY): a video-wall plugin pulling N tiles = N simultaneous\n"
+        "# RTSP opens from one phone, banned mid-operation during a SWAT exercise. Every\n"
+        "# other jail we ship matches a FAILURE; this one never did.\n"
+        "#\n"
+        "# MediaMTX logs a rejected caller on connection close, at INFO:\n"
+        "#     [RTSP] [conn 1.2.3.4:5678] closed: authentication failed: ...\n"
+        "# The `[s->c] RTSP/1.0 401 Unauthorized` line is emitted at DEBUG only, so it is\n"
+        "# NOT usable — our mediamtx.yml runs the default logLevel (info) and a filter\n"
+        "# keyed to a debug-only line would silently never fire.\n"
+        "#\n"
+        "# Protocol-agnostic on purpose: RTMP/SRT/WebRTC publishers log the same\n"
+        "# `closed: authentication failed` shape, and a credential-stuffer will try\n"
+        "# whichever listener answers. Anchored on the conn/session bracket so an\n"
+        "# unrelated line mentioning the phrase cannot match.\n"
+        "failregex = \\[conn <HOST>:\\d+\\] closed: .*authentication failed\n"
+        "            \\[conn <HOST>:\\d+\\] \\[session [^\\]]+\\] closed: .*authentication failed\n"
         "ignoreregex =\n"
     ),
 }
@@ -14853,6 +14902,18 @@ _F2B_LEGACY_FILTERS = {
         # date-detector threw IndexError on every Authentik JSON line, so it matched
         # nothing while appearing healthy.
         '[Definition]\n# Read from Authentik\'s OWN source, 2026-07-27 (authentik 2026.5.x,\n# authentik/stages/identification/stage.py):\n#     self.stage.logger.info(\n#         "invalid_login", identifier=uid_field, client_ip=client_ip,\n#         action="invalid_identifier", ...)\n# structlog renders the first positional arg as "event", so the line is\n#     {... "event":"invalid_login" ... "client_ip":"1.2.3.4" ...}\n#\n# The previous filter matched "action": "login_failed" and never fired once on\n# any box: that string does not appear in the log at all. `login_failed` is a\n# Django SIGNAL name (authentik/core/signals.py), not a logged field — it feeds\n# Authentik\'s own reputation scoring, not this file.\n#\n# REQUIRES AUTHENTIK_LOG_LEVEL=info — the call above is logger.info(), so at\n# `warning` the line is never emitted and this jail cannot fire.\n#\n# Field order is not guaranteed by structlog, so match client_ip in EITHER\n# direction relative to the event. Both alternatives cannot match the same line\n# (each requires the other token on the opposite side), so no double-counting.\n#\n# SCOPE, deliberately: this catches an unknown/invalid IDENTIFIER — credential\n# stuffing and username enumeration, the dominant attack. A wrong PASSWORD on a\n# valid username logs "Invalid credentials" with NO client_ip\n# (stages/password/stage.py), so it is not bannable from the log in this\n# version. Authentik\'s built-in reputation policy covers that case natively.\nfailregex = "event":\\s*"invalid_login".*"client_ip":\\s*"<HOST>"\n            "client_ip":\\s*"<HOST>".*"event":\\s*"invalid_login"\nignoreregex =\n',
+    ],
+    'mediamtx-rtsp': [
+        # v0.9.x–v10.1.29: matched `opened`, a SUCCESS event, so it counted legitimate
+        # stream pulls as strikes. Banned a real operator mid-exercise (2026-08-11).
+        # Every box with MediaMTX auto-installed this jail, so the upgrade has to reach
+        # them through the self-heal — creating-if-missing would skip all of them.
+        "[Definition]\n"
+        "# Match RTSP connection opens per source IP.\n"
+        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
+        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
+        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "ignoreregex =\n",
     ],
 }
 
@@ -16373,8 +16434,13 @@ def _f2b_mediamtx_jail_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf')
 
 def _f2b_read_mediamtx_jail_config():
-    """Read current thresholds from the infratak-mediamtx-rtsp jail config file."""
-    cfg = {'maxretry': 10, 'findtime': 30, 'bantime': 3600}
+    """Read current thresholds and ignoreip from the infratak-mediamtx-rtsp jail config.
+
+    ignoreip was missing here until v10.1.30, which made this the only jail whose
+    per-jail operator whitelist could not survive: the startup self-heal re-derives a
+    jail from what this returns, so anything an operator added was silently dropped on
+    the next console restart."""
+    cfg = {'maxretry': 10, 'findtime': 30, 'bantime': 3600, 'ignoreip': ''}
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     if not os.path.exists(jail_path):
         return cfg
@@ -16386,6 +16452,8 @@ def _f2b_read_mediamtx_jail_config():
                     if line.startswith(key):
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
     except Exception:
         pass
     return cfg
@@ -16415,7 +16483,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
-        f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction_media()}{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     _write_priv(jail_path, jail_conf)
@@ -16470,7 +16538,8 @@ def fail2ban_mediamtx_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     try:
-        _f2b_write_mediamtx_jail(maxretry, findtime, bantime)
+        _f2b_write_mediamtx_jail(maxretry, findtime, bantime,
+                                 str(data.get('ignoreip', '') or '').strip())
         _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                               capture_output=True, text=True)
         if _svc.stdout.strip() != 'active':
@@ -16879,7 +16948,7 @@ def _f2b_rewrite_all_jails():
         done.append('sshd')
     if _f2b_mediamtx_jail_enabled():
         c = _f2b_read_mediamtx_jail_config()
-        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'])
+        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
         done.append('mediamtx-rtsp')
     if _f2b_portal_jail_enabled():
         c = _f2b_read_portal_jail_config()
@@ -69091,7 +69160,7 @@ def _post_update_auto_deploy():
                 if _mtx_svc and _f2b_is_available() and not _f2b_mediamtx_jail_enabled():
                     _f2b_write_mediamtx_jail(maxretry=10, findtime=30, bantime=3600)
                     subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
-                    print("Post-update: MediaMTX RTSP Fail2ban jail installed (10 conns/30s → 1h ban)")
+                    print("Post-update: MediaMTX RTSP Fail2ban jail installed (10 failed auths/30s → 1h ban on media ports only)")
                 elif _mtx_svc and _f2b_mediamtx_jail_enabled():
                     print("Post-update: MediaMTX RTSP Fail2ban jail already present — no change")
             except Exception as _mtx_f2b_err:

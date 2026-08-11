@@ -347,7 +347,7 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for aggressive RTSP scanner traffic. Triggered by <em>opened</em> events — catches scanners before their probe cycle completes. Guard Dog email alert fires on ban. Default thresholds match the tak-10 scanner profile (20 probes in 10 s).</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for <strong>failed stream authentication</strong> — credential guessing against RTSP/RTMP/SRT/WebRTC. Successful stream pulls are never counted, so a client opening many streams at once (a video wall, a multi-feed dashboard) cannot be banned by this jail. Guard Dog email alert fires on ban.<br><span style="color:var(--text-dim)">A ban here blocks the <strong>media ports only</strong> (1935/8322/8554/8555/8888/8889 tcp, 8000/8001/8189/8890 udp) — it can never cut the banned IP off from TAK Server or this console.</span></div>
 
 <div id="mediamtx-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
@@ -380,18 +380,24 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 <div class="form-row" style="margin-bottom:0">
 <label class="form-label">Max Retries</label>
 <input class="form-input" type="number" id="mediamtx-cfg-maxretry" value="10" min="1" max="100">
-<div class="form-hint">Opens before ban</div>
+<div class="form-hint">Failed logins before ban</div>
 </div>
 <div class="form-row" style="margin-bottom:0">
 <label class="form-label">Find Window (seconds)</label>
 <input class="form-input" type="number" id="mediamtx-cfg-findtime" value="30" min="10" max="3600">
-<div class="form-hint">Time window to count opens</div>
+<div class="form-hint">Time window to count failures</div>
 </div>
 <div class="form-row" style="margin-bottom:0">
 <label class="form-label">Ban Duration (minutes)</label>
 <input class="form-input" type="number" id="mediamtx-cfg-bantime" value="60" min="1" max="43200">
 <div class="form-hint">How long to ban the IP</div>
 </div>
+</div>
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" id="mediamtx-cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace" oninput="renderChips('mediamtx-cfg-ignoreip','mediamtx-cfg-ignoreip-chips')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt. Type or paste, then Save &amp; Reload.</div>
+<div id="mediamtx-cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
 </div>
 <div style="margin-top:16px">
 <button class="btn-primary" onclick="saveMtxConfig()">Save &amp; Reload</button>
@@ -1325,6 +1331,11 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         // findtime stored in seconds for mediamtx (not minutes like SSH)
         if (cfg.findtime) document.getElementById('mediamtx-cfg-findtime').value = cfg.findtime;
         if (cfg.bantime)  document.getElementById('mediamtx-cfg-bantime').value  = Math.round(cfg.bantime / 60);
+        var mtxIgnoreipEl = document.getElementById('mediamtx-cfg-ignoreip');
+        if (mtxIgnoreipEl) {
+          mtxIgnoreipEl.value = (cfg.ignoreip || '').replace(/127\.0\.0\.1\/8\s*::1\s*/,'').trim();
+          renderChips('mediamtx-cfg-ignoreip', 'mediamtx-cfg-ignoreip-chips');
+        }
         var ips = d.banned_ips || [];
         window._mtxBannedIps = ips;
         renderMtxBanList(ips);
@@ -1352,7 +1363,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       enabled:  true,
       maxretry: parseInt(document.getElementById('mediamtx-cfg-maxretry').value) || 10,
       findtime: parseInt(document.getElementById('mediamtx-cfg-findtime').value)  || 30,
-      bantime:  (parseInt(document.getElementById('mediamtx-cfg-bantime').value)  || 60) * 60
+      bantime:  (parseInt(document.getElementById('mediamtx-cfg-bantime').value)  || 60) * 60,
+      ignoreip: ((document.getElementById('mediamtx-cfg-ignoreip') || {}).value || '').trim()
     };
     fetch('/api/fail2ban/mediamtx/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
       .then(function(r){ return r.json(); }).then(function(d){
