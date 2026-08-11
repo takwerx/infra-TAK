@@ -3044,14 +3044,22 @@ def render_no_retention_banner(settings, stack_below=0):
             return ''            # a policy is set — nothing to say
     except Exception:
         return ''
+    # Which admin surface to send them to depends on whether this box is
+    # reverse-proxied. With an FQDN, Caddy fronts the username/password WebGUI
+    # (proxied to 8446) and the link takes NO port. Without one — airgapped or
+    # IP-only — there is no proxy and the only admin surface is the cert-auth
+    # port 8443. Same pair the TAK Server / TAK Portal / Authentik pages already
+    # offer ("WebGUI (password)" vs "WebGUI :8443 (cert)"); _get_takserver_host()
+    # returns '' precisely when no domain is configured.
     try:
-        # _get_takserver_base_url() deliberately returns no port; Data Retention
-        # Policies lives in TAK's own Web Admin on :8443, so name it explicitly
-        # rather than dropping the operator on the wrong surface.
+        _host = _get_takserver_host(s)
         _admin = _get_takserver_base_url(s) or ''
     except Exception:
-        _admin = ''
-    _href = f'{_admin}:8443' if _admin.startswith('https://') else '/guarddog'
+        _host, _admin = '', ''
+    if _admin.startswith('https://'):
+        _href = _admin if _host else f'{_admin}:8443'
+    else:
+        _href = '/guarddog'
     _top = _custom_banner_height(s) + int(stack_below or 0)
     _h = 34
     return (
