@@ -2963,12 +2963,29 @@ def render_default_cert_password_warning(settings):
 # Friendly names for the monitor ids the Guard Dog cache reports, so the banner
 # says "Disk" rather than "disk" and "CoT database" rather than "cotdb".
 _GD_MONITOR_NAMES = {
-    'port8089': 'Port 8089', 'process': 'TAK processes', 'network': 'Network',
-    'postgresql': 'PostgreSQL', 'cotdb': 'CoT database', 'autovacuum': 'Auto-VACUUM',
-    'oom': 'Out of memory', 'disk': 'Disk', 'buildcache': 'Docker build cache',
-    'cert': 'Certificate', 'intca': 'Root/Intermediate CA',
-    'remotedb_tcp': 'Remote database', 'remotedb_agent': 'Remote health agent',
-    'remotedb_auth': 'Remote DB auth', 'relay_tunnel': 'Relay tunnel',
+    # Names here are SERVICE-QUALIFIED on purpose. The Guard Dog page shows each
+    # monitor underneath its service, so ids like cloudtak_ctr and fedhub_disk are
+    # displayed there as bare "Container" and "Disk" — unambiguous in that context
+    # and useless in a one-line banner ("Container, Disk are failing" — whose?).
+    # TAK Server
+    'port8089': 'TAK Server port 8089', 'process': 'TAK Server processes',
+    'network': 'Network', 'postgresql': 'PostgreSQL', 'cotdb': 'CoT database',
+    'autovacuum': 'Auto-VACUUM', 'oom': 'Out of memory', 'disk': 'Disk space',
+    'buildcache': 'Docker build cache', 'cert': 'TAK certificate',
+    'intca': 'Root/Intermediate CA', 'updates_check': 'Update check',
+    # Remote database (two-server)
+    'remotedb_tcp': 'Remote database (TCP/SSH)', 'remotedb_agent': 'Remote health agent',
+    'remotedb_auth': 'Remote database auth',
+    # Federation Hub
+    'fedhub_svc': 'Federation Hub service', 'fedhub_port': 'Federation Hub UI (9100)',
+    'fedhub_mongo': 'Federation Hub MongoDB', 'fedhub_cert': 'Federation Hub certificate',
+    'fedhub_disk': 'Federation Hub disk space',
+    'fedhub_intca': 'Federation Hub Root/Intermediate CA',
+    # Other modules
+    'authentik_http': 'Authentik', 'authentik_channels': 'Authentik channels table',
+    'cloudtak_ctr': 'CloudTAK container', 'nodered_http': 'Node-RED',
+    'takportal_ctr': 'TAK Portal', 'tvr_http': 'TAK Video Restreamer',
+    'mediamtx_svc': 'MediaMTX', 'relay_tunnel': 'Relay tunnel',
 }
 
 _NOTICE_BAR_H = 34
@@ -3000,8 +3017,12 @@ def _gd_alert_bar(settings):
     except Exception:
         return None
     names = ', '.join(_GD_MONITOR_NAMES.get(k, k) for k in down)
-    body = f'⚠ Guard Dog alert: {html.escape(names)} '
-    body += ('is failing. ' if len(down) == 1 else 'are failing. ')
+    # Phrase it so the count carries the plural, rather than agreeing with whichever
+    # name happens to land last ("cloudtak_ctr, Disk are failing" — 2026-08-10).
+    if len(down) == 1:
+        body = f'⚠ Guard Dog: {html.escape(names)} check is failing. '
+    else:
+        body = f'⚠ Guard Dog: {len(down)} checks failing — {html.escape(names)}. '
     if has_email or has_sms:
         body += '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>'
     else:
