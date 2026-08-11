@@ -619,12 +619,9 @@ def inject_cloudtak_icon():
         _settings = load_settings()
         _banner = render_custom_banner(_settings)
         _cert_pw_nag = render_default_cert_password_warning(_settings)
-        _gd_gap = render_gd_delivery_gap_banner(_settings)
-        # Stacks UNDER the Guard Dog bar when both are up. Emitted after it, so its
-        # body{padding-top} — which accounts for both bars — is the one that applies.
-        _no_ttl = render_no_retention_banner(_settings, stack_below=34 if _gd_gap else 0)
+        _notices = render_notice_bars(_settings)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
-        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _gd_gap + _no_ttl + _sidebar)
+        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _notices + _sidebar)
         # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
         # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
         d['service_domain'] = lambda key: _get_service_domain(_settings, key)
@@ -2861,7 +2858,7 @@ def render_custom_banner(settings):
     templates. The accompanying <style> block pushes body content down by the banner height
     so nothing is obscured. NOTE: position:fixed is load-bearing, not cosmetic — every page
     has `body{display:flex;flex-direction:row}`, so an in-flow banner here would become a
-    flex COLUMN instead of a top bar (see render_gd_delivery_gap_banner).
+    flex COLUMN instead of a top bar (see render_notice_bars).
     """
     import re as _re_banner
     cust = settings.get('customization', {}) if settings else {}
@@ -2956,130 +2953,162 @@ def render_default_cert_password_warning(settings):
     return ''
 
 
-def render_gd_delivery_gap_banner(settings):
-    """v10.1.1 (F5): show a banner ONLY when Guard Dog has an ACTIVE alert (a
-    monitor is down) AND no notification email/SMS is configured — the gap that
-    let NE-TAK's disk warnings land in a UI nobody had open while the disk filled
-    to 97%. NOT a standing "you have no email" nag: v0.9.35 already removed a
-    per-page nag banner (render_default_cert_password_warning) for being too
-    alarmist. This fires only when there is genuinely something to deliver and
-    nowhere to deliver it. Reads the in-memory GD monitor cache (no subprocess);
-    stays quiet on a healthy box or before the cache is warm.
+# Friendly names for the monitor ids the Guard Dog cache reports, so the banner
+# says "Disk" rather than "disk" and "CoT database" rather than "cotdb".
+_GD_MONITOR_NAMES = {
+    'port8089': 'Port 8089', 'process': 'TAK processes', 'network': 'Network',
+    'postgresql': 'PostgreSQL', 'cotdb': 'CoT database', 'autovacuum': 'Auto-VACUUM',
+    'oom': 'Out of memory', 'disk': 'Disk', 'buildcache': 'Docker build cache',
+    'cert': 'Certificate', 'intca': 'Root/Intermediate CA',
+    'remotedb_tcp': 'Remote database', 'remotedb_agent': 'Remote health agent',
+    'remotedb_auth': 'Remote DB auth', 'relay_tunnel': 'Relay tunnel',
+}
 
-    v10.1.9: this banner is `position:fixed`, NOT in flow. It is concatenated onto
-    the front of `sidebar_html`, which every template renders as a direct child of
-    `body{display:flex;flex-direction:row}` — so as an in-flow div it became a flex
-    ITEM, i.e. a ~800px COLUMN sized to its one long line of text, shoving the
-    sidebar and the whole page right and leaving its faint rgba(...,.12) background
-    looking like dead black space. Found on aws-ubuntu 2026-07-26, the only box
-    meeting the render condition (a monitor down AND no email/SMS), which is why it
-    survived since v10.1.1. Same fixed-bar treatment as render_custom_banner, and it
-    stacks BELOW that banner when both are showing."""
+_NOTICE_BAR_H = 34
+
+
+def _gd_alert_bar(settings):
+    """Spec for the Guard Dog active-alert bar, or None.
+
+    v10.1.29: this used to appear ONLY when there was also no email/SMS
+    configured. That hid it on every box that HAS notifications — where the only
+    on-screen signal was a small coloured dot you have to be looking for, and the
+    only real signal was an inbox you might not be reading. An active alert is
+    worth saying out loud either way; when there is nowhere to deliver it, that
+    fact is appended rather than being the precondition.
+
+    Reads the in-memory GD monitor cache (no subprocess) and stays quiet on a
+    healthy box or before the cache is warm."""
     try:
         s = settings or {}
         if not (s.get('guarddog_deployed_version') or '').strip():
-            return ''  # Guard Dog not deployed here
+            return None                      # Guard Dog not deployed here
+        mon = _guarddog_page_cache.get('monitor_result') or {}
+        down = sorted(k for k, v in mon.items() if v is False)
+        if not down:
+            return None
         has_email = bool((s.get('guarddog_alert_email') or '').strip()
                          or (s.get('guarddog_deployed_email') or '').strip())
         has_sms = bool((s.get('guarddog_sms') or {}).get('provider'))
-        if has_email or has_sms:
-            return ''  # a delivery path exists
-        # Only nag when a monitor is ACTUALLY down (an alert with nowhere to go).
-        # Fail quiet on a cold/empty cache — never nag a box we haven't assessed.
-        mon = _guarddog_page_cache.get('monitor_result') or {}
-        if not any(v is False for v in mon.values()):
-            return ''
     except Exception:
-        return ''
-    _top = _custom_banner_height(s)      # sit under the identification bar when it is up
-    _h = 34
-    return (
-        '<style>'
-        # Wins over render_custom_banner's own padding-top rule: both are !important
-        # and this <style> is emitted after it (see the inject_cloudtak_icon
-        # concatenation order), so the later declaration applies. Covers BOTH bars.
-        f'body{{padding-top:{_top + _h}px!important}}'
-        '.gd-gap-banner{'
-        f'position:fixed;top:{_top}px;left:0;right:0;height:{_h}px;z-index:205;'
-        'display:flex;align-items:center;justify-content:center;gap:6px;'
-        'box-sizing:border-box;padding:0 16px;overflow:hidden;'
-        'background:rgba(234,179,8,.12);border-bottom:1px solid rgba(234,179,8,.4);'
-        'color:#eab308;font-size:13px;font-weight:600;line-height:1.2;text-align:center'
-        '}'
-        '</style>'
-        '<div class="gd-gap-banner">'
-        '⚠ Guard Dog has an active alert but no notification email is configured — '
-        'this alert has nowhere to go. '
-        '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure notifications →</a>'
-        '</div>'
-    )
+        return None
+    names = ', '.join(_GD_MONITOR_NAMES.get(k, k) for k in down)
+    body = f'⚠ Guard Dog alert: {html.escape(names)} '
+    body += ('is failing. ' if len(down) == 1 else 'are failing. ')
+    if has_email or has_sms:
+        body += '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>'
+    else:
+        body += ('No notification email is configured, so this alert has nowhere to go. '
+                 '<a href="/guarddog" style="color:inherit;text-decoration:underline">'
+                 'Configure notifications →</a>')
+    # Dismissal is keyed to WHICH monitors are down, so silencing a Disk alert
+    # today cannot hide a Certificate alert tomorrow.
+    return {'cls': 'gd-gap-banner', 'key': 'gdalert:' + ','.join(down),
+            'fg': '#eab308', 'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)',
+            'html': body}
 
 
-def render_no_retention_banner(settings, stack_below=0):
-    """v10.1.29: standing warning when TAK Server has NO CoT retention policy.
+def _no_retention_bar(settings):
+    """Spec for the "TAK Server has no CoT retention policy" bar, or None.
 
     With no TTL, TAK never deletes a position report, so the CoT database grows
     for as long as the server runs and ends at a full disk — at which point
-    VACUUM FULL and Online Compact are both impossible (they need free space
-    roughly equal to the largest table) and Update Now refuses too. It is
-    completely silent until then, which is why it belongs at the top of every
-    page rather than three clicks into Guard Dog.
+    VACUUM FULL and Online Compact are both impossible (each needs free space
+    roughly equal to the largest table) and Update Now refuses too. The box
+    cannot self-rescue, and nothing says a word until then.
 
-    Unlike the cert-password nag removed in v0.9.35, this is not alarmism about a
-    defensible choice: there is no configuration in which "nothing ever deletes
-    CoT" is the intent on a server carrying traffic. It clears the moment a TTL
-    is set, because it reads the live policy every render.
+    Not a return of the alarmism removed in v0.9.35: there is no configuration in
+    which "nothing ever deletes CoT" is intended on a server carrying traffic. It
+    clears the moment a TTL is set, because it reads the live policy every render.
 
     Gated on TAK being installed AND the policy file existing, so it cannot fire
-    part-way through a deployment. Cheap: one small local file read, no database
-    query and no subprocess, on a path that renders every page.
-
-    `stack_below` is the height already consumed by other fixed bars — this one
-    sits under them (see render_gd_delivery_gap_banner for the same treatment)."""
+    part-way through a deploy. Cheap on a path that renders every page: one small
+    local file read, no database query and no subprocess."""
     try:
         s = settings or {}
         if not os.path.exists('/opt/tak') or not os.path.exists(TAK_RETENTION_POLICY_YML):
-            return ''
+            return None
         if _cotdb_retention_hours() is not None:
-            return ''            # a policy is set — nothing to say
+            return None                      # a policy is set — nothing to say
+    except Exception:
+        return None
+    # Where to send them depends on whether this box is reverse-proxied: with an
+    # FQDN, Caddy fronts the username/password WebGUI (proxied to 8446) and the
+    # link takes NO port; without one there is no proxy and the only admin surface
+    # is the cert-auth port 8443. Same pair the TAK Server page already offers.
+    try:
+        host = _get_takserver_host(s)
+        admin = _get_takserver_base_url(s) or ''
+    except Exception:
+        host, admin = '', ''
+    href = (admin if host else f'{admin}:8443') if admin.startswith('https://') else '/guarddog'
+    body = ('⚠ TAK Server has no CoT retention policy — old position reports are never '
+            'deleted and this database will grow until the disk is full. '
+            f'<a href="{html.escape(href)}" target="_blank" rel="noopener" '
+            'style="color:inherit;text-decoration:underline">Set a retention period →</a>')
+    return {'cls': 'notl-banner', 'key': 'nottl', 'fg': '#ef4444',
+            'bg': '#2b1414', 'border': 'rgba(239,68,68,.45)', 'html': body}
+
+
+def render_notice_bars(settings):
+    """Render every fixed notice bar in ONE place.
+
+    Two reasons this is not two independent functions any more:
+
+    1. Each bar has to know how many bars sit above it, and each was emitting its
+       own `body{padding-top:…!important}`. That only worked because of the order
+       they happened to be concatenated in — a fragile arrangement that would
+       silently mis-stack the moment a third bar appeared or the order changed.
+       One renderer computes one padding rule for all of them.
+    2. The backgrounds were rgba(...,.12) — 12% opaque. A `position:fixed` bar
+       over scrolled content therefore showed the page THROUGH the warning text,
+       which on nuc 2026-08-10 made the Guard Dog banner unreadable the moment
+       the page was scrolled. Solid backgrounds.
+
+    Bars are dismissible; dismissal is keyed to the condition, so a NEW or
+    DIFFERENT problem re-shows rather than inheriting an old silence."""
+    try:
+        specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings)) if b]
     except Exception:
         return ''
-    # Which admin surface to send them to depends on whether this box is
-    # reverse-proxied. With an FQDN, Caddy fronts the username/password WebGUI
-    # (proxied to 8446) and the link takes NO port. Without one — airgapped or
-    # IP-only — there is no proxy and the only admin surface is the cert-auth
-    # port 8443. Same pair the TAK Server / TAK Portal / Authentik pages already
-    # offer ("WebGUI (password)" vs "WebGUI :8443 (cert)"); _get_takserver_host()
-    # returns '' precisely when no domain is configured.
-    try:
-        _host = _get_takserver_host(s)
-        _admin = _get_takserver_base_url(s) or ''
-    except Exception:
-        _host, _admin = '', ''
-    if _admin.startswith('https://'):
-        _href = _admin if _host else f'{_admin}:8443'
-    else:
-        _href = '/guarddog'
-    _top = _custom_banner_height(s) + int(stack_below or 0)
-    _h = 34
-    return (
-        '<style>'
-        f'body{{padding-top:{_top + _h}px!important}}'
-        '.notl-banner{'
-        f'position:fixed;top:{_top}px;left:0;right:0;height:{_h}px;z-index:205;'
-        'display:flex;align-items:center;justify-content:center;gap:6px;'
-        'box-sizing:border-box;padding:0 16px;overflow:hidden;'
-        'background:rgba(239,68,68,.12);border-bottom:1px solid rgba(239,68,68,.4);'
-        'color:#ef4444;font-size:13px;font-weight:600;line-height:1.2;text-align:center'
-        '}'
-        '</style>'
-        '<div class="notl-banner">'
-        '⚠ TAK Server has no CoT retention policy — old position reports are never '
-        'deleted and this database will grow until the disk is full. '
-        f'<a href="{html.escape(_href)}" target="_blank" rel="noopener" '
-        'style="color:#ef4444;text-decoration:underline">Set a retention period →</a>'
-        '</div>'
-    )
+    if not specs:
+        return ''
+    base = _custom_banner_height(settings or {})
+    h = _NOTICE_BAR_H
+    css = [f'body{{padding-top:{base + h * len(specs)}px!important}}']
+    divs = []
+    for i, sp in enumerate(specs):
+        css.append(
+            f'.{sp["cls"]}{{position:fixed;top:{base + i * h}px;left:0;right:0;height:{h}px;'
+            'z-index:205;display:flex;align-items:center;justify-content:center;gap:8px;'
+            'box-sizing:border-box;padding:0 16px;overflow:hidden;'
+            f'background:{sp["bg"]};border-bottom:1px solid {sp["border"]};color:{sp["fg"]};'
+            'font-size:13px;font-weight:600;line-height:1.2;text-align:center}')
+        divs.append(
+            f'<div class="{sp["cls"]} itk-notice" data-key="{html.escape(sp["key"])}" '
+            f'data-base="{base}" data-h="{h}">{sp["html"]}'
+            '<button type="button" class="itk-notice-x" title="Dismiss" '
+            'style="background:none;border:0;color:inherit;cursor:pointer;font-size:15px;'
+            'line-height:1;padding:0 2px;opacity:.75">&times;</button></div>')
+    css.append('.itk-notice-x:hover{opacity:1!important}')
+    script = (
+        '<script>(function(){'
+        'var bars=[].slice.call(document.querySelectorAll(".itk-notice"));'
+        'if(!bars.length)return;'
+        'var base=parseInt(bars[0].getAttribute("data-base"),10)||0;'
+        'var h=parseInt(bars[0].getAttribute("data-h"),10)||34;'
+        'function relayout(){'
+        'var live=bars.filter(function(b){return b.parentNode;});'
+        'live.forEach(function(b,i){b.style.top=(base+i*h)+"px";});'
+        'document.body.style.setProperty("padding-top",(base+live.length*h)+"px","important");}'
+        'bars.forEach(function(b){'
+        'var k=b.getAttribute("data-key");'
+        'try{if(localStorage.getItem("itkNotice:"+k)==="1"){b.parentNode.removeChild(b);}}catch(e){}'
+        'var x=b.querySelector(".itk-notice-x");'
+        'if(x)x.onclick=function(){try{localStorage.setItem("itkNotice:"+k,"1");}catch(e){}'
+        'if(b.parentNode)b.parentNode.removeChild(b);relayout();};});'
+        'relayout();})();</script>')
+    return '<style>' + ''.join(css) + '</style>' + ''.join(divs) + script
 
 
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
