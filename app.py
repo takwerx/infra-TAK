@@ -11312,13 +11312,35 @@ def _conn_wifi_forget(ssid):
             doc = _yaml.safe_load(r.stdout or '') or {}
             wifis = ((doc.get('network') or {}).get('wifis') or {})
             removed_here = False
+            emptied = []
             for _iface, cfg in wifis.items():
-                aps = cfg.get('access-points') or {}
+                aps = (cfg or {}).get('access-points') or {}
                 if ssid in aps:
                     del aps[ssid]
                     removed_here = True
+                    if not aps:
+                        emptied.append(_iface)
             if not removed_here:
                 continue
+            # Prune an interface whose LAST access point just went away, and then a
+            # `wifis:` block with no interfaces left. netplan's generator assumes the
+            # access-points list is never empty and fails outright on `access-points: {}`
+            # (canonical/netplan#468), so leaving the husk behind made `netplan generate`
+            # fail, which reverted the whole edit — i.e. removing the only saved network
+            # for an interface could NEVER succeed. That is the exact shape the Ubuntu
+            # installer writes (one AP under 00-installer-config-wireless.yaml), so this
+            # hit any box whose wifi was set up at install time. Field-hit ops1,
+            # 2026-08-12: "Config failed validation — reverted, nothing changed."
+            # Mutate `wifis` only AFTER the loop above — deleting during iteration
+            # raises RuntimeError, which the bare `except: continue` would swallow into
+            # a silent no-op ("that network is not saved on this box").
+            for _iface in emptied:
+                wifis.pop(_iface, None)
+            if not wifis:
+                (doc.get('network') or {}).pop('wifis', None)
+            # netplan needs the version key even when nothing else is left in the file.
+            if isinstance(doc.get('network'), dict):
+                doc['network'].setdefault('version', 2)
             new_yaml = _yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
             tmp = None
             try:
@@ -11332,7 +11354,13 @@ def _conn_wifi_forget(ssid):
                 gen = _run_priv_chain([['netplan', 'generate']], mode='and')
                 if not gen or gen.returncode != 0:
                     _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
-                    return False, 'Config failed validation — reverted, nothing changed.'
+                    # Carry netplan's own words out to the UI. The bare message gave the
+                    # operator nothing to act on and nothing to report, which is how the
+                    # empty-access-points bug above stayed invisible.
+                    why = ((getattr(gen, 'stderr', '') or getattr(gen, 'stdout', '') or '')
+                           .strip().splitlines() or [''])[-1][:200]
+                    return False, ('Config failed validation — reverted, nothing changed.'
+                                   + (f' netplan: {why}' if why else ''))
                 touched = True
             finally:
                 if tmp and os.path.exists(tmp):
