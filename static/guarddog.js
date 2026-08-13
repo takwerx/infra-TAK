@@ -14,8 +14,8 @@ var gdUpdateMsgTimer=null;
 function gdUpdate(){var btn=document.getElementById('gd-update-btn');var msg=document.getElementById('gd-update-msg');if(!btn)return;btn.disabled=true;clearTimeout(gdUpdateMsgTimer);if(msg){msg.textContent='Updating...';msg.style.color='var(--text-dim)';}fetch('/api/guarddog/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){btn.disabled=false;if(!msg)return;if(d.success){msg.textContent='✓ '+(d.message||'Updated — refreshing…');msg.style.color='var(--green)';gdRefreshHealth();gdRefreshMonitorHealth();setTimeout(function(){location.reload();},1500);}else{msg.textContent=d.error||'Update failed';msg.style.color='var(--red)';}}).catch(function(e){btn.disabled=false;if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}});}
 function gdUninstall(){var pw=document.getElementById('gd-uninstall-password');var msg=document.getElementById('gd-uninstall-msg');if(!pw||!msg)return;msg.textContent='';fetch('/api/guarddog/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';document.getElementById('gd-uninstall-modal').classList.remove('open');setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
 function gdToggleNotifications(){var body=document.getElementById('gd-notify-body');var btn=document.getElementById('gd-notify-toggle-btn');var label=document.getElementById('gd-notify-toggle-label');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(btn){var icon=btn.querySelector('.material-symbols-outlined');if(icon)icon.textContent=show?'expand_less':'expand_more';}if(label)label.textContent=show?'Collapse':'Expand to edit';}
-function gdSaveNotifications(){var el=document.getElementById('gd-save-notify-msg');var btn=document.getElementById('gd-save-notify-btn');var emailEl=document.getElementById('gd-notify-email');var nickEl=document.getElementById('gd-server-nickname');var email=(emailEl&&emailEl.value)?emailEl.value.trim():'';var nick=(nickEl&&nickEl.value)?nickEl.value.trim():'';if(el){el.textContent='Saving...';el.style.color='var(--text-dim)';}if(btn)btn.disabled=true;fetch('/api/guarddog/notifications/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({alert_email:email,server_nickname:nick}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(el){el.textContent=d.success?(d.message||'Saved.'):(d.error||'Failed');el.style.color=d.success?'var(--green)':'var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;if(el){el.textContent=e.message||'Request failed';el.style.color='var(--red)';}});}
-function gdTestEmail(){var el=document.getElementById('gd-test-email-msg');var btn=document.getElementById('gd-test-email-btn');var email=document.getElementById('gd-notify-email');var to=(email&&email.value)?email.value.trim():'';if(!to){el.textContent='Enter an email address.';el.style.color='var(--red)';return;}el.textContent='Sending...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:to,save:true}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Sent.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
+function gdSaveNotifications(){var el=document.getElementById('gd-save-notify-msg');var btn=document.getElementById('gd-save-notify-btn');var emailEl=document.getElementById('gd-notify-email');var nickEl=document.getElementById('gd-server-nickname');var email=(emailEl&&emailEl.value)?emailEl.value.trim():'';var nick=(nickEl&&nickEl.value)?nickEl.value.trim():'';if(el){el.textContent='Saving...';el.style.color='var(--text-dim)';}if(btn)btn.disabled=true;fetch('/api/guarddog/notifications/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({alert_email:email,server_nickname:nick}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(el){el.textContent=d.success?(d.message||'Saved.'):(d.error||'Failed');el.style.color=d.success?'var(--green)':'var(--red)';}if(d.success&&typeof gdLoadPauseState==='function')gdLoadPauseState();}).catch(function(e){if(btn)btn.disabled=false;if(el){el.textContent=e.message||'Request failed';el.style.color='var(--red)';}});}
+function gdTestEmail(){var el=document.getElementById('gd-test-email-msg');var btn=document.getElementById('gd-test-email-btn');var email=document.getElementById('gd-notify-email');var to=(email&&email.value)?email.value.trim():'';if(!to){el.textContent='Enter an email address.';el.style.color='var(--red)';return;}el.textContent='Sending...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:to,save:true}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Sent.';el.style.color='var(--green)';if(typeof gdLoadPauseState==='function')gdLoadPauseState();}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
 function gdSmsProviderChange(){var p=document.getElementById('gd-sms-provider');var v=p?p.value:'';document.getElementById('gd-sms-twilio').style.display=(v==='twilio')?'block':'none';document.getElementById('gd-sms-brevo').style.display=(v==='brevo')?'block':'none';var eb=document.getElementById('gd-brevo-events-btn');if(eb)eb.style.display=(v==='brevo')?'inline-block':'none';if(v==='brevo')gdSenderCheck();}
 function gdSenderCheck(){var inp=document.getElementById('gd-sms-br-sender');var ok=document.getElementById('gd-sms-sender-check');var warn=document.getElementById('gd-sms-sender-warn');if(!inp||!ok||!warn)return;var n=(inp.value||'').trim().length;if(n===0){ok.style.display='none';warn.style.display='none';return;}if(n<=11){ok.style.display='inline';warn.style.display='none';}else{warn.style.display='inline';warn.textContent=n+' chars (max 11)';ok.style.display='none';}}
 function gdSmsSave(){var el=document.getElementById('gd-sms-msg');var p=document.getElementById('gd-sms-provider');var provider=(p&&p.value)?p.value.trim():'';var body={provider:provider};if(provider==='twilio'){body.account_sid=document.getElementById('gd-sms-tw-account').value.trim();body.auth_token=document.getElementById('gd-sms-tw-auth').value;body.from_number=document.getElementById('gd-sms-tw-from').value.trim();body.to_numbers=document.getElementById('gd-sms-tw-to').value.trim();}else if(provider==='brevo'){body.api_key=document.getElementById('gd-sms-br-api').value;body.sender=document.getElementById('gd-sms-br-sender').value.trim();body.to_numbers=document.getElementById('gd-sms-br-to').value.trim();}el.textContent='Saving...';el.style.color='var(--text-dim)';fetch('/api/guarddog/sms/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.success){el.textContent=d.message||'Saved.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
@@ -444,6 +444,45 @@ function gdRenderEmailChips(){
       (ok?'':' ✗')+'</span>';
   }).join('');
 }
+/* Server truth for the Notifications card: what is SAVED and would actually get an
+   alert right now, plus whether the boxes on screen differ from it. The card used to
+   render the field once at page load and then go quiet, so a typed value and a saved
+   value looked identical — which is what made the baked-address bug invisible. */
+var gdSavedNotify={email:null,nickname:null};
+function gdEsc(t){return String(t).replace(/[<>&"]/g,function(c){
+  return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];});}
+function gdNormEmails(v){
+  return (v||'').split(/[,;\s]+/).filter(function(t){return t;}).join(',');
+}
+function gdMarkNotifyDirty(){
+  var box=document.getElementById('gd-saved-state');
+  if(!box||gdSavedNotify.email===null)return;
+  var e=document.getElementById('gd-notify-email'),n=document.getElementById('gd-server-nickname');
+  var dirty=(gdNormEmails(e?e.value:'')!==gdSavedNotify.email)||
+            (((n&&n.value)||'').trim()!==gdSavedNotify.nickname);
+  if(dirty){
+    box.innerHTML='<span style="color:var(--yellow)">Unsaved changes.</span> '+
+      'Click <strong>Save email &amp; nickname</strong> to apply \u2014 until then, alerts still go to '+
+      (gdSavedNotify.email?('<code>'+gdEsc(gdSavedNotify.email.split(',').join(', '))+'</code>')
+                          :'nobody')+'.';
+  }else{
+    gdRenderSavedState();
+  }
+}
+function gdRenderSavedState(){
+  var box=document.getElementById('gd-saved-state');
+  if(!box||gdSavedNotify.email===null)return;
+  if(!gdSavedNotify.email){
+    box.innerHTML='<span style="color:var(--yellow)">No alert email saved</span> \u2014 '+
+      'Guard Dog is monitoring but has nowhere to send alerts.';
+    return;
+  }
+  var list=gdSavedNotify.email.split(',');
+  box.innerHTML='<span style="color:var(--green)">Saving alerts to'+
+    (list.length>1?(' '+list.length+' addresses'):'')+':</span> '+
+    list.map(function(a){return '<code>'+gdEsc(a)+'</code>';}).join(' ')+
+    (gdSavedNotify.nickname?(' \u00b7 shown as <code>'+gdEsc(gdSavedNotify.nickname)+'</code>'):'');
+}
 function gdLoadPauseState(){
   var st=document.getElementById('gd-pause-state');
   var pb=document.getElementById('gd-pause-btn');
@@ -452,6 +491,9 @@ function gdLoadPauseState(){
   if(!st)return;
   fetch('/api/guarddog/notifications/status',{credentials:'same-origin'})
     .then(function(r){return r.json();}).then(function(d){
+      gdSavedNotify.email=d.email_saved||'';
+      gdSavedNotify.nickname=d.nickname||'';
+      gdMarkNotifyDirty();
       if(!d.has_email&&!d.has_sms){
         st.textContent='No email or SMS configured — there is nothing to pause yet.';
         st.style.color='var(--text-dim)';

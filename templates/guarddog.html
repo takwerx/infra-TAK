@@ -228,6 +228,7 @@
     {% if notifications_configured %}
     <div id="gd-notify-banner" class="status-banner running" style="margin-bottom:12px"><div class="dot"></div>Notifications configured</div>
     {% endif %}
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Configure email, Uptime Robot, and optional SMS (Twilio or Brevo) for Guard Dog alerts. The same email receives <strong>update notifications</strong> when a newer version of infra-TAK, Authentik, MediaMTX, CloudTAK, or TAK Portal is available (checked every 6 hours; one email per change so you are not spammed).</p>
     <div class="gd-section" id="gd-pause-section" style="margin-bottom:20px">
       <div class="form-label">Alert delivery</div>
       <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Pause email and SMS alerts during maintenance. Guard Dog keeps monitoring and alerts still appear on this page &mdash; only delivery stops. Test buttons always send, so you can still check the relay while paused.</p>
@@ -244,19 +245,19 @@
       </div>
       <div id="gd-pause-msg" style="margin-top:8px;font-size:12px"></div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Configure email, Uptime Robot, and optional SMS (Twilio or Brevo) for Guard Dog alerts. The same email receives <strong>update notifications</strong> when a newer version of infra-TAK, Authentik, MediaMTX, CloudTAK, or TAK Portal is available (checked every 6 hours; one email per change so you are not spammed).</p>
     <div class="gd-section" style="margin-bottom:20px">
       <div class="form-label">Server nickname</div>
       <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Optional. Shown in alert subject and body so you can tell which server when monitoring multiple (e.g. Production, Staging).</p>
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px">
-        <input class="form-input" type="text" id="gd-server-nickname" placeholder="e.g. Production, Staging" value="{{ guarddog_server_nickname | e }}" style="max-width:220px" maxlength="64">
+        <input class="form-input" type="text" id="gd-server-nickname" placeholder="e.g. Production, Staging" value="{{ guarddog_server_nickname | e }}" style="max-width:220px" maxlength="64" oninput="gdMarkNotifyDirty()">
         <button class="btn btn-ghost" id="gd-save-notify-btn" onclick="gdSaveNotifications()">Save email &amp; nickname</button>
       </div>
+      <div id="gd-saved-state" style="margin-bottom:16px;font-size:12px;color:var(--text-dim)">Loading saved settings&hellip;</div>
       <div class="form-label">Email</div>
       {% if email_relay_configured %}<p style="font-size:12px;color:var(--green);margin-bottom:8px">Using Email Relay (e.g. Brevo SMTP). Alerts are sent through your configured relay.</p>{% endif %}
       <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">One address, or several separated by commas &mdash; every alert goes to all of them.</p>
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
-        <input class="form-input" type="text" id="gd-notify-email" placeholder="ops@example.com, oncall@example.com" value="{{ guarddog_alert_email | e }}" style="max-width:420px" oninput="gdRenderEmailChips()">
+        <input class="form-input" type="text" id="gd-notify-email" placeholder="ops@example.com, oncall@example.com" value="{{ guarddog_alert_email | e }}" style="max-width:420px" oninput="gdRenderEmailChips();gdMarkNotifyDirty()">
         <button class="btn btn-ghost" id="gd-test-email-btn" onclick="gdTestEmail()">Send test email</button>
       </div>
       <div id="gd-notify-email-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>

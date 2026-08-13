@@ -19218,12 +19218,24 @@ def guarddog_notifications_status():
     elapsed snooze reads as resumed without anything having to write settings."""
     settings = load_settings()
     paused, until = _gd_alerts_pause_state(settings)
+    # Report what is ACTUALLY saved and would receive an alert right now, read back
+    # from settings — not echoed from whatever the form posted. The card previously
+    # rendered the field once at page load and then said nothing, so after an edit
+    # there was no way to tell a typed value from a saved one, and no way to see that
+    # a save had silently dropped an invalid address.
+    emails = _safe_alert_emails(settings.get('guarddog_alert_email'))
+    sms = settings.get('guarddog_sms') or {}
     return jsonify({
         'paused': paused,
         'until': until if paused else '',
         'indefinite': bool(paused and not until),
-        'has_email': bool((settings.get('guarddog_alert_email') or '').strip()),
-        'has_sms': bool((settings.get('guarddog_sms') or {}).get('provider')),
+        'has_email': bool(emails),
+        'has_sms': bool(sms.get('provider')),
+        'emails': emails,
+        'email_saved': ','.join(emails),
+        'nickname': (settings.get('guarddog_server_nickname') or '').strip(),
+        'sms_provider': sms.get('provider') or '',
+        'sms_to': (sms.get('to_numbers') or '').strip(),
     })
 
 
