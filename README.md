@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.29-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.29-alpha)**
+**Current release: [v10.1.30-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.30-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.30-alpha — 2026-08-13 — watching your own video streams could get you banned off your own server
+
+**Headline: pulling several camera feeds at once tripped the video server's brute-force protection, and because that protection blocked every port, it took TAK Server with it.** A user running a multi-feed video wall during a live exercise found himself locked out — not just from video, but from his TAK Server entirely, on a phone that had been working minutes earlier. The cause was that the video protection counted **connections**, not **failed logins**. Opening ten streams at once looked identical to an attack, and the default threshold was ten. Every other protection we ship counts failures; this one never did, and it installs itself automatically on any server running the video service, so nobody chose it. Worse, the ban applied to *every* port, so a video-related block severed TAK Server, CloudTAK and the console — and the repeat-offender rule could escalate it to permanent. It now counts **failed stream logins only**: pull fifty feeds if you like, and as long as you are authenticating, this cannot touch you. A ban is also **scoped to the video ports alone**, so it is no longer able to cut anyone off from TAK Server or the console, and repeat offenders are explicitly exempted from the permanent all-ports escalation. On our own test servers this fault had quietly banned 19 addresses in a single week before anyone noticed. Also in this release: **Guard Dog alerts can now be paused** for an hour, four hours, a day, or until you turn them back on — monitoring keeps running, only the emails and texts stop — and **alerts can go to more than one address**. Fixing that surfaced a real fault: **removing or changing your alert email did nothing at all**. The old address was baked into the monitoring scripts when they were installed, so clearing the field said "saved" while mail kept arriving at the old address, and a server set up before you added an email would never send alerts at all no matter what you saved afterwards. That is fixed, and the Notifications page now shows you exactly which addresses are really receiving alerts and warns you when you have unsaved changes. Finally, **removing a WiFi network now works** — previously, deleting the only saved network on a server produced "Config failed validation" and silently changed nothing, which affected any box whose WiFi was set up during the original Ubuntu install. **Who should update:** everyone, and urgently if you run the video service — especially with multiple simultaneous streams. **Upgrade:** automatic on the next console update; the corrected protection is applied to existing servers for you, with no reinstall and no settings to change.
+
+Full notes: [v10.1.30-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.30-alpha).
 
 ### v10.1.29-alpha — 2026-08-10 — the CoT database page now tells you the truth, and the cleanup that never ran now runs
 
