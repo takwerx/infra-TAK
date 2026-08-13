@@ -194,7 +194,7 @@ VACUUM FULL locks tables and can take a long time on large databases; use only w
 
 See also: CoT retention settings and tak-db-cleanup / retention jobs.
 "
-    [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+    echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
   fi
 else
   log_line "Auto-VACUUM: ${DEAD_COUNT} dead tuples found, below threshold (1M), skipped"

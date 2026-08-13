@@ -106,7 +106,7 @@ TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 send_alert() {  # $1=subject  $2=body  $3=dedupe_file
   if [ -f "$3" ] && [ -z "$(find "$3" -mmin +"$DEDUPE_MIN" 2>/dev/null)" ]; then return 0; fi
   touch "$3"
-  [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$2" | /opt/tak-guarddog/send-alert-email.sh "$1" "ALERT_EMAIL_PLACEHOLDER"
+  echo -e "$2" | /opt/tak-guarddog/send-alert-email.sh "$1" "ALERT_EMAIL_PLACEHOLDER"
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
     TMPF="/tmp/gd-sms-$$.txt"; printf '%s' "$2" > "$TMPF"
     /opt/tak-guarddog/sms_send.sh "$1" "$TMPF" 2>/dev/null || true; rm -f "$TMPF"

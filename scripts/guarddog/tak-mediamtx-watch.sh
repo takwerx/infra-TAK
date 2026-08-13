@@ -47,7 +47,7 @@ $ED_ERR
 
 Diagnose: journalctl -u mediamtx-webeditor -n 50
 "
-      [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$ED_BODY" | /opt/tak-guarddog/send-alert-email.sh "$ED_SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+      echo -e "$ED_BODY" | /opt/tak-guarddog/send-alert-email.sh "$ED_SUBJ" "ALERT_EMAIL_PLACEHOLDER"
       if [ -f /opt/tak-guarddog/sms_send.sh ]; then
         ED_TMPF="/tmp/gd-sms-ed-$$.txt"
         printf '%s' "$ED_BODY" > "$ED_TMPF"
@@ -100,7 +100,7 @@ Action: systemctl restart mediamtx
 
 Check /var/log/takguard/restarts.log for history.
 "
-[ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   TMPF="/tmp/gd-sms-$$.txt"
   printf '%s' "$BODY" > "$TMPF"

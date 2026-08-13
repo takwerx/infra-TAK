@@ -91,7 +91,7 @@ This usually means a process is using a lot of memory. Check:
 Guard Dog will automatically reclaim the swap once RAM frees up. This alert is sent once until the
 condition clears.
 "
-  [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+  echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
   touch "$PRESSURE_ALERT_SENT" 2>/dev/null
 fi
 exit 0

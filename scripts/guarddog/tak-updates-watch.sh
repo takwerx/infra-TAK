@@ -10,11 +10,9 @@ CURL_TIMEOUT=15
 
 log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
 
-# Skip only when empty or not a real address (no @). Deploy replaces ALERT_EMAIL_PLACEHOLDER globally, so we must not compare to that literal.
-if [ -z "$ALERT_EMAIL" ] || ! echo "$ALERT_EMAIL" | grep -q '@'; then
-  log_msg "Alert email not configured; skipping. Set email in Guard Dog → Notifications and click Update Guard Dog."
-  exit 0
-fi
+# v10.1.30: do NOT gate on the baked address. The console resolves the recipient from
+# settings.json at send time, so a box deployed before an email was configured still
+# alerts once one is saved - no "click Update Guard Dog" step.
 
 # Fetch latest tag from GitHub (repo = org/repo). Strips version/ and v prefix.
 latest_tag() {
@@ -151,14 +149,10 @@ if $SHOULD_SEND; then
 $(printf '%b' "$UPDATES")
 "
 
-  if [ -n "$ALERT_EMAIL" ]; then
-    if echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
-      log_msg "Updates email sent to $ALERT_EMAIL"
-    else
-      log_msg "Updates email FAILED to $ALERT_EMAIL (console/relay unreachable or check Guard Dog page)"
-    fi
+  if echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
+    log_msg "Updates email handed to console (recipient resolved from settings)"
   else
-    log_msg "Updates available but ALERT_EMAIL not set — save email in Guard Dog → Notifications and Update Guard Dog"
+    log_msg "Updates email FAILED (console/relay unreachable - check the Guard Dog page)"
   fi
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
     TMPF="/tmp/gd-updates-$$.txt"

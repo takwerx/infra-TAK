@@ -252,7 +252,7 @@ $(echo "$REPACK_OUTPUT" | head -10)
 
 The database may still have bloat. Consider running VACUUM FULL during a maintenance window.
 "
-  [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+  echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
   exit 1
 fi
 
@@ -278,7 +278,7 @@ Reclaimed: ~${RECLAIMED}GB
 
 pg_repack ran without exclusive locks; TAK Server remained online.
 "
-  [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+  echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 fi
 
 exit 0

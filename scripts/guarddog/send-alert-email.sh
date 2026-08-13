@@ -3,7 +3,9 @@
 # Replaces direct "mail" so all alerts use the same relay as the test email.
 SUBJ="${1:-Guard Dog Alert}"
 TO="${2:-}"
-[ -z "$TO" ] && exit 0
+# No bail on an empty $TO. $2 is the address baked in at DEPLOY time; the console now
+# resolves the real recipient from settings.json, so bailing here made a box deployed
+# before an email was set stay silent forever after one was added.
 CONSOLE_PORT="${CONSOLE_PORT:-5001}"
 TMPF=$(mktemp)
 trap 'rm -f "$TMPF"' EXIT

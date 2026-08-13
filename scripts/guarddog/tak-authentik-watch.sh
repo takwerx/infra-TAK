@@ -33,7 +33,7 @@ _log() {
 
 _alert() {
   local subj="$1" body="$2"
-  [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$body" | /opt/tak-guarddog/send-alert-email.sh "$subj" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null
+  echo -e "$body" | /opt/tak-guarddog/send-alert-email.sh "$subj" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
     local tmpf="/tmp/gd-sms-$$.txt"
     printf '%s' "$body" > "$tmpf"

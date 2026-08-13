@@ -147,7 +147,7 @@ Guard Dog will now run batched cleanup to remove expired rows safely.
 If this keeps happening, increase TAK Server retention run frequency
 (e.g. hourly instead of daily) in the Web Admin data retention settings.
 "
-    [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+    echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
   fi
 fi
 
@@ -271,7 +271,7 @@ massive DELETE that can take hours and exhaust memory/swap.
 If large cleanups keep happening, consider increasing TAK Server
 retention run frequency (e.g. hourly) in the Web Admin settings.
 "
-  [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+  echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 fi
 
 exit 0
