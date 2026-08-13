@@ -64878,6 +64878,55 @@ def _startup_reapply_f2b_trusted_ignoreip():
 _startup_reapply_f2b_trusted_ignoreip()
 
 
+def _startup_converge_mediamtx_banaction():
+    """v10.1.30: converge the mediamtx jail's ban action to the media-ports-only form.
+
+    Caught in T&E 2026-08-13 — RED on all five boxes. The corrected FILTER reached the
+    fleet (via _F2B_LEGACY_FILTERS + _f2b_selfheal_filters), but the corrected BAN SCOPE
+    did not, so every box was still running `action = ufw` / `iptables-allports`: a video
+    strike would still have severed TAK Server, which is the half of the fix that
+    actually mattered to the operator who reported it.
+
+    Nothing rewrites an EXISTING jail's action. `_f2b_rewrite_all_jails()` is the only
+    writer and its startup caller early-returns unless the trusted-CIDR list changed
+    (`if not need: return`), while the auto-install path explicitly skips a jail that is
+    already present. So a jail written by any earlier release keeps that release's action
+    forever. Exactly the trap `_F2B_LEGACY_FILTERS` exists to close, one layer up — the
+    filter got a self-heal and the jail config never had one.
+
+    Deliberately narrow: only this jail, only its action, and only when it does not
+    already match. Rewriting via `_f2b_write_mediamtx_jail()` re-derives thresholds and
+    ignoreip from what is stored, so an operator's tuning and whitelist survive."""
+    try:
+        if not _f2b_mediamtx_jail_enabled():
+            return
+        jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
+        try:
+            with open(jail_path) as _jf:
+                cur = _jf.read()
+        except OSError:
+            return
+        # Compare against the action we would write now. Substring, not equality: the
+        # guarddog notify action is appended after it and is not ours to judge here.
+        want_first = _f2b_banaction_media().splitlines()[0].strip()
+        if want_first in cur:
+            return
+        c = _f2b_read_mediamtx_jail_config()
+        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'],
+                                 _f2b_operator_extra(c.get('ignoreip', '')))
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                       capture_output=True, timeout=15)
+        print('Startup migration: ✓ mediamtx jail ban action converged to media ports '
+              'only — it was banning on EVERY port, which severs TAK Server on a video '
+              'strike (v10.1.30)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx banaction converge warning (non-fatal): %s' % _e)
+
+_startup_converge_mediamtx_banaction()
+
+
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
 # and force-recreate containers if the loopback binding is absent.
 # Runs on every console startup so restarts self-heal without needing Update Now.
