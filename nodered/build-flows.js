@@ -2212,6 +2212,11 @@ function makeEngineTab(feed) {
     "  }",
     "} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }",
     "",
+    "// v10.1.31: snapshot the mission size BEFORE the delete loop prunes 'existing', so the",
+    "// reconcile log keeps reporting what the server actually held at poll time (comparable",
+    "// with every historical log line).",
+    "var nInMission = Object.keys(existing).length;",
+    "",
     "var arcgis = {};",
     "for (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];",
     "",
@@ -2395,6 +2400,12 @@ function makeEngineTab(feed) {
     "      payload: '',",
     "      topic: topicCfg",
     "    }]);",
+    "    // v10.1.31 W3 corollary: 'existing' is the mission read at the START of this poll, so it",
+    "    // still lists what we just deleted. Without this, W3's live-shape guard below sees the",
+    "    // UID as live and immediately clears the tombstone we just wrote — silently disabling",
+    "    // ghost cleanup for exactly the UIDs that need it (field-caught on test12 2026-08-13:",
+    "    // 3 DELETEs left the sweep count at 433 instead of 436). Deleted here != live.",
+    "    delete existing[duid];",
     "  }",
     "  if (massDelete && nHeld > 0) {",
     "    node.warn(topicCfg + ': MASS-DELETE GUARD — this poll claims ' + candidates.length",
@@ -2455,7 +2466,7 @@ function makeEngineTab(feed) {
     "",
     "node.warn(topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nSkip + ' unchanged, ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
     "  + (nHeld > 0 ? nHeld + ' held, ' : '')",
-    "  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission' + (strictMode ? ' [strict]' : ''));",
+    "  + Object.keys(arcgis).length + ' ArcGIS, ' + nInMission + ' in mission' + (strictMode ? ' [strict]' : ''));",
     "return null;"
   ].join('\n');
 
