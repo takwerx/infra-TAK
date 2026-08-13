@@ -418,3 +418,89 @@ function doConsoleRollbackSubmit(){
       msg.style.color='var(--red)';msg.textContent=e.message||'Network error';
     });
 }
+
+/* v10.1.30 — notification pause + multi-recipient email.
+   Pause suppresses DELIVERY only; monitoring and on-page alerts are unaffected. */
+function gdFmtRemaining(untilIso){
+  if(!untilIso)return '';
+  var ms=new Date(untilIso).getTime()-Date.now();
+  if(isNaN(ms)||ms<=0)return '';
+  var m=Math.round(ms/60000),h=Math.floor(m/60);
+  return h>0?(h+'h '+(m%60)+'m'):(m+'m');
+}
+function gdRenderEmailChips(){
+  var el=document.getElementById('gd-notify-email');
+  var box=document.getElementById('gd-notify-email-chips');
+  if(!el||!box)return;
+  var re=/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+  var toks=(el.value||'').split(/[,;\s]+/).filter(function(t){return t;});
+  if(toks.length<2&&!toks.some(function(t){return !re.test(t);})){box.innerHTML='';return;}
+  box.innerHTML=toks.map(function(t){
+    var ok=re.test(t);
+    return '<span style="font-family:monospace;font-size:11px;padding:2px 8px;border-radius:10px;'+
+      'background:var(--bg-deep);border:1px solid '+(ok?'var(--border)':'var(--red)')+';'+
+      'color:'+(ok?'var(--text-dim)':'var(--red)')+'">'+
+      t.replace(/[<>&"]/g,function(c){return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];})+
+      (ok?'':' ✗')+'</span>';
+  }).join('');
+}
+function gdLoadPauseState(){
+  var st=document.getElementById('gd-pause-state');
+  var pb=document.getElementById('gd-pause-btn');
+  var rb=document.getElementById('gd-resume-btn');
+  var dur=document.getElementById('gd-pause-duration');
+  if(!st)return;
+  fetch('/api/guarddog/notifications/status',{credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d.has_email&&!d.has_sms){
+        st.textContent='No email or SMS configured — there is nothing to pause yet.';
+        st.style.color='var(--text-dim)';
+        if(pb)pb.style.display='none';if(rb)rb.style.display='none';if(dur)dur.style.display='none';
+        return;
+      }
+      if(pb)pb.style.display=d.paused?'none':'';
+      if(dur)dur.style.display=d.paused?'none':'';
+      if(rb)rb.style.display=d.paused?'':'none';
+      if(d.paused){
+        var left=gdFmtRemaining(d.until);
+        st.innerHTML='<strong style="color:var(--yellow)">Alerts are PAUSED.</strong> '+
+          (d.indefinite?'They stay paused until you resume them.'
+                       :('Resuming automatically in '+(left||'under a minute')+'.'));
+        st.style.color='var(--text-dim)';
+      }else{
+        st.textContent='Alerts are being delivered normally.';
+        st.style.color='var(--green)';
+      }
+    }).catch(function(){st.textContent='Could not read pause state.';st.style.color='var(--red)';});
+}
+function gdSetPause(paused,duration){
+  var msg=document.getElementById('gd-pause-msg');
+  var pb=document.getElementById('gd-pause-btn'),rb=document.getElementById('gd-resume-btn');
+  if(msg){msg.textContent='Saving...';msg.style.color='var(--text-dim)';}
+  if(pb)pb.disabled=true;if(rb)rb.disabled=true;
+  fetch('/api/guarddog/notifications/pause',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paused:paused,duration:duration||''}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(pb)pb.disabled=false;if(rb)rb.disabled=false;
+      if(msg){msg.textContent=d.success?(d.message||'Saved.'):(d.error||'Failed');
+              msg.style.color=d.success?'var(--green)':'var(--red)';}
+      gdLoadPauseState();
+    }).catch(function(e){
+      if(pb)pb.disabled=false;if(rb)rb.disabled=false;
+      if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}
+    });
+}
+function gdPauseAlerts(){
+  var dur=document.getElementById('gd-pause-duration');
+  gdSetPause(true,dur?dur.value:'');
+}
+function gdResumeAlerts(){gdSetPause(false,'');}
+(function(){
+  if(document.getElementById('gd-pause-section')){
+    gdLoadPauseState();
+    /* Keeps the "resuming in Xh Ym" countdown honest without a reload, and picks up
+       an auto-resume that happened while the page sat open. */
+    setInterval(gdLoadPauseState,60000);
+  }
+  gdRenderEmailChips();
+})();

@@ -3003,7 +3003,15 @@ def _gd_alert_bar(settings):
     # monitor id, which leaked an internal id (`cloudtak_ctr`) onto an operator's
     # screen and produced "Disk are failing". The banner's job is to get you to
     # the page, not to reproduce it.
-    if has_email or has_sms:
+    # EXCEPT that "you are not being told about this" is a different fact from "there
+    # is an alert", and the operator has to know it. A paused box looks identical to a
+    # working one from the inbox side — which is the whole hazard of a mute switch.
+    if (has_email or has_sms) and _gd_alerts_pause_state(s)[0]:
+        body = ('⚠ Guard Dog has an active alert — and alert delivery is PAUSED, '
+                'so no email or SMS is being sent. '
+                '<a href="/guarddog" style="color:inherit;text-decoration:underline">'
+                'Review →</a>')
+    elif has_email or has_sms:
         body = ('⚠ Guard Dog has an active alert. '
                 '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>')
     else:
@@ -13134,6 +13142,39 @@ def _safe_alert_email(addr):
     return addr if _ALERT_EMAIL_RE.match(addr) else ''
 
 
+# v10.1.30: guarddog_alert_email holds one OR MORE addresses (operator-requested
+# 2026-08-12). Stored comma-joined in the one existing settings key rather than in a
+# new list key, so every reader that only ever expected a string — including scripts
+# already baked onto boxes — keeps working, and a single-address box needs no
+# migration. Separator is a bare comma with NO SPACES: the value is substituted into
+# root-executed script text, so it has to survive as a single shell token. Each
+# address is still checked against the same strict allowlist, so quotes/;/`/$ and
+# whitespace can never reach a shell through the list form either.
+def _safe_alert_emails(value):
+    """[addr, ...] — every valid address in `value`, de-duplicated, order preserved.
+    Accepts comma, semicolon, or whitespace separated input. Invalid entries dropped."""
+    out, seen = [], set()
+    for tok in re.split(r'[,;\s]+', (value or '').strip()):
+        a = _safe_alert_email(tok)
+        if a and a.lower() not in seen:
+            seen.add(a.lower())
+            out.append(a)
+    return out
+
+
+def _safe_alert_email_list(value):
+    """Canonical storage/substitution form: 'a@x.com,b@y.com', or '' if none valid.
+    Use this at EVERY placeholder-substitution site — _safe_alert_email() alone
+    silently blanks a multi-address value, which would disable alerts entirely."""
+    return ','.join(_safe_alert_emails(value))
+
+
+def _alert_email_rejects(value):
+    """Non-empty tokens in `value` that are NOT valid addresses — for error messages."""
+    return [t for t in re.split(r'[,;\s]+', (value or '').strip())
+            if t and not _safe_alert_email(t)]
+
+
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
 def guarddog_deploy_api():
@@ -13141,11 +13182,13 @@ def guarddog_deploy_api():
         return jsonify({'error': 'Deployment already in progress'}), 409
     data = request.json or {}
     alert_email = (data.get('alert_email') or '').strip()
-    if alert_email and not _safe_alert_email(alert_email):
-        return jsonify({'error': 'Invalid alert email address'}), 400
+    _bad = _alert_email_rejects(alert_email)
+    if _bad:
+        return jsonify({'error': 'Invalid alert email address: ' + ', '.join(_bad[:3])}), 400
+    alert_email = _safe_alert_email_list(alert_email)
     settings = load_settings()
     if not alert_email:
-        alert_email = _safe_alert_email(settings.get('guarddog_alert_email'))
+        alert_email = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     # Allow deploy with no email (monitors run; alerts only after user configures email)
     settings['guarddog_alert_email'] = alert_email
     nickname = (data.get('server_nickname') or '').strip()
@@ -13355,7 +13398,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         try:
             content = open(src, 'r', encoding='utf-8').read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
@@ -18710,20 +18753,80 @@ def guarddog_uninstall():
     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
     return jsonify({'success': True})
 
-def _guarddog_send_alert_email_via_relay(to_addr, subject, body):
-    """Send email via Email Relay (localhost:25 → Postfix → Brevo). Used by test email and send-alert-email endpoint."""
+# ── v10.1.30: notification pause (operator-requested 2026-08-12) ──────────────
+# ONE switch muting Guard Dog email + SMS, with an optional auto-resume. Guard Dog
+# keeps monitoring the whole time and the console keeps showing alerts on screen —
+# this suppresses DELIVERY only, so a paused box is quiet, not blind.
+#
+# Enforced inside the two send helpers rather than at each call site. There are
+# five senders today (the two localhost script routes, the AK/PG watchdog, the
+# pending-update notifier, and the test buttons) and a sixth will get added by
+# someone who has never read this comment; gating the helper makes "paused" the
+# default for anything new. The test buttons pass force=True — a test that stays
+# silent while paused is indistinguishable from a broken relay, which is exactly
+# when an operator reaches for it.
+_GD_PAUSE_DURATIONS = {'1h': 1, '4h': 4, '24h': 24}
+
+
+def _gd_alerts_pause_state(settings=None):
+    """Effective pause state: (paused: bool, until_iso: str). '' until = indefinite.
+
+    PURE — never writes. An elapsed snooze reports not-paused rather than being
+    cleared on read, so the expiry needs no writer, cannot race two workers against
+    each other, and cannot leave a box muted because a cleanup write failed.
+
+    An unparseable `until` reports NOT paused. A corrupt timestamp must never be
+    able to silence a box forever; the failure direction has to be toward noise."""
+    from datetime import timezone as _tz
+    s = settings if settings is not None else load_settings()
+    if not s.get('guarddog_alerts_paused'):
+        return False, ''
+    until = (s.get('guarddog_alerts_paused_until') or '').strip()
+    if not until:
+        return True, ''                      # indefinite — until the operator resumes
+    try:
+        dt = datetime.fromisoformat(until.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+    except Exception:
+        return False, ''
+    if datetime.now(_tz.utc) >= dt:
+        return False, until                  # snooze elapsed — auto-resumed
+    return True, until
+
+
+def _guarddog_send_alert_email_via_relay(to_addr, subject, body, force=False):
+    """Send email via Email Relay (localhost:25 → Postfix → Brevo). Used by test email and send-alert-email endpoint.
+
+    Returns True if sent, False if suppressed by the notification pause. Raises on
+    a genuine send failure, so a suppressed alert is never reported as an error."""
     import smtplib
     from email.mime.text import MIMEText
+    if not force:
+        paused, until = _gd_alerts_pause_state()
+        if paused:
+            print(f"[guarddog] alert email suppressed — notifications paused"
+                  f"{' until ' + until if until else ' (indefinite)'}: {subject}", flush=True)
+            return False
     settings = load_settings()
     relay = settings.get('email_relay', {})
     from_addr = relay.get('from_addr', 'noreply@localhost')
     from_name = relay.get('from_name', 'Guard Dog')
+    # to_addr may carry several addresses (comma-joined). Re-validate here rather than
+    # trusting the caller: this is the last point before SMTP, and every entry point
+    # feeding it is a separate route.
+    recipients = _safe_alert_emails(to_addr)
+    if not recipients:
+        return False
     msg = MIMEText(body or '', 'plain', 'utf-8')
     msg['From'] = f'{from_name} <{from_addr}>'
-    msg['To'] = to_addr
+    msg['To'] = ', '.join(recipients)
     msg['Subject'] = subject or 'Guard Dog Alert'
     with smtplib.SMTP('localhost', 25, timeout=15) as s:
-        s.sendmail(from_addr, [to_addr], msg.as_string())
+        # One envelope, all recipients — a per-address loop would let a single bad
+        # mailbox abort the rest partway through.
+        s.sendmail(from_addr, recipients, msg.as_string())
+    return True
 
 
 # ── v10.1.7 WS2: pending-update email notifications ──────────────────────────
@@ -18845,7 +18948,7 @@ def _update_notify_check_once():
     one pending item's identity has not been mailed before (one email per new SHA/tag,
     never per poll). Returns {'pending': [...], 'emailed': bool} for the trigger route."""
     settings = load_settings()
-    to_addr = _safe_alert_email(settings.get('guarddog_alert_email'))
+    to_addr = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     if not to_addr:
         return {'pending': [], 'emailed': False, 'skipped': 'no alert email configured'}
     if settings.get('guarddog_update_email_enabled') is False:
@@ -18995,14 +19098,26 @@ def guarddog_send_alert_email():
     if request.remote_addr not in ('127.0.0.1', '::1'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    to_addr = (data.get('to') or '').strip() or (load_settings().get('guarddog_alert_email') or '').strip()
+    # settings.json is the SOURCE OF TRUTH for the recipient; the caller's `to` is a
+    # legacy fallback only. The watch scripts pass the address that was baked into
+    # them at deploy time (ALERT_EMAIL_PLACEHOLDER), and this used to prefer that —
+    # so clearing the alert email in the console changed the field, said "saved", and
+    # alerts kept arriving at the stale baked address until Guard Dog was redeployed.
+    # Changing the address had the same fault: the OLD one kept getting mail. Reading
+    # settings first makes remove, change, and pause all take effect at once, with no
+    # redeploy ([[no-redeploy-button-on-installed-modules]]).
+    # No `or data.get('to')` fallback: keeping one would defeat the whole fix, since a
+    # cleared setting would fall straight back to the baked address it is trying to
+    # remove. Empty here means the operator removed the recipient — send nothing. The
+    # console shows this same field, so what it displays is what actually gets mail.
+    to_addr = (load_settings().get('guarddog_alert_email') or '').strip()
     if not to_addr:
-        return jsonify({'error': 'No recipient'}), 400
+        return jsonify({'success': True, 'suppressed': True, 'reason': 'no recipient configured'})
     subject = (data.get('subject') or 'Guard Dog Alert')[:200]
     body = (data.get('body') or '')[:50000]
     try:
-        _guarddog_send_alert_email_via_relay(to_addr, subject, body)
-        return jsonify({'success': True})
+        sent = _guarddog_send_alert_email_via_relay(to_addr, subject, body)
+        return jsonify({'success': True, 'suppressed': not sent})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
@@ -19016,17 +19131,25 @@ def guarddog_test_email():
     to_addr = data.get('to', '').strip() or (settings.get('guarddog_alert_email') or '').strip()
     if not to_addr:
         return jsonify({'success': False, 'error': 'No email address configured'}), 400
-    if not _safe_alert_email(to_addr):
-        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
+    _bad = _alert_email_rejects(to_addr)
+    if _bad:
+        return jsonify({'success': False,
+                        'error': 'Invalid alert email address: ' + ', '.join(_bad[:3])}), 400
+    to_addr = _safe_alert_email_list(to_addr)
     if data.get('save'):
         settings['guarddog_alert_email'] = to_addr
         save_settings(settings)
     try:
         _guarddog_send_alert_email_via_relay(
             to_addr, 'Guard Dog Test Alert',
-            'Test alert from infra-TAK Guard Dog.\n\nIf you received this, email notifications are working (via Email Relay/Brevo when deployed).'
+            'Test alert from infra-TAK Guard Dog.\n\nIf you received this, email notifications are working (via Email Relay/Brevo when deployed).',
+            force=True   # a test that goes silent while paused looks like a broken relay
         )
-        return jsonify({'success': True, 'message': f'Test email sent to {to_addr}'})
+        paused, _u = _gd_alerts_pause_state(settings)
+        return jsonify({'success': True,
+                        'message': f'Test email sent to {to_addr}'
+                                   + (' — note: alerts are currently PAUSED, so real alerts are not being delivered.'
+                                      if paused else '')})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
@@ -19037,8 +19160,13 @@ def guarddog_notifications_save():
     data = request.json or {}
     settings = load_settings()
     email = (data.get('alert_email') or '').strip()
-    if email and not _safe_alert_email(email):
-        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
+    _bad = _alert_email_rejects(email)
+    if _bad:
+        return jsonify({'success': False,
+                        'error': 'Invalid alert email address: ' + ', '.join(_bad[:3])}), 400
+    # Store canonicalised (validated, de-duplicated, comma-joined) so every consumer —
+    # including scripts baked at deploy time — reads one predictable shape.
+    email = _safe_alert_email_list(email)
     nickname = (data.get('server_nickname') or '').strip()
     settings['guarddog_alert_email'] = email
     settings['guarddog_server_nickname'] = nickname
@@ -19050,6 +19178,54 @@ def guarddog_notifications_save():
         except Exception:
             pass
     return jsonify({'success': True, 'message': 'Saved. Alerts will use the server nickname.'})
+
+@app.route('/api/guarddog/notifications/pause', methods=['POST'])
+@login_required
+def guarddog_notifications_pause():
+    """Pause or resume Guard Dog alert delivery (email + SMS together).
+
+    Body: {paused: bool, duration: '1h'|'4h'|'24h'|''}. Empty duration = indefinite.
+    Monitoring is unaffected — this suppresses delivery only."""
+    from datetime import timezone as _tz
+    data = request.json or {}
+    paused = bool(data.get('paused'))
+    settings = load_settings()
+    if not paused:
+        settings['guarddog_alerts_paused'] = False
+        settings['guarddog_alerts_paused_until'] = ''
+        save_settings(settings)
+        return jsonify({'success': True, 'paused': False, 'message': 'Alerts resumed.'})
+    duration = (data.get('duration') or '').strip()
+    if duration and duration not in _GD_PAUSE_DURATIONS:
+        return jsonify({'success': False,
+                        'error': 'Duration must be 1h, 4h, 24h, or empty for indefinite'}), 400
+    until = ''
+    if duration:
+        until = (datetime.now(_tz.utc)
+                 + timedelta(hours=_GD_PAUSE_DURATIONS[duration])).replace(microsecond=0).isoformat()
+    settings['guarddog_alerts_paused'] = True
+    settings['guarddog_alerts_paused_until'] = until
+    save_settings(settings)
+    return jsonify({'success': True, 'paused': True, 'until': until,
+                    'message': (f'Alerts paused for {duration}.' if duration
+                                else 'Alerts paused until you resume them.')})
+
+
+@app.route('/api/guarddog/notifications/status')
+@login_required
+def guarddog_notifications_status():
+    """Live pause state for the Guard Dog card. Reports the EFFECTIVE state, so an
+    elapsed snooze reads as resumed without anything having to write settings."""
+    settings = load_settings()
+    paused, until = _gd_alerts_pause_state(settings)
+    return jsonify({
+        'paused': paused,
+        'until': until if paused else '',
+        'indefinite': bool(paused and not until),
+        'has_email': bool((settings.get('guarddog_alert_email') or '').strip()),
+        'has_sms': bool((settings.get('guarddog_sms') or {}).get('provider')),
+    })
+
 
 @app.route('/api/guarddog/sms/save', methods=['POST'])
 @login_required
@@ -19121,10 +19297,19 @@ BODY_FILE="$2"
         p = os.path.join('/opt/tak-guarddog', name)
         _write_priv(p, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
 
-def _guarddog_send_sms_now(sms, text):
-    """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging."""
+def _guarddog_send_sms_now(sms, text, force=False):
+    """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging.
+
+    Returns {'suppressed': True} without sending when notifications are paused
+    (force=True bypasses, for the test button). See _gd_alerts_pause_state()."""
     text = (text or '')[:1600]
     out = {}
+    if not force:
+        paused, until = _gd_alerts_pause_state()
+        if paused:
+            print(f"[guarddog] alert SMS suppressed — notifications paused"
+                  f"{' until ' + until if until else ' (indefinite)'}", flush=True)
+            return {'suppressed': True}
     if sms.get('provider') == 'twilio':
         import base64
         import urllib.error
@@ -19224,8 +19409,11 @@ def guarddog_test_sms():
     if not sms or sms.get('provider') not in ('twilio', 'brevo'):
         return jsonify({'success': False, 'error': 'SMS not configured. Save Twilio or Brevo settings first.'}), 400
     try:
-        info = _guarddog_send_sms_now(sms, 'Guard Dog test - if you got this, SMS is working.')
+        info = _guarddog_send_sms_now(sms, 'Guard Dog test - if you got this, SMS is working.',
+                                      force=True)   # same reason as the test email
         msg = 'Test SMS sent to configured number(s).'
+        if _gd_alerts_pause_state(settings)[0]:
+            msg += ' Note: alerts are currently PAUSED, so real alerts are not being delivered.'
         if info.get('brevo_message_id') is not None:
             msg += f' Brevo message ID: {info["brevo_message_id"]} (check Brevo SMS logs if the text did not arrive).'
         return jsonify({'success': True, 'message': msg})
@@ -19364,7 +19552,7 @@ def run_guarddog_deploy(alert_email):
             content = open(src, 'r').read()
             cert_pass = _get_tak_cert_password(settings)
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
@@ -63762,7 +63950,7 @@ def _auto_update_guarddog():
             with open(src) as f:
                 content = f.read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
@@ -65734,7 +65922,7 @@ Reads guarddog_alert_email + email_relay from infra-TAK settings.json.
 Sends via localhost:25 (same Postfix relay Guard Dog uses). Exits cleanly
 if email is not configured so fail2ban does not treat it as an error.
 """
-import sys, os, json, smtplib, subprocess
+import sys, os, re, json, smtplib, subprocess
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
@@ -65782,6 +65970,28 @@ def main():
               file=sys.stderr)
         sys.exit(0)
 
+    # Honour the Guard Dog notification pause. This script does its own SMTP rather
+    # than going through the console, so the helper-level gate does not cover it —
+    # without this, pausing alerts would silence everything EXCEPT ban notices, which
+    # is the surprise you would only find out about at 3am. Parsing mirrors
+    # _gd_alerts_pause_state(): an elapsed or unparseable deadline means NOT paused,
+    # so a bad timestamp can never mute bans permanently.
+    if settings.get('guarddog_alerts_paused'):
+        _until = (settings.get('guarddog_alerts_paused_until') or '').strip()
+        _muted = True
+        if _until:
+            try:
+                _dt = datetime.fromisoformat(_until.replace('Z', '+00:00'))
+                if _dt.tzinfo is None:
+                    _dt = _dt.replace(tzinfo=timezone.utc)
+                _muted = datetime.now(timezone.utc) < _dt
+            except Exception:
+                _muted = False
+        if _muted:
+            print("infratak-f2b-notify: notifications paused — no email sent",
+                  file=sys.stderr)
+            sys.exit(0)
+
     relay     = settings.get('email_relay', {})
     from_addr = relay.get('from_addr', 'noreply@localhost')
     from_name = relay.get('from_name', 'Guard Dog')
@@ -65808,15 +66018,18 @@ def main():
         f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
     )
 
+    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
+    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
+
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['From'] = f'{from_name} <{from_addr}>'
-    msg['To'] = to_addr
+    msg['To'] = ', '.join(recipients)
     msg['Subject'] = subject
 
     try:
         with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
-            smtp.sendmail(from_addr, [to_addr], msg.as_string())
-        print(f"infratak-f2b-notify: alert sent to {to_addr}", file=sys.stderr)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
     except Exception as e:
         print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
 
