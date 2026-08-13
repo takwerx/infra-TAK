@@ -64924,7 +64924,9 @@ def _startup_converge_mediamtx_banaction():
     except Exception as _e:
         print('Startup migration: mediamtx banaction converge warning (non-fatal): %s' % _e)
 
-_startup_converge_mediamtx_banaction()
+# NOT invoked here. This function is broker-dependent (_f2b_write_mediamtx_jail writes
+# under /etc), and module level runs before the broker-ready gate in _startup_migrations().
+# It is called from the fail2ban self-heal block there instead — see the note at that call.
 
 
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
@@ -66695,6 +66697,20 @@ def _startup_migrations():
             _f2b_selfheal_trusted_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e3:
             print(f"Startup migration: fail2ban trusted-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
+
+        # v10.1.30 — converge the mediamtx jail's ban action to media-ports-only. MUST run
+        # here, inside _startup_migrations() and therefore AFTER the broker-ready gate
+        # above — not at import time. Its first home was module level beside
+        # _startup_reapply_f2b_trusted_ignoreip(), which executes before the broker is
+        # mediating: on test12 that produced `exit status 125` from the broker on both the
+        # first restart and the retry, so the fix never landed and the jail kept banning on
+        # every port. It was not a race — it reproduced exactly. Same window that ate the
+        # Caddy re-assert, the TAK Portal / CloudTAK recreates and the metrics collector on
+        # that box, all with `[Errno 111] Connection refused`.
+        try:
+            _startup_converge_mediamtx_banaction()
+        except Exception as _f2b_e3b:
+            print(f"Startup migration: mediamtx banaction converge error (non-fatal): {_f2b_e3b}", flush=True)
 
         # v10.1.11 — a jail that cannot fire is worse than no jail, because every
         # surface reports it as configured. Repair the two ways we shipped one:
