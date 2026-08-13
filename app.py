@@ -17100,6 +17100,16 @@ def _f2b_write_recidive_config(maxretry, findtime):
         "bantime  = -1\n"
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
+        # v10.1.30: never escalate a MEDIA ban into an all-ports one. recidive matches
+        # `Ban <HOST>` from EVERY jail, bans for -1 (permanent) and uses the all-ports
+        # action — so without this line the media-only scoping of mediamtx-rtsp is
+        # undone after `maxretry` bans, and a repeat video offender loses TAK Server
+        # and the console permanently. That is the exact incident this release exists
+        # to fix (Ryan F., 2026-08-11), just delayed by three bans — and it is most
+        # reachable in his own situation, a phone behind carrier NAT sharing one
+        # public IP. Repeat media abuse keeps earning media-scoped bans instead.
+        # Caught by /security-review before ship, 2026-08-13.
+        "ignoreregex = \\[mediamtx-rtsp\\] Ban\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         f"action   = {_f2b_banaction()}\n"
     )
@@ -64924,6 +64934,44 @@ def _startup_converge_mediamtx_banaction():
     except Exception as _e:
         print('Startup migration: mediamtx banaction converge warning (non-fatal): %s' % _e)
 
+
+def _startup_converge_recidive_media_exempt():
+    """v10.1.30: stop recidive from escalating a MEDIA ban into a permanent all-ports one.
+
+    Scoping the mediamtx jail to media ports is worth nothing while recidive is enabled:
+    it matches `Ban <HOST>` from every jail, bans for -1, and uses the ALL-PORTS action.
+    After `maxretry` media bans the offender loses TAK Server and the console —
+    permanently. Found by /security-review before the v10.1.30 ship; recidive was
+    enabled on all five fleet boxes at the time, so this was live everywhere, not
+    hypothetical.
+
+    Same convergence problem as the ban action: `_f2b_rewrite_all_jails()` only runs
+    when the trusted-CIDR list changes, so an existing recidive jail keeps whatever it
+    was written with. Narrow: only adds the exemption when it is missing, and rewrites
+    through `_f2b_write_recidive_config()` so stored thresholds survive."""
+    try:
+        if not _f2b_recidive_enabled():
+            return
+        path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
+        try:
+            with open(path) as _rf:
+                cur = _rf.read()
+        except OSError:
+            return
+        if 'mediamtx-rtsp' in cur:
+            return
+        c = _f2b_read_recidive_config()
+        _f2b_write_recidive_config(c['maxretry'], c['findtime'])
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                       capture_output=True, timeout=15)
+        print('Startup migration: ✓ recidive now ignores mediamtx-rtsp bans — it was '
+              'escalating a media-only ban into a PERMANENT all-ports one, undoing the '
+              'media scoping entirely (v10.1.30)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: recidive media-exempt converge warning (non-fatal): %s' % _e)
+
 # NOT invoked here. This function is broker-dependent (_f2b_write_mediamtx_jail writes
 # under /etc), and module level runs before the broker-ready gate in _startup_migrations().
 # It is called from the fail2ban self-heal block there instead — see the note at that call.
@@ -66711,6 +66759,12 @@ def _startup_migrations():
             _startup_converge_mediamtx_banaction()
         except Exception as _f2b_e3b:
             print(f"Startup migration: mediamtx banaction converge error (non-fatal): {_f2b_e3b}", flush=True)
+        # Must follow the above: scoping the mediamtx ban to media ports is undone by
+        # recidive, which escalates any repeat to a permanent ALL-PORTS ban.
+        try:
+            _startup_converge_recidive_media_exempt()
+        except Exception as _f2b_e3c:
+            print(f"Startup migration: recidive media-exempt converge error (non-fatal): {_f2b_e3c}", flush=True)
 
         # v10.1.11 — a jail that cannot fire is worse than no jail, because every
         # surface reports it as configured. Repair the two ways we shipped one:

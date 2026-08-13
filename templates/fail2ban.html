@@ -347,7 +347,7 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for <strong>failed stream authentication</strong> — credential guessing against RTSP/RTMP/SRT/WebRTC. Successful stream pulls are never counted, so a client opening many streams at once (a video wall, a multi-feed dashboard) cannot be banned by this jail. Guard Dog email alert fires on ban.<br><span style="color:var(--text-dim)">A ban here blocks the <strong>media ports only</strong> (1935/8322/8554/8555/8888/8889 tcp, 8000/8001/8189/8890 udp) — it can never cut the banned IP off from TAK Server or this console.</span></div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for <strong>failed stream authentication</strong> — credential guessing against RTSP/RTMP/SRT/WebRTC. Successful stream pulls are never counted, so a client opening many streams at once (a video wall, a multi-feed dashboard) cannot be banned by this jail. Guard Dog email alert fires on ban.<br><span style="color:var(--text-dim)">A ban here blocks the <strong>media ports only</strong> (1935/8322/8554/8555/8888/8889 tcp, 8000/8001/8189/8890 udp), so it does not cut the banned IP off from TAK Server or this console. Repeat offenders keep earning media-scoped bans — the <em>Repeat Offenders</em> jail below is set to skip this one, because a permanent all-ports ban is exactly what this scoping exists to prevent.</span></div>
 
 <div id="mediamtx-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
