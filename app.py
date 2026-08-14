@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.32-alpha"
+VERSION = "10.1.33-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -28332,6 +28332,15 @@ hlsAddress: 0.0.0.0:8888
 hlsAllowOrigins: ['*']
 hlsTrustedProxies: ['127.0.0.1']
 webrtc: no
+# v10.1.33: MoQ OFF. Upstream defaults it ON with RELATIVE cert paths
+# (moqServerKey: auto.key / moqServerCert: auto.crt) that it generates into the
+# process CWD. Our unit is User=takwerx with no WorkingDirectory, so CWD is / and
+# the write is denied. Through v1.19.x that was survivable — warnings only. v1.20.0
+# added a native QUIC listener (moqQUICAddress: :8893) whose keypair load failure is
+# FATAL, so the same denied write now exits 1 and crash-loops the service. We never
+# used MoQ; turning it off also drops the 8892 listener that _KNOWN_PUBLIC_PORTS has
+# been carrying as an unexplained "aux listener".
+moq: no
 srt: yes
 srtAddress: :8890
 authMethod: internal
@@ -28941,6 +28950,11 @@ webrtc: no
 webrtcAddress: :8889
 webrtcEncryption: no
 webrtcAllowOrigins: ['*']
+
+# v10.1.33: MoQ OFF — see the note on the split-server template above. Upstream
+# defaults it ON with relative cert paths it cannot write as takwerx from CWD=/;
+# v1.20.0's native QUIC listener makes that failure fatal (exit 1, crash-loop).
+moq: no
 
 srt: yes
 srtAddress: :8890
@@ -65022,6 +65036,83 @@ def _startup_reapply_f2b_trusted_ignoreip():
 _startup_reapply_f2b_trusted_ignoreip()
 
 
+def _startup_converge_mediamtx_moq():
+    """v10.1.33: disable MoQ in an existing mediamtx.yml — since upstream v1.20.0 it
+    crash-loops mediamtx.service on every box we run.
+
+    REPORTED: pwtak, 2026-08-14 — `mediamtx.service` in auto-restart, NRestarts climbing
+    without bound, exit 1 every ~5s:
+        WAR [MoQ] certificate auto.key not found, generating it from scratch
+        WAR [MoQ] failed to save TLS key to auto.key: open auto.key: permission denied
+        ERR unable to load TLS keypair for native MoQ QUIC listener: open auto.crt: ...
+
+    ROOT CAUSE: we install the binary from bluenviron/mediamtx releases/latest, unpinned
+    (both deploy paths). MoQ defaults to ON with RELATIVE cert paths —
+    `moqServerKey: auto.key`, `moqServerCert: auto.crt` — generated into the process CWD.
+    Our unit is `User=takwerx` with no WorkingDirectory, so CWD is `/` and the write is
+    denied. That denial is not new; what changed is its consequence. Verified against the
+    real binaries with CWD=/:
+      v1.19.3  — same two "failed to save TLS key/cert" warnings, MoQ still starts on
+                 :8892, process SURVIVES. Silently exposed, but working.
+      v1.20.0  — adds a native QUIC listener (`moqQUICAddress: :8893`) that cannot fall
+                 back; "unable to load TLS keypair for native MoQ QUIC listener" is FATAL
+                 to the whole process → exit 1 → systemd Restart=always → crash-loop.
+    `moq: no` clears it with zero error lines on both versions.
+
+    Side benefit: this also stops the :8892 listener nobody here chose. It has been
+    sitting in _KNOWN_PUBLIC_PORTS as "aux listener" — the undeclared-listener check was
+    taught to ignore it instead of anyone identifying it as MoQ.
+
+    Why this needs a converge and not just the template fix: the templates only run on a
+    fresh deploy. Boxes already installed keep their on-disk mediamtx.yml, and the
+    "Update MediaMTX" action pulls the new binary onto that OLD config — so a working
+    box breaks the moment the operator updates. That is the wider blast radius, and the
+    operator should not have to redeploy MediaMTX to escape it.
+
+    NOT version-gated on purpose: MediaMTX does not reject the key on older binaries —
+    verified empirically against v1.19.3, which starts clean with `moq: no` present. So
+    it is safe to write regardless of which binary the box is running, and a box patched
+    today stays patched when it later updates to v1.20.0+.
+
+    Idempotent: any existing `moq:` key (ours or an operator's) is left alone."""
+    try:
+        cfg_path = '/usr/local/etc/mediamtx.yml'
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(cfg_path):
+            return
+        try:
+            with open(cfg_path) as _cf:
+                cur = _cf.read()
+        except OSError:
+            return
+        if re.search(r'(?m)^\s*moq\s*:', cur):
+            return
+        # Top-level key appended at column 0 — this terminates the trailing `paths:`
+        # block cleanly and is valid YAML wherever the file ends.
+        patched = cur.rstrip('\n') + (
+            '\n\n# v10.1.33: MoQ disabled. Upstream defaults it ON with relative cert\n'
+            '# paths (auto.key/auto.crt) it cannot write as takwerx from CWD=/. Since\n'
+            "# v1.20.0's native QUIC listener that failure is fatal — exit 1 on every\n"
+            '# start, forever. We do not use MoQ.\n'
+            'moq: no\n'
+        )
+        _write_priv(cfg_path, patched)
+        # Only bounce a service the operator has not deliberately stopped. In the broken
+        # state `is-active` reports activating/failed, never inactive, so the crash-loop
+        # case is still covered.
+        st = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                            capture_output=True, text=True, timeout=15)
+        if (st.stdout or '').strip() != 'inactive':
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']),
+                           capture_output=True, timeout=60)
+        print('Startup migration: ✓ MediaMTX MoQ disabled in mediamtx.yml — its default-on '
+              'QUIC listener cannot write auto.crt as takwerx, which crash-loops the '
+              'service on exit 1 under upstream v1.20.0+ (v10.1.33)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx MoQ converge warning (non-fatal): %s' % _e)
+
+
 def _startup_converge_mediamtx_banaction():
     """v10.1.30: converge the mediamtx jail's ban action to the media-ports-only form.
 
@@ -66899,6 +66990,14 @@ def _startup_migrations():
             _startup_converge_recidive_media_exempt()
         except Exception as _f2b_e3c:
             print(f"Startup migration: recidive media-exempt converge error (non-fatal): {_f2b_e3c}", flush=True)
+
+        # v10.1.33 — disable MoQ in an existing mediamtx.yml. Same reason this sits inside
+        # _startup_migrations() rather than at import time: it writes a privileged path and
+        # restarts a service, both of which need the broker mediating (see the note above).
+        try:
+            _startup_converge_mediamtx_moq()
+        except Exception as _mtx_moq_e:
+            print(f"Startup migration: mediamtx MoQ converge error (non-fatal): {_mtx_moq_e}", flush=True)
 
         # v10.1.32 — heal apt sources left pointing at a vanished install medium
         # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
