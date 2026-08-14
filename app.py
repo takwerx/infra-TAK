@@ -29416,20 +29416,55 @@ WantedBy=multi-user.target
 
             if _caddy_cert_pair_ready(cert_file, key_file):
                 yml = '/usr/local/etc/mediamtx.yml'
-                # Wire cert paths — strip continuation lines first then replace
-                for key in ['rtspServerKey', 'rtspServerCert', 'hlsServerKey', 'hlsServerCert', 'rtmpServerKey', 'rtmpServerCert']:
-                    subprocess.run(f"sed -i '/^{key}:/{{ n; /^  /d }}' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtspServerKey:.*|rtspServerKey: {key_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtspServerCert:.*|rtspServerCert: {cert_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^hlsServerKey:.*|hlsServerKey: {key_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^hlsServerCert:.*|hlsServerCert: {cert_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtmpServerKey:.*|rtmpServerKey: {key_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtmpServerCert:.*|rtmpServerCert: {cert_file}|' {yml}", shell=True)
-                # Enable encryption
-                subprocess.run(f"sed -i 's|^rtspEncryption:.*|rtspEncryption: \"optional\"|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' {yml}", shell=True)
-                plog(f"✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
-                plog(f"  Cert: {cert_file}")
+                # v10.1.33: this was eight `sed -i ... {yml}` calls with shell=True, no
+                # sudo and no return-code check. Every one of them FAILED on non-root:
+                # `sed -i` writes a temp file in the TARGET'S DIRECTORY, and /usr/local/etc
+                # is root:root 0755, so as takwerx sed dies with
+                # `couldn't open temporary file /usr/local/etc/sedXXXXXX: Permission denied`
+                # (rc=4). Owning the file is not enough — you need write on the directory.
+                # Nothing looked at rc, so the deploy printed "✓ SSL certificates wired"
+                # over eight silent failures, and mediamtx.yml kept rtspEncryption "no" and
+                # empty cert paths. Confirmed on test12 2026-08-14: deploy claimed success
+                # while the yml was untouched.
+                #
+                # Read-modify-write in Python and put it back through _write_priv (broker/
+                # root), which does not care about the directory's mode. Then VERIFY, so a
+                # failure can never again be reported as success.
+                try:
+                    try:
+                        with open(yml) as _yf:
+                            _txt = _yf.read()
+                    except (PermissionError, FileNotFoundError):
+                        _txt = _read_priv(yml)
+                    # Strip any indented continuation lines under the keys we rewrite —
+                    # what the old `/^key:/{ n; /^  /d }` pass was for.
+                    for _k in ('rtspServerKey', 'rtspServerCert', 'hlsServerKey',
+                               'hlsServerCert', 'rtmpServerKey', 'rtmpServerCert'):
+                        _txt = re.sub(r'(?m)^(%s:.*\n)(?:[ \t]+\S.*\n)*' % re.escape(_k),
+                                      r'\1', _txt)
+                    for _k, _v in (('rtspServerKey', key_file), ('rtspServerCert', cert_file),
+                                   ('hlsServerKey', key_file), ('hlsServerCert', cert_file),
+                                   ('rtmpServerKey', key_file), ('rtmpServerCert', cert_file),
+                                   ('rtspEncryption', '"optional"'), ('hlsEncryption', 'yes')):
+                        _new = '%s: %s' % (_k, _v)
+                        _txt, _n = re.subn(r'(?m)^%s:.*$' % re.escape(_k), _new.replace('\\', '\\\\'), _txt)
+                        if _n == 0:                      # key absent — append it
+                            _txt = _txt.rstrip('\n') + '\n' + _new + '\n'
+                    _write_priv(yml, _txt)
+                    # chown back: the web editor runs as takwerx and rewrites this file.
+                    subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
+                                   capture_output=True, timeout=15)
+                    _check = _read_priv(yml)
+                    if re.search(r'(?m)^hlsEncryption:\s*yes\s*$', _check) and cert_file in _check:
+                        plog("✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
+                        plog(f"  Cert: {cert_file}")
+                    else:
+                        plog("  ⚠ SSL wiring did not take — mediamtx.yml still shows encryption off")
+                        plog("     RTSPS/HTTPS-HLS are NOT active. Re-run the deploy after checking "
+                             "permissions on /usr/local/etc/mediamtx.yml")
+                except Exception as _sslw_e:
+                    plog(f"  ⚠ SSL wiring failed: {_sslw_e}")
+                    plog("     RTSPS/HTTPS-HLS are NOT active.")
 
                 # Grant MediaMTX (running as takwerx) read access to Caddy's LE cert files.
                 # Caddy stores certs as 0600 caddy:caddy under /var/lib/caddy/.local/share/caddy/...
@@ -29462,7 +29497,10 @@ WantedBy=multi-user.target
                     subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]), capture_output=True)
                     # daemon-reload so the SupplementaryGroups=caddy in the unit (written in Step 5) takes effect
                     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
-                    plog("  ✓ Cert read-access granted to MediaMTX (takwerx in caddy group)")
+                    # v10.1.33: message corrected — the group comes from the unit's
+                    # SupplementaryGroups=caddy, not from a usermod (which never ran).
+                    plog("  ✓ Cert read-access granted to MediaMTX (group-readable + "
+                         "SupplementaryGroups=caddy on the unit)")
                 except Exception as _e:
                     plog(f"  ⚠ Could not grant cert read-access: {_e}")
 
