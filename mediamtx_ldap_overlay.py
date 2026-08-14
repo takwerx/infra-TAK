@@ -68,6 +68,56 @@ def _ak_delete(path):
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
 
+    # ── v10.1.34: intercept the editor's own MediaMTX binary upgrade ──────────
+    # Two independent problems with the vendored editor's `POST
+    # /api/mediamtx/version/upgrade`, both live on every non-root box:
+    #
+    #  1. It cannot work. It backs the binary up to
+    #     /usr/local/bin/mediamtx.backup_<ts> before swapping. The editor runs as
+    #     takwerx and /usr/local/bin is root:root 0755, so it dies with
+    #     "[Errno 13] Permission denied" — confirmed on test8 (Ubuntu x86) and
+    #     aws-arm (ARM64) 2026-08-14. We do NOT fix this by widening
+    #     /usr/local/bin: that directory holds binaries root executes, so making
+    #     it takwerx-writable is the root-equivalence already rejected for this
+    #     module ([[mediamtx-editor-upgrade-broker-not-sudoers]]). The .33 trick
+    #     of widening the directory was safe for /usr/local/etc (MediaMTX files
+    #     only) and is NOT safe here.
+    #
+    #  2. It resolves bluenviron/mediamtx releases/latest on its own, so it would
+    #     push a box to an unvetted upstream build in one click — straight past
+    #     MEDIAMTX_VETTED_RELEASE. That is precisely how 10.1.33's MoQ crash-loop
+    #     would have reached a customer.
+    #
+    # So the button is answered here with the truth instead of a permission error,
+    # and the actual upgrade is left to the console's deploy path, which installs
+    # the pinned version with the right privileges. Lives in the overlay rather
+    # than as a source patch because the editor is cloned from `main` UNPINNED
+    # ([[mediamtx-editor-ref-unpinned]]) — a source edit is clobbered on re-pull,
+    # this module is re-copied by our deploy every time.
+    # Implemented as a before_request intercept rather than a competing @app.route:
+    # the editor registers the same rule itself, and which duplicate wins depends on
+    # werkzeug's map ordering and on where the overlay happens to be injected. A
+    # before_request hook runs first regardless, so this cannot silently stop working
+    # because an upstream re-pull moved a line.
+    _VETTED = os.environ.get('INFRATAK_MEDIAMTX_VETTED', '').strip()
+    _PINNED_PATHS = ('/api/mediamtx/version/upgrade',)
+
+    @app.before_request
+    def _infratak_block_unpinned_upgrade():
+        if request.method != 'POST' or request.path not in _PINNED_PATHS:
+            return
+        pinned = f' (v{_VETTED})' if _VETTED else ''
+        return jsonify({
+            'success': False,
+            'error': (
+                f'MediaMTX is pinned by infra-TAK{pinned}. Upgrading from here is '
+                'disabled so a box cannot be moved to an untested build. Update '
+                'MediaMTX from the infra-TAK console (MediaMTX module → Update), '
+                'which installs the vetted version.'),
+            'pinned_version': _VETTED or None,
+            'infratak_pinned': True,
+        }), 409
+
     VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/viewer/hlscred', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
 

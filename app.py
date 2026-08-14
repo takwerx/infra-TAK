@@ -28732,7 +28732,11 @@ paths:
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
             f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
         )
-    editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
+    # v10.1.34: INFRATAK_MEDIAMTX_VETTED lets the overlay name the pinned version in the
+    # message it returns when the editor's own upgrade button is used (see
+    # mediamtx_ldap_overlay.py). Absence is handled — the overlay still blocks, it just
+    # cannot quote a version.
+    editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\nEnvironment=INFRATAK_MEDIAMTX_VETTED={MEDIAMTX_VETTED_RELEASE}\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
@@ -29430,6 +29434,7 @@ Type=simple
 WorkingDirectory=/opt/mediamtx-webeditor
 Environment=PORT=5080
 Environment=MEDIAMTX_API_URL=http://127.0.0.1:9898
+Environment=INFRATAK_MEDIAMTX_VETTED={MEDIAMTX_VETTED_RELEASE}
 {ldap_env_lines}Restart=always
 RestartSec=5
 User=takwerx
