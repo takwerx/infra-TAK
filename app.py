@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.31-alpha"
+VERSION = "10.1.32-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -14228,6 +14228,14 @@ def _translate_known_failure(text):
     elif re.search(r'address already in use', t, re.I):
         out.append("→ A port infra-TAK needs is already in use on this host.")
         out.append("   Find the holder:  sudo ss -lptn   — free the port and retry.")
+    # v10.1.32 — the install medium left behind by an ISO/USB Ubuntu install.
+    if 'does not have a Release file' in t and re.search(r'cdrom|file:/', t):
+        out.append("→ An apt source still points at the USB/ISO this box was installed from, "
+                   "which is no longer present.")
+        out.append("   infra-TAK disables these automatically — restart the console "
+                   "(`sudo systemctl restart takwerx-console`) and retry.")
+        out.append("   Until it is fixed EVERY apt operation on this box fails, including OS "
+                   "security updates — not just this deploy.")
     if 'Conflicting values set for option Signed-By' in t:
         out.append("→ Another apt source already configures this repository with a different "
                    "signing-key path.")
@@ -60827,18 +60835,136 @@ def _pgdg_existing_apt_sources():
     return hits
 
 
+# ==========================================================================
+# v10.1.32 — apt sources that point at a vanished install medium
+# ==========================================================================
+# Ubuntu's ISO installer records the install medium as a REAL apt source:
+#   deb [check-date=no] file:///cdrom jammy main restricted     (subiquity, 22.04)
+#   deb cdrom:[Ubuntu-Server 22.04 ...] jammy main restricted   (older / desktop)
+# Pull the USB stick and EVERY apt operation on the box fails with
+#   E: The repository 'file:/cdrom jammy Release' does not have a Release file.
+# start.sh now clears this before the first install (see disable_dead_local_apt_sources
+# there). The SAME entry breaks an already-deployed box: the console re-runs
+# apt-get update on every repo add (Docker, PGDG, Caddy, MongoDB, TVR) and in the
+# OS patch job — where the failure is silent and the box simply stops receiving
+# security updates. Field-reported 2026-08-13 on a bare-metal 22.04 install; cloud
+# images never carry the entry, which is why the VPS fleet never surfaced it.
+_APT_ONELINE_RE = re.compile(r'^\s*deb(?:-src)?\s+(?:\[[^\]]*\]\s+)?(\S+)')
+
+
+def _apt_uri_is_dead_local(uri):
+    """True when `uri` names a local install medium that is no longer present.
+
+    A file:/ URI that STILL resolves to a real repository is not dead and must
+    never be disabled — offline/airgap installs are built on exactly those, and
+    breaking one would be a worse bug than the one this fixes. 'Real' = there is
+    a dists/ tree under the URI, the same test apt itself applies."""
+    if uri.startswith('cdrom:'):
+        return not any(os.path.isdir(os.path.join(m, 'dists'))
+                       for m in ('/media/cdrom', '/media/cdrom0', '/media/apt', '/cdrom'))
+    if uri.startswith('file:'):
+        return not os.path.isdir(os.path.join('/' + uri[len('file:'):].lstrip('/'), 'dists'))
+    return False
+
+
+def _apt_dead_local_sources():
+    """[(path, lineno, line_text, uri), …] — every ACTIVE one-line apt source
+    pointing at a missing install medium. deb822 (*.sources) is REPORTED by
+    start.sh but not rewritten here for the same reason: no field artifact of a
+    dead deb822 stanza exists to validate an automatic edit against."""
+    files = ['/etc/apt/sources.list']
+    try:
+        d = '/etc/apt/sources.list.d'
+        files += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith('.list')]
+    except Exception:
+        pass
+    hits = []
+    for p in files:
+        try:
+            with open(p, 'r', errors='replace') as f:
+                lines = f.read().splitlines()
+        except Exception:
+            continue
+        for i, ln in enumerate(lines, 1):
+            if not ln.strip() or ln.lstrip().startswith('#'):
+                continue
+            m = _APT_ONELINE_RE.match(ln)
+            if m and _apt_uri_is_dead_local(m.group(1)):
+                hits.append((p, i, ln, m.group(1)))
+    return hits
+
+
+def _apt_disable_dead_local_sources(log_fn=None):
+    """Comment out apt sources whose install medium is gone, keeping a timestamped
+    backup of every file touched. Returns the list of entries disabled (empty when
+    there was nothing to do, which is the case on every cloud-image box).
+
+    DEBIAN FAMILY ONLY, and never raises — a box that cannot be healed must still
+    reach the caller's own error handling with its original message intact."""
+    if _distro_family() == 'rhel':
+        return []
+    try:
+        hits = _apt_dead_local_sources()
+    except Exception:
+        return []
+    if not hits:
+        return []
+    stamp = time.strftime('%Y%m%d-%H%M%S', time.gmtime())
+    done = []
+    for p in sorted({h[0] for h in hits}):
+        mine = [h for h in hits if h[0] == p]
+        try:
+            with open(p, 'r', errors='replace') as f:
+                body = f.read()
+            # Backups go in /etc/apt itself, never in sources.list.d — apt scans
+            # that directory and emits an "invalid filename extension" notice for
+            # anything not *.list/*.sources, which would then ride along on every
+            # apt run the box ever does. /etc/apt is not scanned for sources.
+            bak = os.path.join('/etc/apt', f'{os.path.basename(p)}.infratak-{stamp}.bak')
+            _write_priv(bak, body)
+            lines = body.splitlines()
+            for _, lineno, _, _ in mine:
+                lines[lineno - 1] = (f'# disabled by infra-TAK {stamp} '
+                                     f'(install medium not present): {lines[lineno - 1]}')
+            _write_priv(p, '\n'.join(lines) + '\n')
+            done += mine
+            if log_fn:
+                for _, lineno, _, uri in mine:
+                    log_fn(f'  ✓ disabled dead apt source {p}:{lineno} → {uri} '
+                           f'(backup: {bak})')
+        except Exception as e:
+            if log_fn:
+                log_fn(f'  ⚠ could not disable dead apt source in {p}: {type(e).__name__}: {e}')
+    return done
+
+
 def _apt_update_capture(timeout=600):
     """`apt-get update` with the output KEPT. Returns (ok, combined_output).
 
     The old call was `apt-get update -qq > /dev/null 2>&1`, which threw away the
     only thing that could have explained the failure. -qq keeps the noise down
-    but still emits E: lines on stderr."""
-    try:
-        r = subprocess.run('apt-get update -qq', shell=True, capture_output=True, text=True,
-                           timeout=timeout, env=_broker_shim_env())
-        return r.returncode == 0, ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
-    except Exception as e:
-        return False, f'{type(e).__name__}: {e}'
+    but still emits E: lines on stderr.
+
+    v10.1.32: on failure, clear any dead install-medium source and retry ONCE.
+    That entry fails the update for reasons that have nothing to do with the repo
+    the caller is actually configuring, so without this the caller misdiagnoses a
+    USB-installed box as a broken PGDG/Docker/Caddy repo."""
+    def _run():
+        try:
+            r = subprocess.run('apt-get update -qq', shell=True, capture_output=True, text=True,
+                               timeout=timeout, env=_broker_shim_env())
+            return r.returncode == 0, ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
+        except Exception as e:
+            return False, f'{type(e).__name__}: {e}'
+
+    ok, out = _run()
+    if not ok and _apt_disable_dead_local_sources():
+        ok2, out2 = _run()
+        if ok2:
+            return True, (out + '\n[infra-TAK] disabled a dead install-medium apt source '
+                                'and retried — update succeeded.\n' + out2).strip()
+        return ok2, out2
+    return ok, out
 
 
 def _setup_pgdg_apt_source():
@@ -63113,6 +63239,14 @@ def _kernel_patch_start_job():
     load, active, sub, result, pid = _kernel_patch_unit_state()
     if active in ('active', 'activating') and pid:
         return (False, f"kernel patch already running (pid {pid})", pid)
+    # v10.1.32 — the patch script's first statement is
+    #   apt-get update || { FATAL; exit $rc; }
+    # so an apt source still pointing at a vanished USB/ISO install medium makes
+    # OS patching fail forever on that box, quietly. This is the worst place for
+    # that entry to survive: the operator sees a failed patch job, not a broken
+    # apt source. Clear it before firing rather than after diagnosing it. No-op on
+    # cloud images and on RHEL.
+    _apt_disable_dead_local_sources()
     # If unit is in a failed state from a previous run, reset so systemd
     # accepts a fresh start request with the same unit name. Only meaningful
     # if LoadState=loaded — a transient unit that doesn't exist post-reboot
@@ -66765,6 +66899,17 @@ def _startup_migrations():
             _startup_converge_recidive_media_exempt()
         except Exception as _f2b_e3c:
             print(f"Startup migration: recidive media-exempt converge error (non-fatal): {_f2b_e3c}", flush=True)
+
+        # v10.1.32 — heal apt sources left pointing at a vanished install medium
+        # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
+        # fixes the box for EVERY downstream apt path — Docker, PGDG, Caddy, MongoDB,
+        # TVR and the OS patch job — instead of each of them re-discovering it. A
+        # no-op on cloud images and on RHEL. Runs after the broker-ready gate above
+        # because the writes into /etc/apt are broker-mediated on non-root boxes.
+        try:
+            _apt_disable_dead_local_sources(lambda m: print(f"Startup migration:{m}", flush=True))
+        except Exception as _apt_e1:
+            print(f"Startup migration: dead apt source converge error (non-fatal): {_apt_e1}", flush=True)
 
         # v10.1.11 — a jail that cannot fire is worse than no jail, because every
         # surface reports it as configured. Repair the two ways we shipped one:

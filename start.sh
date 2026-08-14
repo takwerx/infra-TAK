@@ -367,6 +367,183 @@ wait_for_upgrades() {
 }
 
 # ==========================================
+# Dead local apt sources (the install medium) — v10.1.32
+# ==========================================
+# Ubuntu's ISO installer records the install medium as a REAL apt source:
+#   deb [check-date=no] file:///cdrom jammy main restricted     (subiquity, 22.04)
+#   deb cdrom:[Ubuntu-Server 22.04 ...] jammy main restricted   (older / desktop)
+# The moment the USB stick is pulled, EVERY apt operation on that box fails:
+#   E: The repository 'file:/cdrom jammy Release' does not have a Release file.
+# apt-get update then exits non-zero and install_dependencies() used to `exit 1`,
+# so infra-TAK died before it ever built the venv — on a box whose only fault was
+# being installed from a USB stick instead of a cloud image. Field-reported
+# 2026-08-13 (bare-metal Ubuntu 22.04). Cloud images never carry the entry, which
+# is why the VPS test fleet never saw it.
+#
+# We disable ONLY entries whose target is genuinely gone. A file:/ source that
+# still resolves to a real repository is left ALONE — offline/airgap installs
+# depend on exactly that, and silently breaking them would be a worse bug than
+# the one being fixed here. "Still real" = there is a dists/ tree under the URI.
+
+# 0 = dead local medium (disable it), 1 = leave it alone.
+_apt_uri_is_dead_local() {
+    local uri="$1" path="" m
+    case "$uri" in
+        cdrom:*)
+            # apt mounts cdrom: sources under /media. If any candidate carries a
+            # dists/ tree the medium really is present — keep the entry.
+            for m in /media/cdrom /media/cdrom0 /media/apt /cdrom; do
+                [ -d "$m/dists" ] && return 1
+            done
+            return 0
+            ;;
+        file:*)
+            path="$(printf '%s' "${uri#file:}" | sed 's|^/*|/|')"
+            [ -d "$path/dists" ] && return 1
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# URI of a one-line `deb`/`deb-src` entry, or nothing. The optional [options]
+# block is skipped; a cdrom: URI carrying a bracketed label truncates at the
+# first space, which is harmless — we only classify the scheme, never re-parse it.
+_apt_line_uri() {
+    printf '%s' "$1" | sed -nE 's/^[[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?([^[:space:]]+).*/\3/p'
+}
+
+# deb822 (*.sources) equivalents, DETECTION ONLY — reported in the failure
+# message, never rewritten. 24.04 uses this format; we have no field artifact of
+# a dead deb822 stanza to validate an automatic edit against, and mangling a
+# format we cannot test is not a trade worth making inside a hot fix.
+_apt_deb822_dead_report() {
+    local f
+    for f in /etc/apt/sources.list.d/*.sources; do
+        [ -f "$f" ] || continue
+        awk -v FILE="$f" '
+            function flush(   i, n, arr, u, dead, path) {
+                if (uris == "") { enabled = ""; return }
+                if (enabled == "no" || enabled == "false") { uris=""; enabled=""; return }
+                n = split(uris, arr, /[[:space:]]+/); dead = 0
+                for (i = 1; i <= n; i++) {
+                    u = arr[i]
+                    if (u == "") continue
+                    if (u ~ /^cdrom:/) { dead = 1; continue }
+                    if (u ~ /^file:/) {
+                        path = substr(u, 6); sub(/^\/+/, "/", path)
+                        if (system("test -d \"" path "/dists\"") != 0) dead = 1
+                        continue
+                    }
+                    dead = 0; break   # a live http(s) URI in the same stanza
+                }
+                if (dead) printf "%s: %s\n", FILE, uris
+                uris=""; enabled=""
+            }
+            /^[[:space:]]*$/                  { flush(); next }
+            /^[Uu][Rr][Ii][Ss]:/              { sub(/^[^:]*:[[:space:]]*/, ""); uris=$0; next }
+            /^[Ee][Nn][Aa][Bb][Ll][Ee][Dd]:/  { sub(/^[^:]*:[[:space:]]*/, ""); enabled=tolower($0); next }
+            END { flush() }
+        ' "$f" 2>/dev/null
+    done
+}
+
+# Populated by disable_dead_local_apt_sources(), consumed by the failure message.
+APT_DEB822_DEAD=""
+
+disable_dead_local_apt_sources() {
+    [ "$PKG_MGR" = "apt" ] || return 0
+
+    local stamp notes f tmp line out trimmed uri changed
+    stamp="$(date -u +%Y%m%d-%H%M%S)"
+    notes="$(mktemp)"
+
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        changed=0
+        tmp="$(mktemp)"
+        while IFS= read -r line || [ -n "$line" ]; do
+            out="$line"
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            case "$trimmed" in
+                deb\ *|deb-src\ *|deb"	"*|deb-src"	"*)
+                    uri="$(_apt_line_uri "$line")"
+                    if [ -n "$uri" ] && _apt_uri_is_dead_local "$uri"; then
+                        out="# disabled by infra-TAK ${stamp} (install medium not present): ${line}"
+                        changed=1
+                        echo "    · ${f}  →  ${trimmed}" >> "$notes"
+                    fi
+                    ;;
+            esac
+            printf '%s\n' "$out"
+        done < "$f" > "$tmp"
+        if [ "$changed" = "1" ]; then
+            # Backups live in /etc/apt itself, never in sources.list.d — apt scans
+            # that directory and emits an "invalid filename extension" notice for
+            # anything not *.list/*.sources, which would then ride along on every
+            # apt run the box ever does. /etc/apt is not scanned for sources.
+            cp -a "$f" "/etc/apt/$(basename "$f").infratak-${stamp}.bak" 2>/dev/null
+            cat "$tmp" > "$f"
+        fi
+        rm -f "$tmp"
+    done
+
+    if [ -s "$notes" ]; then
+        echo -e "${YELLOW}  Disabled apt sources that point at a missing install medium:${NC}"
+        cat "$notes"
+        echo -e "${YELLOW}    (originals saved as /etc/apt/*.infratak-${stamp}.bak)${NC}"
+        echo -e "${YELLOW}    This box was installed from a USB/ISO. apt cannot reach that medium${NC}"
+        echo -e "${YELLOW}    any more, which would have blocked every package operation.${NC}"
+    fi
+    rm -f "$notes"
+
+    APT_DEB822_DEAD="$(_apt_deb822_dead_report)"
+}
+
+# apt-get update still failed after the preflight. Say what to DO about it — the
+# raw 20-line apt tail above is accurate and useless to most operators. Every
+# branch here appends to the real output, it never replaces it.
+explain_apt_update_failure() {
+    local log="$1" body
+    body="$(cat "$log" 2>/dev/null)"
+    echo ""
+    echo -e "${YELLOW}  What this means:${NC}"
+
+    if [ -n "$APT_DEB822_DEAD" ]; then
+        echo "    A deb822 apt source still points at an install medium that is not present:"
+        printf '      %s\n' "$APT_DEB822_DEAD"
+        echo "    Set 'Enabled: no' on that stanza (or delete it), then re-run this script."
+    elif printf '%s' "$body" | grep -q "does not have a Release file"; then
+        echo "    An apt repository has no Release file — it is unreachable or not a repository."
+        echo "    If the name mentions cdrom or /cdrom, this box was installed from a USB/ISO"
+        echo "    and apt is still pointed at that stick. Comment the line out:"
+        echo "      sudo sed -i -E '/^[^#]*(cdrom:|file:\\/)/s/^/#/' /etc/apt/sources.list"
+        echo "      sudo apt-get update"
+    fi
+
+    if printf '%s' "$body" | grep -q "Conflicting values set for option Signed-By"; then
+        echo "    Two apt sources configure the same repository with different signing keys."
+        echo "    Remove the duplicate under /etc/apt/sources.list.d/ (keep exactly ONE)."
+        echo "    Until that is fixed EVERY apt operation on this box fails — not just ours."
+    fi
+    if printf '%s' "$body" | grep -q "The list of sources could not be read"; then
+        echo "    apt cannot read its source list — an entry is malformed or conflicting."
+        echo "    All package operations on this box are blocked until it is fixed."
+    fi
+    if printf '%s' "$body" | grep -qE "Temporary failure resolving|Could not resolve|Connection timed out"; then
+        echo "    This box cannot reach the package mirrors — check DNS and outbound network."
+        echo "      ping -c1 archive.ubuntu.com   /   cat /etc/resolv.conf"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}  Confirm apt is healthy, then re-run this script:${NC}"
+    echo "      sudo apt-get update     # must exit 0"
+    echo ""
+    echo -e "${YELLOW}  If you are stuck, open an issue with the output above:${NC}"
+    echo "      https://github.com/takwerx/infra-TAK/issues"
+}
+
+# ==========================================
 # Install Python Dependencies
 # ==========================================
 install_dependencies() {
@@ -378,9 +555,11 @@ install_dependencies() {
         apt)
             export DEBIAN_FRONTEND=noninteractive
             export NEEDRESTART_MODE=a
+            disable_dead_local_apt_sources
             if ! apt-get update -qq > "$apt_log" 2>&1; then
                 echo -e "${RED}  apt-get update failed:${NC}"
                 tail -20 "$apt_log"
+                explain_apt_update_failure "$apt_log"
                 rm -f "$apt_log"
                 exit 1
             fi
