@@ -65212,8 +65212,19 @@ _startup_reapply_f2b_trusted_ignoreip()
 
 
 def _startup_converge_mediamtx_moq():
-    """v10.1.33: disable MoQ in an existing mediamtx.yml — since upstream v1.20.0 it
-    crash-loops mediamtx.service on every box we run.
+    """v10.1.33: disable MoQ in an existing mediamtx.yml — on v1.20.0+ it crash-loops
+    mediamtx.service wherever the unit runs as takwerx.
+
+    SCOPE (measured across the dev fleet 2026-08-14, correcting an earlier overstatement
+    that this hits "every box"). The crash needs BOTH conditions:
+      * unit `User=takwerx` — CWD is / and the MoQ cert write is denied
+      * binary v1.20.0+ — the native QUIC listener makes that denial fatal
+    Fleet at the time: test12/nuc/aws-arm ran takwerx units (test12 on v1.20.0 = the
+    crash; nuc v1.19.3 and aws-arm v1.19.2 = warnings only, inoculated for later).
+    test6/test8 still carry LEGACY root units the non-root flip never rewrote — there the
+    write SUCCEEDS, so instead of crashing they had been quietly dropping /auto.crt and
+    /auto.key in the filesystem root (test6's were dated Jun 23) and serving MoQ on
+    8892/8893. Disabling MoQ fixes both shapes; test6 confirmed 8892/8893 closed after.
 
     REPORTED: pwtak, 2026-08-14 — `mediamtx.service` in auto-restart, NRestarts climbing
     without bound, exit 1 every ~5s:
