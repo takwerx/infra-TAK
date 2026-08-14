@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.32-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.32-alpha)**
+**Current release: [v10.1.33-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.33-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.33-alpha — 2026-08-14 — the video server stops restarting forever, and secure streaming finally switches on
+
+**Headline: if your video server refused to come up after an update — restarting every few seconds, endlessly — this release fixes it, along with three further video faults that were hiding behind it.** The streaming software we install published a new version that switches on a new experimental protocol by default. That protocol tries to write itself a security certificate into a location our servers deliberately do not allow it to write to, and in the newest version that single failure takes the **entire** video server down with it, so it restarts every five seconds and never recovers. Anyone who installed or updated their video component in the last few days would have hit this. We never used that protocol, so it is now switched off; servers already running are corrected automatically on the next console update, with no need to reinstall anything. Fixing that uncovered three more problems, all now fixed. **Secure streaming had never actually been turned on** — the installer looked for your SSL certificate in a folder it was not permitted to read, concluded the certificate did not exist, and skipped the whole setup, while the certificate sat there perfectly valid. It then reported "SSL certificates wired" regardless, so nothing looked wrong. Encrypted RTSP was therefore unavailable on every affected server. The installer now checks correctly, confirms the change actually took effect, and says so plainly when it has not. Existing servers have this applied for them automatically. **The video settings page could not save anything** — pressing Save returned "Failed to save settings" for the same underlying reason. It works now. **The video server and its settings page were running with full administrator rights** on servers set up before our move to restricted accounts; both now run with the limited account the rest of the stack uses, and the configuration file holding your stream passwords is no longer readable by other accounts on the machine. **Who should update:** anyone running the video server — particularly if it is stuck restarting, if you have never been able to use secure streaming, or if the settings page refuses to save. **Upgrade:** automatic on the next console update; every correction applies itself, with nothing to reconfigure and no redeployment needed.
+
+Full notes: [v10.1.33-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.33-alpha).
 
 ### v10.1.32-alpha — 2026-08-14 — installs no longer stop dead on a server built from a USB stick
 
