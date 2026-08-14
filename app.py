@@ -9758,8 +9758,10 @@ def mediamtx_page():
         mediamtx_channel=mtx_vinfo.get('channel') or 'main',
         mediamtx_ahead_of_vetted=mtx_vinfo.get('ahead_of_vetted', False),
         mediamtx_upstream_latest=mtx_vinfo.get('upstream_latest') or '',
-        mediamtx_upstream_newer=(mtx_vinfo.get('upstream_newer', False)
-                                 and (settings.get('update_channel') == 'dev')),
+        # Channel gating lives in the TEMPLATE (same as Authentik), not here: `vetted ✓`
+        # shows only on main, `↑ upstream` only on dev. Gating twice made the module page
+        # and the console card disagree.
+        mediamtx_upstream_newer=mtx_vinfo.get('upstream_newer', False),
         mediamtx_upstream_url=mtx_vinfo.get('upstream_url') or '')
 
 
