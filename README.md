@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.31-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.31-alpha)**
+**Current release: [v10.1.32-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.32-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.32-alpha — 2026-08-14 — installs no longer stop dead on a server built from a USB stick
+
+**Headline: if the installer stopped with a "does not have a Release file" error and refused to go any further, this release fixes it.** Some servers installed from a USB stick or ISO are left with Ubuntu still listing that install medium as a place to fetch software from. The moment the stick comes out, **every** software operation on that machine fails — not just ours — and infra-TAK's installer stopped at its first step, printed the raw error, and left you to find and hand-edit a system file before you could get any further. That underlying problem is an open defect in Ubuntu's own installer, not anything you did wrong. infra-TAK now recognises the situation and handles it: it backs the file up, switches off **only** the entry pointing at the missing medium, tells you exactly what it changed and where the backup went, and carries on with the install. Servers already running get the same repair automatically on their next console update — which matters more than it sounds, because that leftover entry also silently blocks operating-system security updates. Genuine offline/local software mirrors are checked and left untouched. The installer also now explains several other package-system failures in plain language instead of printing raw output at you. **Who should update:** anyone installing on hardware built from a USB/ISO, and every existing server — the blocked-security-updates repair applies to all of them. **Upgrade:** automatic on the next console update; nothing to reconfigure.
+
+Full notes: [v10.1.32-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.32-alpha).
 
 ### v10.1.31-alpha — 2026-08-14 — map feeds stop deleting fires that are still burning
 
