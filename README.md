@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.30-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.30-alpha)**
+**Current release: [v10.1.31-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.31-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.31-alpha — 2026-08-14 — map feeds stop deleting fires that are still burning
+
+**Headline: a wildfire perimeter could appear on your map, vanish five minutes later, come back, and vanish again — for an hour — while your phone was repeatedly asked to delete it.** During a live incident, the newest perimeter of an active fire kept being stripped off responders' screens, and two phones watching the same feed ended up showing different fires. The cause was upstream, but the damage was ours. Public map services are served through a caching network, and the fire perimeter service is configured to hold each cached copy for a full hour — on data that is updated several times an hour by aircraft. So two consecutive checks, five minutes apart, could get genuinely contradictory answers about whether a fire exists. Our map feed treated **every single check as the whole truth**: anything missing from one response was deleted immediately, and a "delete this" instruction was then broadcast to every connected device. One stale answer was all it took to pull a live fire off every screen. Feeds now refuse to trust a single check. Requests are made so they cannot be answered from a stale cache; anything that goes missing must stay missing across several consecutive checks before it is removed; a shape the map still holds can never be deleted off a device; and a single check claiming that most of a feed has disappeared is ignored until it repeats. New data still appears immediately — only removals are cautious. **Who should update:** anyone running ArcGIS map feeds, especially wildfire perimeter feeds. **Upgrade:** automatic on the next console update; your feeds are corrected for you, with nothing to reconfigure.
+
+Full notes: [v10.1.31-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.31-alpha).
 
 ### v10.1.30-alpha — 2026-08-13 — watching your own video streams could get you banned off your own server
 
