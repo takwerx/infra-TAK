@@ -26,10 +26,22 @@ STATE_FILE="/var/lib/takguard/feedsource_notified"
 LOG_FILE="/var/log/takguard/feedsource.log"
 CURL_TIMEOUT=20
 
-# Fleet constant, not a per-customer knob (see the fleet-uniform rules). 6h is well
-# clear of normal publication gaps - FIRIS flies several times a day, outage feeds
-# update continuously - while still catching a dead pipeline the same working day.
-STALE_HOURS=6
+# SELF-CALIBRATING, not a fixed threshold. First live run (test12, 2026-08-14) proved
+# why: a single 6h rule correctly passed CA AIR INTEL and POWER-OUTAGES, but flagged
+# "NWS Response Zones" as STALE at 217h - and that layer is an NWS administrative
+# BOUNDARY set which is redrawn every few months. It was perfectly healthy. A watcher
+# that emails about healthy feeds gets muted, and then it is worthless precisely when
+# it matters.
+#
+# So we learn each layer's own cadence instead (deterministic auto-tune - same logic on
+# every box, no operator knob, per the fleet-uniform rules). We remember the largest gap
+# we have ever OBSERVED between edits for that layer, and alert only when the current
+# silence is well past it. A fire feed that normally updates hourly alerts within hours;
+# a boundary layer that normally updates monthly does not alert until it is months late.
+STALE_FLOOR_H=6          # never alert sooner than this, however chatty the feed
+STALE_GAP_MULTIPLE=3     # ... or sooner than 3x the largest gap ever seen for it
+STALE_UNKNOWN_H=720      # no cadence learned yet (30d) - catches a feed dead since install
+BASELINE_FILE="/var/lib/takguard/feedsource_baseline"
 
 NR_CTX="/var/lib/docker/volumes/node-red_node_red_data/_data/context/global/global.json"
 
@@ -89,15 +101,41 @@ while IFS=$'\t' read -r NAME URL LAYER; do
   fi
   LAST_EPOCH=$((LAST_MS / 1000))
   AGE_H=$(( (NOW_EPOCH - LAST_EPOCH) / 3600 ))
-  if [ "$AGE_H" -ge "$STALE_HOURS" ]; then
+  # Learn this layer's cadence and get back the threshold to judge it by.
+  THRESH_H=$(python3 - "$BASELINE_FILE" "$NAME" "$LAST_EPOCH" "$STALE_FLOOR_H" "$STALE_GAP_MULTIPLE" "$STALE_UNKNOWN_H" <<'PYB' 2>/dev/null
+import os, sys
+path, name, last_s, floor_h, mult, unknown_h = sys.argv[1:7]
+last = int(last_s); floor_h = int(floor_h); mult = int(mult); unknown_h = int(unknown_h)
+rows = {}
+if os.path.exists(path):
+    for line in open(path):
+        parts = line.rstrip("\n").split("|")
+        if len(parts) == 3:
+            rows[parts[0]] = (int(parts[1]), int(parts[2]))
+prev_edit, max_gap = rows.get(name, (0, 0))
+if prev_edit and last > prev_edit:
+    max_gap = max(max_gap, last - prev_edit)   # observed a real publication interval
+rows[name] = (max(last, prev_edit), max_gap)
+tmp = path + ".tmp"
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(tmp, "w") as f:
+    for k, (e, g) in rows.items():
+        f.write("%s|%d|%d\n" % (k, e, g))
+os.replace(tmp, path)
+# No cadence learned yet -> only a very long silence is evidence of death.
+print(unknown_h if max_gap == 0 else max(floor_h, (max_gap * mult) // 3600))
+PYB
+)
+  THRESH_H=${THRESH_H:-$STALE_UNKNOWN_H}
+  if [ "$AGE_H" -ge "$THRESH_H" ]; then
     LAST_ISO=$(date -u -d "@${LAST_EPOCH}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || date -u -r "${LAST_EPOCH}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null)
-    STALE="${STALE}  - ${NAME}: source last updated ${LAST_ISO} (${AGE_H}h ago)\n      ${URL}/${LAYER}\n"
+    STALE="${STALE}  - ${NAME}: source last updated ${LAST_ISO} (${AGE_H}h ago, expected within ${THRESH_H}h)\n      ${URL}/${LAYER}\n"
     # Signature keyed on the feed and the day it went stale, so a feed that stays dead
     # re-alerts daily rather than every run.
     SIG="${SIG}${NAME}:$((LAST_EPOCH / 86400));"
-    log_msg "$NAME: STALE - source last edit ${AGE_H}h ago (threshold ${STALE_HOURS}h)"
+    log_msg "$NAME: STALE - source last edit ${AGE_H}h ago (learned threshold ${THRESH_H}h)"
   else
-    log_msg "$NAME: ok - source last edit ${AGE_H}h ago"
+    log_msg "$NAME: ok - source last edit ${AGE_H}h ago (threshold ${THRESH_H}h)"
   fi
 done <<< "$FEEDS"
 
@@ -128,7 +166,7 @@ This is a fault at the data publisher, not on this server. There is nothing to r
 Contact whoever publishes the service, or expect the map to keep showing old data until
 they resume.
 
-Threshold: no source edit in ${STALE_HOURS}h.
+Thresholds are learned per feed from how often that source normally publishes.
 "
 
   if echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
