@@ -65397,15 +65397,56 @@ def _startup_converge_mediamtx_editor_write():
 
         if need_dir:
             _mediamtx_grant_config_dir_write()
+        moved_off_root = False
         if need_umask and unit_txt:
-            # Insert beside the User= line so it lands inside [Service].
-            new_txt = re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nUMask=0027', unit_txt, count=1)
-            if 'UMask=0027' in new_txt:
+            # Match ANY User= value, not just takwerx. The first cut anchored on
+            # `User=takwerx` and therefore silently did nothing on test6/test8, whose
+            # editor units still say `User=root` — the same class of quiet no-op this
+            # whole release is about, in my own converge. Caught on the fleet 2026-08-14.
+            #
+            # Those legacy units are also why the editor's Save "worked" there: as root
+            # `sed -i` can write /usr/local/etc. So move the editor off root at the same
+            # time, matching the three boxes that already run it as takwerx (proven — a
+            # real save round-tripped on test12 with the config intact). Patch in place
+            # rather than rewriting: the unit carries per-box Environment/LDAP lines.
+            new_txt = re.sub(r'(?m)^User=\S+[ \t]*$', 'User=takwerx', unit_txt, count=1)
+            moved_off_root = 'User=root' in unit_txt
+            new_txt = re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nUMask=0027', new_txt, count=1)
+            if 'UMask=0027' not in new_txt:
+                # Never skip quietly — say why, so this cannot rot unnoticed.
+                print('Startup migration: ⚠ MediaMTX editor unit has no User= line to anchor '
+                      'UMask=0027 — mediamtx.yml may revert to 0644 (world-readable, it holds '
+                      'stream passwords) on the next editor save. Config-dir fix still applied '
+                      '(v10.1.33)')
+            else:
+                if moved_off_root:
+                    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx',
+                                               '/opt/mediamtx-webeditor']),
+                                   capture_output=True, timeout=30)
                 _write_priv(unit, new_txt)
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
                 subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                                capture_output=True, timeout=60)
+                ok = False
+                for _ in range(10):
+                    time.sleep(1)
+                    if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx-webeditor']),
+                                       capture_output=True, text=True, timeout=15
+                                       ).stdout or '').strip() == 'active':
+                        ok = True
+                        break
+                if not ok:
+                    _write_priv(unit, unit_txt)
+                    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+                    subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                                   capture_output=True, timeout=60)
+                    print('Startup migration: ⚠ MediaMTX web editor would not start after the '
+                          'unit change — ROLLED BACK and restarted. Editor still works; it is '
+                          'still running as before (v10.1.33)')
+                    return
         bits = []
+        if moved_off_root:
+            bits.append('web editor moved off root to takwerx')
         if need_dir:
             bits.append('config dir group-writable (editor Save was failing on every non-root box)')
         if need_umask:
