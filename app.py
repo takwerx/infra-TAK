@@ -28307,6 +28307,53 @@ def _stage_priv_file(src_path, dest_path):
     os.chmod(dest_path, 0o600)
 
 
+def _mediamtx_yml_wire_tls(txt, cert_file, key_file):
+    """Return mediamtx.yml text with Caddy's cert wired in and encryption enabled.
+
+    v10.1.33: shared by the deploy path and _startup_converge_mediamtx_ssl() so the two
+    can never drift. Pure text in, text out — no I/O, so it is testable and the caller
+    decides how to persist it (always _write_priv: /usr/local/etc is root:root 0755, so
+    anything that writes a temp file in that directory fails as takwerx)."""
+    # Strip indented continuation lines under the keys we rewrite (what the old
+    # `sed '/^key:/{ n; /^  /d }'` pass did).
+    for _k in ('rtspServerKey', 'rtspServerCert', 'hlsServerKey',
+               'hlsServerCert', 'rtmpServerKey', 'rtmpServerCert'):
+        txt = re.sub(r'(?m)^(%s:.*\n)(?:[ \t]+\S.*\n)*' % re.escape(_k), r'\1', txt)
+    for _k, _v in (('rtspServerKey', key_file), ('rtspServerCert', cert_file),
+                   ('hlsServerKey', key_file), ('hlsServerCert', cert_file),
+                   ('rtmpServerKey', key_file), ('rtmpServerCert', cert_file),
+                   ('rtspEncryption', '"optional"'), ('hlsEncryption', 'yes')):
+        _new = '%s: %s' % (_k, _v)
+        txt, _n = re.subn(r'(?m)^%s:.*$' % re.escape(_k), _new.replace('\\', '\\\\'), txt)
+        if _n == 0:                       # key absent — append it
+            txt = txt.rstrip('\n') + '\n' + _new + '\n'
+    return txt
+
+
+def _mediamtx_tls_wired(txt, cert_file):
+    """True when mediamtx.yml already has HLS encryption on and this cert wired.
+
+    `[ \\t]*` rather than `\\s*` — with (?m), \\s matches newlines and the pattern will
+    happily stitch two lines together. See the guard in _startup_converge_mediamtx_ssl()."""
+    return bool(re.search(r'(?m)^hlsEncryption:[ \t]*yes[ \t]*$', txt)) and cert_file in txt
+
+
+def _grant_caddy_cert_read(cert_base, cert_dir, cert_file, key_file):
+    """Make Caddy's LE cert readable by the mediamtx service (group caddy).
+
+    MediaMTX EXITS if a configured cert cannot be read, so this must succeed BEFORE
+    anything enables TLS in the config — otherwise wiring SSL converts a healthy box into
+    a crash-loop. The service gets group `caddy` from SupplementaryGroups= in its unit;
+    this opens the traversal + read bits it needs. No usermod: see the note at the deploy
+    call site ([[broker-privilege-boundary]])."""
+    for _d in ('/var/lib/caddy', '/var/lib/caddy/.local', '/var/lib/caddy/.local/share',
+               '/var/lib/caddy/.local/share/caddy',
+               '/var/lib/caddy/.local/share/caddy/certificates', cert_base, cert_dir):
+        subprocess.run(_sudo_wrap(['chmod', 'g+rx', _d]), capture_output=True, timeout=15)
+    subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]),
+                   capture_output=True, timeout=15)
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -29436,26 +29483,13 @@ WantedBy=multi-user.target
                             _txt = _yf.read()
                     except (PermissionError, FileNotFoundError):
                         _txt = _read_priv(yml)
-                    # Strip any indented continuation lines under the keys we rewrite —
-                    # what the old `/^key:/{ n; /^  /d }` pass was for.
-                    for _k in ('rtspServerKey', 'rtspServerCert', 'hlsServerKey',
-                               'hlsServerCert', 'rtmpServerKey', 'rtmpServerCert'):
-                        _txt = re.sub(r'(?m)^(%s:.*\n)(?:[ \t]+\S.*\n)*' % re.escape(_k),
-                                      r'\1', _txt)
-                    for _k, _v in (('rtspServerKey', key_file), ('rtspServerCert', cert_file),
-                                   ('hlsServerKey', key_file), ('hlsServerCert', cert_file),
-                                   ('rtmpServerKey', key_file), ('rtmpServerCert', cert_file),
-                                   ('rtspEncryption', '"optional"'), ('hlsEncryption', 'yes')):
-                        _new = '%s: %s' % (_k, _v)
-                        _txt, _n = re.subn(r'(?m)^%s:.*$' % re.escape(_k), _new.replace('\\', '\\\\'), _txt)
-                        if _n == 0:                      # key absent — append it
-                            _txt = _txt.rstrip('\n') + '\n' + _new + '\n'
+                    _txt = _mediamtx_yml_wire_tls(_txt, cert_file, key_file)
                     _write_priv(yml, _txt)
                     # chown back: the web editor runs as takwerx and rewrites this file.
                     subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
                                    capture_output=True, timeout=15)
                     _check = _read_priv(yml)
-                    if re.search(r'(?m)^hlsEncryption:\s*yes\s*$', _check) and cert_file in _check:
+                    if _mediamtx_tls_wired(_check, cert_file):
                         plog("✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
                         plog(f"  Cert: {cert_file}")
                     else:
@@ -65254,6 +65288,121 @@ def _startup_converge_mediamtx_moq():
         print('Startup migration: mediamtx MoQ converge warning (non-fatal): %s' % _e)
 
 
+def _startup_converge_mediamtx_ssl():
+    """v10.1.33: wire Caddy's cert into an existing MediaMTX that never got SSL.
+
+    Companion to _caddy_cert_pair_ready(). That fix repairs the DEPLOY path, but a box
+    deployed before it keeps a mediamtx.yml with `rtspEncryption: "no"` and empty cert
+    paths, and there is no redeploy button ([[no-redeploy-button-on-installed-modules]]).
+    Every non-root box that installed MediaMTX since the flip is in that state: RTSPS on
+    8322 has never worked on any of them.
+
+    Why nobody noticed: the deploy failed to set `hlsEncryption` AND Caddy was told "no
+    cert → use the http upstream". Both halves were wrong in the SAME direction, so HLS
+    playback kept working. Only RTSPS was actually lost. That accident is also the hazard
+    here — flipping MediaMTX to TLS without regenerating Caddy would leave Caddy proxying
+    http to an https listener and BREAK working video with a 400. So this converge is
+    ordered to never leave the box in a mismatched state, and rolls back if it cannot
+    finish:
+
+      1. grant cert read access FIRST — MediaMTX exits hard on an unreadable cert, so
+         doing this after the config flip would crash-loop a healthy box
+      2. keep the old yml in memory, write the wired one, verify it read back
+      3. restart mediamtx and confirm it is actually active
+      4. only then regenerate Caddy so /hls-proxy switches to the https backend
+      5. any failure → restore the original yml, restart, log loudly and leave Caddy alone
+
+    Deliberately narrow. It acts ONLY on the exact broken shape — TLS off and no cert
+    wired — so a box with custom certs, a deliberate plaintext setup, or an already-wired
+    config is untouched. Split-server installs are skipped: the yml lives on the remote
+    host and belongs to that deploy path."""
+    try:
+        yml = '/usr/local/etc/mediamtx.yml'
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(yml):
+            return
+        settings = load_settings()
+        if not settings.get('fqdn'):
+            return                      # no domain → no LE cert to wire (port-5080 plaintext)
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        if cfg.get('target_mode') == 'remote':
+            return                      # remote yml — not ours to rewrite from here
+        mtx_domain = _get_service_domain(settings, 'mediamtx')
+        if not mtx_domain:
+            return
+        try:
+            with open(yml) as _f:
+                cur = _f.read()
+        except (PermissionError, FileNotFoundError):
+            cur = _read_priv(yml)
+        except OSError:
+            return
+
+        cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+        cert_dir  = f'{cert_base}/{mtx_domain}'
+        cert_file = f'{cert_dir}/{mtx_domain}.crt'
+        key_file  = f'{cert_dir}/{mtx_domain}.key'
+
+        if _mediamtx_tls_wired(cur, cert_file):
+            return                      # already correct
+        # Only touch the known-broken shape: encryption off AND no cert of any kind wired.
+        # An operator's custom cert or a deliberate plaintext box must survive untouched.
+        #
+        # `[ \t]*`, NOT `\s*`: in multiline mode \s matches the NEWLINE, so `\s*\S` after
+        # an EMPTY `rtspServerCert:` runs on to the first character of the next line and
+        # reports a cert that isn't there. Caught in testing — the first version of this
+        # guard skipped every box it was written to repair.
+        if (re.search(r'(?m)^rtspServerCert:[ \t]*\S', cur)
+                or re.search(r'(?m)^hlsServerCert:[ \t]*\S', cur)):
+            return
+        if not re.search(r'(?m)^hlsEncryption:[ \t]*(no|false)[ \t]*$', cur):
+            return
+        if not _caddy_cert_pair_ready(cert_file, key_file):
+            return                      # cert not issued yet — deploy/renewal will handle it
+
+        # 1. read access BEFORE the config flip
+        _grant_caddy_cert_read(cert_base, cert_dir, cert_file, key_file)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+
+        # 2. write + verify
+        _write_priv(yml, _mediamtx_yml_wire_tls(cur, cert_file, key_file))
+        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+        if not _mediamtx_tls_wired(_read_priv(yml), cert_file):
+            _write_priv(yml, cur)
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            print('Startup migration: ⚠ MediaMTX SSL converge could not write mediamtx.yml '
+                  '— reverted, box unchanged (v10.1.33)')
+            return
+
+        # 3. restart and confirm it actually came up on the new config
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+        ok = False
+        for _ in range(10):
+            time.sleep(1)
+            if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                               capture_output=True, text=True, timeout=15
+                               ).stdout or '').strip() == 'active':
+                ok = True
+                break
+        if not ok:
+            # 5. roll back — a box with working HLS must not be left with a dead MediaMTX
+            _write_priv(yml, cur)
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+            print('Startup migration: ⚠ MediaMTX did not start with SSL wired — config '
+                  'ROLLED BACK and service restarted. RTSPS stays off; HLS unaffected. '
+                  'Check that the service can read %s (v10.1.33)' % cert_file)
+            return
+
+        # 4. Caddy last — /hls-proxy must follow MediaMTX to https or HLS 400s
+        _caddy_regenerate_if_fqdn()
+        print('Startup migration: ✓ MediaMTX SSL wired from Caddy cert — RTSPS (8322) and '
+              'HTTPS HLS now enabled; they had never been configured on this box (v10.1.33)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx SSL converge warning (non-fatal): %s' % _e)
+
+
 def _startup_converge_mediamtx_banaction():
     """v10.1.30: converge the mediamtx jail's ban action to the media-ports-only form.
 
@@ -67139,6 +67288,15 @@ def _startup_migrations():
             _startup_converge_mediamtx_moq()
         except Exception as _mtx_moq_e:
             print(f"Startup migration: mediamtx MoQ converge error (non-fatal): {_mtx_moq_e}", flush=True)
+
+        # v10.1.33 — wire Caddy's cert into a MediaMTX that never got SSL. MUST run after
+        # the MoQ converge: that one may restart mediamtx, and this one judges success by
+        # whether the service comes back up. Ordering them the other way would let a MoQ
+        # restart land mid-verification and trigger a needless rollback.
+        try:
+            _startup_converge_mediamtx_ssl()
+        except Exception as _mtx_ssl_e:
+            print(f"Startup migration: mediamtx SSL converge error (non-fatal): {_mtx_ssl_e}", flush=True)
 
         # v10.1.32 — heal apt sources left pointing at a vanished install medium
         # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
