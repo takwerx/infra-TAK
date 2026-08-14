@@ -19853,6 +19853,12 @@ def run_guarddog_deploy(alert_email):
             timers.append('takmediamtxguard.timer')
         if 'tak-nodered-watch.sh' in script_files:
             timers.append('taknoderedguard.timer')
+        if 'tak-feedsource-watch.sh' in script_files:
+            # v10.1.34. Registering a watcher takes THREE edits, not two: the script
+            # (script_files), the unit files (units), and enabling the timer HERE.
+            # Missing this one wrote both unit files and left the timer disabled and
+            # inactive — installed, invisible, and silent. Caught on test12 2026-08-14.
+            timers.append('takfeedsourceguard.timer')
         if 'tak-cloudtak-watch.sh' in script_files:
             timers.append('takcloudtakguard.timer')
         if 'tak-takportal-watch.sh' in script_files:
