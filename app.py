@@ -790,6 +790,22 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.6"   # v10.1.15: promoted — PG conn-leak + dramatiq broker fixes (5.5/5.6). 60-min soak on 4 boxes 2026-07-30 (test6, test12, nuc/Rocky-nonroot, aws-arm/ARM64) all clean; PG-bounce test on test12 PASSED with 0 CRITICALs (the 5.4 yellow-flag dramatiq cluster did not reproduce — hold rationale resolved)
+
+# Operator-vetted MediaMTX binary (bluenviron/mediamtx).  Same contract as
+# AUTHENTIK_VETTED_RELEASE: update this ONLY after T&E on the new upstream version.
+#
+# Why this is pinned (v10.1.34).  Deploys used to resolve releases/latest at install
+# time, so (a) the fleet drifted — five boxes were running four different versions —
+# and (b) an upstream default change could break every new install with no change on
+# our side.  That is exactly what happened in 10.1.33: upstream v1.20.0 turned the MoQ
+# QUIC listener's keypair failure FATAL, and fresh deploys crash-looped.  Pinning makes
+# an upstream release a deliberate, tested step instead of a surprise.
+#
+# Rollout is NEW INSTALLS + the explicit Update action only (operator decision
+# 2026-08-14).  There is deliberately NO startup converge that moves existing boxes:
+# MediaMTX exits hard on a bad cert/config, so an unattended version move on a live
+# streaming box is a crash-loop, not a warning.
+MEDIAMTX_VETTED_RELEASE = "1.20.0"      # v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
 AUTHENTIK_DEV_RELEASE    = "2026.5.6"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
@@ -9732,7 +9748,15 @@ def mediamtx_page():
         mediamtx_latest=mtx_vinfo.get('latest') or '',
         editor_version=mtx_vinfo.get('editor_version') or '',
         editor_update_available=mtx_vinfo.get('editor_update_available', False),
-        editor_latest=mtx_vinfo.get('editor_latest') or '')
+        editor_latest=mtx_vinfo.get('editor_latest') or '',
+        # v10.1.34: upstream awareness. Shown on DEV-channel boxes only — it is a
+        # prompt for the operator to run T&E on a new upstream release, never an
+        # action for a customer box (which must only ever move to the vetted pin).
+        mediamtx_vetted=mtx_vinfo.get('vetted') or '',
+        mediamtx_upstream_latest=mtx_vinfo.get('upstream_latest') or '',
+        mediamtx_upstream_newer=(mtx_vinfo.get('upstream_newer_than_vetted', False)
+                                 and (settings.get('update_channel') == 'dev')),
+        mediamtx_upstream_url=mtx_vinfo.get('upstream_url') or '')
 
 
 # ── NetBird VPN ─────────────────────────────────────────────────────────────
@@ -26568,28 +26592,42 @@ def _get_mediamtx_version_info():
                 out['version'] = _run_ver(f'{bin_path} -version 2>&1') or _run_ver(f'{bin_path} --version 2>&1')
                 if out['version']:
                     break
+    # v10.1.34: the binary is PINNED to MEDIAMTX_VETTED_RELEASE, so "update available"
+    # now means "this box is behind the VETTED version" — never "upstream shipped
+    # something". Before the pin this compared against releases/latest, which nagged
+    # every box toward an untested build; that is how 10.1.33's MoQ crash-loop would
+    # have spread. Upstream news is reported separately below and is a signal to the
+    # OPERATOR to run T&E, not an action for a customer box.
+    def _vparts(v):
+        p = [int(x) for x in _re.findall(r'\d+', v or '')[:3]]
+        return p + [0] * (3 - len(p))
+
+    out['vetted'] = MEDIAMTX_VETTED_RELEASE
+    out['latest'] = MEDIAMTX_VETTED_RELEASE  # what this box should be running
+    if out['version']:
+        out['update_available'] = _vparts(MEDIAMTX_VETTED_RELEASE) > _vparts(out['version'])
+    else:
+        # Version unknown (not installed, or the probe failed) — do not claim an update.
+        out['update_available'] = False
+
+    # Upstream awareness: is there a newer release than the one we have vetted?
+    # Surfaced so the operator knows to go test it; deliberately does NOT set
+    # update_available, so customer boxes are never pushed at an unvetted build.
     try:
         req = _ur.Request(
             'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
             headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
         with _ur.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
-        tag = (data or {}).get('tag_name') or ''
+        tag = ((data or {}).get('tag_name') or '').lstrip('vV')
         if tag:
-            out['latest'] = tag.lstrip('vV')
-            if out['version'] and out['latest']:
-                cur_parts = [int(x) for x in _re.findall(r'\d+', out['version'])[:3]]
-                lat_parts = [int(x) for x in _re.findall(r'\d+', out['latest'])[:3]]
-                while len(cur_parts) < 3:
-                    cur_parts.append(0)
-                while len(lat_parts) < 3:
-                    lat_parts.append(0)
-                if lat_parts > cur_parts:
-                    out['update_available'] = True
-            elif out['latest']:
-                out['update_available'] = True
+            out['upstream_latest'] = tag
+            out['upstream_newer_than_vetted'] = _vparts(tag) > _vparts(MEDIAMTX_VETTED_RELEASE)
+            out['upstream_url'] = (data or {}).get('html_url') or ''
     except Exception:
-        pass
+        # Offline or rate-limited: absence of upstream news must never look like news.
+        out['upstream_latest'] = None
+        out['upstream_newer_than_vetted'] = False
     # Web editor: current from CURRENT_VERSION on target, latest from takwerx/mediamtx-installer
     editor_info = _get_mediamtx_editor_version_info(deploy_cfg)
     out['editor_version'] = editor_info.get('version') or ''
@@ -28433,14 +28471,12 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
 
     # Step 2: Version + arch on remote
     plog("")
-    plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
-    r = subprocess.run('curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest', shell=True, capture_output=True, text=True, timeout=30)
-    m = _re.search(r'"tag_name":\s*"v([^"]+)"', r.stdout or '')
-    if not m:
-        plog("✗ Could not detect latest MediaMTX version")
-        mediamtx_deploy_status.update({'running': False, 'error': True})
-        return
-    version = m.group(1)
+    plog("━━━ Step 2/7: Selecting MediaMTX Version ━━━")
+    # v10.1.34: pinned to MEDIAMTX_VETTED_RELEASE, no longer releases/latest.
+    # Deploys used to resolve upstream-latest here, which is how 10.1.33's MoQ
+    # crash-loop reached fresh installs with no change on our side.
+    version = MEDIAMTX_VETTED_RELEASE
+    plog(f"  Vetted version: {version} (pinned — upstream releases are adopted only after T&E)")
     ok, arch_out = _module_run(deploy_cfg, 'uname -m', timeout=10)
     arch_raw = (arch_out or '').strip() or 'x86_64'
     arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
@@ -28982,24 +29018,17 @@ def run_mediamtx_deploy():
         if not created:
             plog("  ✓ takwerx system user already present")
 
-        # Step 2: Detect architecture and latest version
+        # Step 2: Detect architecture, select the vetted version
         plog("")
-        plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
+        plog("━━━ Step 2/7: Selecting MediaMTX Version ━━━")
         arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
         arch_raw = subprocess.run('uname -m', shell=True, capture_output=True, text=True).stdout.strip()
         mtx_arch = arch_map.get(arch_raw, 'amd64')
         plog(f"  Architecture: {arch_raw} → {mtx_arch}")
 
-        r = subprocess.run('curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
-            shell=True, capture_output=True, text=True, timeout=30)
-        import re as _re
-        m = _re.search(r'"tag_name":\s*"v([^"]+)"', r.stdout)
-        if not m:
-            plog("✗ Could not detect latest MediaMTX version")
-            mediamtx_deploy_status.update({'running': False, 'error': True})
-            return
-        version = m.group(1)
-        plog(f"✓ Latest version: {version}")
+        # v10.1.34: pinned to MEDIAMTX_VETTED_RELEASE, no longer releases/latest.
+        version = MEDIAMTX_VETTED_RELEASE
+        plog(f"✓ Vetted version: {version} (pinned — upstream releases are adopted only after T&E)")
 
         # Step 3: Download and install binary
         plog("")
