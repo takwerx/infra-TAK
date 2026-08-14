@@ -28354,6 +28354,50 @@ def _grant_caddy_cert_read(cert_base, cert_dir, cert_file, key_file):
                    capture_output=True, timeout=15)
 
 
+_MEDIAMTX_CONF_DIR = '/usr/local/etc'
+
+
+def _mediamtx_grant_config_dir_write(plog=None):
+    """Let the web editor actually save: group-write on MediaMTX's config DIRECTORY.
+
+    v10.1.33. The editor runs as takwerx and its save handlers shell out to `sed -i`
+    (12+ call sites in the upstream editor we vendor). `sed -i` writes a temp file in the
+    TARGET'S DIRECTORY and renames it over the original, so owning mediamtx.yml is not
+    enough — `/usr/local/etc` is root:root 0755 and every save failed with
+    `sed: couldn't open temporary file /usr/local/etc/sedXXXXXX: Permission denied` (rc=4).
+    The UI reported "Failed to save settings", so Basic/Protocols/encryption settings could
+    not be changed from the console on ANY non-root box.
+
+    Directory permission rather than a source patch, deliberately: the editor is cloned
+    from `main` UNPINNED ([[mediamtx-editor-ref-unpinned]]), so a patched `sed` call is
+    clobbered on the next re-pull. On our boxes this directory holds only MediaMTX's own
+    files (verified across the fleet), so the widening stays scoped to this module.
+
+    Also tightens mediamtx.yml to 0640. It carries `authInternalUsers` passwords and has
+    been 0644 world-readable. That hardening only sticks because the editor unit sets
+    `UMask=0027` — `sed -i` creates a NEW file, so without the umask the mode silently
+    reverts to 0644 on the next save."""
+    def _log(m):
+        if plog:
+            plog(m)
+    try:
+        # `chown root:takwerx`, not `chgrp` — chgrp is not in the broker allowlist and
+        # would be denied on a routed box; chown is, and does the same job.
+        subprocess.run(_sudo_wrap(['chown', 'root:takwerx', _MEDIAMTX_CONF_DIR]),
+                       capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['chmod', '775', _MEDIAMTX_CONF_DIR]),
+                       capture_output=True, timeout=15)
+        yml = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
+        if _caddy_cert_pair_ready(yml, yml):        # cheap privileged existence test
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
+                           capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['chmod', '640', yml]), capture_output=True, timeout=15)
+        return True
+    except Exception as _e:
+        _log(f"  ⚠ Could not grant config-dir write access: {_e}")
+        return False
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -29360,6 +29404,7 @@ Environment=MEDIAMTX_API_URL=http://127.0.0.1:9898
 {ldap_env_lines}Restart=always
 RestartSec=5
 User=takwerx
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target
@@ -29412,7 +29457,22 @@ WantedBy=multi-user.target
                 # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
                 # the editor's Save-Config UI. takwerx ownership lets both work.
                 subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
-                plog("  ✓ Web editor writable paths chowned to takwerx (backups + /opt/mediamtx-webeditor + mediamtx.yml)")
+                # v10.1.33: owning the FILE is not enough for the editor. Its save paths
+                # shell out to `sed -i` (12+ call sites in the upstream editor), and
+                # `sed -i` writes its temp file in the target's DIRECTORY, then renames.
+                # /usr/local/etc is root:root 0755, so as takwerx every save died with
+                #   sed: couldn't open temporary file /usr/local/etc/sedXXXXXX: Permission denied
+                # and the UI showed "Failed to save settings". Found on test12 2026-08-14
+                # while checking whether an editor save preserves `moq: no` — it never got
+                # far enough to touch the file. Broken on every non-root box.
+                #
+                # Fixed by group-owning the directory rather than patching the editor: it
+                # is cloned from `main` UNPINNED ([[mediamtx-editor-ref-unpinned]]), so any
+                # source patch is clobbered on the next re-pull, while a directory
+                # permission survives. On our boxes /usr/local/etc holds only MediaMTX's
+                # own files, so the widening is scoped to this module.
+                _mediamtx_grant_config_dir_write(plog=plog)
+                plog("  ✓ Web editor writable paths chowned to takwerx (backups + /opt/mediamtx-webeditor + mediamtx.yml + config dir group-writable)")
             except Exception as _pe:
                 plog(f"  ⚠ Could not chown web editor paths: {_pe}")
 
@@ -65299,6 +65359,64 @@ def _startup_converge_mediamtx_moq():
         print('Startup migration: mediamtx MoQ converge warning (non-fatal): %s' % _e)
 
 
+def _startup_converge_mediamtx_editor_write():
+    """v10.1.33: make the MediaMTX web editor's Save work on an existing non-root box.
+
+    Found on test12 2026-08-14 while checking whether an editor save preserves `moq: no`:
+    the save never got far enough to touch the file. Every save handler shells out to
+    `sed -i`, which needs write on `/usr/local/etc` (root:root 0755) to place its temp
+    file — so the editor has been unable to change ANY setting on ANY non-root box, with
+    a red "Failed to save settings" banner. Pre-existing, not from this release, but it is
+    the same failure the rest of v10.1.33 is about.
+
+    Deploy-path fix is `_mediamtx_grant_config_dir_write()`; this reaches boxes already
+    installed, since there is no redeploy button. Also adds `UMask=0027` to the editor unit
+    so the 0640 tightening on mediamtx.yml survives the editor rewriting the file — without
+    it `sed -i` recreates the file at 0644 and quietly re-exposes the stream passwords."""
+    try:
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.isdir('/opt/mediamtx-webeditor'):
+            return
+        unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        need_dir = True
+        st = subprocess.run(_sudo_wrap(['stat', '-c', '%a %G', _MEDIAMTX_CONF_DIR]),
+                            capture_output=True, text=True, timeout=15)
+        parts = (st.stdout or '').split()
+        if len(parts) == 2 and parts[1] == 'takwerx' and len(parts[0]) >= 2 and (int(parts[0][-2]) & 2):
+            need_dir = False
+
+        unit_txt = ''
+        need_umask = False
+        if os.path.exists(unit):
+            try:
+                unit_txt = _read_priv(unit)
+                need_umask = 'UMask=' not in unit_txt
+            except Exception:
+                need_umask = False
+        if not need_dir and not need_umask:
+            return
+
+        if need_dir:
+            _mediamtx_grant_config_dir_write()
+        if need_umask and unit_txt:
+            # Insert beside the User= line so it lands inside [Service].
+            new_txt = re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nUMask=0027', unit_txt, count=1)
+            if 'UMask=0027' in new_txt:
+                _write_priv(unit, new_txt)
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, timeout=60)
+        bits = []
+        if need_dir:
+            bits.append('config dir group-writable (editor Save was failing on every non-root box)')
+        if need_umask:
+            bits.append('editor UMask=0027 so mediamtx.yml stays 0640 with its stream passwords')
+        print('Startup migration: ✓ MediaMTX editor write access converged — ' + '; '.join(bits) + ' (v10.1.33)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx editor-write converge warning (non-fatal): %s' % _e)
+
+
 _MEDIAMTX_UNIT_TEXT = """[Unit]
 Description=MediaMTX RTSP/HLS/SRT Streaming Server
 After=network.target
@@ -67447,6 +67565,15 @@ def _startup_migrations():
             _startup_converge_mediamtx_unit_nonroot()
         except Exception as _mtx_unit_e:
             print(f"Startup migration: mediamtx unit converge error (non-fatal): {_mtx_unit_e}", flush=True)
+
+        # v10.1.33 — make the web editor's Save work (it shells out to `sed -i`, which
+        # needs write on /usr/local/etc). After the unit converge: that one may restart
+        # mediamtx, and this one restarts the EDITOR, so keeping them ordered avoids two
+        # services bouncing in the same instant for unrelated reasons.
+        try:
+            _startup_converge_mediamtx_editor_write()
+        except Exception as _mtx_ed_e:
+            print(f"Startup migration: mediamtx editor-write converge error (non-fatal): {_mtx_ed_e}", flush=True)
 
         # v10.1.32 — heal apt sources left pointing at a vanished install medium
         # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
