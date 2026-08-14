@@ -18496,7 +18496,7 @@ def _guarddog_timer_list():
             'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
             'takdbrepack.timer', 'takretentionguard.timer',
-            'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
+            'takmediamtxguard.timer', 'taknoderedguard.timer', 'takfeedsourceguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
 GUARDDOG_DISKIO_TIMER = 'takdiskioguard.timer'
@@ -18790,7 +18790,7 @@ def guarddog_uninstall():
     services_extra = ['tak8089guard.service', 'takoomguard.service', 'takdiskguard.service', 'takdiskioguard.service', 'takdbguard.service',
                       'takcotdbguard.service', 'taknetguard.service', 'takprocessguard.service', 'takcertguard.service',
                       'takintcaguard.service',
-                      'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takcloudtakguard.service', 'taktakportalguard.service', 'tak-health.service']
+                      'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takfeedsourceguard.service', 'takcloudtakguard.service', 'taktakportalguard.service', 'tak-health.service']
     for name in timers + services_extra:
         # v10.0.5 non-root: /etc/systemd/system is root-owned — remove via broker.
         subprocess.run(_sudo_wrap(['rm', '-f', os.path.join('/etc/systemd/system', name)]), capture_output=True)
@@ -19590,6 +19590,11 @@ def run_guarddog_deploy(alert_email):
             script_files.append('tak-mediamtx-watch.sh')
         if os.path.exists(os.path.join(nr_dir, 'docker-compose.yml')):
             script_files.append('tak-nodered-watch.sh')
+            # v10.1.34: feed-source staleness rides with Node-RED, since ArcGIS feed
+            # configs live in Node-RED's global context. The script exits 0 quietly when
+            # no arcgis_configs exist, so installing it alongside Node-RED is harmless
+            # on a box that only runs other flows.
+            script_files.append('tak-feedsource-watch.sh')
         if os.path.exists(cloudtak_dir) and os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')):
             script_files.append('tak-cloudtak-watch.sh')
         portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -19734,6 +19739,14 @@ def run_guarddog_deploy(alert_email):
             units.extend([
                 ('taknoderedguard.service', '[Unit]\nDescription=Guard Dog Node-RED Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-nodered-watch.sh\n'),
                 ('taknoderedguard.timer', '[Unit]\nDescription=Run Node-RED guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taknoderedguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ])
+        if 'tak-feedsource-watch.sh' in script_files:
+            # Hourly, not per-minute like the service monitors: this watches an EXTERNAL
+            # publisher's edit timestamp, the threshold is 6h, and each run costs one
+            # HTTPS request per configured feed against a third-party service.
+            units.extend([
+                ('takfeedsourceguard.service', '[Unit]\nDescription=Guard Dog Map Feed Source Monitor (upstream publisher staleness)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-feedsource-watch.sh\n'),
+                ('takfeedsourceguard.timer', '[Unit]\nDescription=Check map feed sources hourly\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1h\nUnit=takfeedsourceguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         if 'tak-cloudtak-watch.sh' in script_files:
             units.extend([
