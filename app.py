@@ -21242,12 +21242,24 @@ def _caddy_letsencrypt_days_left(settings):
     cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
     for name in (fqdn, f'infratak.{fqdn}'):
         crt = os.path.join(cert_base, name, f'{name}.crt')
-        if not os.path.isfile(crt):
+        # v10.1.33: was os.path.isfile() + `openssl -in <crt>`. Caddy's store is 0700
+        # caddy:caddy and the console is takwerx, so BOTH the stat and the read failed on
+        # every non-root box and this fallback silently never produced a number. Same
+        # blindness as _caddy_cert_pair_ready().
+        #
+        # Read the PEM with privilege, then pipe it to openssl on STDIN — `openssl` is not
+        # broker-allowlisted (and does not need to be, since it needs no privilege of its
+        # own once it has the bytes).
+        try:
+            _pem = _read_priv(crt)
+        except Exception:
+            continue
+        if not _pem.strip():
             continue
         try:
             r = subprocess.run(
-                ['openssl', 'x509', '-enddate', '-noout', '-in', crt],
-                capture_output=True, text=True, timeout=5
+                ['openssl', 'x509', '-enddate', '-noout'],
+                input=_pem, capture_output=True, text=True, timeout=5
             )
             if r.returncode != 0:
                 continue
@@ -23035,12 +23047,20 @@ def _get_mediamtx_hls_upstream(settings):
         host = (cfg.get('remote', {}).get('host') or '').strip()
         if host:
             # Remote MediaMTX: the yml lives on the remote host (too heavy to read
-            # here every regen). Preserve the prior cert-existence signal as a
-            # best-effort for the remote case — the non-root traversal problem is
-            # local-console-only, so this path is unaffected by the fleet bug.
+            # here every regen), so fall back to the cert-existence signal.
+            #
+            # v10.1.33: that fallback had the SAME non-root blindness this function's
+            # docstring describes. The note here claimed "the non-root traversal problem
+            # is local-console-only, so this path is unaffected" — but cert_base is a
+            # path on the LOCAL console box (Caddy runs here, fronting the remote
+            # MediaMTX), evaluated by the local takwerx process. It returned False on
+            # every non-root box regardless of the remote's state, so split-server
+            # deployments always got the plain-HTTP upstream. Test it with privilege.
             mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
             cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
-            enc = bool(mtx_domain and os.path.exists(f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'))
+            enc = bool(mtx_domain and _caddy_cert_pair_ready(
+                f'{cert_base}/{mtx_domain}/{mtx_domain}.crt',
+                f'{cert_base}/{mtx_domain}/{mtx_domain}.key'))
             return f'{host}:8888', enc
     return '127.0.0.1:8888', _hls_encrypted_from_yml()
 
@@ -28240,6 +28260,53 @@ def mediamtx_uninstall():
     _deregister_authentik_proxy_app(settings, 'stream', 'MediaMTX', plog=lambda m: steps.append(m.strip()))
     return jsonify({'success': True, 'steps': steps})
 
+def _caddy_cert_pair_ready(cert_file, key_file):
+    """True when BOTH Caddy cert files exist — tested WITH PRIVILEGE, not os.path.exists().
+
+    v10.1.33. Found on test12 2026-08-14 while chasing an unrelated MediaMTX report: the
+    deploy logged `⚠ Cert not found after 60s — SSL not wired` for a domain whose
+    Let's Encrypt cert was present, valid and actively serving HTTPS.
+
+    The cert was never missing — the console cannot SEE it. Caddy stores certs under
+    /var/lib/caddy/.local/share/caddy/certificates, which is `drwx------ caddy:caddy`.
+    The console runs as `takwerx`, which is deliberately not in group `caddy`, so
+    `os.path.exists()` on that path returns False for a file that plainly exists. A
+    permission error reported as absence — same failure shape as [[broker-privilege-boundary]]
+    and the CoreConfig 640 case in _read_coreconfig(): the box answers "no" instead of
+    "not allowed", and every caller downstream believes it.
+
+    Impact was silent and total on non-root boxes: MediaMTX never got rtspServerCert /
+    hlsServerCert wired, so RTSPS and HTTPS-HLS stayed off on every deploy since the
+    non-root flip. Worse, the code that grants takwerx access to those certs
+    (usermod -aG caddy + chmod g+rx on the chain) lives INSIDE the `if cert exists`
+    branch — gated behind the very permission it exists to grant. The remediation the
+    deploy log printed ("reload Caddy, restart MediaMTX to retry") could never succeed.
+
+    Note a group grant alone would not fix this: supplementary groups are fixed when the
+    console process starts, so a running console stays blind until restart. Detection has
+    to be privileged, which is why this asks sudo/broker rather than the filesystem."""
+    try:
+        for _p in (cert_file, key_file):
+            if subprocess.run(_sudo_wrap(['test', '-f', _p]),
+                              capture_output=True, timeout=10).returncode != 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _stage_priv_file(src_path, dest_path):
+    """Copy a root/caddy-owned file to a path the console can actually read.
+
+    v10.1.33: scp and shutil.copy2 both read the SOURCE as the console user, so handing
+    them a 0600 caddy:caddy cert fails for the same reason os.path.exists() did. Pull the
+    bytes through the broker/sudo first, then hand the copy a file we own."""
+    data = _read_priv(src_path)
+    with open(dest_path, 'w') as _f:
+        _f.write(data)
+    os.chmod(dest_path, 0o600)
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -28601,15 +28668,30 @@ paths:
         key_file  = f'{cert_base}/{mtx_domain}/{mtx_domain}.key'
         plog(f"  Waiting for Caddy to issue cert for {mtx_domain}...")
         for i in range(30):
-            if os.path.exists(cert_file) and os.path.exists(key_file):
+            # v10.1.33: privileged test — os.path.exists() reports Caddy's 0700 cert dir
+            # as "no cert" on every non-root box. See _caddy_cert_pair_ready().
+            if _caddy_cert_pair_ready(cert_file, key_file):
                 break
             if i % 5 == 0:
                 plog(f"  ⏳ {i * 2}s...")
             time.sleep(2)
-        if os.path.exists(cert_file) and os.path.exists(key_file):
+        if _caddy_cert_pair_ready(cert_file, key_file):
             _module_run(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
-            ok_cert, _ = _module_copy(deploy_cfg, cert_file, '/tmp/mediamtx_stream.crt', log_fn=plog)
-            ok_key, _  = _module_copy(deploy_cfg, key_file,  '/tmp/mediamtx_stream.key', log_fn=plog)
+            # Stage both files somewhere the console can read before copying: scp/copy2
+            # open the SOURCE as takwerx and would fail on 0600 caddy:caddy.
+            ok_cert = ok_key = False
+            _stage_dir = tempfile.mkdtemp(prefix='mtx-cert-')
+            try:
+                _lc = os.path.join(_stage_dir, 'stream.crt')
+                _lk = os.path.join(_stage_dir, 'stream.key')
+                _stage_priv_file(cert_file, _lc)
+                _stage_priv_file(key_file, _lk)
+                ok_cert, _ = _module_copy(deploy_cfg, _lc, '/tmp/mediamtx_stream.crt', log_fn=plog)
+                ok_key, _  = _module_copy(deploy_cfg, _lk, '/tmp/mediamtx_stream.key', log_fn=plog)
+            except Exception as _stage_e:
+                plog(f"  ⚠ Could not stage certs for copy: {_stage_e}")
+            finally:
+                shutil.rmtree(_stage_dir, ignore_errors=True)
             if ok_cert and ok_key:
                 _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && chmod 600 /etc/mediamtx/certs/stream.key', timeout=10)
                 remote_cert = '/etc/mediamtx/certs/stream.crt'
@@ -29322,13 +29404,17 @@ WantedBy=multi-user.target
             key_file  = f'{cert_base}/{mtx_domain}/{mtx_domain}.key'
             plog(f"  Waiting for Caddy to issue cert for {mtx_domain}...")
             for i in range(30):
-                if os.path.exists(cert_file) and os.path.exists(key_file):
+                # v10.1.33: privileged test — os.path.exists() reports Caddy's 0700 cert
+                # dir as "no cert" on every non-root box, so this loop always ran the full
+                # 60s and then declared a live, valid cert missing. See
+                # _caddy_cert_pair_ready() for the full account.
+                if _caddy_cert_pair_ready(cert_file, key_file):
                     break
                 if i % 5 == 0:
                     plog(f"  ⏳ {i * 2}s...")
                 time.sleep(2)
 
-            if os.path.exists(cert_file):
+            if _caddy_cert_pair_ready(cert_file, key_file):
                 yml = '/usr/local/etc/mediamtx.yml'
                 # Wire cert paths — strip continuation lines first then replace
                 for key in ['rtspServerKey', 'rtspServerCert', 'hlsServerKey', 'hlsServerCert', 'rtmpServerKey', 'rtmpServerCert']:
@@ -29351,7 +29437,20 @@ WantedBy=multi-user.target
                 # make the directory chain group-traversable + the cert/key files group-readable.
                 # Without this, mediamtx fails on startup with "permission denied" on the cert path.
                 try:
-                    subprocess.run('usermod -aG caddy takwerx 2>/dev/null', shell=True, capture_output=True)
+                    # v10.1.33: the `usermod -aG caddy takwerx` that used to be here is
+                    # GONE, not fixed. It ran as `subprocess.run('usermod ... 2>/dev/null',
+                    # shell=True)` — no sudo, stderr discarded — so it had been a silent
+                    # no-op on every non-root box regardless. Routing it through _sudo_wrap
+                    # would not work either: `usermod` is deliberately absent from the
+                    # broker allowlist, and adding it would hand the console the ability to
+                    # put takwerx in ANY group, which is a privilege boundary we do not
+                    # cross for a convenience ([[broker-privilege-boundary]]).
+                    #
+                    # It is not needed. The mediamtx PROCESS gets the caddy group from
+                    # SupplementaryGroups=caddy in its unit (Step 5), which systemd applies
+                    # independently of /etc/group. The console does not need the group
+                    # either — it reads these paths through sudo/broker now. The chmod
+                    # chain below is what actually makes the files readable.
                     for d in ('/var/lib/caddy',
                               '/var/lib/caddy/.local',
                               '/var/lib/caddy/.local/share',
@@ -44130,7 +44229,11 @@ def _reassert_mediamtx_cert_grant(plog=None):
         if not need:
             return False  # grant intact — healthy box, no restart
         _log("  mediamtx: cert-read grant missing (renewal/ssl-flip dropped group perms) — re-applying")
-        subprocess.run('usermod -aG caddy takwerx 2>/dev/null; true', shell=True, capture_output=True, timeout=5)
+        # v10.1.33: the bare `usermod -aG caddy takwerx 2>/dev/null` that used to be here
+        # is removed rather than sudo-wrapped. It was a silent no-op as takwerx, and
+        # `usermod` is intentionally not broker-allowlisted (it could place takwerx in any
+        # group). The mediamtx unit's SupplementaryGroups=caddy already gives the service
+        # the group; the chmod re-apply below is the part that was ever doing the work.
         # chmod via sudo unconditionally (no os.path.exists guard — the console can't stat under
         # the locked caddy dirs; a chmod on a non-existent path just errors harmlessly).
         for d in ('/var/lib/caddy',
