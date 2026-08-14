@@ -65299,6 +65299,127 @@ def _startup_converge_mediamtx_moq():
         print('Startup migration: mediamtx MoQ converge warning (non-fatal): %s' % _e)
 
 
+_MEDIAMTX_UNIT_TEXT = """[Unit]
+Description=MediaMTX RTSP/HLS/SRT Streaming Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
+Restart=always
+RestartSec=5
+User=takwerx
+SupplementaryGroups=caddy
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _startup_converge_mediamtx_unit_nonroot():
+    """v10.1.33: move a legacy `User=root` mediamtx.service onto takwerx.
+
+    Found 2026-08-14 surveying the fleet for the MoQ fix: `systemctl show mediamtx -p User`
+    returned **root** on test6 and test8, and takwerx on test12/nuc/aws-arm. The non-root
+    flip rewrote the unit for NEW deploys and never converged existing ones, so a box that
+    installed MediaMTX before the flip has been running a network-exposed streaming server
+    with full root ever since — against the posture the rest of the stack holds.
+
+    It also silently changed the MoQ bug's shape: as root the cert write SUCCEEDS, so
+    instead of crash-looping, those boxes wrote /auto.crt + /auto.key into the FILESYSTEM
+    ROOT (test6's dated 2026-06-23) and served MoQ on 8892/8893. Those files are inert now
+    that MoQ is off; this reports them rather than deleting anything at /.
+
+    Ordering: runs AFTER the MoQ and SSL converges. Flipping the user is the step most
+    likely to fail, and it must not be what stops the other two from landing.
+
+    Safety — this changes the identity of a RUNNING service, so it refuses rather than
+    guesses, and rolls back if the service does not come back:
+      * skips if recording or playback is enabled — those write to paths that may be
+        root-owned, and silently breaking a recording box is worse than leaving it as root
+      * grants cert read access BEFORE the flip (mediamtx exits hard on an unreadable
+        cert; as root it could read Caddy's store, as takwerx it needs the group bits)
+      * chowns mediamtx.yml to takwerx so the service and the web editor can both write
+      * verifies the service is active afterwards, and restores the ORIGINAL unit and
+        restarts if not
+    Ports are all >1024, so binding is unaffected by the drop from root."""
+    try:
+        unit_path = '/etc/systemd/system/mediamtx.service'
+        yml = '/usr/local/etc/mediamtx.yml'
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(unit_path):
+            return
+        cur_user = (subprocess.run(_sudo_wrap(['systemctl', 'show', 'mediamtx', '-p', 'User', '--value']),
+                                   capture_output=True, text=True, timeout=15).stdout or '').strip()
+        if cur_user != 'root':
+            return                        # already converged (or never was root)
+
+        try:
+            with open(yml) as _f:
+                ycur = _f.read()
+        except (PermissionError, FileNotFoundError):
+            ycur = _read_priv(yml)
+        except OSError:
+            return
+        # Refuse on a recording/playback box — those paths may be root-owned.
+        if (re.search(r'(?m)^[ \t]+record:[ \t]*(yes|true)[ \t]*$', ycur)
+                or re.search(r'(?m)^record:[ \t]*(yes|true)[ \t]*$', ycur)
+                or re.search(r'(?m)^playback:[ \t]*(yes|true)[ \t]*$', ycur)):
+            print('Startup migration: MediaMTX still runs as root — NOT converged, this box '
+                  'has recording/playback enabled and those paths may be root-owned. Flip it '
+                  'by hand or redeploy MediaMTX when convenient (v10.1.33)')
+            return
+
+        try:
+            old_unit = _read_priv(unit_path)
+        except Exception:
+            return
+        if 'User=takwerx' in old_unit:
+            return
+
+        # Cert read access BEFORE the flip — as root it could read Caddy's store directly.
+        settings = load_settings()
+        mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
+        if mtx_domain:
+            cb = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+            cd = f'{cb}/{mtx_domain}'
+            cf, kf = f'{cd}/{mtx_domain}.crt', f'{cd}/{mtx_domain}.key'
+            if _caddy_cert_pair_ready(cf, kf):
+                _grant_caddy_cert_read(cb, cd, cf, kf)
+        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+
+        _write_priv(unit_path, _MEDIAMTX_UNIT_TEXT)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+        ok = False
+        for _ in range(12):
+            time.sleep(1)
+            if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                               capture_output=True, text=True, timeout=15
+                               ).stdout or '').strip() == 'active':
+                ok = True
+                break
+        if not ok:
+            _write_priv(unit_path, old_unit)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+            print('Startup migration: ⚠ MediaMTX would not start as takwerx — unit ROLLED BACK '
+                  'to root and the service restarted. Streaming is unaffected; the box is still '
+                  'running MediaMTX as root. Check what under its config paths is root-owned '
+                  '(v10.1.33)')
+            return
+        print('Startup migration: ✓ MediaMTX moved off root — unit now User=takwerx '
+              '+ SupplementaryGroups=caddy. It had kept a pre-non-root-flip unit and was '
+              'running the streaming server as root (v10.1.33)')
+        if os.path.exists('/auto.crt') or os.path.exists('/auto.key'):
+            print('Startup migration:   note — /auto.crt and /auto.key at the filesystem root '
+                  'are leftovers MoQ wrote while this ran as root. Inert now that MoQ is off; '
+                  'safe to delete at your convenience.')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx unit converge warning (non-fatal): %s' % _e)
+
+
 def _startup_converge_mediamtx_ssl():
     """v10.1.33: wire Caddy's cert into an existing MediaMTX that never got SSL.
 
@@ -65362,6 +65483,16 @@ def _startup_converge_mediamtx_ssl():
         # an EMPTY `rtspServerCert:` runs on to the first character of the next line and
         # reports a cert that isn't there. Caught in testing — the first version of this
         # guard skipped every box it was written to repair.
+        #
+        # Note some boxes store the value as an INDENTED CONTINUATION line:
+        #     rtspServerCert:
+        #       /var/lib/caddy/.../stream.example.com.crt
+        # (test6, 2026-08-14 — this is why the old deploy carried a
+        # `sed '/^key:/{ n; /^  /d }'` pass). Such a box reads as "no cert" here, and that
+        # is FINE: it is then caught by the hlsEncryption gate below if it is healthy, and
+        # if it is not, _mediamtx_yml_wire_tls() strips the continuation and normalises the
+        # key inline. Do not "fix" this check to span lines — that would make the
+        # already-wired case fall through to the encryption gate instead of stopping here.
         if (re.search(r'(?m)^rtspServerCert:[ \t]*\S', cur)
                 or re.search(r'(?m)^hlsServerCert:[ \t]*\S', cur)):
             return
@@ -67308,6 +67439,14 @@ def _startup_migrations():
             _startup_converge_mediamtx_ssl()
         except Exception as _mtx_ssl_e:
             print(f"Startup migration: mediamtx SSL converge error (non-fatal): {_mtx_ssl_e}", flush=True)
+
+        # v10.1.33 — move a legacy root mediamtx.service onto takwerx. LAST of the three:
+        # changing a running service's identity is the likeliest to fail, and it must not
+        # be what prevents the MoQ and SSL converges above from landing.
+        try:
+            _startup_converge_mediamtx_unit_nonroot()
+        except Exception as _mtx_unit_e:
+            print(f"Startup migration: mediamtx unit converge error (non-fatal): {_mtx_unit_e}", flush=True)
 
         # v10.1.32 — heal apt sources left pointing at a vanished install medium
         # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
