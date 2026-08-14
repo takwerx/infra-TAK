@@ -9749,12 +9749,16 @@ def mediamtx_page():
         editor_version=mtx_vinfo.get('editor_version') or '',
         editor_update_available=mtx_vinfo.get('editor_update_available', False),
         editor_latest=mtx_vinfo.get('editor_latest') or '',
-        # v10.1.34: upstream awareness. Shown on DEV-channel boxes only — it is a
-        # prompt for the operator to run T&E on a new upstream release, never an
-        # action for a customer box (which must only ever move to the vetted pin).
-        mediamtx_vetted=mtx_vinfo.get('vetted') or '',
+        # v10.1.34: same vetted-release markers Authentik/NetBird already use
+        # (`· main: vX` / `update` / `! unvetted` / `↑ upstream` / `vetted ✓`) —
+        # deliberately NOT a MediaMTX-specific banner. Upstream news is dev-channel
+        # only: it prompts the operator to run T&E, it is never an action for a
+        # customer box, which only ever moves to the pin.
+        mediamtx_vetted=mtx_vinfo.get('vetted_release') or '',
+        mediamtx_channel=mtx_vinfo.get('channel') or 'main',
+        mediamtx_ahead_of_vetted=mtx_vinfo.get('ahead_of_vetted', False),
         mediamtx_upstream_latest=mtx_vinfo.get('upstream_latest') or '',
-        mediamtx_upstream_newer=(mtx_vinfo.get('upstream_newer_than_vetted', False)
+        mediamtx_upstream_newer=(mtx_vinfo.get('upstream_newer', False)
                                  and (settings.get('update_channel') == 'dev')),
         mediamtx_upstream_url=mtx_vinfo.get('upstream_url') or '')
 
@@ -26602,13 +26606,19 @@ def _get_mediamtx_version_info():
         p = [int(x) for x in _re.findall(r'\d+', v or '')[:3]]
         return p + [0] * (3 - len(p))
 
-    out['vetted'] = MEDIAMTX_VETTED_RELEASE
+    # Key names deliberately match the Authentik vetted-release contract so the console
+    # card and module page can reuse the SAME markers (`update` / `vetted ✓` /
+    # `! unvetted` / `· main: vX` / `↑ upstream`) rather than inventing MediaMTX-only UI.
+    out['vetted_release'] = MEDIAMTX_VETTED_RELEASE
     out['latest'] = MEDIAMTX_VETTED_RELEASE  # what this box should be running
+    out['channel'] = (settings.get('update_channel') or 'main')
     if out['version']:
         out['update_available'] = _vparts(MEDIAMTX_VETTED_RELEASE) > _vparts(out['version'])
+        out['ahead_of_vetted'] = _vparts(out['version']) > _vparts(MEDIAMTX_VETTED_RELEASE)
     else:
         # Version unknown (not installed, or the probe failed) — do not claim an update.
         out['update_available'] = False
+        out['ahead_of_vetted'] = False
 
     # Upstream awareness: is there a newer release than the one we have vetted?
     # Surfaced so the operator knows to go test it; deliberately does NOT set
@@ -26622,12 +26632,12 @@ def _get_mediamtx_version_info():
         tag = ((data or {}).get('tag_name') or '').lstrip('vV')
         if tag:
             out['upstream_latest'] = tag
-            out['upstream_newer_than_vetted'] = _vparts(tag) > _vparts(MEDIAMTX_VETTED_RELEASE)
+            out['upstream_newer'] = _vparts(tag) > _vparts(MEDIAMTX_VETTED_RELEASE)
             out['upstream_url'] = (data or {}).get('html_url') or ''
     except Exception:
         # Offline or rate-limited: absence of upstream news must never look like news.
         out['upstream_latest'] = None
-        out['upstream_newer_than_vetted'] = False
+        out['upstream_newer'] = False
     # Web editor: current from CURRENT_VERSION on target, latest from takwerx/mediamtx-installer
     editor_info = _get_mediamtx_editor_version_info(deploy_cfg)
     out['editor_version'] = editor_info.get('version') or ''

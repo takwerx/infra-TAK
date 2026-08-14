@@ -5,7 +5,9 @@ const fn = new Function('msg', 'node', 'flow', 'global', 'context', 'env', 'util
   tf['arcgis.reconcile'].func);
 
 function mkFeatures(uids) {
-  return uids.map(u => ({ uid: u, cotXml: '<event uid="' + u + '"/>', _hash: 'h' }));
+  // NOTE: reconcile reads feat.cot (not cotXml) — getting this wrong made every
+  // streamed payload undefined and silently zeroed the keepalive assertion.
+  return uids.map(u => ({ uid: u, cot: '<event uid="' + u + '"/>', _hash: 'h' }));
 }
 function mkMission(uids) {
   return { data: { uids: uids.map(u => ({ data: u })) } };
@@ -27,7 +29,7 @@ function poll(state, arcgisUids, missionUids, cfgOver) {
     configName: 'CA AIR INTEL', missionName: 'AIR-INTEL', uidPrefix: 'firis-',
     strictMode: true, creatorUid: 'admin', cotStreamPort: 8089,
   }, cfgOver || {});
-  const out = { puts: [], deletes: [], forceDeletes: [], warns: [] };
+  const out = { puts: [], deletes: [], forceDeletes: [], warns: [], streamed: 0 };
   const flowStore = state;
   const flow = { get: k => flowStore[k], set: (k, v) => { flowStore[k] = v; } };
   const glob = { get: () => ({}), set: () => {} };
@@ -38,6 +40,7 @@ function poll(state, arcgisUids, missionUids, cfgOver) {
       if (b && b.method === 'DELETE') out.deletes.push(decodeURIComponent(b.url.split('uid=')[1].split('&')[0]));
       if (a && a._rawCotXml) out.forceDeletes.push(a._rawCotXml.match(/<link uid="([^"]+)"/)[1]);
       if (a && a._putUids) out.puts.push(...a._putUids);
+      if (a && a.payload && !a._rawCotXml) out.streamed++;
     },
   };
   const msg = {
@@ -162,6 +165,43 @@ console.log('\nScenario 5b — deleted-this-pass UID must be tombstoned (regress
   const r2 = poll(st, without, without);   // mission now reflects the delete
   check('ForceDelete broadcast on the following poll', r2.forceDeletes.includes(gone),
         r2.forceDeletes.length + ' broadcast');
+}
+
+// ── Scenario 7: keepalive re-stream (dangling-UID rot) ────────────────────────
+// A quiet feed must still re-stream its CoT periodically, or TAK ages the events out
+// of its repository while the mission keeps the UIDs — mission points at nothing and
+// new subscribers sit on ATAK's yellow pending icon forever.
+console.log('\nScenario 7 — quiet feed re-streams so its CoT cannot age out');
+{
+  const st = {};
+  poll(st, ALL, ALL);                       // cold start: seeds, does not stream
+  const quiet = poll(st, ALL, ALL);         // nothing changed
+  check('steady state does not re-stream every poll', quiet.puts.length === 0);
+  // age every keepalive timestamp past the refresh window
+  const ls = st._lastStreamed || {};
+  const aged = Object.keys(ls).length;
+  for (const k of Object.keys(ls)) ls[k] -= (7 * 3600000);
+  check('keepalive timestamps are tracked', aged > 0, aged + ' tracked');
+  const r = poll(st, ALL, ALL);
+  check('due UIDs get re-streamed', r.streamed > 0, r.streamed + ' streamed');
+  check('burst is capped per poll', r.streamed <= 25, r.streamed + ' streamed (cap 25)');
+}
+
+// ── Scenario 8: tombstone sweep is capped ─────────────────────────────────────
+console.log('\nScenario 8 — tombstone sweep burst cap + send-count retirement');
+{
+  const st = { _tombstones: {}, _tombSweepTs: 0, _tombSends: {} };
+  const now = Date.now();
+  for (let i = 0; i < 600; i++) st._tombstones['firis-dead-' + i] = now - i * 1000;
+  const r = poll(st, BASE, BASE);
+  check('sweep burst capped at 250', r.forceDeletes.length === 250,
+        r.forceDeletes.length + ' broadcast');
+  check('oldest tombstones go first',
+        r.forceDeletes.includes('firis-dead-599'), 'oldest present');
+  // drive one uid past the send cap
+  st._tombSends['firis-dead-599'] = 48;
+  const r2 = poll(st, BASE, BASE);
+  check('retired uid is no longer broadcast', !r2.forceDeletes.includes('firis-dead-599'));
 }
 
 // ── Scenario 6: existing guards still work ─────────────────────────────────────
