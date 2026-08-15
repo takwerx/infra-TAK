@@ -93,68 +93,6 @@ def apply_ldap_overlay(app):
             if p not in VIEWER_ALLOWED and not p.startswith('/static') and not any(p.startswith(px) for px in VIEWER_PREFIXES):
                 return redirect('/viewer')
 
-    # v10.1.34 (security review): registered AFTER _authentik_auto_auth on purpose.
-    # Flask runs before_request hooks in registration order, and this one returns a
-    # terminal 409 — registering it first meant an unauthenticated POST short-circuited
-    # authentication entirely and still learned the pinned version. It performs no
-    # action either way, but auth must be evaluated first.
-    # ── v10.1.34: intercept the editor's own MediaMTX binary upgrade ──────────
-    # Two independent problems with the vendored editor's `POST
-    # /api/mediamtx/version/upgrade`, both live on every non-root box:
-    #
-    #  1. It cannot work. It backs the binary up to
-    #     /usr/local/bin/mediamtx.backup_<ts> before swapping. The editor runs as
-    #     takwerx and /usr/local/bin is root:root 0755, so it dies with
-    #     "[Errno 13] Permission denied" — confirmed on test8 (Ubuntu x86) and
-    #     aws-arm (ARM64) 2026-08-14. We do NOT fix this by widening
-    #     /usr/local/bin: that directory holds binaries root executes, so making
-    #     it takwerx-writable is the root-equivalence already rejected for this
-    #     module ([[mediamtx-editor-upgrade-broker-not-sudoers]]). The .33 trick
-    #     of widening the directory was safe for /usr/local/etc (MediaMTX files
-    #     only) and is NOT safe here.
-    #
-    #  2. It resolves bluenviron/mediamtx releases/latest on its own, so it would
-    #     push a box to an unvetted upstream build in one click — straight past
-    #     MEDIAMTX_VETTED_RELEASE. That is precisely how 10.1.33's MoQ crash-loop
-    #     would have reached a customer.
-    #
-    # So the button is answered here with the truth instead of a permission error,
-    # and the actual upgrade is left to the console's deploy path, which installs
-    # the pinned version with the right privileges. Lives in the overlay rather
-    # than as a source patch because the editor is cloned from `main` UNPINNED
-    # ([[mediamtx-editor-ref-unpinned]]) — a source edit is clobbered on re-pull,
-    # this module is re-copied by our deploy every time.
-    # Implemented as a before_request intercept rather than a competing @app.route:
-    # the editor registers the same rule itself, and which duplicate wins depends on
-    # werkzeug's map ordering and on where the overlay happens to be injected. A
-    # before_request hook runs first regardless, so this cannot silently stop working
-    # because an upstream re-pull moved a line.
-    _VETTED = os.environ.get('INFRATAK_MEDIAMTX_VETTED', '').strip()
-    # Every editor endpoint that SWAPS THE BINARY. /upgrade fetches a fresh build and is
-    # arch-blind — it put an x86 tarball on aarch64 and took the service down with
-    # "Exec format error" (status 203/EXEC) on aws-arm 2026-08-15, recovered only by
-    # systemd's restart rolling back. /rollback restores an older build. Both move the box
-    # off the vetted pin, so both are refused. version/check and version/test are read-only
-    # and deliberately left working.
-    _PINNED_PATHS = ('/api/mediamtx/version/upgrade', '/api/mediamtx/version/rollback')
-
-    @app.before_request
-    def _infratak_block_unpinned_upgrade():
-        if request.method != 'POST' or request.path not in _PINNED_PATHS:
-            return
-        pinned = f' (v{_VETTED})' if _VETTED else ''
-        return jsonify({
-            'success': False,
-            'error': (
-                f'MediaMTX is pinned by infra-TAK{pinned}. Changing the binary from here '
-                'is disabled so a box cannot be moved off the tested build — and this '
-                'page does not select a build for your CPU architecture. Use the '
-                'infra-TAK console (MediaMTX module -> Update), which installs the '
-                'vetted version built for this machine.'),
-            'pinned_version': _VETTED or None,
-            'infratak_pinned': True,
-        }), 409
-
     # ── HLS helpers ─────────────────────────────────────────────────────
 
     CONFIG_FILE = os.environ.get('MEDIAMTX_CONFIG', '/usr/local/etc/mediamtx.yml')

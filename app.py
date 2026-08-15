@@ -9744,24 +9744,16 @@ def mediamtx_page():
         deploying=mediamtx_deploy_status.get('running', False),
         deploy_done=mediamtx_deploy_status.get('complete', False),
         mediamtx_version=mtx_vinfo.get('version') or '',
-        mediamtx_update_available=mtx_vinfo.get('update_available', False),
+        mediamtx_update_available=mtx_vinfo.get('binary_update_available', False),
         mediamtx_latest=mtx_vinfo.get('latest') or '',
         editor_version=mtx_vinfo.get('editor_version') or '',
         editor_update_available=mtx_vinfo.get('editor_update_available', False),
         editor_latest=mtx_vinfo.get('editor_latest') or '',
-        # v10.1.34: same vetted-release markers Authentik/NetBird already use
-        # (`· main: vX` / `update` / `! unvetted` / `↑ upstream` / `vetted ✓`) —
-        # deliberately NOT a MediaMTX-specific banner. Upstream news is dev-channel
-        # only: it prompts the operator to run T&E, it is never an action for a
-        # customer box, which only ever moves to the pin.
-        mediamtx_vetted=mtx_vinfo.get('vetted_release') or '',
-        mediamtx_channel=mtx_vinfo.get('channel') or 'main',
-        mediamtx_ahead_of_vetted=mtx_vinfo.get('ahead_of_vetted', False),
+        # The page states the installed version and, when upstream is newer, points at
+        # the web editor. No vetted/channel badges: the operator cannot act on the pin
+        # from here, and a console that advertises a version it will not install is the
+        # defect this replaced.
         mediamtx_upstream_latest=mtx_vinfo.get('upstream_latest') or '',
-        # Channel gating lives in the TEMPLATE (same as Authentik), not here: `vetted ✓`
-        # shows only on main, `↑ upstream` only on dev. Gating twice made the module page
-        # and the console card disagree.
-        mediamtx_upstream_newer=mtx_vinfo.get('upstream_newer', False),
         mediamtx_upstream_url=mtx_vinfo.get('upstream_url') or '')
 
 
@@ -26617,33 +26609,34 @@ def _get_mediamtx_version_info():
                 out['version'] = _run_ver(f'{bin_path} -version 2>&1') or _run_ver(f'{bin_path} --version 2>&1')
                 if out['version']:
                     break
-    # v10.1.34: the binary is PINNED to MEDIAMTX_VETTED_RELEASE, so "update available"
-    # now means "this box is behind the VETTED version" — never "upstream shipped
-    # something". Before the pin this compared against releases/latest, which nagged
-    # every box toward an untested build; that is how 10.1.33's MoQ crash-loop would
-    # have spread. Upstream news is reported separately below and is a signal to the
-    # OPERATOR to run T&E, not an action for a customer box.
+    # v10.1.34: THE CONSOLE ANNOUNCES, THE WEB EDITOR UPDATES. infra-TAK installs a
+    # vetted MediaMTX on a FRESH deploy and never touches the binary again; every
+    # subsequent MediaMTX and web-editor update happens in the web editor at
+    # https://stream.<fqdn>. So "update available" here means exactly one thing —
+    # upstream has published a newer release than this box is running — and the only
+    # action it may ever suggest is "open the web editor".
+    #
+    # It briefly meant "behind MEDIAMTX_VETTED_RELEASE", paired with an overlay that
+    # 409'd the editor's Upgrade button and told the operator to press a console Update
+    # button that does not render on an installed box. That left the fleet with no
+    # working update path at all. Do not reintroduce it.
     def _vparts(v):
         p = [int(x) for x in _re.findall(r'\d+', v or '')[:3]]
         return p + [0] * (3 - len(p))
 
-    # Key names deliberately match the Authentik vetted-release contract so the console
-    # card and module page can reuse the SAME markers (`update` / `vetted ✓` /
-    # `! unvetted` / `· main: vX` / `↑ upstream`) rather than inventing MediaMTX-only UI.
+    # vetted_release is what a FRESH deploy installs. It is deliberately NOT surfaced as
+    # a badge: the operator cannot act on it from here, and a console that advertises a
+    # version it will not install is the exact complaint that produced this rewrite.
     out['vetted_release'] = MEDIAMTX_VETTED_RELEASE
-    out['latest'] = MEDIAMTX_VETTED_RELEASE  # what this box should be running
-    out['channel'] = (settings.get('update_channel') or 'main')
-    if out['version']:
-        out['update_available'] = _vparts(MEDIAMTX_VETTED_RELEASE) > _vparts(out['version'])
-        out['ahead_of_vetted'] = _vparts(out['version']) > _vparts(MEDIAMTX_VETTED_RELEASE)
-    else:
-        # Version unknown (not installed, or the probe failed) — do not claim an update.
-        out['update_available'] = False
-        out['ahead_of_vetted'] = False
+    out['latest'] = None
+    out['update_available'] = False
+    # Kept distinct from update_available, which is a UNION of the binary and the web
+    # editor further down. The status banner announces a MediaMTX RELEASE, so it must
+    # not fire because the editor happens to have an update.
+    out['binary_update_available'] = False
 
-    # Upstream awareness: is there a newer release than the one we have vetted?
-    # Surfaced so the operator knows to go test it; deliberately does NOT set
-    # update_available, so customer boxes are never pushed at an unvetted build.
+    # Upstream awareness. This is the ONLY source of "an update exists" — compared
+    # against what this box is actually running, not against our pin.
     try:
         req = _ur.Request(
             'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
@@ -26653,12 +26646,15 @@ def _get_mediamtx_version_info():
         tag = ((data or {}).get('tag_name') or '').lstrip('vV')
         if tag:
             out['upstream_latest'] = tag
-            out['upstream_newer'] = _vparts(tag) > _vparts(MEDIAMTX_VETTED_RELEASE)
             out['upstream_url'] = (data or {}).get('html_url') or ''
+            out['latest'] = tag
+            # No installed version means not installed or a failed probe: never claim news.
+            if out['version']:
+                out['binary_update_available'] = _vparts(tag) > _vparts(out['version'])
+                out['update_available'] = out['binary_update_available']
     except Exception:
         # Offline or rate-limited: absence of upstream news must never look like news.
         out['upstream_latest'] = None
-        out['upstream_newer'] = False
     # Web editor: current from CURRENT_VERSION on target, latest from takwerx/mediamtx-installer
     editor_info = _get_mediamtx_editor_version_info(deploy_cfg)
     out['editor_version'] = editor_info.get('version') or ''
@@ -28781,11 +28777,7 @@ paths:
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
             f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
         )
-    # v10.1.34: INFRATAK_MEDIAMTX_VETTED lets the overlay name the pinned version in the
-    # message it returns when the editor's own upgrade button is used (see
-    # mediamtx_ldap_overlay.py). Absence is handled — the overlay still blocks, it just
-    # cannot quote a version.
-    editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\nEnvironment=INFRATAK_MEDIAMTX_VETTED={MEDIAMTX_VETTED_RELEASE}\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
+    editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
@@ -29520,7 +29512,6 @@ Type=simple
 WorkingDirectory=/opt/mediamtx-webeditor
 Environment=PORT=5080
 Environment=MEDIAMTX_API_URL=http://127.0.0.1:9898
-Environment=INFRATAK_MEDIAMTX_VETTED={MEDIAMTX_VETTED_RELEASE}
 {ldap_env_lines}Restart=always
 RestartSec=5
 User=takwerx
@@ -65598,22 +65589,23 @@ WantedBy=multi-user.target
 def _startup_converge_mediamtx_overlay():
     """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
 
-    The overlay is our own module the vendored editor imports, and it is copied ONLY by
-    the MediaMTX deploy path (_module_copy at the deploy sites). A console update never
-    touched it. So the v10.1.34 upgrade intercept — the thing that stops the editor's
-    own "Upgrade MediaMTX" button pushing a box to an unvetted build — sat in the repo
-    for hours and was live on ZERO boxes, because nobody redeploys MediaMTX.
+    The overlay is our own module the vendored editor imports (LDAP/Authentik auth and
+    the viewer-role restrictions live in it), and it was copied ONLY by the MediaMTX
+    deploy path. A console update never touched it, so overlays rotted: test8 was still
+    running the 2026-03-16 copy five months later. This converges it on console update.
 
-    That is not academic. On aws-arm 2026-08-15 the un-intercepted button ran and the
-    editor fetched an x86 tarball onto aarch64: `Failed to execute /usr/local/bin/mediamtx:
-    Exec format error`, status=203/EXEC, service down until systemd's restart rolled it
-    back to v1.19.2. The editor's upgrade has no architecture detection at all (our deploy
-    path does, via arch_map). The intercept would have refused the click outright — but
-    only if it had been deployed.
+    It is also how v10.1.34 UNDOES its own mistake. v10.1.34 briefly shipped a
+    before_request intercept that answered the web editor's Upgrade and Rollback buttons
+    with a 409, on the false premise that the console performs MediaMTX updates. It does
+    not — every MediaMTX and web-editor update happens IN THE WEB EDITOR; the console
+    only reports that a newer version exists. The intercept therefore blocked the only
+    real update path and pointed operators at a console button that does not render on an
+    installed box. Pushing the corrected overlay removes it from test8/test12/aws-arm,
+    and the same pass strips the now-dead INFRATAK_MEDIAMTX_VETTED line those boxes
+    carry in their editor unit. infra-TAK does not reach into the editor.
 
-    Also (re)asserts Environment=INFRATAK_MEDIAMTX_VETTED on the editor unit so the refusal
-    can name the pinned version, and restarts the editor only when something actually
-    changed, so a healthy box is left alone."""
+    Restarts the editor only when something actually changed, so a healthy box is left
+    alone."""
     try:
         if not os.path.isdir('/opt/mediamtx-webeditor'):
             return
@@ -65634,7 +65626,7 @@ def _startup_converge_mediamtx_overlay():
             _write_priv(dst, want)
             subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', dst]), capture_output=True, timeout=15)
             changed = True
-            print("Startup migration: MediaMTX editor overlay updated (upgrade intercept + LDAP overlay)", flush=True)
+            print("Startup migration: MediaMTX editor overlay updated (LDAP/Authentik auth + viewer roles)", flush=True)
 
         unit = '/etc/systemd/system/mediamtx-webeditor.service'
         if os.path.exists(unit):
@@ -65642,17 +65634,18 @@ def _startup_converge_mediamtx_overlay():
                 txt = _read_priv(unit)
             except Exception:
                 txt = ''
-            if txt and 'INFRATAK_MEDIAMTX_VETTED=' not in txt:
-                # Anchor on the PORT env line, which every editor unit has, rather than on
-                # any User= value — anchoring on User=takwerx is exactly the mistake that
-                # made the v10.1.33 UMask converge a silent no-op on root-era units.
-                if 'Environment=PORT=5080' in txt:
-                    txt = txt.replace('Environment=PORT=5080',
-                                      'Environment=PORT=5080\nEnvironment=INFRATAK_MEDIAMTX_VETTED=' + MEDIAMTX_VETTED_RELEASE, 1)
-                    _write_priv(unit, txt)
-                    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
-                    changed = True
-                    print(f"Startup migration: MediaMTX editor unit now declares vetted release {MEDIAMTX_VETTED_RELEASE}", flush=True)
+            # v10.1.34 shipped Environment=INFRATAK_MEDIAMTX_VETTED here to feed the
+            # upgrade intercept. The intercept is gone and the variable is dead, so take
+            # it back off the boxes that got it rather than leaving litter in a unit file
+            # we had no business editing in the first place.
+            if txt and 'INFRATAK_MEDIAMTX_VETTED=' in txt:
+                kept = [ln for ln in txt.split('\n')
+                        if not ln.startswith('Environment=INFRATAK_MEDIAMTX_VETTED=')]
+                txt = '\n'.join(kept)
+                _write_priv(unit, txt)
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+                changed = True
+                print("Startup migration: removed dead INFRATAK_MEDIAMTX_VETTED from the MediaMTX editor unit", flush=True)
 
         if changed:
             r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
@@ -65660,7 +65653,7 @@ def _startup_converge_mediamtx_overlay():
             if r.returncode != 0:
                 print(f"Startup migration: \u26a0 MediaMTX editor restart failed: {(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
             else:
-                print("Startup migration: MediaMTX editor restarted with the upgrade intercept active", flush=True)
+                print("Startup migration: MediaMTX editor restarted with the current overlay", flush=True)
     except Exception as _e:
         print(f"Startup migration: MediaMTX editor overlay converge error (non-fatal): {_e}", flush=True)
 
