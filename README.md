@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.33-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.33-alpha)**
+**Current release: [v10.1.34-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.34-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.34-alpha — 2026-08-15 — map feeds hold their nerve, and the video server stops moving under you
+
+**Headline: a brief hiccup at a data provider could wipe live shapes off your map, and the video server could change version on its own.** Two unrelated ways a server could change behaviour without anyone deciding it should. **Map feeds** now refuse to act on a single bad answer. If a data source blips — and they do, several times an hour in some cases — anything that appears to have vanished is held for **15 minutes** before it is removed, and a poll claiming most of a feed has disappeared must persist for **30 minutes**. During testing a real provider outage briefly reported 16 of 17 flight restrictions as gone; nothing was deleted, and everything returned intact. Previously that would have removed all 16 and re-added them minutes later, prompting every connected device to delete things that never actually went away. Quiet feeds are also refreshed periodically, fixing a fault where a rarely-updated feed could silently become impossible for new users to load — the map looked full, but anyone joining fresh saw nothing and had no way to tell why. Feeds now also **watch their own data provider**: if the source stops publishing, you get an email saying so, with the time it stopped and a note that the fault is upstream. It learns each source's normal rhythm, so a wildfire feed that updates hourly is flagged within hours, while a boundary layer that updates monthly is not flagged for being quiet. During testing this caught a statewide power-outage provider that had been down for **46 hours** while the map showed its last data as though current. Separately, the **video server is now pinned to a tested version**. It previously installed whatever was newest at the moment, so servers drifted apart and an upstream change could break new installs with nothing changed on your side — which is exactly what happened last release. New versions are now adopted deliberately, after testing. **Who should update:** everyone, and especially anyone running map feeds or the video server. **Upgrade:** automatic on the next console update; feeds and video are corrected for you, with nothing to reconfigure.
+
+Full notes: [v10.1.34-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.34-alpha).
 
 ### v10.1.33-alpha — 2026-08-14 — the video server stops restarting forever, and secure streaming finally switches on
 
