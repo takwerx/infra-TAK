@@ -26530,6 +26530,47 @@ def _get_cloudtak_version_info():
     return out
 
 
+# ── Cached GitHub release lookups ────────────────────────
+_GH_JSON_CACHE = {}      # url -> {"at": epoch, "data": parsed}
+_GH_JSON_TTL = 1800      # 30 min. Release cadences are days; nobody needs fresher.
+
+
+def _gh_json_cached(url, timeout=15, ttl=_GH_JSON_TTL):
+    """GET a GitHub API URL, cached in-process, serving last-known-good on failure.
+
+    v10.1.34: for MediaMTX the console's ONLY job is announcing that a newer version
+    exists — and it was doing that with an uncached, unauthenticated api.github.com call
+    on EVERY render. Unauthenticated GitHub allows 60 requests/hour per IP; app.py has 17
+    call sites and one dashboard load fires a batch of them. Once a box is rate-limited
+    every lookup raises, every handler swallows it, and the UI silently reads as "you are
+    up to date" — while another surface, rendered a second earlier off a call that did
+    succeed, says an update IS available. That is exactly the console-card vs module-page
+    disagreement reported on test8 2026-08-15: card said `update`, page said nothing,
+    both were reading the same function.
+
+    Failing to reach GitHub must not look like news, and must not look like the absence
+    of news either. A stale-but-true answer beats a confident lie.
+
+    Only the two MediaMTX callers are routed through this so far. The other 15 sites
+    share the same defect and the same fix — ROADMAP, not this change.
+    """
+    now = time.time()
+    hit = _GH_JSON_CACHE.get(url)
+    if hit and (now - hit['at']) < ttl:
+        return hit['data']
+    try:
+        req = _ur.Request(url, headers={'Accept': 'application/vnd.github.v3+json',
+                                        'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        _GH_JSON_CACHE[url] = {'at': now, 'data': data}
+        return data
+    except Exception:
+        # Rate-limited, offline, or GitHub is having a day: serve the last good answer
+        # however old. Only a box that has NEVER had one gets None.
+        return hit['data'] if hit else None
+
+
 def _get_mediamtx_editor_version_info(deploy_cfg):
     """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
     Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
@@ -26558,11 +26599,7 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
                 pass
     # Latest from takwerx/mediamtx-installer releases/latest
     try:
-        req = _ur.Request(
-            'https://api.github.com/repos/takwerx/mediamtx-installer/releases/latest',
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
+        data = _gh_json_cached('https://api.github.com/repos/takwerx/mediamtx-installer/releases/latest')
         tag = (data or {}).get('tag_name') or ''
         if tag:
             out['latest'] = tag.lstrip('vV')
@@ -26638,11 +26675,7 @@ def _get_mediamtx_version_info():
     # Upstream awareness. This is the ONLY source of "an update exists" — compared
     # against what this box is actually running, not against our pin.
     try:
-        req = _ur.Request(
-            'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
+        data = _gh_json_cached('https://api.github.com/repos/bluenviron/mediamtx/releases/latest')
         tag = ((data or {}).get('tag_name') or '').lstrip('vV')
         if tag:
             out['upstream_latest'] = tag
@@ -26655,6 +26688,14 @@ def _get_mediamtx_version_info():
     except Exception:
         # Offline or rate-limited: absence of upstream news must never look like news.
         out['upstream_latest'] = None
+    # A box that has never once reached GitHub still knows one true thing: the release we
+    # ship exists. Use it as a FLOOR so the page is not silently blank when the lookup is
+    # unavailable — blank reads as "you are current", which is the lie. Never the reverse:
+    # the pin only fills a gap, it never suppresses real upstream news.
+    if not out['latest'] and out['version']:
+        out['latest'] = MEDIAMTX_VETTED_RELEASE
+        out['binary_update_available'] = _vparts(MEDIAMTX_VETTED_RELEASE) > _vparts(out['version'])
+        out['update_available'] = out['binary_update_available']
     # Web editor: current from CURRENT_VERSION on target, latest from takwerx/mediamtx-installer
     editor_info = _get_mediamtx_editor_version_info(deploy_cfg)
     out['editor_version'] = editor_info.get('version') or ''
