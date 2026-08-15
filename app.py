@@ -26597,10 +26597,33 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
                             break
             except Exception:
                 pass
-    # Latest from takwerx/mediamtx-installer releases/latest
+    # Latest from takwerx/mediamtx-installer, via TWO independent sources.
+    # The releases API is the authority, but it shares one 60/hour unauthenticated
+    # budget with 16 other call sites in this file. raw.githubusercontent.com is a
+    # different host with a different budget, and reading CURRENT_VERSION off main is
+    # exactly how the editor checks itself. Either source answering is enough.
     try:
         data = _gh_json_cached('https://api.github.com/repos/takwerx/mediamtx-installer/releases/latest')
         tag = (data or {}).get('tag_name') or ''
+        if not tag:
+            try:
+                _raw = _ur.Request(
+                    'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main'
+                    '/config-editor/mediamtx_config_editor.py',
+                    headers={'User-Agent': 'infra-TAK'})
+                with _ur.urlopen(_raw, timeout=15) as _r:
+                    _head = _r.read(32768).decode('utf-8', 'replace')
+                _m = _re.search(r'CURRENT_VERSION\s*=\s*["\']([^"\']+)["\']', _head)
+                if _m:
+                    tag = _m.group(1)
+            except Exception as _raw_err:
+                print(f"MediaMTX editor version: raw fallback failed: {_raw_err}", flush=True)
+        if not tag:
+            # Never silent. A missing 'editor vX available' notice is indistinguishable
+            # from 'you are current', and that is how test8 sat on v2.0.9 unnoticed.
+            print("MediaMTX editor version: both sources returned nothing "
+                  "(installed=%s), update notice suppressed" % (out['version'] or '?'),
+                  flush=True)
         if tag:
             out['latest'] = tag.lstrip('vV')
             if out['version'] and out['latest']:
