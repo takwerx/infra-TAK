@@ -26554,6 +26554,10 @@ def _gh_json_cached(url, timeout=15, ttl=_GH_JSON_TTL):
     Only the two MediaMTX callers are routed through this so far. The other 15 sites
     share the same defect and the same fix — ROADMAP, not this change.
     """
+    # _ur is a per-function import convention throughout this file, never module
+    # level. Omitting it here is what made every MediaMTX/editor lookup raise
+    # NameError into a bare except and render as "no update available".
+    import urllib.request as _ur
     now = time.time()
     hit = _GH_JSON_CACHE.get(url)
     if hit and (now - hit['at']) < ttl:
@@ -26575,6 +26579,7 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
     """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
     Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
     import re as _re
+    import urllib.request as _ur
     out = {'version': '', 'update_available': False, 'latest': None}
     # Current: grep CURRENT_VERSION from editor script on target
     cmd = 'grep -oE \'CURRENT_VERSION = "[^"]+"\' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null | head -1'
