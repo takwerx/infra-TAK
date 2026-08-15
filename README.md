@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.34-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.34-alpha)**
+**Current release: [v10.1.35-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.35-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.35-alpha — 2026-08-15 — one mistyped password no longer knocks users off your server
+
+**Headline: a self-repair feature was tearing down your sign-in service whenever somebody fat-fingered a login — and the fault it was built to repair does not exist.** The console watched TAK Server's log for sign-in errors and, on seeing two within six minutes, rebuilt part of the Authentik sign-in service on the assumption it had become stuck. Two problems. First, **a single mistyped login is enough to set it off** — one rejected sign-in records two errors, which is already the trigger. So one person mistyping their username, once, could take down the sign-in service for everyone. Second, and worse, **the stuck state it was written to clear could not be reproduced at all.** The theory was that after a password change, TAK Server would keep rejecting you even with the correct new password until that service was rebuilt. Testing it directly — including the exact password-change sequence described — the correct password was accepted immediately every time, and every sign-in error observed had reached the identity service normally rather than being answered from a stale cache. In the field this had real cost: a user mistyping their username during device enrollment triggered a rebuild that left the server briefly unable to resolve who was in which channel, and **disconnected a device that was in the middle of a session** — with nothing wrong on that user's end, and no indication of what had happened. The feature has been **removed entirely**. Sign-in errors are now logged and left alone, which is what they always deserved: a mistyped password is a mistyped password, not a fault to repair. The genuine identity health monitoring around it is untouched and still runs — it verifies a real problem before acting, rather than inferring one from error counts. Removing this also takes two privileged system commands out of the console, so it runs with slightly less power than before. **Who should update:** everyone, and especially anyone enrolling new users or running devices in the field. **Upgrade:** automatic on the next console update, with nothing to reconfigure.
+
+Full notes: [v10.1.35-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.35-alpha).
 
 ### v10.1.34-alpha — 2026-08-15 — map feeds hold their nerve, and update notices finally tell you the truth
 
