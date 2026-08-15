@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.34-alpha"
+VERSION = "10.1.35-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -48730,115 +48730,6 @@ def _takportal_admin_guardrail(plog_fn=None):
         _log(f"takportal admin guardrail error (non-fatal): {_e}")
 
 
-def _check_takserver_ldap49_and_heal(plog=None):
-    """v0.9.38: Detect TAK Server negative LDAP auth cache and auto-flush the
-    LDAP outpost to clear it.
-
-    When a user fails to authenticate, TAK Server's LdapAuthenticator caches
-    the failed result internally (DistributedPersistentGroupManager). After a
-    password change in TAK Portal, subsequent logins still hit that cache and
-    return LDAP 49 without the request ever reaching Authentik. The only fix is
-    --force-recreate ldap, which forces TAK Server to drop and re-establish its
-    LDAP connection, clearing the cached failure.
-
-    Detection: tail /opt/tak/logs/takserver-api.log and count lines matching
-    'LdapAuthenticator - exception during group assignment' within the last
-    360 seconds. Threshold >= 2: one failure = normal wrong-password typo, no
-    action; two or more in a 5-min window = pattern indicates a stuck negative
-    cache (password changed, user retrying, still blocked).
-
-    Rate limit: 4-minute cooldown via settings['ldap49_cache_flush'] — at most
-    one flush per watchdog tick regardless of how many failures accumulate.
-
-    Called from _authentik_ldap_sa_bind_watchdog_loop before the SA bind probe
-    so the outpost is already fresh when the probe runs.
-    """
-    _log = plog or (lambda m: print(m, flush=True))
-    try:
-        _api_log = '/opt/tak/logs/takserver-api.log'
-        if not os.path.exists(_api_log):
-            return
-
-        _settings = load_settings()
-
-        # 4-minute cooldown — prevents double-flushes within a single tick window
-        _cooldown_info = _settings.get('ldap49_cache_flush') or {}
-        _last_flush = float(_cooldown_info.get('last_flush_ts') or 0)
-        if time.time() - _last_flush < 240:
-            return
-
-        # Tail last 300 lines — covers several minutes on an active box.
-        # Use subprocess list form to avoid shell expansion on the path.
-        _r = subprocess.run(
-            ['tail', '-n', '300', _api_log],
-            capture_output=True, text=True, timeout=5
-        )
-        if _r.returncode != 0 or not _r.stdout:
-            return
-
-        _cutoff = datetime.utcnow() - timedelta(seconds=360)
-        _count = 0
-        _marker = 'LdapAuthenticator - exception during group assignment'
-        for _line in _r.stdout.splitlines():
-            if _marker not in _line:
-                continue
-            try:
-                # TAK Server log format: 2026-05-23-03:18:13.396 [...] WARN ...
-                _ts_str = _line.split(' ')[0]
-                _ts = datetime.strptime(_ts_str, '%Y-%m-%d-%H:%M:%S.%f')
-                if _ts >= _cutoff:
-                    _count += 1
-            except (ValueError, IndexError):
-                # Unparseable timestamp — count conservatively
-                _count += 1
-
-        if _count < 2:
-            return
-
-        _log(f"  LDAP 49 cache-hit watchdog: {_count} user auth failure(s) in "
-             f"last 6 min — flushing LDAP outpost bind cache")
-        _ak_cfg = _get_module_deployment_config(_settings, 'authentik_deployment')
-        _is_remote = (
-            _ak_cfg.get('target_mode') == 'remote' and
-            bool((_ak_cfg.get('remote', {}).get('host') or '').strip())
-        )
-        try:
-            if _is_remote:
-                _module_run(
-                    _ak_cfg,
-                    'cd ~/authentik && docker compose up -d --no-deps --force-recreate ldap 2>&1',
-                    timeout=90
-                )
-            else:
-                _flush_r = subprocess.run(
-                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=os.path.expanduser('~/authentik'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90
-                )
-                if _flush_r.returncode != 0:
-                    _log(f"  ⚠ LDAP 49 cache flush failed "
-                         f"(rc={_flush_r.returncode}): {(_flush_r.stdout or '')[:200]}")
-                    return
-            _log("  ✓ LDAP outpost flushed — TAK Server LDAP connection will "
-                 "reset on next auth attempt, clearing the cached failure")
-            # Persist audit trail so operators can track frequency
-            try:
-                _s2 = load_settings()
-                _prior = _s2.get('ldap49_cache_flush') or {}
-                _s2['ldap49_cache_flush'] = {
-                    'last_flush_ts': time.time(),
-                    'flush_count': int(_prior.get('flush_count') or 0) + 1,
-                    'last_trigger_count': _count,
-                }
-                save_settings(_s2)
-            except Exception:
-                pass
-        except Exception as _fe:
-            _log(f"  ⚠ LDAP 49 cache flush error: {str(_fe)[:120]}")
-    except Exception as _e:
-        (_plog := plog or print)(
-            f"  _check_takserver_ldap49_and_heal error (non-fatal): {str(_e)[:120]}"
-        )
-
-
 def _authentik_ldap_sa_bind_watchdog_loop():
     """v0.9.23 (Item 1+2 of PLAN-v0.9.23-alpha.md). Background daemon — periodic
     LDAP SA bind verification + webadmin admin-role drift heal.
@@ -48884,11 +48775,18 @@ def _authentik_ldap_sa_bind_watchdog_loop():
                 _wt.sleep(300)
                 continue
 
-            # v0.9.38: detect TAK Server negative auth cache and flush if needed,
-            # before the SA bind probe so the outpost is fresh when we test it.
-            _check_takserver_ldap49_and_heal(
-                plog=lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True)
-            )
+            # v10.1.35: the LDAP-49 auto-flush was REMOVED here. It force-recreated
+            # the Authentik LDAP outpost whenever TAK logged >=2 'exception during
+            # group assignment' lines in 6 min, on the v0.9.38 premise that TAK
+            # caches negative auth results and answers 49 WITHOUT the bind ever
+            # reaching Authentik. Disproven on test6 2026-08-15: all 8 test 49s had
+            # a matching Authentik login_failed at the same second, and a correct
+            # password was accepted immediately after a failure in BOTH the
+            # wrong-password and the password-change scenarios. Meanwhile one
+            # rejected login emits TWO markers, so a single typo tripped the
+            # threshold and destroyed outposts that had been healthy for days --
+            # on test8 2026-08-14 that dropped a live EUD's session. Do not
+            # re-add a log-count-triggered flush. See PLAN-v10.1.35.md.
 
             try:
                 _verdict = _test_ldap_bind_dn_verdict(
