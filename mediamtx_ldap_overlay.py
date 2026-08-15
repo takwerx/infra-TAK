@@ -68,6 +68,36 @@ def _ak_delete(path):
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
 
+    VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/viewer/hlscred', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
+    VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
+
+    @app.before_request
+    def _authentik_auto_auth():
+        ak_user = request.headers.get('X-Authentik-Username', '')
+        ak_groups_raw = request.headers.get('X-Authentik-Groups', '')
+        if not ak_user:
+            return
+        groups = [g.strip() for g in ak_groups_raw.split('|') if g.strip()]
+        role = 'admin' if any(g in ADMIN_GROUPS for g in groups) else 'viewer'
+        session['username'] = ak_user
+        session['logged_in'] = True
+        session['role'] = role
+        session['ldap_groups'] = groups
+        session['ldap_mode'] = True
+        # Redirect away from standalone auth pages
+        if request.path in ('/login', '/register', '/forgot-password', '/reset-password'):
+            return redirect('/')
+        # Viewers (vid_public, vid_private) only see Active Streams — redirect to viewer page, block full editor
+        if role == 'viewer':
+            p = request.path
+            if p not in VIEWER_ALLOWED and not p.startswith('/static') and not any(p.startswith(px) for px in VIEWER_PREFIXES):
+                return redirect('/viewer')
+
+    # v10.1.34 (security review): registered AFTER _authentik_auto_auth on purpose.
+    # Flask runs before_request hooks in registration order, and this one returns a
+    # terminal 409 — registering it first meant an unauthenticated POST short-circuited
+    # authentication entirely and still learned the pinned version. It performs no
+    # action either way, but auth must be evaluated first.
     # ── v10.1.34: intercept the editor's own MediaMTX binary upgrade ──────────
     # Two independent problems with the vendored editor's `POST
     # /api/mediamtx/version/upgrade`, both live on every non-root box:
@@ -117,31 +147,6 @@ def apply_ldap_overlay(app):
             'pinned_version': _VETTED or None,
             'infratak_pinned': True,
         }), 409
-
-    VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/viewer/hlscred', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
-    VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
-
-    @app.before_request
-    def _authentik_auto_auth():
-        ak_user = request.headers.get('X-Authentik-Username', '')
-        ak_groups_raw = request.headers.get('X-Authentik-Groups', '')
-        if not ak_user:
-            return
-        groups = [g.strip() for g in ak_groups_raw.split('|') if g.strip()]
-        role = 'admin' if any(g in ADMIN_GROUPS for g in groups) else 'viewer'
-        session['username'] = ak_user
-        session['logged_in'] = True
-        session['role'] = role
-        session['ldap_groups'] = groups
-        session['ldap_mode'] = True
-        # Redirect away from standalone auth pages
-        if request.path in ('/login', '/register', '/forgot-password', '/reset-password'):
-            return redirect('/')
-        # Viewers (vid_public, vid_private) only see Active Streams — redirect to viewer page, block full editor
-        if role == 'viewer':
-            p = request.path
-            if p not in VIEWER_ALLOWED and not p.startswith('/static') and not any(p.startswith(px) for px in VIEWER_PREFIXES):
-                return redirect('/viewer')
 
     # ── HLS helpers ─────────────────────────────────────────────────────
 
