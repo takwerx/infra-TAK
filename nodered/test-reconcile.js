@@ -20,6 +20,12 @@ function mkMission(uids) {
 const POLL_INTERVAL_MS = 300000;
 function tick(state) {
   if (typeof state._tombSweepTs === 'number') state._tombSweepTs -= POLL_INTERVAL_MS;
+  // v10.1.34: hysteresis is now TIME-based, so simulated polls must actually advance
+  // time. Ageing the miss-map backwards is equivalent to the clock moving forward.
+  for (const k of ['_missStreak', '_tfrMissStreak']) {
+    const m = state[k];
+    if (m) for (const u of Object.keys(m)) m[u] -= POLL_INTERVAL_MS;
+  }
 }
 
 // One poll. Returns {puts, deletes, forceDeletes, warns}
@@ -89,12 +95,12 @@ console.log('\nScenario 2 — genuine removal (1 UID gone for good)');
   const gone = TALBOT[0];
   const arcgis = ALL.filter(u => u !== gone);
   let deletedAt = -1;
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 6; i++) {
     const r = poll(st, arcgis, mission);
     if (r.deletes.includes(gone) && deletedAt < 0) deletedAt = i;
   }
   check('not deleted on poll 1 or 2', deletedAt >= 2, 'deleted at poll index ' + deletedAt);
-  check('deleted by poll 3 (MISS_THRESHOLD=3)', deletedAt === 2, 'deleted at poll index ' + deletedAt);
+  check('deleted once 15 min absent has elapsed', deletedAt === 3, 'deleted at poll index ' + deletedAt);
 }
 
 // ── Scenario 3: streak resets on a single good poll ────────────────────────────
@@ -119,13 +125,13 @@ console.log('\nScenario 4 — mass delete (148 -> 30, config-change shape)');
   const BIG = Array.from({ length: 148 }, (_, i) => 'firis-big-' + i);
   const KEEP = BIG.slice(0, 30);
   let firstDelete = -1;
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 10; i++) {
     const r = poll(st, KEEP, BIG);
     if (r.deletes.length && firstDelete < 0) firstDelete = i;
   }
-  check('held past MISS_THRESHOLD (not deleted at poll 3)', firstDelete >= 5,
+  check('mass claim held past the 15-min bar', firstDelete >= 4,
         'first delete at poll index ' + firstDelete);
-  check('mass claim eventually converges (by poll 6)', firstDelete === 5,
+  check('mass claim converges at 30 min absent', firstDelete === 6,
         'first delete at poll index ' + firstDelete);
   const st2 = {};
   const r1 = poll(st2, KEEP, BIG);
@@ -156,7 +162,7 @@ console.log('\nScenario 5b — deleted-this-pass UID must be tombstoned (regress
   const gone = TALBOT[0];
   const without = ALL.filter(u => u !== gone);
   let r;
-  for (let i = 0; i < 3; i++) r = poll(st, without, ALL);   // 3 misses -> delete on the 3rd
+  for (let i = 0; i < 4; i++) r = poll(st, without, ALL);   // 15 min absent -> delete
   check('the UID was deleted', r.deletes.includes(gone), JSON.stringify(r.deletes));
   const tombs = st._tombstones || {};
   check('a tombstone was written and SURVIVED the sweep', !!tombs[gone],
@@ -202,6 +208,30 @@ console.log('\nScenario 8 — tombstone sweep burst cap + send-count retirement'
   st._tombSends['firis-dead-599'] = 48;
   const r2 = poll(st, BASE, BASE);
   check('retired uid is no longer broadcast', !r2.forceDeletes.includes('firis-dead-599'));
+}
+
+// ── Scenario 9: the DC-TFR blip that shipped broken ───────────────────────────
+// test12 2026-08-15: a 1-min-poll feed went 17 -> 1 -> back to 17 over ~4 minutes.
+// Count-based hysteresis (3 polls = 3 min on that cadence) deleted 16 live shapes and
+// re-added 14 three minutes later. Time-based hysteresis must ride it out.
+console.log('\nScenario 9 — 4-minute blip on a fast-polling feed (the DC-TFR regression)');
+{
+  const st = {};
+  const FULL = Array.from({ length: 17 }, (_, i) => 'firis-tfr-' + i);
+  const ONE = [FULL[0]];
+  const FAST = 60000;                       // 1-minute polls
+  const fastTick = (s) => { const m = s._missStreak; if (m) for (const u of Object.keys(m)) m[u] -= FAST; };
+  let deletes = 0;
+  poll(st, FULL, FULL);                     // steady
+  for (let i = 0; i < 4; i++) {             // 4 one-minute polls of the blip
+    st._tombSweepTs = 0;
+    const r = poll(st, ONE, FULL);
+    deletes += r.deletes.length;
+    fastTick(st);                           // only 1 min of real time passes per poll
+  }
+  const back = poll(st, FULL, FULL);        // source recovers
+  check('no deletes during a 4-minute blip', deletes === 0, deletes + ' deleted');
+  check('nothing re-added afterwards (no churn)', back.puts.length === 0, back.puts.length + ' puts');
 }
 
 // ── Scenario 6: existing guards still work ─────────────────────────────────────
