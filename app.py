@@ -28517,13 +28517,31 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     # Step 3: Download and install binary on remote
     plog("")
     plog("━━━ Step 3/7: Downloading & Installing MediaMTX (remote) ━━━")
-    url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}/mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+    tarball = f"mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+    base_url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}"
+    url = f"{base_url}/{tarball}"
+    sums_url = f"{base_url}/checksums.sha256"
+    # v10.1.34: VERIFY THE ARTIFACT, not just the version. Pinning decides WHICH release
+    # to fetch; it says nothing about what actually arrived over the wire. Upstream
+    # publishes checksums.sha256 with every release (and build attestation) and we were
+    # ignoring both — downloading a tarball and executing it as root with no integrity
+    # check at all. Half a supply-chain control is not one.
+    # Fails CLOSED: a missing or mismatching checksum aborts the install rather than
+    # falling through to "install it anyway", which is the only behaviour worth having.
     # restorecon relabels the binary to bin_t on RHEL/SELinux (mv from /tmp keeps
-    # tmp_t → systemd 203/EXEC); no-op on Debian (|| true). Universal one-liner.
-    cmd = f'cd /tmp && wget -q -O mediamtx.tar.gz "{url}" && tar -xzf mediamtx.tar.gz && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && (restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && rm -f mediamtx.tar.gz'
+    # tmp_t → systemd 203/EXEC); no-op on Debian (|| true).
+    cmd = (
+        f'cd /tmp && rm -f {tarball} checksums.sha256 && '
+        f'wget -q -O {tarball} "{url}" && '
+        f'wget -q -O checksums.sha256 "{sums_url}" && '
+        f'grep " {tarball}$" checksums.sha256 | sha256sum --check --status && '
+        f'tar -xzf {tarball} && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
+        f'(restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && '
+        f'rm -f {tarball} checksums.sha256'
+    )
     ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
     if not ok:
-        plog(f"✗ Download/install failed: {(out or '')[-200:]}")
+        plog(f"✗ Download/verify/install failed (checksum mismatch aborts the install): {(out or '')[-200:]}")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog(f"✓ MediaMTX v{version} installed")
@@ -29068,15 +29086,52 @@ def run_mediamtx_deploy():
         # Step 3: Download and install binary
         plog("")
         plog("━━━ Step 3/7: Downloading & Installing MediaMTX ━━━")
-        url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}/mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+        tarball = f"mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+        base_url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}"
+        url = f"{base_url}/{tarball}"
         tmp = '/tmp/mediamtx_install'
         os.makedirs(tmp, exist_ok=True)
-        r = subprocess.run(f'wget -q -O {tmp}/mediamtx.tar.gz "{url}"', shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(['wget', '-q', '-O', os.path.join(tmp, tarball), url],
+                           capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             plog(f"✗ Download failed")
             mediamtx_deploy_status.update({'running': False, 'error': True})
             return
-        subprocess.run(f'tar -xzf {tmp}/mediamtx.tar.gz -C {tmp}', shell=True, capture_output=True)
+        # v10.1.34: verify against upstream's published checksums before executing it as
+        # root. See the remote path for the full rationale. Fails CLOSED.
+        # Verified in-process with hashlib rather than shelling out to sha256sum: no
+        # shell, nothing to quote, and the comparison is explicit. Fails CLOSED — a
+        # missing checksums file, a missing entry, or a mismatch all abort the install.
+        try:
+            import hashlib  # not a module-level import in this file
+            rs = subprocess.run(['wget', '-q', '-O', os.path.join(tmp, 'checksums.sha256'),
+                                 f'{base_url}/checksums.sha256'],
+                                capture_output=True, text=True, timeout=60)
+            if rs.returncode != 0:
+                raise RuntimeError('could not fetch upstream checksums.sha256')
+            want = ''
+            with open(os.path.join(tmp, 'checksums.sha256'), 'r') as _cf:
+                for _line in _cf:
+                    _parts = _line.split()
+                    if len(_parts) == 2 and _parts[1].lstrip('*') == tarball:
+                        want = _parts[0].lower()
+                        break
+            if not want:
+                raise RuntimeError(f'{tarball} not listed in upstream checksums.sha256')
+            _h = hashlib.sha256()
+            with open(os.path.join(tmp, tarball), 'rb') as _bf:
+                for _chunk in iter(lambda: _bf.read(1024 * 1024), b''):
+                    _h.update(_chunk)
+            got = _h.hexdigest().lower()
+            if got != want:
+                raise RuntimeError(f'checksum mismatch (expected {want[:16]}…, got {got[:16]}…)')
+        except Exception as _ve:
+            plog(f"✗ REFUSING TO INSTALL — artifact verification failed: {_ve}")
+            plog("  Nothing was changed. The running MediaMTX is untouched.")
+            mediamtx_deploy_status.update({'running': False, 'error': True})
+            return
+        plog(f"✓ Verified {tarball} against upstream checksums.sha256")
+        subprocess.run(['tar', '-xzf', os.path.join(tmp, tarball), '-C', tmp], capture_output=True)
         # install(1) reads the /tmp source (broker source-permissive), writes the
         # allowlisted dest, and sets the mode in one step (replaces mv + chmod).
         subprocess.run(_sudo_wrap(['install', '-m', '0755', f'{tmp}/mediamtx', '/usr/local/bin/mediamtx']), capture_output=True)
