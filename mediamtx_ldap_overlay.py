@@ -130,7 +130,13 @@ def apply_ldap_overlay(app):
     # before_request hook runs first regardless, so this cannot silently stop working
     # because an upstream re-pull moved a line.
     _VETTED = os.environ.get('INFRATAK_MEDIAMTX_VETTED', '').strip()
-    _PINNED_PATHS = ('/api/mediamtx/version/upgrade',)
+    # Every editor endpoint that SWAPS THE BINARY. /upgrade fetches a fresh build and is
+    # arch-blind — it put an x86 tarball on aarch64 and took the service down with
+    # "Exec format error" (status 203/EXEC) on aws-arm 2026-08-15, recovered only by
+    # systemd's restart rolling back. /rollback restores an older build. Both move the box
+    # off the vetted pin, so both are refused. version/check and version/test are read-only
+    # and deliberately left working.
+    _PINNED_PATHS = ('/api/mediamtx/version/upgrade', '/api/mediamtx/version/rollback')
 
     @app.before_request
     def _infratak_block_unpinned_upgrade():
@@ -140,10 +146,11 @@ def apply_ldap_overlay(app):
         return jsonify({
             'success': False,
             'error': (
-                f'MediaMTX is pinned by infra-TAK{pinned}. Upgrading from here is '
-                'disabled so a box cannot be moved to an untested build. Update '
-                'MediaMTX from the infra-TAK console (MediaMTX module → Update), '
-                'which installs the vetted version.'),
+                f'MediaMTX is pinned by infra-TAK{pinned}. Changing the binary from here '
+                'is disabled so a box cannot be moved off the tested build — and this '
+                'page does not select a build for your CPU architecture. Use the '
+                'infra-TAK console (MediaMTX module -> Update), which installs the '
+                'vetted version built for this machine.'),
             'pinned_version': _VETTED or None,
             'infratak_pinned': True,
         }), 409

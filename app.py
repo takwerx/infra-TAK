@@ -65540,6 +65540,76 @@ WantedBy=multi-user.target
 """
 
 
+def _startup_converge_mediamtx_overlay():
+    """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
+
+    The overlay is our own module the vendored editor imports, and it is copied ONLY by
+    the MediaMTX deploy path (_module_copy at the deploy sites). A console update never
+    touched it. So the v10.1.34 upgrade intercept — the thing that stops the editor's
+    own "Upgrade MediaMTX" button pushing a box to an unvetted build — sat in the repo
+    for hours and was live on ZERO boxes, because nobody redeploys MediaMTX.
+
+    That is not academic. On aws-arm 2026-08-15 the un-intercepted button ran and the
+    editor fetched an x86 tarball onto aarch64: `Failed to execute /usr/local/bin/mediamtx:
+    Exec format error`, status=203/EXEC, service down until systemd's restart rolled it
+    back to v1.19.2. The editor's upgrade has no architecture detection at all (our deploy
+    path does, via arch_map). The intercept would have refused the click outright — but
+    only if it had been deployed.
+
+    Also (re)asserts Environment=INFRATAK_MEDIAMTX_VETTED on the editor unit so the refusal
+    can name the pinned version, and restarts the editor only when something actually
+    changed, so a healthy box is left alone."""
+    try:
+        if not os.path.isdir('/opt/mediamtx-webeditor'):
+            return
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
+        if not os.path.exists(src):
+            return
+        dst = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
+        changed = False
+
+        with open(src, 'r') as f:
+            want = f.read()
+        have = ''
+        try:
+            have = _read_priv(dst)
+        except Exception:
+            have = ''
+        if have != want:
+            _write_priv(dst, want)
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', dst]), capture_output=True, timeout=15)
+            changed = True
+            print("Startup migration: MediaMTX editor overlay updated (upgrade intercept + LDAP overlay)", flush=True)
+
+        unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        if os.path.exists(unit):
+            try:
+                txt = _read_priv(unit)
+            except Exception:
+                txt = ''
+            if txt and 'INFRATAK_MEDIAMTX_VETTED=' not in txt:
+                # Anchor on the PORT env line, which every editor unit has, rather than on
+                # any User= value — anchoring on User=takwerx is exactly the mistake that
+                # made the v10.1.33 UMask converge a silent no-op on root-era units.
+                if 'Environment=PORT=5080' in txt:
+                    txt = txt.replace('Environment=PORT=5080',
+                                      'Environment=PORT=5080\nEnvironment=INFRATAK_MEDIAMTX_VETTED=' + MEDIAMTX_VETTED_RELEASE, 1)
+                    _write_priv(unit, txt)
+                    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+                    changed = True
+                    print(f"Startup migration: MediaMTX editor unit now declares vetted release {MEDIAMTX_VETTED_RELEASE}", flush=True)
+
+        if changed:
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                print(f"Startup migration: \u26a0 MediaMTX editor restart failed: {(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
+            else:
+                print("Startup migration: MediaMTX editor restarted with the upgrade intercept active", flush=True)
+    except Exception as _e:
+        print(f"Startup migration: MediaMTX editor overlay converge error (non-fatal): {_e}", flush=True)
+
+
 def _startup_converge_mediamtx_unit_nonroot():
     """v10.1.33: move a legacy `User=root` mediamtx.service onto takwerx.
 
@@ -67659,6 +67729,15 @@ def _startup_migrations():
         # the MoQ converge: that one may restart mediamtx, and this one judges success by
         # whether the service comes back up. Ordering them the other way would let a MoQ
         # restart land mid-verification and trigger a needless rollback.
+        # v10.1.34 — push our editor overlay (and the vetted-release env) to boxes on a
+        # console update. Without this the upgrade intercept only ever reaches a box that
+        # someone redeploys MediaMTX on, which is nobody: it was live on ZERO boxes while
+        # the un-intercepted button put an x86 binary on an ARM box (aws-arm 2026-08-15).
+        try:
+            _startup_converge_mediamtx_overlay()
+        except Exception as _mtx_ov_e:
+            print(f"Startup migration: mediamtx overlay converge error (non-fatal): {_mtx_ov_e}", flush=True)
+
         try:
             _startup_converge_mediamtx_ssl()
         except Exception as _mtx_ssl_e:
