@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.35-alpha"
+VERSION = "10.1.36-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -4933,6 +4933,197 @@ def _w1_setup_stage_pks(ak_url, ak_headers):
         except Exception:
             pass
     return pks
+
+
+# --- MFA device recovery (v10.1.36) — "I lost my phone" ---------------------------------
+# W1 force-enroll only rescues users with ZERO devices. Someone whose registered TOTP device
+# is gone hits the validate stage and cannot produce a code, and the recovery flow deliberately
+# ends signed out (WS3/WS3c) so a reset email is not an MFA bypass. The upstream-documented
+# remedy is for an admin to delete the user's authenticators so they re-enroll at next login
+# (https://docs.goauthentik.io/users-sources/user/user_basic_operations/) — these helpers put
+# that behind a console button instead of five menus of the Authentik admin UI.
+#
+# Field-verified against Authentik 2026.5.6 (test12, 2026-08-15) — the API does NOT behave the
+# way its reference docs imply, so read these notes before "simplifying" anything below:
+#   * `?user=<pk>` is SILENTLY IGNORED on every authenticators/admin/<kind>/ viewset. Asking
+#     for ?user=1 returned a device belonging to user pk 26. Grouping MUST happen client-side.
+#   * /authenticators/admin/all/ carries no `user` field at all, so it cannot answer "whose
+#     device is this?" — the per-kind viewsets are the only source that names the owner.
+#   * core/authenticated_sessions/?user= is ignored too, and that row's `user` is a bare int pk
+#     (not the nested object the device rows carry).
+# Device rows expose only name/pk/user — no seed or secret — so they are safe to hand the UI.
+#
+# The kind list is the set of authenticators a USER enrolls for themselves, enumerated from the
+# live Device subclasses on 2026.5.6 rather than guessed. `email` is easy to miss and its absence
+# would make us report "no devices" for someone whose only second factor is an emailed code.
+# DELIBERATELY EXCLUDED: `endpoint` (and the Apple secure-enclave / gdtc models behind it) —
+# those are device-trust attestations issued to a machine, not something a person loses with
+# their phone, and revoking them is a different operation with different consequences.
+_AK_MFA_DEVICE_KINDS = ('totp', 'webauthn', 'static', 'sms', 'duo', 'email')
+
+# Operator-facing labels; the raw authentik kind is a poor thing to show during a support call.
+_AK_MFA_KIND_LABELS = {
+    'totp': 'Authenticator app',
+    'webauthn': 'Security key',
+    'static': 'Backup codes',
+    'sms': 'SMS',
+    'duo': 'Duo',
+    'email': 'Email code',
+}
+
+
+def _ak_paged(ak_url, path, ak_headers, page_size=1000, max_pages=50):
+    """Every result across an authentik paginated list endpoint.
+
+    authentik's `pagination.next` is an int page number (0 = no more), not a URL.
+    max_pages is a runaway guard, not an expected limit.
+    """
+    out = []
+    sep = '&' if '?' in path else '?'
+    page = 1
+    while page and page <= max_pages:
+        d = _w1_ak_get(ak_url, f'{path}{sep}page_size={page_size}&page={page}', ak_headers)
+        out.extend(d.get('results') or [])
+        pg = d.get('pagination') or {}
+        nxt = pg.get('next') or 0
+        page = nxt if nxt and nxt > page else 0
+    return out
+
+
+def _ak_all_mfa_devices(ak_url, ak_headers):
+    """{user_pk: [{'kind','label','pk','name'}, ...]} for every MFA device on the box.
+
+    One pass over the five device viewsets — see the module note above for why this cannot
+    be a per-user query. A kind whose stage isn't installed 404s; that is normal, not an error.
+    """
+    by_user = {}
+    for kind in _AK_MFA_DEVICE_KINDS:
+        try:
+            rows = _ak_paged(ak_url, f'authenticators/admin/{kind}/', ak_headers)
+        except Exception:
+            continue  # stage not installed on this box
+        for r in rows:
+            u = r.get('user')
+            upk = u.get('pk') if isinstance(u, dict) else u
+            if upk is None:
+                continue
+            by_user.setdefault(int(upk), []).append({
+                'kind': kind,
+                'label': _AK_MFA_KIND_LABELS.get(kind, kind),
+                'pk': r.get('pk'),
+                'name': r.get('name') or _AK_MFA_KIND_LABELS.get(kind, kind),
+            })
+    return by_user
+
+
+def _ak_user_mfa_devices(ak_url, ak_headers, user_pk):
+    """MFA devices for one user. Prefer _ak_all_mfa_devices() when you need several users —
+    this re-walks all five viewsets on every call."""
+    return _ak_all_mfa_devices(ak_url, ak_headers).get(int(user_pk), [])
+
+
+def _ak_force_enroll_posture(ak_url, ak_headers):
+    """(force_enroll, detail) — will a device-less user be walked through enrollment at login?
+
+    This is the whole safety net behind revoking someone's devices. False means revoking would
+    silently drop that user to password-only instead of prompting them to enroll again.
+    """
+    try:
+        stage_pk, stage = _w1_mfa_validate_stage(ak_url, ak_headers)
+    except Exception as e:
+        return (False, f'could not read the login MFA stage ({e})')
+    if not stage_pk:
+        return (False, 'no MFA validation stage is bound to the web login flow')
+    if (stage or {}).get('not_configured_action') != 'configure':
+        return (False, 'the login flow does not offer enrollment to users without a device')
+    if not (stage or {}).get('configuration_stages'):
+        return (False, 'enrollment is enabled but no setup stage is attached')
+    return (True, 'device-less users are walked through authenticator setup at sign-in')
+
+
+def _ak_backup_codes_posture(ak_url, ak_headers):
+    """(available, detail) — can users self-add backup codes from their own settings page?
+
+    Stock authentik ships `default-authenticator-static-setup` with a configure_flow, which is
+    what makes the "Add" button appear under MFA Devices. We only report on it: adding the
+    static stage to W1's configuration_stages would let a user enroll printable codes INSTEAD
+    of an authenticator (authentik shows a chooser when that list has more than one entry),
+    which is a downgrade dressed as a convenience. Check and report; never create.
+    """
+    try:
+        rows = _w1_ak_get(ak_url, 'stages/authenticator/static/?page_size=20', ak_headers).get('results', [])
+    except Exception as e:
+        return (False, f'could not read the backup-codes stage ({e})')
+    for s in rows:
+        if s.get('configure_flow'):
+            return (True, f"{s.get('token_count') or 0} codes per set")
+    if rows:
+        return (False, 'the backup-codes stage has no configuration flow, so users cannot add them')
+    return (False, 'no backup-codes stage is installed')
+
+
+def _ak_user_sessions(ak_url, ak_headers, user_pk):
+    """authenticated_session rows belonging to one user (client-side filter — see module note)."""
+    want = int(user_pk)
+    out = []
+    for r in _ak_paged(ak_url, 'core/authenticated_sessions/', ak_headers):
+        u = r.get('user')
+        upk = u.get('pk') if isinstance(u, dict) else u
+        try:
+            if upk is not None and int(upk) == want:
+                out.append(r)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ak_revoke_mfa_devices(ak_url, ak_headers, devices):
+    """DELETE each device. Returns (removed_by_kind, failures) — a partial failure is a
+    result to surface, never a silent success."""
+    removed, failures = {}, []
+    for d in devices:
+        kind, pk = d.get('kind'), d.get('pk')
+        if kind not in _AK_MFA_DEVICE_KINDS or pk in (None, ''):
+            continue
+        try:
+            # urllib.parse (module-level import) — NOT a bare `quote`: this call sits inside
+            # `except Exception`, which would swallow a NameError as a per-device failure.
+            dev_pk = urllib.parse.quote(str(pk), safe='')
+            _ak_api_call(f'{ak_url}/api/v3/authenticators/admin/{kind}/{dev_pk}/',
+                         method='DELETE', headers=ak_headers)
+            removed[kind] = removed.get(kind, 0) + 1
+        except Exception as e:
+            failures.append(f'{_AK_MFA_KIND_LABELS.get(kind, kind)} "{d.get("name")}": {e}')
+    return removed, failures
+
+
+def _record_mfa_reset(username, user_pk, removed, sessions_killed, method='console'):
+    """Append an MFA reset to the bounded audit trail in settings.json (last 20).
+
+    Authentik logs the deletions itself under the bootstrap token, but that attributes every
+    reset to the same service identity — this is the operator-facing "who clicked it, when,
+    and what went away" record. Device NAMES only; never a secret (device rows carry none).
+    """
+    try:
+        s = load_settings()
+        trail = list(s.get('authentik_mfa_resets') or [])
+        trail.insert(0, {
+            'ts': datetime.now().isoformat(timespec='seconds'),
+            'username': username,
+            'user_pk': user_pk,
+            'devices_removed': dict(removed or {}),
+            'sessions_killed': int(sessions_killed or 0),
+            'method': method,
+            'console_user': (session.get('authentik_username')
+                             or session.get('username') or 'console'),
+        })
+        s['authentik_mfa_resets'] = trail[:20]
+        save_settings(s)
+    except Exception:
+        # An audit-write failure must never mask a completed reset; the operator already
+        # saw the result and authentik has its own event record.
+        pass
+
 
 # --- Fleet-uniform Authentik login/MFA copy (clearer than the stock "authentik" text) -
 # Replaces "Welcome to authentik!" / "TOTP Device" / "WebAuthn device" with plain-English
@@ -54919,6 +55110,98 @@ def _recover_authentik_user(username):
     return False, f"All recovery paths failed. API: {api_err}. ak shell: {out_s[:240] or 'no output'}", None
 
 
+def _purge_authentik_user_mfa(username):
+    """v10.1.36 break-glass: wipe a protected admin's MFA devices so they can enroll a new one.
+
+    Same layered shape as _recover_authentik_user():
+      1. API — list the admin device viewsets, DELETE what belongs to this user.
+      2. `ak shell` — delete the Device rows straight out of the ORM. Survives a revoked
+         bootstrap token, a broken auth flow, a wedged outpost: anything short of the
+         container being down. This is the path that matters at 3am.
+
+    Returns (success, message, method|None).
+
+    Whitelisted to _AUTHENTIK_RECOVERABLE_USERS ('akadmin', 'webadmin') for the same reason the
+    reactivate helper is: the username is f-string-interpolated into the ORM snippet, and the
+    whitelist is what makes that safe. It also keeps this from becoming a generic
+    strip-anyone's-MFA primitive — ordinary users go through the API-only route below.
+    DO NOT WIDEN.
+    """
+    if username not in _AUTHENTIK_RECOVERABLE_USERS:
+        return False, (f"MFA reset not permitted for '{username}' here "
+                       f"(allowed: {', '.join(_AUTHENTIK_RECOVERABLE_USERS)}). "
+                       f"Use the MFA Device Recovery panel for ordinary users."), None
+
+    import base64 as _b64
+
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+
+    # Layer 1: API
+    api_err = None
+    ak_url, ak_headers, _s = _w1_ak_ctx()
+    if ak_url:
+        try:
+            users = _w1_ak_get(
+                ak_url, f'core/users/?username={urllib.parse.quote(username, safe="")}',
+                ak_headers).get('results', [])
+            match = next((u for u in users if u.get('username') == username), None)
+            if match is None:
+                return False, f"User '{username}' does not exist in Authentik.", None
+            devs = _ak_user_mfa_devices(ak_url, ak_headers, match['pk'])
+            if not devs:
+                return True, (f"{username} has no MFA devices registered — they will be asked to "
+                              f"set one up at their next sign-in."), 'api'
+            removed, failures = _ak_revoke_mfa_devices(ak_url, ak_headers, devs)
+            if not failures:
+                n = sum(removed.values())
+                return True, (f"Removed {n} MFA device{'s' if n != 1 else ''} from {username}. "
+                              f"They will be asked to set up a new authenticator at their next "
+                              f"sign-in."), 'api'
+            api_err = '; '.join(failures)[:200]
+        except Exception as e:
+            api_err = f'API error: {str(e)[:160]}'
+    else:
+        api_err = 'AUTHENTIK_BOOTSTRAP_TOKEN missing'
+
+    # Layer 2: ak shell (Django ORM inside authentik-server-1).
+    # Device models are discovered from the app registry, NOT hardcoded: authentik 2026.5.x
+    # dropped django_otp (verified on a live box — `import django_otp` raises
+    # ModuleNotFoundError), and the concrete model set moves between releases. Every concrete
+    # subclass of authentik.stages.authenticator.models.Device is a device row; the endpoint /
+    # secure-enclave attestation models are skipped for the same reason the API path skips them.
+    py = (
+        "from django.apps import apps\n"
+        "from authentik.core.models import User\n"
+        "from authentik.stages.authenticator.models import Device\n"
+        f"u = User.objects.filter(username='{username}').first()\n"
+        "if u is None:\n"
+        "    print('AK-SHELL-NOTFOUND')\n"
+        "else:\n"
+        "    n = 0\n"
+        "    for m in apps.get_models():\n"
+        "        if not issubclass(m, Device) or m._meta.abstract:\n"
+        "            continue\n"
+        "        if 'endpoint' in m._meta.app_label or 'connectors' in m._meta.app_label:\n"
+        "            continue\n"
+        "        n += m.objects.filter(user=u).delete()[0]\n"
+        "    print('AK-SHELL-OK %d' % n)\n"
+    )
+    b64 = _b64.b64encode(py.encode()).decode()
+    cmd = f"docker exec authentik-server-1 sh -c 'echo {b64} | base64 -d | ak shell' 2>&1"
+    ok, out = _module_run(ak_cfg, cmd, timeout=45)
+    out_s = (out or '').strip()
+    if ok and 'AK-SHELL-OK' in out_s:
+        n = out_s.rsplit('AK-SHELL-OK', 1)[1].strip().split()[0] if 'AK-SHELL-OK' in out_s else '?'
+        return True, (f"Removed {n} MFA device(s) from {username} via ak shell (API path: "
+                      f"{api_err}). They will be asked to set up a new authenticator at their "
+                      f"next sign-in."), 'ak-shell'
+    if 'AK-SHELL-NOTFOUND' in out_s:
+        return False, f"User '{username}' does not exist in Authentik DB.", None
+    return False, (f"All MFA reset paths failed. API: {api_err}. "
+                   f"ak shell: {out_s[:240] or 'no output'}"), None
+
+
 @app.route('/api/authentik/admin-accounts')
 @login_required
 def authentik_admin_accounts_api():
@@ -55109,6 +55392,208 @@ def authentik_recover_admin_api():
     ok, msg, method = _recover_authentik_user(username)
     status = 200 if ok else 400
     return jsonify({'success': ok, 'message': msg, 'method': method}), status
+
+
+# --- v10.1.36 MFA device recovery -------------------------------------------------------
+
+@app.route('/api/authentik/mfa/users')
+@login_required
+def authentik_mfa_users_api():
+    """Search Authentik users and report the MFA devices each one has registered.
+
+    Powers the MFA Device Recovery panel on /authentik — the "user lost their phone" path.
+    Read-only. Requires ?q= (>=2 chars) so this can never be used to dump the directory.
+    """
+    q = (request.args.get('q') or '').strip()
+    ak_url, ak_headers, _s = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'users': [], 'error': 'authentik-not-deployed',
+                        'message': 'Authentik is not deployed on this box (no API token).'})
+    if len(q) < 2:
+        return jsonify({'users': [], 'message': 'Type at least 2 characters to search.'})
+
+    try:
+        force_enroll, force_detail = _ak_force_enroll_posture(ak_url, ak_headers)
+        codes_ok, codes_detail = _ak_backup_codes_posture(ak_url, ak_headers)
+        found = _w1_ak_get(
+            ak_url, f'core/users/?search={urllib.parse.quote(q, safe="")}&page_size=25',
+            ak_headers).get('results', [])
+        # One pass for the whole box, then join — authentik ignores ?user= on the device
+        # viewsets, so a per-user query would be both wrong and 5x more calls.
+        dev_map = _ak_all_mfa_devices(ak_url, ak_headers)
+    except Exception as e:
+        return jsonify({'users': [], 'error': 'authentik-api',
+                        'message': f'Could not reach the Authentik API: {str(e)[:200]}'}), 502
+
+    users = []
+    for u in found:
+        devs = dev_map.get(int(u['pk']), [])
+        users.append({
+            'pk': u['pk'],
+            'username': u.get('username') or '',
+            'name': u.get('name') or '',
+            'email': u.get('email') or '',
+            'is_active': bool(u.get('is_active')),
+            'is_superuser': bool(u.get('is_superuser')),
+            'devices': devs,
+            'device_count': len(devs),
+        })
+    users.sort(key=lambda x: (x['device_count'] == 0, x['username'].lower()))
+    return jsonify({
+        'users': users,
+        'posture': {
+            'force_enroll': force_enroll,
+            'force_enroll_detail': force_detail,
+            'backup_codes': codes_ok,
+            'backup_codes_detail': codes_detail,
+        },
+    })
+
+
+@app.route('/api/authentik/mfa/reset', methods=['POST'])
+@login_required
+def authentik_mfa_reset_api():
+    """Revoke every MFA device registered to one Authentik user.
+
+    The lost-phone remedy: with the devices gone, W1's force-enroll walks the user through
+    setting up a new authenticator at their next sign-in (this is the flow upstream documents
+    for exactly this case). ATAK/iTAK are unaffected — the LDAP flow is never MFA-bound.
+
+    Body: {user_pk: int, username: str, kill_sessions: bool, confirm_no_force_enroll: bool}
+
+    `username` is an interlock, not decoration: the caller must name who it believes it is
+    resetting, and we refuse on mismatch. Prevents a stale browser row from revoking the wrong
+    person's MFA after the directory shifts under it.
+    """
+    data = request.get_json() or {}
+    raw_pk = data.get('user_pk')
+    expect = (data.get('username') or '').strip()
+    kill_sessions = data.get('kill_sessions', True)
+
+    try:
+        user_pk = int(raw_pk)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': 'user_pk must be an integer'}), 400
+    if not expect:
+        return jsonify({'success': False, 'message': 'username is required (identity interlock)'}), 400
+
+    ak_url, ak_headers, _s = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'success': False,
+                        'message': 'Authentik is not deployed on this box (no API token).'}), 400
+
+    try:
+        user = _w1_ak_get(ak_url, f'core/users/{user_pk}/', ak_headers)
+    except Exception as e:
+        return jsonify({'success': False,
+                        'message': f'Could not read user {user_pk}: {str(e)[:200]}'}), 502
+    actual = user.get('username') or ''
+    if actual != expect:
+        return jsonify({'success': False, 'conflict': True,
+                        'message': (f'Refusing to act: user {user_pk} is "{actual}", but the '
+                                    f'request named "{expect}". Re-run the search and try again.')}), 409
+
+    # Guard: without force-enroll, revoking devices does not prompt re-enrollment — it just
+    # drops this user to password-only. Warn once, act only on an explicit second call.
+    force_enroll, force_detail = _ak_force_enroll_posture(ak_url, ak_headers)
+    if not force_enroll and not data.get('confirm_no_force_enroll'):
+        return jsonify({
+            'success': False, 'warning': 'no-force-enroll',
+            'message': (f'This box will not prompt {actual} to enroll a new authenticator '
+                        f'({force_detail}). Revoking their devices now would leave them signing '
+                        f'in with a password only. Confirm to proceed anyway.'),
+        }), 200
+
+    try:
+        devices = _ak_user_mfa_devices(ak_url, ak_headers, user_pk)
+    except Exception as e:
+        return jsonify({'success': False,
+                        'message': f'Could not list devices: {str(e)[:200]}'}), 502
+
+    removed, failures = _ak_revoke_mfa_devices(ak_url, ak_headers, devices)
+
+    # Verify — never trust the write. Anything left is a failure to surface, not a success.
+    try:
+        left = _ak_user_mfa_devices(ak_url, ak_headers, user_pk)
+    except Exception:
+        left = []
+    n_removed = sum(removed.values())
+
+    sessions_killed, session_failures = 0, []
+    if kill_sessions and not failures:
+        try:
+            for s in _ak_user_sessions(ak_url, ak_headers, user_pk):
+                uuid_ = s.get('uuid')
+                if not uuid_:
+                    continue
+                try:
+                    _ak_api_call(
+                        f'{ak_url}/api/v3/core/authenticated_sessions/'
+                        f'{urllib.parse.quote(str(uuid_), safe="")}/',
+                        method='DELETE', headers=ak_headers)
+                    sessions_killed += 1
+                except Exception as e:
+                    session_failures.append(str(e)[:80])
+        except Exception as e:
+            session_failures.append(str(e)[:80])
+
+    _record_mfa_reset(actual, user_pk, removed, sessions_killed)
+
+    if failures or left:
+        return jsonify({
+            'success': False,
+            'message': (f'Partly failed: removed {n_removed}, but {len(left)} device(s) remain '
+                        f'on {actual}. ' + ('; '.join(failures)[:300] if failures else '')),
+            'removed': removed, 'remaining': len(left),
+        }), 500
+
+    if n_removed == 0:
+        msg = (f'{actual} had no MFA devices registered. They will be asked to set one up at '
+               f'their next sign-in.')
+    else:
+        parts = ', '.join(f'{n} × {_AK_MFA_KIND_LABELS.get(k, k)}' for k, n in sorted(removed.items()))
+        msg = (f'Removed {parts} from {actual}. They will be asked to set up a new authenticator '
+               f'the next time they sign in.')
+    if sessions_killed:
+        msg += f' {sessions_killed} active session(s) signed out.'
+    if session_failures:
+        msg += f' (Some sessions could not be signed out: {session_failures[0]})'
+    return jsonify({'success': True, 'message': msg, 'removed': removed,
+                    'sessions_killed': sessions_killed})
+
+
+@app.route('/api/authentik/mfa/reset-admin', methods=['POST'])
+@login_required
+def authentik_mfa_reset_admin_api():
+    """Break-glass: reset a PROTECTED admin's MFA (akadmin / webadmin) when the operator is the
+    one who lost their device. Falls back to `ak shell` when the API is unusable — see
+    _purge_authentik_user_mfa(). Whitelist-gated; ordinary users go through /api/authentik/mfa/reset.
+    """
+    data = request.get_json() or {}
+    username = (data.get('user') or '').strip()
+    if not username:
+        return jsonify({'success': False, 'message': 'user field required'}), 400
+    # Count what is there BEFORE the purge so the audit entry states a real number. The
+    # ak-shell fallback reports its own count but the API path does not, and an audit trail
+    # that invents a figure is worse than one that admits it does not know.
+    before = {}
+    try:
+        _u, _h, _s2 = _w1_ak_ctx()
+        if _u:
+            found = _w1_ak_get(
+                _u, f'core/users/?username={urllib.parse.quote(username, safe="")}',
+                _h).get('results', [])
+            match = next((x for x in found if x.get('username') == username), None)
+            if match:
+                for d in _ak_user_mfa_devices(_u, _h, match['pk']):
+                    before[d['kind']] = before.get(d['kind'], 0) + 1
+    except Exception:
+        before = {}
+
+    ok, msg, method = _purge_authentik_user_mfa(username)
+    if ok:
+        _record_mfa_reset(username, None, before, 0, method=method or 'break-glass')
+    return jsonify({'success': ok, 'message': msg, 'method': method}), (200 if ok else 400)
 
 
 @app.route('/api/takserver/webadmin-password')

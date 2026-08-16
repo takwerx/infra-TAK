@@ -148,6 +148,23 @@
 <div id="admin-accounts-rows" style="display:flex;flex-direction:column;gap:6px;font-family:'JetBrains Mono',monospace;font-size:11px"><div style="color:var(--text-dim)">Loading…</div></div>
 <div id="admin-accounts-msg" style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
 <div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
+<div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);font-size:10px;color:var(--text-dim);line-height:1.5">Lost the phone holding <strong>your own</strong> admin authenticator? <button type="button" onclick="resetAdminMfa('akadmin')" id="reset-mfa-akadmin-btn" style="background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:2px 12px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;cursor:pointer">Reset akadmin MFA</button> <button type="button" onclick="resetAdminMfa('webadmin')" id="reset-mfa-webadmin-btn" style="background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:2px 12px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;cursor:pointer">Reset webadmin MFA</button><br>Removes that account's authenticators so it can enroll a new one at the next sign-in. Falls back to <code style="color:var(--cyan)">ak shell</code> when the API is unreachable.</div>
+</div>
+</div>
+
+<div class="section-title" data-collapse="mfa-recovery">MFA Device Recovery</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:14px">A user who lost the phone with their authenticator app cannot sign in and cannot reset it themselves — by design, so a password-reset email can never be an MFA bypass. Find them here and revoke their registered devices; they will be walked through setting up a new authenticator the next time they sign in.</div>
+<div id="mfa-posture" style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-bottom:12px"></div>
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+<input type="text" id="mfa-search" placeholder="Search by username or email…" autocomplete="off" oninput="mfaSearchDebounced()" style="flex:1;background:var(--bg-dark);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:12px">
+<button type="button" onclick="mfaSearch()" style="background:none;border:1px solid var(--border);color:var(--text-dim);padding:8px 14px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Search</button>
+</div>
+<div id="mfa-results" style="display:flex;flex-direction:column;gap:8px;font-family:'JetBrains Mono',monospace;font-size:11px"></div>
+<div id="mfa-msg" style="margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
+<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:10px;color:var(--text-dim);line-height:1.6">
+<strong>ATAK / iTAK devices are not affected.</strong> MFA covers web sign-ins only (this console, TAK Portal, Node-RED, NetBird, WebODM). Field devices authenticate by certificate over LDAP, which is never MFA-gated — a lost phone does not disconnect an EUD.<br>
+<strong>Verify identity out of band</strong> before revoking — a phone call or in-person check, not an email to the address on the account.
 </div>
 </div>
 <div class="section-title" data-collapse="ldap-config" data-collapsed="1">LDAP Configuration</div>
@@ -460,6 +477,170 @@ async function reactivateAdmin(username){
         if (msg) { msg.style.color = 'var(--red)'; msg.textContent = 'Error: ' + e.message; }
     } finally {
         setTimeout(refreshAdminAccounts, 600);
+    }
+}
+
+// --- v10.1.36 MFA Device Recovery ----------------------------------------------------
+var _mfaTimer = null;
+var _mfaPosture = null;
+
+function mfaMsg(text, color){
+    var m = document.getElementById('mfa-msg');
+    if (!m) { return; }
+    m.style.display = text ? 'block' : 'none';
+    m.style.color = color || 'var(--text-dim)';
+    m.textContent = text || '';
+}
+
+function mfaSearchDebounced(){
+    clearTimeout(_mfaTimer);
+    _mfaTimer = setTimeout(mfaSearch, 350);
+}
+
+async function mfaSearch(){
+    var q = (document.getElementById('mfa-search') || {}).value || '';
+    var out = document.getElementById('mfa-results');
+    if (!out) { return; }
+    if (q.trim().length < 2) { out.innerHTML = ''; mfaMsg(''); return; }
+    out.innerHTML = '<div style="color:var(--text-dim)">Searching…</div>';
+    try {
+        var r = await fetch('/api/authentik/mfa/users?q=' + encodeURIComponent(q.trim()));
+        var d = await r.json();
+        if (d.posture) { _mfaPosture = d.posture; renderMfaPosture(d.posture); }
+        if (d.error) { out.innerHTML = ''; mfaMsg(d.message || d.error, 'var(--red)'); return; }
+        mfaMsg('');
+        if (!d.users || !d.users.length) {
+            out.innerHTML = '<div style="color:var(--text-dim)">No users matched “' + escapeHtml(q.trim()) + '”.</div>';
+            return;
+        }
+        out.innerHTML = d.users.map(renderMfaRow).join('');
+    } catch(e) {
+        out.innerHTML = '';
+        mfaMsg('Error: ' + e.message, 'var(--red)');
+    }
+}
+
+function renderMfaPosture(p){
+    var el = document.getElementById('mfa-posture');
+    if (!el) { return; }
+    var bits = [];
+    if (p.force_enroll) {
+        bits.push('<div style="color:var(--green)">✓ Re-enrollment is ON — ' + escapeHtml(p.force_enroll_detail || '') + '</div>');
+    } else {
+        bits.push('<div style="color:var(--amber,#f59e0b);line-height:1.6">⚠ Re-enrollment is OFF — ' + escapeHtml(p.force_enroll_detail || '') +
+                  '.<br>Revoking devices here will leave the user signing in with a password only. Apply Cyber Controls W1 to turn this on.</div>');
+    }
+    bits.push('<div style="color:var(--text-dim);margin-top:4px">' + (p.backup_codes ? '✓' : '·') + ' Backup codes: ' +
+              escapeHtml(p.backup_codes ? ('available (' + (p.backup_codes_detail || '') + ') — users can add a set from their own Authentik settings page → MFA Devices → Add, so a lost phone need not mean a support call' ) : (p.backup_codes_detail || 'unavailable')) + '</div>');
+    el.innerHTML = bits.join('');
+}
+
+function renderMfaRow(u){
+    var id = 'mfa-u-' + u.pk;
+    var devs = (u.devices || []).map(function(d){
+        return '<span style="background:var(--bg-dark);border:1px solid var(--border);border-radius:3px;padding:1px 7px;margin-right:5px">' +
+               escapeHtml(d.label) + '</span>';
+    }).join('');
+    var right;
+    if (!u.device_count) {
+        right = '<span style="color:var(--text-dim)">no devices — will enroll at next sign-in</span>';
+    } else {
+        right = devs + '<button type="button" onclick="mfaConfirm(' + u.pk + ')" id="' + id + '-btn" ' +
+                'style="margin-left:8px;background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:2px 12px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;font-weight:600;cursor:pointer">Revoke MFA devices</button>';
+    }
+    return '<div id="' + id + '" data-username="' + escapeHtml(u.username) + '" style="border:1px solid var(--border);border-radius:6px;padding:8px 10px">' +
+           '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">' +
+           '<span><span style="color:var(--cyan)">' + escapeHtml(u.username) + '</span>' +
+           (u.email ? ' <span style="color:var(--text-dim)">· ' + escapeHtml(u.email) + '</span>' : '') +
+           (u.is_active ? '' : ' <span style="color:var(--red)">· DEACTIVATED</span>') +
+           '</span><span style="display:flex;align-items:center;flex-wrap:wrap">' + right + '</span></div>' +
+           '<div id="' + id + '-confirm" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)"></div>' +
+           '</div>';
+}
+
+function mfaConfirm(pk){
+    var row = document.getElementById('mfa-u-' + pk);
+    var box = document.getElementById('mfa-u-' + pk + '-confirm');
+    if (!row || !box) { return; }
+    var uname = row.getAttribute('data-username') || '';
+    box.style.display = 'block';
+    box.innerHTML =
+        '<label style="display:block;margin-bottom:6px;cursor:pointer;line-height:1.5">' +
+        '<input type="checkbox" id="mfa-u-' + pk + '-verified" onchange="document.getElementById(\'mfa-u-' + pk + '-go\').disabled = !this.checked" style="vertical-align:-1px;margin-right:6px">' +
+        'I have verified <strong style="color:var(--cyan)">' + escapeHtml(uname) + '</strong>’s identity out of band (phone or in person — <em>not</em> by email).</label>' +
+        '<label style="display:block;margin-bottom:8px;cursor:pointer;line-height:1.5">' +
+        '<input type="checkbox" id="mfa-u-' + pk + '-kill" checked style="vertical-align:-1px;margin-right:6px">' +
+        'Also sign them out of any active sessions (do this if the phone may have been stolen).</label>' +
+        '<button type="button" id="mfa-u-' + pk + '-go" disabled onclick="mfaReset(' + pk + ')" ' +
+        'style="background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:4px 14px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;font-weight:600;cursor:pointer">Revoke now</button> ' +
+        '<button type="button" onclick="document.getElementById(\'mfa-u-' + pk + '-confirm\').style.display=\'none\'" ' +
+        'style="background:none;border:1px solid var(--border);color:var(--text-dim);padding:4px 12px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Cancel</button>';
+}
+
+async function mfaReset(pk, confirmNoForceEnroll){
+    var row = document.getElementById('mfa-u-' + pk);
+    if (!row) { return; }
+    var uname = row.getAttribute('data-username') || '';
+    var killEl = document.getElementById('mfa-u-' + pk + '-kill');
+    var go = document.getElementById('mfa-u-' + pk + '-go');
+    if (go) { go.disabled = true; go.textContent = 'Revoking…'; go.style.cursor = 'wait'; }
+    mfaMsg('Revoking MFA devices for ' + uname + '…');
+    try {
+        var r = await fetch('/api/authentik/mfa/reset', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+                user_pk: pk,
+                username: uname,
+                kill_sessions: killEl ? !!killEl.checked : true,
+                confirm_no_force_enroll: !!confirmNoForceEnroll
+            })
+        });
+        var d = await r.json();
+        if (d.warning === 'no-force-enroll' && !confirmNoForceEnroll) {
+            mfaMsg('');
+            var box = document.getElementById('mfa-u-' + pk + '-confirm');
+            if (box) {
+                box.innerHTML = '<div style="color:var(--amber,#f59e0b);line-height:1.6;margin-bottom:8px">⚠ ' + escapeHtml(d.message) + '</div>' +
+                    '<button type="button" onclick="mfaReset(' + pk + ', true)" style="background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:4px 14px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;font-weight:600;cursor:pointer">Revoke anyway</button> ' +
+                    '<button type="button" onclick="document.getElementById(\'mfa-u-' + pk + '-confirm\').style.display=\'none\'" style="background:none;border:1px solid var(--border);color:var(--text-dim);padding:4px 12px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Cancel</button>';
+            }
+            return;
+        }
+        mfaMsg((d.success ? '✓ ' : '✗ ') + (d.message || (d.success ? 'Done.' : 'Failed.')),
+               d.success ? 'var(--green)' : 'var(--red)');
+        if (d.success) { setTimeout(mfaSearch, 500); }
+    } catch(e) {
+        mfaMsg('Error: ' + e.message, 'var(--red)');
+    } finally {
+        if (go) { go.disabled = false; go.textContent = 'Revoke now'; go.style.cursor = 'pointer'; }
+    }
+}
+
+async function resetAdminMfa(username){
+    if (!confirm('Remove all MFA devices from ' + username + '?\n\n' + username +
+                 ' will be asked to set up a new authenticator at the next sign-in. ' +
+                 'Use this when you have lost your own admin authenticator.')) { return; }
+    var btn = document.getElementById('reset-mfa-' + username + '-btn');
+    var msg = document.getElementById('admin-accounts-msg');
+    if (btn) { btn.disabled = true; btn.textContent = 'Resetting…'; btn.style.opacity = '0.6'; btn.style.cursor = 'wait'; }
+    if (msg) { msg.style.display = 'block'; msg.style.color = 'var(--text-dim)'; msg.textContent = 'Resetting MFA for ' + username + '…'; }
+    try {
+        var r = await fetch('/api/authentik/mfa/reset-admin', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({user: username})
+        });
+        var d = await r.json();
+        if (msg) {
+            msg.style.color = d.success ? 'var(--green)' : 'var(--red)';
+            msg.textContent = (d.success ? '✓ ' : '✗ ') + (d.message || (d.success ? 'Done.' : 'Failed.')) +
+                              (d.method ? ' [via ' + d.method + ']' : '');
+        }
+    } catch(e) {
+        if (msg) { msg.style.color = 'var(--red)'; msg.textContent = 'Error: ' + e.message; }
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Reset ' + username + ' MFA'; btn.style.opacity = '1'; btn.style.cursor = 'pointer'; }
     }
 }
 
