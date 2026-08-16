@@ -10,6 +10,13 @@ You create the relay VM once (about 5 minutes in Oracle's console). After that, 
 Relay** card in the Connectivity page does everything else automatically — you just give it the
 relay's IP and upload the key file.
 
+> **Oracle is the walkthrough, not a requirement.** It is used here because it is the only provider
+> with a permanently free server that has a public address and real bandwidth. The console only ever
+> asks for an IP and an SSH key, so any small VPS works identically — see [Where to run the
+> relay](#where-to-run-the-relay--you-are-not-tied-to-oracle). If Oracle keeps telling you it is
+> **out of capacity**, go straight to [that section](#if-oracle-says-out-of-capacity) — it is the
+> most common thing that stalls people here, and the usual fix takes one dropdown.
+
 ## 1. Create the relay
 
 This is two parts — **the network first, then the VM.**
@@ -66,8 +73,10 @@ The wizard runs across four sections — *Basics → Security → Networking →
   - **Pick the image before the shape.** Oracle cross-filters the two lists, so choosing an x86 shape
     first can hide the ARM builds of an image and make it look like that image "isn't available" on
     A1.
-  - *If Oracle says "out of capacity"* for A1: try a different Availability Domain, or pick
-    **VM.Standard.E2.1.Micro** — also Always Free, and fine for a relay.
+  - *If Oracle says "out of capacity"* for A1: that is the shape being full, not a problem with your
+    account. The short answer is to pick **VM.Standard.E2.1.Micro** instead — also Always Free, and
+    fine for a relay. Full list of things to try: [If Oracle says "Out of
+    capacity"](#if-oracle-says-out-of-capacity) below.
   - **ARM or x86 makes no difference here.** A1.Flex is ARM, E2.1.Micro is x86, and the relay setup
     is identical on both — it installs only WireGuard and standard Linux packet forwarding, which
     ship for both architectures. A1 is the better pick when available (more free network bandwidth),
@@ -353,6 +362,52 @@ directly, with the password login that exists for exactly this situation.
 - If SSH to the relay is refused, check the key file's permissions first — `0644` makes SSH ignore
   it silently apart from a warning.
 
+## If Oracle says "Out of capacity"
+
+This is the single most common thing that stops people building a relay, and it can go on for days.
+It is not a problem with your account, your card, or your region choice — it means the specific
+**shape** you asked for has no free machines left in that availability domain right now. Work down
+this list; most people are fixed at step 1.
+
+**1. Stop asking for Ampere.** The error is almost always **VM.Standard.A1.Flex** (ARM) — it is the
+shape everyone wants and the one that runs dry. Pick **VM.Standard.E2.1.Micro** instead. It is also
+Always Free, it is x86, and it is very rarely capacity-blocked. A relay forwards packets and runs
+nothing else, so the micro is ample. See *ARM or x86 makes no difference here* in step 1b — the
+console's relay setup installs only WireGuard and standard Linux packet forwarding, both of which
+exist for either architecture. A1 is the nicer option when it is available (more headroom and
+bandwidth), never a required one.
+
+> **Pick the image before the shape.** Oracle cross-filters the two lists. If you select an x86
+> shape first, ARM builds of an image disappear from the list and it looks like the image "isn't
+> available" — and vice versa. Choose Ubuntu 22.04/24.04 first, then the shape.
+
+**2. If you specifically want A1, ask for less of it.** Request **1 OCPU / 6 GB** rather than the
+full 4 OCPU / 24 GB. A smaller request fits into fragmented capacity that a large one can't.
+
+**3. Try each availability domain by hand.** In multi-AD regions (Ashburn, Phoenix, Frankfurt,
+London) the *Placement* section on the Basics page lets you pick AD-1, AD-2 or AD-3 explicitly.
+Oracle's default placement will not walk them for you — try each one.
+
+**4. Upgrade to Pay As You Go — this costs nothing and is the real fix.** Free Tier accounts are
+last in line for Always Free Ampere capacity; accounts with a payment method on file are served
+first. Upgrading does **not** start billing you for the relay: Always Free resources stay free on a
+paid account, and a 1 OCPU / 6 GB A1 or an E2.1.Micro sits inside the allowance. It also solves the
+idle-reclamation problem described in the next section, which you want solved anyway. Read that
+section before you upgrade.
+
+**5. Understand what you cannot change.** Your **home region is fixed when you create the account**
+and Always Free resources can only be built there. Switching to Phoenix or another region means a
+whole new tenancy with that home region — you cannot move an existing account, so retrying the same
+account in a different region is not a thing that exists. If you do start a fresh account, pick a
+less-contended home region at signup.
+
+**6. Don't script a retry storm.** People post loops that hammer the launch API every few seconds.
+Oracle rate-limits and it does not improve your odds. Retry by hand a few times a day, at different
+hours, while working steps 1–4.
+
+**7. If none of it works, don't wait on Oracle.** Any small server with a public IP works as a
+relay, and the console setup is identical — see [Where to run the relay](#where-to-run-the-relay--you-are-not-tied-to-oracle).
+
 ## Free Tier vs Pay As You Go — read this before you rely on a relay
 
 Oracle reclaims **idle** Always Free compute instances. An instance counts as idle if, over a 7-day
@@ -380,9 +435,81 @@ the box's CPU continuously to defeat a policy that a payment method removes outr
 Either way, Guard Dog monitors the relay tunnel and will alert you if it drops, so a reclaimed or
 stopped relay surfaces as an alert rather than a silent outage.
 
+## Where to run the relay — you are not tied to Oracle
+
+This guide walks through Oracle because it is the only provider that gives you a permanently free
+server with a public address and enough bandwidth to be useful. But nothing in infra-TAK is
+Oracle-specific. **The console asks for an IP address and an SSH key — that is all.** If a provider
+gives you those, the Connectivity page sets the relay up the same way.
+
+**What a relay actually needs** — the bar is low, which is why the free tiers are viable at all:
+
+- **A public IPv4 address that doesn't change.** This is the whole point; the entire job is having a
+  stable address your clients can be pointed at.
+- **1 vCPU and 512 MB–1 GB of RAM.** It forwards packets. It does not terminate TLS, run a database,
+  or hold state.
+- **Root/sudo SSH access with a key**, and the ability to open UDP and TCP ports.
+- **Bandwidth headroom** — the one spec that genuinely matters, see below.
+- Ubuntu 22.04 or 24.04. (Other distributions are not field-validated by the console's setup.)
+
+### Free forever
+
+| Provider | What you get | Verdict for a relay |
+|---|---|---|
+| **Oracle Cloud Always Free** | 4 OCPU / 24 GB Ampere ARM total (a relay uses 1/6), **or** 2× E2.1.Micro x86; 200 GB block storage; **10 TB/month egress** | **The only genuinely viable free option.** Capacity fights on A1 and idle-reclaim on Free Tier are the two catches — both covered above |
+| **Google Cloud** e2-micro | 1 e2-micro in `us-west1`, `us-central1` or `us-east1`; 30 GB disk | **Not usable as a relay.** Two hard blockers below |
+| **AWS** | Since 15 July 2025, new accounts get a credit balance (Free plan, up to 6 months or until credits run out) — not the old 12-month always-free EC2 | **Temporary.** Fine to trial, will stop being free |
+| **Azure** | $200 credit for 30 days, plus 12-month limited offers | **Temporary.** Same problem |
+
+**Why Google Cloud's free VM does not work here**, despite being the closest thing to a competitor:
+its Always Free allowance includes **1 GB of egress per month**, and since February 2024 an in-use
+external IPv4 address bills at $0.005/hour (about **$3.65/month**) — the public address a relay
+exists to provide is no longer part of the free tier. So it is neither free nor big enough. One GB a
+month is less than an hour of a single video stream, and even a CoT-only relay for a small team will
+pass it. Don't build a relay there expecting it to hold.
+
+That leaves Oracle as the only free-forever option worth the effort — which is exactly why the
+capacity errors are worth working through rather than abandoning.
+
+### Paid, if free isn't happening
+
+Any small VPS works, and at this size they are all much cheaper than paying Oracle. Approximate
+pricing as of August 2026 — check current rates before you buy:
+
+| Option | Spec | Approx/month |
+|---|---|---|
+| **Hetzner** CX22 | 2 vCPU / 4 GB / 40 GB, **20 TB traffic** (EU; US in Ashburn + Hillsboro) | **~$4.59** + ~€0.70 for the IPv4 |
+| **Vultr / DigitalOcean / Linode** | 1 vCPU / 1 GB, 0.5–1 TB transfer | **~$4–6** |
+| **Budget hosts** (RackNerd and similar) | 1 vCPU / 1 GB, annual billing | **~$1–2** equivalent |
+| Oracle **A1.Flex**, paid | 1 OCPU / 6 GB | **~$13.90** |
+| Oracle **E5.Flex** — *the shape Oracle preselects* | 1 OCPU / 12 GB | **~$31** |
+
+Two things fall out of that table. First, **once you are paying, Oracle is one of the worse deals** —
+roughly two to three times a Hetzner-class VPS for a machine that forwards packets. Its advantage is
+being free, and it is a strong advantage; it does not survive contact with a bill. Second, watch the
+shape if you build on Oracle anyway: the **preselected** default is the ~$31/month one, and clicking
+through the wizard without changing it is the expensive mistake in this whole process — far more
+costly than the capacity errors that made you look at paid options in the first place.
+
+### The one thing that flips it back to Oracle: bandwidth
+
+Oracle includes **10 TB/month** of egress. That is enormous for this workload and no low-cost VPS
+matches it outright, though Hetzner's included 20 TB does.
+
+Whether it matters depends entirely on what crosses your relay:
+
+- **CoT only** — position reports, chat, markers for a team. Trivial. Hundreds of megabytes a month.
+  Every option above is fine and bandwidth should not influence your choice.
+- **Video restreaming** — this is what consumes an allowance. A single stream at infra-TAK's default
+  2500 kbps is about **1.1 GB/hour**, so one continuous feed is roughly 800 GB/month, and several
+  feeds or several viewers multiply that. At that point compare transfer allowances first and price
+  second, and read the per-GB overage rate before you commit.
+
 ## Notes
 
-- **Cost:** Oracle's Always Free tier covers this VM at no charge.
+- **Cost:** Oracle's Always Free tier covers this VM at no charge. If you can't get free capacity,
+  or you'd rather not use Oracle at all, see [Where to run the
+  relay](#where-to-run-the-relay--you-are-not-tied-to-oracle) for what else works and what it costs.
 - **Why two tunnel ports:** 51820 is WireGuard's standard port and the carrier-safe default —
   cellular networks run QUIC-aware middleboxes that sometimes eat non-QUIC traffic on UDP 443. But
   some hotel and guest Wi-Fi permits *only* 443. The relay listens on whichever you picked and
