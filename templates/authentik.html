@@ -148,7 +148,6 @@
 <div id="admin-accounts-rows" style="display:flex;flex-direction:column;gap:6px;font-family:'JetBrains Mono',monospace;font-size:11px"><div style="color:var(--text-dim)">Loading…</div></div>
 <div id="admin-accounts-msg" style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
 <div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
-<div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);font-size:10px;color:var(--text-dim);line-height:1.5">Lost the phone holding <strong>your own</strong> admin authenticator? <button type="button" onclick="resetAdminMfa('akadmin')" id="reset-mfa-akadmin-btn" style="background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:2px 12px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;cursor:pointer">Reset akadmin MFA</button> <button type="button" onclick="resetAdminMfa('webadmin')" id="reset-mfa-webadmin-btn" style="background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:2px 12px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;cursor:pointer">Reset webadmin MFA</button><br>Removes that account's authenticators so it can enroll a new one at the next sign-in. Falls back to <code style="color:var(--cyan)">ak shell</code> when the API is unreachable.</div>
 </div>
 </div>
 
@@ -162,6 +161,16 @@
 </div>
 <div id="mfa-results" style="display:flex;flex-direction:column;gap:8px;font-family:'JetBrains Mono',monospace;font-size:11px"></div>
 <div id="mfa-msg" style="margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
+
+<div style="margin-top:16px;padding-top:14px;border-top:1px dashed var(--border)">
+<div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Break-glass — your own admin account</div>
+<div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:10px">Use the search above for everyone else. These two are for when <strong>you</strong> have lost the authenticator for the account you administer with. They also work when the Authentik API is unreachable — the search cannot — by falling back to <code style="color:var(--cyan)">ak shell</code>.</div>
+<button type="button" onclick="resetAdminMfa('akadmin')" id="reset-mfa-akadmin-btn" style="background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:4px 14px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reset akadmin MFA</button>
+<button type="button" onclick="resetAdminMfa('webadmin')" id="reset-mfa-webadmin-btn" style="margin-left:6px;background:rgba(239,68,68,.12);border:1px solid var(--red);color:var(--red);padding:4px 14px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reset webadmin MFA</button>
+<div id="mfa-admin-msg" style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
+<div style="margin-top:8px;font-size:10px;color:var(--text-dim);line-height:1.5">If this console is only reachable behind Authentik SSO, losing the admin authenticator locks you out of this page too. The way back in is an SSH tunnel to the console port, then this button.</div>
+</div>
+
 <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:10px;color:var(--text-dim);line-height:1.6">
 <strong>ATAK / iTAK devices are not affected.</strong> MFA covers web sign-ins only (this console, TAK Portal, Node-RED, NetBird, WebODM). Field devices authenticate by certificate over LDAP, which is never MFA-gated — a lost phone does not disconnect an EUD.<br>
 <strong>Verify identity out of band</strong> before revoking — a phone call or in-person check, not an email to the address on the account.
@@ -622,7 +631,9 @@ async function resetAdminMfa(username){
                  ' will be asked to set up a new authenticator at the next sign-in. ' +
                  'Use this when you have lost your own admin authenticator.')) { return; }
     var btn = document.getElementById('reset-mfa-' + username + '-btn');
-    var msg = document.getElementById('admin-accounts-msg');
+    // v10.1.36: break-glass moved into the MFA Device Recovery panel, so it reports into
+    // that panel's own status line — not the Protected Admin Accounts one it used to sit under.
+    var msg = document.getElementById('mfa-admin-msg');
     if (btn) { btn.disabled = true; btn.textContent = 'Resetting…'; btn.style.opacity = '0.6'; btn.style.cursor = 'wait'; }
     if (msg) { msg.style.display = 'block'; msg.style.color = 'var(--text-dim)'; msg.textContent = 'Resetting MFA for ' + username + '…'; }
     try {
