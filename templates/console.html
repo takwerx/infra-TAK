@@ -107,12 +107,22 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
-<div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-<div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now<span id="kpatch-cve"></span></div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
-<div style="display:flex;gap:8px">
-<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
+<div id="kpatch-idle">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; <span id="osupd-headline">Operating system updates available</span><span id="kpatch-cve"></span></div>
+<div id="osupd-plain" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">Checking what is pending&hellip;</div>
+<div id="osupd-managed" style="margin-top:8px"></div>
+<div id="osupd-auto" style="font-size:10px;color:var(--text-dim);margin-top:8px;padding-top:7px;border-top:1px solid rgba(255,255,255,0.07);line-height:1.6"></div>
+</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Install updates</button>
+<button onclick="toggleOsUpdDetails()" id="osupd-details-btn" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Show details</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div></div>
+<div id="osupd-details" style="display:none;margin-top:10px;background:#0a0e1a;border:1px solid rgba(234,179,8,0.15);border-radius:6px;padding:10px">
+<div id="osupd-details-body" style="font-size:10px;color:var(--text-secondary);line-height:1.7;font-family:'JetBrains Mono',monospace"></div>
+<div style="font-size:9px;color:var(--text-dim);margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.06)">Installs with <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}</code> in a detached background process &mdash; safe over SSH, survives session drops. TAK Server is held during the run and is never upgraded by this job. Reboot is a separate explicit click.</div>
 </div></div>
 <div id="kpatch-running" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
@@ -184,13 +194,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
 {% for host in uu_hosts %}
-<div class="metric-card" style="position:relative" title="OS/apt automatic upgrades on this host." data-uu-target="{{ host.id }}">
+<div class="metric-card" style="position:relative" title="Automatic operating-system updates on this host ({{ host.get('mechanism','unattended-upgrades') }})." data-uu-target="{{ host.id }}">
 <div style="min-height:52px">
-<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended upgrades — {{ host.label }}
+<div class="metric-label" style="display:flex;align-items:center;gap:6px">Automatic updates — {{ host.label }}
 {% if host.enabled and host.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="Upgrade in progress"></span>{% endif %}
 </div>
 {% if host.get('error') %}<div class="metric-detail" style="color:var(--red);font-size:10px;margin-top:2px">{{ host.error }}</div>{% endif %}
-<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt</div>
+<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">{{ host.get('mechanism','unattended-upgrades') }}{% if host.get('installed', True) == False %} — not installed{% endif %}</div>
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 <label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
@@ -675,6 +685,62 @@ function _kpatchShowState(state){
         var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
     });
 }
+function toggleOsUpdDetails(){
+    var d=document.getElementById('osupd-details'),b=document.getElementById('osupd-details-btn');
+    if(!d)return;
+    var open=d.style.display!=='none';
+    d.style.display=open?'none':'block';
+    if(b)b.textContent=open?'Show details':'Hide details';
+}
+// Plain-language rendering of /api/os-updates. The average operator should never
+// need to know what a package or a repo is: they get "N updates, M restart these
+// services, click here". The package-level detail lives behind "Show details".
+var _osUpdLast=null;
+function renderOsUpdates(d){
+    if(!d)return;
+    _osUpdLast=d;
+    var restarts=d.restarts||[],alerts=d.alerts||[],managed=d.managed||[];
+    var hl=document.getElementById('osupd-headline');
+    if(hl)hl.textContent=d.total+(d.total===1?' operating system update available':' operating system updates available');
+    var parts=[];
+    if(restarts.length){
+        var svc=restarts.map(function(m){return m.service;}).filter(function(v,i,a){return a.indexOf(v)===i;});
+        parts.push('<b style="color:var(--yellow)">'+restarts.length+'</b> of them will briefly restart '+escapeHtml(svc.join(', '))+'.');
+    } else {
+        parts.push('None of them restart TAK services &mdash; these are routine operating system patches.');
+    }
+    if(d.reboot_required)parts.push('A reboot is needed afterwards to finish.');
+    parts.push('Clients reconnect on their own, but pick a quiet moment if you are mid-operation.');
+    var pl=document.getElementById('osupd-plain');
+    if(pl)pl.innerHTML=parts.join(' ');
+    // Per-service impact lines — the "what does this actually cost me" answer.
+    var mh='';
+    alerts.concat(restarts).forEach(function(m){
+        var col=m.impact_class==='alert'?'var(--red)':(m.major?'var(--red)':'var(--yellow)');
+        mh+='<div style="font-size:10px;margin-top:3px;color:'+col+'">&#9679; <b>'+escapeHtml(m.service)+'</b> &mdash; '+escapeHtml(m.impact)+'</div>';
+    });
+    var me=document.getElementById('osupd-managed');
+    if(me)me.innerHTML=mh;
+    // What updates this box on its own — answers "is something changing my
+    // server behind my back?" in one sentence, per family.
+    var ae=document.getElementById('osupd-auto'),p=d.posture||{};
+    if(ae)ae.innerHTML='<b>Automatic updates:</b> '+escapeHtml(p.note||'unknown')+
+        (p.third_party_allowed?' <span style="color:var(--yellow)">Review this.</span>':'');
+    // Details: every pending package, versions, and what it restarts.
+    var body='';
+    managed.forEach(function(m){
+        var col=m.impact_class==='alert'?'var(--red)':(m.major?'var(--red)':(m.impact_class==='restart'?'var(--yellow)':'var(--text-dim)'));
+        body+='<div style="color:'+col+'">'+escapeHtml(m.name)+'  '+escapeHtml(m.old||'(new)')+' &rarr; '+escapeHtml(m.new)+'  &mdash; '+escapeHtml(m.impact)+'</div>';
+    });
+    if(d.routine_count){
+        body+='<div style="color:var(--text-dim);margin-top:4px">'+d.routine_count+' routine update'+(d.routine_count===1?'':'s')+
+              (d.routine_sample&&d.routine_sample.length?' ('+escapeHtml(d.routine_sample.join(', '))+(d.routine_count>d.routine_sample.length?', &hellip;':'')+')':'')+
+              ' &mdash; nothing restarts</div>';
+    }
+    body+='<div style="color:var(--text-dim);margin-top:6px">Checked '+escapeHtml(d.checked_at||'')+' against the package list already on this box.</div>';
+    var be=document.getElementById('osupd-details-body');
+    if(be)be.innerHTML=body;
+}
 async function checkKernelPatch(){
     var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
     var dismissed=localStorage.getItem('kernel-patch-dismissed');
@@ -705,24 +771,57 @@ async function checkKernelPatch(){
             return;
         }
     }catch(e){}
-    // No in-flight job — fall back to the "is there a kernel update available?" check
+    // No in-flight job. The panel now covers ALL pending OS updates, not just a
+    // kernel bump — an operator who does not use the CLI still has to be told
+    // that e.g. a docker update will bounce every container. The kernel check is
+    // kept only for its CVE label.
     try{
-        var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
-        var d=await r.json();
-        if(d.patched){localStorage.removeItem('kernel-patch-dismissed');banner.style.display='none';return;}
-        var cveEl=document.getElementById('kpatch-cve');
-        if(cveEl)cveEl.textContent=d.cve_banner?(' to fix '+d.cve_banner):'';
-        if(!dismissed){banner.style.display='block';_kpatchShowState('idle');}
+        var ur=await fetch('/api/os-updates',{credentials:'same-origin',cache:'no-store'});
+        var ud=await ur.json();
+        if(!ud||!ud.total){banner.style.display='none';localStorage.removeItem('kernel-patch-dismissed');return;}
+        renderOsUpdates(ud);
+        try{
+            var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
+            var d=await r.json();
+            var cveEl=document.getElementById('kpatch-cve');
+            if(cveEl)cveEl.textContent=(d&&d.cve_banner)?(' — fixes '+d.cve_banner):'';
+        }catch(e){}
+        // Dismissal is keyed to WHAT is pending, not to a global flag: a box that
+        // is dismissed once must still speak up when a new update lands (the old
+        // behaviour hid the banner until the box was fully patched).
+        var sig=ud.total+':'+(ud.managed||[]).map(function(m){return m.name+m.new;}).join(',');
+        if(dismissed===sig){banner.style.display='none';return;}
+        if(dismissed)localStorage.removeItem('kernel-patch-dismissed');
+        banner.setAttribute('data-osupd-sig',sig);
+        banner.style.display='block';_kpatchShowState('idle');
     }catch(e){}
 }
 function dismissKernelBanner(){
     var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
-    localStorage.setItem('kernel-patch-dismissed','1');
+    // Store WHICH update set was dismissed so a newly-arrived update re-surfaces
+    // the panel instead of staying hidden forever.
+    localStorage.setItem('kernel-patch-dismissed',(b&&b.getAttribute('data-osupd-sig'))||'1');
     // Don't kill the polling timer if a job is running in the background —
     // we just hide the UI. The job continues to run regardless.
 }
 async function startKernelPatch(){
-    if(!confirm("Start kernel patch?\n\nThis will run a full OS package upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\u2019s a separate explicit click.\n\nContinue?"))return;
+    // The confirm must name the SERVICES this run will bounce, not just say
+    // "OS upgrade". This click is the moment of consequence — a docker update
+    // restarts every container, and the operator has to know that here, not
+    // afterwards from a dropped map.
+    var msg="Install operating system updates?\n\n";
+    var rs=(_osUpdLast&&_osUpdLast.restarts)||[];
+    if(rs.length){
+        msg+="This will briefly restart:\n";
+        rs.forEach(function(m){msg+="  \u2022 "+m.service+" \u2014 "+m.impact+"\n";});
+        msg+="\n";
+    } else {
+        msg+="No TAK services will be restarted by this run.\n\n";
+    }
+    msg+="Runs in a detached background process (typically 2-5 minutes) and is safe over SSH \u2014 the job survives session drops. TAK Server is held and is never upgraded by this job.";
+    if(_osUpdLast&&_osUpdLast.reboot_required)msg+="\n\nA reboot is needed afterwards \u2014 that is a separate explicit click.";
+    msg+="\n\nContinue?";
+    if(!confirm(msg))return;
     var banner=document.getElementById('kernel-patch-banner');
     _kpatchShowState('running');
     document.getElementById('kpatch-pid').textContent='starting...';

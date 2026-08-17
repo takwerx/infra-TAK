@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.36-alpha"
+VERSION = "10.1.37-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -3393,6 +3393,246 @@ print(json.dumps(out))
         pass
     return None
 
+# ---------------------------------------------------------------------------
+# OS update awareness (v10.1.37)
+#
+# Why this exists: a plain `apt upgrade` / `dnf upgrade` typed over SSH restarts
+# services infra-TAK manages, and the console never said so. Worst case is
+# docker — upgrading it restarts dockerd, which bounces EVERY container at once
+# (Authentik/SSO+LDAP, CloudTAK, Node-RED, TAK Portal, Email Relay). Operators
+# should not need CLI maintenance skills to patch a box safely, so the console
+# reports what is pending, what each item would restart, and installs it.
+#
+# MEASURED on live dev boxes 2026-08-15 — do NOT re-derive from first principles:
+#   * takserver / takserver-fed-hub are in NO repo (we install from an uploaded
+#     .deb/.rpm, which registers no source). `apt-cache policy takserver` shows
+#     the candidate coming from /var/lib/dpkg/status at priority 100 — apt-speak
+#     for "installed, offered by nobody". A package manager therefore CANNOT move
+#     TAK Server, and cannot drag in the 5.8 -> PostgreSQL-18 dependency chain.
+#     If takserver ever DOES appear in this list, someone added a repo — that is
+#     why _classify_os_updates() flags it loudly instead of ignoring it.
+#   * MediaMTX is /usr/local/bin/mediamtx + a systemd unit — also in no repo.
+#   * PGDG package names are major-versioned (postgresql-15 only ever receives
+#     15.x), so apt cannot jump a Postgres major on its own. Minors are bug/CVE
+#     fixes that never change on-disk format — the only cost is the restart.
+#   * docker-ce is the exception: Docker ships every version through one `stable`
+#     channel, so a MAJOR jump (29.x -> 30.x) arrives through the same upgrade as
+#     a patch. That is a behaviour change, not just a restart, so it is called out
+#     separately.
+#   * unattended-upgrades carries an Allowed-Origins allowlist limited to the
+#     distro's own archives, so the AUTOMATIC path never takes the third-party
+#     repos above. That protection is the distro default, NOT something we set —
+#     which is why _auto_update_posture() reads it rather than assuming it holds.
+# ---------------------------------------------------------------------------
+
+# (regex, service label, what a restart costs, class)
+#   'restart' = installing it bounces a running service
+#   'reboot'  = staged on disk, only takes effect after a reboot
+#   'none'    = libraries/CLI/plugins only; nothing restarts
+_MANAGED_PKG_IMPACT = [
+    (r'^takserver', 'TAK Server', 'TAK Server should NOT be upgradable from a repo — a package source was added to this box. Do not install this here; use the TAK Server page.', 'alert'),
+    (r'^(docker-ce|docker\.io|containerd\.io|containerd)$', 'Docker',
+     'restarts every container: Authentik (SSO/LDAP), CloudTAK, Node-RED, TAK Portal, Email Relay', 'restart'),
+    (r'^(postgresql|postgresql-\d+|postgresql\d+-server|postgresql-common)$', 'TAK database',
+     'restarts PostgreSQL — TAK Server clients reconnect automatically', 'restart'),
+    (r'^caddy$', 'Caddy (HTTPS)', 'restarts the SSL front door — brief blip on every web service', 'restart'),
+    (r'^netbird$', 'NetBird VPN',
+     'restarts the mesh tunnel — including the connection you may be managing this box through', 'restart'),
+    (r'^(linux-image|linux-headers|linux-generic|kernel|kernel-core)', 'Linux kernel',
+     'staged now, active after a reboot', 'reboot'),
+]
+_MANAGED_PKG_IMPACT = [(re.compile(p), s, i, c) for p, s, i, c in _MANAGED_PKG_IMPACT]
+
+_OS_UPDATES_CACHE = {'ts': 0.0, 'data': None}
+_OS_UPDATES_TTL = 300  # seconds; the panel also offers an explicit refresh
+
+
+def _parse_apt_simulation(out):
+    """Parse `apt-get -s full-upgrade` output into [{name, old, new}]."""
+    pend = []
+    # Inst <pkg> [<oldver>] (<newver> <origin>...)   — [oldver] absent for new installs
+    rx = re.compile(r'^Inst\s+(\S+)\s+(?:\[([^\]]+)\]\s+)?\((\S+)')
+    for line in (out or '').splitlines():
+        m = rx.match(line.strip())
+        if m:
+            pend.append({'name': m.group(1), 'old': m.group(2) or '', 'new': m.group(3)})
+    return pend
+
+
+def _parse_dnf_check_update(out):
+    """Parse `dnf -C -q check-update` output into [{name, old, new}].
+
+    Lines look like `name.arch   version-release   repo`. dnf also emits an
+    "Obsoleting Packages" section we must stop at, and wraps long names onto a
+    continuation line (leading whitespace) which we skip rather than mis-parse.
+    """
+    pend = []
+    for line in (out or '').splitlines():
+        if not line.strip():
+            continue
+        if line.lower().startswith('obsoleting'):
+            break
+        if line[:1].isspace():        # continuation of a wrapped row
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        name = parts[0].rsplit('.', 1)[0]   # strip .x86_64 / .noarch
+        pend.append({'name': name, 'old': '', 'new': parts[1]})
+    return pend
+
+
+def _pending_os_updates():
+    """Return [{name, old, new}] of packages a full upgrade would install.
+
+    Read-only SIMULATION on both families, run UNPRIVILEGED (neither command
+    needs root) and against the package lists already on disk — no network, no
+    `apt-get update`. So the answer is exactly what the operator would see, and
+    is only as fresh as the last list refresh (the UI says so).
+    """
+    try:
+        if _pkg_mgr() == 'dnf':
+            # -C = cacheonly. Without it dnf may hit the network for metadata and
+            # hang a UI request; check-update exits 100 when updates exist, 0 when
+            # none, so a non-zero rc is NOT an error here.
+            r = subprocess.run(['dnf', '-C', '-q', 'check-update'],
+                               capture_output=True, text=True, timeout=60)
+            return _parse_dnf_check_update(r.stdout)
+        r = subprocess.run(['apt-get', '-s', '-o', 'Dpkg::Use-Pty=0', 'full-upgrade'],
+                           capture_output=True, text=True, timeout=60)
+        return _parse_apt_simulation(r.stdout)
+    except Exception:
+        return []
+
+
+def _is_major_jump(old, new):
+    """True when the leading numeric component changes (29.7.2 -> 30.0.1).
+
+    Deliberately conservative: unparseable or missing versions return False, so
+    we never label something a major jump on a guess.
+    """
+    def _lead(v):
+        m = re.search(r'(\d+)', re.sub(r'^\d+:', '', v or ''))   # drop epoch
+        return m.group(1) if m else None
+    a, b = _lead(old), _lead(new)
+    return bool(a and b and a != b)
+
+
+def _classify_os_updates(pending):
+    """Split pending updates into managed (restart/reboot/alert) and routine."""
+    managed, routine = [], []
+    for p in pending:
+        hit = None
+        for rx, service, impact, cls in _MANAGED_PKG_IMPACT:
+            if rx.match(p['name']):
+                hit = (service, impact, cls)
+                break
+        if not hit:
+            routine.append(p)
+            continue
+        service, impact, cls = hit
+        item = dict(p, service=service, impact=impact, impact_class=cls)
+        if cls == 'restart' and _is_major_jump(p.get('old'), p.get('new')):
+            item['major'] = True
+            item['impact'] = 'MAJOR VERSION CHANGE — ' + impact
+        managed.append(item)
+    return managed, routine
+
+
+def _auto_update_posture():
+    """What (if anything) installs updates on this box without being asked.
+
+    Family-aware and honest: on EL the answer is dnf-automatic, NOT
+    unattended-upgrades, and "the apt config file is missing" is not evidence of
+    anything. Debian reads `apt-config dump` — apt's own resolved view — rather
+    than parsing 50unattended-upgrades, so include/override files are accounted
+    for the way apt actually sees them.
+    """
+    post = {'mechanism': None, 'installed': False, 'enabled': False,
+            'third_party_allowed': None, 'origins': [], 'note': ''}
+    try:
+        if _pkg_mgr() == 'dnf':
+            post['mechanism'] = 'dnf-automatic'
+            r = subprocess.run(['rpm', '-q', 'dnf-automatic'], capture_output=True, text=True, timeout=10)
+            post['installed'] = (r.returncode == 0)
+            if not post['installed']:
+                post['note'] = 'dnf-automatic is not installed — nothing updates this box on its own.'
+                return post
+            for unit in ('dnf-automatic-install.timer', 'dnf-automatic.timer'):
+                r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', unit]),
+                                   capture_output=True, text=True, timeout=5)
+                if (r.stdout or '').strip() == 'enabled':
+                    post['enabled'] = True
+                    break
+            # download-only is very different from applying; say which it is
+            applies = False
+            try:
+                with open('/etc/dnf/automatic.conf', 'r') as fh:
+                    applies = bool(re.search(r'^\s*apply_updates\s*=\s*yes', fh.read(), re.M))
+            except Exception:
+                pass
+            post['third_party_allowed'] = True   # dnf-automatic has no origin allowlist
+            post['note'] = ('dnf-automatic installs updates automatically, and unlike Ubuntu it has no '
+                            'allowlist — it can update TAK components too.') if (post['enabled'] and applies) else \
+                           ('dnf-automatic is installed but is not applying updates automatically.')
+            return post
+
+        post['mechanism'] = 'unattended-upgrades'
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'unattended-upgrades']),
+                           capture_output=True, text=True, timeout=5)
+        post['installed'] = (r.returncode == 0)
+        post['enabled'] = ((r.stdout or '').strip() == 'enabled')
+        r = subprocess.run(['apt-config', 'dump'], capture_output=True, text=True, timeout=15)
+        origins = re.findall(r'Unattended-Upgrade::Allowed-Origins::\s*"([^"]*)"', r.stdout or '')
+        post['origins'] = origins
+        # The distro default allowlist is the archive's own pockets. Anything else
+        # means a hardening baseline (or an operator) widened it, and third-party
+        # repos — PGDG/Docker/Caddy/NetBird — become fair game for the automatic
+        # path. We never used to look; that unowned assumption is the point here.
+        safe = re.compile(r'^\$\{distro_id\}(ESM|ESMApps)?:\$\{distro_codename\}(-(security|updates|apps-security|infra-security))?$')
+        if origins:
+            widened = [o for o in origins if not safe.match(o)]
+            post['third_party_allowed'] = bool(widened)
+            post['note'] = ('Automatic updates are limited to Ubuntu security patches — they never touch '
+                            'TAK components.') if not widened else \
+                           ('Automatic updates have been widened beyond Ubuntu security patches (' +
+                            ', '.join(widened[:3]) + ') — they can now update TAK components too.')
+        return post
+    except Exception as e:
+        post['note'] = 'could not determine: ' + str(e)[:80]
+        return post
+
+
+def _os_updates_summary(force=False):
+    """Cached {pending, managed, routine, posture, reboot_required} for the panel."""
+    now = time.time()
+    if not force and _OS_UPDATES_CACHE['data'] is not None and (now - _OS_UPDATES_CACHE['ts']) < _OS_UPDATES_TTL:
+        return _OS_UPDATES_CACHE['data']
+    pending = _pending_os_updates()
+    managed, routine = _classify_os_updates(pending)
+    data = {
+        'total': len(pending),
+        'managed': managed,
+        'routine_count': len(routine),
+        'routine_sample': [p['name'] for p in routine[:8]],
+        'restarts': [m for m in managed if m['impact_class'] == 'restart'],
+        'alerts': [m for m in managed if m['impact_class'] == 'alert'],
+        'reboot_required': any(m['impact_class'] == 'reboot' for m in managed) or os.path.exists('/var/run/reboot-required'),
+        'posture': _auto_update_posture(),
+        'checked_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'pkg_mgr': _pkg_mgr(),
+    }
+    _OS_UPDATES_CACHE['ts'], _OS_UPDATES_CACHE['data'] = now, data
+    return data
+
+
+@app.route('/api/os-updates')
+@login_required
+def os_updates_api():
+    """Pending OS updates, classified by what installing them would restart."""
+    return jsonify(_os_updates_summary(force=(request.args.get('refresh') == '1')))
+
+
 def _get_unattended_upgrades_status():
     """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade job active (not shutdown-waiter)."""
     enabled = False
@@ -3435,11 +3675,19 @@ def _get_unattended_upgrades_status_remote(remote_cfg):
 
 def _build_uu_hosts(metrics, settings):
     """Build list of {id, label, enabled, running} for main console UU per-host cards."""
+    # v10.1.37: name the mechanism honestly. On EL there is no unattended-upgrades
+    # at all — the analogue is dnf-automatic — so a card reading "Unattended
+    # upgrades / OS-apt / Disabled" on a Rocky box was describing something that
+    # does not exist there. Carry the real mechanism (and whether it is even
+    # installed) so the template can say what is actually true on this family.
+    _lp = _auto_update_posture()
     hosts = [{
         'id': 'this_host',
         'label': 'This host',
         'enabled': metrics.get('unattended_upgrades', {}).get('enabled', False),
         'running': metrics.get('unattended_upgrades', {}).get('running', False),
+        'mechanism': _lp.get('mechanism') or 'unattended-upgrades',
+        'installed': _lp.get('installed', True),
     }]
     cfg = _get_tak_deployment_config(settings)
     if cfg.get('mode') == 'two_server':
@@ -9649,7 +9897,20 @@ def takserver_pin_packages():
         elif status == 'already_pinned':
             msgs.append(f'{label}: already pinned')
         elif status == 'no_unattended_upgrades':
-            msgs.append(f'{label}: unattended-upgrades not installed (safe)')
+            # v10.1.37: this used to read "(safe)". On RHEL/Rocky the apt config
+            # file is ALWAYS absent, so every EL box was told it was safe on the
+            # strength of a file we never expected to find — a guess, not a check.
+            # The EL analogue is dnf-automatic; report what we actually observed.
+            if _pkg_mgr() == 'dnf':
+                _p = _auto_update_posture()
+                if not _p.get('installed'):
+                    msgs.append(f'{label}: dnf-automatic not installed — nothing updates this host automatically')
+                elif _p.get('enabled'):
+                    msgs.append(f'{label}: ⚠ dnf-automatic is ENABLED and has no package allowlist — it can update TAK components')
+                else:
+                    msgs.append(f'{label}: dnf-automatic installed but not enabled')
+            else:
+                msgs.append(f'{label}: unattended-upgrades not installed')
         else:
             msgs.append(f'{label}: {status}')
 
@@ -64120,8 +64381,17 @@ def _kernel_patch_start_job():
         # equivalent of apt full-upgrade, with the TAK Server packages EXCLUDED —
         # the SAME invariant the apt path enforces via apt-mark hold: OS patching
         # must never sweep in an operator-driven, backup-gated TAK major upgrade
-        # (v0.9.44 field incident — a kernel patch pulled takserver 5.6->5.7 and
-        # wedged the package DB). `--exclude='takserver*'` covers takserver and
+        # (v0.9.44 field incident — a kernel patch left takserver at 5.7 and wedged
+        # the package DB. NOTE v10.1.37: the original wording said the patch job
+        # "pulled" 5.7 from a repo. Measured 2026-08-15 on test6/test12/nuc — no
+        # repo offers takserver at all (`apt-cache policy takserver` sources the
+        # candidate from /var/lib/dpkg/status), so apt CANNOT have fetched it. The
+        # real mechanism was almost certainly a half-unpacked/unconfigured dpkg
+        # state that the next full-upgrade finished configuring. The exclusion is
+        # still correct — it stops exactly that resumption — but do not reason
+        # from the old wording: it led a later session to invent a fleet-wide
+        # "5.8 arrives automatically" exposure that does not exist.)
+        # `--exclude='takserver*'` covers takserver and
         # takserver-fed-hub and needs no versionlock plugin. systemd-run, the
         # detached-cgroup rationale, and the reboot-pending signal are all
         # distro-agnostic, so only this script body changes. dnf runs as root
