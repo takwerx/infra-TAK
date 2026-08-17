@@ -16141,9 +16141,13 @@ def _f2b_selfheal_authentik_log_level(plog=None):
     except Exception as e:
         _log(f'fail2ban: could not raise AUTHENTIK_LOG_LEVEL (non-fatal): {e}')
         return False
-    _log('fail2ban: AUTHENTIK_LOG_LEVEL warning -> info. The Authentik brute-force jail '
-         'matches logger.info("invalid_login"), so at `warning` it could never fire — '
-         'and never had. Recreating Authentik to apply; brief SSO interruption, once.')
+    # Name the file. The bug this release fixes was the heal reading the WRONG .env
+    # (or none at all), so "it healed" is not a useful log line without the path —
+    # on a box with a stale second copy, that path is the whole diagnosis.
+    _log('fail2ban: AUTHENTIK_LOG_LEVEL warning -> info in %s. The Authentik '
+         'brute-force jail matches logger.info("invalid_login"), so at `warning` it '
+         'could never fire — and never had. Recreating Authentik to apply; brief SSO '
+         'interruption, once.' % env_path)
     try:
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
                            capture_output=True, text=True, timeout=300)
