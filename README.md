@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.35-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.35-alpha)**
+**Current release: [v10.1.36-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.36-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.36-alpha — 2026-08-17 — a lost phone no longer means a locked-out user
+
+**Headline: when someone loses the phone holding their authenticator app, you can get them back in from the console in about five seconds.** With multi-factor authentication enforced, a lost phone locks a user out of every web sign-in — the console, TAK Portal, Node-RED, NetBird, WebODM. They cannot fix it themselves, and that is deliberate: if a password-reset email could clear MFA, the second factor would only ever be as strong as the mailbox, so the reset flow refuses to act as a bypass. That left the actual fix buried five menus deep in the Authentik administration interface — not something anyone finds while a user is waiting on the phone. This release adds an **MFA Device Recovery** panel to the Authentik page. Search the user by name or email, see which authenticators they have registered, and revoke them. The next time they sign in with their password, they are walked through setting up a new authenticator. You never see or change their password, and they enroll the new device themselves. Their active sessions are signed out at the same time by default, in case the phone was stolen rather than simply lost. **And for when it is your own admin authenticator that is gone**, a break-glass control on the same panel resets the protected admin accounts — and it keeps working even when Authentik's own API is unreachable, which is precisely the situation where every other route has already failed. **TAK clients are not affected:** ATAK, iTAK and CloudTAK authenticate by certificate over LDAP, which is never MFA-gated, so a lost phone does not knock anyone off the map. **Who should update:** anyone running with MFA enforced. **Upgrade:** automatic on the next console update, with nothing to configure.
+
+Full notes: [v10.1.36-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.36-alpha).
 
 ### v10.1.35-alpha — 2026-08-15 — one mistyped password no longer knocks users off your server
 
