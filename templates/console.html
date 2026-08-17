@@ -126,15 +126,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div></div>
 <div id="kpatch-running" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-<div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Kernel patch in progress &mdash; <span id="kpatch-pid"></span></div>
+<div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Installing operating system updates &mdash; <span id="kpatch-pid"></span></div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Detached from console &mdash; safe to close this tab. Job runs to completion regardless. Typical time: 2-5 min.</div></div>
 </div>
 <pre id="kpatch-log" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
 <div id="kpatch-done" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-<div><div style="font-size:13px;font-weight:600;color:var(--green)">&#10003; Kernel patch complete &mdash; reboot required to boot the new kernel</div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get full-upgrade finished cleanly. The new kernel is staged but the running system is still on the old one. Reboot when ready.</div></div>
+<div><div style="font-size:13px;font-weight:600;color:var(--green)">&#10003; Updates installed &mdash; reboot required to finish</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %} finished cleanly. Any new kernel is staged but the running system is still on the old one. Reboot when ready.</div></div>
 <div style="display:flex;gap:8px">
 <button onclick="rebootForKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I&#39;ll reboot later</button>
@@ -143,8 +143,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="kpatch-error" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
-<div><div style="font-size:13px;font-weight:600;color:var(--red)">&#10007; Kernel patch FAILED &mdash; see log below</div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get exited non-zero. No reboot will run. Investigate the log and either retry or fix manually over SSH.</div></div>
+<div><div style="font-size:13px;font-weight:600;color:var(--red)">&#10007; Update install FAILED &mdash; see log below</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">The package manager exited non-zero, so nothing further ran and no reboot will happen. Nothing has been left half-installed by us &mdash; read the log below and retry.</div></div>
 <div style="display:flex;gap:8px">
 <button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Retry</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
