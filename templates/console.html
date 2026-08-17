@@ -133,11 +133,11 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="kpatch-done" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-<div><div style="font-size:13px;font-weight:600;color:var(--green)">&#10003; Updates installed &mdash; reboot required to finish</div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %} finished cleanly. Any new kernel is staged but the running system is still on the old one. Reboot when ready.</div></div>
+<div><div id="kpatch-done-head" style="font-size:13px;font-weight:600;color:var(--green)">&#10003; Updates installed</div>
+<div id="kpatch-done-body" style="font-size:11px;color:var(--text-dim);margin-top:4px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %} finished cleanly.</div></div>
 <div style="display:flex;gap:8px">
-<button onclick="rebootForKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
-<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I&#39;ll reboot later</button>
+<button id="kpatch-reboot-btn" onclick="rebootForKernelPatch()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
+<button id="kpatch-done-dismiss" onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Close</button>
 </div></div>
 <pre id="kpatch-log-done" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:10px;font-size:10px;color:var(--text-dim);max-height:140px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
@@ -692,6 +692,26 @@ function _kpatchShowState(state){
         var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
     });
 }
+function _kpatchRenderDone(d){
+    // "Finished" and "needs a reboot" are different facts. A docker-only update
+    // completes with nothing to reboot for, and telling the operator to reboot
+    // anyway (or hiding the finish behind a reboot they don't need) is wrong.
+    var pm = '{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}';
+    var head=document.getElementById('kpatch-done-head'),
+        body=document.getElementById('kpatch-done-body'),
+        rb=document.getElementById('kpatch-reboot-btn'),
+        dz=document.getElementById('kpatch-done-dismiss');
+    var needsReboot=!!(d&&d.reboot_required);
+    if(head)head.innerHTML='&#10003; Updates installed'+(needsReboot?' &mdash; reboot required to finish':'');
+    if(body)body.textContent=pm+' finished cleanly.'+(needsReboot
+        ?' A new kernel is staged but the running system is still on the old one. Reboot when ready.'
+        :' Nothing needs a reboot.');
+    if(rb)rb.style.display=needsReboot?'':'none';
+    if(dz)dz.textContent=needsReboot?"I'll reboot later":'Close';
+    document.getElementById('kpatch-log-done').textContent=(d&&d.log_tail)||'';
+    // The pending list is stale the moment the job lands.
+    fetch('/api/os-updates?refresh=1',{credentials:'same-origin',cache:'no-store'}).catch(function(){});
+}
 function toggleOsUpdDetails(){
     var d=document.getElementById('osupd-details'),b=document.getElementById('osupd-details-btn');
     if(!d)return;
@@ -792,7 +812,7 @@ async function checkKernelPatch(){
         if(jd && jd.done){
             banner.style.display='block';
             _kpatchShowState('done');
-            document.getElementById('kpatch-log-done').textContent=jd.log_tail||'';
+            _kpatchRenderDone(jd);
             return;
         }
         if(jd && jd.error){
@@ -890,10 +910,16 @@ async function _kpatchPollOnce(){
         if(d.done){
             clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
             _kpatchShowState('done');
-            document.getElementById('kpatch-log-done').textContent=d.log_tail||'';
-            // The pending list just became stale — force a re-read so the panel
-            // cannot keep advertising updates that were only just installed.
-            fetch('/api/os-updates?refresh=1',{credentials:'same-origin',cache:'no-store'}).catch(function(){});
+            _kpatchRenderDone(d);
+            return;
+        }
+        // Terminating branch: the job is not running and reported neither done
+        // nor error. Previously this fell through and the loop span forever on
+        // "Installing...". Stop polling and re-derive from scratch instead of
+        // trusting a state that says nothing.
+        if(!d.running){
+            clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            checkKernelPatch();
             return;
         }
         if(d.error){

@@ -64570,10 +64570,37 @@ def _kernel_patch_job_state():
         last_done = log_tail.rfind('=== DONE')
         last_fatal = log_tail.rfind('FATAL:')
         completed_ok = last_done != -1 and last_done > last_fatal
+        # v10.1.37: `done` also required reboot_required, so a successful run that
+        # staged no new kernel reported running=False, done=False, error=False —
+        # and the panel polled forever on "Installing...", never offering the
+        # finish button. Field: aws-arm 2026-08-17, a docker/containerd-only
+        # update whose own log says "Running kernel seems to be up-to-date".
+        # Latent since v0.9.44 and invisible only because the banner used to
+        # appear ONLY when a kernel update was pending, which made
+        # reboot_required true by construction; surfacing the panel for ANY
+        # pending update exposed it.
+        #
+        # Completion and reboot-need are separate facts: a job that logged DONE
+        # is done, whether or not anything needs rebooting. What actually guards
+        # the v0.9.32 post-reboot loop is not the reboot flag but WHEN the job
+        # finished — a DONE marker older than this boot describes a previous life
+        # of the box and must not be reported as a fresh completion.
+        done_fresh = completed_ok
+        if completed_ok:
+            _m = None
+            for _m in re.finditer(r'\[(\d{4}-\d{2}-\d{2}T[\d:]{8})Z\]\s*=== DONE', log_tail):
+                pass                      # keep the LAST match
+            if _m:
+                try:
+                    from datetime import timezone as _tz
+                    _dt = datetime.strptime(_m.group(1), '%Y-%m-%dT%H:%M:%S').replace(tzinfo=_tz.utc)
+                    done_fresh = _dt.timestamp() >= psutil.boot_time()
+                except Exception:
+                    done_fresh = completed_ok      # unparseable stamp: fail toward showing it
         return {
             'running': False,
             'pid': None,
-            'done': bool(completed_ok and reboot_required),
+            'done': bool(done_fresh),
             'error': bool(last_fatal != -1 and last_fatal > last_done),
             'reboot_required': reboot_required,
             'log_tail': log_tail,
