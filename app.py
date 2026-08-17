@@ -3459,6 +3459,11 @@ def _parse_apt_simulation(out):
     return pend
 
 
+# name.arch as dnf prints it — the arch suffix is what separates a package
+# row from prose/prompt noise on stdout.
+_DNF_ROW_RE = re.compile(r'^[A-Za-z0-9._+-]+\.(x86_64|noarch|aarch64|i686|armv7hl|ppc64le|s390x)$')
+
+
 def _parse_dnf_check_update(out):
     """Parse `dnf -C -q check-update` output into [{name, old, new}].
 
@@ -3476,6 +3481,15 @@ def _parse_dnf_check_update(out):
             continue
         parts = line.split()
         if len(parts) < 3:
+            continue
+        # A real row is `name.arch  version-release  repo`. Anything else is
+        # noise on stdout and MUST NOT be parsed as a package. Field observed
+        # on nuc 2026-08-17: a leaked GPG key-import prompt, `Is this ok
+        # [y/N]:`, split into 4 fields and would have been reported to the
+        # operator as a pending package named "Is" at version "this". The
+        # arch suffix is the discriminator — every genuine row has one, and
+        # no prose line does.
+        if not _DNF_ROW_RE.match(parts[0]):
             continue
         name = parts[0].rsplit('.', 1)[0]   # strip .x86_64 / .noarch
         pend.append({'name': name, 'old': '', 'new': parts[1]})
