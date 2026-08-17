@@ -862,12 +862,19 @@ async function checkKernelPatch(){
             // console restart does not. Previously the done branch never consulted
             // the dismissal at all and reappeared on every restart.
             var dsig='done@'+(jd.done_at||'');
-            if(_kpatchDismissMatches(dsig)){banner.style.display='none';return;}
-            banner.setAttribute('data-osupd-sig',dsig);
-            banner.style.display='block';
-            _kpatchShowState('done');
-            _kpatchRenderDone(jd);
-            return;
+            // If this finished run has NOT been dismissed, show it and stop.
+            // If it HAS been dismissed, fall through to the pending-updates check
+            // instead of returning: a closed "Updates installed" notice must never
+            // blind the panel to updates that landed afterwards. On a box that
+            // never reboots the done state persists indefinitely, so an early
+            // return here hid real pending updates for good.
+            if(!_kpatchDismissMatches(dsig)){
+                banner.setAttribute('data-osupd-sig',dsig);
+                banner.style.display='block';
+                _kpatchShowState('done');
+                _kpatchRenderDone(jd);
+                return;
+            }
         }
         if(jd && jd.error){
             banner.style.display='block';
