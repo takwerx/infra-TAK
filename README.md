@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.36-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.36-alpha)**
+**Current release: [v10.1.37-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.37-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.37-alpha — 2026-08-17 — see what an operating-system update will restart, before you run it
+
+**Headline: the console now tells you which pending updates will restart your stack, in plain language, and installs them for you.** Keeping a server patched has meant either ignoring it or opening an SSH session and typing `apt upgrade` — and that command is not as harmless as it looks. It will happily restart Docker, and restarting Docker restarts *every* container at once: single sign-on, the map, your flows, the portal, the mail relay. Nobody was told that in advance. This release adds an **Operating System Updates** panel to the top of the console. It lists what is pending, separates routine patches from the ones that touch something you care about, and names the cost in words rather than package jargon — "restarts every container: Authentik (SSO/LDAP), CloudTAK, Node-RED, TAK Portal, Email Relay", or "restarts PostgreSQL — TAK Server clients reconnect automatically". A major version jump is called out differently from a routine security patch, because one is a behaviour change and the other is not. **One button installs them**, in a detached background job that survives you closing the tab, and TAK Server is held throughout so an operating-system patch can never sweep it up. A reboot, if one is needed, stays a separate explicit click. **It also answers the question people actually have:** is something updating my server behind my back? The panel reads the automatic-update configuration and says so plainly — and on RHEL and Rocky it now reports `dnf-automatic` honestly instead of describing an Ubuntu component that does not exist there. **Also fixed:** the patch job could collide with the system's own scheduled `apt` run and fail outright, leaving nothing installed; it now waits for the package manager to be free. **Who should update:** everyone. **Upgrade:** automatic on the next console update, with nothing to configure.
+
+Full notes: [v10.1.37-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.37-alpha).
 
 ### v10.1.36-alpha — 2026-08-17 — a lost phone no longer means a locked-out user
 
