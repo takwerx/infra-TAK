@@ -3447,6 +3447,27 @@ _OS_UPDATES_CACHE = {'ts': 0.0, 'data': None}
 _OS_UPDATES_TTL = 300  # seconds; the panel also offers an explicit refresh
 
 
+def _real_bin(name):
+    """Absolute path to the REAL binary, deliberately bypassing the broker shims.
+
+    v10.1.37: the non-root console runs with /opt/infratak/.shims first on PATH,
+    so a bare `apt-get`/`dnf`/`rpm` resolves to a broker shim. That is correct for
+    privileged operations and WRONG for these read-only probes:
+      * `apt-get -s full-upgrade` is denied outright ("subcommand not allowed:
+        full-upgrade"), and
+      * `-o/--setopt` is denied on purpose — it is the hook-command escalation
+        vector the broker exists to block.
+    Field: test6 2026-08-17, where every check came back DENIED and (before the
+    silent-failure fix) the panel simply reported no updates.
+    The answer is NOT to widen the broker allowlist — that would punch a hole in a
+    CJIS control for a status query. These commands need no privilege at all:
+    a simulation and two queries, run as the console user. So call the real binary
+    directly and leave the broker out of it.
+    """
+    cand = os.path.join('/usr/bin', name)
+    return cand if os.path.exists(cand) else name
+
+
 def _parse_apt_simulation(out):
     """Parse `apt-get -s full-upgrade` output into [{name, old, new}]."""
     pend = []
@@ -3510,7 +3531,7 @@ def _pending_os_updates():
             # -C = cacheonly. Without it dnf may hit the network for metadata and
             # hang a UI request; check-update exits 100 when updates exist, 0 when
             # none, so a non-zero rc is NOT an error here.
-            r = subprocess.run(['dnf', '-C', '-q', 'check-update'],
+            r = subprocess.run([_real_bin('dnf'), '-C', '-q', 'check-update'],
                                capture_output=True, text=True, timeout=60)
             pend = _parse_dnf_check_update(r.stdout)
             # check-update reports only the CANDIDATE version. Without the
@@ -3520,7 +3541,7 @@ def _pending_os_updates():
             # fills it in; apt's simulation already gives us both sides.
             if pend:
                 try:
-                    q = subprocess.run(['rpm', '-qa', '--qf', '%{NAME} %{EVR}\n'],
+                    q = subprocess.run([_real_bin('rpm'), '-qa', '--qf', '%{NAME} %{EVR}\n'],
                                        capture_output=True, text=True, timeout=30)
                     inst = {}
                     for ln in (q.stdout or '').splitlines():
@@ -3532,7 +3553,7 @@ def _pending_os_updates():
                 except Exception:
                     pass
             return pend
-        r = subprocess.run(['apt-get', '-s', '-o', 'Dpkg::Use-Pty=0', 'full-upgrade'],
+        r = subprocess.run([_real_bin('apt-get'), '-s', 'full-upgrade'],
                            capture_output=True, text=True, timeout=60)
         return _parse_apt_simulation(r.stdout)
     except Exception as _e:
@@ -3593,7 +3614,7 @@ def _auto_update_posture():
     try:
         if _pkg_mgr() == 'dnf':
             post['mechanism'] = 'dnf-automatic'
-            r = subprocess.run(['rpm', '-q', 'dnf-automatic'], capture_output=True, text=True, timeout=10)
+            r = subprocess.run([_real_bin('rpm'), '-q', 'dnf-automatic'], capture_output=True, text=True, timeout=10)
             post['installed'] = (r.returncode == 0)
             if not post['installed']:
                 post['note'] = 'dnf-automatic is not installed — nothing updates this box on its own.'
@@ -3622,7 +3643,7 @@ def _auto_update_posture():
                            capture_output=True, text=True, timeout=5)
         post['installed'] = (r.returncode == 0)
         post['enabled'] = ((r.stdout or '').strip() == 'enabled')
-        r = subprocess.run(['apt-config', 'dump'], capture_output=True, text=True, timeout=15)
+        r = subprocess.run([_real_bin('apt-config'), 'dump'], capture_output=True, text=True, timeout=15)
         origins = re.findall(r'Unattended-Upgrade::Allowed-Origins::\s*"([^"]*)"', r.stdout or '')
         post['origins'] = origins
         # The distro default allowlist is the archive's own pockets. Anything else
