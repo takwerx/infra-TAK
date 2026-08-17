@@ -434,6 +434,29 @@ def _read_priv(path):
     return proc.stdout
 
 
+def _exists_priv(path):
+    """Existence test that survives a directory the console cannot traverse.
+
+    v10.1.38: `os.path.exists()` returns **False**, not an error, when any parent
+    directory denies traversal. On a box installed in the root era and later flipped
+    to a non-root console, Authentik lives in /root/authentik (mode 700) — so every
+    `os.path.exists('/root/authentik/.env')` in this file answers False and the code
+    concludes "Authentik is not installed here" on a box where it plainly is. That is
+    how the v10.1.11 fail2ban log-level self-heal silently no-opped in the field for
+    seven releases (US-FED-NE, 2026-08-17): the jail it was meant to arm stayed
+    decorative and nothing said so.
+
+    Cheap path first (a readable path is readable); only pay for a privileged read
+    when the plain answer is False, since that answer cannot be trusted."""
+    if os.path.exists(path):
+        return True
+    try:
+        _read_priv(path)
+        return True
+    except Exception:
+        return False
+
+
 def _read_coreconfig(path=CORECONFIG_PATH):
     """Read CoreConfig.xml as text — the ONE way the console is allowed to read it.
 
@@ -781,7 +804,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.37-alpha"
+VERSION = "10.1.38-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -15602,10 +15625,63 @@ def _f2b_loaded_jails():
     return []
 
 
+# Authentik's log level decides whether the Authentik jail can EVER match, so the
+# answer is part of that jail's health — but reading it costs a `docker inspect` plus
+# a privileged file read, and /api/fail2ban/status is on a page poll. v10.1.37 already
+# had to pull a posture probe off the 5-second metrics poll; this memo keeps the same
+# mistake from being made again. TTL is generous because the answer only changes when
+# an operator edits .env or this very release heals it.
+_F2B_AK_LEVEL_TTL = 300
+_F2B_AK_LEVEL_CACHE = {'at': 0.0, 'verdict': None}
+
+# Levels at or below info. `invalid_login` is a logger.info() call, so anything
+# coarser than these cannot emit the only failed-login line that carries a client IP.
+_F2B_AK_MATCHABLE_LEVELS = ('info', 'debug', 'trace', 'notset')
+
+
+def _f2b_ak_log_level_verdict(force=False):
+    """Can Authentik, as configured, emit a line the Authentik jail could match?
+
+    Returns (ok, level, reason): ok True = yes, False = no, None = cannot tell.
+
+    This is the check that was missing. `fail2ban-client status authentik` reports a
+    jail that is loaded, fed and completely inert, because whether the PRODUCER can
+    emit a matchable line at all is invisible from fail2ban's side. Field report
+    US-FED-NE 2026-08-17: sshd jail banning normally, Authentik jail Active with 0
+    hits, log level `warning` — a decorative control the console called protection."""
+    now = time.monotonic()
+    cached = _F2B_AK_LEVEL_CACHE.get('verdict')
+    if cached is not None and not force and (now - _F2B_AK_LEVEL_CACHE['at']) < _F2B_AK_LEVEL_TTL:
+        return cached
+    ak_dir, env_path, _c = _find_authentik_install_dir()
+    if not ak_dir:
+        verdict = (None, None, 'Authentik install dir not found (tried the running '
+                               'container label, ~/authentik, /opt/authentik)')
+    else:
+        try:
+            content = _read_priv(env_path)
+        except Exception as e:
+            verdict = (None, None, f'{env_path} could not be read ({str(e)[:80]})')
+        else:
+            m = re.search(r'^AUTHENTIK_LOG_LEVEL\s*=\s*(\S*)\s*$', content, re.M)
+            # Absent = upstream's own default = info = matchable.
+            level = (m.group(1).strip().lower() if m and m.group(1).strip() else 'info')
+            if level in _F2B_AK_MATCHABLE_LEVELS:
+                verdict = (True, level, '')
+            else:
+                verdict = (False, level,
+                           'AUTHENTIK_LOG_LEVEL=%s cannot emit the invalid_login line '
+                           'this jail matches (it is a logger.info call), so the jail '
+                           'is loaded but can never fire' % level)
+    _F2B_AK_LEVEL_CACHE['verdict'] = verdict
+    _F2B_AK_LEVEL_CACHE['at'] = now
+    return verdict
+
+
 def _f2b_dead_jails():
     """Jails that are configured but protecting nothing. [(jail, filter, reason)].
 
-    TWO failure modes, because fixing only the first still leaves a green console
+    THREE failure modes, because fixing only the first still leaves a green console
     over a control that cannot fire:
 
     1. NOT LOADED — enabled on disk but absent from the running daemon, usually a
@@ -15615,7 +15691,15 @@ def _f2b_dead_jails():
        the jail shipped ahead of the TAK Portal writer that was meant to emit the
        log, and the container has no mount for that path either.) A 0-byte file is
        used as the signal rather than staleness — a quiet box legitimately has quiet
-       logs, but a log that has never received one byte is unambiguous."""
+       logs, but a log that has never received one byte is unambiguous.
+    3. INERT — loaded, and its log is being written, but the PRODUCER cannot emit a
+       line this filter could ever match. Modes 1 and 2 both look at fail2ban; this
+       one looks at the software on the other end of the log, which is where the
+       Authentik jail actually failed in the field (US-FED-NE, 2026-08-17: log level
+       `warning`, so `invalid_login` — a logger.info call — was never written, on a
+       jail reporting Active). Only Authentik is checked here, because it is the only
+       jail whose producer has a config knob that can silently disarm it; the general
+       case (does this filter match this log at all?) is roadmapped, not shipped."""
     dead = []
     loaded = _f2b_loaded_jails()
     if not loaded:
@@ -15644,9 +15728,52 @@ def _f2b_dead_jails():
                 dead.append((name, filt,
                              'loaded, but its log %s is 0 bytes — nothing has ever '
                              'written to it, so this jail can never fire' % lp))
+                continue                  # 0 bytes is the deeper fault; don't double-report
         except OSError:
             dead.append((name, filt, 'loaded, but its log %s cannot be read' % lp))
+            continue
+        # Mode 3 — the log is being written, but can the producer emit a matchable
+        # line at all? Authentik only: see the docstring.
+        if name == 'authentik':
+            ok, _level, why = _f2b_ak_log_level_verdict()
+            if ok is False:
+                dead.append((name, filt, why))
+            elif ok is None:
+                dead.append((name, filt,
+                             'loaded, but infra-TAK cannot verify Authentik is able to '
+                             'emit a matchable line (%s) — treat this jail as unproven' % why))
     return dead
+
+
+def _f2b_remove_jail(jail_file, why, plog=None):
+    """Delete a jail config and reload fail2ban. For when the thing it guards is gone.
+
+    v10.1.38. Uninstalling a module left its jail behind: test12 still carried
+    /etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf dated Jul 27 with MediaMTX long
+    removed. Its `journalmatch=_SYSTEMD_UNIT=mediamtx.service` can never match, so it
+    is inert rather than dangerous — but it is a configured-and-dead jail, it lands in
+    _f2b_dead_jails() forever, and during v10.1.30 T&E it made a stale ban action look
+    like a live one. No-op when the file is absent, so it is safe on every path."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    # This name is formatted into a path that is `rm -f`d with sudo. Every caller
+    # passes a literal today; the guard is so that stays true if one ever doesn't.
+    if not re.fullmatch(r'[A-Za-z0-9._-]+\.conf', jail_file or ''):
+        _log('fail2ban: refusing to remove jail with unexpected name %r' % (jail_file,))
+        return False
+    path = '/etc/fail2ban/jail.d/%s' % jail_file
+    if not _exists_priv(path):
+        return False
+    try:
+        subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
+    except Exception as e:
+        _log('fail2ban: could not remove jail %s (%s) — it will keep showing as a dead '
+             'jail until it is deleted' % (jail_file, str(e)[:80]))
+        return False
+    _log('Removed the %s fail2ban jail (%s)' % (jail_file, why))
+    return True
 
 
 # Log files infra-TAK ITSELF produces and one of our jails then reads. These we may
@@ -15966,22 +16093,48 @@ def _f2b_selfheal_authentik_log_level(plog=None):
         deliberately chose `debug`/`error` keeps it,
       - recreates Authentik so the change takes effect. Skipping that would leave the
         setting written and the jail still dead, which is the exact failure this whole
-        release is about. Costs one brief SSO interruption, ONCE."""
+        release is about. Costs one brief SSO interruption, ONCE.
+
+    v10.1.38 — every exit now says why. This function shipped in v10.1.11 and ran on
+    every console start for seven releases while doing NOTHING on an entire class of
+    box, because each of its five give-up paths was a bare `return False`. Reported
+    from the field (US-FED-NE, 2026-08-17) on a box whose Authentik jail read `Active`
+    with AUTHENTIK_LOG_LEVEL=warning: /root is mode 700, the console runs as `takwerx`,
+    so `os.path.exists('/root/authentik/.env')` was False and the heal declined without
+    a word. A self-heal that cannot heal must be as loud as a jail that cannot fire —
+    the same rule _f2b_dead_jails() already applies one screen below."""
     _log = plog or (lambda m: None)
     if not _f2b_authentik_jail_enabled():
-        return False
-    ak_dir = os.path.expanduser('~/authentik')
-    env_path = os.path.join(ak_dir, '.env')
-    if not os.path.exists(env_path):
+        return False                      # no jail: nothing to arm, and not a fault
+    ak_dir, env_path, _compose = _find_authentik_install_dir()
+    if not ak_dir:
+        _log('fail2ban: cannot locate the Authentik install dir (tried the running '
+             'container label, ~/authentik, /opt/authentik) — the Authentik jail is '
+             'enabled but its log level cannot be verified. If Authentik IS installed '
+             'here, this jail is protecting nothing.')
         return False
     try:
-        with open(env_path) as f:
-            content = f.read()
-    except OSError:
+        content = _read_priv(env_path)
+    except Exception as e:
+        _log(f'fail2ban: cannot read {env_path} ({e}) — the Authentik jail is enabled '
+             'but its log level cannot be verified, so it may be protecting nothing.')
         return False
     m = re.search(r'^AUTHENTIK_LOG_LEVEL\s*=\s*(\S*)\s*$', content, re.M)
-    if not m or m.group(1).strip().lower() != 'warning':
-        return False                      # absent, already info, or operator's own choice
+    if not m:
+        # Absent = upstream default = info = the jail can fire. Nothing to do.
+        return False
+    cur = m.group(1).strip().lower()
+    if cur != 'warning':
+        if cur not in ('info', 'debug', 'trace'):
+            # An operator-chosen level ABOVE info. Deliberate, so it is preserved --
+            # but invalid_login is a logger.info() call, so the jail cannot fire and
+            # the operator has to be told rather than left with a decorative control.
+            _log(f'fail2ban: AUTHENTIK_LOG_LEVEL={cur} in {env_path} — kept (operator '
+                 'choice, not our old default), but the Authentik jail matches '
+                 'logger.info("invalid_login") and therefore CANNOT FIRE at this level. '
+                 'Set it to info to arm the jail, or disable the jail so the console '
+                 'stops reporting protection that is not there.')
+        return False
     new = re.sub(r'^AUTHENTIK_LOG_LEVEL\s*=.*$', 'AUTHENTIK_LOG_LEVEL=info', content, count=1, flags=re.M)
     try:
         _write_priv(env_path, new)
@@ -28929,6 +29082,10 @@ def mediamtx_uninstall():
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         steps.append('Stopped and disabled mediamtx and mediamtx-webeditor services')
         steps.append('Removed binary, config, and web editor files')
+    # The RTSP jail watches mediamtx.service on THIS box, so it is stale in both
+    # target modes once MediaMTX is gone. Left behind it can never match again.
+    _f2b_remove_jail('infratak-mediamtx-rtsp.conf', 'MediaMTX was uninstalled',
+                     plog=lambda m: steps.append(m.strip()))
     mediamtx_deploy_log.clear()
     mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
     generate_caddyfile(settings)
@@ -42882,37 +43039,59 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
 
-def _find_authentik_install_dir():
-    """Return (ak_dir, env_path, compose_path) if found, else (None, None, None). Tries ~/authentik, /opt/authentik, then docker compose project dir."""
-    for candidate in [os.path.expanduser('~/authentik'), '/opt/authentik']:
-        if not candidate:
-            continue
-        env_path = os.path.join(candidate, '.env')
-        compose_path = os.path.join(candidate, 'docker-compose.yml')
-        if os.path.exists(env_path) and os.path.exists(compose_path):
-            return (candidate, env_path, compose_path)
+def _ak_live_compose_dir():
+    """The directory the RUNNING Authentik actually runs from, per its own compose
+    label. Ground truth, or None if Authentik is not running."""
     try:
         r = subprocess.run(
             _sudo_wrap(['docker', 'ps', '-q', '-f', 'name=authentik-server']),
             capture_output=True, text=True, timeout=5
         )
         if not (r.returncode == 0 and r.stdout and r.stdout.strip()):
-            return (None, None, None)
+            return None
         cid = r.stdout.strip().split('\n')[0].strip()
         if not cid:
-            return (None, None, None)
+            return None
         r2 = subprocess.run(
             _sudo_wrap(['docker', 'inspect', cid, '--format', '{{index .Config.Labels "com.docker.compose.project.working_dir"}}']),
             capture_output=True, text=True, timeout=5
         )
         if r2.returncode == 0 and r2.stdout and r2.stdout.strip():
-            candidate = r2.stdout.strip()
-            env_path = os.path.join(candidate, '.env')
-            compose_path = os.path.join(candidate, 'docker-compose.yml')
-            if os.path.exists(env_path) and os.path.exists(compose_path):
-                return (candidate, env_path, compose_path)
+            return r2.stdout.strip()
     except Exception:
         pass
+    return None
+
+
+def _find_authentik_install_dir():
+    """Return (ak_dir, env_path, compose_path) if found, else (None, None, None).
+
+    v10.1.38 — order reversed, and existence tested privileged. Previously this asked
+    `~/authentik` first and only consulted the running container if the guess missed,
+    using bare `os.path.exists()` for both. That is wrong twice on a box installed in
+    the root era and later flipped to a non-root console:
+
+      - the guess can WIN while pointing at the wrong tree. test12 carries a stale
+        /root/authentik byte-identical to the live /home/takwerx/authentik; whichever
+        one `~` names is taken as fact, so a write can land in a directory nothing
+        runs from and report success.
+      - the guess can MISS a live install. /root is mode 700, so as `takwerx`
+        `os.path.exists('/root/authentik/.env')` is False — indistinguishable from
+        "not installed" — and the whole function answers (None, None, None) on a box
+        with Authentik plainly running.
+
+    A running container's own compose label cannot be either of those, so it is asked
+    first. Same rule CLAUDE.md already mandates for Node-RED's settings.js: derive the
+    path from what the container reports, not from $HOME. Candidates remain the
+    fallback for an Authentik that is installed but stopped."""
+    candidates = [_ak_live_compose_dir(), os.path.expanduser('~/authentik'), '/opt/authentik']
+    for candidate in candidates:
+        if not candidate:
+            continue
+        env_path = os.path.join(candidate, '.env')
+        compose_path = os.path.join(candidate, 'docker-compose.yml')
+        if _exists_priv(env_path) and _exists_priv(compose_path):
+            return (candidate, env_path, compose_path)
     return (None, None, None)
 
 

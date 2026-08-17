@@ -71,6 +71,16 @@
 ⚠ fail2ban daemon is not running — jails are inactive. Toggle any jail ON to auto-restart it, or run <code>systemctl enable --now fail2ban</code> on the server.
 </div>
 
+<!-- v10.1.38: the API has returned `dead_jails` since v10.1.11 and NO page ever
+     rendered it, so a jail that is enabled, loaded and completely unable to fire
+     read as protection in this console for 27 releases. A control the operator
+     cannot see is not a control. -->
+<div id="dead-jails-warn" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.35);border-radius:10px;padding:14px 18px;margin-bottom:20px;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--red)">
+  <div style="font-weight:600;margin-bottom:8px">&#9888; Enabled, but protecting nothing</div>
+  <div id="dead-jails-list" style="line-height:1.7"></div>
+  <div style="margin-top:10px;opacity:.85">These jails are switched on, and this console has been counting them as coverage. They cannot ban anyone until the cause above is fixed.</div>
+</div>
+
 {% if not installed %}
 <div class="not-installed-banner">
 <img src="https://avatars.githubusercontent.com/u/1087378?s=128&v=4" alt="Fail2ban" style="height:56px;width:auto;border-radius:8px;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto">
@@ -701,6 +711,28 @@ function loadStatus(cb) {
     // Warn if the fail2ban daemon itself is not running
     var daemonWarn = document.getElementById('daemon-warn');
     if (daemonWarn) daemonWarn.style.display = (d.daemon_running === false) ? '' : 'none';
+
+    // Jails that are enabled and loaded but cannot fire. Rendered here because the
+    // stat tiles above show 0 banned / 0 failed for a dead jail and a healthy quiet
+    // one identically — the operator cannot tell those apart without this.
+    var deadWarn = document.getElementById('dead-jails-warn');
+    var deadList = document.getElementById('dead-jails-list');
+    if (deadWarn && deadList) {
+      var dead = d.dead_jails || [];
+      deadList.textContent = '';
+      dead.forEach(function(j){
+        // textContent throughout: a jail's reason can carry a logpath read straight
+        // out of a config file on disk, so it is never interpolated as markup.
+        var row = document.createElement('div');
+        var name = document.createElement('strong');
+        name.textContent = j.jail || '?';
+        row.appendChild(document.createTextNode('• '));
+        row.appendChild(name);
+        row.appendChild(document.createTextNode(' — ' + (j.reason || '')));
+        deadList.appendChild(row);
+      });
+      deadWarn.style.display = dead.length ? '' : 'none';
+    }
 
     document.getElementById('stat-banned').textContent = d.currently_banned || 0;
     document.getElementById('stat-failed').textContent = d.currently_failed || 0;
