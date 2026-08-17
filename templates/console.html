@@ -752,9 +752,14 @@ function renderOsUpdates(d){
     var parts=[];
     if(restarts.length){
         var svc=restarts.map(function(m){return m.service;}).filter(function(v,i,a){return a.indexOf(v)===i;});
-        parts.push('<b style="color:var(--yellow)">'+restarts.length+'</b> of them will briefly restart '+escapeHtml(svc.join(', '))+'.');
+        // "1 of them" reads wrong when there is only one update in total.
+        var lead=(d.total===1)?'It will briefly restart '
+                :(restarts.length===d.total?'All <b style="color:var(--yellow)">'+restarts.length+'</b> will briefly restart '
+                :'<b style="color:var(--yellow)">'+restarts.length+'</b> of them will briefly restart ');
+        parts.push(lead+escapeHtml(svc.join(', '))+'.');
     } else {
-        parts.push('None of them restart TAK services &mdash; these are routine operating system patches.');
+        parts.push((d.total===1?'It does not restart any TAK service':'None of them restart TAK services')+
+                   ' &mdash; '+(d.total===1?'this is a routine operating system patch.':'these are routine operating system patches.'));
     }
     if(d.reboot_required)parts.push('A reboot is needed afterwards to finish.');
     parts.push('Clients reconnect on their own, but pick a quiet moment if you are mid-operation.');
