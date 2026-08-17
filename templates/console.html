@@ -692,6 +692,18 @@ function _kpatchShowState(state){
         var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
     });
 }
+// Dismissal state is stored as JSON, not a delimiter-joined string: the old
+// 'sig@@ts' form mis-parsed whenever the signature was empty (e.g. a missing
+// done_at produced 'done@' + '@@' + ts -> split gave the wrong halves and the
+// dismissal could NEVER match again, so the panel returned forever).
+function _kpatchReadDismiss(){
+    try{ var v=JSON.parse(localStorage.getItem('kernel-patch-dismissed')||'null');
+         return (v&&typeof v==='object'&&v.sig!==undefined)?v:null; }catch(e){ return null; }
+}
+function _kpatchDismissMatches(sig){
+    var d=_kpatchReadDismiss();
+    return !!(d && d.sig===sig && d.ts>0 && (Date.now()-d.ts)<24*60*60*1000);
+}
 function _kpatchBannerTone(tone){
     // A yellow warning panel that says "nothing restarts" trains people to
     // ignore the panel. Severity has to match the content: routine-only reads
@@ -840,10 +852,7 @@ async function checkKernelPatch(){
             // console restart does not. Previously the done branch never consulted
             // the dismissal at all and reappeared on every restart.
             var dsig='done@'+(jd.done_at||'');
-            if(dismissed){
-                var dp=String(dismissed).split('@@'), psig=dp[0], pts=parseInt(dp[1]||'0',10);
-                if(psig===dsig&&pts>0&&((Date.now()-pts)<24*60*60*1000)){banner.style.display='none';return;}
-            }
+            if(_kpatchDismissMatches(dsig)){banner.style.display='none';return;}
             banner.setAttribute('data-osupd-sig',dsig);
             banner.style.display='block';
             _kpatchShowState('done');
@@ -891,13 +900,8 @@ async function checkKernelPatch(){
         // pending update could sit invisible for weeks on the one screen that
         // surfaces it. A day is long enough to stop nagging, short enough that
         // the box cannot go quiet indefinitely.
-        var DISMISS_TTL=24*60*60*1000, keep=false;
-        if(dismissed){
-            var parts=String(dismissed).split('@@'), dsig=parts[0], dts=parseInt(parts[1]||'0',10);
-            keep=(dsig===sig)&&dts>0&&((Date.now()-dts)<DISMISS_TTL);
-        }
-        if(keep){banner.style.display='none';return;}
-        if(dismissed)localStorage.removeItem('kernel-patch-dismissed');
+        if(_kpatchDismissMatches(sig)){banner.style.display='none';return;}
+        if(_kpatchReadDismiss())localStorage.removeItem('kernel-patch-dismissed');
         banner.setAttribute('data-osupd-sig',sig);
         banner.style.display='block';_kpatchShowState('idle');
     }catch(e){}
@@ -906,7 +910,8 @@ function dismissKernelBanner(){
     var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
     // Store WHICH update set was dismissed so a newly-arrived update re-surfaces
     // the panel instead of staying hidden forever.
-    localStorage.setItem('kernel-patch-dismissed',((b&&b.getAttribute('data-osupd-sig'))||'1')+'@@'+Date.now());
+    try{localStorage.setItem('kernel-patch-dismissed',
+        JSON.stringify({sig:(b&&b.getAttribute('data-osupd-sig'))||'1',ts:Date.now()}));}catch(e){}
     // Don't kill the polling timer if a job is running in the background —
     // we just hide the UI. The job continues to run regardless.
 }

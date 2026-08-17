@@ -64599,39 +64599,34 @@ def _kernel_patch_job_state():
     # within seconds of completion — even while the box is still up — so the old
     # "load != loaded => done=False" gate left the UI stuck on "in progress" with
     # the DONE log showing. Read the job's own log markers + the reboot flag instead.
+    # v10.1.37: the job's own log markers are the shared source of truth for BOTH
+    # return paths below. They used to be computed only inside the
+    # `load != 'loaded'` branch, so when systemd still had the unit loaded the
+    # other path fell back to `result == 'success' and reboot_required` and
+    # carried both original defects: a patch staging no kernel never reported
+    # done (panel span forever), and it returned no done_at (so a dismissal could
+    # never be keyed to the run, and the finished panel came back after every
+    # restart). Compute once, use in both.
+    last_done = log_tail.rfind('=== DONE')
+    last_fatal = log_tail.rfind('FATAL:')
+    completed_ok = last_done != -1 and last_done > last_fatal
+    log_failed = last_fatal != -1 and last_fatal > last_done
+    done_at = ''
+    done_fresh = completed_ok
+    if completed_ok:
+        _m = None
+        for _m in re.finditer(r'\[(\d{4}-\d{2}-\d{2}T[\d:]{8})Z\]\s*=== DONE', log_tail):
+            pass                      # keep the LAST match
+        if _m:
+            done_at = _m.group(1)
+            try:
+                from datetime import timezone as _tz
+                _dt = datetime.strptime(_m.group(1), '%Y-%m-%dT%H:%M:%S').replace(tzinfo=_tz.utc)
+                done_fresh = _dt.timestamp() >= psutil.boot_time()
+            except Exception:
+                done_fresh = completed_ok      # unparseable stamp: fail toward showing it
+
     if load != 'loaded':
-        last_done = log_tail.rfind('=== DONE')
-        last_fatal = log_tail.rfind('FATAL:')
-        completed_ok = last_done != -1 and last_done > last_fatal
-        # v10.1.37: `done` also required reboot_required, so a successful run that
-        # staged no new kernel reported running=False, done=False, error=False —
-        # and the panel polled forever on "Installing...", never offering the
-        # finish button. Field: aws-arm 2026-08-17, a docker/containerd-only
-        # update whose own log says "Running kernel seems to be up-to-date".
-        # Latent since v0.9.44 and invisible only because the banner used to
-        # appear ONLY when a kernel update was pending, which made
-        # reboot_required true by construction; surfacing the panel for ANY
-        # pending update exposed it.
-        #
-        # Completion and reboot-need are separate facts: a job that logged DONE
-        # is done, whether or not anything needs rebooting. What actually guards
-        # the v0.9.32 post-reboot loop is not the reboot flag but WHEN the job
-        # finished — a DONE marker older than this boot describes a previous life
-        # of the box and must not be reported as a fresh completion.
-        done_fresh = completed_ok
-        done_at = ''
-        if completed_ok:
-            _m = None
-            for _m in re.finditer(r'\[(\d{4}-\d{2}-\d{2}T[\d:]{8})Z\]\s*=== DONE', log_tail):
-                pass                      # keep the LAST match
-            if _m:
-                done_at = _m.group(1)
-                try:
-                    from datetime import timezone as _tz
-                    _dt = datetime.strptime(_m.group(1), '%Y-%m-%dT%H:%M:%S').replace(tzinfo=_tz.utc)
-                    done_fresh = _dt.timestamp() >= psutil.boot_time()
-                except Exception:
-                    done_fresh = completed_ok      # unparseable stamp: fail toward showing it
         return {
             'running': False,
             'pid': None,
@@ -64655,8 +64650,11 @@ def _kernel_patch_job_state():
     # Done only if it finished successfully AND a reboot is actually pending —
     # the "done" banner's whole job is to say "reboot to boot the new kernel",
     # so if reboot-required is gone (already rebooted) there's nothing to assert.
-    done = (not running) and (result == 'success') and reboot_required
-    err = (not running) and (active == 'failed' or (result not in ('', 'success')))
+    # Same rule as the branch above: DONE means the job logged DONE this boot,
+    # independent of whether anything needs rebooting.
+    done = (not running) and completed_ok and done_fresh
+    err = (not running) and (active == 'failed' or log_failed
+                            or (result not in ('', 'success')))
 
     # If the job clearly completed (success or failure), bust the kernel
     # patch status cache so the post-reboot banner check picks up reality.
@@ -64666,6 +64664,7 @@ def _kernel_patch_job_state():
         'running': running,
         'pid': (pid or None) if running else None,
         'done': done,
+        'done_at': done_at,
         'error': err,
         'reboot_required': reboot_required,
         'log_tail': log_tail,
