@@ -203,6 +203,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">{{ host.get('mechanism','unattended-upgrades') }}{% if host.get('installed', True) == False %} — not installed{% endif %}</div>
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
+{# v10.1.37: no toggle when the mechanism is not installed. On Rocky the switch
+   posted to /api/unattended-upgrades, which manages a unit that does not exist
+   on that family — a control that cannot do anything is worse than no control. #}
+{% if host.get('installed', True) == False %}
+<span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">Nothing updates this host automatically</span>
+{% else %}
 <label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
 <input type="checkbox" class="uu-toggle" data-target="{{ host.id }}" {% if host.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
 <span class="uu-slider" data-target="{{ host.id }}" style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if host.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s"></span>
@@ -210,6 +216,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </label>
 <span class="uu-spinner" data-target="{{ host.id }}" style="display:none"></span>
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
+{% endif %}
 </div>
 <button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
 <div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
@@ -739,9 +746,22 @@ function renderOsUpdates(d){
         (p.third_party_allowed?' <span style="color:var(--yellow)">Review this.</span>':'');
     // Details: every pending package, versions, and what it restarts.
     var body='';
+    // Collapse packages that move together to the same version (a RHEL kernel
+    // bump is 6 rows saying the identical thing — field: nuc, 2026-08-17).
+    var dseen={},drows=[];
     managed.forEach(function(m){
+        var k=m.service+'|'+m.impact_class+'|'+m.new;
+        if(dseen[k]){dseen[k].names.push(m.name);return;}
+        dseen[k]={m:m,names:[m.name]};drows.push(dseen[k]);
+    });
+    drows.forEach(function(g){
+        var m=g.m;
         var col=m.impact_class==='alert'?'var(--red)':(m.major?'var(--red)':(m.impact_class==='restart'?'var(--yellow)':'var(--text-dim)'));
-        body+='<div style="color:'+col+'">'+escapeHtml(m.name)+'  '+escapeHtml(m.old||'(new)')+' &rarr; '+escapeHtml(m.new)+'  &mdash; '+escapeHtml(m.impact)+'</div>';
+        var label=escapeHtml(g.names[0])+(g.names.length>1?' <span style="color:var(--text-dim)">+'+(g.names.length-1)+' related</span>':'');
+        // dnf gives no installed version for a not-yet-installed package; only
+        // render the arrow when we actually know both sides.
+        var ver=m.old?(escapeHtml(m.old)+' &rarr; '+escapeHtml(m.new)):escapeHtml(m.new);
+        body+='<div style="color:'+col+'">'+label+'  '+ver+'  &mdash; '+escapeHtml(m.impact)+'</div>';
     });
     if(d.routine_count){
         body+='<div style="color:var(--text-dim);margin-top:4px">'+d.routine_count+' routine update'+(d.routine_count===1?'':'s')+

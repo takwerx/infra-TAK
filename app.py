@@ -3497,7 +3497,26 @@ def _pending_os_updates():
             # none, so a non-zero rc is NOT an error here.
             r = subprocess.run(['dnf', '-C', '-q', 'check-update'],
                                capture_output=True, text=True, timeout=60)
-            return _parse_dnf_check_update(r.stdout)
+            pend = _parse_dnf_check_update(r.stdout)
+            # check-update reports only the CANDIDATE version. Without the
+            # installed side, the panel rendered every row as "(new)" — a
+            # visible lie for packages that are plainly installed (field:
+            # `postgresql15-server (new)` on nuc, 2026-08-17). One rpm query
+            # fills it in; apt's simulation already gives us both sides.
+            if pend:
+                try:
+                    q = subprocess.run(['rpm', '-qa', '--qf', '%{NAME} %{EVR}\n'],
+                                       capture_output=True, text=True, timeout=30)
+                    inst = {}
+                    for ln in (q.stdout or '').splitlines():
+                        bits = ln.split(None, 1)
+                        if len(bits) == 2:
+                            inst[bits[0]] = bits[1]
+                    for p in pend:
+                        p['old'] = inst.get(p['name'], '')
+                except Exception:
+                    pass
+            return pend
         r = subprocess.run(['apt-get', '-s', '-o', 'Dpkg::Use-Pty=0', 'full-upgrade'],
                            capture_output=True, text=True, timeout=60)
         return _parse_apt_simulation(r.stdout)
