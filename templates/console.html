@@ -714,10 +714,21 @@ function renderOsUpdates(d){
     var pl=document.getElementById('osupd-plain');
     if(pl)pl.innerHTML=parts.join(' ');
     // Per-service impact lines — the "what does this actually cost me" answer.
-    var mh='';
+    // Collapse by SERVICE: docker-ce and containerd.io are both "Docker" and
+    // bounce the same containers, so listing them twice says nothing extra and
+    // reads like a rendering bug. Package-level detail stays in Show details.
+    var seen={},bullets=[];
     alerts.concat(restarts).forEach(function(m){
-        var col=m.impact_class==='alert'?'var(--red)':(m.major?'var(--red)':'var(--yellow)');
-        mh+='<div style="font-size:10px;margin-top:3px;color:'+col+'">&#9679; <b>'+escapeHtml(m.service)+'</b> &mdash; '+escapeHtml(m.impact)+'</div>';
+        var k=m.service+'|'+m.impact_class;
+        if(seen[k]){seen[k].n++;if(m.major){seen[k].major=true;seen[k].impact=m.impact;}return;}
+        seen[k]={m:m,n:1,major:!!m.major,impact:m.impact};bullets.push(seen[k]);
+    });
+    var mh='';
+    bullets.forEach(function(b){
+        var col=b.m.impact_class==='alert'?'var(--red)':(b.major?'var(--red)':'var(--yellow)');
+        mh+='<div style="font-size:10px;margin-top:3px;color:'+col+'">&#9679; <b>'+escapeHtml(b.m.service)+'</b>'+
+            (b.n>1?' <span style="color:var(--text-dim)">('+b.n+' packages)</span>':'')+
+            ' &mdash; '+escapeHtml(b.impact)+'</div>';
     });
     var me=document.getElementById('osupd-managed');
     if(me)me.innerHTML=mh;

@@ -3572,7 +3572,7 @@ def _auto_update_posture():
             except Exception:
                 pass
             post['third_party_allowed'] = True   # dnf-automatic has no origin allowlist
-            post['note'] = ('dnf-automatic installs updates automatically, and unlike Ubuntu it has no '
+            post['note'] = ('dnf-automatic is applying updates automatically, and unlike Ubuntu it has no '
                             'allowlist — it can update TAK components too.') if (post['enabled'] and applies) else \
                            ('dnf-automatic is installed but is not applying updates automatically.')
             return post
@@ -3593,10 +3593,10 @@ def _auto_update_posture():
         if origins:
             widened = [o for o in origins if not safe.match(o)]
             post['third_party_allowed'] = bool(widened)
-            post['note'] = ('Automatic updates are limited to Ubuntu security patches — they never touch '
-                            'TAK components.') if not widened else \
-                           ('Automatic updates have been widened beyond Ubuntu security patches (' +
-                            ', '.join(widened[:3]) + ') — they can now update TAK components too.')
+            post['note'] = ('limited to Ubuntu security patches — these never touch TAK '
+                            'components.') if not widened else \
+                           ('widened beyond Ubuntu security patches (' +
+                            ', '.join(widened[:3]) + ') — these can now update TAK components too.')
         return post
     except Exception as e:
         post['note'] = 'could not determine: ' + str(e)[:80]
