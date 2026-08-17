@@ -3504,6 +3504,7 @@ def _pending_os_updates():
     `apt-get update`. So the answer is exactly what the operator would see, and
     is only as fresh as the last list refresh (the UI says so).
     """
+    ok = True
     try:
         if _pkg_mgr() == 'dnf':
             # -C = cacheonly. Without it dnf may hit the network for metadata and
@@ -3534,8 +3535,14 @@ def _pending_os_updates():
         r = subprocess.run(['apt-get', '-s', '-o', 'Dpkg::Use-Pty=0', 'full-upgrade'],
                            capture_output=True, text=True, timeout=60)
         return _parse_apt_simulation(r.stdout)
-    except Exception:
-        return []
+    except Exception as _e:
+        # v10.1.37: this used to `return []`, which made "I could not check"
+        # indistinguishable from "nothing is pending" — the panel simply
+        # vanished. That is the same silent-failure shape as the `_ur` NameError
+        # that told operators they were current for five releases
+        # ([[apppy-ur-per-function-import-silent-nameerror]]). Raise so the
+        # caller can SAY it failed; the failure direction must be toward noise.
+        raise RuntimeError('could not read pending updates: ' + str(_e)[:120])
 
 
 def _is_major_jump(old, new):
@@ -3641,7 +3648,11 @@ def _os_updates_summary(force=False):
     now = time.time()
     if not force and _OS_UPDATES_CACHE['data'] is not None and (now - _OS_UPDATES_CACHE['ts']) < _OS_UPDATES_TTL:
         return _OS_UPDATES_CACHE['data']
-    pending = _pending_os_updates()
+    err = ''
+    try:
+        pending = _pending_os_updates()
+    except Exception as _pe:
+        pending, err = [], str(_pe)[:160]
     managed, routine = _classify_os_updates(pending)
     data = {
         'total': len(pending),
@@ -3654,6 +3665,7 @@ def _os_updates_summary(force=False):
         'posture': _auto_update_posture(),
         'checked_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'pkg_mgr': _pkg_mgr(),
+        'error': err,
     }
     _OS_UPDATES_CACHE['ts'], _OS_UPDATES_CACHE['data'] = now, data
     return data

@@ -692,6 +692,18 @@ function _kpatchShowState(state){
         var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
     });
 }
+function _kpatchBannerTone(tone){
+    // A yellow warning panel that says "nothing restarts" trains people to
+    // ignore the panel. Severity has to match the content: routine-only reads
+    // as information, anything that bounces a TAK service reads as a warning.
+    var b=document.getElementById('kernel-patch-banner');if(!b)return;
+    var T={warn:['rgba(234,179,8,0.1)','rgba(234,179,8,0.05)','rgba(234,179,8,0.3)'],
+           info:['rgba(59,130,246,0.10)','rgba(59,130,246,0.04)','rgba(59,130,246,0.28)'],
+           ok:['rgba(16,185,129,0.10)','rgba(16,185,129,0.04)','rgba(16,185,129,0.28)']}[tone]||null;
+    if(!T)return;
+    b.style.background='linear-gradient(135deg,'+T[0]+','+T[1]+')';
+    b.style.border='1px solid '+T[2];
+}
 function _kpatchRenderDone(d){
     // "Finished" and "needs a reboot" are different facts. A docker-only update
     // completes with nothing to reboot for, and telling the operator to reboot
@@ -702,6 +714,7 @@ function _kpatchRenderDone(d){
         rb=document.getElementById('kpatch-reboot-btn'),
         dz=document.getElementById('kpatch-done-dismiss');
     var needsReboot=!!(d&&d.reboot_required);
+    _kpatchBannerTone('ok');
     if(head)head.innerHTML='&#10003; Updates installed'+(needsReboot?' &mdash; reboot required to finish':'');
     if(body)body.textContent=pm+' finished cleanly.'+(needsReboot
         ?' A new kernel is staged but the running system is still on the old one. Reboot when ready.'
@@ -727,8 +740,15 @@ function renderOsUpdates(d){
     if(!d)return;
     _osUpdLast=d;
     var restarts=d.restarts||[],alerts=d.alerts||[],managed=d.managed||[];
+    var severe=(restarts.length>0||alerts.length>0);
+    _kpatchBannerTone(severe?'warn':'info');
     var hl=document.getElementById('osupd-headline');
-    if(hl)hl.textContent=d.total+(d.total===1?' operating system update available':' operating system updates available');
+    if(hl){
+        hl.textContent=d.total+(d.total===1?' operating system update available':' operating system updates available');
+        var hp=hl.parentNode;
+        if(hp){hp.style.color=severe?'var(--yellow)':'var(--cyan)';
+               hp.innerHTML=hp.innerHTML.replace(/^\s*&#9888;|^\s*\u26a0/,severe?'\u26a0':'\u2139');}
+    }
     var parts=[];
     if(restarts.length){
         var svc=restarts.map(function(m){return m.service;}).filter(function(v,i,a){return a.indexOf(v)===i;});
@@ -829,6 +849,16 @@ async function checkKernelPatch(){
     try{
         var ur=await fetch('/api/os-updates',{credentials:'same-origin',cache:'no-store'});
         var ud=await ur.json();
+        if(ud&&ud.error){
+            // "Could not check" is NOT "nothing pending" — say so rather than
+            // rendering an empty, reassuring screen.
+            renderOsUpdates(ud);
+            var pl=document.getElementById('osupd-plain');
+            if(pl)pl.innerHTML='<span style="color:var(--yellow)">Could not read pending updates: '+escapeHtml(ud.error)+'</span>';
+            var hl2=document.getElementById('osupd-headline');
+            if(hl2)hl2.textContent='Update check failed';
+            banner.style.display='block';_kpatchShowState('idle');return;
+        }
         if(!ud||!ud.total){banner.style.display='none';localStorage.removeItem('kernel-patch-dismissed');return;}
         renderOsUpdates(ud);
         try{
@@ -841,7 +871,17 @@ async function checkKernelPatch(){
         // is dismissed once must still speak up when a new update lands (the old
         // behaviour hid the banner until the box was fully patched).
         var sig=ud.total+':'+(ud.managed||[]).map(function(m){return m.name+m.new;}).join(',');
-        if(dismissed===sig){banner.style.display='none';return;}
+        // Dismissal is scoped to WHAT is pending AND expires. Without the expiry a
+        // dismissed set stayed hidden until the set itself changed, so a single
+        // pending update could sit invisible for weeks on the one screen that
+        // surfaces it. A day is long enough to stop nagging, short enough that
+        // the box cannot go quiet indefinitely.
+        var DISMISS_TTL=24*60*60*1000, keep=false;
+        if(dismissed){
+            var parts=String(dismissed).split('@'), dsig=parts[0], dts=parseInt(parts[1]||'0',10);
+            keep=(dsig===sig)&&dts>0&&((Date.now()-dts)<DISMISS_TTL);
+        }
+        if(keep){banner.style.display='none';return;}
         if(dismissed)localStorage.removeItem('kernel-patch-dismissed');
         banner.setAttribute('data-osupd-sig',sig);
         banner.style.display='block';_kpatchShowState('idle');
@@ -851,7 +891,7 @@ function dismissKernelBanner(){
     var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
     // Store WHICH update set was dismissed so a newly-arrived update re-surfaces
     // the panel instead of staying hidden forever.
-    localStorage.setItem('kernel-patch-dismissed',(b&&b.getAttribute('data-osupd-sig'))||'1');
+    localStorage.setItem('kernel-patch-dismissed',((b&&b.getAttribute('data-osupd-sig'))||'1')+'@'+Date.now());
     // Don't kill the polling timer if a job is running in the background —
     // we just hide the UI. The job continues to run regardless.
 }
