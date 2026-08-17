@@ -717,6 +717,16 @@ function _kpatchBannerTone(tone){
     b.style.border='1px solid '+T[2];
 }
 function _kpatchRenderDone(d){
+    // v10.1.37: the signature is set HERE, not at the call sites. Two paths render
+    // this panel -- page load (checkKernelPatch) and the poll that fires the moment
+    // an install finishes -- and only the first one used to set it. So after an
+    // install the poll rendered a done panel with no signature, Close stored '1',
+    // and every later load computed 'done@<stamp>' which could never equal '1':
+    // the panel came back forever on exactly the boxes an install had been run on.
+    // Third time this release that fixing one call site instead of the shared
+    // function left half the behaviour broken.
+    var _b=document.getElementById('kernel-patch-banner');
+    if(_b)_b.setAttribute('data-osupd-sig','done@'+((d&&d.done_at)||''));
     // "Finished" and "needs a reboot" are different facts. A docker-only update
     // completes with nothing to reboot for, and telling the operator to reboot
     // anyway (or hiding the finish behind a reboot they don't need) is wrong.
@@ -910,8 +920,14 @@ function dismissKernelBanner(){
     var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
     // Store WHICH update set was dismissed so a newly-arrived update re-surfaces
     // the panel instead of staying hidden forever.
-    try{localStorage.setItem('kernel-patch-dismissed',
-        JSON.stringify({sig:(b&&b.getAttribute('data-osupd-sig'))||'1',ts:Date.now()}));}catch(e){}
+    var _sig=(b&&b.getAttribute('data-osupd-sig'))||'';
+    // Storing a placeholder ('1') was the poison: it can never match a real
+    // signature, so the panel returned on every load with no way to stop it.
+    // If we genuinely have no signature, record nothing and let it re-show.
+    try{
+        if(_sig)localStorage.setItem('kernel-patch-dismissed',JSON.stringify({sig:_sig,ts:Date.now()}));
+        else localStorage.removeItem('kernel-patch-dismissed');
+    }catch(e){}
     // Don't kill the polling timer if a job is running in the background —
     // we just hide the UI. The job continues to run regardless.
 }
@@ -969,8 +985,15 @@ async function _kpatchPollOnce(){
         }
         if(d.done){
             clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
-            _kpatchShowState('done');
             _kpatchRenderDone(d);
+            // Honour a dismissal already recorded for THIS run (same rule as page
+            // load) rather than re-showing a panel the operator just closed.
+            if(_kpatchDismissMatches('done@'+((d&&d.done_at)||''))){
+                var bb=document.getElementById('kernel-patch-banner');
+                if(bb)bb.style.display='none';
+                return;
+            }
+            _kpatchShowState('done');
             return;
         }
         // Terminating branch: the job is not running and reported neither done
