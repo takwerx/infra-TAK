@@ -3600,6 +3600,10 @@ def _classify_os_updates(pending):
     return managed, routine
 
 
+_AUTO_POSTURE_CACHE = {'ts': 0.0, 'data': None}
+_AUTO_POSTURE_TTL = 300
+
+
 def _auto_update_posture():
     """What (if anything) installs updates on this box without being asked.
 
@@ -3609,6 +3613,16 @@ def _auto_update_posture():
     than parsing 50unattended-upgrades, so include/override files are accounted
     for the way apt actually sees them.
     """
+    # v10.1.37 REGRESSION FIX: this is reached from _build_uu_hosts(), which
+    # /api/metrics calls — and the dashboard polls /api/metrics every 5 SECONDS.
+    # Uncached, every open console tab was spawning two subprocesses every five
+    # seconds, one of them a systemctl call routed through the broker. That is a
+    # page-load and CPU tax on every box with the console open, and it is
+    # entirely avoidable: this answer changes when an operator flips a unit on or
+    # off, not second to second.
+    _now = time.time()
+    if _AUTO_POSTURE_CACHE['data'] is not None and (_now - _AUTO_POSTURE_CACHE['ts']) < _AUTO_POSTURE_TTL:
+        return _AUTO_POSTURE_CACHE['data']
     post = {'mechanism': None, 'installed': False, 'enabled': False,
             'third_party_allowed': None, 'origins': [], 'note': ''}
     try:
@@ -3618,6 +3632,7 @@ def _auto_update_posture():
             post['installed'] = (r.returncode == 0)
             if not post['installed']:
                 post['note'] = 'dnf-automatic is not installed — nothing updates this box on its own.'
+                _AUTO_POSTURE_CACHE['ts'], _AUTO_POSTURE_CACHE['data'] = _now, post
                 return post
             for unit in ('dnf-automatic-install.timer', 'dnf-automatic.timer'):
                 r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', unit]),
@@ -3636,6 +3651,7 @@ def _auto_update_posture():
             post['note'] = ('dnf-automatic is applying updates automatically, and unlike Ubuntu it has no '
                             'allowlist — it can update TAK components too.') if (post['enabled'] and applies) else \
                            ('dnf-automatic is installed but is not applying updates automatically.')
+            _AUTO_POSTURE_CACHE['ts'], _AUTO_POSTURE_CACHE['data'] = _now, post
             return post
 
         post['mechanism'] = 'unattended-upgrades'
@@ -3658,9 +3674,11 @@ def _auto_update_posture():
                             'components.') if not widened else \
                            ('widened beyond Ubuntu security patches (' +
                             ', '.join(widened[:3]) + ') — these can now update TAK components too.')
+        _AUTO_POSTURE_CACHE['ts'], _AUTO_POSTURE_CACHE['data'] = _now, post
         return post
     except Exception as e:
         post['note'] = 'could not determine: ' + str(e)[:80]
+        _AUTO_POSTURE_CACHE['ts'], _AUTO_POSTURE_CACHE['data'] = _now, post
         return post
 
 
