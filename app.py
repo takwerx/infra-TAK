@@ -5042,13 +5042,20 @@ def _ak_force_enroll_posture(ak_url, ak_headers):
 
 
 def _ak_backup_codes_posture(ak_url, ak_headers):
-    """(available, detail) — can users self-add backup codes from their own settings page?
+    """(configured, detail) — is a backup-codes stage present, with a configure flow attached?
 
-    Stock authentik ships `default-authenticator-static-setup` with a configure_flow, which is
-    what makes the "Add" button appear under MFA Devices. We only report on it: adding the
-    static stage to W1's configuration_stages would let a user enroll printable codes INSTEAD
-    of an authenticator (authentik shows a chooser when that list has more than one entry),
-    which is a downgrade dressed as a convenience. Check and report; never create.
+    NOT the same as "users can add backup codes themselves", and do not relabel it as such.
+    An earlier version of this docstring and the panel copy claimed the configure_flow made an
+    "Add" button appear on the user's own Authentik settings page. Operators who run this daily
+    report otherwise: MFA is offered ONLY when the box is Hardened (W1) — on a Standard box no
+    user is prompted and no self-service enrolment surfaces. The configure_flow is necessary but
+    evidently not sufficient, and the difference was never proven in a live UI.
+
+    So this reports stage configuration only. Anything stronger needs on-box UI evidence first.
+
+    Separately, and still true: adding the static stage to W1's configuration_stages would let a
+    user enroll printable codes INSTEAD of an authenticator (authentik shows a chooser when that
+    list has more than one entry), which is a downgrade dressed as a convenience. Report; never create.
     """
     try:
         rows = _w1_ak_get(ak_url, 'stages/authenticator/static/?page_size=20', ak_headers).get('results', [])

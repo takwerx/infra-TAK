@@ -539,8 +539,14 @@ function renderMfaPosture(p){
         bits.push('<div style="color:var(--amber,#f59e0b);line-height:1.6">⚠ Re-enrollment is OFF — ' + escapeHtml(p.force_enroll_detail || '') +
                   '.<br>Revoking devices here will leave the user signing in with a password only. Apply Cyber Controls W1 to turn this on.</div>');
     }
-    bits.push('<div style="color:var(--text-dim);margin-top:4px">' + (p.backup_codes ? '✓' : '·') + ' Backup codes: ' +
-              escapeHtml(p.backup_codes ? ('available (' + (p.backup_codes_detail || '') + ') — users can add a set from their own Authentik settings page → MFA Devices → Add, so a lost phone need not mean a support call' ) : (p.backup_codes_detail || 'unavailable')) + '</div>');
+    // v10.1.36: this line used to tell operators that users could add backup codes themselves
+    // from their Authentik settings page. That was inferred from the setup stage carrying a
+    // configure_flow, and it is WRONG in practice — operators report MFA is only ever offered
+    // when the box is Hardened; on a Standard box no user is prompted and no self-service
+    // enrolment appears. Do not restore that claim without proving it in the UI on a live box.
+    // Report only what is actually verifiable: whether the stage exists at all.
+    bits.push('<div style="color:var(--text-dim);margin-top:4px">' + (p.backup_codes ? '✓' : '·') +
+              ' Backup codes stage: ' + escapeHtml(p.backup_codes ? ('configured (' + (p.backup_codes_detail || '') + ')') : (p.backup_codes_detail || 'not configured')) + '</div>');
     el.innerHTML = bits.join('');
 }
 
