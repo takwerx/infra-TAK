@@ -64435,10 +64435,29 @@ def _kernel_patch_start_job():
         '[ -n "$HELD" ] && echo "[$(TS)] TAK packages held for this patch (operator-driven upgrade only):$HELD"\n'
         'release_holds() { for p in $HELD; do apt-mark unhold "$p" >/dev/null 2>&1; done; [ -n "$HELD" ] && echo "[$(TS)] released TAK holds:$HELD"; }\n'
         'trap release_holds EXIT\n'
+        # v10.1.37: wait for unattended-upgrades / apt-daily / dpkg to let go.
+        # Field 2026-08-17 (test6): this job raced unattended-upgrades and died on
+        # "E: Unable to lock directory /var/lib/apt/lists/" -> exit 100, nothing
+        # installed, and the operator got a red FAILED panel for a transient lock.
+        # Mirrors start.sh's wait_for_upgrades(); the shutdown waiter is excluded
+        # because it stays running forever on Ubuntu and would block us for good.
+        'WAITED=0\n'
+        'while [ "$WAITED" -lt 1800 ]; do\n'
+        '  BUSY=0\n'
+        '  pgrep -f apt.systemd.daily >/dev/null 2>&1 && BUSY=1\n'
+        '  pgrep -x apt-get >/dev/null 2>&1 && BUSY=1\n'
+        '  pgrep -x apt >/dev/null 2>&1 && BUSY=1\n'
+        '  pgrep -x dpkg >/dev/null 2>&1 && BUSY=1\n'
+        '  pgrep -af unattended-upgrade 2>/dev/null | grep -qv unattended-upgrade-shutdown && BUSY=1\n'
+        '  [ "$BUSY" -eq 0 ] && break\n'
+        '  [ $((WAITED % 60)) -eq 0 ] && echo "[$(TS)] waiting for another apt/dpkg process to finish (${WAITED}s)"\n'
+        '  sleep 5; WAITED=$((WAITED+5))\n'
+        'done\n'
+        'if [ "$WAITED" -ge 1800 ]; then echo "[$(TS)] FATAL: apt/dpkg still busy after 30 min"; exit 1; fi\n'
         'echo "[$(TS)] apt-get update"\n'
-        'apt-get update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
+        'apt-get -o DPkg::Lock::Timeout=300 update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] apt-get full-upgrade -y (TAK Server packages held)"\n'
-        'apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
+        'apt-get -y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
         '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
     )
@@ -64468,6 +64487,12 @@ def _kernel_patch_start_job():
             'set -o pipefail\n'
             'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
             'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) [dnf/EL9] ==="\n'
+            'WAITED=0\n'
+            'while [ "$WAITED" -lt 1800 ]; do\n'
+            '  pgrep -x dnf >/dev/null 2>&1 || pgrep -x yum >/dev/null 2>&1 || break\n'
+            '  [ $((WAITED % 60)) -eq 0 ] && echo "[$(TS)] waiting for another dnf/yum process to finish (${WAITED}s)"\n'
+            '  sleep 5; WAITED=$((WAITED+5))\n'
+            'done\n'
             'echo "[$(TS)] dnf -y upgrade (TAK Server packages excluded)"\n'
             "dnf -y upgrade --exclude='takserver*' 2>&1 \\\n"
             '  || { rc=$?; echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc)"; exit $rc; }\n'
