@@ -830,6 +830,16 @@ async function checkKernelPatch(){
             return;
         }
         if(jd && jd.done){
+            // A finished run is dismissible and STAYS dismissed. Keyed to that
+            // run's own completion stamp, so the next patch re-surfaces it but a
+            // console restart does not. Previously the done branch never consulted
+            // the dismissal at all and reappeared on every restart.
+            var dsig='done@'+(jd.done_at||'');
+            if(dismissed){
+                var dp=String(dismissed).split('@@'), psig=dp[0], pts=parseInt(dp[1]||'0',10);
+                if(psig===dsig&&pts>0&&((Date.now()-pts)<24*60*60*1000)){banner.style.display='none';return;}
+            }
+            banner.setAttribute('data-osupd-sig',dsig);
             banner.style.display='block';
             _kpatchShowState('done');
             _kpatchRenderDone(jd);
@@ -878,7 +888,7 @@ async function checkKernelPatch(){
         // the box cannot go quiet indefinitely.
         var DISMISS_TTL=24*60*60*1000, keep=false;
         if(dismissed){
-            var parts=String(dismissed).split('@'), dsig=parts[0], dts=parseInt(parts[1]||'0',10);
+            var parts=String(dismissed).split('@@'), dsig=parts[0], dts=parseInt(parts[1]||'0',10);
             keep=(dsig===sig)&&dts>0&&((Date.now()-dts)<DISMISS_TTL);
         }
         if(keep){banner.style.display='none';return;}
@@ -891,7 +901,7 @@ function dismissKernelBanner(){
     var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
     // Store WHICH update set was dismissed so a newly-arrived update re-surfaces
     // the panel instead of staying hidden forever.
-    localStorage.setItem('kernel-patch-dismissed',((b&&b.getAttribute('data-osupd-sig'))||'1')+'@'+Date.now());
+    localStorage.setItem('kernel-patch-dismissed',((b&&b.getAttribute('data-osupd-sig'))||'1')+'@@'+Date.now());
     // Don't kill the polling timer if a job is running in the background —
     // we just hide the UI. The job continues to run regardless.
 }

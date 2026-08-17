@@ -64619,11 +64619,13 @@ def _kernel_patch_job_state():
         # finished — a DONE marker older than this boot describes a previous life
         # of the box and must not be reported as a fresh completion.
         done_fresh = completed_ok
+        done_at = ''
         if completed_ok:
             _m = None
             for _m in re.finditer(r'\[(\d{4}-\d{2}-\d{2}T[\d:]{8})Z\]\s*=== DONE', log_tail):
                 pass                      # keep the LAST match
             if _m:
+                done_at = _m.group(1)
                 try:
                     from datetime import timezone as _tz
                     _dt = datetime.strptime(_m.group(1), '%Y-%m-%dT%H:%M:%S').replace(tzinfo=_tz.utc)
@@ -64633,6 +64635,11 @@ def _kernel_patch_job_state():
         return {
             'running': False,
             'pid': None,
+            # v10.1.37: identifies WHICH completed run this is, so a dismissal can
+            # stick to it. Without it the finished panel reappeared on every console
+            # restart — the DONE marker is still in the log and still newer than
+            # boot, so it re-rendered forever no matter how often it was closed.
+            'done_at': done_at,
             'done': bool(done_fresh),
             'error': bool(last_fatal != -1 and last_fatal > last_done),
             'reboot_required': reboot_required,
