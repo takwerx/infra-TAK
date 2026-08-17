@@ -891,6 +891,9 @@ async function _kpatchPollOnce(){
             clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
             _kpatchShowState('done');
             document.getElementById('kpatch-log-done').textContent=d.log_tail||'';
+            // The pending list just became stale — force a re-read so the panel
+            // cannot keep advertising updates that were only just installed.
+            fetch('/api/os-updates?refresh=1',{credentials:'same-origin',cache:'no-store'}).catch(function(){});
             return;
         }
         if(d.error){

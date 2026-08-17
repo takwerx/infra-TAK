@@ -64602,6 +64602,10 @@ def kernel_patch_start_api():
         ok, msg, pid = _kernel_patch_start_job()
     except Exception as e:
         return jsonify({'ok': False, 'error': f'start error: {e}'}), 500
+    # v10.1.37: the pending-updates answer is about to stop being true. Drop the
+    # cache so nothing can serve a pre-install list after the job lands (the
+    # panel also force-refreshes when it sees the job finish).
+    _OS_UPDATES_CACHE['ts'], _OS_UPDATES_CACHE['data'] = 0.0, None
     return jsonify({'ok': ok, 'message': msg, 'pid': pid})
 
 
