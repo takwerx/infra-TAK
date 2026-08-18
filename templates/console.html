@@ -696,12 +696,52 @@ function _kpatchShowState(state){
 // 'sig@@ts' form mis-parsed whenever the signature was empty (e.g. a missing
 // done_at produced 'done@' + '@@' + ts -> split gave the wrong halves and the
 // dismissal could NEVER match again, so the panel returned forever).
-function _kpatchReadDismiss(){
-    try{ var v=JSON.parse(localStorage.getItem('kernel-patch-dismissed')||'null');
+// v10.1.38: ONE key held TWO incompatible namespaces, and the loser was always
+// the done-panel.
+//
+// dismissKernelBanner() stored `done@<stamp>`; the very next load fell through to
+// the pending check (correct, 1c86157), where a `done@...` string can never equal
+// a `<count>:<pkgs>` string, so both exits called
+// removeItem('kernel-patch-dismissed') and destroyed the record. A done-dismissal
+// survived exactly one page load, on every platform, always. Measured on test8:
+// Close stored a valid record; one reload and it was null with the signature
+// overwritten to the pending set's.
+//
+// The namespace is now derived FROM THE SIGNATURE, not chosen by the caller. That
+// is deliberate: this bug class has bitten five times because a fix landed at one
+// call site and missed the others. A caller cannot write to, or clear, the wrong
+// namespace — there is no argument for it to get wrong.
+function _kpatchNs(sig){ return (String(sig||'').indexOf('done@')===0)?'done':'pending'; }
+function _kpatchKey(ns){ return 'kernel-patch-dismissed-'+ns; }
+
+// One-time carry-over of the pre-v10.1.38 single key, so an operator who dismissed
+// a panel just before updating does not get it thrown back at them once more.
+function _kpatchMigrateLegacy(){
+    try{
+        var raw=localStorage.getItem('kernel-patch-dismissed');
+        if(raw===null)return;
+        localStorage.removeItem('kernel-patch-dismissed');
+        var v=JSON.parse(raw||'null');
+        if(v&&typeof v==='object'&&v.sig)localStorage.setItem(_kpatchKey(_kpatchNs(v.sig)),raw);
+    }catch(e){}
+}
+function _kpatchReadDismiss(ns){
+    _kpatchMigrateLegacy();
+    try{ var v=JSON.parse(localStorage.getItem(_kpatchKey(ns))||'null');
          return (v&&typeof v==='object'&&v.sig!==undefined)?v:null; }catch(e){ return null; }
 }
+function _kpatchStoreDismiss(sig){
+    if(!sig)return;              // no signature: record nothing, let it re-show
+    _kpatchMigrateLegacy();
+    try{ localStorage.setItem(_kpatchKey(_kpatchNs(sig)),
+                              JSON.stringify({sig:sig,ts:Date.now()})); }catch(e){}
+}
+function _kpatchClearDismiss(ns){
+    _kpatchMigrateLegacy();
+    try{ localStorage.removeItem(_kpatchKey(ns)); }catch(e){}
+}
 function _kpatchDismissMatches(sig){
-    var d=_kpatchReadDismiss();
+    var d=_kpatchReadDismiss(_kpatchNs(sig));
     return !!(d && d.sig===sig && d.ts>0 && (Date.now()-d.ts)<24*60*60*1000);
 }
 function _kpatchBannerTone(tone){
@@ -841,7 +881,6 @@ function renderOsUpdates(d){
 }
 async function checkKernelPatch(){
     var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
-    var dismissed=localStorage.getItem('kernel-patch-dismissed');
     // First: check if a background patch job is in flight (started in a prior
     // session — UI reload, browser refresh, etc.). If so, jump straight into
     // the live polling state instead of showing the idle banner.
@@ -900,7 +939,10 @@ async function checkKernelPatch(){
             if(hl2)hl2.textContent='Update check failed';
             banner.style.display='block';_kpatchShowState('idle');return;
         }
-        if(!ud||!ud.total){banner.style.display='none';localStorage.removeItem('kernel-patch-dismissed');return;}
+        // Nothing pending: clear only the PENDING record. Clearing the done record
+        // here is what made the finished-run panel come back — it is the common case
+        // (a box with a finished patch run and nothing new to install).
+        if(!ud||!ud.total){banner.style.display='none';_kpatchClearDismiss('pending');return;}
         renderOsUpdates(ud);
         try{
             var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
@@ -911,14 +953,20 @@ async function checkKernelPatch(){
         // Dismissal is keyed to WHAT is pending, not to a global flag: a box that
         // is dismissed once must still speak up when a new update lands (the old
         // behaviour hid the banner until the box was fully patched).
-        var sig=ud.total+':'+(ud.managed||[]).map(function(m){return m.name+m.new;}).join(',');
+        // Prefer the server-side digest over name+version of `managed` alone:
+        // `managed` is only the TAK-touching subset, so a routine-only update set
+        // collapsed to a bare count ("2:") that could not distinguish one pair of
+        // updates from any other. Fall back to the old form if an older backend
+        // does not send pkg_sig.
+        var sig=ud.pkg_sig?(ud.total+':'+ud.pkg_sig)
+                          :(ud.total+':'+(ud.managed||[]).map(function(m){return m.name+m.new;}).join(','));
         // Dismissal is scoped to WHAT is pending AND expires. Without the expiry a
         // dismissed set stayed hidden until the set itself changed, so a single
         // pending update could sit invisible for weeks on the one screen that
         // surfaces it. A day is long enough to stop nagging, short enough that
         // the box cannot go quiet indefinitely.
         if(_kpatchDismissMatches(sig)){banner.style.display='none';return;}
-        if(_kpatchReadDismiss())localStorage.removeItem('kernel-patch-dismissed');
+        if(_kpatchReadDismiss('pending'))_kpatchClearDismiss('pending');
         banner.setAttribute('data-osupd-sig',sig);
         banner.style.display='block';_kpatchShowState('idle');
     }catch(e){}
@@ -931,10 +979,10 @@ function dismissKernelBanner(){
     // Storing a placeholder ('1') was the poison: it can never match a real
     // signature, so the panel returned on every load with no way to stop it.
     // If we genuinely have no signature, record nothing and let it re-show.
-    try{
-        if(_sig)localStorage.setItem('kernel-patch-dismissed',JSON.stringify({sig:_sig,ts:Date.now()}));
-        else localStorage.removeItem('kernel-patch-dismissed');
-    }catch(e){}
+    // Namespaced by signature, so closing the done panel cannot disturb a pending
+    // dismissal and vice versa. An empty signature records nothing (and destroys
+    // nothing) — better to re-show than to wipe a valid record.
+    _kpatchStoreDismiss(_sig);
     // Don't kill the polling timer if a job is running in the background —
     // we just hide the UI. The job continues to run regardless.
 }

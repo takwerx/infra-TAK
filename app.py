@@ -3716,8 +3716,22 @@ def _os_updates_summary(force=False):
     except Exception as _pe:
         pending, err = [], str(_pe)[:160]
     managed, routine = _classify_os_updates(pending)
+    # v10.1.38 — identity of the pending SET, computed where the full list exists.
+    #
+    # The panel used to build its dismissal signature client-side as
+    # `total + ':' + managed.map(name+new)`. `managed` is only the TAK-touching
+    # subset, so a box with two routine updates produced the signature "2:" — a
+    # bare count with no package identity at all (measured, test8 2026-08-17).
+    # Two pending updates today and two entirely different ones next week both
+    # hash to "2:", so dismissing the first silently suppressed the second.
+    # Hashing name=version over ALL pending packages makes the signature mean
+    # what it always claimed to mean.
+    _psig = hashlib.sha256(
+        '\n'.join(sorted('%s=%s' % (p.get('name', ''), p.get('new', '')) for p in pending)
+                   ).encode('utf-8', 'replace')).hexdigest()[:16] if pending else ''
     data = {
         'total': len(pending),
+        'pkg_sig': _psig,
         'managed': managed,
         'routine_count': len(routine),
         'routine_sample': [p['name'] for p in routine[:8]],
