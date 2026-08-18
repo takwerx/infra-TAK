@@ -25406,6 +25406,237 @@ def _get_service_alias(settings, service_key):
     """Return the configured alias domain for a service (or empty string)."""
     return settings.get(f'{service_key}_domain_alias', '').strip()
 
+# ── Caddy version gate + Caddyfile validation (GH #59, v10.1.39) ────────────────
+# GH #59 root cause: _emit_outpost_callback_rescue() emitted the SSO callback-rescue page
+# as a Caddyfile HEREDOC (`respond <<CBRESCUE … CBRESCUE 200`). Heredoc support landed in
+# Caddy 2.7.0, so on anything older the ENTIRE Caddyfile is unparseable
+# ("unrecognized directive: <!doctype"). `systemctl reload caddy` then fails, Caddy keeps
+# serving its PREVIOUS in-memory config, the newly written tak.<fqdn> vhost is never
+# served, no cert is issued, the LDAP outpost cannot move to FQDN routing, and the deploy
+# ends in 24/24 LDAP bind failures with nothing in the log naming the cause. Worse, the box
+# limps on the stale config until the next `systemctl restart caddy` or reboot — at which
+# point Caddy CANNOT START AT ALL and every proxied service goes down.
+#
+# Fresh installs never saw it: they add the cloudsmith repo and get 2.10.x. It only hits a
+# box that ALREADY had Caddy — Ubuntu 22.04 universe ships 2.4.5, Debian bookworm 2.6.2 —
+# because the only checks anywhere were "does the binary execute".
+_CADDY_MIN_HEREDOC = (2, 7)      # heredoc (`respond <<TAG`) support landed here
+_CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
+
+_caddy_version_cache = {'ver': None, 'ts': 0.0}
+
+
+def _caddy_version_tuple(refresh=False):
+    """(major, minor, patch) of the installed Caddy, or () when it cannot be determined.
+
+    () sorts BELOW every real version, so a gate written as `>= _CADDY_MIN_HEREDOC` FAILS
+    CLOSED — "we could not tell" is treated exactly like "too old". That direction is the
+    safe one: emitting a heredoc onto an old Caddy bricks the whole config, while emitting
+    the plain page onto a new one costs only some CSS.
+
+    Cached for 5 minutes — generate_caddyfile() runs on every module deploy and on several
+    startup migrations, and must not shell out on every call."""
+    now = time.time()
+    if not refresh and _caddy_version_cache['ver'] is not None and (now - _caddy_version_cache['ts']) < 300:
+        return _caddy_version_cache['ver']
+    ver = ()
+    try:
+        r = subprocess.run('caddy version 2>/dev/null', shell=True, capture_output=True,
+                           text=True, timeout=10)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            m = re.search(r'v?(\d+)\.(\d+)(?:\.(\d+))?', r.stdout)
+            if m:
+                ver = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+    except (subprocess.TimeoutExpired, OSError):
+        ver = ()
+    _caddy_version_cache['ver'] = ver
+    _caddy_version_cache['ts'] = now
+    return ver
+
+
+def _caddy_supports_heredoc():
+    """True only when the installed Caddy is >= 2.7. Unknown version => False (see above)."""
+    v = _caddy_version_tuple()
+    return bool(v) and v >= _CADDY_MIN_HEREDOC
+
+
+def _caddy_rescue_html_oneline(root_url):
+    """The callback-rescue page as ONE Caddyfile-safe token, for Caddy < 2.7.
+
+    The constraints here are the Caddyfile's, not HTML's. The whole page must fit in a
+    single quoted token: no newlines, no `"` (it would close the token), and no `{`/`}`
+    (Caddy reads those as placeholders — which is precisely why the styled version can only
+    be expressed inside a heredoc, since its CSS is nothing but braces). Attributes use
+    single quotes and the CSS is dropped. The page is plain, but it renders, and it can
+    never make the config unparseable."""
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Continue to sign in</title></head>"
+        "<body><h1>Almost there</h1>"
+        "<p>Your password was saved. This last step couldn't complete on its own, "
+        "so sign in below to finish.</p>"
+        "<a href='" + root_url + "'>Continue to sign in</a></body></html>"
+    )
+
+
+def _caddy_install_official_static(plog=None):
+    """Install the official static Caddy build over the current one. Returns True on success.
+
+    Used by the deploy version gate on the dnf side: the RHEL COPR package is the family's
+    usual source but can lag, and there is no `--only-upgrade` equivalent there that
+    reliably lands >= 2.7. Verifies the download RUNS before installing it \u2014 a partial
+    fetch would otherwise pass a mere presence check and then fail caddy.service with
+    203/EXEC. Mirrors the existing EL9 COPR payload-quirk path."""
+    _log = plog or (lambda m: print(m, flush=True))
+    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+    _dl = '/tmp/caddy.upgrade.download'
+    _url = f'https://caddyserver.com/api/download?os=linux&arch={_arch}'
+    try:
+        # argv throughout — no shell string carries an interpolated value (Dependency Rule).
+        try:
+            os.remove(_dl)
+        except OSError:
+            pass
+        subprocess.run(['curl', '-fsSL', '--retry', '3', '--retry-delay', '2', _url, '-o', _dl],
+                       capture_output=True, text=True, timeout=300)
+        subprocess.run(_sudo_wrap(['chmod', '+x', _dl]), capture_output=True, text=True)
+        ver = subprocess.run([_dl, 'version'], capture_output=True, text=True, timeout=20)
+        if ver.returncode != 0:
+            _log(f"  \u2717 official static caddy download did not validate: {((ver.stderr or ver.stdout) or 'no output').strip()[:160]}")
+            return False
+        subprocess.run(_sudo_wrap(['install', '-m', '0755', _dl, '/usr/bin/caddy']),
+                       capture_output=True, text=True, timeout=30)
+        # RHEL: keep the httpd_exec_t label the rpm scriptlet set, else systemd refuses it.
+        _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'],
+                         ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
+        _log(f"  \u2713 official static caddy {(ver.stdout or '').split()[0] if ver.stdout else ''} installed")
+        return True
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _log(f"  \u2717 official static caddy install failed: {str(e)[:160]}")
+        return False
+    finally:
+        try:
+            os.remove(_dl)
+        except OSError:
+            pass
+        _caddy_version_cache['ver'] = None
+
+
+_caddy_last_validate_error = {'err': '', 'ts': 0.0}
+
+
+def _caddy_validate_config(path=None, timeout=30):
+    """Run Caddy's own adapter over `path`. Returns (verdict, output).
+
+    verdict is 'ok' | 'bad' | 'unknown'. 'unknown' covers a missing/unrunnable caddy binary,
+    a timeout, and — importantly — a permission-denied result: on custom-cert
+    (ssl_mode='custom') non-root boxes this runs as takwerx, which cannot traverse
+    /var/lib/caddy (0750 caddy:caddy) to open the deployed cert copy, so validate fails on a
+    config the caddy service itself loads fine. That is inconclusive, NOT a bad config —
+    the same carve-out the W1 path already makes (~app.py:5981). Without it we would
+    "restore" a good config over a good config on every single write."""
+    cp = path or CADDYFILE_PATH
+    try:
+        if not shutil.which('caddy'):
+            return 'unknown', 'caddy binary not found'
+        v = subprocess.run(['caddy', 'validate', '--config', cp, '--adapter', 'caddyfile'],
+                           capture_output=True, text=True, timeout=timeout)
+        out = ((v.stdout or '') + (v.stderr or '')).strip()
+        if v.returncode == 0:
+            return 'ok', out
+        if 'permission denied' in out.lower():
+            return 'unknown', out
+        return 'bad', out
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 'unknown', str(e)
+
+
+def _caddy_validate_or_restore(prev_contents, plog=None):
+    """Validate the Caddyfile we just wrote; on a genuine parse failure put `prev_contents`
+    back and surface the error. Returns (ok, err) — ok is False ONLY for verdict 'bad'.
+
+    This is the GH #59 backstop and it lives at the single choke point on purpose:
+    generate_caddyfile() feeds 67 call sites and 48 `systemctl reload caddy` sites, so a
+    per-call-site fix is not maintainable. Restoring the last-known-parseable file converts
+    the catastrophic failure mode (Caddy cannot start after the next reboot, every proxied
+    service down) into an ordinary failed change that the caller's own verification reports.
+
+    Deliberately does NOT raise: those 67 callers do not expect an exception here, and the
+    Authentik deploy's post-write verification (v10.1.38) already reads the file back and
+    reports the missing vhost honestly — restoring makes that report correct rather than
+    masking anything."""
+    verdict, out = _caddy_validate_config()
+    if verdict != 'bad':
+        return True, ''
+    err = (out or 'caddy validate failed with no output')[-400:]
+    _caddy_last_validate_error['err'] = err
+    _caddy_last_validate_error['ts'] = time.time()
+    msg = ('Caddyfile REJECTED by `caddy validate` — NOT applying it: %s' % err)
+    restored = False
+    if prev_contents:
+        try:
+            _write_priv(CADDYFILE_PATH, prev_contents)
+            restored = True
+        except Exception as e:
+            msg += ' | restore of the previous Caddyfile FAILED: %s' % str(e)[:160]
+    else:
+        msg += ' | no previous Caddyfile to restore (nothing was being served yet)'
+    if restored:
+        msg += ' | previous Caddyfile restored, Caddy keeps serving it'
+    _cv = _caddy_version_tuple()
+    if _cv and _cv < _CADDY_MIN_SUPPORTED:
+        msg += (' | this Caddy is %s, older than the %s minimum — upgrade it (GH #59)'
+                % ('.'.join(map(str, _cv)), '.'.join(map(str, _CADDY_MIN_SUPPORTED))))
+    print('Caddy: ' + msg, flush=True)
+    if plog:
+        try:
+            plog('  \u2717 ' + msg)
+        except Exception:
+            pass
+    return False, err
+
+
+def _startup_caddy_selfheal():
+    """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
+
+    _startup_migrations() already regenerates the Caddyfile in seven places, but every one
+    is conditional on some other migration firing — so a box already limping on a stale
+    config heals only by luck. This step asks Caddy whether the file ON DISK parses and, if
+    it does not, regenerates it and reloads. With the heredoc gate in place the regenerated
+    file parses on old Caddy too, so an affected box repairs itself on the next console
+    restart. Rides the console update, never start.sh ([[feedback-console-path-delivery]])."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    verdict, out = _caddy_validate_config()
+    if verdict == 'ok':
+        return
+    if verdict == 'unknown':
+        # No caddy binary, or the inconclusive permission-denied case. Nothing to heal
+        # from and nothing safe to conclude — stay quiet rather than regenerate blindly.
+        return
+    _cv = _caddy_version_tuple()
+    print('Startup migration: Caddyfile on disk does NOT parse (caddy %s): %s'
+          % ('.'.join(map(str, _cv)) if _cv else 'version unknown', (out or '')[-200:]), flush=True)
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        print('Startup migration: caddy self-heal skipped — no FQDN configured', flush=True)
+        return
+    generate_caddyfile(s)          # re-emits without the heredoc on Caddy < 2.7
+    verdict2, out2 = _caddy_validate_config()
+    if verdict2 == 'bad':
+        print('Startup migration: caddy self-heal FAILED — regenerated Caddyfile still does '
+              'not parse: %s' % (out2 or '')[-200:], flush=True)
+        return
+    rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                        capture_output=True, text=True, timeout=60)
+    if rl.returncode != 0:
+        rl = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
+                            capture_output=True, text=True, timeout=90)
+    print('Startup migration: \u2713 Caddyfile regenerated and Caddy %s (GH #59 self-heal)'
+          % ('reloaded' if rl.returncode == 0 else 'reload FAILED'), flush=True)
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -25491,18 +25722,28 @@ def generate_caddyfile(settings=None):
         lines.append(f"                @cb400 status 400")
         lines.append(f"                handle_response @cb400 {{")
         lines.append(f"                    header Content-Type \"text/html; charset=utf-8\"")
-        lines.append(f"                    respond <<CBRESCUE")
-        lines.append(f"                        <!doctype html>")
-        lines.append(f"                        <html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Continue to sign in</title>")
-        lines.append(f"                        <style>body{{font-family:system-ui,sans-serif;background:#0f1420;color:#e6e8ee;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}main{{max-width:26rem;padding:2rem;text-align:center}}h1{{font-size:1.25rem}}p{{color:#9aa3b2;line-height:1.6}}a{{display:inline-block;margin-top:1rem;padding:.7rem 1.6rem;background:#2b6cb0;color:#fff;border-radius:.5rem;text-decoration:none;font-weight:600}}</style></head>")
-        lines.append(f"                        <body><main><h1>Almost there</h1>")
-        # Cause-neutral on purpose: the 400 has several triggers (no outpost session at the
-        # callback, a state minted in another browser, an expired flow). Naming one of them
-        # is wrong for the other cases — field-checked 2026-08-08, where the message blamed a
-        # different browser but the operator had stayed in a single incognito window.
-        lines.append(f"                        <p>Your password was saved. This last step couldn't complete on its own, so sign in below to finish.</p>")
-        lines.append(f"                        <a href=\"{root_url}\">Continue to sign in</a></main></body></html>")
-        lines.append(f"                        CBRESCUE 200")
+        # v10.1.39 (GH #59): the styled page can ONLY be expressed as a heredoc — its CSS is
+        # nothing but braces, and outside a heredoc Caddy reads `{`/`}` as placeholders. But
+        # heredocs arrived in Caddy 2.7.0, and on anything older this block makes the WHOLE
+        # Caddyfile unparseable ("unrecognized directive: <!doctype"), which costs the box
+        # every proxied service at its next Caddy restart. So: styled page on 2.7+, plain
+        # one-line page below that. Unknown version counts as old — see _caddy_version_tuple.
+        if _caddy_supports_heredoc():
+            lines.append(f"                    respond <<CBRESCUE")
+            lines.append(f"                        <!doctype html>")
+            lines.append(f"                        <html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Continue to sign in</title>")
+            lines.append(f"                        <style>body{{font-family:system-ui,sans-serif;background:#0f1420;color:#e6e8ee;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}main{{max-width:26rem;padding:2rem;text-align:center}}h1{{font-size:1.25rem}}p{{color:#9aa3b2;line-height:1.6}}a{{display:inline-block;margin-top:1rem;padding:.7rem 1.6rem;background:#2b6cb0;color:#fff;border-radius:.5rem;text-decoration:none;font-weight:600}}</style></head>")
+            lines.append(f"                        <body><main><h1>Almost there</h1>")
+            # Cause-neutral on purpose: the 400 has several triggers (no outpost session at the
+            # callback, a state minted in another browser, an expired flow). Naming one of them
+            # is wrong for the other cases — field-checked 2026-08-08, where the message blamed a
+            # different browser but the operator had stayed in a single incognito window.
+            lines.append(f"                        <p>Your password was saved. This last step couldn't complete on its own, so sign in below to finish.</p>")
+            lines.append(f"                        <a href=\"{root_url}\">Continue to sign in</a></main></body></html>")
+            lines.append(f"                        CBRESCUE 200")
+        else:
+            _rescue_1l = _caddy_rescue_html_oneline(root_url)
+            lines.append(f"                    respond \"{_rescue_1l}\" 200")
         lines.append(f"                }}")
         lines.append(f"            }}")
         lines.append(f"        }}")
@@ -26069,7 +26310,23 @@ def generate_caddyfile(settings=None):
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
     _makedirs_priv(os.path.dirname(CADDYFILE_PATH))
+    # v10.1.39 (GH #59): keep the outgoing file so a config that does not parse can be put
+    # back. Must be read BEFORE the write — after it there is nothing left to restore.
+    _caddy_prev = None
+    try:
+        if os.path.exists(CADDYFILE_PATH):
+            _caddy_prev = _read_priv(CADDYFILE_PATH)
+    except Exception:
+        _caddy_prev = None
     _write_priv(CADDYFILE_PATH, caddyfile)
+    # Ask Caddy whether what we just wrote is actually loadable, BEFORE any of the 48
+    # `systemctl reload caddy` sites acts on it. A rejected config is restored here rather
+    # than left on disk to strand the box at its next restart (GH #59). Same single choke
+    # point as _selinux_sync_caddy_ports() below.
+    try:
+        _caddy_validate_or_restore(_caddy_prev)
+    except Exception as _cv_err:
+        print(f'Caddy: validate/restore step errored (non-fatal): {_cv_err}', flush=True)
     # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
     # http_port_t (80/443/8443/9000…). A non-standard listener — e.g. the
     # CloudTAK video vhost on :9997 — is denied (name_bind) so the reload fails
@@ -26843,6 +27100,39 @@ def run_caddy_deploy(domain):
             caddy_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Caddy installed")
+
+        # v10.1.39 (GH #59): a VERSION gate, not just "does the binary execute". Until now the
+        # only checks anywhere were `which caddy` and a `caddy version` returncode, so a box
+        # that already had a distro Caddy — Ubuntu 22.04 universe ships 2.4.5, Debian
+        # bookworm 2.6.2 — was accepted silently and then could not parse the Caddyfile we
+        # generate. Catch it here instead of at reload time, where it costs the whole config.
+        _cv = _caddy_version_tuple(refresh=True)
+        _min_s = '.'.join(map(str, _CADDY_MIN_SUPPORTED))
+        if _cv and _cv < _CADDY_MIN_SUPPORTED:
+            plog(f"  Caddy {'.'.join(map(str, _cv))} is older than the {_min_s} minimum — upgrading…")
+            if pkg_mgr == 'apt':
+                # The cloudsmith repo was added in Step 1, so apt already has a newer
+                # candidate and a plain install upgrades in place — keeping apt in charge of
+                # the binary rather than dropping a static build over an apt-managed
+                # /usr/bin/caddy. Routed through the shim per CLAUDE.md (never a bare
+                # apt-get). _pkg_install runs DEBIAN_FRONTEND=noninteractive, under which
+                # dpkg keeps the existing conffile instead of stopping on the
+                # /etc/caddy/Caddyfile prompt — the upgrade gotcha in the GH #59 handoff.
+                _pkg_install('caddy', log_fn=plog, timeout=300)
+                _caddy_version_cache['ver'] = None
+            else:
+                # dnf: the @caddy/caddy COPR can lag behind 2.7, so take the official build.
+                _caddy_install_official_static(plog)
+            _cv = _caddy_version_tuple(refresh=True)
+        if not _cv:
+            plog(f"  ⚠ Could not read the Caddy version — treating it as older than {_min_s}. "
+                 "The Caddyfile is generated without heredocs so it stays parseable (GH #59).")
+        elif _cv < _CADDY_MIN_SUPPORTED:
+            plog(f"  ⚠ Caddy is still {'.'.join(map(str, _cv))} (< {_min_s}). Deploy continues — the "
+                 "Caddyfile is generated without heredocs so it stays parseable — but the SSO "
+                 "callback-rescue page stays plain until Caddy is upgraded (GH #59).")
+        else:
+            plog(f"  ✓ Caddy {'.'.join(map(str, _cv))} (>= {_min_s})")
 
         plog("")
         plog("━━━ Step 2/4: Generating Caddyfile ━━━")
@@ -70694,6 +70984,16 @@ def _startup_migrations():
             _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _snap_err:
             print(f"Startup migration: snapshot schedule error (non-fatal): {_snap_err}")
+
+        # v10.1.39 (GH #59): unconditional Caddyfile self-heal. The seven Caddyfile
+        # regenerations above are each gated on some other migration firing, so a box already
+        # limping on an unparseable config heals only by luck. Ask Caddy whether the file on
+        # disk actually loads; if not, regenerate (without heredocs on Caddy < 2.7) and
+        # reload. Runs last, so it judges whatever the migrations above left behind.
+        try:
+            _startup_caddy_selfheal()
+        except Exception as _cs_err:
+            print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to
