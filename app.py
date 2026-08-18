@@ -16194,6 +16194,14 @@ def _f2b_selfheal_authentik_log_level(plog=None, detail=None):
     except Exception as e:
         _log(f'fail2ban: could not raise AUTHENTIK_LOG_LEVEL (non-fatal): {e}')
         return False
+    # The INERT verdict is memoised for 300 s to keep docker inspect off the page
+    # poll. Nothing invalidated it here, so for up to five minutes after the heal
+    # repaired the level the console kept rendering "Enabled, but protecting
+    # nothing" over a jail that was already fine — the operator fixes it and the
+    # console calls them a liar. Same cry-wolf class as the logrotate false alarm;
+    # a stale cache is just a slower way to say something untrue.
+    _F2B_AK_LEVEL_CACHE['verdict'] = None
+    _F2B_AK_LEVEL_CACHE['at'] = 0.0
     # Name the file. The bug this release fixes was the heal reading the WRONG .env
     # (or none at all), so "it healed" is not a useful log line without the path —
     # on a box with a stale second copy, that path is the whole diagnosis.
