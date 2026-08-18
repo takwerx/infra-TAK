@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.37-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.37-alpha)**
+**Current release: [v10.1.38-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.38-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.38-alpha — 2026-08-18 — a security control that cannot work now says so
+
+**Headline: switching on the Authentik brute-force jail now actually arms it, and any protection that cannot work is stated plainly on the page instead of quietly reading as healthy.** The console can block repeated failed logins against single sign-on. Switching that on wrote the rule, started the log reader, and reported success — but it did not change the one setting that decides whether Authentik ever writes the failed-login line the rule looks for. Until the console happened to restart, which might be days or weeks, the jail was loaded, listed as active, counted as coverage, and could not ban anybody. A field report caught it: the SSH jail on the same box was banning normally while this one sat at zero. **Enabling it now arms it in the same click**, and if the setting is one the console will not overwrite because you chose it deliberately, it says so in red rather than congratulating you. **More broadly, the console now shows you a control that cannot fire.** It has been able to detect that condition for twenty-seven releases and had nowhere to display it, so the page showed the same reassuring green for a working jail and a dead one. There is now a panel that names each affected jail and why — in words, not log jargon. **Also in this release:** the "Updates installed" notice came back every time you reloaded the page, no matter how many times you dismissed it, because the dismissal was being erased by the very next page load; it now stays dismissed, while a genuinely new update run still brings it back. And when deploying single sign-on cannot get a certificate because the web server was never told to serve that hostname, the deploy says exactly that instead of reporting success and then stalling five minutes on a certificate that was never going to arrive. **Who should update:** everyone, and particularly anyone who has switched on the Authentik jail. **Upgrade:** automatic on the next console update, with nothing to configure.
+
+Full notes: [v10.1.38-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.38-alpha).
 
 ### v10.1.37-alpha — 2026-08-17 — see what an operating-system update will restart, before you run it
 
