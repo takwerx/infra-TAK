@@ -15678,6 +15678,44 @@ def _f2b_ak_log_level_verdict(force=False):
     return verdict
 
 
+def _f2b_log_has_rotated_history(logpath):
+    """True if this log has ever been written — including into a rotated sibling.
+
+    v10.1.38, caught in T&E. The 0-byte STARVING test was written on the reasoning that
+    "a quiet box legitimately has quiet logs, but a log that has never received one byte
+    is unambiguous". Daily logrotate with `copytruncate` falsifies that: at 00:00 the
+    rule copies auth.log to auth.log.1 and truncates the original to zero, so from
+    midnight until the next failed login a perfectly healthy jail has a 0-byte log.
+    Measured on test8/test12/aws-arm simultaneously, 2026-08-18 03:04 — all three
+    reported STARVING with 1899 bytes sitting in auth.log.1 beside them.
+
+    That was survivable while the verdict only reached a journal line nobody read. This
+    release renders dead jails in the console, so without this check every operator would
+    get a red "protecting nothing" banner every morning — and a control that cries wolf
+    daily is worse than one that says nothing, because it trains people to ignore it.
+
+    A rotated sibling with content proves the writer works. Only a log with no history at
+    all is genuinely starving."""
+    try:
+        d = os.path.dirname(logpath) or '.'
+        base = os.path.basename(logpath)
+        for f in os.listdir(d):
+            if f == base or not f.startswith(base + '.'):
+                continue
+            suffix = f[len(base) + 1:]
+            # rotated siblings only: .1, .2.gz, .1.bz2 ... never .parked-missing-log
+            if not re.fullmatch(r'\d+(\.(gz|bz2|xz|zst))?', suffix):
+                continue
+            try:
+                if os.path.getsize(os.path.join(d, f)) > 0:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
 def _f2b_dead_jails():
     """Jails that are configured but protecting nothing. [(jail, filter, reason)].
 
@@ -15724,10 +15762,11 @@ def _f2b_dead_jails():
             continue
         lp = lm.group(1)
         try:
-            if os.path.getsize(lp) == 0:
+            if os.path.getsize(lp) == 0 and not _f2b_log_has_rotated_history(lp):
                 dead.append((name, filt,
-                             'loaded, but its log %s is 0 bytes — nothing has ever '
-                             'written to it, so this jail can never fire' % lp))
+                             'loaded, but its log %s is 0 bytes and has no rotated '
+                             'history — nothing has ever written to it, so this jail '
+                             'can never fire' % lp))
                 continue                  # 0 bytes is the deeper fault; don't double-report
         except OSError:
             dead.append((name, filt, 'loaded, but its log %s cannot be read' % lp))
