@@ -52516,11 +52516,52 @@ entries:
                 plog("  ⚠ Authentik HTTP not ready in time — Caddy may 502 briefly; retry in a minute.")
             plog("  Updating Caddy config...")
             generate_caddyfile(settings)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=90)
-            plog(f"  ✓ Caddy config updated for Authentik")
+            _cad_rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                                     capture_output=True, text=True, timeout=90)
+            # v10.1.38 (GH #59) — this used to print an unconditional
+            # "✓ Caddy config updated for Authentik" and then block 300 s waiting for a
+            # certificate on a hostname Caddy had never been asked to serve.
+            #
+            # On the reporter's box the Authentik vhost was never written at all:
+            # generate_caddyfile() emits it only `if ak.get('installed')`, and
+            # detect_modules() returned False there. Every downstream symptom — no cert,
+            # the 300 s stall, the LDAP outpost falling back to internal routing, 24/24 SA
+            # bind failures, "TAK enrollment will reject users" — descends from that, and
+            # not one line of the deploy log named it. The operator was told Caddy was
+            # updated. It was; it just did not contain Authentik.
+            #
+            # Read the file back rather than trusting the call. generate_caddyfile()
+            # returns None, so the written artifact is the only evidence.
+            #
+            # TRAP: `tak.<fqdn>` is a SUFFIX of `infratak.<fqdn>`, so a bare substring test
+            # matches the console's own vhost and reports success on every box. The emitter
+            # writes "# Authentik\n" then f"{ak_host} {{" — anchor on the leading newline.
+            _ak_vhost_host = (_get_authentik_host(settings) or settings.get('fqdn', '') or '').split(':')[0]
+            _ak_vhost_ok = False
+            try:
+                _cad_txt = _read_priv(CADDYFILE_PATH)
+                _ak_vhost_ok = bool(_ak_vhost_host) and ('\n%s {' % _ak_vhost_host) in _cad_txt
+            except Exception as _ce:
+                plog(f"  ⚠ Could not read {CADDYFILE_PATH} to verify the Authentik vhost ({str(_ce)[:80]})")
+            if not _ak_vhost_ok:
+                plog(f"  ✗ Caddy was reloaded, but its config has NO vhost for {_ak_vhost_host or '(unknown host)'}.")
+                plog(f"    Caddy is not serving Authentik, so no certificate will ever be issued for that name.")
+                plog(f"    generate_caddyfile() writes that vhost only when Authentik is detected as installed,")
+                plog(f"    so detection is failing on this box — check the Caddy page for the vhost list.")
+                plog(f"    NOTE: the console's own forward_auth is gated on the same signal, so SSO may be off too.")
+            elif _cad_rl.returncode != 0:
+                plog(f"  ✗ Authentik vhost {_ak_vhost_host} was written, but `systemctl reload caddy` failed"
+                     f" (rc={_cad_rl.returncode}): {(_cad_rl.stderr or _cad_rl.stdout or '').strip()[:160]}")
+                plog(f"    The running Caddy is still on the OLD config until this is fixed.")
+            else:
+                plog(f"  ✓ Caddy reloaded and now serves {_ak_vhost_host}")
             # Wait for Caddy to provision the TLS cert before restarting LDAP
             # (LDAP outpost uses AUTHENTIK_HOST = https://<ak_host> — needs valid cert on that exact domain)
-            _ak_tls_host = _get_authentik_host(settings) or settings.get('fqdn', '')
+            # Only worth waiting if Caddy is actually serving the name: without the vhost this
+            # loop burns a guaranteed 300 s and then blames the certificate.
+            _ak_tls_host = (_get_authentik_host(settings) or settings.get('fqdn', '')) if _ak_vhost_ok else ''
+            if not _ak_vhost_ok:
+                plog("  Skipping the TLS wait — nothing is serving that hostname yet.")
             if _ak_tls_host:
                 _ak_tls_hostname = _ak_tls_host.split(':')[0]
                 plog(f"  Waiting for TLS cert on {_ak_tls_hostname}...")
