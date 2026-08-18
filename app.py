@@ -58,7 +58,7 @@ from flask import (Flask, render_template, request, jsonify,
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from functools import wraps
-import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress, hashlib
+import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress, hashlib, socket
 import hmac
 import urllib.request
 import urllib.parse
