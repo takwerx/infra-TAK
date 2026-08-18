@@ -804,7 +804,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.38-alpha"
+VERSION = "10.1.39-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -27077,6 +27077,10 @@ def _get_authentik_latest_release_tag(use_cache=True):
         if tag.startswith('version/'):
             tag = tag[len('version/'):]
         tag = tag.lstrip('vV').strip() or None
+        # v10.1.39: a tag_name that is not Authentik CalVer never becomes an update target.
+        # This is the chokepoint: from here the value reaches an SSH sed and the .env pin.
+        if tag and not _ak_tag_is_sane(tag):
+            return _authentik_release_cache.get('tag')
         if tag:
             _authentik_release_cache['tag'] = tag
             _authentik_release_cache['ts'] = _time.time()
@@ -27103,6 +27107,164 @@ def _get_authentik_target_release(settings=None):
     if channel == 'dev':
         return _get_authentik_latest_release_tag() or AUTHENTIK_DEV_RELEASE
     return AUTHENTIK_VETTED_RELEASE
+
+
+def _ak_tag_is_sane(tag):
+    """True when `tag` looks like a real Authentik release ('2026.5.6', '2026.2').
+
+    Authentik ships CalVer (YYYY.M[.P]). This is a security gate, not cosmetics. On the DEV
+    channel the update target is GitHub's `tag_name` — REMOTE input, previously passed
+    through with only 'version/' and a leading 'v' stripped. v10.1.39 makes that value flow
+    into two new places: the remote branch's SSH `sed` (shell) and, via _ak_env_pin_tag, the
+    .env file that holds PG_PASS / AUTHENTIK_SECRET_KEY / the bootstrap token — where one
+    embedded newline would append arbitrary Authentik env keys. Reject anything that is not
+    digits-and-dots at the source rather than trying to escape it downstream.
+    (CLAUDE.md: no remote input interpolated into a shell command or a config path.)"""
+    return bool(re.match(r'^\d{4}(\.\d{1,3}){1,3}$', (tag or '').strip()))
+
+
+def _ak_ver_tuple(v):
+    """Comparable tuple from an Authentik version string ('2026.5.6' -> (2026, 5, 6)).
+    Returns () when there is nothing numeric, which sorts BELOW any real version, so an
+    unparseable value never wins a > test (never triggers a downgrade refusal by accident)."""
+    return tuple(int(x) for x in re.findall(r'\d+', (v or '')))
+
+
+def _ak_env_path(ak_dir=None):
+    """Path to the Authentik compose project's .env.
+
+    This is the file `docker compose` reads for ${VAR} INTERPOLATION. It is a different
+    job from the `env_file: - .env` the containers get: interpolation decides which IMAGE
+    compose resolves, env_file only decides what the process inside sees."""
+    return os.path.join(ak_dir or os.path.expanduser('~/authentik'), '.env')
+
+
+def _ak_env_read(ak_dir=None):
+    """Raw text of the Authentik .env, or None. Falls back to a privileged read: on a
+    flipped non-root box the file is routinely still root:root, where a plain open()
+    returns nothing and the caller silently concludes 'no pin' (same trap documented on
+    _get_authentik_env_content)."""
+    _p = _ak_env_path(ak_dir)
+    try:
+        if os.path.isfile(_p):
+            with open(_p) as _f:
+                _txt = _f.read()
+            if _txt:
+                return _txt
+    except Exception:
+        pass
+    try:
+        _txt = _read_priv(_p)
+        if _txt:
+            return _txt
+    except Exception:
+        pass
+    return None
+
+
+def _ak_env_tag(ak_dir=None, env_txt=None):
+    """The ACTIVE `AUTHENTIK_TAG=` pin in the Authentik .env, or '' when there is none.
+
+    v10.1.39 (COPIX field report on 10.1.38): this pin is the half of Docker Compose's
+    interpolation contract infra-TAK never wrote. `image: ...:${AUTHENTIK_TAG:-2026.5.6}`
+    uses the `:-` default ONLY while AUTHENTIK_TAG is unset; once .env defines it the .env
+    value WINS and the compose default is dead text. On the reporter's box Update rewrote
+    the compose default to the vetted release for 23 consecutive versions while .env held
+    AUTHENTIK_TAG=2026.2.2 — so `compose pull` re-pulled 2026.2.2, `up -d` recreated
+    2026.2.2, and the console reported success every single time.
+
+    Commented-out lines are NOT a pin (compose ignores them) and are not reported. The LAST
+    assignment wins, which is what compose's dotenv parsing does."""
+    _txt = env_txt if env_txt is not None else _ak_env_read(ak_dir)
+    if not _txt:
+        return ''
+    _m = None
+    for _line in _txt.splitlines():
+        _mm = re.match(r'[ \t]*AUTHENTIK_TAG[ \t]*=[ \t]*(.*)$', _line)
+        if _mm:
+            _m = _mm
+    if not _m:
+        return ''
+    return _m.group(1).strip().strip('"').strip("'").lstrip('vV')
+
+
+def _ak_env_pin_tag(tag, ak_dir=None, plog=None):
+    """Converge an EXISTING active `AUTHENTIK_TAG=` pin in .env onto `tag`.
+
+    Returns (changed, previous_tag).
+
+    Deliberately does NOT create the key when it is absent. The compose `:-default` is
+    infra-TAK's canonical pin (fleet-uniform: one source of truth); writing a second pin
+    into every box's .env would double what has to converge on every release. But when a
+    pin IS present it overrides compose, so it has to be dragged along.
+
+    Writes through _write_priv (broker/sudo) because .env is frequently root-owned on a
+    flipped box. .env also carries PG_PASS, AUTHENTIK_SECRET_KEY and the bootstrap token,
+    and the broker's write op is O_TRUNC-then-write (not atomic) — so the previous file is
+    stashed as .env.infratak-prev first, the rewrite is read back, and a rewrite that does
+    not verify is rolled back rather than left half-written."""
+    _log = plog or (lambda m: None)
+    _txt = _ak_env_read(ak_dir)
+    if _txt is None:
+        return False, ''
+    _prev = _ak_env_tag(env_txt=_txt)
+    if not _prev:
+        return False, ''
+    _want = (tag or '').strip().lstrip('vV')
+    if not _ak_tag_is_sane(_want):
+        raise ValueError('refusing to pin a malformed Authentik tag into .env: %r' % (tag,))
+    if _prev == _want:
+        return False, _prev
+    _out = []
+    for _line in _txt.splitlines(True):
+        if re.match(r'[ \t]*AUTHENTIK_TAG[ \t]*=', _line):
+            _out.append('AUTHENTIK_TAG=%s%s' % (_want, '\n' if _line.endswith('\n') else ''))
+        else:
+            _out.append(_line)
+    _new = ''.join(_out)
+    _envp = _ak_env_path(ak_dir)
+    _write_priv(_envp + '.infratak-prev', _txt, perm=0o600)
+    _write_priv(_envp, _new, perm=0o600)
+    _back = _ak_env_read(ak_dir)
+    if not _back or _ak_env_tag(env_txt=_back) != _want:
+        _write_priv(_envp, _txt, perm=0o600)
+        raise RuntimeError('.env AUTHENTIK_TAG rewrite did not verify - previous file restored')
+    _log("  .env AUTHENTIK_TAG %s -> %s (this pin OVERRIDES the compose default)" % (_prev, _want))
+    return True, _prev
+
+
+def _ak_tags_from_text(txt):
+    """Extract goauthentik image tags from `docker compose config` output (or an SSH
+    capture of it). Shared by the local and remote Update paths."""
+    _tags = set()
+    for _m in re.finditer(r'ghcr\.io/goauthentik/\S+?:([^\s"\']+)', txt or ''):
+        _tags.add(_m.group(1).strip().strip('"').strip("'"))
+    return _tags
+
+
+def _ak_resolved_authentik_tags(ak_dir=None):
+    """Authentik image tags as `docker compose` ACTUALLY resolves them.
+
+    Returns (ok, tags, err). `docker compose config` is Compose's own verification command
+    and the only honest answer to "what will `up -d` start": it applies .env interpolation,
+    the `:-` defaults and the process environment together. CLAUDE.md's rule — never trust
+    the input config to mean the runtime is using it — is exactly what was missing here:
+    the old Update path wrote a file and believed it.
+
+    An empty tag set means "could not tell" (e.g. AUTHENTIK_IMAGE points at a non-ghcr
+    registry), not "wrong" — callers must not treat that as a failure."""
+    _d = ak_dir or os.path.expanduser('~/authentik')
+    try:
+        # cwd= (not _broker_compose's --project-directory): compose DISCOVERS the compose
+        # file from the working directory, and .env interpolation is read from there too.
+        # Same invocation shape as the pull/up chain below; the broker forwards cwd.
+        _r = subprocess.run(_sudo_wrap(['docker', 'compose', 'config']),
+                            cwd=_d, capture_output=True, text=True, timeout=90)
+    except Exception as _e:
+        return False, set(), str(_e)[:200]
+    if _r.returncode != 0:
+        return False, set(), ((_r.stderr or _r.stdout or '').strip()[-300:] or 'no output')
+    return True, _ak_tags_from_text(_r.stdout or ''), ''
 
 
 def _get_authentik_version_info():
@@ -27192,6 +27354,20 @@ def _get_authentik_version_info():
                     out['ahead_of_vetted'] = True
             except Exception:
                 out['update_available'] = True
+    # v10.1.39: surface the .env interpolation pin. Without this the page cannot tell the
+    # operator "the compose default says 2026.5.6 but .env is pinning 2026.2.2" — which is
+    # precisely the state that made Update look like it worked for 23 releases. Local path
+    # only: the remote (split-box) case would cost an extra SSH round trip on every page
+    # load, and the remote Update branch verifies the resolved tag itself.
+    out['env_tag'] = ''
+    out['pin_conflict'] = False
+    if _get_module_deployment_config(_s, 'authentik_deployment').get('target_mode') != 'remote':
+        try:
+            out['env_tag'] = _ak_env_tag()
+        except Exception:
+            pass
+        if out['env_tag'] and out['env_tag'] != target:
+            out['pin_conflict'] = True
     # Dev channel only: surface when UPSTREAM has shipped a release newer than our pin,
     # so the operator learns about new Authentik releases (e.g. a bugfix) without anyone
     # editing the pin first. Awareness ONLY — never changes what Update installs (the pin).
@@ -40514,9 +40690,50 @@ def authentik_control():
         elif action == 'restart':
             _ssh_probe(remote, f'cd {ak_dir} && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=180)
         elif action == 'update':
+            # v10.1.39: same fix as the local branch — the compose `:-` default alone is a
+            # no-op whenever .env defines AUTHENTIK_TAG, so converge .env too, verify with
+            # `docker compose config`, and check what is actually running afterwards.
             latest = _get_authentik_target_release(settings)
+            if not _ak_tag_is_sane(latest):
+                return jsonify({'error': f'Refusing to update: target release '
+                                         f'"{latest}" is not a valid Authentik version.'}), 500
             _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
-            _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=360)
+            # Rewrite an EXISTING active pin only (see _ak_env_pin_tag for why we do not
+            # create one). sed -i writes a temp file and renames, so .env is never left
+            # half-written. Perms are preserved by sed.
+            _ssh_probe(remote, f"cd {ak_dir} && (grep -qE '^[ \t]*AUTHENTIK_TAG[ \t]*=' .env 2>/dev/null && sed -i 's/^[ \t]*AUTHENTIK_TAG[ \t]*=.*/AUTHENTIK_TAG={latest}/' .env || true)", timeout=15)
+            _cok, _cout = _ssh_probe(remote, f'cd {ak_dir} && docker compose config 2>&1 | grep goauthentik', timeout=90)
+            if _cok:
+                _ctags = _ak_tags_from_text(_cout or '')
+                if _ctags and _ctags != {latest}:
+                    return jsonify({'error': f'Refusing to update {remote.get("host")}: compose '
+                                             f'resolves Authentik to '
+                                             f'{", ".join(sorted(_ctags))}, not {latest} alone. '
+                                             f'Something outside docker-compose.yml and .env is '
+                                             f'pinning the tag.'}), 500
+            _pok, _pout = _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=360)
+            if not _pok:
+                return jsonify({'error': f'Remote Authentik pull/recreate failed: '
+                                         f'{(_pout or "no output").strip()[-400:]}'}), 500
+            _rtag = ''
+            for _ in range(8):
+                time.sleep(2)
+                _rok, _rimg = _ssh_probe(remote, 'docker ps --filter name=authentik-server --format "{{.Image}}"', timeout=15)
+                _rfirst = ((_rimg or '').strip().split('\n') or [''])[0]
+                if _rok and ':' in _rfirst:
+                    _rtag = _rfirst.rsplit(':', 1)[1].strip()
+                if _rtag:
+                    break
+            if not _rtag:
+                return jsonify({'error': f'Authentik did not come back up on '
+                                         f'{remote.get("host")} after the update to '
+                                         f'v{latest}.'}), 500
+            if _rtag != latest:
+                return jsonify({'error': f'Update did not take on {remote.get("host")}: '
+                                         f'authentik-server is running v{_rtag}, expected '
+                                         f'v{latest}.'}), 500
+            return jsonify({'success': True, 'running': True, 'action': action,
+                            'version': _rtag})
         else:
             return jsonify({'error': 'Invalid action'}), 400
         time.sleep(3)
@@ -40532,18 +40749,92 @@ def authentik_control():
     elif action == 'restart':
         _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
     elif action == 'update':
+        # v10.1.39 (COPIX field report): this used to rewrite ONLY the compose
+        # `${AUTHENTIK_TAG:-<tag>}` default, which Docker Compose ignores whenever .env
+        # defines AUTHENTIK_TAG — so on any box carrying that pin (upstream Authentik's own
+        # documented way to version its compose) Update re-pulled the SAME image, recreated
+        # it, discarded the return code and reported success. Twenty-three releases of
+        # "update available" that could never be taken. Now: converge both halves of the
+        # interpolation contract, verify with `docker compose config` BEFORE pulling, and
+        # confirm the running image afterwards instead of assuming.
         import re as _re
         latest = _get_authentik_target_release(settings)
+        if not _ak_tag_is_sane(latest):
+            return jsonify({'error': f'Refusing to update: target release '
+                                     f'"{latest}" is not a valid Authentik version.'}), 500
         cp = os.path.join(ak_dir, 'docker-compose.yml')
-        if os.path.isfile(cp):
-            with open(cp) as _f:
-                _cc = _f.read()
-            _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
-            if _new != _cc:
-                with open(cp, 'w') as _f:
-                    _f.write(_new)
-        _ensure_authentik_compose_patches(cp)
-        _run_priv_chain([['docker', 'compose', 'pull'], ['docker', 'compose', 'down', '--timeout', '30'], ['docker', 'compose', 'up', '-d'], ['docker', 'image', 'prune', '-f']], 'and', timeout=360, cwd=ak_dir)
+        _inst = (_get_authentik_version_info().get('version') or '').strip()
+        # Never walk a box BACKWARDS. The badge only offers Update when target > running,
+        # but the button is always live — and now that the .env pin actually converges, a
+        # downgrade would TAKE where before .env silently absorbed it.
+        if _inst and _ak_ver_tuple(_inst) > _ak_ver_tuple(latest):
+            return jsonify({'error': f'Refusing to downgrade Authentik: v{_inst} is running, '
+                                     f'this channel targets v{latest}. Promote the vetted '
+                                     f'release instead of downgrading a live IdP.'}), 409
+        try:
+            # (a) The compose `:-` default — governs only while .env does NOT set the tag.
+            if os.path.isfile(cp):
+                _cc = None
+                try:
+                    with open(cp) as _f:
+                        _cc = _f.read()
+                except Exception:
+                    _cc = _read_priv(cp)      # root-owned compose on a flipped box
+                if _cc:
+                    _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
+                    if _new != _cc:
+                        _write_priv(cp, _new)
+            # (b) The .env pin — the half we never wrote. When present it OVERRIDES (a).
+            _ak_env_pin_tag(latest, ak_dir)
+            _ensure_authentik_compose_patches(cp)
+            # (c) VERIFY before pulling anything, with Compose's own verification command.
+            _cok, _ctags, _cerr = _ak_resolved_authentik_tags(ak_dir)
+            if not _cok:
+                return jsonify({'error': f'docker compose config failed - refusing to update '
+                                         f'a stack we cannot resolve: {_cerr}'}), 500
+            if _ctags and _ctags != {latest}:
+                return jsonify({'error': f'Refusing to update: compose resolves Authentik to '
+                                         f'{", ".join(sorted(_ctags))}, not {latest} alone. Something '
+                                         f'outside docker-compose.yml and .env is pinning the tag '
+                                         f'(the console process environment, a services.*.environment '
+                                         f'override, or a second env file).'}), 500
+            # (d) Pull + recreate, and BELIEVE the return code (it used to be discarded).
+            _last = _run_priv_chain([['docker', 'compose', 'pull'],
+                                     ['docker', 'compose', 'down', '--timeout', '30'],
+                                     ['docker', 'compose', 'up', '-d']],
+                                    'and', timeout=360, cwd=ak_dir)
+            if _last is None or _last.returncode != 0:
+                _err = ((_last.stderr or _last.stdout or '') if _last else '').strip()
+                return jsonify({'error': f'Authentik pull/recreate failed: '
+                                         f'{_err[-400:] or "no output"}'}), 500
+            # (e) Confirm the RUNNING image before claiming success, and only prune once it
+            #     is right — pruning after a failed upgrade throws away the rollback images.
+            _run_tag = ''
+            for _ in range(8):
+                time.sleep(2)
+                _pr = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server',
+                                                 '--format', '{{.Image}}']),
+                                     capture_output=True, text=True, timeout=10)
+                _img = (_pr.stdout or '').strip().split('\n')[0]
+                if _img and ':' in _img:
+                    _run_tag = _img.rsplit(':', 1)[1].strip()
+                if _run_tag:
+                    break
+            _authentik_release_cache['tag'] = None
+            if not _run_tag:
+                return jsonify({'error': f'Authentik did not come back up after the update to '
+                                         f'v{latest} (no authentik-server container running). '
+                                         f'Images were NOT pruned - check the Docker logs.'}), 500
+            if _run_tag != latest:
+                return jsonify({'error': f'Update did not take: authentik-server is running '
+                                         f'v{_run_tag}, expected v{latest}. Images were NOT '
+                                         f'pruned.'}), 500
+            _run_priv_chain([['docker', 'image', 'prune', '-f']], 'and', timeout=120, cwd=ak_dir)
+            return jsonify({'success': True, 'running': True, 'action': action,
+                            'version': _run_tag})
+        except Exception as _e:
+            _authentik_release_cache['tag'] = None
+            return jsonify({'error': f'Authentik update failed: {str(_e)[:400]}'}), 500
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(5)
@@ -51639,6 +51930,24 @@ entries:
                         except Exception:
                             lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
                             needs_write = True
+        # v10.1.39: converge the .env interpolation pin too, on the same never-downgrade
+        # rule as the compose default above. The loop above only touches the compose
+        # `:-default`, which Docker Compose IGNORES whenever .env defines AUTHENTIK_TAG —
+        # so a Deploy / "Update config" could log the right pin while compose kept
+        # resolving the old tag, and the next console update would do it again. Fixing
+        # only the Update button would leave that half of the path still lying.
+        try:
+            _env_pin = _ak_env_tag(ak_dir)
+            if _env_pin and _env_pin != ak_tag:
+                if _compose_fresh_download or _ak_ver_tuple(ak_tag) > _ak_ver_tuple(_env_pin):
+                    _ak_env_pin_tag(ak_tag, ak_dir, plog)
+                else:
+                    plog(f"  .env pins AUTHENTIK_TAG={_env_pin}, newer than target {ak_tag} - left alone")
+            elif _env_pin:
+                plog(f"  .env AUTHENTIK_TAG already {ak_tag}")
+        except Exception as _e:
+            plog(f"  ! .env AUTHENTIK_TAG converge failed ({_e}) - compose may still resolve the old tag")
+
         # Inject healthchecks for server and worker if missing (upstream compose may not have them)
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
             _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
