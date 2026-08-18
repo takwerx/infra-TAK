@@ -25526,6 +25526,19 @@ def _caddy_install_official_static(plog=None):
 _caddy_last_validate_error = {'err': '', 'ts': 0.0}
 
 
+def _caddy_validate_clean(out):
+    """Keep only the lines a human needs from `caddy validate` output.
+
+    caddy writes structured JSON log lines ({"level":"info",...}) to stdout before the
+    actual error, so a naive tail of the combined output reports a truncated fragment of a
+    log line instead of the parse error. Field-observed on aws-arm 2026-08-18, where the
+    message read `... does NOT parse: ided configuration","config_file":...`. Drop the JSON,
+    keep the diagnosis."""
+    keep = [ln.strip() for ln in (out or '').splitlines()
+            if ln.strip() and not ln.strip().startswith('{"level"')]
+    return ' '.join(keep).strip()
+
+
 def _caddy_validate_config(path=None, timeout=30):
     """Run Caddy's own adapter over `path`. Returns (verdict, output).
 
@@ -25542,7 +25555,7 @@ def _caddy_validate_config(path=None, timeout=30):
             return 'unknown', 'caddy binary not found'
         v = subprocess.run(['caddy', 'validate', '--config', cp, '--adapter', 'caddyfile'],
                            capture_output=True, text=True, timeout=timeout)
-        out = ((v.stdout or '') + (v.stderr or '')).strip()
+        out = _caddy_validate_clean(((v.stdout or '') + '\n' + (v.stderr or '')))
         if v.returncode == 0:
             return 'ok', out
         if 'permission denied' in out.lower():
