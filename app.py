@@ -16772,7 +16772,40 @@ def fail2ban_authentik_toggle_api():
                            capture_output=True)
             forwarder_msg = 'log forwarder started'
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
-        return jsonify({'ok': True, 'enabled': True, 'forwarder': forwarder_msg})
+        # v10.1.38 — ARM the jail, don't just switch it on.
+        #
+        # Until now this route wrote the jail, started the forwarder, returned
+        # enabled:true, and left AUTHENTIK_LOG_LEVEL alone. The level was raised ONLY by
+        # _f2b_selfheal_authentik_log_level() at console startup — so from the moment an
+        # operator enabled this jail until whenever the console next restarted, the
+        # console reported a live brute-force control that could not match a single line.
+        # `invalid_login` is a logger.info() call; at `warning` Authentik never writes it.
+        # That window is unbounded: days, or weeks.
+        #
+        # This is what the field report was (US-FED-NE, 2026-08-17): jail enabled
+        # 2026-08-15 18:24, reporting Active, 0 bans, .env at `warning`. Not a path bug —
+        # enabling the control simply never armed it.
+        #
+        # The heal is a no-op unless the level is exactly `warning`, so on a correctly
+        # configured box this costs one file read. When it does fire it recreates
+        # Authentik, which is why the outcome is returned for the UI to surface rather
+        # than done silently behind a toggle.
+        level_msg = ''
+        try:
+            if _f2b_selfheal_authentik_log_level():
+                level_msg = ('AUTHENTIK_LOG_LEVEL raised warning -> info and Authentik '
+                             'recreated — the jail could not have matched anything at '
+                             '`warning` (brief SSO interruption, once)')
+            else:
+                ok, lvl, why = _f2b_ak_log_level_verdict(force=True)
+                if ok is False:
+                    level_msg = 'WARNING: %s' % why
+                elif ok is None:
+                    level_msg = 'WARNING: could not verify Authentik can emit a matchable line (%s)' % why
+        except Exception as _e:
+            level_msg = 'WARNING: log-level check failed (%s)' % str(_e)[:80]
+        return jsonify({'ok': True, 'enabled': True, 'forwarder': forwarder_msg,
+                        'log_level': level_msg})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 

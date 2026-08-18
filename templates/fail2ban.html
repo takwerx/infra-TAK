@@ -688,7 +688,13 @@ function toggleAuthentikJail() {
   }).then(r=>r.json()).then(d=>{
     if (d.ok) {
       _applyAuthentikJailState(enabled);
-      if (enabled && d.forwarder) showToast('Authentik jail enabled — ' + d.forwarder, 'success');
+      if (enabled && d.log_level && d.log_level.indexOf('WARNING:') === 0) {
+        // The jail is on but cannot fire. Say so loudly rather than reporting success —
+        // a green toast over a decorative control is the whole fault this release fixes.
+        showToast(d.log_level.replace('WARNING: ', 'Jail enabled but INERT — '), 'error');
+      } else if (enabled && d.log_level) {
+        showToast('Authentik jail enabled — ' + d.log_level, 'success');
+      } else if (enabled && d.forwarder) showToast('Authentik jail enabled — ' + d.forwarder, 'success');
       else if (!enabled) showToast('Authentik jail disabled.', 'success');
       loadStatus();
     } else {
