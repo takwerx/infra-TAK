@@ -16115,7 +16115,7 @@ _AK_FORWARDER_UNIT = (
 )
 
 
-def _f2b_selfheal_authentik_log_level(plog=None):
+def _f2b_selfheal_authentik_log_level(plog=None, detail=None):
     """Flip AUTHENTIK_LOG_LEVEL warning -> info so the Authentik jail can actually fire.
 
     The only failed-login line carrying a client IP is
@@ -16185,17 +16185,37 @@ def _f2b_selfheal_authentik_log_level(plog=None):
     # on a box with a stale second copy, that path is the whole diagnosis.
     _log('fail2ban: AUTHENTIK_LOG_LEVEL warning -> info in %s. The Authentik '
          'brute-force jail matches logger.info("invalid_login"), so at `warning` it '
-         'could never fire — and never had. Recreating Authentik to apply; brief SSO '
-         'interruption, once.' % env_path)
+         'could never fire — and never had. Applying to the running Authentik.' % env_path)
+    # v10.1.38 — report what ACTUALLY happened, not what we intended.
+    #
+    # This previously announced "Recreating Authentik; brief SSO interruption, once"
+    # unconditionally. But `compose up -d` only recreates when the resolved config
+    # changed: if the container is already running at the target level (the file drifted
+    # but the process did not), it is a no-op and there is no interruption. Measured on
+    # test12 2026-08-18 — toast claimed a recreate while the container showed Up 12 hours.
+    # Claiming an outage that did not happen is the same class of fault as claiming
+    # protection that is not there; this release does not get to do one while fixing the
+    # other. The container ID before/after is the only honest test.
+    before = _ak_server_container_id()
+    ok = True
     try:
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
                            capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
-            _log('fail2ban: Authentik recreate returned %s — the new log level applies at '
+            ok = False
+            _log('fail2ban: Authentik apply returned %s — the new log level takes effect at '
                  'its next restart; jail stays dormant until then.'
                  % (r.stderr or r.stdout or '')[-160:].strip())
     except Exception as e:
-        _log(f'fail2ban: Authentik recreate failed ({e}) — new log level applies on next restart.')
+        ok = False
+        _log(f'fail2ban: Authentik apply failed ({e}) — new log level applies on next restart.')
+    recreated = bool(ok and before and _ak_server_container_id() != before)
+    if ok:
+        _log('fail2ban: Authentik %s.'
+             % ('recreated — one brief SSO interruption' if recreated
+                else 'was already running at that level; nothing restarted'))
+    if isinstance(detail, dict):
+        detail.update({'env_path': env_path, 'recreated': recreated, 'applied': ok})
     return True
 
 
@@ -16831,10 +16851,13 @@ def fail2ban_authentik_toggle_api():
         # than done silently behind a toggle.
         level_msg = ''
         try:
-            if _f2b_selfheal_authentik_log_level():
-                level_msg = ('AUTHENTIK_LOG_LEVEL raised warning -> info and Authentik '
-                             'recreated — the jail could not have matched anything at '
-                             '`warning` (brief SSO interruption, once)')
+            _heal = {}
+            if _f2b_selfheal_authentik_log_level(detail=_heal):
+                # Say only what happened. `compose up -d` is a no-op when the running
+                # container already matches, so "Authentik recreated" is not a given.
+                level_msg = ('log level raised to info; Authentik restarted'
+                             if _heal.get('recreated')
+                             else 'log level raised to info (no restart needed)')
             else:
                 ok, lvl, why = _f2b_ak_log_level_verdict(force=True)
                 if ok is False:
@@ -43137,6 +43160,19 @@ def _ak_live_compose_dir():
     except Exception:
         pass
     return None
+
+
+def _ak_server_container_id():
+    """Current authentik-server container ID, or '' if it is not running. Used to tell a
+    real recreate from a no-op `compose up -d` (v10.1.38)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=authentik-server']),
+                           capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.strip().split('\n')[0].strip()
+    except Exception:
+        pass
+    return ''
 
 
 def _find_authentik_install_dir():
