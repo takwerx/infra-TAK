@@ -52839,16 +52839,30 @@ entries:
             # "✓ Caddy config updated for Authentik" and then block 300 s waiting for a
             # certificate on a hostname Caddy had never been asked to serve.
             #
-            # On the reporter's box the Authentik vhost was never written at all:
-            # generate_caddyfile() emits it only `if ak.get('installed')`, and
-            # detect_modules() returned False there. Every downstream symptom — no cert,
-            # the 300 s stall, the LDAP outpost falling back to internal routing, 24/24 SA
-            # bind failures, "TAK enrollment will reject users" — descends from that, and
-            # not one line of the deploy log named it. The operator was told Caddy was
-            # updated. It was; it just did not contain Authentik.
+            # ROOT CAUSE — corrected in v10.1.39, once the reporter ran `caddy validate`.
+            # The vhost WAS written: generate_caddyfile() emitted it correctly, along with the
+            # console forward_auth. What failed was the RELOAD. Our own
+            # _emit_outpost_callback_rescue() writes the rescue page as a Caddyfile HEREDOC
+            # (respond <<CBRESCUE), and heredoc support only landed in Caddy 2.7.0 — on his
+            # older Caddy the entire config was rejected ("unrecognized directive: <!doctype"),
+            # so Caddy carried on serving its PREVIOUS config, which had no Authentik vhost.
+            # Hence no cert, the 300 s stall, the LDAP outpost falling back to internal routing,
+            # 24/24 SA bind failures and "TAK enrollment will reject users". Not one line of the
+            # deploy log named it. The operator was told Caddy was updated. It was written; it
+            # was never loaded.
             #
-            # Read the file back rather than trusting the call. generate_caddyfile()
-            # returns None, so the written artifact is the only evidence.
+            # An earlier reading of this blamed detect_modules() returning installed=False.
+            # That was WRONG — it rested on a truncated Caddyfile paste from the issue thread.
+            # Do not restore it.
+            #
+            # BOTH branches below are still needed: a missing vhost (detection genuinely off)
+            # and a written-but-never-loaded vhost (reload failed) are different failures. The
+            # reload-rc branch is the one that catches THIS bug.
+            #
+            # Read the file back rather than trusting the call — the written artifact is the
+            # evidence that matters, and it also covers a partial or failed write. (Note:
+            # generate_caddyfile() does return the caddyfile text; it returns None only on the
+            # early no-FQDN path.)
             #
             # TRAP: `tak.<fqdn>` is a SUFFIX of `infratak.<fqdn>`, so a bare substring test
             # matches the console's own vhost and reports success on every box. The emitter
