@@ -65453,10 +65453,31 @@ def _kernel_patch_start_job():
         'done\n'
         'if [ "$WAITED" -ge 1800 ]; then echo "[$(TS)] FATAL: apt/dpkg still busy after 30 min"; exit 1; fi\n'
         'echo "[$(TS)] apt-get update"\n'
-        'apt-get -o DPkg::Lock::Timeout=300 update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
+        # v10.1.40: Acquire::Retries. apt defaults to ZERO retries; dnf defaults to 10.
+        # apt was the outlier, and on 2026-08-19 a transient 503 from AWS's regional ports
+        # mirror (us-east-2.ec2.ports.ubuntu.com) failed the operator's update on aws-arm
+        # with nothing installed. Every failing URL returned 200 minutes later — one retry
+        # would have carried it. Same class as the v10.1.37 lock-wait: do not hand the
+        # operator a red FATAL panel for a transient upstream condition.
+        'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] apt-get full-upgrade -y (TAK Server packages held)"\n'
-        'apt-get -y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
-        '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
+        'UPGLOG="$(mktemp)"\n'
+        'apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
+        '  | tee "$UPGLOG"\n'
+        'rc=${PIPESTATUS[0]}\n'
+        'if [ "$rc" -ne 0 ]; then\n'
+        # A download failure and an install failure are NOT the same event and must not
+        # read the same. On a fetch failure apt installs nothing, so the box is untouched
+        # and the honest advice is "try again" — not the bare FATAL that sent the operator
+        # looking for a fault on their own machine.
+        '  if grep -qE "Failed to fetch|Unable to fetch some archives|503  Service Unavailable|Connection timed out|Temporary failure resolving" "$UPGLOG"; then\n'
+        '    echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc) — could not DOWNLOAD from the distribution mirror. Nothing was installed and this system is unchanged. Mirror outages are usually transient: run Install updates again in a few minutes."\n'
+        '  else\n'
+        '    echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"\n'
+        '  fi\n'
+        '  rm -f "$UPGLOG"; exit $rc\n'
+        'fi\n'
+        'rm -f "$UPGLOG"\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
     )
     if pkg_mgr == 'dnf':
@@ -65492,8 +65513,20 @@ def _kernel_patch_start_job():
             '  sleep 5; WAITED=$((WAITED+5))\n'
             'done\n'
             'echo "[$(TS)] dnf -y upgrade (TAK Server packages excluded)"\n'
-            "dnf -y upgrade --exclude='takserver*' 2>&1 \\\n"
-            '  || { rc=$?; echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc)"; exit $rc; }\n'
+            'UPGLOG="$(mktemp)"\n'
+            "dnf -y upgrade --exclude='takserver*' 2>&1 | tee \"$UPGLOG\"\n"
+            'rc=${PIPESTATUS[0]}\n'
+            'if [ "$rc" -ne 0 ]; then\n'
+            # Message parity with the apt leg. dnf already defaults to retries=10, so no
+            # retry knob is added here — only the honest fetch-vs-install distinction.
+            '  if grep -qiE "Failed to download|Cannot download|Error downloading packages|Could not resolve host|Connection timed out" "$UPGLOG"; then\n'
+            '    echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc) — could not DOWNLOAD from the distribution mirror. Nothing was installed and this system is unchanged. Mirror outages are usually transient: run Install updates again in a few minutes."\n'
+            '  else\n'
+            '    echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc)"\n'
+            '  fi\n'
+            '  rm -f "$UPGLOG"; exit $rc\n'
+            'fi\n'
+            'rm -f "$UPGLOG"\n'
             'echo "[$(TS)] === DONE — safe to reboot ==="\n'
         )
     _script_path = '/var/lib/infratak-kernel-patch.sh'
