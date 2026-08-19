@@ -389,21 +389,6 @@ PATH_ALLOW_READONLY = (
 
 # Exact privileged paths that are read/written but aren't directories.
 PATH_ALLOW_EXACT = (
-    # v10.1.40: the ONE logrotate rule the console writes. Exact path, not the
-    # /etc/logrotate.d/ prefix — a logrotate config can carry a postrotate script that
-    # runs as root, so the directory is not something to hand over wholesale.
-    #
-    # Why it has to be allowed at all: _f2b_ensure_authentik_logrotate() has been writing
-    # this file since v10.1.26 to bound /var/log/authentik/auth.log, and the broker has
-    # been DENYING it on every non-root box the whole time — silently, because the caller
-    # swallows the exception. The entire fleet is non-root, so the rotation has never once
-    # worked. Measured on test6 2026-08-19: auth.log 25,355,469 bytes, zero rotated
-    # siblings, growing unbounded on a file whose own code comment says "It has NEVER been
-    # rotated."
-    #
-    # Grants no new authority: /etc/systemd/system/ is already in PATH_ALLOW, and an
-    # arbitrary root unit is strictly more powerful than a postrotate hook.
-    '/etc/logrotate.d/infratak-authentik',
     '/etc/fstab',
     '/etc/os-release',
     '/etc/sysctl.conf',         # vm.overcommit_memory persistence (Redis BGSAVE fix)
