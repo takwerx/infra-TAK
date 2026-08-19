@@ -25889,6 +25889,58 @@ def _caddy_validate_or_restore(prev_contents, plog=None):
     return False, err
 
 
+def _ak_invalidate_all_sessions(plog=None):
+    """Delete every Authentik authenticated session. Returns (deleted, total).
+
+    v10.1.40 — the other half of the Caddy floor-lift. Lifting a box off Caddy < 2.7 repairs
+    the SERVER; it does nothing for a browser that already holds a session minted while the
+    proxy was mangling headers. Measured on test8 2026-08-19: with Caddy already back on
+    2.11.4 and the config correct, the operator authenticated cleanly — the Authentik log
+    shows `user: webadmin`, `amr: ["pwd","mfa"]`, `is_superuser: true` — and was immediately
+    bounced through `/if/flow/default-invalidation-flow/?id_token_hint=…` back to the sign-in
+    page. An incognito window worked first try; clearing site data fixed the normal one.
+
+    So the box heals and the human stays locked out, with nothing on screen explaining why,
+    and the only documented escape is DevTools → Clear site data — a CLI-class remedy we
+    treat as a product defect ([[feedback-ui-only-never-propose-cli]]). Killing the stale
+    sessions server-side turns that into an ordinary "please sign in again".
+
+    Only ever called after a floor-lift actually fired, i.e. on a box that WAS below 2.7 and
+    therefore had no working sessions worth preserving. A healthy box never reaches this."""
+    _log = plog or (lambda m: None)
+    try:
+        s = load_settings()
+        tok = (_get_authentik_env_value(s, 'AUTHENTIK_TOKEN')
+               or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not tok:
+            _log('could not invalidate stale SSO sessions — no Authentik API token on this box')
+            return (0, 0)
+        base = _get_authentik_api_url(s)
+        hdrs = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
+        uuids, page = [], 1
+        while page <= 20:                      # bounded; 20*100 sessions is far past real
+            r = _ak_api_call(f'{base}/api/v3/core/authenticated_sessions/'
+                             f'?page_size=100&page={page}', headers=hdrs, timeout=20)
+            d = json.loads(r.read().decode())
+            got = d.get('results') or []
+            uuids += [x.get('uuid') for x in got if x.get('uuid')]
+            if len(got) < 100:
+                break
+            page += 1
+        killed = 0
+        for u in uuids:
+            try:
+                _ak_api_call(f'{base}/api/v3/core/authenticated_sessions/{u}/',
+                             method='DELETE', headers=hdrs, timeout=15)
+                killed += 1
+            except Exception:
+                pass                            # one stubborn session must not stop the rest
+        return (killed, len(uuids))
+    except Exception as e:
+        _log(f'stale-session invalidation failed (non-fatal): {str(e)[:160]}')
+        return (0, 0)
+
+
 def _startup_caddy_selfheal():
     """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
 
@@ -25950,6 +26002,14 @@ def _startup_caddy_selfheal():
                 except Exception as _rg:
                     print('Startup migration: ⚠ Caddyfile regen after upgrade failed: %s'
                           % str(_rg)[:160], flush=True)
+                # Kill sessions minted while the proxy was mangling auth headers — they
+                # survive the upgrade and lock the user out of a box that is now healthy.
+                _k, _t = _ak_invalidate_all_sessions(
+                    lambda m: print('Startup migration:   %s' % m, flush=True))
+                if _t:
+                    print('Startup migration:   invalidated %d/%d Authentik session(s) minted '
+                          'while Caddy was below the floor — everyone signs in again once, '
+                          'instead of looping on a stale cookie' % (_k, _t), flush=True)
             else:
                 # Say it plainly. A box here serves every page and cannot log anyone in,
                 # which is harder to diagnose than an outage.
