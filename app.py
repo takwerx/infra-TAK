@@ -16524,10 +16524,14 @@ def _f2b_selfheal_ak_forwarder(plog=None):
     # safe because this file is the jail's private feed, not an audit record, and the
     # full stream remains in `docker logs`.
     try:
-        subprocess.run(_sudo_wrap(['truncate', '-s', '0', '/var/log/authentik/auth.log']),
-                       capture_output=True, timeout=15)
-    except Exception:
-        pass
+        # v10.1.40: was `truncate -s 0`, which the broker DENIES on every non-root box
+        # ("binary not in allow-list: truncate") — and the failure was swallowed, so the
+        # rewrite path believed it had cleared the file for eight releases. /var/log/ is
+        # already a broker write prefix, so an empty write does the same job through a
+        # path that is actually permitted, on root and non-root alike.
+        _write_priv('/var/log/authentik/auth.log', '')
+    except Exception as _tr_e:
+        _log(f'fail2ban: could not clear auth.log after the forwarder rebuild: {_tr_e}')
     try:
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
         # v10.1.40: clear any failed/rate-limited state, or the restart is refused.
