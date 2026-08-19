@@ -66757,13 +66757,24 @@ def _startup_ensure_broker():
             _self_restart = _broker_should_route() and _broker_available()
 
             def _broker_mainpid():
-                """Read-only, no privilege needed. '' when unknown."""
-                try:
-                    _p = subprocess.run(['systemctl', 'show', 'takwerx-broker', '-p', 'MainPID',
-                                         '--value'], capture_output=True, text=True, timeout=8)
-                    return (_p.stdout or '').strip()
-                except Exception:
-                    return ''
+                """Read-only, no privilege needed. '' when UNKNOWN (not when zero).
+
+                v10.1.40: timeout is generous on purpose. test12 runs at load ~8 and an
+                8s timeout here expired, returning '' — which an earlier cut of this code
+                read as "the daemon did not restart" and refused to stamp. Unknown is not
+                failure; see the caller."""
+                for _attempt in (1, 2):
+                    try:
+                        _p = subprocess.run(['systemctl', 'show', 'takwerx-broker', '-p',
+                                             'MainPID', '--value'],
+                                            capture_output=True, text=True, timeout=20)
+                        _v = (_p.stdout or '').strip()
+                        if _v:
+                            return _v
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                return ''
 
             # v10.1.40: capture the PID BEFORE the restart. On a self-restart the mediation
             # probe alone is not proof — the OLD daemon can answer it perfectly well if the
@@ -66781,10 +66792,19 @@ def _startup_ensure_broker():
             # console restart (test12 2026-07-17, 17:31:42-43 — 4s after the restart the
             # daemon still wasn't accepting). Downstream "brief waits" existed but guessed
             # too short under load; waiting HERE fixes every caller at once.
+            # v10.1.40: 30s was a guess (v10.1.4) and test12 disproves it. systemd reports
+            # takwerx-broker Stopping→Started within the SAME second there, yet the daemon
+            # was still not accepting on the socket 45s later at load ~8 — the Portal,
+            # CloudTAK and metrics converge steps all hit 'Connection refused' AFTER the
+            # 30s window had already expired. Because the verdict now feeds the stamp, a
+            # too-short wait means the box never converges and restarts the broker on every
+            # console start forever. This wait only runs when a restart actually happened,
+            # so the extra ceiling costs nothing on a settled box.
+            _BROKER_MEDIATE_SECS = 60
             _rw_ok = False
             if _broker_should_route():
                 _rw_t0 = time.time()
-                while time.time() - _rw_t0 < 30:
+                while time.time() - _rw_t0 < _BROKER_MEDIATE_SECS:
                     try:
                         if _broker_available():
                             _rw = subprocess.run(_sudo_wrap(['systemctl', '--version']),
@@ -66800,8 +66820,19 @@ def _startup_ensure_broker():
             # the daemon must also be a NEW process (see _pid_before).
             if _self_restart:
                 _pid_after = _broker_mainpid()
-                _restarted = bool(_pid_after) and _pid_after != '0' and _pid_after != _pid_before
-                _restart_ok = _rw_ok and _restarted
+                # THREE states, not two. `None` = inconclusive (we could not read a PID on
+                # one side or the other), and inconclusive must NEVER read as failure —
+                # that is the same trap as classifying `caddy validate`'s permission-denied
+                # as a bad config (GH #59). Here it would refuse to stamp a broker that
+                # restarted perfectly well, leaving the box in the very loop this fixes.
+                if _pid_before and _pid_after and _pid_after != '0':
+                    _restarted = (_pid_after != _pid_before)
+                else:
+                    _restarted = None
+                # Mediation is the primary proof: it is a positive liveness signal from the
+                # daemon itself. The PID check exists only to VETO the case where the OLD
+                # daemon answered because the restart never happened.
+                _restart_ok = _rw_ok and (_restarted is not False)
             else:
                 _restarted = True
                 _restart_ok = (_rr.returncode == 0)
@@ -66815,8 +66846,9 @@ def _startup_ensure_broker():
                 if _broker_should_route() and not _rw_ok:
                     # Restart judged OK but the daemon still is not answering: downstream
                     # migrations are about to race it, so say so (the v10.1.4 WS9 warning).
-                    print('Startup migration: ⚠ broker not mediating within 30s of its restart — '
-                          'later migrations may fail and will retry next console restart', flush=True)
+                    print(f'Startup migration: ⚠ broker not mediating within '
+                          f'{_BROKER_MEDIATE_SECS}s of its restart — later migrations may '
+                          'fail and will retry next console restart', flush=True)
             else:
                 # v10.1.13: never stamp a FAILED restart. Stamping it made the box
                 # believe the broker converged, so the stale daemon was never
@@ -66827,9 +66859,11 @@ def _startup_ensure_broker():
                 # v10.1.40: on a self-restart say WHICH signal failed. rc is not the
                 # evidence there — "the new daemon never answered within 30s" is.
                 if _self_restart:
-                    _why = ('the daemon did not restart (MainPID unchanged at '
-                            f'{_pid_before or "unknown"})' if not _restarted else
-                            'the new daemon did not mediate within 30s of its restart')
+                    if _restarted is False:
+                        _why = f'the daemon did not restart (MainPID still {_pid_before})'
+                    else:
+                        _why = (f'the new daemon did not answer within {_BROKER_MEDIATE_SECS}s '
+                                'of its restart')
                     print(f'Startup migration: ⚠ broker restart FAILED — {_why}. '
                           'Later migrations may fail; will retry next boot', flush=True)
                 else:
