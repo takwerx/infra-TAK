@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.38-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.38-alpha)**
+**Current release: [v10.1.39-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.39-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.39-alpha — 2026-08-19 — the update that could never finish, and a web-server config older servers could not read
+
+**Headline: two faults where the console reported a success it had not achieved — both found by people running it, not by us.** The first: on some installs, clicking **Update** on the identity provider pulled the same version down again, restarted it, and said it worked. The page kept offering the newer version, the operator kept clicking, and nothing ever moved — on one report, for twenty-three consecutive releases. The cause is that two files decide which version runs, and we were only ever writing the one the container system ignores whenever the other is present. **Both are written now**, the console asks the container system which version it has actually resolved *before* it downloads anything, and it confirms what ended up running instead of assuming. If it cannot move, it now says so plainly rather than showing a tick. The identity provider page also flags when a version is pinned somewhere that overrides the intended one, so an install stuck in this state is visible at a glance instead of quietly advertising an update forever. **The second is more serious, and it only affects machines that already had the Caddy web server installed before infra-TAK.** On those, the configuration we generate could be rejected outright, because it used a syntax that only exists in newer Caddy versions. What the operator saw was single sign-on never getting its certificate and enrolment ending in login errors that named no cause. What was actually happening is that the web server refused the whole configuration and carried on with its previous one — so the machine limped, apparently fine, until the next restart or reboot, at which point the web server **could not start at all** and every service behind it went down together. Four things change: the console now checks a configuration is loadable *before* anything applies it and puts the previous one back if it is not; it writes the older-compatible form when it detects an older web server; it upgrades a too-old web server during deployment instead of accepting it silently; and a machine already in this state repairs itself on the next console restart, with no intervention. **Who should update:** everyone — and with priority if you installed Caddy yourself before infra-TAK, or if your identity provider has been offering the same update for a while without ever taking it. **Upgrade:** automatic on the next console update, with nothing to configure.
+
+Full notes: [v10.1.39-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.39-alpha).
 
 ### v10.1.38-alpha — 2026-08-18 — a security control that cannot work now says so
 
