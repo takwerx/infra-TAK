@@ -25712,12 +25712,23 @@ def _caddy_validate_config(path=None, timeout=30):
     """Run Caddy's own adapter over `path`. Returns (verdict, output).
 
     verdict is 'ok' | 'bad' | 'unknown'. 'unknown' covers a missing/unrunnable caddy binary,
-    a timeout, and — importantly — a permission-denied result: on custom-cert
-    (ssl_mode='custom') non-root boxes this runs as takwerx, which cannot traverse
-    /var/lib/caddy (0750 caddy:caddy) to open the deployed cert copy, so validate fails on a
-    config the caddy service itself loads fine. That is inconclusive, NOT a bad config —
-    the same carve-out the W1 path already makes (~app.py:5981). Without it we would
-    "restore" a good config over a good config on every single write."""
+    a timeout, and — importantly — a permission-denied result. TWO different paths produce
+    that, and v10.1.39 shipped naming only the first:
+
+      1. custom-cert (ssl_mode='custom') non-root boxes: this runs as takwerx, which cannot
+         traverse /var/lib/caddy (0750 caddy:caddy) to open the deployed cert copy. This is
+         the W1 case (~app.py:5981).
+      2. the Caddy LOG file — and this is the one actually observed in the field. On `nuc`
+         during the GH #59 validation (2026-08-18), `caddy validate` run as the console user
+         failed with permission denied opening /var/log/caddy/takportal-access.log (0644
+         caddy:caddy), because validate sets up the log WRITER. nuc has NO ssl_mode set at
+         all, so the custom-cert explanation did not apply to it. Same class, different path.
+
+    Either way the config is fine and the caddy service loads it. That is inconclusive, NOT
+    a bad config. Without this carve-out _caddy_validate_or_restore() would "restore" a good
+    config over a good config on EVERY write on a non-root box — silently undoing every
+    module deploy. nuc logged zero self-heal lines during the 10.1.39 soak, which is the
+    correct quiet behaviour and the evidence this carve-out is load-bearing."""
     cp = path or CADDYFILE_PATH
     try:
         if not shutil.which('caddy'):
@@ -67143,6 +67154,63 @@ def _startup_repo_ownership_heal():
         print(f"Startup migration: repo ownership heal error (non-fatal): {_e}", flush=True)
 
 
+def _startup_normalize_git_refspec():
+    """v10.1.40 (C2): make `git fetch origin <branch>` actually update a tracking ref.
+
+    `remote.origin.fetch` is not uniform across the fleet and two of five boxes could not
+    pull `dev` with the canonical T&E command at all. Surveyed 2026-08-19:
+
+        test6, test8   +refs/heads/dev:refs/remotes/origin/dev   (dev only)
+        test12, nuc    +refs/heads/*:refs/remotes/origin/*       (correct)
+        aws-arm        (EMPTY)                                   (nothing ever updates)
+
+    With an empty or branch-scoped refspec, `git fetch origin dev` fetches the objects but
+    updates NO tracking ref, so the `git checkout -B dev origin/dev` that follows resolves
+    against a STALE origin/dev and the box silently stays on its previous SHA while the
+    command reports success. That is the "soaking the wrong SHA" hazard — found on aws-arm
+    2026-08-18 during GH #59 validation. T&E Step 2's SHA gate caught it, so the procedure
+    held, but a pull that silently no-ops should not depend on a downstream gate.
+
+    Converges every box on the git default. Console-owned file (.git/config), so no broker
+    and no privilege needed — and deliberately NOT in start.sh, because fixes have to ride
+    the console update ([[feedback-console-path-delivery]]).
+
+    Fleet-uniform by construction: one constant, written unconditionally when it differs.
+    Never a max()/preserve of whatever the box happened to have."""
+    WANT = '+refs/heads/*:refs/remotes/origin/*'
+    try:
+        repo = os.path.dirname(os.path.abspath(__file__))
+        if not os.path.isdir(os.path.join(repo, '.git')):
+            return
+        gitc = ['git', '-c', f'safe.directory={repo}']
+        cur = subprocess.run(gitc + ['config', '--get-all', 'remote.origin.fetch'],
+                             cwd=repo, capture_output=True, text=True, timeout=20)
+        have = [l.strip() for l in (cur.stdout or '').splitlines() if l.strip()]
+        if have == [WANT]:
+            return                                    # already converged — silent no-op
+        r = subprocess.run(gitc + ['config', '--replace-all', 'remote.origin.fetch', WANT],
+                           cwd=repo, capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            print(f"Startup migration: git refspec normalise FAILED: "
+                  f"{(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
+            return
+        # Verify rather than assume — this whole migration exists because a git command
+        # reported success while changing nothing.
+        chk = subprocess.run(gitc + ['config', '--get-all', 'remote.origin.fetch'],
+                             cwd=repo, capture_output=True, text=True, timeout=20)
+        now = [l.strip() for l in (chk.stdout or '').splitlines() if l.strip()]
+        if now == [WANT]:
+            print(f"Startup migration: git refspec normalised {have or ['(empty)']} -> "
+                  f"{WANT} — `git fetch origin <branch>` now updates its tracking ref",
+                  flush=True)
+        else:
+            print(f"Startup migration: ⚠ git refspec normalise did not take, still {now}",
+                  flush=True)
+    except Exception as _e:
+        print(f"Startup migration: git refspec normalise error (non-fatal): {_e}", flush=True)
+
+
+_startup_normalize_git_refspec()
 _startup_repo_ownership_heal()
 _startup_ensure_broker()
 
