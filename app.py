@@ -18250,6 +18250,14 @@ def _guarddog_health_check(service_id):
             s = socket.create_connection((db_host, db_port), timeout=5)
             s.close()
             return True
+    except subprocess.TimeoutExpired:
+        # v10.1.40: same carve-out as _monitor_health_check() below, and it matters MORE
+        # here — this function's caller does `'ok' if val else 'fail'`, so a timed-out
+        # probe painted a hard RED on the Console card rather than a caution. The probes
+        # above run on 2-5s timeouts (`ss` 2s, `systemctl is-active` 3s, `docker ps` 5s),
+        # which a box under load will blow through while being perfectly healthy.
+        # None means "no reading"; the caller already filters it (`if val is not None`).
+        return None
     except Exception:
         return False
     return False
@@ -18958,6 +18966,19 @@ def _monitor_health_check(monitor_id):
                 if not ok2:
                     return None
                 return 'OK' in (out2 or '')
+    except subprocess.TimeoutExpired:
+        # v10.1.40: a check that RAN OUT OF TIME has told us nothing — it is not a
+        # failing monitor. Returning False here made a loaded box report itself sick:
+        # every probe above runs on a 2-5s timeout, and on test6 at load ~8 one would
+        # intermittently expire, flip its service to 'caution' (some monitors pass,
+        # some "fail"), and yellow the Console module card — while the Guard Dog page,
+        # reading a 25s cache instead of running the checks live, stayed green. The
+        # operator sees a caution, clicks through, and finds nothing wrong.
+        # None is the documented third state and every caller already honours it
+        # (_compute_guarddog_overall filters `if v is not None`), so the machinery to
+        # say "unknown" was always there — this path just bypassed it.
+        # Same class as _caddy_validate_config()'s permission-denied carve-out.
+        return None
     except Exception:
         return False
     return None
