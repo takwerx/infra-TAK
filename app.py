@@ -23296,25 +23296,117 @@ def caddy_control():
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
 
+def _caddy_ensure_apt_repo(log_fn=None):
+    """Make sure the cloudsmith Caddy repo exists and apt has refreshed against it.
+
+    v10.1.40 — GH #59 residual, reproduced on test8 2026-08-19. The repo-add lives only in
+    run_caddy_deploy()'s Step 1, and the console shows no Deploy button once Caddy is
+    installed ([[no-redeploy-button-on-installed-modules]]). So the ONLY upgrade action an
+    operator can reach is /api/caddy/update, which ran
+
+        (apt update, then an install limited to *upgrades only*)
+
+    with no repo added first. On a box carrying a DISTRO Caddy (Ubuntu 22.04 universe 2.4.5, Debian
+    bookworm 2.6.2) the candidate therefore stays at the distro version, `--only-upgrade`
+    is a no-op, and the route returns success. Measured: clicking Update on a 2.6.2 box
+    left it on 2.6.2 while the UI said "Caddy updated successfully."
+
+    That is exactly what GH #59's reporter described ("tried your commands but it didn't
+    update the caddy installed") — he was right, and he had to replace the binary by hand.
+
+    Returns True when apt can see a Caddy candidate from cloudsmith."""
+    _log = log_fn or (lambda m: None)
+    listf = '/etc/apt/sources.list.d/caddy-stable.list'
+    env = _broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive',
+                            'NEEDRESTART_MODE': 'a'})
+    try:
+        if not os.path.exists(listf):
+            _log('Caddy repo missing — adding the cloudsmith repository')
+            # Prereqs go through the apt/dnf shim, never a bare package manager (CLAUDE.md).
+            _pkg_install(['debian-keyring', 'debian-archive-keyring',
+                          'apt-transport-https', 'curl'], log_fn=log_fn, timeout=180)
+            # These two genuinely need a shell (they are pipelines). Written as explicit
+            # literals rather than a loop variable so no variable is ever handed to
+            # shell=True — same commands run by run_caddy_deploy()'s Step 1.
+            _key = subprocess.run(
+                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" '
+                '| gpg --batch --yes --dearmor '
+                '-o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120, env=env)
+            if _key.returncode != 0:
+                _log(f'could not fetch the Caddy signing key: '
+                     f'{(_key.stderr or _key.stdout).strip()[:200]}')
+                return False
+            _src = subprocess.run(
+                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" '
+                '| tee /etc/apt/sources.list.d/caddy-stable.list 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120, env=env)
+            if _src.returncode != 0:
+                _log(f'could not write the Caddy sources list: '
+                     f'{(_src.stderr or _src.stdout).strip()[:200]}')
+                return False
+        subprocess.run('apt-get update -qq 2>&1', shell=True, capture_output=True,
+                       text=True, timeout=180, env=env)
+        return True
+    except Exception as e:
+        _log(f'Caddy repo setup error: {str(e)[:200]}')
+        return False
+
+
 @app.route('/api/caddy/update', methods=['POST'])
 @login_required
 def caddy_update():
-    """Upgrade Caddy to the latest apt package version and reload."""
+    """Upgrade Caddy to the latest package version and reload.
+
+    v10.1.40: this is the ONLY upgrade action the UI exposes once Caddy is installed, so it
+    must be able to lift a distro Caddy over the 2.7 floor the generated Caddyfile needs.
+    It could not: it never added the cloudsmith repo, so on a distro box the candidate was
+    the distro version, `--only-upgrade` did nothing, and this route reported success
+    anyway. Verified on test8 2026-08-19 — clicked Update on 2.6.2, UI said "Caddy updated
+    successfully", box stayed on 2.6.2. GH #59's reporter hit exactly this.
+    """
     try:
         settings = load_settings()
         pkg_mgr = settings.get('pkg_mgr', 'apt')
+        _before = _caddy_version_tuple(refresh=True)
         if pkg_mgr == 'apt':
-            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '--only-upgrade', '-y', 'caddy']], 'and', timeout=120)
+            # Repo FIRST — otherwise apt cannot see a newer Caddy at all.
+            _caddy_ensure_apt_repo()
+            # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
+            # different origin, and `install` is what moves it across. Already-current boxes
+            # are a no-op either way.
+            r = _run_priv_chain([['apt-get', 'update', '-qq'],
+                                 ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
         else:
+            _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
-                _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
         # Restart (not reload) — apt replaced the binary; reload only re-reads config and
         # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
             _sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-        return jsonify({'success': True, 'output': (r.stdout or '').strip()})
+        # v10.1.40: report what actually happened. "Updated successfully" over an unchanged
+        # version is how GH #59's reporter was told his Caddy had upgraded when it had not.
+        _after = _caddy_version_tuple(refresh=True)
+        _vs = lambda v: '.'.join(map(str, v)) if v else 'unknown'
+        _out = (r.stdout or '').strip()
+        if _after and _after < _CADDY_MIN_SUPPORTED:
+            return jsonify({
+                'success': False,
+                'error': (f'Caddy is still {_vs(_after)}, below the {_vs(_CADDY_MIN_SUPPORTED)} '
+                          'minimum this console generates config for. The package manager has no '
+                          'newer Caddy available on this box. Nothing was broken — the generated '
+                          'Caddyfile stays parseable — but the SSO callback-rescue page stays '
+                          'plain until Caddy is upgraded (GH #59).'),
+                'installed': _vs(_after), 'output': _out})
+        if _before and _after and _before == _after:
+            return jsonify({'success': True, 'no_change': True,
+                            'installed': _vs(_after),
+                            'output': _out or f'Caddy is already {_vs(_after)} — nothing to upgrade.'})
+        return jsonify({'success': True, 'installed': _vs(_after),
+                        'previous': _vs(_before), 'output': _out})
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'error': 'apt-get timed out'})
     except Exception as e:
