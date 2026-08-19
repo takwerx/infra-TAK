@@ -804,7 +804,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.39-alpha"
+VERSION = "10.1.40-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -66743,24 +66743,37 @@ def _startup_ensure_broker():
         active = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
                                 capture_output=True, text=True, timeout=8).stdout.strip()
         if unit_changed or active != 'active' or src_hash != old_hash:
+            # v10.1.40 (B3b): when the console routes through the broker — which is EVERY
+            # non-root box, i.e. the whole fleet — this is a SELF-restart: the daemon is
+            # killed by the very command it is executing, so the response never arrives and
+            # the client's return code says nothing about whether the restart worked. It
+            # always looked like a failure (rc=1, JSONDecodeError traceback pre-B3a; rc=125
+            # after it), the stamp was therefore never written, and the next console start
+            # restarted the broker again — forever, on every box. The restart itself always
+            # SUCCEEDED (broker ActiveEnterTimestamp ~6s after the console's, NRestarts=0).
+            # So: on a self-restart, judge by re-probing the new daemon, not by rc. That is
+            # exactly what the v10.1.4 (WS9) mediation wait below already does — it just was
+            # not wired to the verdict. See PLAN-v10.1.40 §3B/§4B.
+            _self_restart = _broker_should_route() and _broker_available()
+
+            def _broker_mainpid():
+                """Read-only, no privilege needed. '' when unknown."""
+                try:
+                    _p = subprocess.run(['systemctl', 'show', 'takwerx-broker', '-p', 'MainPID',
+                                         '--value'], capture_output=True, text=True, timeout=8)
+                    return (_p.stdout or '').strip()
+                except Exception:
+                    return ''
+
+            # v10.1.40: capture the PID BEFORE the restart. On a self-restart the mediation
+            # probe alone is not proof — the OLD daemon can answer it perfectly well if the
+            # restart silently never happened, and stamping that would recreate the exact
+            # v10.1.13 field wedge (box believes it converged, stale daemon denies verbs the
+            # console issues). Requiring a CHANGED MainPID makes "it actually restarted" the
+            # thing we verify, not "something is listening".
+            _pid_before = _broker_mainpid() if _self_restart else ''
             _rr = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']),
                                  capture_output=True, text=True, timeout=20)
-            if _rr.returncode == 0:
-                try:
-                    with open(stamp, 'w') as sf:
-                        sf.write(src_hash)
-                except OSError:
-                    pass
-                print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
-            else:
-                # v10.1.13: never stamp a FAILED restart. Stamping it made the box
-                # believe the broker converged, so the stale daemon was never
-                # retried — a console then issues verbs its own broker denies,
-                # and every privileged action fails until a manual start.sh
-                # (the 2026-07-28 field wedge). Leaving the old stamp makes the
-                # next console boot retry the restart.
-                print(f"Startup migration: ⚠ broker restart FAILED (rc={_rr.returncode}): "
-                      f"{(_rr.stderr or _rr.stdout or '').strip()[:200]} — will retry next boot", flush=True)
             # v10.1.4 (WS9): after the restart, BLOCK until the new daemon mediates a real
             # exec. The restart tears down the socket, and the module-level migrations that
             # run next (hardening posture re-assert, TAK Portal recreate, …) raced the new
@@ -66768,9 +66781,9 @@ def _startup_ensure_broker():
             # console restart (test12 2026-07-17, 17:31:42-43 — 4s after the restart the
             # daemon still wasn't accepting). Downstream "brief waits" existed but guessed
             # too short under load; waiting HERE fixes every caller at once.
+            _rw_ok = False
             if _broker_should_route():
                 _rw_t0 = time.time()
-                _rw_ok = False
                 while time.time() - _rw_t0 < 30:
                     try:
                         if _broker_available():
@@ -66782,9 +66795,46 @@ def _startup_ensure_broker():
                     except Exception:
                         pass
                     time.sleep(1)
-                if not _rw_ok:
+            # A self-restart's rc is meaningless (see above); a direct restart's rc is not.
+            # For the self-restart verdict, mediation is necessary but NOT sufficient —
+            # the daemon must also be a NEW process (see _pid_before).
+            if _self_restart:
+                _pid_after = _broker_mainpid()
+                _restarted = bool(_pid_after) and _pid_after != '0' and _pid_after != _pid_before
+                _restart_ok = _rw_ok and _restarted
+            else:
+                _restarted = True
+                _restart_ok = (_rr.returncode == 0)
+            if _restart_ok:
+                try:
+                    with open(stamp, 'w') as sf:
+                        sf.write(src_hash)
+                except OSError:
+                    pass
+                print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
+                if _broker_should_route() and not _rw_ok:
+                    # Restart judged OK but the daemon still is not answering: downstream
+                    # migrations are about to race it, so say so (the v10.1.4 WS9 warning).
                     print('Startup migration: ⚠ broker not mediating within 30s of its restart — '
                           'later migrations may fail and will retry next console restart', flush=True)
+            else:
+                # v10.1.13: never stamp a FAILED restart. Stamping it made the box
+                # believe the broker converged, so the stale daemon was never
+                # retried — a console then issues verbs its own broker denies,
+                # and every privileged action fails until a manual start.sh
+                # (the 2026-07-28 field wedge). Leaving the old stamp makes the
+                # next console boot retry the restart.
+                # v10.1.40: on a self-restart say WHICH signal failed. rc is not the
+                # evidence there — "the new daemon never answered within 30s" is.
+                if _self_restart:
+                    _why = ('the daemon did not restart (MainPID unchanged at '
+                            f'{_pid_before or "unknown"})' if not _restarted else
+                            'the new daemon did not mediate within 30s of its restart')
+                    print(f'Startup migration: ⚠ broker restart FAILED — {_why}. '
+                          'Later migrations may fail; will retry next boot', flush=True)
+                else:
+                    print(f"Startup migration: ⚠ broker restart FAILED (rc={_rr.returncode}): "
+                          f"{(_rr.stderr or _rr.stdout or '').strip()[:200]} — will retry next boot", flush=True)
     except PermissionError:
         pass
     except Exception as _e:

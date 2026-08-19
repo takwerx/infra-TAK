@@ -2717,7 +2717,16 @@ def cli_exec(args):
         req['timeout'] = min(_env_t, MAX_TIMEOUT)
     try:
         resp = client_send(req, timeout=(req.get('timeout') or DEFAULT_TIMEOUT) + 60)
-    except (OSError, socket.timeout) as e:
+    except (OSError, socket.timeout, ValueError) as e:
+        # v10.1.40 (B3a): ValueError covers json.JSONDecodeError (and UnicodeDecodeError),
+        # which client_send's closing json.loads() raises whenever the daemon dies
+        # mid-request and the response comes back empty or truncated. It was NOT caught
+        # here, so it escaped main() as an unhandled traceback and the process exited 1
+        # instead of the 125 this path documents. The console's _startup_ensure_broker()
+        # then read rc=1 as a FAILED restart, refused (correctly, v10.1.13) to stamp it,
+        # and the stale .broker_srcstamp made it restart the broker again on the NEXT
+        # console start — forever, on every box in the fleet. Any mid-request daemon
+        # death hit this, not just the self-restart; see PLAN-v10.1.40 §4B.
         sys.stderr.write(f'takwerx_broker: cannot reach broker: {e}\n')
         return 125
     if not resp.get('ok'):
