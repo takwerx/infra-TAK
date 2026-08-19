@@ -25900,6 +25900,67 @@ def _startup_caddy_selfheal():
     restart. Rides the console update, never start.sh ([[feedback-console-path-delivery]])."""
     if not os.path.exists(CADDYFILE_PATH):
         return
+
+    # v10.1.40 — LIFT THE BOX OVER THE 2.7 FLOOR, not just make its config parse.
+    #
+    # v10.1.39 stopped a Caddy < 2.7 box from being catastrophically broken: no heredoc
+    # below 2.7, so the config parses and every vhost serves. Proven on test8 2026-08-19 —
+    # downgraded to 2.6.2, all 13 vhosts died, a console restart regenerated a parseable
+    # file and they all came back.
+    #
+    # But "serving" is not "working". Measured on that same box: with Caddy 2.6.2 every
+    # site returned 200/302 while SSO LOGIN LOOPED — user, password, authenticator, back to
+    # the sign-in page. Cause, confirmed by diffing `caddy adapt` output between 2.6.2 and
+    # 2.11.4 on the identical Caddyfile: 2.7 rewrote how `copy_headers` compiles. 2.11.4
+    # emits, per header, a delete followed by a set guarded on the upstream having returned
+    # a non-empty value. 2.6.2 emits an UNCONDITIONAL set, so an unauthenticated request
+    # reaches the console carrying a full set of empty/unresolved X-Authentik-* headers and
+    # the session logic never settles. That behaviour is not expressible in the old
+    # Caddyfile syntax, so it cannot be worked around in the generator.
+    #
+    # Dropping the forward_auth blocks below 2.7 would be worse — they ARE the auth gate.
+    # So the only correct repair is to stop the box being below 2.7. The deploy gate and
+    # (since this release) the Update button both do that, but each needs an operator to
+    # click something, and a box left alone sits in the looping state indefinitely. Do it
+    # here, unattended, the same way the Authentik log forwarder self-heals.
+    try:
+        _cv0 = _caddy_version_tuple(refresh=True)
+        if _cv0 and _cv0 < _CADDY_MIN_SUPPORTED:
+            _v0s = '.'.join(map(str, _cv0))
+            _mins = '.'.join(map(str, _CADDY_MIN_SUPPORTED))
+            print('Startup migration: Caddy %s is below the %s floor — SSO login loops on '
+                  'this version (copy_headers compiles differently before 2.7). Upgrading…'
+                  % (_v0s, _mins), flush=True)
+            if (load_settings().get('pkg_mgr', 'apt') or 'apt').lower() == 'apt':
+                _caddy_ensure_apt_repo(lambda m: print('Startup migration:   %s' % m, flush=True))
+                _pkg_install('caddy', log_fn=lambda m: print('Startup migration:   %s' % m,
+                                                             flush=True), timeout=300)
+            else:
+                _caddy_install_official_static(lambda m: print('Startup migration:   %s' % m,
+                                                              flush=True))
+            _cv1 = _caddy_version_tuple(refresh=True)
+            if _cv1 and _cv1 >= _CADDY_MIN_SUPPORTED:
+                print('Startup migration: ✓ Caddy %s → %s; regenerating the Caddyfile so the '
+                      'styled rescue page and conditional auth headers come back'
+                      % (_v0s, '.'.join(map(str, _cv1))), flush=True)
+                try:
+                    generate_caddyfile(load_settings())
+                    subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
+                                   capture_output=True, timeout=90)
+                except Exception as _rg:
+                    print('Startup migration: ⚠ Caddyfile regen after upgrade failed: %s'
+                          % str(_rg)[:160], flush=True)
+            else:
+                # Say it plainly. A box here serves every page and cannot log anyone in,
+                # which is harder to diagnose than an outage.
+                print('Startup migration: ⚠ Caddy is STILL %s (< %s). Sites will serve but '
+                      'SSO LOGIN WILL LOOP. Upgrade Caddy on this box (console → Caddy → '
+                      'Update), or the package manager has no newer version available.'
+                      % ('.'.join(map(str, _cv1)) if _cv1 else 'unknown', _mins), flush=True)
+    except Exception as _cvE:
+        print('Startup migration: Caddy version floor check error (non-fatal): %s'
+              % str(_cvE)[:160], flush=True)
+
     verdict, out = _caddy_validate_config()
     if verdict == 'ok':
         return
