@@ -16403,6 +16403,52 @@ def _f2b_ensure_authentik_logrotate(plog=None):
         return False
 
 
+def _f2b_start_ak_forwarder(plog=None):
+    """Start authentik-log-forwarder.service and REPORT whether it actually started.
+
+    v10.1.40. Every previous start site did a bare
+        systemctl enable --now authentik-log-forwarder
+    with capture_output=True and no return-code check. Two ways that lies:
+
+    1. A unit in `failed` state that has tripped systemd's start rate limit refuses
+       every start with "start request repeated too quickly" until someone runs
+       `reset-failed`. Nothing in the codebase ever did. This is why toggling the
+       Authentik jail off and on did NOT recover Charles Laird's box (NC, v10.1.39) —
+       the console ran the start, systemd declined, the return code was discarded, and
+       the UI reported "log forwarder started" over a forwarder that was still dead.
+    2. Even without the rate limit, a start that fails for any other reason was
+       invisible for the same reason.
+
+    So: clear the failed state first, start, then VERIFY with is-active and hand the
+    caller the truth. Returns (ok: bool, msg: str)."""
+    _log = plog or (lambda m: None)
+    try:
+        # Harmless when the unit is not failed; the whole point is that we cannot know.
+        subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'authentik-log-forwarder']),
+                       capture_output=True, timeout=20)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now',
+                                       'authentik-log-forwarder']),
+                           capture_output=True, text=True, timeout=40)
+    except Exception as e:
+        _log(f'fail2ban: could not start the Authentik log forwarder: {e}')
+        return (False, f'log forwarder start failed: {str(e)[:120]}')
+    # Never trust rc alone here — verify the daemon agrees it is running.
+    try:
+        active = subprocess.run(['systemctl', 'is-active', 'authentik-log-forwarder'],
+                                capture_output=True, text=True, timeout=15
+                                ).stdout.strip() == 'active'
+    except Exception:
+        active = False
+    if active:
+        return (True, 'log forwarder started')
+    err = ((r.stderr or r.stdout or '').strip() or 'no error reported')[:200]
+    _log(f'fail2ban: the Authentik log forwarder did NOT start — {err}')
+    return (False, f'log forwarder FAILED to start: {err}')
+
+
 def _f2b_selfheal_ak_forwarder(plog=None):
     """Bring the Authentik log forwarder up to the current, working definition.
 
@@ -16460,12 +16506,8 @@ def _f2b_selfheal_ak_forwarder(plog=None):
             return False
         if not _ak_up:
             return False                  # Authentik down: nothing to forward yet
-        try:
-            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now',
-                                       'authentik-log-forwarder']),
-                           capture_output=True, timeout=30)
-        except Exception as e:
-            _log(f'fail2ban: could not start the Authentik log forwarder: {e}')
+        _ok, _m = _f2b_start_ak_forwarder(plog)
+        if not _ok:
             return False
         _log('fail2ban: the Authentik log forwarder was stopped while its jail was '
              'enabled — restarted it. Nothing writes /var/log/authentik/auth.log while '
@@ -16488,6 +16530,9 @@ def _f2b_selfheal_ak_forwarder(plog=None):
         pass
     try:
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        # v10.1.40: clear any failed/rate-limited state, or the restart is refused.
+        subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'authentik-log-forwarder']),
+                       capture_output=True, timeout=20)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'authentik-log-forwarder']),
                        capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
@@ -16941,9 +16986,10 @@ def fail2ban_authentik_toggle_api():
             capture_output=True, text=True).stdout
         forwarder_msg = 'log forwarder not started (Authentik not running)'
         if 'authentik' in ak_running:
-            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
-                           capture_output=True)
-            forwarder_msg = 'log forwarder started'
+            # v10.1.40: was a bare enable --now with the return code discarded, so a
+            # rate-limited/failed unit reported success while staying dead (Charles
+            # Laird, NC — toggling the jail off/on "worked" and changed nothing).
+            _fok, forwarder_msg = _f2b_start_ak_forwarder()
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         # v10.1.38 — ARM the jail, don't just switch it on.
         #
@@ -69060,9 +69106,12 @@ def _fail2ban_install_and_configure(plog):
         _sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
         capture_output=True, text=True).stdout
     if 'authentik' in ak_running:
-        subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
-                       capture_output=True)
-        plog("fail2ban migration: Authentik detected — log forwarder enabled and started")
+        # v10.1.40: report what actually happened. This used to print
+        # "enabled and started" unconditionally, over a start whose return code was
+        # discarded — so a refused start read as a success in the deploy log.
+        _fok, _fmsg = _f2b_start_ak_forwarder(plog)
+        plog("fail2ban migration: Authentik detected — %s"
+             % ('log forwarder enabled and started' if _fok else _fmsg))
     else:
         plog("fail2ban migration: Authentik not running — log forwarder will start when Authentik jail is enabled")
     subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
