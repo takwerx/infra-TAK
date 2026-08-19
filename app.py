@@ -25995,13 +25995,39 @@ def _startup_caddy_selfheal():
                 print('Startup migration: ✓ Caddy %s → %s; regenerating the Caddyfile so the '
                       'styled rescue page and conditional auth headers come back'
                       % (_v0s, '.'.join(map(str, _cv1))), flush=True)
-                try:
-                    generate_caddyfile(load_settings())
-                    subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
-                                   capture_output=True, timeout=90)
-                except Exception as _rg:
-                    print('Startup migration: ⚠ Caddyfile regen after upgrade failed: %s'
-                          % str(_rg)[:160], flush=True)
+                # Regenerate, then CONFIRM the new file parses — and retry once if it does
+                # not. v10.1.40: the apt upgrade takes ~2 minutes (repo add + update +
+                # install), and a single version probe taken while dpkg is still swapping
+                # /usr/bin/caddy can report >= 2.7 a moment before the binary on disk really
+                # is. The generator then emits a heredoc that the not-yet-replaced binary
+                # rejects ("unrecognized directive: <!doctype"), generate_caddyfile's own
+                # backstop restores the previous file, and the box keeps the PLAIN rescue
+                # page until something else regenerates. Observed once on test8 2026-08-19;
+                # a second run won the race and succeeded, which is what makes it a race.
+                # Never fatal — the GH #59 backstop means a bad file is never applied — but
+                # re-probing and retrying gets the styled page back on the first pass.
+                for _rgn in (1, 2):
+                    try:
+                        generate_caddyfile(load_settings())
+                        _vv, _ = _caddy_validate_config()
+                        if _vv != 'bad':
+                            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
+                                           capture_output=True, timeout=90)
+                            break
+                        if _rgn == 1:
+                            print('Startup migration:   regenerated Caddyfile did not parse '
+                                  '(binary likely still settling) — re-probing and retrying',
+                                  flush=True)
+                            time.sleep(8)
+                            _caddy_version_tuple(refresh=True)
+                        else:
+                            print('Startup migration: ⚠ Caddyfile still does not parse after '
+                                  'the Caddy upgrade; previous config retained (rescue page '
+                                  'stays plain until the next regeneration)', flush=True)
+                    except Exception as _rg:
+                        print('Startup migration: ⚠ Caddyfile regen after upgrade failed: %s'
+                              % str(_rg)[:160], flush=True)
+                        break
                 # Kill sessions minted while the proxy was mangling auth headers — they
                 # survive the upgrade and lock the user out of a box that is now healthy.
                 _k, _t = _ak_invalidate_all_sessions(
