@@ -129,7 +129,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Installing operating system updates &mdash; <span id="kpatch-pid"></span></div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Detached from console &mdash; safe to close this tab. Job runs to completion regardless. Typical time: 2-5 min.</div></div>
 </div>
-<pre id="kpatch-log" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+<pre id="kpatch-log" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:180px;overflow-y:auto;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
 <div id="kpatch-done" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
@@ -139,7 +139,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button id="kpatch-reboot-btn" onclick="rebootForKernelPatch()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
 <button id="kpatch-done-dismiss" onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Close</button>
 </div></div>
-<pre id="kpatch-log-done" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:10px;font-size:10px;color:var(--text-dim);max-height:140px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+<pre id="kpatch-log-done" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:10px;font-size:10px;color:var(--text-dim);max-height:140px;overflow-y:auto;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
 <div id="kpatch-error" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
@@ -149,7 +149,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Retry</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
 </div></div>
-<pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+<pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
 </div>
 <!-- v10.1.9 W8 — disk-reclaim card. Hidden unless /api/guarddog/disk-layout reports
@@ -783,7 +783,7 @@ function _kpatchRenderDone(d){
         :' Nothing needs a reboot.');
     if(rb)rb.style.display=needsReboot?'':'none';
     if(dz)dz.textContent=needsReboot?"I'll reboot later":'Close';
-    document.getElementById('kpatch-log-done').textContent=(d&&d.log_tail)||'';
+    setLogPane('kpatch-log-done',(d&&d.log_tail)||'');
     // The pending list is stale the moment the job lands.
     fetch('/api/os-updates?refresh=1',{credentials:'same-origin',cache:'no-store'}).catch(function(){});
 }
@@ -891,7 +891,7 @@ async function checkKernelPatch(){
             banner.style.display='block';
             _kpatchShowState('running');
             document.getElementById('kpatch-pid').textContent='pid '+(jd.pid||'?');
-            document.getElementById('kpatch-log').textContent=jd.log_tail||'(no output yet)';
+            setLogPane('kpatch-log',jd.log_tail||'(no output yet)');
             _kpatchStartPolling();
             return;
         }
@@ -918,7 +918,7 @@ async function checkKernelPatch(){
         if(jd && jd.error){
             banner.style.display='block';
             _kpatchShowState('error');
-            document.getElementById('kpatch-log-error').textContent=jd.log_tail||'';
+            setLogPane('kpatch-log-error',jd.log_tail||'');
             return;
         }
     }catch(e){}
@@ -1092,6 +1092,20 @@ async function rebootForKernelPatch(){
 }
 checkKernelPatch();
 var updateBody='';
+function setLogPane(id,text){
+    /* v10.1.40: a log pane must open at the END. `textContent=` resets scrollTop to 0,
+       so these panes always showed the HEAD of the tail while the outcome line
+       (=== DONE / FATAL) sits at the BOTTOM. Field cost: an operator read a tail that
+       appeared to stop before the DONE marker — it was 22 bytes below the fold — and a
+       whole session went down a dead "the marker fell out of the window" lead.
+       Scroll only when already at/near the bottom OR on first fill, so an operator who
+       has deliberately scrolled up to read something is not yanked back down. */
+    var el=document.getElementById(id); if(!el) return;
+    var wasEmpty=!el.textContent;
+    var atBottom=(el.scrollHeight-el.scrollTop-el.clientHeight)<24;
+    el.textContent=text;
+    if(wasEmpty||atBottom){el.scrollTop=el.scrollHeight;}
+}
 async function checkUpdate(forceRefresh){
     var btn=document.getElementById('check-release-btn');
     if(btn){btn.disabled=true;btn.textContent='Checking...';}
@@ -1103,7 +1117,12 @@ async function checkUpdate(forceRefresh){
             document.getElementById('update-banner').style.display='block';
             document.getElementById('update-info').textContent='v'+d.current+' -> v'+d.latest+(d.notes?' - '+d.notes:'');
             updateBody=d.body||'No details available';
-        }else if(forceRefresh&&btn){btn.textContent='Up to date';setTimeout(function(){btn.textContent='Check for new release';},2000);}
+        }else if(d.check_failed){
+            /* v10.1.40: the server could not find out. Never print "Up to date" over a
+               GitHub rate-limit, DNS blip or timeout — that is a box quietly telling you
+               it is current while it has no idea. */
+            if(forceRefresh&&btn){btn.textContent='Check failed';btn.title=d.error||'Could not reach GitHub';}
+        }else if(forceRefresh&&btn){btn.textContent='Up to date';btn.title='';setTimeout(function(){btn.textContent='Check for new release';},2000);}
     }catch(e){if(forceRefresh&&btn)btn.textContent='Check failed';}
     if(btn){btn.disabled=false;if(btn.textContent==='Checking...'||btn.textContent==='Check failed')setTimeout(function(){btn.textContent='Check for new release';},2000);}
 }

@@ -6622,7 +6622,8 @@ def update_check():
             dev_data = json.loads(dev_resp.read().decode())
             if not dev_data:
                 return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'dev',
-                    'error': 'No commits on dev', 'body': '', 'update_available': False})
+                    'error': 'No commits on dev', 'body': '', 'update_available': False,
+                    'check_failed': True})
             head = dev_data[0]
             head_sha = head.get('sha', '')[:7]
             head_msg = (head.get('commit', {}).get('message', '') or '').splitlines()[0][:80]
@@ -6644,8 +6645,14 @@ def update_check():
             return _update_check_response({'current': VERSION, 'latest': latest_label, 'notes': notes,
                 'body': body, 'channel': 'dev', 'update_available': _is_ahead})
         except Exception as e:
+            # v10.1.40: check_failed distinguishes "I could not find out" from "there is
+            # nothing new". Without it the UI's `else` branch printed "Up to date" over a
+            # GitHub rate-limit (unauthenticated = 60/hour/IP, and the Guard Dog updates
+            # watcher spends from the same bucket), a DNS blip or a 5s timeout — so a box
+            # could stop seeing console updates for an hour and say it was current.
             return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'dev',
-                'error': str(e)[:200], 'body': '', 'update_available': False})
+                'error': str(e)[:200], 'body': '', 'update_available': False,
+                'check_failed': True})
 
     # Main channel: existing tag-based check.
     force = request.args.get('refresh') == '1'
@@ -6668,7 +6675,7 @@ def update_check():
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode())
         if not data:
-            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No tags found', 'body': '', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No tags found', 'body': '', 'update_available': False, 'check_failed': True})
         # Only surface tags that are actually on the main branch so that tags
         # pushed on dev before a merge-to-main don't show as "update available".
         try:
@@ -6691,7 +6698,7 @@ def update_check():
             except (ValueError, IndexError):
                 continue
         if not versions:
-            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No version tags', 'body': '', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No version tags', 'body': '', 'update_available': False, 'check_failed': True})
         versions.sort(key=lambda x: x[0], reverse=True)
         latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
@@ -6711,7 +6718,7 @@ def update_check():
         return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': body,
             'channel': 'main', 'update_available': is_newer})
     except Exception as e:
-        return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': str(e)[:200], 'body': '', 'update_available': False})
+        return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': str(e)[:200], 'body': '', 'update_available': False, 'check_failed': True})
 
 def _fetch_latest_tag_name():
     """Return the latest release tag name (e.g. 'v0.2.3-alpha') from GitHub, or None on error."""
