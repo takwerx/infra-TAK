@@ -2490,6 +2490,27 @@ def _apply_authentik_session():
             return False
     session['authenticated'] = True
     session['authentik_username'] = uname
+    # v10.1.40: stamp the idle clock at the moment SSO authenticates.
+    #
+    # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
+    # itself. Of the three paths that establish an authenticated session, the password
+    # path at index() POST calls session.clear() first (so a stale value cannot survive),
+    # but THIS path and the other did not, leaving whatever the browser's cookie already
+    # carried. A returning user whose cookie held a last_activity older than idle_max was
+    # therefore re-authenticated by forward_auth and then, on the very next request, had
+    # the idle lock fire against a timestamp from their PREVIOUS visit — bounced to
+    # /outpost.goauthentik.io/sign_out and round the invalidation flow again.
+    #
+    # Verified on test8 2026-08-19 by forging a session cookie with last_activity two
+    # hours old and replaying it with the forward_auth headers: the console answered
+    # 302 -> https://infratak.<fqdn>/outpost.goauthentik.io/sign_out and cleared the
+    # cookie. That is the first hop of the loop the operator kept hitting, where the only
+    # reliable escape was clearing site data.
+    #
+    # Authenticating IS activity, so this is the correct value regardless of whether it
+    # fully explains that loop — the console is reachable on several vhosts and each keeps
+    # its own cookie, so a stale one on a sibling host can still bounce once.
+    session['last_activity'] = int(time.time())
     return True
 
 def login_required(f):
@@ -4424,6 +4445,7 @@ def index():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['authenticated'] = True
+            session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
         return render_template('login.html', error='Invalid password', version=VERSION, login_logo_url=logo_url)
