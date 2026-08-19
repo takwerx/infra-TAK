@@ -15777,6 +15777,39 @@ def _f2b_dead_jails():
         lp = lm.group(1)
         try:
             if os.path.getsize(lp) == 0 and not _f2b_log_has_rotated_history(lp):
+                # v10.1.40 — the Authentik jail is NOT covered by the 0-byte rule, and
+                # treating it as if it were is a false alarm.
+                #
+                # The STARVING test assumes "a log that has never received one byte is
+                # unambiguous". True for takportal, whose writer emits routine traffic.
+                # FALSE here: this feed is
+                #     docker logs -f authentik-server-1 | grep -F invalid_login >> auth.log
+                # so it writes ONLY when a login actually fails. A healthy box on which
+                # nobody has ever mistyped a password has a legitimately 0-byte auth.log
+                # and a perfectly armed jail. Reporting that as "protecting nothing" is
+                # the same cry-wolf failure the rotated-log carve-out above exists to
+                # prevent, and it reached a customer (Charles Laird, NC, v10.1.39).
+                #
+                # The signal that actually distinguishes the two cases is whether the
+                # FORWARDER is running — which the console already computes for its
+                # status badge and, until now, never used here.
+                if name == 'authentik':
+                    try:
+                        _fwd = subprocess.run(
+                            ['systemctl', 'is-active', 'authentik-log-forwarder'],
+                            capture_output=True, text=True, timeout=10
+                            ).stdout.strip() == 'active'
+                    except Exception:
+                        _fwd = None       # inconclusive — do NOT convict on it
+                    if _fwd is not False:
+                        continue          # feed alive (or unknown): armed, nothing to log yet
+                    dead.append((name, filt,
+                                 'the Authentik log forwarder (authentik-log-forwarder.'
+                                 'service) is not running, so nothing writes %s and this '
+                                 'jail has no feed. The console restarts it automatically '
+                                 'on startup; to fix it now, toggle the Authentik jail off '
+                                 'and on.' % lp))
+                    continue
                 dead.append((name, filt,
                              'loaded, but its log %s is 0 bytes and has no rotated '
                              'history — nothing has ever written to it, so this jail '
@@ -16112,11 +16145,29 @@ _AK_FORWARDER_EXEC = ("ExecStart=/bin/bash -c 'docker logs -f authentik-server-1
                       "| grep --line-buffered -F invalid_login "
                       ">> /var/log/authentik/auth.log'\n")
 
+# v10.1.40 marker. Bump this string whenever the unit body changes so
+# _f2b_selfheal_ak_forwarder() can recognise an out-of-date unit without having to
+# enumerate every broken generation that ever shipped.
+_AK_FORWARDER_MARK = '# infratak-forwarder-rev2'
+
 _AK_FORWARDER_UNIT = (
     "[Unit]\n"
+    f"{_AK_FORWARDER_MARK}\n"
     "Description=Authentik Docker Log Forwarder for fail2ban\n"
     "After=docker.service\n"
-    "Requires=docker.service\n\n"
+    # v10.1.40: Wants=, NOT Requires=. With Requires= a docker.service restart STOPS
+    # this unit and never brings it back — and dockerd restarts on any OS update that
+    # upgrades docker-ce, which is routine. Field: Charles Laird (NC, yfdtak.com) on
+    # v10.1.39 showed "Log Forwarder Stopped" with a 0-byte auth.log and a red
+    # "protecting nothing" banner; the jail was fine, its feed was dead. Wants= keeps
+    # the ordering without the stop-propagation, and Restart=always then reattaches
+    # once `docker logs -f` exits with the bounced container.
+    "Wants=docker.service\n"
+    # Never give up permanently. Without this, a burst of fast exits (docker socket not
+    # ready at boot, container not yet created) can trip systemd's default start-rate
+    # limit and leave the unit failed until a human intervenes — which is exactly the
+    # state this feed must never reach, because nothing else writes auth.log.
+    "StartLimitIntervalSec=0\n\n"
     "[Service]\n"
     "Type=simple\n"
     "Restart=always\n"
@@ -16378,8 +16429,49 @@ def _f2b_selfheal_ak_forwarder(plog=None):
             cur = f.read()
     except OSError:
         return False
-    if 'invalid_login' in cur:
-        return False                      # already current (or a hand-rolled narrowing)
+    # v10.1.40: two independent conditions now.
+    #   (a) the unit body is out of date — either of the two broken generations above,
+    #       or the pre-rev2 unit whose `Requires=docker.service` made a dockerd restart
+    #       stop the forwarder for good.
+    #   (b) the unit is fine but NOT RUNNING. That is the state Charles Laird's box was
+    #       in on v10.1.39: correct unit, dead feed, 0-byte auth.log, and a red banner
+    #       blaming the jail. Nothing in the console ever restarted it — the page could
+    #       SEE it (it renders a "Log Forwarder Stopped" badge from `forwarder_active`)
+    #       but no code acted on it, and there was no button to press.
+    _stale = ('invalid_login' not in cur) or (_AK_FORWARDER_MARK not in cur)
+    if not _stale:
+        # Body is current — but is it actually running? Only worth starting when the
+        # jail is on and Authentik is up; otherwise a stopped forwarder is correct.
+        try:
+            _active = subprocess.run(['systemctl', 'is-active', 'authentik-log-forwarder'],
+                                     capture_output=True, text=True, timeout=10
+                                     ).stdout.strip() == 'active'
+        except Exception:
+            return False
+        if _active:
+            return False
+        if not _f2b_authentik_jail_enabled():
+            return False
+        try:
+            _ak_up = 'authentik' in subprocess.run(
+                _sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
+                capture_output=True, text=True, timeout=20).stdout
+        except Exception:
+            return False
+        if not _ak_up:
+            return False                  # Authentik down: nothing to forward yet
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now',
+                                       'authentik-log-forwarder']),
+                           capture_output=True, timeout=30)
+        except Exception as e:
+            _log(f'fail2ban: could not start the Authentik log forwarder: {e}')
+            return False
+        _log('fail2ban: the Authentik log forwarder was stopped while its jail was '
+             'enabled — restarted it. Nothing writes /var/log/authentik/auth.log while '
+             'it is down, so the jail had no feed. A dockerd restart (any OS update '
+             'that upgrades docker-ce) is the usual cause on units predating v10.1.40.')
+        return True
     try:
         _write_priv(svc_path, _AK_FORWARDER_UNIT)
     except Exception as e:
