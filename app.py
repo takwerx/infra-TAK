@@ -20450,7 +20450,13 @@ def run_guarddog_deploy(alert_email):
                 .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+                # v10.1.40: the updates watcher must compare Authentik against what THIS
+                # box's console will actually offer, not upstream latest — see
+                # scripts/guarddog/tak-updates-watch.sh.
+                .replace('UPDATE_CHANNEL_PLACEHOLDER',
+                         (settings.get('update_channel') or 'main').strip().lower())
+                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
@@ -66378,7 +66384,13 @@ def _auto_update_guarddog():
                 .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+                # v10.1.40: the updates watcher must compare Authentik against what THIS
+                # box's console will actually offer, not upstream latest — see
+                # scripts/guarddog/tak-updates-watch.sh.
+                .replace('UPDATE_CHANNEL_PLACEHOLDER',
+                         (settings.get('update_channel') or 'main').strip().lower())
+                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)

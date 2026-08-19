@@ -4,11 +4,27 @@
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_EMAIL="ALERT_EMAIL_PLACEHOLDER"
 CONSOLE_VERSION="CONSOLE_VERSION_PLACEHOLDER"
+# v10.1.40: this box's update channel and the Authentik release its CONSOLE will actually
+# offer. Without these the watcher compared against upstream latest while the console was
+# gated to the vetted release, so main-channel users were emailed about an Authentik update
+# that the Update button then correctly refused to install.
+UPDATE_CHANNEL="UPDATE_CHANNEL_PLACEHOLDER"
+AK_VETTED_RELEASE="AK_VETTED_PLACEHOLDER"
 STATE_FILE="/var/lib/takguard/updates_notified"
 LOG_FILE="/var/log/takguard/updates.log"
 CURL_TIMEOUT=15
 
 log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
+
+# v10.1.40: "was this value ever substituted?" — WITHOUT writing a full *_PLACEHOLDER
+# token, because the deploy-time .replace() rewrites every occurrence including the one
+# inside the test itself. That is not hypothetical: the infra-TAK console check below
+# used to compare cur_console against the CONSOLE_VERSION token itself, which substitution
+# turned into [ "$cur_console" != "<the actual version>" ] — always false. The console
+# update check therefore NEVER fired on any box (updates.log showed zero "infra-TAK:"
+# lines fleet-wide). Matching on the suffix alone is safe: no replace target is a bare
+# "_PLACEHOLDER".
+unsubstituted() { case "$1" in *_PLACEHOLDER) return 0 ;; *) return 1 ;; esac; }
 
 # v10.1.30: do NOT gate on the baked address. The console resolves the recipient from
 # settings.json at send time, so a box deployed before an email was configured still
@@ -48,22 +64,37 @@ SIG=""
 # infra-TAK (skip if placeholders not replaced; never report update when current equals latest)
 latest_console=$(latest_infratak)
 cur_console="$CONSOLE_VERSION"
-if [ "$cur_console" != "CONSOLE_VERSION_PLACEHOLDER" ] && [ -n "$cur_console" ] && [ -n "$latest_console" ] && [ "$cur_console" != "$latest_console" ] && need_update "$cur_console" "$latest_console"; then
+if ! unsubstituted "$cur_console" && [ -n "$cur_console" ] && [ -n "$latest_console" ] && [ "$cur_console" != "$latest_console" ] && need_update "$cur_console" "$latest_console"; then
   UPDATES="${UPDATES}  - infra-TAK: current ${cur_console:-unknown}, latest ${latest_console}\n"
   SIG="${SIG}infratak:${latest_console};"
 fi
 
-# Authentik (only if installed) — read version from docker-compose.yml (same as dashboard), then .env
+# Authentik (only if installed).
+# v10.1.40 — .env is read FIRST, on purpose. Docker Compose resolves ${AUTHENTIK_TAG:-default}
+# by letting .env WIN over the compose default, so reading compose first reported the wrong
+# running version on any box carrying an .env pin. Same precedence bug v10.1.39 fixed on the
+# console side (COPIX field report); it was still live here.
 cur_ak=""
-if [ -f "$HOME/authentik/docker-compose.yml" ]; then
+[ -f "$HOME/authentik/.env" ] && cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$HOME/authentik/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
+if [ -z "$cur_ak" ] && [ -f "$HOME/authentik/docker-compose.yml" ]; then
   cur_ak=$(grep -oE 'AUTHENTIK_TAG:-[^}[:space:]]+' "$HOME/authentik/docker-compose.yml" 2>/dev/null | head -1 | sed 's/AUTHENTIK_TAG:-//' | sed 's/^v//')
 fi
-[ -z "$cur_ak" ] && [ -f "$HOME/authentik/.env" ] && cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$HOME/authentik/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
 if [ -f "$HOME/authentik/docker-compose.yml" ] || [ -f "$HOME/authentik/.env" ]; then
-  latest_ak=$(latest_tag "goauthentik/authentik")
-  if need_update "$cur_ak" "$latest_ak"; then
-    UPDATES="${UPDATES}  - Authentik: current ${cur_ak:-unknown}, latest ${latest_ak}\n"
-    SIG="${SIG}authentik:${latest_ak};"
+  # Compare against what the CONSOLE will offer, never against upstream latest.
+  # main -> AUTHENTIK_VETTED_RELEASE (the fleet-validation gate); dev -> upstream latest,
+  # falling back to the baked vetted value when GitHub is unreachable. Mirrors
+  # _get_authentik_target_release() in app.py — if that logic changes, change it here too.
+  if [ "$UPDATE_CHANNEL" = "dev" ]; then
+    target_ak=$(latest_tag "goauthentik/authentik")
+    [ -z "$target_ak" ] && target_ak="$AK_VETTED_RELEASE"
+  else
+    target_ak="$AK_VETTED_RELEASE"
+  fi
+  if unsubstituted "$target_ak" || [ -z "$target_ak" ]; then
+    log_msg "authentik: no usable target (channel=$UPDATE_CHANNEL) - skipping"
+  elif need_update "$cur_ak" "$target_ak"; then
+    UPDATES="${UPDATES}  - Authentik: current ${cur_ak:-unknown}, latest ${target_ak}\n"
+    SIG="${SIG}authentik:${target_ak};"
   fi
 fi
 
