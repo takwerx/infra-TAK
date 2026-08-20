@@ -32939,6 +32939,69 @@ def cloudtak_bootstrap_cert_download():
     return jsonify({'error': 'TAK Server certificate store not found'}), 404
 
 
+@app.route('/api/cloudtak/coreevents-identity')
+@login_required
+def cloudtak_coreevents_identity_api():
+    """v10.1.43 (PLAN W2): report which certificate identity CloudTAK's TAK Server
+    connection (connection 0, server.auth) is using, so the operator can see when a
+    box set up before v10.1.18 is still on a legacy cert (user.p12 / admin.p12) and
+    run the existing generate + swap flow. Read-only status; the swap itself stays
+    operator-driven per the 2026-08-03 no-auto-bootstrap decision. Says nothing
+    about load — the bootstrap identity is a CoreEvents-delivery correctness fix,
+    not a load fix (measured 2026-08-20: TAK resolves LDAP groups per request for
+    every cert identity, resolvable or not)."""
+    settings = load_settings()
+    cn = None
+    sql = "select coalesce(auth->>'cert','') from server where id = 1"
+    try:
+        cfg = _get_cloudtak_deployment_config(settings)
+        if (cfg.get('target_mode') or 'local').strip().lower() == 'remote':
+            # Fixed string — nothing request-controlled enters the remote shell.
+            ok, out = _ssh_probe(cfg.get('remote', {}),
+                                 'docker exec cloudtak-postgis-1 psql -U docker -d gis -tAc '
+                                 f'"{sql}" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null',
+                                 timeout=20)
+            subj = (out or '') if ok else ''
+        else:
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1',
+                                           'psql', '-U', 'docker', '-d', 'gis', '-tAc', sql]),
+                               capture_output=True, text=True, timeout=20)
+            pem = (r.stdout or '').strip()
+            subj = ''
+            if pem.startswith('-----BEGIN'):
+                r2 = subprocess.run(['openssl', 'x509', '-noout', '-subject'],
+                                    input=pem, capture_output=True, text=True, timeout=10)
+                subj = r2.stdout or ''
+        m = re.search(r'CN\s*=\s*([^,/\n]+)', subj)
+        if m:
+            cn = m.group(1).strip()
+    except Exception:
+        pass
+    if not cn:
+        # Unconfigured wizard, container down, empty cert — nothing to warn about.
+        return jsonify({'success': True, 'configured': False})
+    p12_exists = None
+    uaf_entry = None
+    try:
+        mode, _s2 = _cloudtak_bootstrap_cert_target(settings)
+        if mode == 'local':
+            p12_exists = os.path.exists(f'/opt/tak/certs/files/{CLOUDTAK_BOOTSTRAP_CERT_CN}.p12')
+            if os.path.exists('/opt/tak/UserAuthenticationFile.xml'):
+                uaf_entry = (f'identifier="{CLOUDTAK_BOOTSTRAP_CERT_CN}"'
+                             in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or ''))
+    except Exception:
+        pass
+    return jsonify({
+        'success': True,
+        'configured': True,
+        'cn': cn,
+        'is_bootstrap': cn == CLOUDTAK_BOOTSTRAP_CERT_CN,
+        'bootstrap_cn': CLOUDTAK_BOOTSTRAP_CERT_CN,
+        'p12_exists': p12_exists,
+        'uaf_entry': uaf_entry,
+    })
+
+
 @app.route('/api/cloudtak/deploy', methods=['POST'])
 @login_required
 def cloudtak_deploy_api():
@@ -41671,6 +41734,43 @@ window.ctGenBootstrapCert = function(btn) {
     if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + (e && e.message ? e.message : String(e)) + '</span>';
   });
 };
+
+// v10.1.43 W2: surface which cert identity CloudTAK's TAK connection uses, so
+// pre-10.1.18 boxes still on a legacy cert (user.p12/admin.p12) get told to run
+// the existing generate + swap flow. Correctness (Events delivery) only — this
+// banner makes no load claims. Fail-quiet: no banner on any error/unconfigured.
+window.ctLoadCoreEventsIdentity = function() {
+  var host = document.getElementById('ct-coreevents-identity');
+  if (!host) return;
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  fetch('/api/cloudtak/coreevents-identity', { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.success || !d.configured || !d.cn) return;
+      if (d.is_bootstrap) {
+        host.innerHTML =
+          '<div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-radius:10px;margin-bottom:20px;' +
+          'font-size:12.5px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.18);color:var(--green)">' +
+          '<span style="width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0"></span>' +
+          'TAK Server connection identity: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">' + esc(d.cn) + '</code> — Bootstrap Admin certificate in use ✓</div>';
+        return;
+      }
+      var fix = d.p12_exists
+        ? ('<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">' + esc(d.bootstrap_cn) + '.p12</code> already exists on this box — ' +
+           '<a href="/api/cloudtak/bootstrap-cert/download" style="color:var(--cyan);font-weight:600">download it</a> and swap it in')
+        : ('generate it in <strong style="color:var(--text-primary)">First-Time Setup → Step 2</strong> below, then swap it in');
+      host.innerHTML =
+        '<div style="background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.4);border-radius:12px;padding:14px 20px;margin-bottom:20px">' +
+        '<div style="font-weight:600;font-size:13px;margin-bottom:4px;color:var(--yellow)">CloudTAK is connected to TAK Server with a legacy certificate (CN=' + esc(d.cn) + ')</div>' +
+        '<div style="color:var(--text-secondary);font-size:12.5px;line-height:1.6">' +
+        'CloudTAK 13.59+ (Core Events) reposts Events over this certificate and can <strong style="color:var(--text-primary)">silently skip channels</strong> it cannot resolve. ' +
+        'The fix is the Bootstrap Admin certificate: ' + fix + ' at ' +
+        '<strong style="color:var(--text-primary)">CloudTAK Admin → Server → Admin Certificate</strong>. One swap, no re-bootstrap, existing sessions unaffected.' +
+        '</div></div>';
+    })
+    .catch(function() { /* fail-quiet status probe */ });
+};
+document.addEventListener('DOMContentLoaded', function() { window.ctLoadCoreEventsIdentity(); });
 
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;

@@ -115,6 +115,11 @@
   <div class="status-banner not-installed"><div class="dot"></div>CloudTAK is not installed</div>
   {% endif %}
 
+  {% if cloudtak.installed and not deploying %}
+  <!-- v10.1.43 W2: CoreEvents connection identity (filled by ctLoadCoreEventsIdentity) -->
+  <div id="ct-coreevents-identity"></div>
+  {% endif %}
+
   {% if cloudtak.installed %}
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
