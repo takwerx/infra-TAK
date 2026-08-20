@@ -22638,6 +22638,63 @@ _ACME_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$
 _ACME_EAB_RE   = re.compile(r'^[A-Za-z0-9._~\-]{1,512}$')     # base64url; no space, no brace
 
 
+ACME_EAB_ENV_KID = 'TAKWERX_ACME_EAB_KID'
+ACME_EAB_ENV_MAC = 'TAKWERX_ACME_EAB_MAC'
+CADDY_ACME_EAB_DROPIN = '/etc/systemd/system/caddy.service.d/10-takwerx-acme-eab.conf'
+
+
+def _caddy_acme_env(cfg=None):
+    """Environment the caddy unit needs for the EAB placeholders, or {} when unset.
+
+    Also handed to `caddy validate` — see _caddy_validate_config(). A validator that cannot
+    resolve the placeholders reports a good config as 'bad', and the GH #59 backstop would
+    then restore over every write."""
+    cfg = load_caddy_acme() if cfg is None else cfg
+    kid = (cfg.get('eab_key_id') or '').strip()
+    mac = (cfg.get('eab_mac_key') or '').strip()
+    if not (kid and mac):
+        return {}
+    return {ACME_EAB_ENV_KID: kid, ACME_EAB_ENV_MAC: mac}
+
+
+def _sync_caddy_acme_eab_dropin(cfg=None):
+    """Write (or remove) the 600 systemd drop-in carrying the EAB credentials.
+
+    Returns True when the on-disk state changed, so the caller knows a `systemctl restart`
+    is required: systemd reads a unit's Environment= at START, so a reload will NOT pick up
+    a changed credential."""
+    env = _caddy_acme_env(cfg)
+    want = ''
+    if env:
+        want = ('# Written by infra-TAK. The EAB credentials live here, at mode 600, rather\n'
+                '# than in /etc/caddy/Caddyfile, which is world-readable.\n'
+                '[Service]\n'
+                f'Environment="{ACME_EAB_ENV_KID}={env[ACME_EAB_ENV_KID]}"\n'
+                f'Environment="{ACME_EAB_ENV_MAC}={env[ACME_EAB_ENV_MAC]}"\n')
+    try:
+        cur = _read_priv(CADDY_ACME_EAB_DROPIN) if _exists_priv(CADDY_ACME_EAB_DROPIN) else ''
+    except Exception:
+        cur = ''
+    if cur == want:
+        return False
+    if want:
+        _makedirs_priv(os.path.dirname(CADDY_ACME_EAB_DROPIN))
+        # Create empty and tighten BEFORE the credentials go in — writing first and
+        # chmod'ing after leaves a window where the secret sits at the default mode.
+        subprocess.run(_sudo_wrap(['touch', CADDY_ACME_EAB_DROPIN]),
+                       capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['chmod', '600', CADDY_ACME_EAB_DROPIN]),
+                       capture_output=True, timeout=15)
+        _write_priv(CADDY_ACME_EAB_DROPIN, want)
+        subprocess.run(_sudo_wrap(['chmod', '600', CADDY_ACME_EAB_DROPIN]),
+                       capture_output=True, timeout=15)
+    else:
+        subprocess.run(_sudo_wrap(['rm', '-f', CADDY_ACME_EAB_DROPIN]),
+                       capture_output=True, timeout=15)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+    return True
+
+
 def _caddy_acme_config_path():
     return os.path.join(CONFIG_DIR, CADDY_ACME_CONFIG_FILE)
 
@@ -22712,9 +22769,16 @@ def _caddy_acme_global_lines(cfg=None):
         out.append(f"    email {cfg['email'].strip()}")
     out.append(f"    acme_ca {cfg['acme_ca'].strip()}")
     if (cfg.get('eab_key_id') or '').strip():
+        # The EAB credentials are referenced, never written. /etc/caddy/Caddyfile is 644
+        # root:root on every box (checked test12 + nuc, 2026-08-20), so putting an HMAC key
+        # in it would publish a CA account credential to every local user — and our own rule
+        # is that secrets live in .config at mode 600 and are never written world-readable.
+        # `caddy adapt` keeps the placeholder verbatim in the JSON too, so the secret is not
+        # in the adapted config either; it reaches Caddy only through the unit's environment
+        # (a 600 systemd drop-in — see _sync_caddy_acme_eab_dropin).
         out.append('    acme_eab {')
-        out.append(f"        key_id {cfg['eab_key_id'].strip()}")
-        out.append(f"        mac_key {cfg['eab_mac_key'].strip()}")
+        out.append(f'        key_id {{env.{ACME_EAB_ENV_KID}}}')
+        out.append(f'        mac_key {{env.{ACME_EAB_ENV_MAC}}}')
         out.append('    }')
     out.append('}')
     out.append('')
@@ -22743,7 +22807,7 @@ def _caddy_acme_validate_isolated(cfg):
         with os.fdopen(fd, 'w') as f:
             f.write(probe)
         os.chmod(tmp, 0o644)          # the validate may run as caddy/takwerx, not the writer
-        verdict, out = _caddy_validate_config(tmp)
+        verdict, out = _caddy_validate_config(tmp, env=_caddy_acme_env(cfg))
         if verdict == 'bad':
             return False, (out or '').strip()[-400:]
         if verdict == 'unknown':
@@ -23069,15 +23133,21 @@ def caddy_acme_set():
                 os.unlink(_caddy_acme_config_path())
         except Exception as e:
             return jsonify({'success': False, 'error': f'Could not clear: {e}'}), 500
+        print('AUDIT: ACME issuer reverted to the Caddy default by %s'
+              % (session.get('authentik_username') or 'console-admin'), flush=True)
         msg = ("Reverted to Caddy's default CA (Let's Encrypt, ZeroSSL fallback). Existing "
                "certificates keep serving until they renew.")
+        try:
+            eab_changed = _sync_caddy_acme_eab_dropin({})   # removes the credential drop-in
+        except Exception:
+            eab_changed = True
         if (load_settings().get('fqdn') or '').strip():
             try:
                 generate_caddyfile()
             except Exception as e:
                 return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
-            r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
-                               capture_output=True, text=True, timeout=60)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart' if eab_changed else 'reload', 'caddy']),
+                               capture_output=True, text=True, timeout=90)
             if r.returncode != 0:
                 return jsonify({'success': False,
                                 'error': 'Setting cleared but Caddy reload failed: '
@@ -23107,6 +23177,16 @@ def caddy_acme_set():
         return jsonify({'success': True, 'message': 'Configuration is valid.', 'warning': warn})
 
     save_caddy_acme(cfg)
+    # C3/C7: changing the CA that issues every certificate on the box is security-relevant.
+    # Log WHO and WHAT (never the credential) so it reaches the off-box audit path.
+    print('AUDIT: ACME issuer set to %s by %s (EAB %s)'
+          % (cfg['acme_ca'], session.get('authentik_username') or 'console-admin',
+             'configured' if cfg.get('eab_key_id') else 'none'), flush=True)
+    try:
+        eab_changed = _sync_caddy_acme_eab_dropin(cfg)
+    except Exception as e:
+        return jsonify({'success': False,
+                        'error': f'Saved, but the EAB credential drop-in failed: {e}'}), 500
     if not (load_settings().get('fqdn') or '').strip():
         return jsonify({'success': True, 'warning': warn,
                         'message': 'Saved. It takes effect when a base domain is configured.'})
@@ -23114,8 +23194,11 @@ def caddy_acme_set():
         generate_caddyfile()
     except Exception as e:
         return jsonify({'success': False, 'error': f'Saved, but Caddyfile regeneration failed: {e}'}), 500
-    r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
-                       capture_output=True, text=True, timeout=60)
+    # systemd reads Environment= at unit START, so changed credentials need a restart; a
+    # reload would leave Caddy holding the previous (or empty) EAB values.
+    _verb = 'restart' if eab_changed else 'reload'
+    r = subprocess.run(_sudo_wrap(['systemctl', _verb, 'caddy']),
+                       capture_output=True, text=True, timeout=90)
     if r.returncode != 0:
         return jsonify({'success': False, 'warning': warn,
                         'error': 'Saved, but Caddy reload failed: '
@@ -26142,7 +26225,7 @@ def _caddy_validate_clean(out):
     return ' '.join(keep).strip()
 
 
-def _caddy_validate_config(path=None, timeout=30):
+def _caddy_validate_config(path=None, timeout=30, env=None):
     """Run Caddy's own adapter over `path`. Returns (verdict, output).
 
     verdict is 'ok' | 'bad' | 'unknown'. 'unknown' covers a missing/unrunnable caddy binary,
@@ -26167,8 +26250,18 @@ def _caddy_validate_config(path=None, timeout=30):
     try:
         if not shutil.which('caddy'):
             return 'unknown', 'caddy binary not found'
+        # v10.1.41: the EAB credentials are `{env.…}` placeholders in the Caddyfile so the
+        # secret never lands in that world-readable file. Caddy refuses to provision an ACME
+        # issuer whose placeholder resolves empty, so validation MUST see the same
+        # environment the caddy unit gets — otherwise this backstop would judge a perfectly
+        # good config 'bad' and restore over it on every write.
+        _env = dict(os.environ)
+        try:
+            _env.update(_caddy_acme_env() if env is None else env)
+        except Exception:
+            pass
         v = subprocess.run(['caddy', 'validate', '--config', cp, '--adapter', 'caddyfile'],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout, env=_env)
         out = _caddy_validate_clean(((v.stdout or '') + '\n' + (v.stderr or '')))
         if v.returncode == 0:
             return 'ok', out
