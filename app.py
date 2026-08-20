@@ -22253,6 +22253,56 @@ def fedhub_rotate_ca_log_api():
     })
 
 
+def _caddy_acme_issuer_key(ca_url):
+    """Caddy's certificate-store directory name for an ACME directory URL, or '' if unparseable.
+
+    certmagic keys the store by host + path with '/' turned into '-', so
+    https://acme-v02.api.letsencrypt.org/directory -> acme-v02.api.letsencrypt.org-directory.
+    Callers must treat the result as a HINT and verify it against what is actually on disk —
+    if this derivation is ever wrong, an unmatched hint degrades to the previous behaviour
+    instead of pointing at a directory that does not exist."""
+    try:
+        from urllib.parse import urlparse as _urlparse
+        u = _urlparse((ca_url or '').strip())
+        if not u.netloc:
+            return ''
+        return (u.netloc + (u.path or '').replace('/', '-')).strip('-')
+    except Exception:
+        return ''
+
+
+def _caddy_configured_issuer_dir():
+    """The issuer directory name infra-TAK BELIEVES is live, from config rather than from mtime.
+
+    v10.1.42 (W-C3). With an operator-set CA, that is its directory. With none set, the box is on
+    Caddy's default pair and the answer is Let's Encrypt — ZeroSSL is only a fallback. Returning
+    the LE name in the unconfigured case is the half that matters: the failure this fixes happened
+    after a REVERT, when acme_ca is empty and the abandoned issuer's directory is still newest."""
+    try:
+        ca = (load_caddy_acme().get('acme_ca') or '').strip()
+    except Exception:
+        ca = ''
+    return _caddy_acme_issuer_key(ca) if ca else CADDY_LE_ISSUER_DIR
+
+
+def _caddy_cert_not_expired(crt_path):
+    """True when the PEM at crt_path is currently valid. Unverifiable -> True (see below).
+
+    The store is 0700 caddy:caddy, so the bytes come through _read_priv and openssl reads them on
+    stdin (openssl is not broker-allowlisted and does not need to be). On any failure this answers
+    True: the caller uses it only to reject an EXPIRED preferred issuer, and 'could not check' must
+    not silently hand the decision back to newest-wins — that is the behaviour being fixed."""
+    try:
+        pem = _read_priv(crt_path)
+        if not (pem or '').strip():
+            return True
+        r = subprocess.run(['openssl', 'x509', '-checkend', '0', '-noout'],
+                           input=pem, capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
 def _caddy_acme_cert_base(domain=None):
     """Return the ACME issuer directory inside Caddy's cert store, resolved from disk.
 
@@ -22277,10 +22327,18 @@ def _caddy_acme_cert_base(domain=None):
       - With a `domain`, find that domain's actual `<domain>.crt` under any issuer directory
         and return the issuer directory holding it.
       - When several issuers hold a cert for the domain (the switching case — Caddy does not
-        delete the old CA's copy), take the **most recently written**, which is the one being
-        renewed. Preferring the Let's Encrypt name here would be wrong: after a switch it is
-        the stale copy.
-      - Without a `domain`, return the only issuer directory present, else the LE one.
+        delete the old CA's copy), prefer the issuer we are CONFIGURED to use
+        (_caddy_configured_issuer_dir()), and fall back to the most recently written.
+
+        v10.1.42 (W-C3): newest-wins alone is wrong in the direction that hurts. After a CA is
+        reverted, the abandoned issuer's directory stays newest until the real cert renews, so
+        the resolver keeps returning it — on `nuc` that primed _selfheal_takserver_le_cert() to
+        import a **staging** certificate into TAK's 8446 keystore, which is the documented
+        WebTAK-403 / CloudTAK-login-failure signature. Configuration is the authority on which
+        issuer is live; mtime is only the tie-breaker. The preferred directory is skipped if its
+        certificate has actually expired, so a genuine ZeroSSL fallback still resolves.
+      - Without a `domain`, return the configured issuer's directory when it exists, else the
+        only issuer directory present, else the LE one.
       - On any doubt, fall back to the Let's Encrypt path — today's behaviour, so this can
         never be worse than what it replaces.
 
@@ -22313,12 +22371,28 @@ def _caddy_acme_cert_base(domain=None):
             if rows:
                 rows.sort(reverse=True)
                 # <store>/<issuer>/<domain>/<domain>.crt -> <store>/<issuer>
-                return os.path.dirname(os.path.dirname(rows[0][1]))
+                newest = os.path.dirname(os.path.dirname(rows[0][1]))
+                if len(rows) == 1:
+                    return newest
+                # More than one issuer holds a cert for this domain — a CA switch or a revert.
+                # Configuration decides, not mtime. See W-C3 in the docstring.
+                want = _caddy_configured_issuer_dir()
+                if want:
+                    for _ts, _path in rows:
+                        _base = os.path.dirname(os.path.dirname(_path))
+                        if os.path.basename(_base) == want and _caddy_cert_not_expired(_path):
+                            return _base
+                return newest
             return le
         r = subprocess.run(_sudo_wrap([
             'find', CADDY_CERT_STORE, '-mindepth', '1', '-maxdepth', '1', '-type', 'd']),
             capture_output=True, text=True, timeout=15)
         dirs = [ln.strip() for ln in (r.stdout or '').splitlines() if ln.strip()]
+        want = _caddy_configured_issuer_dir()
+        if want:
+            for d in dirs:
+                if os.path.basename(d) == want:
+                    return d
         if len(dirs) == 1:
             return dirs[0]
         return le
@@ -23161,23 +23235,25 @@ def caddy_acme_set():
             return jsonify({'success': False, 'error': f'Could not clear: {e}'}), 500
         print('AUDIT: ACME issuer reverted to the Caddy default by %s'
               % (session.get('authentik_username') or 'console-admin'), flush=True)
-        msg = ("Reverted to Caddy's default CA (Let's Encrypt, ZeroSSL fallback). Existing "
-               "certificates keep serving until they renew.")
+        # v10.1.42 (W-C2): the old message said "existing certificates keep serving until they
+        # renew". They do not — Caddy reissues from the new issuer within seconds. That claim was
+        # wrong on the way out AND on the way back.
+        msg = ("Reverted to Caddy's default CA (Let's Encrypt, ZeroSSL fallback). Caddy is "
+               "requesting fresh certificates now; give it a minute, then reload this page.")
         try:
             eab_changed = _sync_caddy_acme_eab_dropin({})   # removes the credential drop-in
         except Exception:
             eab_changed = True
         if (load_settings().get('fqdn') or '').strip():
-            try:
-                generate_caddyfile()
-            except Exception as e:
-                return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
-            r = subprocess.run(_sudo_wrap(['systemctl', 'restart' if eab_changed else 'reload', 'caddy']),
-                               capture_output=True, text=True, timeout=90)
-            if r.returncode != 0:
-                return jsonify({'success': False,
-                                'error': 'Setting cleared but Caddy reload failed: '
-                                         + (r.stdout or r.stderr or '').strip()[-300:]}), 500
+            # v10.1.42 (W-C1): DEFER. The console is behind Caddy, so restarting it here kills
+            # the connection carrying this very response and the browser reports
+            # "TypeError: Failed to fetch" for work that fully succeeded. The Caddyfile is
+            # regenerated inside the deferred worker and any failure lands in caddy_last_action,
+            # which the Caddy card and /api/caddy/log already surface.
+            threading.Thread(target=_caddy_restart_after_response,
+                             kwargs={'action': 'acme-revert',
+                                     'verb': 'restart' if eab_changed else 'reload'},
+                             daemon=True).start()
         return jsonify({'success': True, 'message': msg})
 
     cfg = {
@@ -23213,26 +23289,33 @@ def caddy_acme_set():
     except Exception as e:
         return jsonify({'success': False,
                         'error': f'Saved, but the EAB credential drop-in failed: {e}'}), 500
-    if not (load_settings().get('fqdn') or '').strip():
+    _s_now = load_settings()
+    if not (_s_now.get('fqdn') or '').strip():
         return jsonify({'success': True, 'warning': warn,
                         'message': 'Saved. It takes effect when a base domain is configured.'})
-    try:
-        generate_caddyfile()
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'Saved, but Caddyfile regeneration failed: {e}'}), 500
+    # The way back in, spelled out with this box's real address — an operator reading this
+    # message may be about to lose the hostname it is served on.
+    _ip_url = (f"https://{(_s_now.get('server_ip') or '').strip()}"
+               f":{_s_now.get('console_port') or 5001}")
+    # v10.1.42 (W-C1): DEFER the apply. The console is behind Caddy, so restarting it inline
+    # kills the connection carrying this response — every Save & apply reported
+    # "TypeError: Failed to fetch" for an operation that had fully succeeded (found on nuc).
     # systemd reads Environment= at unit START, so changed credentials need a restart; a
     # reload would leave Caddy holding the previous (or empty) EAB values.
-    _verb = 'restart' if eab_changed else 'reload'
-    r = subprocess.run(_sudo_wrap(['systemctl', _verb, 'caddy']),
-                       capture_output=True, text=True, timeout=90)
-    if r.returncode != 0:
-        return jsonify({'success': False, 'warning': warn,
-                        'error': 'Saved, but Caddy reload failed: '
-                                 + (r.stdout or r.stderr or '').strip()[-300:]}), 500
+    threading.Thread(target=_caddy_restart_after_response,
+                     kwargs={'action': 'acme-set',
+                             'verb': 'restart' if eab_changed else 'reload'},
+                     daemon=True).start()
     return jsonify({
         'success': True, 'warning': warn,
-        'message': ('Certificate authority updated. Caddy will request new certificates from '
-                    'it as each one renews — existing certificates keep serving until then.'),
+        # v10.1.42 (W-C2): this used to say certificates were not reissued until renewal. False —
+        # on nuc every hostname was reissued from the new CA within seconds. Telling an operator a
+        # CA change is low-impact when it changes what every browser sees, at once, is how someone
+        # ends up locked out of a box in the field.
+        'message': ('Certificate authority updated. Caddy is requesting new certificates from it '
+                    'NOW — every hostname on this box will be reissued within about a minute. If '
+                    'the new certificates are not trusted, reach the console at '
+                    + _ip_url + ' (HSTS does not apply to a bare IP) and revert.'),
     })
 
 
@@ -23656,17 +23739,23 @@ def _caddy_failure_detail():
     return lines[-1][-400:] if lines else ''
 
 
-def _caddy_restart_after_response(action='restart'):
+def _caddy_restart_after_response(action='restart', verb='restart'):
     """Run in background: write Caddyfile and restart Caddy after a short delay so
     the HTTP response can be sent first (console is often behind Caddy).
 
     Records the outcome in caddy_last_action so a failure is visible on the Caddy
-    card and in /api/caddy/log instead of vanishing."""
+    card and in /api/caddy/log instead of vanishing.
+
+    `action` is the label shown in the UI; `verb` is what systemctl actually does. v10.1.42
+    (W-C1) added `verb` so the ACME-issuer route can defer a *reload* when only the Caddyfile
+    changed, and a *restart* when the EAB credential drop-in changed (systemd reads
+    Environment= at unit START, so a reload would leave Caddy holding the previous values).
+    Every existing caller keeps the restart default."""
     time.sleep(2)
     rc, out, ok = None, '', False
     try:
         generate_caddyfile(load_settings())
-        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+        r = subprocess.run(_sudo_wrap(['systemctl', verb, 'caddy']), stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, timeout=90)
         rc = r.returncode
         out = (r.stdout or '').strip()
@@ -23684,7 +23773,7 @@ def _caddy_restart_after_response(action='restart'):
             detail = _caddy_failure_detail()
             out = (out + ('\n' + detail if detail else '')).strip()
     except subprocess.TimeoutExpired:
-        rc, ok, out = -1, False, 'systemctl restart caddy timed out after 90s'
+        rc, ok, out = -1, False, f'systemctl {verb} caddy timed out after 90s'
     except Exception as e:
         rc, ok, out = -1, False, f'{type(e).__name__}: {e}'
     caddy_last_action.update({'ok': ok, 'action': action, 'rc': rc,

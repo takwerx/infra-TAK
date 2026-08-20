@@ -159,7 +159,7 @@
 <button onclick="clearAcmeCa()" id="acme-ca-clear-btn" class="control-btn">Revert to default CA</button>
 <span id="acme-ca-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);line-height:1.5;white-space:pre-wrap"></span>
 </div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">The block is checked with Caddy's own config parser before it is written, so an invalid value is refused here instead of taking the whole Caddyfile down. Existing certificates keep serving until they renew — changing the CA does not reissue immediately.</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">The block is checked with Caddy's own config parser before it is written, so an invalid value is refused here instead of taking the whole Caddyfile down. <strong style="color:var(--text-primary)">Changing the CA reissues every certificate on this box within about a minute</strong> — it is not deferred until renewal. If the new certificates are not trusted, this console sends HSTS and your browser will refuse to load it; reach it at <span style="font-family:'JetBrains Mono',monospace">https://{{ settings.server_ip }}:{{ settings.console_port or 5001 }}</span> (HSTS does not apply to a bare IP) and revert from there.</div>
 </div>
 </div>
 </div>
@@ -414,10 +414,24 @@ async function _acmeCaPost(payload,btnId,busyText,refresh){
     }catch(e){st.style.color='var(--red)';st.textContent='\u2717 '+e;}
     if(btn){btn.disabled=false;btn.textContent=old;}
 }
+var ACME_IP_URL="https://{{ settings.server_ip }}:{{ settings.console_port or 5001 }}";
 function validateAcmeCa(){return _acmeCaPost(_acmeCaPayload({validate_only:true}),'acme-ca-validate-btn','Checking…',false);}
-function saveAcmeCa(){return _acmeCaPost(_acmeCaPayload(),'acme-ca-save-btn','Applying…');}
+// v10.1.42: changing the CA is not a low-impact setting change and must not be one click.
+// Caddy reissues every hostname within seconds; if the new certificates are not trusted, this
+// console's HSTS header makes the browser hard-refuse it — no "Advanced -> Proceed" — and the
+// only control that undoes the change lives inside the console you can no longer reach.
+// Name the consequence AND the way back, before the click.
+function saveAcmeCa(){
+    if(!confirm("Change the certificate authority for this box?\n\n"
+        +"Caddy reissues certificates for EVERY hostname here within about a minute. This is NOT deferred until renewal.\n\n"
+        +"If the new CA is wrong, or its certificates are not trusted by your browser, this console sends HSTS and the browser will REFUSE to load it \u2014 with no \"proceed anyway\" option. The control that undoes this is in here.\n\n"
+        +"The way back in: "+ACME_IP_URL+"\n(HSTS does not apply to a bare IP address.)\n\nContinue?"))return;
+    return _acmeCaPost(_acmeCaPayload(),'acme-ca-save-btn','Applying…');
+}
 function clearAcmeCa(){
-    if(!confirm("Revert to Caddy's default CA (Let's Encrypt, ZeroSSL fallback)?\n\nExisting certificates keep serving until they renew."))return;
+    if(!confirm("Revert to Caddy's default CA (Let's Encrypt, ZeroSSL fallback)?\n\n"
+        +"Caddy reissues every certificate on this box within about a minute \u2014 reverting is not deferred until renewal either.\n\n"
+        +"If this console becomes unreachable, use "+ACME_IP_URL))return;
     return _acmeCaPost({clear:true},'acme-ca-clear-btn','Reverting…');
 }
 async function applyAutoMode(){
