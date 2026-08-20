@@ -111,7 +111,7 @@
 </label>
 <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:10px 0;border-top:1px solid var(--border)">
 <input type="radio" name="ssl-mode" value="custom" {% if _sslmode == 'custom' %}checked{% endif %} onchange="toggleSslMode()" style="margin-top:3px">
-<div><div style="font-weight:600;color:var(--text-primary)">Custom certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (commercial / enterprise PKI)</span></div>
+<div><div style="font-weight:600;color:var(--text-primary)">Custom Certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (commercial / enterprise PKI)</span></div>
 <div style="font-size:12px;color:var(--text-dim);margin-top:2px">Upload your own full-chain certificate + private key (PEM). Applied to all subdomains — use a wildcard (e.g. <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">*.{{ settings.get('fqdn','') }}</code>). For domains behind a corporate WAF/gateway where ACME can't reach.</div></div>
 </label>
 <div id="custom-cert-panel" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);{% if _sslmode != 'custom' %}display:none{% endif %}">
@@ -137,7 +137,7 @@
 </div>
 <div id="acme-ca-panel" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);{% if _sslmode == 'custom' %}display:none{% endif %}">
 <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleAcmeCa()">
-<div><div style="font-weight:600;color:var(--text-primary);font-size:13px">Certificate authority <span style="font-size:11px;color:var(--text-dim);font-weight:400">— advanced</span></div>
+<div><div style="font-weight:600;color:var(--text-primary);font-size:13px">Certificate Authority <span style="font-size:11px;color:var(--text-dim);font-weight:400">— advanced</span></div>
 <div id="acme-ca-summary" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px">Checking…</div></div>
 <span id="acme-ca-chevron" style="color:var(--text-dim);font-size:12px">&#9656;</span>
 </div>
@@ -205,7 +205,7 @@
 </label>
 <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 0;border-top:1px solid var(--border)">
 <input type="radio" name="setup-ssl-mode" value="custom" onchange="toggleSetupSslMode()" style="margin-top:3px">
-<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Custom certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (no ACME)</span></div>
+<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Custom Certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (no ACME)</span></div>
 <div style="font-size:12px;color:var(--text-dim)">Upload a full-chain PEM + key, applied to all subdomains. Use a wildcard (e.g. *.yourdomain.com). Caddy never attempts Let's Encrypt.</div></div>
 </label>
 <div id="setup-custom-cert" style="display:none;margin:12px 0 4px;padding:16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px">
@@ -248,7 +248,7 @@ async function deployCaddy(){
     var req;
     if(mode==='custom'){
         var cf=document.getElementById('setup-cert-file'),kf=document.getElementById('setup-key-file');
-        if(!cf.files.length||!kf.files.length){alert('Custom certificate selected — choose both a certificate and a private key file.');return}
+        if(!cf.files.length||!kf.files.length){alert('Custom Certificate selected — choose both a certificate and a private key file.');return}
         if(!confirm('Deploy Caddy for '+domain+' with your custom certificate?\n\nCaddy will serve your cert on all subdomains and will not attempt Let\'s Encrypt.')){return}
         var fd=new FormData();fd.append('domain',domain);fd.append('ssl_mode','custom');fd.append('cert_file',cf.files[0]);fd.append('key_file',kf.files[0]);
         req={method:'POST',body:fd};
@@ -452,7 +452,7 @@ async function loadCustomCertInfo(){
         var r=await fetch('/api/caddy/custom-cert/info');var d=await r.json();
         if(d.present){
             el.style.color='var(--green)';
-            el.innerHTML='✓ Custom certificate in use'+(d.not_after?' · expires '+d.not_after:'')+(d.names&&d.names.length?'<br><span style="color:var(--text-dim)">Names: '+d.names.join(', ')+'</span>':'');
+            el.innerHTML='✓ Custom Certificate in use'+(d.not_after?' · expires '+d.not_after:'')+(d.names&&d.names.length?'<br><span style="color:var(--text-dim)">Names: '+d.names.join(', ')+'</span>':'');
         }else{
             el.style.color='var(--text-dim)';
             el.textContent='No custom certificate uploaded yet.';
