@@ -5559,6 +5559,20 @@ AK_EVENT_RETENTION = 'days=30'
 # remote tak-ldap-setup.yaml templates) — those are plain strings and cannot interpolate this.
 AK_LDAP_SESSION_DURATION = 'hours=1'
 
+# v10.1.42 W-P4 — TAK Server's CoreConfig <ldap updateinterval> is in MILLISECONDS.
+# TAK Server Configuration Guide 5.7 and 5.8, <ldap> attribute table: "Frequency (in
+# milliseconds) at which the server refreshes group memberships from LDAP" — and both guides'
+# example stanza reads updateinterval="60000". infra-TAK wrote a literal '30' from the start,
+# i.e. 30 MILLISECONDS. That does not poll at 33 Hz: it means the group-membership cache is
+# expired at every check, so every auth/group lookup goes live to LDAP and the cache never
+# serves a hit. That is the bind+search chatter seen across the fleet, and it is ambient load
+# feeding the Authentik event/CPU churn (see memory authentik-2026-5-event-task-churn-fleet-cpu).
+# Raised by Christian Elsen (AWS) 2026-08-20 and confirmed against both guides.
+# 30000 = a real 30-second refresh: channel-membership changes still propagate in under 30s,
+# while LDAP traffic drops by orders of magnitude. Fleet constant — never tune it per box, and
+# never "helpfully" shrink the number: the unit is milliseconds.
+TAK_LDAP_UPDATE_INTERVAL_MS = '30000'
+
 # v10.1.17 W4 — finished-task retention for the 2026.5 postgres-backed worker queue.
 # Stock AUTHENTIK_WORKER__TASK_EXPIRATION=days=30 held ~59k `done` rows per box in
 # authentik_tasks_task, scanned by every purge/schedule pass. 3 days keeps a real
@@ -54396,7 +54410,8 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     _ldap_attrs = {
         'url': f'ldap://{ldap_host}:{_ldap_port}',
         'userstring': 'cn={username},ou=users,dc=takldap',
-        'updateinterval': '30',
+        # v10.1.42 (W-P4): MILLISECONDS, not seconds — see TAK_LDAP_UPDATE_INTERVAL_MS.
+        'updateinterval': TAK_LDAP_UPDATE_INTERVAL_MS,
         'groupprefix': 'cn=tak_',
         'groupNameExtractorRegex': 'cn=tak_(.*?)(?:,|$)',
         'serviceAccountDN': 'cn=adm_ldapservice,ou=users,dc=takldap',
@@ -54592,7 +54607,8 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true"'
         ' x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
         f'        <ldap url="ldap://{ldap_host}:389" userstring="cn={{username}},ou=users,dc=takldap"'
-        f' updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
+        f' updateinterval="{TAK_LDAP_UPDATE_INTERVAL_MS}" groupprefix="cn=tak_"'
+        f' groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
         f' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="{ldap_pass}"'
         f' groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap"'
         f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
@@ -54610,6 +54626,63 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         return True, f'CoreConfig.xml LDAP auth updated (text patcher, ldap://{ldap_host}:389)'
     except Exception as e:
         return False, f'CoreConfig.xml text patcher error: {e}'
+
+
+def _heal_coreconfig_updateinterval_ms(log=None):
+    """v10.1.42 (W-P4): heal a seconds-vs-milliseconds <ldap updateinterval> in CoreConfig.xml.
+
+    The two-line constant fix does not reach a box that is already wired to LDAP: both deploy
+    paths call _apply_ldap_to_coreconfig() only `if not _coreconfig_has_ldap()`, so an existing
+    install would keep updateinterval="30" until somebody clicked "Resync LDAP". Fixes ride the
+    console update (memory feedback-console-path-delivery), so this runs as a startup migration.
+
+    Deliberately narrow:
+      * only fires when the value is numeric AND < 1000 — a number that can only be the
+        seconds-vs-ms mistake. An operator's 60000 (TAK's own documented example) is left alone;
+        a fresh LDAP sync still writes the TAK_LDAP_UPDATE_INTERVAL_MS fleet constant.
+      * a targeted attribute substitution on the raw text, NOT an ElementTree round-trip — this
+        must change one attribute and leave the rest of the document byte-for-byte, and CoreConfig
+        canonicalization/namespace churn has bitten us before (memory
+        tak-coreconfig-canonicalization-and-defaults).
+      * it does NOT restart TAK Server. A restart drops every connected client; the file is
+        correct and the running JVM picks it up on the operator's next restart. Say so in the log.
+
+    Idempotent, non-fatal, returns True only when it actually changed the file."""
+    _log = log or (lambda m: print(m, flush=True))
+    try:
+        if not os.path.exists(CORECONFIG_PATH):
+            return False
+        content = _read_coreconfig(CORECONFIG_PATH)
+    except Exception as _re_err:
+        # Unreadable CoreConfig is a real condition (640 tak:tak, broker down) but it must
+        # never block boot — and it is emphatically not "no migration needed".
+        _log(f"CoreConfig updateinterval migration: cannot read CoreConfig.xml "
+             f"({str(_re_err)[:100]}) — skipped, will retry next boot")
+        return False
+    try:
+        _tag_re = re.compile(r'<(?:[A-Za-z][\w-]*:)?ldap\b[^>]*>', re.IGNORECASE)
+        _attr_re = re.compile(r'(\bupdateinterval\s*=\s*)(["\'])(\d+)\2', re.IGNORECASE)
+        found = []
+
+        def _fix_attr(a):
+            val = int(a.group(3))
+            if val >= 1000:
+                return a.group(0)  # plausible milliseconds — operator's or already ours
+            found.append(val)
+            return f'{a.group(1)}{a.group(2)}{TAK_LDAP_UPDATE_INTERVAL_MS}{a.group(2)}'
+
+        new_content = _tag_re.sub(lambda m: _attr_re.sub(_fix_attr, m.group(0)), content)
+        if not found:
+            return False
+        _write_priv(CORECONFIG_PATH, new_content)
+        _log(f"CoreConfig <ldap updateinterval> {found[0]} -> {TAK_LDAP_UPDATE_INTERVAL_MS} "
+             f"(the unit is MILLISECONDS — {found[0]}ms expired the group cache on every check, "
+             f"so every auth lookup went live to LDAP). TAK Server picks this up on its NEXT "
+             f"restart; nothing was restarted for you.")
+        return True
+    except Exception as e:
+        _log(f"CoreConfig updateinterval migration error (non-fatal): {str(e)[:160]}")
+        return False
 
 
 def _coreconfig_has_ldap():
@@ -71907,6 +71980,18 @@ def _startup_migrations():
                                        daemon=True, name='netbird-orphan-heal').start()
         except Exception as nb_orph_err:
             print(f"Startup migration: netbird orphan-heal spawn error (non-fatal): {nb_orph_err}")
+
+        # v10.1.42 (W-P4) — heal a seconds-vs-milliseconds <ldap updateinterval> in
+        # CoreConfig.xml on boxes already wired to LDAP. The deploy paths only run the LDAP
+        # writer when LDAP is ABSENT, so without this an existing install keeps the 30ms value
+        # (group cache expired at every check -> every auth lookup goes live to LDAP) until
+        # someone clicks "Resync LDAP". Narrow, idempotent, and never restarts TAK Server.
+        try:
+            _heal_coreconfig_updateinterval_ms(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _ui_err:
+            print(f"Startup migration: CoreConfig updateinterval error (non-fatal): {_ui_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
