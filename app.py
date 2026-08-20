@@ -29276,35 +29276,79 @@ def takportal_page():
 takportal_deploy_log = []
 takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 
-# Keys in TAK Portal settings.json that are configurable in TAK Portal UI (e.g. custom logo/photo). We never overwrite these when pushing settings on update/reconfigure/deploy.
-# EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO: operator-set CC/BCC addresses entered in TAK
-# Portal's UI. _portal_email_settings() always emits them as "" — without preserve,
-# every settings push (deploy, update-config, post-update guardrail) wiped them
-# (field report, fixed v10.1.19). Preserve-if-set: fresh installs still get "".
-# EMAIL_FAIL_HARD (v10.1.20): operator POLICY, not transport — preserve-if-set too.
-PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL', 'TAK_SSH_ONBOARDED', 'TAK_SSH_LAST_HANDSHAKE_AT',
-                                     'EMAIL_ALWAYS_CC', 'EMAIL_SEND_COPY_TO', 'EMAIL_FAIL_HARD'])
+# TAK Portal's settings.json is OPERATOR-OWNED (v10.1.42, W-P1).
+#
+# infra-TAK is authoritative for the keys below and NOTHING else. Every other key
+# _takportal_build_settings_dict() emits is SEED-ONLY: written when the portal's file has
+# no value for it (fresh install, or a key the portal has never had), never overwritten
+# afterwards. Hands-off is the DEFAULT, not an opt-out.
+#
+# This replaces the old PRESERVE_TAKPORTAL_KEYS allowlist ("write everything except these"),
+# which lost an operator's setting three times before anyone noticed: EMAIL_ALWAYS_CC /
+# EMAIL_SEND_COPY_TO (v10.1.19), EMAIL_FAIL_HARD (v10.1.20), and TAK_SSH_USER /
+# TAK_SSH_LAST_HANDSHAKE_AT (field report, Justin Davis/TN, 2026-08-20). Every new key we
+# emitted was another field a customer lost before we heard about it. Do not reintroduce a
+# preserve-list — widen this authoritative set only when infra-TAK genuinely owns the fact,
+# and only deliberately. See CLAUDE.md "Third-party app config is operator-owned".
+#
+# AUTHENTIK_URL / AUTHENTIK_TOKEN: the portal cannot talk to Authentik without these, they are
+# derived entirely from infra-TAK's own deployment, and a blank token freezes portal user
+# management (_heal_takportal_authentik_token). AUTHENTIK_BOOTSTRAP_TOKEN is listed for the
+# same reason should the portal ever consume it (we do not emit it today).
+TAKPORTAL_AUTHORITATIVE_KEYS = frozenset(['AUTHENTIK_URL', 'AUTHENTIK_TOKEN',
+                                          'AUTHENTIK_BOOTSTRAP_TOKEN'])
 
 # Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
 # SEED-ONLY (write-if-absent) when it is not — see _takportal_merged_settings_json().
+# EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO / EMAIL_FAIL_HARD are deliberately NOT transport:
+# they are operator policy and stay seed-only even while the relay is configured.
 EMAIL_TRANSPORT_KEYS = frozenset(['EMAIL_ENABLED', 'EMAIL_PROVIDER', 'SMTP_HOST', 'SMTP_PORT',
                                   'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'])
 
 
 def _takportal_get_existing_settings():
-    """Read current settings.json from TAK Portal container. Returns dict or {} if container missing or file invalid."""
+    """Read current settings.json from TAK Portal container. Returns dict or {} if container missing or file invalid.
+
+    v10.1.42: falls back to `docker cp` when `docker exec` fails. exec needs a RUNNING
+    container; cp works on a created/stopped one. The deploy path seeds settings.json into a
+    created-but-not-started container — without this fallback that seed read {} and rewrote
+    the whole file from our defaults, clobbering operator values on any redeploy."""
     try:
         r = subprocess.run(
             _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-        if r.returncode != 0 or not (r.stdout or '').strip():
+        if r.returncode == 0 and (r.stdout or '').strip():
+            return json.loads(r.stdout.strip())
+    except Exception:
+        pass
+    # Container not running (or exec unavailable) — stream the file out as a tar on stdout.
+    # `docker cp <container>:<path> -` avoids writing a temp file: under _sudo_wrap the copy
+    # would land root-owned and a non-root console could not read it back.
+    try:
+        import io as _io
+        import tarfile as _tarfile
+        cp = subprocess.run(
+            _sudo_wrap(['docker', 'cp', 'tak-portal:/usr/src/app/data/settings.json', '-']),
+            capture_output=True, timeout=15)
+        if cp.returncode != 0 or not cp.stdout:
             return {}
-        return json.loads(r.stdout.strip())
+        with _tarfile.open(fileobj=_io.BytesIO(cp.stdout)) as tf:
+            member = next((m for m in tf.getmembers() if m.isfile()), None)
+            if member is None:
+                return {}
+            body = (tf.extractfile(member).read() or b'').decode('utf-8', 'replace').strip()
+        return json.loads(body) if body else {}
     except Exception:
         return {}
 
 
 def _takportal_build_settings_dict(settings):
-    """Build infra-TAK managed TAK Portal settings dict (no merge)."""
+    """Build infra-TAK's view of TAK Portal's settings (no merge).
+
+    v10.1.42: this is a PROPOSAL, not a mandate. Only TAKPORTAL_AUTHORITATIVE_KEYS (plus the
+    email transport keys while Email Relay is configured) are actually written over an
+    existing portal value — everything else here is seed-only. See
+    _takportal_merged_settings_json(); never docker-cp this dict straight into a portal that
+    already has a settings.json."""
     server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     # v10.0.9 preserve-on-empty: if the .env read comes back empty (e.g. a config rebuild racing
@@ -29339,8 +29383,8 @@ def _takportal_build_settings_dict(settings):
     # _write_takportal_override) — that resolves the FQDN to 172.17.0.1 INSIDE the container on
     # both normal and gateway-fronted boxes (the Portal validates the CA chain, not the
     # hostname). Reverts c384fc8's host.docker.internal override, which leaked into every QR.
-    # Recomputed every build (deterministic; never preserved — TAK_URL is intentionally NOT in
-    # PRESERVE_TAKPORTAL_KEYS).
+    # v10.1.42: seed-only like the rest — recomputed here, but only written into a portal
+    # that has no TAK_URL yet. An operator who edits it in the portal UI keeps their value.
     tak_dns = (_get_takserver_host(settings) or '').strip()
     if settings.get('fqdn') and tak_dns:
         tak_url_host = tak_dns
@@ -29357,6 +29401,10 @@ def _takportal_build_settings_dict(settings):
     # SSH user = whoever the console runs as — that's whose ~/.ssh/authorized_keys
     # _takportal_setup_ssh installs the portal key into (root, or takwerx after the
     # non-root flip).
+    # v10.1.42: SEED-ONLY. Justin Davis (TN) had deliberately set TAK_SSH_USER=root; the old
+    # "overwrite when the current value looks like something we wrote" heuristic classified his
+    # choice as our leftover and healed it away on every portal update. We now propose this
+    # value for a portal that has none, and never touch it again.
     ssh_user = 'root'
     if tak_local:
         try:
@@ -29364,7 +29412,7 @@ def _takportal_build_settings_dict(settings):
             ssh_user = _pwd.getpwuid(os.getuid()).pw_name
         except Exception:
             pass
-    return {
+    _built = {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
         # v0.9.15 — akadmin and webadmin are both HIDDEN and ACTION-LOCKED in
@@ -29404,39 +29452,100 @@ def _takportal_build_settings_dict(settings):
         "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
         "TAK_SSH_PASSPHRASE": "",
     }
+    # v10.1.42 (W-P2): TAK_SSH_ONBOARDED used to be written by a SECOND writer inside
+    # _takportal_setup_ssh() that bypassed every merge rule. It is emitted here instead — as a
+    # seed, and only once the keypair actually exists on disk, so a portal that has never been
+    # onboarded is told "true" only when it is true. TAK_SSH_LAST_HANDSHAKE_AT is deliberately
+    # NOT emitted: it means "when the PORTAL last handshook", a fact we do not own.
+    if tak_local and os.path.exists(os.path.expanduser('~/TAK-Portal/data/ssh/tak_ssh_ed25519')):
+        _built["TAK_SSH_ONBOARDED"] = "true"
+    return _built
+
+
+def _takportal_settings_value_is_blank(v):
+    """True when a settings.json value carries no operator intent (missing / empty / whitespace).
+
+    A blank value is not a choice — seeding over it is safe, and it is what un-sticks a key that
+    was written as "" before its source existed (e.g. AUTHENTIK_PUBLIC_URL seeded before an FQDN
+    was set). Any non-empty value — including False / 0 — is treated as the operator's."""
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return not v.strip()
+    return False
 
 
 def _takportal_merged_settings_json(settings):
-    """Build settings JSON for TAK Portal, preserving user-configured keys (e.g. BRAND_LOGO_URL / custom photo) from existing container settings."""
+    """Build settings JSON for TAK Portal. THE single source of every settings.json we write.
+
+    v10.1.42 (W-P1) — ownership is inverted. The old model wrote everything infra-TAK computes
+    EXCEPT an ever-growing preserve-list, so every key we added was a field an operator could
+    lose silently. The model now:
+
+      * TAKPORTAL_AUTHORITATIVE_KEYS  -> always written (the portal breaks without them)
+      * EMAIL_TRANSPORT_KEYS          -> written only while Email Relay is configured (v10.1.20)
+      * everything else               -> SEED-ONLY: written when the portal has no value of its
+                                         own for the key, never overwritten afterwards
+      * keys we do not emit at all    -> untouched, always
+
+    There is deliberately no heuristic that infers ownership from the VALUE. "Overwrite it if it
+    equals something we might have written" cannot tell our default from an operator who chose
+    the same thing — that is exactly how a customer's deliberate TAK_SSH_USER=root was healed
+    away on every portal update (field report, Justin Davis/TN, 2026-08-20)."""
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
-    # SSH target: an operator-entered host/user/port (on-prem internal IP, non-root SSH
-    # user) must survive every settings push. Only values infra-TAK itself is known to
-    # have written are overwritten — so boxes broken by the old server_ip default
-    # self-heal on the next push, while manual fixes are never clobbered again.
-    _server_ip = (settings.get('server_ip') or '').strip()
-    _ssh_managed = {
-        'TAK_SSH_HOST': {'host.docker.internal', _server_ip},
-        'TAK_SSH_USER': {'root', (our.get('TAK_SSH_USER') or '')},
-        'TAK_SSH_PORT': {'22'},
-    }
     # v10.1.20 email ownership: when the Email Relay module IS configured, infra-TAK is
-    # authoritative for the portal's email TRANSPORT keys. When it is NOT, those keys are
-    # SEED-ONLY — written once on a portal whose settings lack them (fresh install), never
-    # overwritten after, so a manually-configured portal SMTP survives every settings push.
+    # authoritative for the portal's email TRANSPORT keys — our relay, our credentials, and they
+    # must follow a relay reconfigure. When it is NOT, they fall back to seed-only like
+    # everything else, so a hand-configured portal SMTP survives every settings push.
     _relay = settings.get('email_relay') or {}
     _relay_configured = bool(_relay.get('relay_host') and _relay.get('smtp_user'))
     for k, v in our.items():
-        cur = (merged.get(k) or '').strip() if isinstance(merged.get(k), str) else ''
-        if k in PRESERVE_TAKPORTAL_KEYS and cur:
+        if _takportal_settings_value_is_blank(merged.get(k)):
+            merged[k] = v  # seed — the portal has no value of its own for this key
             continue
-        if k in EMAIL_TRANSPORT_KEYS and not _relay_configured and k in merged:
-            continue  # no relay to speak for — portal's email transport is operator-owned
-        if k in _ssh_managed and cur and cur not in _ssh_managed[k]:
-            continue  # operator-customized SSH target — never overwrite
-        merged[k] = v
+        if k in TAKPORTAL_AUTHORITATIVE_KEYS:
+            merged[k] = v
+            continue
+        if k in EMAIL_TRANSPORT_KEYS and _relay_configured:
+            merged[k] = v
+            continue
+        # operator-owned — hands off, whatever the current value is
     return json.dumps(merged, indent=2)
+
+
+def _takportal_write_settings_json(settings_json, plog=None):
+    """v10.1.42 (W-P2): the ONE and ONLY writer of TAK Portal's settings.json.
+
+    Every path that updates the portal's settings goes through here, and everything that reaches
+    here has been through _takportal_merged_settings_json(). A second writer is how
+    TAK_SSH_LAST_HANDSHAKE_AT got clobbered *despite* being on the old preserve-list: it did its
+    own read-modify-write straight into the container and bypassed every rule. If you are about
+    to add another `docker cp ... tak-portal:/usr/src/app/data/settings.json` — don't; call this.
+
+    Returns (ok, error_message). Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-settings-')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(settings_json)
+            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
+                                capture_output=True, text=True, timeout=20)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if cp.returncode != 0:
+            err = ((cp.stderr or cp.stdout) or 'docker cp failed').strip()[:300]
+            _log(f"  takportal settings write failed: {err}")
+            return False, err
+        return True, ''
+    except Exception as e:
+        _log(f"  takportal settings write error: {str(e)[:200]}")
+        return False, str(e)[:300]
 
 
 def _takportal_push_settings(plog=None, restart=True):
@@ -29451,20 +29560,9 @@ def _takportal_push_settings(plog=None, restart=True):
         if (r.stdout or '').strip() != 'true':
             return False
         settings = load_settings()
-        settings_json = _takportal_merged_settings_json(settings)
-        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-push-')
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(settings_json)
-            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
-                                capture_output=True, text=True, timeout=20)
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        if cp.returncode != 0:
-            _log(f"  takportal settings push: docker cp failed: {((cp.stderr or cp.stdout) or '').strip()[:200]}")
+        ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings), plog=_log)
+        if not ok:
+            _log(f"  takportal settings push: docker cp failed: {err}")
             return False
         if restart:
             rs = subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
@@ -29582,29 +29680,21 @@ def _takportal_setup_ssh(log_fn=None):
         if log_fn:
             log_fn("  ✓ SSH keys copied into TAK Portal container")
 
-        # Mark onboarded in container settings
-        try:
-            from datetime import datetime as _dt
-            r = subprocess.run(
-                _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-            if r.returncode == 0 and r.stdout.strip():
-                import json as _json
-                portal_cfg = _json.loads(r.stdout)
-                portal_cfg['TAK_SSH_ONBOARDED'] = 'true'
-                portal_cfg['TAK_SSH_LAST_HANDSHAKE_AT'] = _dt.now().isoformat()
-                fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-ssh-')
-                try:
-                    with os.fdopen(fd, 'w') as f:
-                        _json.dump(portal_cfg, f, indent=2)
-                    subprocess.run(
-                        _sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-                finally:
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
+        # Mark onboarded — through the ONE writer, not behind its back.
+        #
+        # v10.1.42 (W-P2): this used to read settings.json out of the container, mutate two keys
+        # and docker-cp the WHOLE file back. That bypassed every merge rule (it is why
+        # TAK_SSH_LAST_HANDSHAKE_AT was clobbered on a customer box despite already being on the
+        # old preserve-list), and it lost anything TAK Portal itself changed between the read and
+        # the write. Two things changed:
+        #   * TAK_SSH_LAST_HANDSHAKE_AT is no longer written at all. It means "when the PORTAL
+        #     last completed a handshake" — not "when infra-TAK last ran this function", which is
+        #     what we were stamping into it, in the wrong format (naive local microseconds vs the
+        #     portal's ISO-8601 Z). It is the portal's fact; the portal owns it.
+        #   * TAK_SSH_ONBOARDED is emitted by _takportal_build_settings_dict() (by now the keypair
+        #     exists, so it is true) and seeded by the normal merge — write-if-absent, so a portal
+        #     that already has a value of its own keeps it.
+        _takportal_push_settings(restart=False)
 
         return True
     except Exception as e:
@@ -29643,18 +29733,9 @@ def takportal_control():
         settings = load_settings()
         settings_json = _takportal_merged_settings_json(settings)
         try:
-            fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
-            try:
-                with os.fdopen(fd, 'w') as f:
-                    f.write(settings_json)
-                cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp_settings, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=20)
-            finally:
-                try:
-                    os.remove(tmp_settings)
-                except OSError:
-                    pass
-            if cp.returncode != 0:
-                return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if not cp_ok:
+                return jsonify({'success': False, 'error': cp_err or 'docker cp failed'}), 500
             _takportal_setup_ssh()
             subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         except Exception as e:
@@ -29727,22 +29808,13 @@ def takportal_control():
                 cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
             except Exception:
                 pass
-            fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
-            try:
-                with os.fdopen(fd, 'w') as f:
-                    f.write(settings_json)
-                cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp_settings, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=20)
-            finally:
-                try:
-                    os.remove(tmp_settings)
-                except OSError:
-                    pass
-            if cp.returncode == 0:
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if cp_ok:
                 _takportal_setup_ssh()
                 subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
                 settings_synced = True
             else:
-                settings_sync_error = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]
+                settings_sync_error = cp_err or 'docker cp failed'
         except Exception as e:
             settings_sync_error = str(e)[:300]
         subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
@@ -30016,20 +30088,15 @@ def run_takportal_deploy():
         # boot. Step 6 re-writes settings.json idempotently (and adds the SSH-onboarded
         # flag) after the post-start cert/SSH sync, so this is purely a head-start.
         try:
-            import json as _json_seed
-            _seed_dict = _takportal_build_settings_dict(load_settings())
-            _fd_seed, _tmp_seed = tempfile.mkstemp(suffix='.json', prefix='tak-portal-seed-')
-            try:
-                with os.fdopen(_fd_seed, 'w') as _sf:
-                    _sf.write(_json_seed.dumps(_seed_dict, indent=2))
-                subprocess.run(
-                    _sudo_wrap(['docker', 'cp', _tmp_seed, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-                plog("  ✓ Seeded settings.json before first start (suppresses placeholder Authentik fetch)")
-            finally:
-                try:
-                    os.remove(_tmp_seed)
-                except OSError:
-                    pass
+            # v10.1.42: go through the merge, not the raw build dict. The data volume can survive
+            # a redeploy, so this container may already hold an operator's settings.json —
+            # _takportal_get_existing_settings() reads it via docker cp (the container is created,
+            # not running, so exec is unavailable) and the merge seeds only what is missing.
+            _seed_ok, _seed_err = _takportal_write_settings_json(
+                _takportal_merged_settings_json(load_settings()), plog=plog)
+            if not _seed_ok:
+                raise RuntimeError(_seed_err or 'docker cp failed')
+            plog("  ✓ Seeded settings.json before first start (suppresses placeholder Authentik fetch)")
         except Exception as _seed_e:
             plog(f"  ⚠ Could not pre-seed settings.json: {str(_seed_e)[:80]} (first boot may log a harmless placeholder error)")
 
@@ -30080,19 +30147,18 @@ def run_takportal_deploy():
         settings = load_settings()
         server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
         import json as json_mod
-        portal_settings = _takportal_build_settings_dict(settings)
-        ak_token = portal_settings.get('AUTHENTIK_TOKEN', '')
-        settings_json = json_mod.dumps(portal_settings, indent=2)
-        fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+        # v10.1.42: merge, never the raw build dict — a redeploy over a surviving data volume
+        # must not overwrite what the operator set in TAK Portal's own UI. portal_settings below
+        # is the MERGED result, so the log lines report what the portal will actually run with.
+        settings_json = _takportal_merged_settings_json(settings)
         try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(settings_json)
-            subprocess.run(_sudo_wrap(['docker', 'cp', tmp_settings, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True)
-        finally:
-            try:
-                os.remove(tmp_settings)
-            except OSError:
-                pass
+            portal_settings = json_mod.loads(settings_json)
+        except Exception:
+            portal_settings = _takportal_build_settings_dict(settings)
+        ak_token = portal_settings.get('AUTHENTIK_TOKEN', '')
+        _st6_ok, _st6_err = _takportal_write_settings_json(settings_json, plog=plog)
+        if not _st6_ok:
+            plog(f"  ⚠ settings.json write failed: {_st6_err}")
         plog(f"  AUTHENTIK_URL (internal): {portal_settings['AUTHENTIK_URL']}")
         plog(f"  AUTHENTIK_PUBLIC_URL: {portal_settings.get('AUTHENTIK_PUBLIC_URL', '')}")
         plog(f"  TAK Server URL: {portal_settings['TAK_URL']}")
@@ -30111,7 +30177,7 @@ def run_takportal_deploy():
         plog("")
         plog("\u2501\u2501\u2501 Setting up SSH (container \u2192 host) \u2501\u2501\u2501")
         if _takportal_setup_ssh(log_fn=plog):
-            plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:22 as root")
+            plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:{portal_settings.get('TAK_SSH_PORT', '22')} as {portal_settings.get('TAK_SSH_USER', 'root')}")
             plog("\u2713 SSH ready (no handshake needed)")
         else:
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
@@ -72693,16 +72759,7 @@ def _post_update_auto_deploy():
                             try:
                                 settings = load_settings()
                                 settings_json = _takportal_merged_settings_json(settings)
-                                fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
-                                try:
-                                    with os.fdopen(fd, 'w') as f:
-                                        f.write(settings_json)
-                                    subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=20)
-                                finally:
-                                    try:
-                                        os.remove(tmp)
-                                    except OSError:
-                                        pass
+                                _takportal_write_settings_json(settings_json)
                                 _takportal_setup_ssh()
                                 _ensure_infratak_network_for_authentik()
                                 _ensure_infratak_network_for_portal()
