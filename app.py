@@ -26311,6 +26311,32 @@ def generate_caddyfile(settings=None):
         lines.append(f"# TAK Server")
         lines.append(f"{tak_host} {{")
         lines.append(f"    reverse_proxy 127.0.0.1:8446 {{")
+        # v10.1.41 (GH #60) — WebTAK's WebSocket died with a 1006 through this vhost while
+        # it connected fine straight to :8446.  Caddy preserves the client's Host header on
+        # a plain-HTTP upstream, but with a `transport http { tls }` block it replaces it
+        # with the DIAL ADDRESS — measured on test12 2026-08-20: a plain upstream received
+        # `Host: takserver.<fqdn>`, the identical request over a TLS upstream received
+        # `Host: 127.0.0.1:8446`.
+        #
+        # TAK's Spring WebSocket handshake runs OriginHandshakeInterceptor, which compares
+        # the browser's `Origin` against the origin it derives from the REQUEST — scheme +
+        # getServerName() + getServerPort(), i.e. straight off the Host header.  So it
+        # compared `https://127.0.0.1:8446` with `https://takserver.<fqdn>` and returned a
+        # bodyless 403, which the browser surfaces as a bare 1006 close with no reason.
+        # Ordinary requests were unaffected — only the handshake consults Origin, and only
+        # a browser sends one, which is why curl could never reproduce it (a request with
+        # no Origin header is allowed through: `if (origin == null) return true`).
+        #
+        # Restoring the client's Host makes TAK derive `https://takserver.<fqdn>` (a
+        # port-less Host means the scheme default, 443 — matching what the browser puts in
+        # Origin).  Proven on test12: same request, 403 -> 101 + live CoT frames flowing.
+        # The Federation Hub block below already does this for the same reason.
+        #
+        # The two header_down rewrites are NOT the cause (A/B'd both ways, 403 either way)
+        # — but they are the same root cause seen from the response side: TAK was emitting
+        # Location headers naming 127.0.0.1:8446 because that is the Host it was handed.
+        # Kept as belt-and-braces; removing them is a separate, evidence-free change.
+        lines.append(f"        header_up Host {{host}}")
         lines.append(f"        transport http {{")
         lines.append(f"            tls")
         lines.append(f"            tls_insecure_skip_verify")
