@@ -22663,7 +22663,19 @@ def _sync_caddy_acme_eab_dropin(cfg=None):
     Returns True when the on-disk state changed, so the caller knows a `systemctl restart`
     is required: systemd reads a unit's Environment= at START, so a reload will NOT pick up
     a changed credential."""
+    cfg = load_caddy_acme() if cfg is None else cfg
     env = _caddy_acme_env(cfg)
+    if env:
+        # Validate before writing, exactly as _caddy_acme_global_lines() does. The route
+        # already validated, but this function also runs off the stored file — and a value
+        # carrying a double quote or a newline would break out of `Environment="K=V"` and
+        # append arbitrary unit directives. .config is mode 600 so writing it already implies
+        # console privilege, but the emitter and the writer must not disagree about what is
+        # acceptable.
+        _ok, _err = _validate_caddy_acme_fields(cfg)
+        if not _ok:
+            print(f'Caddy: refusing to write EAB credentials — {_err}', flush=True)
+            env = {}
     want = ''
     if env:
         want = ('# Written by infra-TAK. The EAB credentials live here, at mode 600, rather\n'
