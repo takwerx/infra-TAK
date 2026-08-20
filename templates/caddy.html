@@ -389,7 +389,7 @@ function _acmeCaPayload(extra){
     if(extra)Object.assign(p,extra);
     return p;
 }
-async function _acmeCaPost(payload,btnId,busyText){
+async function _acmeCaPost(payload,btnId,busyText,refresh){
     var st=document.getElementById('acme-ca-status'),btn=document.getElementById(btnId);
     var old=btn?btn.textContent:'';
     if(btn){btn.disabled=true;btn.textContent=busyText;}
@@ -401,7 +401,12 @@ async function _acmeCaPost(payload,btnId,busyText){
         if(d.success){
             st.style.color='var(--green)';
             st.textContent='\u2713 '+(d.message||'Done')+(d.warning?('\n'+d.warning):'');
-            await loadAcmeCa();
+            // Only re-read from the server when the server actually changed. Validate saves
+            // nothing, so refreshing after it wipes the operator's typed CA URL and email
+            // (the HMAC survived only because loadAcmeCa touches its placeholder, not its
+            // value) — and the next click of Save then posts an empty URL. Found on nuc
+            // during the v10.1.41 post-ship UI check.
+            if(refresh!==false)await loadAcmeCa();
         }else{
             st.style.color='var(--red)';
             st.textContent='\u2717 '+(d.error||'Failed');
@@ -409,7 +414,7 @@ async function _acmeCaPost(payload,btnId,busyText){
     }catch(e){st.style.color='var(--red)';st.textContent='\u2717 '+e;}
     if(btn){btn.disabled=false;btn.textContent=old;}
 }
-function validateAcmeCa(){return _acmeCaPost(_acmeCaPayload({validate_only:true}),'acme-ca-validate-btn','Checking…');}
+function validateAcmeCa(){return _acmeCaPost(_acmeCaPayload({validate_only:true}),'acme-ca-validate-btn','Checking…',false);}
 function saveAcmeCa(){return _acmeCaPost(_acmeCaPayload(),'acme-ca-save-btn','Applying…');}
 function clearAcmeCa(){
     if(!confirm("Revert to Caddy's default CA (Let's Encrypt, ZeroSSL fallback)?\n\nExisting certificates keep serving until they renew."))return;
