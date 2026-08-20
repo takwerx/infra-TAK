@@ -22614,6 +22614,151 @@ def _custom_cert_paths():
     return os.path.join(ssl_dir, 'custom-fullchain.pem'), os.path.join(ssl_dir, 'custom-key.pem')
 
 
+# ── Operator-chosen ACME issuer (v10.1.41) ────────────────────────────────────────
+# Caddy's default is Let's Encrypt (with a ZeroSSL fallback). Agencies whose PKI policy
+# names a different CA — Sectigo, DigiCert, Google Trust Services, an internal step-ca —
+# need Caddy pointed at that CA's ACME directory instead. Every public CA except Let's
+# Encrypt requires External Account Binding: a key_id + mac_key issued by the CA that ties
+# the ACME account to a paid one.
+#
+# Caddy requires the global options block to be the FIRST block in the Caddyfile, so this
+# cannot live in the bottom user-blocks region (CADDYFILE_USER_BLOCKS_MARKER) — a global
+# block placed last is a hard adapter error: "server block without any key is global
+# configuration, and if used, it must be first" (verified 2026-08-20). Comments may precede
+# it, so the generated file keeps its two identifying header lines.
+CADDY_ACME_CONFIG_FILE = 'caddy_acme.json'
+
+# These values are interpolated into the Caddyfile. A value carrying a brace, a newline or
+# whitespace could close the global block early and append arbitrary directives — `admin
+# 0.0.0.0:2019` would hand the box's entire running config to the network. The character
+# classes below are the injection boundary and must stay strict; they are deliberately
+# narrower than the RFCs allow.
+_ACME_CA_RE    = re.compile(r'^https://[A-Za-z0-9._~\-]+(?::\d{1,5})?(?:/[A-Za-z0-9._~\-/%]*)?$')
+_ACME_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$')
+_ACME_EAB_RE   = re.compile(r'^[A-Za-z0-9._~\-]{1,512}$')     # base64url; no space, no brace
+
+
+def _caddy_acme_config_path():
+    return os.path.join(CONFIG_DIR, CADDY_ACME_CONFIG_FILE)
+
+
+def load_caddy_acme():
+    """Operator's ACME issuer config, or {} when the box uses Caddy's default CA."""
+    try:
+        with open(_caddy_acme_config_path()) as f:
+            cfg = json.loads(f.read())
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_caddy_acme(cfg):
+    """Persist the ACME issuer config atomically at mode 600 (it holds the EAB mac_key)."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    p = _caddy_acme_config_path()
+    tmp = f'{p}.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def _validate_caddy_acme_fields(cfg):
+    """Field-level validation. Returns (ok, error). See _ACME_*_RE on why this is strict."""
+    ca = (cfg.get('acme_ca') or '').strip()
+    email = (cfg.get('email') or '').strip()
+    key_id = (cfg.get('eab_key_id') or '').strip()
+    mac_key = (cfg.get('eab_mac_key') or '').strip()
+    if not ca:
+        return False, 'CA directory URL is required.'
+    if not _ACME_CA_RE.match(ca):
+        return False, ('CA directory URL must be a plain https:// URL with no spaces, quotes '
+                       'or braces (e.g. https://acme.sectigo.com/v2/DV).')
+    if email and not _ACME_EMAIL_RE.match(email):
+        return False, 'Account email is not a valid address.'
+    if bool(key_id) != bool(mac_key):
+        return False, ('External Account Binding needs BOTH the key ID and the HMAC key. '
+                       'Most CAs other than Let\'s Encrypt require them; leave both blank only '
+                       'if your CA issues without EAB.')
+    for label, val in (('EAB key ID', key_id), ('EAB HMAC key', mac_key)):
+        if val and not _ACME_EAB_RE.match(val):
+            return False, (f'{label} must be the base64url value your CA issued — letters, '
+                           'digits, dot, underscore, tilde or hyphen only.')
+    return True, ''
+
+
+def _caddy_acme_global_lines(cfg=None):
+    """Caddyfile global options block for the operator's CA, or [] when unset/invalid.
+
+    Emitting nothing is the correct default: with no global block Caddy uses Let's Encrypt
+    with its ZeroSSL fallback, which is what every box does today. A box that has never
+    touched this feature must produce a byte-identical Caddyfile.
+    """
+    cfg = load_caddy_acme() if cfg is None else cfg
+    if not cfg or not (cfg.get('acme_ca') or '').strip():
+        return []
+    ok, _err = _validate_caddy_acme_fields(cfg)
+    if not ok:
+        # Never emit an unvalidated value into the Caddyfile — a bad one takes the WHOLE
+        # config down (the GH #59 validate-or-restore backstop would then roll back every
+        # module deploy on the box, with nothing naming this as the cause).
+        print('Caddy: stored ACME issuer config is invalid and was NOT emitted — '
+              f'{_err}', flush=True)
+        return []
+    out = ['{']
+    if (cfg.get('email') or '').strip():
+        out.append(f"    email {cfg['email'].strip()}")
+    out.append(f"    acme_ca {cfg['acme_ca'].strip()}")
+    if (cfg.get('eab_key_id') or '').strip():
+        out.append('    acme_eab {')
+        out.append(f"        key_id {cfg['eab_key_id'].strip()}")
+        out.append(f"        mac_key {cfg['eab_mac_key'].strip()}")
+        out.append('    }')
+    out.append('}')
+    out.append('')
+    return out
+
+
+def _caddy_acme_validate_isolated(cfg):
+    """Ask Caddy whether this global block adapts, BEFORE it can reach /etc/caddy/Caddyfile.
+
+    Returns (ok, detail). The real file is never the test subject: a bad block there would
+    be caught by _caddy_validate_or_restore() only after the write, and the operator would
+    see "module deploy reverted" with no mention of the block that caused it.
+
+    A 'unknown' verdict (no caddy binary, timeout, permission denied — see
+    _caddy_validate_config) is NOT a failure. It means we could not check, and saying
+    "invalid" over an inconclusive result is the exact mistake this codebase keeps fixing.
+    """
+    lines = _caddy_acme_global_lines(cfg)
+    if not lines:
+        return False, 'nothing to validate'
+    probe = '\n'.join(lines) + '\nlocalhost {\n    respond "ok"\n}\n'
+    tmp = None
+    try:
+        import tempfile as _tf
+        fd, tmp = _tf.mkstemp(suffix='.caddyfile', prefix='acme-probe-')
+        with os.fdopen(fd, 'w') as f:
+            f.write(probe)
+        os.chmod(tmp, 0o644)          # the validate may run as caddy/takwerx, not the writer
+        verdict, out = _caddy_validate_config(tmp)
+        if verdict == 'bad':
+            return False, (out or '').strip()[-400:]
+        if verdict == 'unknown':
+            return True, f'UNVERIFIED: Caddy could not be consulted ({(out or "").strip()[-200:]})'
+        return True, ''
+    except Exception as e:
+        return True, f'UNVERIFIED: {e}'
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
 def _sync_custom_cert_for_caddy():
     """Deploy a Caddy-readable copy of the custom cert/key and return its (cert, key) paths.
 
@@ -22889,6 +23034,97 @@ def caddy_set_ssl_mode():
                     return
         threading.Thread(target=_delayed_mtx_grant, daemon=True).start()
     return jsonify({'success': True, 'message': "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."})
+
+
+@app.route('/api/caddy/acme', methods=['GET'])
+@login_required
+def caddy_acme_get():
+    """Current ACME issuer settings. NEVER returns the EAB HMAC key — it is a credential;
+    the UI shows whether one is stored, not what it is."""
+    cfg = load_caddy_acme()
+    return jsonify({
+        'success': True,
+        'configured': bool((cfg.get('acme_ca') or '').strip()),
+        'acme_ca': (cfg.get('acme_ca') or ''),
+        'email': (cfg.get('email') or ''),
+        'eab_key_id': (cfg.get('eab_key_id') or ''),
+        'eab_mac_key_set': bool((cfg.get('eab_mac_key') or '').strip()),
+        'default_ca_note': ("Unset means Caddy's default: Let's Encrypt, with ZeroSSL as an "
+                            "automatic fallback."),
+    })
+
+
+@app.route('/api/caddy/acme', methods=['POST'])
+@login_required
+def caddy_acme_set():
+    """Set (or clear) the ACME issuer, then regenerate + reload.
+
+    `validate_only: true` checks without saving — the page's Validate button.
+    `clear: true` returns the box to Caddy's default CA.
+    """
+    data = request.get_json(silent=True) or {}
+    if data.get('clear'):
+        try:
+            if os.path.exists(_caddy_acme_config_path()):
+                os.unlink(_caddy_acme_config_path())
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Could not clear: {e}'}), 500
+        msg = ("Reverted to Caddy's default CA (Let's Encrypt, ZeroSSL fallback). Existing "
+               "certificates keep serving until they renew.")
+        if (load_settings().get('fqdn') or '').strip():
+            try:
+                generate_caddyfile()
+            except Exception as e:
+                return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
+            r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                return jsonify({'success': False,
+                                'error': 'Setting cleared but Caddy reload failed: '
+                                         + (r.stdout or r.stderr or '').strip()[-300:]}), 500
+        return jsonify({'success': True, 'message': msg})
+
+    cfg = {
+        'acme_ca': (data.get('acme_ca') or '').strip(),
+        'email': (data.get('email') or '').strip(),
+        'eab_key_id': (data.get('eab_key_id') or '').strip(),
+        'eab_mac_key': (data.get('eab_mac_key') or '').strip(),
+    }
+    # An empty mac_key on an otherwise-complete form means "keep the stored one" — the GET
+    # never hands it back, so the page cannot echo it into the POST.
+    if cfg['eab_key_id'] and not cfg['eab_mac_key']:
+        cfg['eab_mac_key'] = (load_caddy_acme().get('eab_mac_key') or '').strip()
+
+    ok, err = _validate_caddy_acme_fields(cfg)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    ok, detail = _caddy_acme_validate_isolated(cfg)
+    if not ok:
+        return jsonify({'success': False,
+                        'error': 'Caddy rejected this configuration:\n' + detail}), 400
+    warn = detail if detail.startswith('UNVERIFIED') else ''
+    if data.get('validate_only'):
+        return jsonify({'success': True, 'message': 'Configuration is valid.', 'warning': warn})
+
+    save_caddy_acme(cfg)
+    if not (load_settings().get('fqdn') or '').strip():
+        return jsonify({'success': True, 'warning': warn,
+                        'message': 'Saved. It takes effect when a base domain is configured.'})
+    try:
+        generate_caddyfile()
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Saved, but Caddyfile regeneration failed: {e}'}), 500
+    r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'warning': warn,
+                        'error': 'Saved, but Caddy reload failed: '
+                                 + (r.stdout or r.stderr or '').strip()[-300:]}), 500
+    return jsonify({
+        'success': True, 'warning': warn,
+        'message': ('Certificate authority updated. Caddy will request new certificates from '
+                    'it as each one renews — existing certificates keep serving until then.'),
+    })
 
 
 @app.route('/api/caddy/custom-cert/info')
@@ -26185,7 +26421,14 @@ def generate_caddyfile(settings=None):
         return
     modules = detect_modules()
 
+    # v10.1.41 — the operator's ACME issuer, if they set one, MUST come first: Caddy rejects
+    # a global options block that is not the first block ("server block without any key is
+    # global configuration, and if used, it must be first"). Comments are not blocks, so the
+    # two header lines above it are fine (verified with `caddy validate`, 2026-08-20).
+    # Emits nothing when unset, so a box that never touches this generates a byte-identical
+    # file to before.
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
+    lines += _caddy_acme_global_lines()
     sd = _get_all_service_domains(settings)
 
     def _emit_alias_redirect(alias, canonical):

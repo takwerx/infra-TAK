@@ -133,7 +133,34 @@
 <button onclick="applyAutoMode()" id="apply-auto-btn" style="padding:10px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Switch to automatic HTTPS</button>
 <span id="apply-auto-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);line-height:1.5"></span>
 </div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">Stops serving your uploaded certificate and lets Caddy obtain & renew Let's Encrypt certs again. Requires DNS pointing here and ports 80/443 reachable from the internet.</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">Stops serving your uploaded certificate and lets Caddy obtain &amp; renew Let's Encrypt certs again. Requires DNS pointing here and ports 80/443 reachable from the internet.</div>
+</div>
+<div id="acme-ca-panel" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);{% if _sslmode == 'custom' %}display:none{% endif %}">
+<div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleAcmeCa()">
+<div><div style="font-weight:600;color:var(--text-primary);font-size:13px">Certificate authority <span style="font-size:11px;color:var(--text-dim);font-weight:400">— advanced</span></div>
+<div id="acme-ca-summary" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px">Checking…</div></div>
+<span id="acme-ca-chevron" style="color:var(--text-dim);font-size:12px">&#9656;</span>
+</div>
+<div id="acme-ca-body" style="display:none;margin-top:16px">
+<div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:16px">Leave blank to use Caddy's default: Let's Encrypt, with ZeroSSL as an automatic fallback. Set these only if your PKI policy names a different CA — Sectigo, DigiCert, Google Trust Services, or an internal ACME server. Public CAs other than Let's Encrypt issue you an <strong>External Account Binding</strong> key pair that ties ACME to your paid account.</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div><label class="input-label">CA directory URL</label>
+<input type="text" id="acme-ca-url" class="input-field" placeholder="https://acme.sectigo.com/v2/DV" autocomplete="off"></div>
+<div><label class="input-label">Account email</label>
+<input type="text" id="acme-ca-email" class="input-field" placeholder="certs@your-agency.gov" autocomplete="off"></div>
+<div><label class="input-label">EAB key ID <span style="color:var(--text-dim);font-weight:400">(if your CA issued one)</span></label>
+<input type="text" id="acme-ca-kid" class="input-field" autocomplete="off"></div>
+<div><label class="input-label">EAB HMAC key</label>
+<input type="password" id="acme-ca-hmac" class="input-field" placeholder="unchanged" autocomplete="new-password"></div>
+</div>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<button onclick="validateAcmeCa()" id="acme-ca-validate-btn" class="control-btn">Validate</button>
+<button onclick="saveAcmeCa()" id="acme-ca-save-btn" style="padding:10px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Save &amp; apply</button>
+<button onclick="clearAcmeCa()" id="acme-ca-clear-btn" class="control-btn">Revert to default CA</button>
+<span id="acme-ca-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);line-height:1.5;white-space:pre-wrap"></span>
+</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">The block is checked with Caddy's own config parser before it is written, so an invalid value is refused here instead of taking the whole Caddyfile down. Existing certificates keep serving until they renew — changing the CA does not reissue immediately.</div>
+</div>
 </div>
 </div>
 {% if configured_urls %}
@@ -330,6 +357,63 @@ function toggleSslMode(){
     if(cp)cp.style.display=(v==='custom')?'block':'none';
     // The "switch to automatic" button only matters when we're currently on a custom cert.
     if(ap)ap.style.display=(v==='fqdn'&&_currentSslMode==='custom')?'block':'none';
+    var cap=document.getElementById('acme-ca-panel');
+    if(cap)cap.style.display=(v==='custom')?'none':'block';
+}
+// ── Certificate authority (v10.1.41) ─────────────────────────────────────────
+function toggleAcmeCa(){
+    var b=document.getElementById('acme-ca-body'),c=document.getElementById('acme-ca-chevron');
+    if(!b)return;
+    var open=b.style.display!=='none';
+    b.style.display=open?'none':'block';
+    if(c)c.innerHTML=open?'&#9656;':'&#9662;';
+}
+async function loadAcmeCa(){
+    var sum=document.getElementById('acme-ca-summary');
+    if(!sum)return;
+    try{
+        var d=await (await fetch('/api/caddy/acme')).json();
+        document.getElementById('acme-ca-url').value=d.acme_ca||'';
+        document.getElementById('acme-ca-email').value=d.email||'';
+        document.getElementById('acme-ca-kid').value=d.eab_key_id||'';
+        // The HMAC key is a credential and is never sent back — blank means "keep it".
+        document.getElementById('acme-ca-hmac').placeholder=d.eab_mac_key_set?'stored — leave blank to keep':'';
+        sum.textContent=d.configured?('Using '+d.acme_ca):"Default — Let's Encrypt (ZeroSSL fallback)";
+    }catch(e){sum.textContent='Could not read current setting';}
+}
+function _acmeCaPayload(extra){
+    var p={acme_ca:document.getElementById('acme-ca-url').value.trim(),
+           email:document.getElementById('acme-ca-email').value.trim(),
+           eab_key_id:document.getElementById('acme-ca-kid').value.trim(),
+           eab_mac_key:document.getElementById('acme-ca-hmac').value.trim()};
+    if(extra)Object.assign(p,extra);
+    return p;
+}
+async function _acmeCaPost(payload,btnId,busyText){
+    var st=document.getElementById('acme-ca-status'),btn=document.getElementById(btnId);
+    var old=btn?btn.textContent:'';
+    if(btn){btn.disabled=true;btn.textContent=busyText;}
+    st.style.color='var(--text-dim)';st.textContent='';
+    try{
+        var r=await fetch('/api/caddy/acme',{method:'POST',headers:{'Content-Type':'application/json'},
+                                             body:JSON.stringify(payload)});
+        var d=await r.json();
+        if(d.success){
+            st.style.color='var(--green)';
+            st.textContent='\u2713 '+(d.message||'Done')+(d.warning?('\n'+d.warning):'');
+            await loadAcmeCa();
+        }else{
+            st.style.color='var(--red)';
+            st.textContent='\u2717 '+(d.error||'Failed');
+        }
+    }catch(e){st.style.color='var(--red)';st.textContent='\u2717 '+e;}
+    if(btn){btn.disabled=false;btn.textContent=old;}
+}
+function validateAcmeCa(){return _acmeCaPost(_acmeCaPayload({validate_only:true}),'acme-ca-validate-btn','Checking…');}
+function saveAcmeCa(){return _acmeCaPost(_acmeCaPayload(),'acme-ca-save-btn','Applying…');}
+function clearAcmeCa(){
+    if(!confirm("Revert to Caddy's default CA (Let's Encrypt, ZeroSSL fallback)?\n\nExisting certificates keep serving until they renew."))return;
+    return _acmeCaPost({clear:true},'acme-ca-clear-btn','Reverting…');
 }
 async function applyAutoMode(){
     var status=document.getElementById('apply-auto-status');
@@ -380,7 +464,7 @@ async function applyCustomCert(){
         }
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Validate & Apply';}
 }
-document.addEventListener('DOMContentLoaded',function(){if(document.getElementById('custom-cert-panel'))loadCustomCertInfo();});
+document.addEventListener('DOMContentLoaded',function(){if(document.getElementById('custom-cert-panel'))loadCustomCertInfo();if(document.getElementById('acme-ca-panel'))loadAcmeCa();});
 async function caddyUpdate(){
     var btn=document.getElementById('caddy-update-btn');
     var status=document.getElementById('caddy-update-status');
