@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.40-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.40-alpha)**
+**Current release: [v10.1.41-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.41-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.41-alpha — 2026-08-20 — the web map that would not connect, and a certificate assumption nobody had tested
+
+**Headline: WebTAK's live map never connected when reached through your normal address, and the console had been quietly assuming every certificate comes from one particular authority.** The first was reported by someone running it, who had been handed a confident diagnosis that turned out to be wrong. WebTAK loaded, the map drew, and the live connection died instantly with an error code that carries no explanation. Going directly to the server's own port worked, so the fault was in the web server sitting in front of it. The cause is that our web server was telling TAK Server it had been reached at a loopback address rather than at the name the browser actually used. TAK Server compares those two things before it will open a live connection, saw them disagree, and refused — silently, with an empty response the browser reports as a bare failure code. **It now passes the real address through**, and the map connects. This one resisted five earlier attempts, all of them ruled out by testing rather than argument, because the check being tripped is one that only browsers trigger — every command-line test passed for the wrong reason. **The second was found while building something else, and had never fired.** Ten separate places in the console assumed that certificates live in the folder used by Let's Encrypt. That is where they do live, right up until the moment they do not: the web server ships with a second authority as an automatic fallback and switches to it on its own if the first cannot issue — after a rate limit, an outage, or a failed check. Had that ever happened, TAK Server would have stopped being given its certificate and stopped having it renewed, on a machine that looked completely healthy from every page in the console. **The console now finds the certificates wherever they actually are**, and when two authorities have issued for the same name it takes the one being kept up to date rather than the stale one. **New: you can choose your certificate authority from the console.** Agencies whose policy names a specific commercial authority — Sectigo, DigiCert, Google Trust Services — or who run their own internal one can now point the console at it, with the account credentials those authorities issue, from the Caddy page. It is checked with the web server's own parser before anything is applied, so a mistake is refused on the spot with the reason instead of taking the site configuration down. Machines that do not set it are completely unaffected and generate exactly the configuration they did before. **Who should update:** everyone, and with priority if anyone uses WebTAK. **Upgrade:** automatic on the next console update, with nothing to configure.
+
+Full notes: [v10.1.41-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.41-alpha).
 
 ### v10.1.40-alpha — 2026-08-20 — nine places the console told you something it had not checked
 
