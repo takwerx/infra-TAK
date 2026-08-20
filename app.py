@@ -842,6 +842,11 @@ CLOUDTAK_VETTED_RELEASE = "13.54.3"     # OFFLINE FALLBACK ONLY since v10.1.17 �
                                         # value is used only when the GitHub release lookup is
                                         # unreachable. Bump to current latest when convenient.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
+# Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
+# Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
+# constant — see _caddy_acme_cert_base(). Never hardcode the LE name at a call site.
+CADDY_CERT_STORE = "/var/lib/caddy/.local/share/caddy/certificates"
+CADDY_LE_ISSUER_DIR = "acme-v02.api.letsencrypt.org-directory"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
 # CloudTAK official icon (SVG data URL)
@@ -22234,6 +22239,79 @@ def fedhub_rotate_ca_log_api():
     })
 
 
+def _caddy_acme_cert_base(domain=None):
+    """Return the ACME issuer directory inside Caddy's cert store, resolved from disk.
+
+    v10.1.41. Caddy namespaces its certificate storage by the ACME **directory URL**, so a
+    Let's Encrypt cert lands in
+
+        /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/
+
+    and a cert from any other CA lands in a differently-named sibling. Ten call sites used to
+    hardcode the Let's Encrypt name, which made every one of them answer "no cert" the moment
+    the issuer changed — silently, on a box that looks healthy. The TAK Server 8446 install and
+    its renewal self-heal were among them, so the failure mode was a WebTAK/CloudTAK cert that
+    quietly stopped being maintained.
+
+    This is NOT hypothetical and it does not need an operator to change anything: Caddy's
+    documented default is Let's Encrypt **with ZeroSSL as an automatic fallback**
+    (https://caddyserver.com/docs/automatic-https — "If Caddy cannot get a certificate from
+    Let's Encrypt, it will try with ZeroSSL"). We emit no `acme_ca` and no `cert_issuer`, so
+    every box runs that pair. One LE rate-limit or failed challenge and the certs move.
+
+    Resolution rules:
+      - With a `domain`, find that domain's actual `<domain>.crt` under any issuer directory
+        and return the issuer directory holding it.
+      - When several issuers hold a cert for the domain (the switching case — Caddy does not
+        delete the old CA's copy), take the **most recently written**, which is the one being
+        renewed. Preferring the Let's Encrypt name here would be wrong: after a switch it is
+        the stale copy.
+      - Without a `domain`, return the only issuer directory present, else the LE one.
+      - On any doubt, fall back to the Let's Encrypt path — today's behaviour, so this can
+        never be worse than what it replaces.
+
+    Detection is PRIVILEGED. The store is `drwx------ caddy:caddy` and the console runs as
+    `takwerx`, so an unprivileged listing reports an empty store rather than a denied one —
+    the exact "permission error reported as absence" trap documented on
+    _caddy_cert_pair_ready(). `find` is broker-allowlisted read-only traversal.
+    """
+    le = f'{CADDY_CERT_STORE}/{CADDY_LE_ISSUER_DIR}'
+    dom = (domain or '').strip()
+    if dom and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', dom):
+        return le                      # never interpolate an unvalidated name into an argv
+    try:
+        if dom:
+            # '%T@ %p' = mtime + path, so the newest cert wins without a second stat call.
+            r = subprocess.run(_sudo_wrap([
+                'find', CADDY_CERT_STORE, '-mindepth', '3', '-maxdepth', '3',
+                '-type', 'f', '-name', f'{dom}.crt', '-printf', '%T@ %p\n']),
+                capture_output=True, text=True, timeout=15)
+            rows = []
+            for ln in (r.stdout or '').splitlines():
+                ln = ln.strip()
+                if not ln or ' ' not in ln:
+                    continue
+                ts, _, path = ln.partition(' ')
+                try:
+                    rows.append((float(ts), path))
+                except ValueError:
+                    continue
+            if rows:
+                rows.sort(reverse=True)
+                # <store>/<issuer>/<domain>/<domain>.crt -> <store>/<issuer>
+                return os.path.dirname(os.path.dirname(rows[0][1]))
+            return le
+        r = subprocess.run(_sudo_wrap([
+            'find', CADDY_CERT_STORE, '-mindepth', '1', '-maxdepth', '1', '-type', 'd']),
+            capture_output=True, text=True, timeout=15)
+        dirs = [ln.strip() for ln in (r.stdout or '').splitlines() if ln.strip()]
+        if len(dirs) == 1:
+            return dirs[0]
+        return le
+    except Exception:
+        return le
+
+
 def _caddy_letsencrypt_days_left(settings):
     """Return days until the active Caddy cert expires (for primary FQDN), or None if unavailable.
     In custom mode (ssl_mode='custom') this reads the uploaded custom cert's expiry instead of
@@ -22295,9 +22373,8 @@ def _caddy_letsencrypt_days_left(settings):
         except Exception:
             continue
     # Fallback: read cert from Caddy's storage (primary domain or infratak)
-    cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
     for name in (fqdn, f'infratak.{fqdn}'):
-        crt = os.path.join(cert_base, name, f'{name}.crt')
+        crt = os.path.join(_caddy_acme_cert_base(name), name, f'{name}.crt')
         # v10.1.33: was os.path.isfile() + `openssl -in <crt>`. Caddy's store is 0700
         # caddy:caddy and the console is takwerx, so BOTH the stat and the read failed on
         # every non-root box and this fallback silently never produced a number. Same
@@ -24205,7 +24282,7 @@ def _get_mediamtx_hls_upstream(settings):
             # every non-root box regardless of the remote's state, so split-server
             # deployments always got the plain-HTTP upstream. Test it with privilege.
             mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
-            cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+            cert_base = _caddy_acme_cert_base(mtx_domain)
             enc = bool(mtx_domain and _caddy_cert_pair_ready(
                 f'{cert_base}/{mtx_domain}/{mtx_domain}.crt',
                 f'{cert_base}/{mtx_domain}/{mtx_domain}.key'))
@@ -27023,11 +27100,12 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
         cert_crt, cert_key = _custom_cert_paths()
         cert_dir = os.path.dirname(cert_crt); cert_label = 'custom'
     else:
-        cert_dir = (f"/var/lib/caddy/.local/share/caddy/certificates/"
-                    f"acme-v02.api.letsencrypt.org-directory/{takserver_host}")
+        _acme_base = _caddy_acme_cert_base(takserver_host)
+        cert_dir = f"{_acme_base}/{takserver_host}"
         cert_crt = f"{cert_dir}/{takserver_host}.crt"
         cert_key = f"{cert_dir}/{takserver_host}.key"
-        cert_label = 'LE'
+        # Do not call it 'LE' without checking — the issuer is whatever Caddy actually used.
+        cert_label = 'LE' if os.path.basename(_acme_base) == CADDY_LE_ISSUER_DIR else 'ACME'
     core_config = '/opt/tak/CoreConfig.xml'
     # v10.0.5 non-root: read Caddy's caddy:caddy-owned cert via the broker into
     # console-readable copies for openssl (raw os.path.exists/openssl EPERM-fail
@@ -27172,11 +27250,12 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         cert_dir = os.path.dirname(cert_crt)
         cert_label = "custom"
     else:
-        cert_dir = (f"/var/lib/caddy/.local/share/caddy/certificates/"
-                    f"acme-v02.api.letsencrypt.org-directory/{takserver_host}")
+        _acme_base = _caddy_acme_cert_base(takserver_host)
+        cert_dir = f"{_acme_base}/{takserver_host}"
         cert_crt = f"{cert_dir}/{takserver_host}.crt"
         cert_key = f"{cert_dir}/{takserver_host}.key"
-        cert_label = "LE"
+        # Do not call it 'LE' without checking — the issuer is whatever Caddy actually used.
+        cert_label = "LE" if os.path.basename(_acme_base) == CADDY_LE_ISSUER_DIR else "ACME"
     core_config = "/opt/tak/CoreConfig.xml"
 
     # Optionally wait for Caddy to finish obtaining the cert (ACME only — a custom cert
@@ -27438,8 +27517,7 @@ def _selfheal_takserver_le_cert(plog=None):
             if not os.path.exists(cert_crt):
                 return
         else:
-            _src = (f'/var/lib/caddy/.local/share/caddy/certificates/'
-                    f'acme-v02.api.letsencrypt.org-directory/{host}/{host}.crt')
+            _src = f'{_caddy_acme_cert_base(host)}/{host}/{host}.crt'
             _cc = subprocess.run(_sudo_wrap(['cat', _src]), capture_output=True, timeout=15)
             if _cc.returncode != 0 or not _cc.stdout:
                 return  # no active cert for this host — nothing to sync from
@@ -30678,7 +30756,7 @@ paths:
     plog("━━━ Step 8/8: SSL Certificates (remote) ━━━")
     ssl_ok = False
     if mtx_domain:
-        cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+        cert_base = _caddy_acme_cert_base(mtx_domain)
         cert_file = f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'
         key_file  = f'{cert_base}/{mtx_domain}/{mtx_domain}.key'
         plog(f"  Waiting for Caddy to issue cert for {mtx_domain}...")
@@ -31460,7 +31538,7 @@ WantedBy=multi-user.target
             plog(f"✓ Caddyfile updated — {mtx_domain}")
 
             # Wait up to 60s for cert
-            cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+            cert_base = _caddy_acme_cert_base(mtx_domain)
             cert_file = f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'
             key_file  = f'{cert_base}/{mtx_domain}/{mtx_domain}.key'
             plog(f"  Waiting for Caddy to issue cert for {mtx_domain}...")
@@ -46427,7 +46505,7 @@ def _reassert_mediamtx_cert_grant(plog=None):
         mtx_domain = _get_service_domain(settings, 'mediamtx')
         if not mtx_domain:
             return False
-        cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+        cert_base = _caddy_acme_cert_base(mtx_domain)
         cert_dir = f'{cert_base}/{mtx_domain}'
         cert_file = f'{cert_dir}/{mtx_domain}.crt'
         key_file = f'{cert_dir}/{mtx_domain}.key'
@@ -68231,7 +68309,7 @@ def _startup_converge_mediamtx_unit_nonroot():
         settings = load_settings()
         mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
         if mtx_domain:
-            cb = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+            cb = _caddy_acme_cert_base(mtx_domain)
             cd = f'{cb}/{mtx_domain}'
             cf, kf = f'{cd}/{mtx_domain}.crt', f'{cd}/{mtx_domain}.key'
             if _caddy_cert_pair_ready(cf, kf):
@@ -68320,7 +68398,7 @@ def _startup_converge_mediamtx_ssl():
         except OSError:
             return
 
-        cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+        cert_base = _caddy_acme_cert_base(mtx_domain)
         cert_dir  = f'{cert_base}/{mtx_domain}'
         cert_file = f'{cert_dir}/{mtx_domain}.crt'
         key_file  = f'{cert_dir}/{mtx_domain}.key'
