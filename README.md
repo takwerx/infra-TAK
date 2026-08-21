@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.42-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.42-alpha)**
+**Current release: [v10.1.43-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.43-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.43-alpha — 2026-08-21 — the constant directory traffic, measured to its source — and a warning when CloudTAK is on the wrong certificate
+
+**Headline: we found where the permanent identity-provider traffic comes from, proved no setting on your machine can reduce it, and made the console tell you when CloudTAK is connected on a certificate that quietly breaks Events.** The last release admitted we were still chasing the ambient directory load every machine generates while completely idle — a steady couple of lookups per second, around the clock. This release is the answer, and we want to be precise about what it is and is not. **It is a measurement, not a load fix. Nothing in this release reduces that traffic, and we are claiming no improvement whatsoever.** What the measurement established: TAK Server asks the identity directory for a certificate's group memberships on **every single API request** it receives — whether or not the identity exists in the directory, whether or not its group cache is enabled, whether or not the connection is reused. We proved this directly: sixty requests with an identity that resolves perfectly produced the same one-lookup-per-request traffic as sixty requests with one that doesn't. That rules out every fix on our side of the fence — a "better" service identity, a cache setting, a connection tweak — all of them would have changed nothing, and we know because we measured rather than reasoned. The traffic is simply TAK Server's per-request cost multiplied by how often CloudTAK polls it, and the polling rate lives in CloudTAK's own code. We have taken the numbers upstream to the CloudTAK team with a concrete ask: back off the polling when there is nothing to poll for. Until that lands, the load is a known constant, not a fault on your machine. **What does ship is a warning the measurement surfaced.** Machines that set up CloudTAK before the Bootstrap Admin certificate existed are still connected on the old bootstrap certificate — and on that certificate, CloudTAK 13.59+ silently skips delivering Events to channels it cannot resolve. Silently is the problem: everything looks connected, Events just don't arrive everywhere they should. The CloudTAK page now checks which certificate the connection is actually using and tells you plainly: a warning with the exact fix (generate the Bootstrap Admin certificate — one button, already in the console — and swap it once in CloudTAK's admin page, no re-bootstrap, nobody signed out) or a green confirmation when the right certificate is in use. We validated the whole path live: the swap took effect without dropping the session, and Events demonstrably deliver on the new certificate. **Who should update:** everyone; act on the new warning if your CloudTAK predates v10.1.18. **Upgrade:** automatic on the next console update, nothing to configure.
+
+Full notes: [v10.1.43-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.43-alpha).
 
 ### v10.1.42-alpha — 2026-08-20 — the settings it kept putting back, and a number in the wrong unit
 
