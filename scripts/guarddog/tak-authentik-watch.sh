@@ -19,10 +19,11 @@ mkdir -p "$STATE_DIR"
 UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 [ "$UPTIME_SECS" -lt 600 ] && exit 0
 
-AK_DIR=""
-for _d in "${HOME:-/home/takwerx}/authentik"; do
-  [ -f "$_d/docker-compose.yml" ] && AK_DIR="$_d" && break
-done
+# v10.1.44 (W3): resolve the stack dir via the shared lib — $HOME is EMPTY in a
+# systemd unit, so the old "${HOME:-...}" default silently pointed at nothing on
+# installs that do not match it and this watchdog exited 0 without ever watching.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+AK_DIR="$(gd_find_stack_dir authentik authentik-server-1)"
 [ -z "$AK_DIR" ] && exit 0
 
 _ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }

@@ -14,8 +14,12 @@ mkdir -p "$STATE_DIR"
 UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 [ "$UPTIME_SECS" -lt 900 ] && exit 0
 
-NR_DIR="${HOME:-/home/takwerx}/node-red"
-[ ! -f "$NR_DIR/docker-compose.yml" ] && exit 0
+# v10.1.44 (W3): resolve the stack dir via the shared lib — $HOME is EMPTY in a
+# systemd unit, so the old "${HOME:-...}" default silently pointed at nothing on
+# installs that do not match it and this watchdog exited 0 without ever watching.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+NR_DIR="$(gd_find_stack_dir node-red nodered)"
+[ -z "$NR_DIR" ] && exit 0
 
 # Health: HTTP to Node-RED (1880)
 CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://127.0.0.1:1880/ 2>/dev/null || echo "000")

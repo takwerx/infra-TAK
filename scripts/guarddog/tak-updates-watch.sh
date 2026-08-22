@@ -14,6 +14,15 @@ STATE_FILE="/var/lib/takguard/updates_notified"
 LOG_FILE="/var/log/takguard/updates.log"
 CURL_TIMEOUT=15
 
+# v10.1.44 (W3): resolve stack dirs via the shared lib. These were bare "$HOME/..."
+# with NO fallback at all — and $HOME is EMPTY in a systemd unit, so every probe below
+# read a path like "/authentik/.env", found nothing, and reported no current version.
+# The console's update badge reads "no update found" as "up to date".
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+AK_DIR="$(gd_find_stack_dir authentik authentik-server-1)"
+CT_DIR="$(gd_find_stack_dir CloudTAK cloudtak-api-1)"
+PORTAL_DIR="$(gd_find_stack_dir TAK-Portal tak-portal)"
+
 log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
 
 # v10.1.40: "was this value ever substituted?" — WITHOUT writing a full *_PLACEHOLDER
@@ -75,11 +84,11 @@ fi
 # running version on any box carrying an .env pin. Same precedence bug v10.1.39 fixed on the
 # console side (COPIX field report); it was still live here.
 cur_ak=""
-[ -f "$HOME/authentik/.env" ] && cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$HOME/authentik/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
-if [ -z "$cur_ak" ] && [ -f "$HOME/authentik/docker-compose.yml" ]; then
-  cur_ak=$(grep -oE 'AUTHENTIK_TAG:-[^}[:space:]]+' "$HOME/authentik/docker-compose.yml" 2>/dev/null | head -1 | sed 's/AUTHENTIK_TAG:-//' | sed 's/^v//')
+[ -f "$AK_DIR/.env" ] && cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$AK_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
+if [ -z "$cur_ak" ] && [ -f "$AK_DIR/docker-compose.yml" ]; then
+  cur_ak=$(grep -oE 'AUTHENTIK_TAG:-[^}[:space:]]+' "$AK_DIR/docker-compose.yml" 2>/dev/null | head -1 | sed 's/AUTHENTIK_TAG:-//' | sed 's/^v//')
 fi
-if [ -f "$HOME/authentik/docker-compose.yml" ] || [ -f "$HOME/authentik/.env" ]; then
+if [ -f "$AK_DIR/docker-compose.yml" ] || [ -f "$AK_DIR/.env" ]; then
   # Compare against what the CONSOLE will offer, never against upstream latest.
   # main -> AUTHENTIK_VETTED_RELEASE (the fleet-validation gate); dev -> upstream latest,
   # falling back to the baked vetted value when GitHub is unreachable. Mirrors
@@ -120,8 +129,8 @@ if [ -f "/opt/mediamtx-webeditor/mediamtx_config_editor.py" ]; then
 fi
 
 # CloudTAK (only if installed)
-if [ -f "$HOME/CloudTAK/api/package.json" ]; then
-  cur_ct=$(grep -o '"version":[[:space:]]*"[^"]*"' "$HOME/CloudTAK/api/package.json" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+if [ -f "$CT_DIR/api/package.json" ]; then
+  cur_ct=$(grep -o '"version":[[:space:]]*"[^"]*"' "$CT_DIR/api/package.json" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
   latest_ct=$(latest_tag "dfpc-coe/CloudTAK")
   if need_update "$cur_ct" "$latest_ct"; then
     UPDATES="${UPDATES}  - CloudTAK: current ${cur_ct:-unknown}, latest ${latest_ct}\n"
@@ -130,8 +139,8 @@ if [ -f "$HOME/CloudTAK/api/package.json" ]; then
 fi
 
 # CloudTAK plugins — compare local HEAD vs remote HEAD (no release tags; use git ls-remote)
-if [ -d "$HOME/CloudTAK/api/web/plugins" ]; then
-  for plugin_dir in "$HOME/CloudTAK/api/web/plugins"/*/; do
+if [ -d "$CT_DIR/api/web/plugins" ]; then
+  for plugin_dir in "$CT_DIR/api/web/plugins"/*/; do
     [ -d "$plugin_dir/.git" ] || continue
     plugin_name=$(basename "$plugin_dir")
     local_sha=$(git -C "$plugin_dir" rev-parse HEAD 2>/dev/null)
@@ -144,8 +153,8 @@ if [ -d "$HOME/CloudTAK/api/web/plugins" ]; then
 fi
 
 # TAK Portal (current from package.json, latest from container logs [update-check] — same as console)
-if [ -f "$HOME/TAK-Portal/package.json" ]; then
-  cur_portal=$(grep -o '"version":[[:space:]]*"[^"]*"' "$HOME/TAK-Portal/package.json" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+if [ -f "$PORTAL_DIR/package.json" ]; then
+  cur_portal=$(grep -o '"version":[[:space:]]*"[^"]*"' "$PORTAL_DIR/package.json" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
   latest_portal=""
   if docker ps --filter name=tak-portal -q 2>/dev/null | grep -q .; then
     latest_portal=$(docker logs tak-portal --tail 200 2>/dev/null | grep '\[update-check\]' | tail -1 | sed -n 's/.*latest=\([^[:space:]]*\).*/\1/p')
