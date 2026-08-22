@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.44-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.44-alpha)**
+**Current release: [v10.1.45-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.45-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,26 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.45-alpha — 2026-08-22 — one bad second on the network cost you the whole video config editor
+
+**Headline: while setting up the video streaming server, a momentary network hiccup could cost you its web configuration editor entirely — and the message it left behind sent you down a path that could not work, when a single button on that same page would have fixed it in seconds.** Streaming itself was never affected. Video kept working, cameras kept connecting, feeds kept flowing. What went missing was the web page you use to configure it all — and everything about how that failure was handled was wrong.
+
+**It gave up after one try.** Setting up the video server involves fetching the configuration editor from the internet. That fetch was given sixty seconds and exactly one attempt. If the network stumbled for those particular sixty seconds — not an outage, just a stumble, the kind that resolves on its own a moment later — the editor was simply not installed. On the machine where this was reported, the video server software itself downloaded successfully seconds earlier. Nothing was wrong with that machine or its connection. It was unlucky, once, for a minute.
+
+**Then it told you to do something impossible.** The setup log advised placing a particular file on the machine by hand and running the whole setup again. That file has never been part of what we ship, so there was nothing to place. The instruction could not be followed by anyone, and following it as closely as possible meant removing the entire video server and reinstalling it from scratch — which is what the person who reported this reasonably did, losing a working streaming configuration in the process.
+
+**And a one-click fix was already sitting right there.** The video server's page in the console has always had a **Patch web editor** button that repairs exactly this: it fetches the editor a different way, reapplies your settings, and restarts it — no reinstall, no lost configuration, a few seconds. Nothing in the failure mentioned it. The information needed to recover was on screen the whole time and the message pointed away from it.
+
+**All three are fixed.** The fetch now tries again before giving up, and if it still cannot get through, it falls back to downloading just the single file it needs by a different route — a much smaller request that succeeds on connections where the full fetch times out. Together these mean a passing network stumble no longer costs you anything. And if a machine genuinely cannot reach the internet, the message now says so plainly and tells you to click Patch web editor once your connection is back, instead of sending you to reinstall.
+
+**Slow connections got a real fix too, and it is a separate one.** Retrying helps when the network stumbles and then recovers — but it does nothing if your connection is simply slow all the time, because a second attempt runs into the same wall as the first. That is the normal state of affairs on satellite, Ku-band, and weak cellular, which is where a great many of these machines actually live. The fetch was being cut off after sixty seconds; elsewhere in the console, the same fetch to the same place was already allowed ninety. There was no reason for the difference. Both now get ninety seconds, so a connection that is merely slow rather than broken has the time it needs to finish.
+
+**One honest note about this release.** The new safety net only runs when a fetch fails, and we could not make a fetch fail on any of the machines we tested on — every one of them succeeded on the first try, exactly as they should. So this ships a fallback we have read carefully and reasoned about, but have not watched save a real installation. The worst case if we got it wrong is that it behaves exactly as before, which is why we are shipping it rather than holding it — but you should know which parts were proven and which were not.
+
+**Who should update:** anyone using video streaming, and anyone about to set it up — particularly on satellite, cellular, or other connections where fetches are slow or unreliable. **Upgrade:** automatic on the next console update, nothing to configure. If you are missing the video configuration editor right now, you do not need this release to fix it — click **Patch web editor** on the video server's page.
+
+Full notes: [v10.1.45-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.45-alpha).
 
 ### v10.1.44-alpha — 2026-08-22 — after a reboot, people were connected to nothing
 
