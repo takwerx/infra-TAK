@@ -2,17 +2,48 @@
 # Guard Dog Post-Start Orchestrator
 # Runs as a separate systemd oneshot after takserver.service.
 #
-# Waits for TAK Server to be fully listening on 8089, then starts
-# every service in order:
-#   1. Authentik (LDAP + SSO) — waits for healthy
-#   2. TAK Portal
-#   3. CloudTAK
-#   4. Node-RED
-#   5. MediaMTX
+# Starts every service in order:
+#   1. Authentik (LDAP + SSO) — waits for the LDAP outpost on 389
+#   2. (wait for TAK Server 8089)
+#   3. TAK Portal
+#   4. CloudTAK
+#   5. Node-RED
+#   6. MediaMTX
 #
 # Each service is given time to stabilize before the next one starts.
 # Only starts services that are actually installed; skips the rest.
 # Companion to tak-boot-sequencer.sh which stops these before TAK starts.
+#
+# v10.1.44 (W1) — AUTHENTIK STARTS BEFORE THE 8089 WAIT, NOT AFTER. This order is
+# load-bearing; do not "tidy" it back.
+#
+# Until 10.1.44 this script waited for TAK's 8089 to LISTEN and only THEN started
+# Authentik. Since tak-boot-sequencer.sh stops Authentik before TAK starts, that
+# left a window — measured 42s (test6), 61-62s (test6/test12) — in which TAK was
+# accepting client connections with LDAP down. An EUD reconnecting inside it got a
+# subscription with a NULL USER:
+#
+#   Added Subscription: id=tls:3 source=<eud>
+#   ERROR DistributedSubscriptionManager - found subscription with null user!
+#   ERROR DistributedPersistentGroupManager - LDAP connection has been closed
+#
+# The subscription is never removed, the TCP socket stays ESTABLISHED forever, and
+# ATAK shows a healthy green connection — while TAK routes the client nothing and
+# it appears in no channel. It never self-heals: the client sees a good socket and
+# never reconnects. Reproduced live on test6 2026-08-22; field-reported on a
+# production public-safety deployment 2026-08-21.
+#
+# TAK takes 110-170s to open 8089; Authentik reaches a live LDAP outpost in ~40-60s.
+# Starting Authentik first therefore has LDAP up well before TAK can accept anyone,
+# and costs nothing at the tail: the heavy consumers (CloudTAK, Node-RED, MediaMTX)
+# still start after 8089, which is what the boot sequencer's CPU-headroom design was
+# actually protecting.
+#
+# RESIDUAL RACE (not closed here): if TAK ever opens 8089 before Authentik's LDAP is
+# up — a warm restart, an unusually slow Authentik — the window reopens. Closing it
+# for good needs a hard gate (hold TAK's client ports until 389 answers) plus reaping
+# null-user subscriptions so a client that slips through reconnects instead of
+# camping on a dead socket. Both are tracked for 10.1.45.
 
 # v10.0.1: container-aware via _gd-tak-lib.sh. The 8089 wait and service
 # orchestration are host-level and unchanged; only the "messaging crashed"
@@ -28,39 +59,7 @@ _log() {
   logger -t takguard-boot "$1" 2>/dev/null
 }
 
-# ── 1. Wait for TAK Server to be listening on 8089 ──
-_log "Waiting for TAK Server port 8089..."
-_t=0
-_msg_restarted=0
-while [ $_t -lt $MAX_WAIT_TAK ]; do
-  if ss -ltn "sport = :8089" 2>/dev/null | grep -q LISTEN; then
-    _log "TAK Server 8089 ready (${_t}s)"
-    break
-  fi
-
-  if [ $_t -ge 120 ] && [ $_msg_restarted -eq 0 ] && [ $((_t % 60)) -eq 0 ]; then
-    if grep -q "Started TAK Server config Microservice" /opt/tak/logs/takserver-config.log 2>/dev/null; then
-      if ! gd_tak_pgrep "spring.profiles.active=messaging"; then
-        _log "Config ready but messaging crashed — restarting messaging"
-        if gd_is_container; then
-          # All JVMs share one container — restart it to recover messaging.
-          gd_tak_restart
-        else
-          service takserver-messaging start 2>/dev/null
-        fi
-        _msg_restarted=1
-      fi
-    fi
-  fi
-
-  sleep $INTERVAL
-  _t=$((_t + INTERVAL))
-done
-if [ $_t -ge $MAX_WAIT_TAK ]; then
-  _log "TAK Server 8089 not ready after ${MAX_WAIT_TAK}s — starting remaining services anyway"
-fi
-
-# ── 2. Start Authentik ──
+# ── 1. Start Authentik FIRST — TAK cannot authenticate anyone without LDAP ──
 AK_DIR=""
 for _d in "${HOME:-/home/takwerx}/authentik"; do
   [ -f "$_d/docker-compose.yml" ] && AK_DIR="$_d" && break
@@ -123,6 +122,38 @@ if [ -n "$AK_DIR" ]; then
   fi
 else
   _log "Authentik not installed, skipping"
+fi
+
+# ── 2. Wait for TAK Server to be listening on 8089 ──
+_log "Waiting for TAK Server port 8089..."
+_t=0
+_msg_restarted=0
+while [ $_t -lt $MAX_WAIT_TAK ]; do
+  if ss -ltn "sport = :8089" 2>/dev/null | grep -q LISTEN; then
+    _log "TAK Server 8089 ready (${_t}s)"
+    break
+  fi
+
+  if [ $_t -ge 120 ] && [ $_msg_restarted -eq 0 ] && [ $((_t % 60)) -eq 0 ]; then
+    if grep -q "Started TAK Server config Microservice" /opt/tak/logs/takserver-config.log 2>/dev/null; then
+      if ! gd_tak_pgrep "spring.profiles.active=messaging"; then
+        _log "Config ready but messaging crashed — restarting messaging"
+        if gd_is_container; then
+          # All JVMs share one container — restart it to recover messaging.
+          gd_tak_restart
+        else
+          service takserver-messaging start 2>/dev/null
+        fi
+        _msg_restarted=1
+      fi
+    fi
+  fi
+
+  sleep $INTERVAL
+  _t=$((_t + INTERVAL))
+done
+if [ $_t -ge $MAX_WAIT_TAK ]; then
+  _log "TAK Server 8089 not ready after ${MAX_WAIT_TAK}s — starting remaining services anyway"
 fi
 
 # ── 3. Start TAK Portal ──
