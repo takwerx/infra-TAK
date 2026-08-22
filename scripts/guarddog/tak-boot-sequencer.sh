@@ -13,6 +13,11 @@
 # The companion tak-post-start.sh brings services back up in order
 # once TAK is listening on 8089.
 
+# v10.1.44 (W2): source the shared lib for gd_find_stack_dir() — $HOME is
+# EMPTY in a systemd unit, so the old "${HOME:-/home/takwerx}/<stack>" globs
+# silently missed /root-era installs and this script stopped NOTHING.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+
 MAX_WAIT=120
 INTERVAL=5
 
@@ -34,28 +39,33 @@ _uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 9999)
 if [ "$_uptime_sec" -lt 600 ]; then
   _log "Boot detected (uptime ${_uptime_sec}s) — stopping Docker containers and MediaMTX to give TAK Server full CPU..."
 
-  for _d in "${HOME:-/home/takwerx}/authentik"; do
-    if [ -f "$_d/docker-compose.yml" ]; then
-      cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Authentik containers stopped"
-      break
-    fi
-  done
+  _ak_d="$(gd_find_stack_dir authentik authentik-server-1)"
+  if [ -n "$_ak_d" ]; then
+    cd "$_ak_d" && docker compose stop -t 10 2>/dev/null && _log "Authentik containers stopped"
+  else
+    # Last resort: stop by container name so `restart: unless-stopped` cannot
+    # race TAK's start even when no compose dir is discoverable.
+    docker stop -t 10 authentik-server-1 authentik-worker-1 authentik-ldap-1 2>/dev/null \
+      && _log "Authentik containers stopped (by name — no compose dir found)"
+  fi
 
   docker stop tak-portal 2>/dev/null && _log "TAK Portal stopped"
 
-  for _d in "${HOME:-/home/takwerx}/CloudTAK"; do
-    if [ -f "$_d/docker-compose.yml" ]; then
-      cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "CloudTAK stopped"
-      break
-    fi
-  done
+  _ct_d="$(gd_find_stack_dir CloudTAK cloudtak-api-1)"
+  if [ -n "$_ct_d" ]; then
+    cd "$_ct_d" && docker compose stop -t 10 2>/dev/null && _log "CloudTAK stopped"
+  fi
 
-  for _d in "${HOME:-/home/takwerx}/node-red"; do
-    if [ -f "$_d/docker-compose.yml" ]; then
-      cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Node-RED stopped"
-      break
-    fi
-  done
+  _nr_d="$(gd_find_stack_dir node-red nodered)"
+  if [ -n "$_nr_d" ]; then
+    cd "$_nr_d" && docker compose stop -t 10 2>/dev/null && _log "Node-RED stopped"
+  else
+    # Node-RED's feeds connect the instant 8089 opens. If it is not stopped here,
+    # `restart: unless-stopped` starts it alongside TAK and every feed binds with
+    # no LDAP behind it. Stop it by name rather than let that happen.
+    docker stop -t 10 nodered 2>/dev/null \
+      && _log "Node-RED stopped (by name — no compose dir found)"
+  fi
 
   if systemctl list-unit-files mediamtx.service &>/dev/null && systemctl is-active --quiet mediamtx 2>/dev/null; then
     systemctl stop mediamtx 2>/dev/null && _log "MediaMTX stopped"

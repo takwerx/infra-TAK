@@ -60,10 +60,9 @@ _log() {
 }
 
 # ── 1. Start Authentik FIRST — TAK cannot authenticate anyone without LDAP ──
-AK_DIR=""
-for _d in "${HOME:-/home/takwerx}/authentik"; do
-  [ -f "$_d/docker-compose.yml" ] && AK_DIR="$_d" && break
-done
+# v10.1.44 (W2): $HOME is EMPTY in a systemd unit — never resolve the stack
+# dir from it alone. gd_find_stack_dir() asks the container itself first.
+AK_DIR="$(gd_find_stack_dir authentik authentik-server-1)"
 
 if [ -n "$AK_DIR" ]; then
   cd "$AK_DIR"
@@ -168,10 +167,9 @@ fi
 
 # ── 4. Start CloudTAK ──
 # Stagger Docker starts to avoid iptables churn that disrupts TAK Server connections
-CT_DIR=""
-for _d in "${HOME:-/home/takwerx}/CloudTAK"; do
-  [ -f "$_d/docker-compose.yml" ] && CT_DIR="$_d" && break
-done
+# v10.1.44 (W2): $HOME is EMPTY in a systemd unit — never resolve the stack
+# dir from it alone. gd_find_stack_dir() asks the container itself first.
+CT_DIR="$(gd_find_stack_dir CloudTAK cloudtak-api-1)"
 
 if [ -n "$CT_DIR" ]; then
   _log "Starting CloudTAK (30s stagger to protect TAK connections)..."
@@ -184,10 +182,9 @@ else
 fi
 
 # ── 5. Start Node-RED ──
-NR_DIR=""
-for _d in "${HOME:-/home/takwerx}/node-red"; do
-  [ -f "$_d/docker-compose.yml" ] && NR_DIR="$_d" && break
-done
+# v10.1.44 (W2): $HOME is EMPTY in a systemd unit — never resolve the stack
+# dir from it alone. gd_find_stack_dir() asks the container itself first.
+NR_DIR="$(gd_find_stack_dir node-red nodered)"
 
 if [ -n "$NR_DIR" ]; then
   _log "Starting Node-RED (30s stagger to protect TAK connections)..."

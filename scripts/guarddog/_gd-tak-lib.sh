@@ -237,3 +237,43 @@ gd_keytool() {
     keytool "$@" 2>/dev/null
   fi
 }
+
+# ---------------------------------------------------------------------------
+# v10.1.44 (W2): resolve a compose stack directory WITHOUT trusting $HOME.
+#
+# Field report (TN TAK production, 2026-08-22): systemd units get an EMPTY
+# environment unless told otherwise — `systemctl show tak-post-start.service -p
+# Environment -p User` returned both blank. So `${HOME:-/home/takwerx}/authentik`
+# resolved to /home/takwerx/authentik on a root-era box whose stacks live in
+# /root/authentik. tak-post-start.sh logged "Authentik not installed, skipping"
+# and never started Authentik or waited for LDAP at all; tak-boot-sequencer.sh
+# likewise never stopped Node-RED, so Docker's `restart: unless-stopped` brought
+# it up in parallel with TAK and its feeds connected the instant 8089 opened —
+# with no LDAP behind them. Every one of those sessions came up __ANON__.
+#
+# app.py already searches both ~/authentik and /root/authentik for exactly this
+# reason (see the `cd: can't cd to ~/authentik` note at app.py:79); the shell
+# scripts never got the same treatment. Eight of them depended on $HOME.
+#
+# $1 = stack dir name (authentik | CloudTAK | node-red | TAK-Portal)
+# $2 = optional container name; its compose label is authoritative when present.
+# Prints the directory and returns 0, or returns 1.
+gd_find_stack_dir() {
+  local _name="$1" _ctr="$2" _d _wd
+  # 1. Authoritative: ask a container of this stack where its project lives.
+  #    Works regardless of which user owns it or where it was installed.
+  if [ -n "$_ctr" ]; then
+    _wd=$(docker inspect "$_ctr" \
+            --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
+            2>/dev/null)
+    if [ -n "$_wd" ] && [ -f "$_wd/docker-compose.yml" ]; then
+      printf '%s' "$_wd"; return 0
+    fi
+  fi
+  # 2. Explicit search list. $HOME is used when SET but never relied on:
+  #    ${HOME:+...} yields empty (not a bogus path) when it is unset.
+  for _d in "${HOME:+$HOME/$_name}" "/root/$_name" /home/*/"$_name"; do
+    [ -n "$_d" ] && [ -f "$_d/docker-compose.yml" ] && { printf '%s' "$_d"; return 0; }
+  done
+  return 1
+}
