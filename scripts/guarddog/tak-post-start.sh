@@ -155,7 +155,92 @@ if [ $_t -ge $MAX_WAIT_TAK ]; then
   _log "TAK Server 8089 not ready after ${MAX_WAIT_TAK}s — starting remaining services anyway"
 fi
 
-# ── 3. Start TAK Portal ──
+# ── 3. Recycle sessions that connected before TAK's API was ready ──
+#
+# v10.1.44 (W4). TAK opens 8089 from the *messaging* JVM, but the dashboard and
+# every /Marti/api/* view are served by the *api* JVM, which finishes starting
+# LATER. Measured on test6 across every boot on record (Jun 4 - Aug 22): the gap
+# between "Netty started on 8089" and "Started TAK Server api Microservice" runs
+# 5.5s to 23.6s. It is inherent to TAK, not something infra-TAK introduced.
+#
+# A client that connects inside that gap gets a working session — messaging routes
+# it, traffic flows both ways, groups resolve correctly — but the api JVM never
+# learns about the subscription, so the client is INVISIBLE in the 8446 client
+# dashboard and in /Marti/api/subscriptions/all. It never self-corrects, because
+# nothing is actually wrong from the client's side.
+#
+# Proven on test6 2026-08-22: an ATAK client connecting 10s after 8089 opened
+# (4.3s before the api microservice finished) passed traffic continuously but did
+# not appear in the dashboard. Killing its socket made ATAK reconnect on its own
+# within a minute, and it appeared immediately with its correct channels.
+#
+# This is what the operator of a large deployment sees as "a lot of missing users"
+# after a reboot: hundreds of EUDs all reconnect the instant 8089 opens, so a large
+# share of them land inside the window every time.
+#
+# Fix: once the api JVM is genuinely up, recycle exactly the sockets that were
+# already connected when it came up. Those are precisely the ones that raced it.
+# Each client reconnects itself into a fully-ready server. Cost is one reconnect
+# for the affected clients; doing nothing leaves them invisible until someone
+# notices and toggles them by hand.
+#
+# Deliberately NOT a firewall gate on 8089: a bug in that locks every EUD out of a
+# public-safety server with no safe failure mode. The worst case here is a spurious
+# reconnect.
+#
+# SAFETY: `ss -K` with no filter destroys EVERY socket on the box, including SSH.
+# Every kill below is filtered to one exact peer address+port AND sport = :8089.
+# Never add an unfiltered `ss -K` to this script.
+_api_ready=0
+_t=0
+_MAX_API=300
+_log "Waiting for TAK Server API microservice (8443)..."
+while [ $_t -lt $_MAX_API ]; do
+  if gd_tcp_up 127.0.0.1 8443; then
+    _api_ready=1
+    _log "TAK API responding on 8443 (${_t}s)"
+    break
+  fi
+  sleep $INTERVAL
+  _t=$((_t + INTERVAL))
+done
+
+if [ $_api_ready -eq 0 ]; then
+  _log "TAK API not up after ${_MAX_API}s — skipping session recycle (fail safe: change nothing)"
+elif ! command -v ss >/dev/null 2>&1; then
+  _log "ss not available — skipping session recycle"
+else
+  # Snapshot the peers already connected at the moment the API came up. Anything
+  # connecting after this point talks to a ready server and is left alone.
+  _early=$(ss -tn state established "( sport = :8089 )" 2>/dev/null | tail -n +2 | awk '{print $4}' | grep -E '^[0-9a-fA-F:.]+:[0-9]+$')
+  _n=$(printf '%s\n' "$_early" | grep -c . || true)
+  if [ "${_n:-0}" -eq 0 ]; then
+    _log "No clients connected before the API was ready — nothing to recycle"
+  else
+    # Let anything that CAN still register do so before we judge it.
+    sleep 20
+    _killed=0
+    for _peer in $_early; do
+      _ip="${_peer%:*}"
+      _port="${_peer##*:}"
+      [ -z "$_ip" ] && continue
+      [ -z "$_port" ] && continue
+      # Still connected? (it may have gone away during the settle)
+      if ! ss -tn state established "( sport = :8089 )" "dst $_ip and dport = $_port" 2>/dev/null | tail -n +2 | grep -q .; then
+        continue
+      fi
+      if ss -K state established "( sport = :8089 )" "dst $_ip and dport = $_port" >/dev/null 2>&1; then
+        _killed=$((_killed + 1))
+        _log "Recycled pre-API session $_peer (client will reconnect itself)"
+      else
+        _log "Could not recycle $_peer (kernel may lack INET_DIAG_DESTROY) — leaving it"
+      fi
+    done
+    _log "Session recycle complete — $_killed of $_n pre-API session(s) recycled"
+  fi
+fi
+
+# ── 4. Start TAK Portal ──
 if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^tak-portal$'; then
   _log "Starting TAK Portal..."
   docker start tak-portal 2>/dev/null
@@ -165,7 +250,7 @@ else
   _log "TAK Portal not found, skipping"
 fi
 
-# ── 4. Start CloudTAK ──
+# ── 5. Start CloudTAK ──
 # Stagger Docker starts to avoid iptables churn that disrupts TAK Server connections
 # v10.1.44 (W2): $HOME is EMPTY in a systemd unit — never resolve the stack
 # dir from it alone. gd_find_stack_dir() asks the container itself first.
@@ -181,7 +266,7 @@ else
   _log "CloudTAK not installed, skipping"
 fi
 
-# ── 5. Start Node-RED ──
+# ── 6. Start Node-RED ──
 # v10.1.44 (W2): $HOME is EMPTY in a systemd unit — never resolve the stack
 # dir from it alone. gd_find_stack_dir() asks the container itself first.
 NR_DIR="$(gd_find_stack_dir node-red nodered)"
@@ -196,7 +281,7 @@ else
   _log "Node-RED not installed, skipping"
 fi
 
-# ── 6. Start MediaMTX ──
+# ── 7. Start MediaMTX ──
 # MediaMTX is systemd-native (no Docker iptables impact), shorter stagger is fine
 if systemctl list-unit-files mediamtx.service &>/dev/null; then
   _log "Starting MediaMTX..."
