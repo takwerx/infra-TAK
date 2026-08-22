@@ -31749,8 +31749,15 @@ WantedBy=multi-user.target
             try:
                 subprocess.run(f'rm -rf {clone_dir}', shell=True, capture_output=True)
                 os.makedirs(clone_dir, exist_ok=True)
+                # 90s, matching the remote-target clone at ~app.py:31109. The local path
+                # used to allow only 60s for the identical clone, an asymmetry with no
+                # justification behind it. Retrying twice at 60s gives more TOTAL tolerance
+                # than one 90s try, but it does nothing for the case this product actually
+                # meets in the field: a satellite / Ku-band / degraded-LTE link where EVERY
+                # attempt takes 70-80s. Both retries fail identically there; only a longer
+                # per-attempt ceiling helps.
                 r = subprocess.run(f'git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
-                    shell=True, capture_output=True, text=True, timeout=60)
+                    shell=True, capture_output=True, text=True, timeout=90)
                 if r.returncode == 0:
                     candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
                     if os.path.exists(candidate):
@@ -31768,7 +31775,9 @@ WantedBy=multi-user.target
                 import urllib.request as _urlreq
                 os.makedirs(clone_dir, exist_ok=True)
                 _raw_dst = os.path.join(clone_dir, 'mediamtx_config_editor.py')
-                with _urlreq.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as _resp:
+                # 90s here too: this fallback exists FOR the slow link, so it must not be
+                # given a tighter budget than the clone it is rescuing.
+                with _urlreq.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=90) as _resp:
                     _body = _resp.read()
                 # Guard against a captive portal / proxy handing back an HTML error page.
                 if b'app = Flask' in _body:
