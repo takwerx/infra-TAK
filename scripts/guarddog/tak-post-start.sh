@@ -39,11 +39,11 @@
 # still start after 8089, which is what the boot sequencer's CPU-headroom design was
 # actually protecting.
 #
-# RESIDUAL RACE (not closed here): if TAK ever opens 8089 before Authentik's LDAP is
-# up — a warm restart, an unusually slow Authentik — the window reopens. Closing it
-# for good needs a hard gate (hold TAK's client ports until 389 answers) plus reaping
-# null-user subscriptions so a client that slips through reconnects instead of
-# camping on a dead socket. Both are tracked for 10.1.45.
+# RESIDUAL RACE — CLOSED IN 10.1.46 (W1). The window above is now held shut by a
+# firewall gate on 8089 inserted by tak-boot-sequencer.sh (boot only) and released
+# by THIS script the instant TAK's api JVM answers on 8443. See the trap below:
+# releasing that gate is this script's single most important obligation, and it
+# happens on every exit path — success, timeout, crash, kill.
 
 # v10.0.1: container-aware via _gd-tak-lib.sh. The 8089 wait and service
 # orchestration are host-level and unchanged; only the "messaging crashed"
@@ -58,6 +58,26 @@ _log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') post-start: $1"
   logger -t takguard-boot "$1" 2>/dev/null
 }
+
+# ── 0. The client gate must come down no matter how this script ends ──
+# v10.1.46 (W1). tak-boot-sequencer.sh may have inserted a firewall gate on 8089
+# so no EUD can connect before TAK's api JVM can account for it. If this script
+# dies, times out, or is killed, that gate is what stands between a public-safety
+# fleet and its server. Release is idempotent and safe with no gate present, so
+# calling it twice (trap + explicit) costs nothing.
+# Two independent backstops exist beyond this trap: takclientgate.timer
+# (OnBootSec=15min, unconditional) and the console-startup sweep in app.py.
+_gate_released=0
+release_client_gate() {
+  [ "$_gate_released" -eq 1 ] && return 0
+  _gate_released=1
+  if [ -x /opt/tak-guarddog/tak-client-gate.sh ]; then
+    GATE_LOG_PREFIX="post-start" /opt/tak-guarddog/tak-client-gate.sh release 2>/dev/null || true
+  fi
+  return 0
+}
+trap release_client_gate EXIT
+trap 'release_client_gate; exit 143' TERM INT
 
 # ── 1. Start Authentik FIRST — TAK cannot authenticate anyone without LDAP ──
 # v10.1.44 (W2): $HOME is EMPTY in a systemd unit — never resolve the stack
@@ -184,9 +204,13 @@ fi
 # for the affected clients; doing nothing leaves them invisible until someone
 # notices and toggles them by hand.
 #
-# Deliberately NOT a firewall gate on 8089: a bug in that locks every EUD out of a
-# public-safety server with no safe failure mode. The worst case here is a spurious
-# reconnect.
+# v10.1.46 (W1): a boot-time firewall gate on 8089 now PREVENTS the race, so on a
+# healthy box this step should find nothing to recycle. 10.1.44 rejected a gate
+# because "a bug in that locks every EUD out of a public-safety server with no safe
+# failure mode" — that objection was answered, not ignored: the gate is boot-only,
+# fails open on every error, is released by a trap on every exit path here, and has
+# an independent timer backstop plus a console-startup sweep. This recycler STAYS as
+# defence in depth for exactly the case where the gate failed open.
 #
 # SAFETY: `ss -K` with no filter destroys EVERY socket on the box, including SSH.
 # Every kill below is filtered to one exact peer address+port AND sport = :8089.
@@ -205,14 +229,25 @@ while [ $_t -lt $_MAX_API ]; do
   _t=$((_t + INTERVAL))
 done
 
+# Snapshot the peers already connected at the moment the API came up — BEFORE the
+# gate comes down, so the set is exactly "who raced the API", not "who walked in
+# through the door we just opened". Anything connecting after this talks to a ready
+# server and is left alone.
+_early=""
+if [ $_api_ready -eq 1 ] && command -v ss >/dev/null 2>&1; then
+  _early=$(ss -tn state established "( sport = :8089 )" 2>/dev/null | tail -n +2 | awk '{print $4}' | grep -E '^[0-9a-fA-F:.]+:[0-9]+$')
+fi
+
+# Open the door. Unconditional: whether the API came up or timed out, a gated 8089
+# must not outlive this point — a server nobody can reach is worse than a server
+# with a stale client list.
+release_client_gate
+
 if [ $_api_ready -eq 0 ]; then
   _log "TAK API not up after ${_MAX_API}s — skipping session recycle (fail safe: change nothing)"
 elif ! command -v ss >/dev/null 2>&1; then
   _log "ss not available — skipping session recycle"
 else
-  # Snapshot the peers already connected at the moment the API came up. Anything
-  # connecting after this point talks to a ready server and is left alone.
-  _early=$(ss -tn state established "( sport = :8089 )" 2>/dev/null | tail -n +2 | awk '{print $4}' | grep -E '^[0-9a-fA-F:.]+:[0-9]+$')
   _n=$(printf '%s\n' "$_early" | grep -c . || true)
   if [ "${_n:-0}" -eq 0 ]; then
     _log "No clients connected before the API was ready — nothing to recycle"

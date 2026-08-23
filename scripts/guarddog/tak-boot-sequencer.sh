@@ -37,6 +37,20 @@ _tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 # fine and should not be disturbed.
 _uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 9999)
 if [ "$_uptime_sec" -lt 600 ]; then
+  # ── 0. Hold the client port shut until TAK can actually account for clients ──
+  # v10.1.46 (W1). TAK opens 8089 from the messaging JVM but serves the client
+  # dashboard and /Marti/api/* from the api JVM, which finishes 5.5-30s LATER.
+  # Anything that connects in that gap works but is invisible to the api JVM
+  # forever. tak-post-start.sh releases the gate the instant 8443 answers; a
+  # trap there, an independent takclientgate.timer backstop at OnBootSec=15min,
+  # and a console-startup sweep all release it independently. The gate script
+  # fails OPEN on every error — a box that cannot gate simply behaves like
+  # 10.1.44, where the post-start sweeper still recycles the racers.
+  # This runs as ExecStartPre, so the gate is up before TAK's first listener.
+  if [ -x /opt/tak-guarddog/tak-client-gate.sh ]; then
+    GATE_LOG_PREFIX="boot-sequencer" /opt/tak-guarddog/tak-client-gate.sh insert || true
+  fi
+
   _log "Boot detected (uptime ${_uptime_sec}s) — stopping Docker containers and MediaMTX to give TAK Server full CPU..."
 
   _ak_d="$(gd_find_stack_dir authentik authentik-server-1)"

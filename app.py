@@ -20526,6 +20526,28 @@ _METRICS_COLLECTOR_UNIT = ('[Unit]\nDescription=Guard Dog Network/Fanout Metrics
                            'Restart=always\nRestartSec=15\n\n'
                            '[Install]\nWantedBy=multi-user.target\n')
 
+# v10.1.46 (W1/W2). ONE definition, used by both the Guard Dog deploy path and the
+# console-startup auto-update — if the two ever disagree the startup path rewrites
+# the unit on every restart, and which cadence a box gets depends on which ran last
+# (the takbuildcachereclaim daily-vs-hourly split, ~line 67665, is that bug).
+#
+# takclientgate is the INDEPENDENT backstop for the 8089 boot gate: OnBootSec only,
+# fires once per boot, releases whether or not a gate exists and whether or not
+# tak-post-start.sh ever ran. It is deliberately dumb.
+_CLIENT_GATE_UNITS = [
+    ('takclientgate.service', '[Unit]\nDescription=Guard Dog TAK client gate release (boot backstop)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-client-gate.sh release\n'),
+    ('takclientgate.timer', '[Unit]\nDescription=Release the TAK client gate 15 min after boot, unconditionally\n\n[Timer]\nOnBootSec=15min\nAccuracySec=30s\nUnit=takclientgate.service\n\n[Install]\nWantedBy=timers.target\n'),
+    ('taksessionguard.service', '[Unit]\nDescription=TAK Client Session Visibility Monitor (invisible / groupless sessions)\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-session-watch.sh\n'),
+    ('taksessionguard.timer', '[Unit]\nDescription=Run TAK session visibility monitor every 5 minutes\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=5min\nUnit=taksessionguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+    # Console-startup stale-gate sweep. A UNIT rather than a direct call because
+    # the broker denies `bash <script>` outright (arbitrary-shell escalation) —
+    # on a non-root box a direct invocation would simply be refused, and the
+    # sweep would silently never run. `systemctl start` is already allowed, and
+    # this adds no new privilege the console did not have.
+    # No timer: the console triggers it, and takclientgate.timer is the periodic net.
+    ('takclientgatesweep.service', '[Unit]\nDescription=Guard Dog TAK client gate stale sweep (console startup)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-client-gate.sh sweep\n'),
+]
+
 def run_guarddog_deploy(alert_email):
     """Deploy Guard Dog: monitors + health endpoint. Requires TAK Server at /opt/tak. Alert email optional (alerts only when set)."""
     def plog(msg):
@@ -20579,6 +20601,10 @@ def run_guarddog_deploy(alert_email):
             # branch emits the identical commands); enables container mode here.
             '_gd-tak-lib.sh',
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
+            # v10.1.46 (W1/W2): the boot client gate on 8089 and the session
+            # visibility watcher. Both are fleet-wide — the gate no-ops on a box
+            # with no firewall backend, the watcher no-ops until TAK is up.
+            'tak-client-gate.sh', 'tak-session-watch.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
@@ -20791,6 +20817,12 @@ def run_guarddog_deploy(alert_email):
                 ('takfedhubguard.service', '[Unit]\nDescription=Guard Dog Federation Hub Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-fedhub-watch.sh\n'),
                 ('takfedhubguard.timer', '[Unit]\nDescription=Run Federation Hub guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takfedhubguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+        # v10.1.46 (W1) — the client gate's INDEPENDENT backstop. It must not depend
+        # on tak-post-start.sh having run, completed, or even existing: this is the
+        # net under the net. OnBootSec only (no OnUnitActiveSec) — it fires once per
+        # boot, 15 minutes in, and releases whether or not a gate is present.
+        # v10.1.46 (W2) — session visibility watcher: read-only, alerts only.
+        units.extend(_CLIENT_GATE_UNITS)
         _updates_home = os.path.expanduser('~')
         units.extend([
             ('takupdatesguard.service', f'[Unit]\nDescription=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n[Service]\nType=oneshot\nEnvironment=HOME={_updates_home}\nExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'),
@@ -20894,6 +20926,12 @@ def run_guarddog_deploy(alert_email):
         if 'tak-fedhub-watch.sh' in script_files:
             timers.append('takfedhubguard.timer')
         timers.append('takupdatesguard.timer')
+        # v10.1.46: the gate backstop and the session watcher. A timer written but
+        # not enabled is the exact bug called out above for takfeedsourceguard —
+        # and for the gate backstop it would be the difference between a released
+        # gate and a locked-out fleet.
+        timers.append('takclientgate.timer')
+        timers.append('taksessionguard.timer')
         for t in timers:
             re = subprocess.run(_sudo_wrap(['systemctl', 'enable', t]), capture_output=True, text=True, timeout=5)
             if re.returncode != 0:
@@ -67683,6 +67721,37 @@ def _auto_update_guarddog():
             if _bc_reload:
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
                 subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takbuildcachereclaim.timer']), capture_output=True, timeout=10)
+        # v10.1.46 (W1/W2): install the client-gate backstop and the session watcher
+        # on a plain pull+restart. Fixes ride the console update — an operator must
+        # never have to click "Update Guard Dog" to get the safety net under a gate
+        # their boot sequencer is already inserting.
+        if os.path.isfile('/opt/tak-guarddog/tak-client-gate.sh'):
+            _cg_reload = False
+            for _un, _body in _CLIENT_GATE_UNITS:
+                _up = os.path.join('/etc/systemd/system', _un)
+                try:
+                    if os.path.isfile(_up) and _read_priv(_up) == _body:
+                        continue
+                except Exception:
+                    pass
+                _write_priv(_up, _body)
+                _cg_reload = True
+            if _cg_reload:
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+                for _t in ('takclientgate.timer', 'taksessionguard.timer'):
+                    subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', _t]), capture_output=True, timeout=10)
+                print("Guard Dog: installed takclientgate/taksessionguard units on startup.")
+            # Safety item 5 — sweep a client gate that outlived its boot. UFW rules
+            # PERSIST across reboot (firewalld rich rules do not), so a box that lost
+            # power mid-gate would come back with 8089 denied to every EUD.
+            # `sweep` releases ONLY a gate from a previous boot or one past the 15-min
+            # backstop: the console also restarts during boot, and an unconditional
+            # release here would defeat the gate on every single boot.
+            try:
+                subprocess.run(_sudo_wrap(['systemctl', 'start', 'takclientgatesweep.service']),
+                               capture_output=True, timeout=30)
+            except Exception as _e:
+                print(f"Guard Dog: client-gate sweep skipped: {_e}")
         if updated > 0:
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takremotedbauthguard.timer']), capture_output=True, timeout=10)
