@@ -72,6 +72,10 @@ STALE_AFTER=900          # a gate older than the 15-min backstop is stale
 # before our chain is reached; it is listed anyway so the intent is explicit.
 PERMIT_NETS="127.0.0.0/8 172.16.0.0/12"
 
+# Display label — the detection key stays 'ufw'/'firewalld' (which family owns the
+# firewall) but the ufw family's rules now live in the raw table, so say so.
+_be_label() { case "$1" in ufw) echo "iptables raw";; firewalld) echo "firewalld";; *) echo "${1:-none}";; esac; }
+
 _log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') ${GATE_LOG_PREFIX:-client-gate}: $1"
   logger -t takguard-boot "${GATE_LOG_PREFIX:+${GATE_LOG_PREFIX}: }$1" 2>/dev/null
@@ -105,16 +109,31 @@ _fwd_permit_rule() { echo "rule priority=\"-10\" family=\"ipv4\" source address=
 # For ufw the real precondition is that its chains EXIST: an inactive ufw has no
 # ufw-user-input chain, so this is a stricter and more honest check than
 # `ufw status`.
-UFW_CHAIN4="ufw-user-input"
-UFW_CHAIN6="ufw6-user-input"
-_ufw_active() { iptables -S "$UFW_CHAIN4" >/dev/null 2>&1; }
+# THE RAW TABLE, NOT ufw's CHAINS. (v10.1.46 W5 — learned on test6, live.)
+# W4 put the gate directly into ufw-user-input. It engaged correctly and then
+# vanished within 7 seconds, because ANY `ufw` command makes ufw flush and rebuild
+# that chain from /etc/ufw/user.rules — and the console's own startup hardening
+# runs one on every boot:
+#   03:22:33  boot-sequencer: client gate ENGAGED on 8089 (ufw)
+#   03:22:40  Startup migration: guarddog 8080: source-scoped ALLOW ... (ufw)
+# By the time TAK opened 8089 the gate was long gone. Nothing logged its removal,
+# because nothing of ours removed it.
+# The raw table is not managed by ufw — `grep '^\*' /etc/ufw/*.rules` yields only
+# `*filter` — so a rule here survives ufw reloads from the console, from a module
+# opening a port, and from the operator. It is still runtime-only: nothing
+# persists or restores the raw table, so a reboot clears the gate by construction.
+# raw/PREROUTING is the first hook in the path, before conntrack; ACCEPT there
+# simply ends raw-table traversal and the packet continues through the normal
+# firewall, so the permits below do NOT bypass ufw.
+RAW_CHAIN="PREROUTING"
+_ufw_active() { iptables -t raw -S "$RAW_CHAIN" >/dev/null 2>&1; }
 _fwd_active() { [ "$(firewall-cmd --state 2>/dev/null)" = "running" ]; }
 
 # The gate rules, as iptables argument vectors. ONE definition each so insert,
 # check and delete can never drift apart — a delete spec that does not match the
 # insert spec is a gate that cannot be removed.
-_ipt4() { iptables "$@" ; }
-_ipt6() { ip6tables "$@" ; }
+_ipt4() { iptables  -t raw "$@" ; }
+_ipt6() { ip6tables -t raw "$@" ; }
 # Rule bodies WITHOUT the chain: iptables takes the chain (and, for -I, the
 # position) before the spec — `-I <chain> <pos> <spec>` but `-C/-D <chain> <spec>`.
 # Keeping the chain out of these keeps one body shared by all three verbs.
@@ -139,7 +158,7 @@ _gate_in_force() {
 # this can never be confused by an operator's rule or by ufw's status formatting
 # (the v6 rows print as "8089/tcp (v6)", which is what made the old status-parsing
 # check miss its own leaked rule).
-_ufw_has_drop() { _ipt4 -C "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1; }
+_ufw_has_drop() { _ipt4 -C "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1; }
 
 # ─────────────────────────── RELEASE ───────────────────────────
 # Idempotent, backend-agnostic, and correct with no state file — the backstop
@@ -157,14 +176,14 @@ _release() {
       fi
     done
   fi
-  # ufw chains: delete by EXACT rule spec, v4 and v6. `-D` removes one matching
+  # raw table: delete by EXACT rule spec, v4 and v6. `-D` removes one matching
   # rule per call and fails when none matches, so the loop self-terminates; the
   # counter is a backstop against a kernel that reports success without removing.
   if command -v iptables >/dev/null 2>&1; then
     local _guard=0
-    while _ipt4 -C "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1 && [ "$_guard" -lt 10 ]; do
+    while _ipt4 -C "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1 && [ "$_guard" -lt 10 ]; do
       _guard=$((_guard + 1))
-      _ipt4 -D "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1 || break
+      _ipt4 -D "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1 || break
       removed=$((removed + 1))
     done
     # The permits are ours by construction — we create them in our own gate pass
@@ -173,20 +192,20 @@ _release() {
     local _g2
     for _net in $PERMIT_NETS; do
       _g2=0
-      while _ipt4 -C "$UFW_CHAIN4" $(_permit_args "$_net") >/dev/null 2>&1 && [ "$_g2" -lt 10 ]; do
+      while _ipt4 -C "$RAW_CHAIN" $(_permit_args "$_net") >/dev/null 2>&1 && [ "$_g2" -lt 10 ]; do
         _g2=$((_g2 + 1))
-        _ipt4 -D "$UFW_CHAIN4" $(_permit_args "$_net") >/dev/null 2>&1 || break
+        _ipt4 -D "$RAW_CHAIN" $(_permit_args "$_net") >/dev/null 2>&1 || break
       done
     done
-    if _ipt4 -C "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1; then
-      _log "WARNING: a DROP rule on $PORT survived release — inspect: iptables -S $UFW_CHAIN4"
+    if _ipt4 -C "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1; then
+      _log "WARNING: a DROP rule on $PORT survived release — inspect: iptables -t raw -S $RAW_CHAIN"
     fi
   fi
   if command -v ip6tables >/dev/null 2>&1; then
     local _guard6=0
-    while _ipt6 -C "$UFW_CHAIN6" $(_drop_args) >/dev/null 2>&1 && [ "$_guard6" -lt 10 ]; do
+    while _ipt6 -C "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1 && [ "$_guard6" -lt 10 ]; do
       _guard6=$((_guard6 + 1))
-      _ipt6 -D "$UFW_CHAIN6" $(_drop_args) >/dev/null 2>&1 || break
+      _ipt6 -D "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1 || break
       removed=$((removed + 1))
     done
   fi
@@ -206,7 +225,7 @@ _release() {
   fi
 
   if [ "$removed" -gt 0 ]; then
-    _log "client gate RELEASED on $PORT (${be:-none}, $removed rule(s) removed)"
+    _log "client gate RELEASED on $PORT ($(_be_label "$be"), $removed rule(s) removed)"
   else
     _log "client gate not engaged on $PORT — nothing to release"
   fi
@@ -286,23 +305,22 @@ _insert() {
   : > "$_tmp"
 
   if [ "$be" = "ufw" ]; then
-    # Straight into ufw's own chains — see the header. Order matters: each `-I 1`
-    # pushes the previous rule down, so the DROP goes in first and ends up below
-    # the permits.
-    if ! _ipt4 -I "$UFW_CHAIN4" 1 $(_drop_args) >/dev/null 2>&1; then
-      _log "client gate FAILED to insert (ufw chains) — continuing ungated"
+    # Into the raw table — see the header for why NOT ufw's chains. Order matters:
+    # each `-I 1` pushes the previous rule down, so the DROP goes in first and ends
+    # up below the permits.
+    if ! _ipt4 -I "$RAW_CHAIN" 1 $(_drop_args) >/dev/null 2>&1; then
+      _log "client gate FAILED to insert (raw table) — continuing ungated"
       rm -f "$_tmp"; return 0
     fi
     for _net in $PERMIT_NETS; do
       case "$_net" in *:*) continue;; esac
-      _ipt4 -I "$UFW_CHAIN4" 1 $(_permit_args "$_net") >/dev/null 2>&1 || \
+      _ipt4 -I "$RAW_CHAIN" 1 $(_permit_args "$_net") >/dev/null 2>&1 || \
         _log "client gate: permit for $_net not applied — containers on that range may be held off until release"
     done
-    # IPv6 is best-effort: a v6-disabled box has no ip6tables chain, and a v4-only
-    # gate is still strictly better than none. Loopback is accepted by
-    # ufw6-before-input before this chain is reached.
+    # IPv6 is best-effort: a v6-disabled box has no ip6tables raw table, and a
+    # v4-only gate is still strictly better than none.
     if command -v ip6tables >/dev/null 2>&1; then
-      _ipt6 -I "$UFW_CHAIN6" 1 $(_drop_args) >/dev/null 2>&1 || \
+      _ipt6 -I "$RAW_CHAIN" 1 $(_drop_args) >/dev/null 2>&1 || \
         _log "client gate: ipv6 drop not applied (v6 may be disabled) — v4 gate active"
     fi
   elif [ "$be" = "firewalld" ]; then
@@ -345,12 +363,12 @@ _insert() {
   # Verify before claiming anything. An insert that "succeeded" without producing
   # a rule is a gate that is not there.
   if ! _gate_in_force "$be"; then
-    _log "client gate did NOT take on $be (command succeeded, rule absent) — rolling back, continuing ungated"
+    _log "client gate did NOT take on $(_be_label "$be") (command succeeded, rule absent) — rolling back, continuing ungated"
     _release >/dev/null 2>&1
     return 0
   fi
 
-  _log "client gate ENGAGED on $PORT ($be)"
+  _log "client gate ENGAGED on $PORT ($(_be_label "$be"))"
   return $rc
 }
 
@@ -364,10 +382,10 @@ _status() {
     echo "state file: (none)"
   fi
   if command -v iptables >/dev/null 2>&1; then
-    echo "ufw chain rules for $PORT (v4):"
-    iptables -S "$UFW_CHAIN4" 2>/dev/null | grep -- "--dport $PORT" | sed 's/^/  /'
-    echo "ufw chain rules for $PORT (v6):"
-    ip6tables -S "$UFW_CHAIN6" 2>/dev/null | grep -- "--dport $PORT" | sed 's/^/  /'
+    echo "raw/PREROUTING rules for $PORT (v4):"
+    iptables  -t raw -S "$RAW_CHAIN" 2>/dev/null | grep -- "--dport $PORT" | sed 's/^/  /'
+    echo "raw/PREROUTING rules for $PORT (v6):"
+    ip6tables -t raw -S "$RAW_CHAIN" 2>/dev/null | grep -- "--dport $PORT" | sed 's/^/  /'
   fi
   if command -v firewall-cmd >/dev/null 2>&1; then
     echo "firewalld rich rules for $PORT:"; firewall-cmd --list-rich-rules 2>/dev/null | grep "$PORT" | sed 's/^/  /'
