@@ -20846,7 +20846,17 @@ def run_guarddog_deploy(alert_email):
             # systemd's 90s default would otherwise kill start-pre mid-wait and
             # mark the unit failed(timeout) before the sequencer's "proceed anyway"
             # fallback can fire. Universal hardening — applies to every distro.
-            _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+            # v10.1.46 (W6): `+` = run ExecStartPre with FULL PRIVILEGES regardless of
+            # the unit's User=. On RHEL, TAK's .rpm unit carries User=tak, so the boot
+            # sequencer ran UNPRIVILEGED there and every privileged step silently
+            # no-opped: `docker stop` (the whole CPU-headroom design), `systemctl stop
+            # mediamtx`, and — as of this release — the client gate's firewall-cmd.
+            # Measured on nuc 2026-08-24: not one container-stop line logged (each is
+            # `docker ... && _log`, so the && short-circuits), TAK took 210s to open
+            # 8089 against 20-30s on the Debian boxes, and its messaging JVM crashed on
+            # the way up. Debian's .deb unit runs ExecStartPre as root already, so `+`
+            # is a no-op there. This has been broken on RHEL since 10.1.44.
+            _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
@@ -67741,6 +67751,23 @@ def _auto_update_guarddog():
                 for _t in ('takclientgate.timer', 'taksessionguard.timer'):
                     subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', _t]), capture_output=True, timeout=10)
                 print("Guard Dog: installed takclientgate/taksessionguard units on startup.")
+            # v10.1.46 (W6): grant the boot sequencer real privileges on boxes whose
+            # drop-in predates this release. Without it the sequencer runs as `tak` on
+            # RHEL and the gate — plus 10.1.44's container-stop logic — silently does
+            # nothing. Rides the console update; no Guard Dog redeploy needed.
+            try:
+                _tdp = '/etc/systemd/system/takserver.service.d/soft-start.conf'
+                if os.path.isfile(_tdp):
+                    _tdc = _read_priv(_tdp)
+                    if 'ExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh' in _tdc:
+                        _write_priv(_tdp, _tdc.replace(
+                            'ExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh',
+                            'ExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh'))
+                        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+                        print("Guard Dog: boot sequencer now runs privileged (ExecStartPre=+) — "
+                              "on RHEL it was running as 'tak' and silently no-opping.")
+            except Exception as _e:
+                print(f"Guard Dog: boot-sequencer privilege migration skipped: {_e}")
             # Safety item 5 — sweep a client gate that outlived its boot. As of
             # v10.1.46 (W4) the gate is runtime-only on BOTH families — firewalld
             # rich rules, and direct rules in ufw's own iptables chains, which ufw
