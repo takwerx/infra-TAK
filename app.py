@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # infra-TAK — TAK Infrastructure Platform
-# Copyright (C) 2026 TAKWERX
+# Copyright (C) 2026 Andreas Johansson (TAKWERX)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published

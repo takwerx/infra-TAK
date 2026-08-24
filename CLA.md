@@ -34,7 +34,10 @@ is often the more useful contribution anyway.
 ## Terms
 
 You accept and agree to the following terms for your present and future
-Contributions submitted to TAKWERX ("**TAKWERX**", "we", "us"). Except for the
+Contributions submitted to Andreas Johansson, an individual doing business as
+TAKWERX ("**TAKWERX**", "we", "us"). TAKWERX is a trading name, not a separate
+legal entity; the grants below run to that individual, and to any entity to
+which the copyright in infra-TAK is later assigned. Except for the
 licences granted here, you retain all right, title and interest in and to your
 Contributions.
 

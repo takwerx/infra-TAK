@@ -919,6 +919,8 @@ Older releases: [GitHub Releases tab](https://github.com/takwerx/infra-TAK/relea
 
 ## License
 
+Copyright (C) 2026 Andreas Johansson (TAKWERX).
+
 infra-TAK is free software, licensed under the
 **[GNU Affero General Public License v3.0 or later](LICENSE)** (AGPL-3.0-or-later).
 
