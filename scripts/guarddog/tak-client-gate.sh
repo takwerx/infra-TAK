@@ -85,6 +85,20 @@ _fwd_permit_rule() { echo "rule priority=\"-10\" family=\"ipv4\" source address=
 _ufw_active() { ufw status 2>/dev/null | head -1 | grep -q "Status: active"; }
 _fwd_active() { [ "$(firewall-cmd --state 2>/dev/null)" = "running" ]; }
 
+# Is the gate ACTUALLY in force right now? Never infer this from an insert
+# command's exit status — on RHEL the ufw->firewalld shim returns 0 for verbs it
+# does not implement ("never break a deploy"), so an unverified insert would log
+# ENGAGED while 8089 stayed wide open. T&E greps for that very line to conclude
+# W1 works, so a lying log line would manufacture a false PASS on the one test
+# that validates this feature.
+_gate_in_force() {
+  case "$1" in
+    ufw)       _ufw_has_drop ;;
+    firewalld) firewall-cmd --query-rich-rule="$(_fwd_drop_rule ipv4)" >/dev/null 2>&1 ;;
+    *)         return 1 ;;
+  esac
+}
+
 # Does OUR exact drop rule exist right now?
 _ufw_has_drop()   { ufw status 2>/dev/null | grep -qE "^${PORT}(/tcp)?[[:space:]]+DENY"; }
 # Does a permit for $1 on this port already exist? (an operator's rule we must never delete)
@@ -262,6 +276,9 @@ _insert() {
     rm -f "$_tmp"; return 0
   fi
 
+  # Record state FIRST — the rollback below goes through _release, which is the
+  # only thing that knows which permit rules were ours, and it learns that from
+  # the state file. Verifying before writing it would orphan those permits.
   {
     echo "backend=$be"
     echo "engaged_at=$(date +%s)"
@@ -270,6 +287,15 @@ _insert() {
   } > "$STATE_FILE" 2>/dev/null
   chmod 600 "$STATE_FILE" 2>/dev/null
   rm -f "$_tmp"
+
+  # Verify before claiming anything. An insert that "succeeded" without producing
+  # a rule is a gate that is not there.
+  if ! _gate_in_force "$be"; then
+    _log "client gate did NOT take on $be (command succeeded, rule absent) — rolling back, continuing ungated"
+    _release >/dev/null 2>&1
+    return 0
+  fi
+
   _log "client gate ENGAGED on $PORT ($be)"
   return $rc
 }
