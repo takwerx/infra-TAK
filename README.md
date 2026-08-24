@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.45-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.45-alpha)**
+**Current release: [v10.1.46-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.46-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,26 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.46-alpha — 2026-08-24 — your server now tells you when people are connected to nothing, and Rocky Linux starts properly for the first time
+
+**Headline: two problems that were invisible by nature — clients who appear connected but are receiving nothing, and, on Rocky Linux, a TAK Server that has been starting up while fighting every other service on the machine for CPU.** Neither announced itself. Both were found because somebody looked.
+
+**Nobody was told when clients were connected to nothing.** After a reboot it is possible for a device to hold a perfectly healthy-looking connection and yet be in no channel at all, or be missing from your client list entirely. The radio shows green. The user sees an empty map. Nothing in the console, the logs, or your inbox said a word about it — the last time this happened on a large deployment, it ran unnoticed until somebody happened to open the client dashboard and spot it. That is what made it expensive: not the fault, the silence.
+
+**Now the server watches for it and emails you.** Guard Dog checks every five minutes for two specific conditions: devices connected but missing from the client list, and devices connected with no channel assigned. If either persists for fifteen minutes you get an email naming how many, what it means, and what to do about it. It only reports — it never disconnects anybody. We would rather tell you about a problem than guess at it and drop a working user in the middle of an incident.
+
+It found a real one the day it was switched on, on a machine we had been running for months without noticing.
+
+**On Rocky Linux, TAK Server has been starting up the hard way this whole time.** When the machine boots, we briefly stop the other services — the map server, the automation engine, the video server and so on — so TAK Server gets the whole machine to itself while it starts. It is a heavy startup and it wants the room. On Rocky Linux that step has never actually worked. It reported success and did nothing, because of a permissions difference in how TAK Server is packaged there that we had never had reason to notice.
+
+The effect was not subtle once we measured it: TAK Server took **three times longer** to accept connections on a Rocky machine than it should have — around three and a half minutes instead of just over one — and on the way up its messaging component would sometimes fall over and need restarting. All of that was TAK competing with everything else on the box for CPU during the worst possible minute. This is fixed, and the improvement is immediate on the next reboot. If you run Rocky Linux, this release is worth having on its own.
+
+**One honest note about this release.** We set out to ship a third thing: holding the client port closed for the few seconds during startup when TAK Server accepts connections before it is ready for them — the root cause of the connected-to-nothing problem above. It works, and we proved it works on Ubuntu, including the safety behaviour that guarantees it can never lock anyone out. It does not yet work on Rocky Linux, for reasons specific to how firewall rules are handled there. We hold ourselves to the rule that a fix has to work the same way on every supported platform, so it is held for the next release rather than shipped half-working. In the meantime the existing safety net that cleans these up after the fact is still in place and still working — the new alerting above now tells you when it happens.
+
+**Who should update:** everyone, and **Rocky Linux deployments especially** — the startup fix is significant there. **Upgrade:** automatic on the next console update. The new monitoring turns itself on; make sure your alert email is set on the Guard Dog page if you want the notifications.
+
+Full notes: [v10.1.46-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.46-alpha).
 
 ### v10.1.45-alpha — 2026-08-22 — one bad second on the network cost you the whole video config editor
 
