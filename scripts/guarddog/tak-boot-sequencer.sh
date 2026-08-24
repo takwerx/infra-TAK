@@ -43,8 +43,9 @@ if [ "$_uptime_sec" -lt 600 ]; then
   # Anything that connects in that gap works but is invisible to the api JVM
   # forever. tak-post-start.sh releases the gate the instant 8443 answers; a
   # trap there, an independent takclientgate.timer backstop at OnBootSec=15min,
-  # and a console-startup sweep all release it independently. The gate script
-  # fails OPEN on every error — a box that cannot gate simply behaves like
+  # and a console-startup sweep all release it independently — and the rules are
+  # runtime-only on both families, so a reboot clears them regardless. The gate
+  # script fails OPEN on every error — a box that cannot gate simply behaves like
   # 10.1.44, where the post-start sweeper still recycles the racers.
   # This runs as ExecStartPre, so the gate is up before TAK's first listener.
   if [ -x /opt/tak-guarddog/tak-client-gate.sh ]; then

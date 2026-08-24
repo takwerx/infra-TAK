@@ -35,6 +35,24 @@
 #                      outlived its boot — the ufw case, where rules persist.
 #   6. IDEMPOTENT.     release is safe with no gate present, and safe to repeat.
 #
+# NEVER GATE THROUGH `ufw` RULES. (v10.1.46 W4 — learned on test6, live.)
+# ufw 0.36.1 deduplicates rules by (proto, port, source, direction) and IGNORES
+# the action. TAK's own `allow 8089/tcp` therefore collides with any blanket deny
+# on 8089, and ufw resolves the collision two different ways:
+#   - `ufw insert 1 deny proto tcp to any port 8089` -> "Skipping inserting
+#     existing rule". The gate is silently never created.
+#   - the v6 half takes the add path instead and REPLACES the allow:
+#     `### tuple ### allow tcp 8089 ::/0` became `### tuple ### deny tcp 8089 ::/0`.
+# The second is the dangerous one. Had the v4 rule behaved the same way, releasing
+# the gate would have deleted the deny and left 8089 with NO rule at all — default
+# deny, every EUD locked out permanently, after an ordinary boot. That is exactly
+# the outcome 10.1.44 refused to build a gate for.
+# So on Debian the gate is inserted DIRECTLY into ufw's own iptables chains
+# (`ufw-user-input` / `ufw6-user-input`). That cannot collide with, consume, or
+# rewrite an operator's ufw rules, is exactly verifiable with `iptables -C`, and is
+# RUNTIME-ONLY — ufw rebuilds those chains at boot, so the gate now dies with a
+# reboot on BOTH families, the same as firewalld's runtime rich rules.
+#
 # Verbs: release | sweep | insert | status      (release is defined FIRST on
 # purpose: the gate must be provably removable before it is ever inserted.)
 #
@@ -50,6 +68,8 @@ STALE_AFTER=900          # a gate older than the 15-min backstop is stale
 # loopback Marti calls, and CloudTAK / Node-RED / TAK Portal on the Docker
 # bridge. (The boot sequencer stops those containers anyway, so this is belt
 # and braces — but a gate that can break a container feed is not one we ship.)
+# Loopback is already accepted by ufw-before-input / firewalld's trusted zone
+# before our chain is reached; it is listed anyway so the intent is explicit.
 PERMIT_NETS="127.0.0.0/8 172.16.0.0/12"
 
 _log() {
@@ -82,8 +102,24 @@ _fwd_permit_rule() { echo "rule priority=\"-10\" family=\"ipv4\" source address=
 # A rule added to an INACTIVE firewall is not enforced, so gating there would be
 # a lie; and it would leave cruft behind if release ever failed. Treat "backend
 # present but not running" as no backend at all — fail open.
-_ufw_active() { ufw status 2>/dev/null | head -1 | grep -q "Status: active"; }
+# For ufw the real precondition is that its chains EXIST: an inactive ufw has no
+# ufw-user-input chain, so this is a stricter and more honest check than
+# `ufw status`.
+UFW_CHAIN4="ufw-user-input"
+UFW_CHAIN6="ufw6-user-input"
+_ufw_active() { iptables -S "$UFW_CHAIN4" >/dev/null 2>&1; }
 _fwd_active() { [ "$(firewall-cmd --state 2>/dev/null)" = "running" ]; }
+
+# The gate rules, as iptables argument vectors. ONE definition each so insert,
+# check and delete can never drift apart — a delete spec that does not match the
+# insert spec is a gate that cannot be removed.
+_ipt4() { iptables "$@" ; }
+_ipt6() { ip6tables "$@" ; }
+# Rule bodies WITHOUT the chain: iptables takes the chain (and, for -I, the
+# position) before the spec — `-I <chain> <pos> <spec>` but `-C/-D <chain> <spec>`.
+# Keeping the chain out of these keeps one body shared by all three verbs.
+_drop_args()     { echo "-p tcp --dport $PORT -j DROP"; }
+_permit_args()   { echo "-s $1 -p tcp --dport $PORT -j ACCEPT"; }
 
 # Is the gate ACTUALLY in force right now? Never infer this from an insert
 # command's exit status — on RHEL the ufw->firewalld shim returns 0 for verbs it
@@ -99,10 +135,11 @@ _gate_in_force() {
   esac
 }
 
-# Does OUR exact drop rule exist right now?
-_ufw_has_drop()   { ufw status 2>/dev/null | grep -qE "^${PORT}(/tcp)?[[:space:]]+DENY"; }
-# Does a permit for $1 on this port already exist? (an operator's rule we must never delete)
-_ufw_has_permit() { ufw status 2>/dev/null | tr -s " " | grep -qF "$PORT/tcp ALLOW IN $1"; }
+# Does OUR exact drop rule exist right now? -C matches the rule spec exactly, so
+# this can never be confused by an operator's rule or by ufw's status formatting
+# (the v6 rows print as "8089/tcp (v6)", which is what made the old status-parsing
+# check miss its own leaked rule).
+_ufw_has_drop() { _ipt4 -C "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1; }
 
 # ─────────────────────────── RELEASE ───────────────────────────
 # Idempotent, backend-agnostic, and correct with no state file — the backstop
@@ -120,20 +157,38 @@ _release() {
       fi
     done
   fi
-  if command -v ufw >/dev/null 2>&1; then
-    # ufw has no --query; delete is a no-op ("Could not delete non-existent rule")
-    # when the rule is absent, so this is safe to call blind.
-    # Bounded: a delete that reports success without removing the rule must not
-    # spin forever inside the backstop. 10 is far above any real duplicate count.
+  # ufw chains: delete by EXACT rule spec, v4 and v6. `-D` removes one matching
+  # rule per call and fails when none matches, so the loop self-terminates; the
+  # counter is a backstop against a kernel that reports success without removing.
+  if command -v iptables >/dev/null 2>&1; then
     local _guard=0
-    while _ufw_has_drop && [ "$_guard" -lt 10 ]; do
+    while _ipt4 -C "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1 && [ "$_guard" -lt 10 ]; do
       _guard=$((_guard + 1))
-      ufw delete deny proto tcp to any port "$PORT" >/dev/null 2>&1 || break
+      _ipt4 -D "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1 || break
       removed=$((removed + 1))
     done
-    if _ufw_has_drop; then
-      _log "WARNING: a DENY rule on $PORT survived release — inspect: ufw status | grep $PORT"
+    # The permits are ours by construction — we create them in our own gate pass
+    # and they are meaningless without the drop — so they are removed here rather
+    # than tracked in the state file.
+    local _g2
+    for _net in $PERMIT_NETS; do
+      _g2=0
+      while _ipt4 -C "$UFW_CHAIN4" $(_permit_args "$_net") >/dev/null 2>&1 && [ "$_g2" -lt 10 ]; do
+        _g2=$((_g2 + 1))
+        _ipt4 -D "$UFW_CHAIN4" $(_permit_args "$_net") >/dev/null 2>&1 || break
+      done
+    done
+    if _ipt4 -C "$UFW_CHAIN4" $(_drop_args) >/dev/null 2>&1; then
+      _log "WARNING: a DROP rule on $PORT survived release — inspect: iptables -S $UFW_CHAIN4"
     fi
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    local _guard6=0
+    while _ipt6 -C "$UFW_CHAIN6" $(_drop_args) >/dev/null 2>&1 && [ "$_guard6" -lt 10 ]; do
+      _guard6=$((_guard6 + 1))
+      _ipt6 -D "$UFW_CHAIN6" $(_drop_args) >/dev/null 2>&1 || break
+      removed=$((removed + 1))
+    done
   fi
 
   # PERMIT rules are removed only when the state file proves WE inserted them —
@@ -141,10 +196,6 @@ _release() {
   if [ -f "$STATE_FILE" ]; then
     while IFS= read -r _line; do
       case "$_line" in
-        permit_ufw=*)
-          command -v ufw >/dev/null 2>&1 && \
-            ufw delete allow from "${_line#permit_ufw=}" to any port "$PORT" proto tcp >/dev/null 2>&1
-          ;;
         permit_fwd=*)
           command -v firewall-cmd >/dev/null 2>&1 && \
             firewall-cmd --remove-rich-rule="$(_fwd_permit_rule "${_line#permit_fwd=}")" >/dev/null 2>&1
@@ -193,7 +244,7 @@ _sweep() {
 # unambiguously orphaned — nothing legitimate engages a gate without writing state.
 _release_if_orphan_rule() {
   local orphan=0
-  command -v ufw >/dev/null 2>&1 && _ufw_has_drop && orphan=1
+  command -v iptables >/dev/null 2>&1 && _ufw_has_drop && orphan=1
   command -v firewall-cmd >/dev/null 2>&1 && \
     firewall-cmd --query-rich-rule="$(_fwd_drop_rule ipv4)" >/dev/null 2>&1 && orphan=1
   if [ "$orphan" -eq 1 ]; then
@@ -235,22 +286,25 @@ _insert() {
   : > "$_tmp"
 
   if [ "$be" = "ufw" ]; then
-    # NOTE THE ASYMMETRY: ufw rules PERSIST across reboot. That is exactly why
-    # the backstop timer and the console-startup sweep exist.
-    # Insert order matters — each `insert 1` pushes the previous down, so the
-    # deny goes in FIRST and ends up last of the three.
-    if ! ufw insert 1 deny proto tcp to any port "$PORT" >/dev/null 2>&1; then
-      _log "client gate FAILED to insert (ufw) — continuing ungated"
+    # Straight into ufw's own chains — see the header. Order matters: each `-I 1`
+    # pushes the previous rule down, so the DROP goes in first and ends up below
+    # the permits.
+    if ! _ipt4 -I "$UFW_CHAIN4" 1 $(_drop_args) >/dev/null 2>&1; then
+      _log "client gate FAILED to insert (ufw chains) — continuing ungated"
       rm -f "$_tmp"; return 0
     fi
     for _net in $PERMIT_NETS; do
-      # Never delete a rule we did not create: an operator's own permit is left
-      # exactly as found, and only a permit WE add is recorded for removal.
-      _ufw_has_permit "$_net" && continue
-      if ufw insert 1 allow from "$_net" to any port "$PORT" proto tcp >/dev/null 2>&1; then
-        echo "permit_ufw=$_net" >> "$_tmp"
-      fi
+      case "$_net" in *:*) continue;; esac
+      _ipt4 -I "$UFW_CHAIN4" 1 $(_permit_args "$_net") >/dev/null 2>&1 || \
+        _log "client gate: permit for $_net not applied — containers on that range may be held off until release"
     done
+    # IPv6 is best-effort: a v6-disabled box has no ip6tables chain, and a v4-only
+    # gate is still strictly better than none. Loopback is accepted by
+    # ufw6-before-input before this chain is reached.
+    if command -v ip6tables >/dev/null 2>&1; then
+      _ipt6 -I "$UFW_CHAIN6" 1 $(_drop_args) >/dev/null 2>&1 || \
+        _log "client gate: ipv6 drop not applied (v6 may be disabled) — v4 gate active"
+    fi
   elif [ "$be" = "firewalld" ]; then
     for _net in $PERMIT_NETS; do
       case "$_net" in *:*) continue;; esac
@@ -309,8 +363,11 @@ _status() {
   else
     echo "state file: (none)"
   fi
-  if command -v ufw >/dev/null 2>&1; then
-    echo "ufw rules for $PORT:"; ufw status 2>/dev/null | grep -E "(^|[[:space:]])$PORT" | sed 's/^/  /'
+  if command -v iptables >/dev/null 2>&1; then
+    echo "ufw chain rules for $PORT (v4):"
+    iptables -S "$UFW_CHAIN4" 2>/dev/null | grep -- "--dport $PORT" | sed 's/^/  /'
+    echo "ufw chain rules for $PORT (v6):"
+    ip6tables -S "$UFW_CHAIN6" 2>/dev/null | grep -- "--dport $PORT" | sed 's/^/  /'
   fi
   if command -v firewall-cmd >/dev/null 2>&1; then
     echo "firewalld rich rules for $PORT:"; firewall-cmd --list-rich-rules 2>/dev/null | grep "$PORT" | sed 's/^/  /'

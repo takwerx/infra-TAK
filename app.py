@@ -67741,9 +67741,13 @@ def _auto_update_guarddog():
                 for _t in ('takclientgate.timer', 'taksessionguard.timer'):
                     subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', _t]), capture_output=True, timeout=10)
                 print("Guard Dog: installed takclientgate/taksessionguard units on startup.")
-            # Safety item 5 — sweep a client gate that outlived its boot. UFW rules
-            # PERSIST across reboot (firewalld rich rules do not), so a box that lost
-            # power mid-gate would come back with 8089 denied to every EUD.
+            # Safety item 5 — sweep a client gate that outlived its boot. As of
+            # v10.1.46 (W4) the gate is runtime-only on BOTH families — firewalld
+            # rich rules, and direct rules in ufw's own iptables chains, which ufw
+            # rebuilds at boot — so a gate cannot survive a reboot by construction.
+            # This stays as the net for the case that construction does not cover:
+            # a gate engaged on a box that then runs for hours without the api JVM
+            # ever answering and without the backstop timer having fired.
             # `sweep` releases ONLY a gate from a previous boot or one past the 15-min
             # backstop: the console also restarts during boot, and an unconditional
             # release here would defeat the gate on every single boot.
