@@ -56,7 +56,32 @@
 # Verbs: release | sweep | insert | status      (release is defined FIRST on
 # purpose: the gate must be provably removable before it is ever inserted.)
 #
-# NON-ROOT-COMMANDS: ufw, firewall-cmd (logged for the v10.0.5 sudoers allowlist).
+# v10.1.47: BOTH FAMILIES NOW USE THE RAW TABLE. The firewalld branch is gone.
+# firewalld runtime rich rules are transient by design, and on RHEL both Docker and
+# the console's own startup hardening touch the firewall within ~10s of the gate
+# going in, so the gate never survived to do its job:
+#   06:06:41  boot-sequencer: client gate ENGAGED on 8089 (firewalld)
+#   06:06:50  console startup hardening runs firewall-cmd
+#   06:08:xx  post-start: client gate not engaged on 8089 — nothing to release
+# Same shape as the ufw failure above. Two families, two volatile rule stores, one
+# answer: use neither. PROVEN on nuc 2026-08-24 (Rocky 9.8, firewalld 1.3.4,
+# Docker 29.7.2) by inserting a marked raw rule and running each operation:
+# `firewall-cmd --reload`, `systemctl restart docker` (all 17 containers bounced),
+# and `systemctl restart firewalld` — the rule survived all three, at position 1.
+# It holds structurally, not by luck: RHEL 9 firewalld runs FirewallBackend=nftables,
+# so its store is the nft table `inet firewalld` while the gate lives in `ip raw` —
+# a different table it flushes and rebuilds without ever touching ours.
+# Docker is a heavy co-tenant here (34 rules on nuc) and that is fine: it rebuilds
+# its OWN rules on restart rather than flushing the chain, and every rule it keeps
+# there is a narrow DROP, never an ACCEPT that could short-circuit ahead of us. A
+# container starting mid-gate can push our rule down the chain, which is harmless —
+# but it is why release MUST delete by exact rule spec and never by index.
+#
+# PRIVILEGE: every call site is a root systemd oneshot with no User= (the boot
+# sequencer via ExecStartPre=+, takclientgate.service, takclientgatesweep.service).
+# The console process never executes this script — it only writes units and enables
+# timers. So `iptables` here needs NO broker rule and NO sudoers entry, and the
+# non-root broker should go on denying it.
 
 PORT=8089
 STATE_DIR="/var/lib/takguard"
@@ -72,9 +97,10 @@ STALE_AFTER=900          # a gate older than the 15-min backstop is stale
 # before our chain is reached; it is listed anyway so the intent is explicit.
 PERMIT_NETS="127.0.0.0/8 172.16.0.0/12"
 
-# Display label — the detection key stays 'ufw'/'firewalld' (which family owns the
-# firewall) but the ufw family's rules now live in the raw table, so say so.
-_be_label() { case "$1" in ufw) echo "iptables raw";; firewalld) echo "firewalld";; *) echo "${1:-none}";; esac; }
+# Display label. The detection key stays 'ufw'/'firewalld' — which family owns the
+# box's firewall is worth recording for forensics — but since v10.1.47 both families
+# are gated by the same raw-table rules, so the MECHANISM label is a single string.
+_be_label() { case "$1" in ufw|firewalld) echo "iptables raw";; *) echo "${1:-none}";; esac; }
 
 _log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') ${GATE_LOG_PREFIX:-client-gate}: $1"
@@ -98,8 +124,12 @@ _backend() {
   echo ""
 }
 
-# firewalld rich rules. RUNTIME ONLY — never --permanent, so a reboot inherently
-# clears the gate even if every other safety net fails.
+# firewalld rich rules — REMOVAL ONLY since v10.1.47. Nothing inserts these any
+# more. They are kept solely so `release` and `sweep` can still clean up a gate left
+# behind by a 10.1.46-era script on a box updated in place without a reboot. Release
+# stays maximally paranoid on purpose (it is defined first in this file for the same
+# reason); it is the INSERT side that had to become single-mechanism. Drop this pair
+# once no box in the fleet can still be running 10.1.46.
 _fwd_drop_rule()   { echo "rule family=\"$1\" port port=\"$PORT\" protocol=\"tcp\" drop"; }
 _fwd_permit_rule() { echo "rule priority=\"-10\" family=\"ipv4\" source address=\"$1\" port port=\"$PORT\" protocol=\"tcp\" accept"; }
 
@@ -126,7 +156,15 @@ _fwd_permit_rule() { echo "rule priority=\"-10\" family=\"ipv4\" source address=
 # simply ends raw-table traversal and the packet continues through the normal
 # firewall, so the permits below do NOT bypass ufw.
 RAW_CHAIN="PREROUTING"
-_ufw_active() { iptables -t raw -S "$RAW_CHAIN" >/dev/null 2>&1; }
+# Can we actually write the gate? This is the mechanism precondition, and as of
+# v10.1.47 it is the SAME on both families.
+_raw_available() { iptables -t raw -S "$RAW_CHAIN" >/dev/null 2>&1; }
+# Is the box's firewall manager running? A raw-table DROP is enforced by the kernel
+# whether or not firewalld is up, so this is no longer a CORRECTNESS precondition —
+# it is kept deliberately as a BLAST-RADIUS limit. It means v10.1.47 gates exactly
+# the set of boxes 10.1.46 already gated and never newly gates one with no firewall
+# management at all. Widening that is a separate, deliberate decision, not a
+# side effect of unifying the mechanism.
 _fwd_active() { [ "$(firewall-cmd --state 2>/dev/null)" = "running" ]; }
 
 # The gate rules, as iptables argument vectors. ONE definition each so insert,
@@ -148,9 +186,8 @@ _permit_args()   { echo "-s $1 -p tcp --dport $PORT -j ACCEPT"; }
 # that validates this feature.
 _gate_in_force() {
   case "$1" in
-    ufw)       _ufw_has_drop ;;
-    firewalld) firewall-cmd --query-rich-rule="$(_fwd_drop_rule ipv4)" >/dev/null 2>&1 ;;
-    *)         return 1 ;;
+    ufw|firewalld) _raw_has_drop ;;
+    *)             return 1 ;;
   esac
 }
 
@@ -158,7 +195,7 @@ _gate_in_force() {
 # this can never be confused by an operator's rule or by ufw's status formatting
 # (the v6 rows print as "8089/tcp (v6)", which is what made the old status-parsing
 # check miss its own leaked rule).
-_ufw_has_drop() { _ipt4 -C "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1; }
+_raw_has_drop() { _ipt4 -C "$RAW_CHAIN" $(_drop_args) >/dev/null 2>&1; }
 
 # ─────────────────────────── RELEASE ───────────────────────────
 # Idempotent, backend-agnostic, and correct with no state file — the backstop
@@ -263,7 +300,7 @@ _sweep() {
 # unambiguously orphaned — nothing legitimate engages a gate without writing state.
 _release_if_orphan_rule() {
   local orphan=0
-  command -v iptables >/dev/null 2>&1 && _ufw_has_drop && orphan=1
+  command -v iptables >/dev/null 2>&1 && _raw_has_drop && orphan=1
   command -v firewall-cmd >/dev/null 2>&1 && \
     firewall-cmd --query-rich-rule="$(_fwd_drop_rule ipv4)" >/dev/null 2>&1 && orphan=1
   if [ "$orphan" -eq 1 ]; then
@@ -295,70 +332,53 @@ _insert() {
     _log "client gate SKIPPED (no firewall backend) — continuing ungated"
     return 0
   fi
-  if { [ "$be" = "ufw" ] && ! _ufw_active; } || { [ "$be" = "firewalld" ] && ! _fwd_active; }; then
-    _log "client gate SKIPPED ($be present but not running) — continuing ungated"
+  case "$be" in
+    ufw|firewalld) ;;
+    *) _log "client gate SKIPPED (unrecognised backend '$be') — continuing ungated"
+       return 0 ;;
+  esac
+  if [ "$be" = "firewalld" ] && ! _fwd_active; then
+    _log "client gate SKIPPED (firewalld present but not running) — continuing ungated"
+    return 0
+  fi
+  if ! _raw_available; then
+    _log "client gate SKIPPED (raw table unavailable) — continuing ungated"
     return 0
   fi
 
   mkdir -p "$STATE_DIR" 2>/dev/null
-  local _tmp="$STATE_FILE.tmp.$$"
-  : > "$_tmp"
 
-  if [ "$be" = "ufw" ]; then
-    # Into the raw table — see the header for why NOT ufw's chains. Order matters:
-    # each `-I 1` pushes the previous rule down, so the DROP goes in first and ends
-    # up below the permits.
-    if ! _ipt4 -I "$RAW_CHAIN" 1 $(_drop_args) >/dev/null 2>&1; then
-      _log "client gate FAILED to insert (raw table) — continuing ungated"
-      rm -f "$_tmp"; return 0
-    fi
-    for _net in $PERMIT_NETS; do
-      case "$_net" in *:*) continue;; esac
-      _ipt4 -I "$RAW_CHAIN" 1 $(_permit_args "$_net") >/dev/null 2>&1 || \
-        _log "client gate: permit for $_net not applied — containers on that range may be held off until release"
-    done
-    # IPv6 is best-effort: a v6-disabled box has no ip6tables raw table, and a
-    # v4-only gate is still strictly better than none.
-    if command -v ip6tables >/dev/null 2>&1; then
-      _ipt6 -I "$RAW_CHAIN" 1 $(_drop_args) >/dev/null 2>&1 || \
-        _log "client gate: ipv6 drop not applied (v6 may be disabled) — v4 gate active"
-    fi
-  elif [ "$be" = "firewalld" ]; then
-    for _net in $PERMIT_NETS; do
-      case "$_net" in *:*) continue;; esac
-      firewall-cmd --query-rich-rule="$(_fwd_permit_rule "$_net")" >/dev/null 2>&1 && continue
-      if firewall-cmd --add-rich-rule="$(_fwd_permit_rule "$_net")" >/dev/null 2>&1; then
-        echo "permit_fwd=$_net" >> "$_tmp"
-      fi
-    done
-    if ! firewall-cmd --add-rich-rule="$(_fwd_drop_rule ipv4)" >/dev/null 2>&1; then
-      _log "client gate FAILED to insert (firewalld) — continuing ungated"
-      # Roll back the permits we just added so the box is left untouched.
-      while IFS= read -r _l; do
-        [ -n "$_l" ] && firewall-cmd --remove-rich-rule="$(_fwd_permit_rule "${_l#permit_fwd=}")" >/dev/null 2>&1
-      done < "$_tmp"
-      rm -f "$_tmp"; return 0
-    fi
-    # IPv6 is best-effort: a v6-disabled box rejects it, and a v4-only gate is
-    # still strictly better than none.
-    firewall-cmd --add-rich-rule="$(_fwd_drop_rule ipv6)" >/dev/null 2>&1 || \
-      _log "client gate: ipv6 drop rule not applied (v6 may be disabled) — v4 gate active"
-  else
-    _log "client gate SKIPPED (unrecognised backend '$be') — continuing ungated"
-    rm -f "$_tmp"; return 0
+  # ONE mechanism for both families (v10.1.47) — into the raw table. See the header
+  # for why neither ufw's chains nor firewalld's rich rules can hold a boot gate.
+  # Order matters: each `-I 1` pushes the previous rule down, so the DROP goes in
+  # first and ends up BELOW the permits.
+  if ! _ipt4 -I "$RAW_CHAIN" 1 $(_drop_args) >/dev/null 2>&1; then
+    _log "client gate FAILED to insert (raw table) — continuing ungated"
+    return 0
+  fi
+  for _net in $PERMIT_NETS; do
+    case "$_net" in *:*) continue;; esac
+    _ipt4 -I "$RAW_CHAIN" 1 $(_permit_args "$_net") >/dev/null 2>&1 || \
+      _log "client gate: permit for $_net not applied — containers on that range may be held off until release"
+  done
+  # IPv6 is best-effort: a v6-disabled box has no ip6tables raw table, and a
+  # v4-only gate is still strictly better than none.
+  if command -v ip6tables >/dev/null 2>&1; then
+    _ipt6 -I "$RAW_CHAIN" 1 $(_drop_args) >/dev/null 2>&1 || \
+      _log "client gate: ipv6 drop not applied (v6 may be disabled) — v4 gate active"
   fi
 
-  # Record state FIRST — the rollback below goes through _release, which is the
-  # only thing that knows which permit rules were ours, and it learns that from
-  # the state file. Verifying before writing it would orphan those permits.
+  # Record state FIRST — the rollback below goes through _release, and a rollback
+  # that runs before the state file exists cannot know this boot owned the gate.
+  # (Pre-10.1.47 this file also carried permit_fwd= lines for firewalld's rich-rule
+  # permits; nothing writes those any more, and release still reads them so a gate
+  # left by a 10.1.46-era script is still cleaned up.)
   {
     echo "backend=$be"
     echo "engaged_at=$(date +%s)"
     echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
-    cat "$_tmp"
   } > "$STATE_FILE" 2>/dev/null
   chmod 600 "$STATE_FILE" 2>/dev/null
-  rm -f "$_tmp"
 
   # Verify before claiming anything. An insert that "succeeded" without producing
   # a rule is a gate that is not there.
@@ -388,7 +408,10 @@ _status() {
     ip6tables -t raw -S "$RAW_CHAIN" 2>/dev/null | grep -- "--dport $PORT" | sed 's/^/  /'
   fi
   if command -v firewall-cmd >/dev/null 2>&1; then
-    echo "firewalld rich rules for $PORT:"; firewall-cmd --list-rich-rules 2>/dev/null | grep "$PORT" | sed 's/^/  /'
+    # Nothing inserts these any more — anything listed here is a 10.1.46-era
+    # leftover that `release` should have cleaned up. Shown so it is not invisible.
+    echo "firewalld rich rules for $PORT (leftovers only, none expected):"
+    firewall-cmd --list-rich-rules 2>/dev/null | grep "$PORT" | sed 's/^/  /'
   fi
 }
 
