@@ -28,5 +28,5 @@ body::after{content:'';position:fixed;top:0;left:0;right:0;height:2px;background
 <div class="logo">{% if login_logo_url %}<img src="{{ login_logo_url }}" alt="TAKWERX" class="login-logo">{% else %}<div class="logo-icon">⚡</div>{% endif %}<h1>infra-TAK</h1><p>TAK Infrastructure Platform</p><p class="built-by">built by TAKWERX</p></div>
 {% if error %}<div class="err">{{ error }}</div>{% endif %}
 <form method="POST"><div class="fg"><label>Password</label><input type="password" name="password" autofocus placeholder="Enter admin password"></div><button type="submit" class="btn">Sign In</button></form>
-</div><div class="ver">v{{ version }}</div></div>
+</div><div class="ver">v{{ version }}<br><a href="{{ source_url }}" rel="noopener" target="_blank" style="color:#64748b;text-decoration:underline">Source code</a> &middot; AGPL-3.0</div></div>
 </body></html>

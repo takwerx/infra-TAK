@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# infra-TAK — TAK Infrastructure Platform
+# Copyright (C) 2026 TAKWERX
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """infra-TAK v0.2.4 - TAK Infrastructure Platform"""
 
 # === Auto-upgrade: seamlessly switch from Flask dev server to gunicorn ===
@@ -806,6 +822,39 @@ def apply_security_headers(response):
     return response
 VERSION = "10.1.47-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
+
+# --- AGPL section 13: offer the Corresponding Source to network users ---------
+# The console is served over a network, so everyone who interacts with it is owed
+# a way to obtain the source of the version they are talking to.  The default
+# points at the upstream repository, which always resolves and carries every tag.
+#
+# ANYONE WHO MODIFIES infra-TAK AND SERVES IT TO OTHERS must point this at their
+# own modified source instead — set "source_url" in .config/settings.json.  That
+# is how a downstream fork discharges its own section 13 obligation; leaving it
+# aimed at upstream does not satisfy it, because upstream is not your source.
+SOURCE_URL_DEFAULT = f'https://github.com/{GITHUB_REPO}'
+
+
+def _source_url():
+    """Public URL for this console's complete corresponding source (AGPL 13)."""
+    try:
+        override = (load_settings().get('source_url') or '').strip()
+    except Exception:
+        override = ''
+    if override.startswith(('https://', 'http://')):
+        return override
+    return SOURCE_URL_DEFAULT
+
+
+@app.context_processor
+def inject_source_url():
+    # Templates only; skip the settings read on /api/* (metrics polls hit those
+    # every few seconds and never render a template).
+    from flask import request
+    if request.path.startswith('/api'):
+        return {}
+    return {'source_url': _source_url()}
+
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
 # Main-channel boxes will never be offered a version above AUTHENTIK_VETTED_RELEASE.

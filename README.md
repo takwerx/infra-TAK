@@ -919,7 +919,33 @@ Older releases: [GitHub Releases tab](https://github.com/takwerx/infra-TAK/relea
 
 ## License
 
-MIT
+infra-TAK is free software, licensed under the
+**[GNU Affero General Public License v3.0 or later](LICENSE)** (AGPL-3.0-or-later).
+
+You may run it, study it, modify it, and share it — for any purpose, commercial
+or not, with no fee and no per-seat licence. What the AGPL adds over a permissive
+licence is a guarantee that it **stays** free: if you modify infra-TAK and let
+other people use it — including over a network, as a hosted console — you must
+offer those users the complete corresponding source of your modified version
+under the same licence (AGPL §13). That is the point. Nobody can take this,
+close it, and sell it back to the emergency-services community.
+
+**If you only deploy and use infra-TAK, this obligation never touches you.**
+Running the console for your own agency — however many boxes, however many users
+— triggers nothing. The source offer is owed only by someone who *modifies* the
+code and then serves it to others.
+
+**Scope.** The AGPL covers infra-TAK's own code. It does not change the licence
+of the software infra-TAK installs and orchestrates — TAK Server, Authentik,
+CloudTAK, Caddy, MediaMTX, Node-RED and the rest are separate programs, invoked
+at arm's length over Docker and systemd, and each keeps its own licence and its
+own terms.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+contribution terms and the [Contributor Licence Agreement](CLA.md).
+
+Releases before v10.1.47 were published under the MIT licence and remain
+available under those terms.
 
 ## Credits
 
