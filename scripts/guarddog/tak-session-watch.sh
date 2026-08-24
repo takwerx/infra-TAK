@@ -20,6 +20,9 @@
 #   2. GROUPLESS SUBSCRIPTION — a subscription whose only group is __ANON__.
 #      That is the null-user/LDAP-down case: connected, authenticated to nothing,
 #      routed nothing.
+#   3. CONNECTION STORM (v10.1.47 W2) — one DEVICE holding hundreds or thousands
+#      of concurrent connections. Field report 2026-08-24: ~3000 TLS connections
+#      from a single EUD running a beta WinTAK tracker. Nothing detected it.
 #
 # WHY IT ONLY DETECTS
 # -------------------
@@ -61,6 +64,23 @@ STARTUP_GRACE=600        # TAK needs ~5-7 min to finish starting
 CONSEC_REQUIRED=3        # 3 consecutive runs (15 min) before anyone is emailed
 COOLDOWN_SECS=3600       # one alert per hour at most
 
+# ── W2 connection-storm thresholds (v10.1.47) ──
+# Provenance, stated plainly because it is not symmetrical: the FLOOR is ours and
+# measured; the CEILING is a single field report.
+#   Floor  - Guard Dog's metrics collector has recorded conn_count on :8089 every
+#            30s since v0.9.47. Pulled 2026-08-24: 80,663 samples over 7 days on
+#            four boxes. Fleet-wide ceiling 9 TOTAL concurrent connections per box.
+#            Per real device, measured from the subscriptions API: 1.
+#   Ceiling- one operator field report of ~3000 connections from one device.
+# The two ends are three orders of magnitude apart, so any threshold in the wide
+# middle cannot fire on a healthy device and cannot miss that storm. These are NOT
+# tuned against a storm we instrumented; nobody should read them as precise.
+STORM_UID_SUBS=50        # one non-empty clientUid holding >= this many subscriptions
+STORM_IP_SOCKETS=100     # one external peer IP holding >= this many sockets on 8089
+STORM_IP_RATIO=25        # ...AND that many sockets per distinct uid behind that IP.
+                         # A NAT'd agency is 3000 sockets / 400 uids = 7.5 and must
+                         # never alert; one storming device is 3000 / 1 = 3000.
+
 # Our own containers and the console's loopback Marti calls are NOT EUDs; they
 # are excluded from the socket count so they can never manufacture an alert.
 # (Same nets the client gate permits — see tak-client-gate.sh.)
@@ -89,9 +109,14 @@ command -v python3 >/dev/null 2>&1 || exit 0
 ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN || exit 0
 
 # ── 1. External established peers on 8089 ──
-EXTERNAL=$(ss -tn state established "( sport = :$PORT )" 2>/dev/null \
+# Collected once, used twice: the total (invisible-client check) and the per-IP
+# breakdown (storm check). Peer IPs are taken from the socket table rather than
+# from the subscriptions API on purpose — a storming client can hold sockets that
+# never became subscriptions, and that is precisely the case worth seeing.
+PEER_IPS=$(ss -tn state established "( sport = :$PORT )" 2>/dev/null \
   | tail -n +2 | awk '{print $4}' | sed 's/:[0-9]*$//' \
-  | grep -Ev "$LOCAL_PEER_RE" | grep -c . || true)
+  | grep -Ev "$LOCAL_PEER_RE" || true)
+EXTERNAL=$(printf '%s\n' "$PEER_IPS" | grep -c . || true)
 EXTERNAL=${EXTERNAL:-0}
 
 # ── 2. Subscriptions the api JVM knows about ──
@@ -132,42 +157,88 @@ if [ -z "$SUBS_JSON" ] || ! echo "$SUBS_JSON" | grep -q '"data"'; then
   exit 0
 fi
 
-# Parse: total subscriptions, and how many resolve to no real channel.
-# SCHEMA TOLERANCE IS DELIBERATE. The exact key carrying groups is not pinned in
-# any TAK doc we have, so any record where no group-ish field is found counts as
-# UNKNOWN, never as groupless — an alert must never rest on a guessed schema.
-# The observed key set is logged once so the next release can pin it.
-read -r SUBS GROUPLESS UNKNOWN KEYS <<EOF
-$(printf '%s' "$SUBS_JSON" | python3 -c '
-import json, sys
+# Parse the subscription payload: channel health (W2 of 10.1.46) plus the
+# per-device connection counts (W2 of 10.1.47).
+#
+# SCHEMA IS NOW PINNED (v10.1.47 W4). 10.1.46 shipped a schema-TOLERANT parser
+# because the key carrying groups was not pinned in any TAK doc we had; it
+# happened to be correct by stringifying whatever it found. Live data from the
+# fleet settled it:
+#   groups = [ {name, direction, created, type, bitpos, active}, ... ]
+# so read g["name"]. Each channel appears TWICE (direction IN and OUT), which is
+# why names are de-duplicated before deciding a subscription is groupless.
+# The UNKNOWN counter is kept: a record that does not match the pinned shape is
+# counted as unknown, never as groupless. An alert must never rest on a guess.
+#
+# Two traps the live data confirmed, both of which a naive counter walks into:
+#   - clientUid is EMPTY on most subscriptions (9 of 10 on test12: admin, feeds,
+#     container connections). Counting empty uids buckets unrelated rows together
+#     and alerts on a healthy box on day one. Empty uids are excluded outright.
+#   - username is NOT device identity. admin legitimately holds 6 subscriptions,
+#     and one cert used across ATAK/WinTAK/iTAK/TAK Aware is expected and normal.
+#     Never key the storm check on username.
+read -r SUBS GROUPLESS UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS KEYS <<EOF
+$(printf '%s' "$SUBS_JSON" | PEER_IPS="$PEER_IPS" python3 -c '
+import json, os, sys, collections
+def out(*a): print(" ".join(str(x) for x in a))
 try:
     rows = json.load(sys.stdin).get("data") or []
 except Exception:
-    print("ERR 0 0 -"); sys.exit(0)
+    out("ERR",0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
 if not isinstance(rows, list):
-    print("ERR 0 0 -"); sys.exit(0)
+    out("ERR",0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
+
 groupless = unknown = 0
 keys = set()
+uid_subs = collections.Counter()        # non-empty clientUid -> subscriptions
+ip_uids  = collections.defaultdict(set) # peer ip -> distinct non-empty uids
+uid_meta = {}                           # uid -> (takClient, takVersion)
+
 for r in rows:
     if not isinstance(r, dict):
         unknown += 1; continue
     keys.update(r.keys())
-    vals = []
-    found = False
-    for k, v in r.items():
-        if "group" not in k.lower():
-            continue
-        found = True
-        if isinstance(v, list):
-            vals += [str(x) for x in v]
-        elif isinstance(v, str):
-            vals += [p for p in v.replace(",", " ").split() if p]
-    if not found:
-        unknown += 1; continue
-    real = [x for x in vals if x and "__ANON__" not in x]
-    if not real:
-        groupless += 1
-print(len(rows), groupless, unknown, ",".join(sorted(keys)) or "-")
+
+    g = r.get("groups")
+    if isinstance(g, list):
+        names = {x.get("name") for x in g
+                 if isinstance(x, dict) and isinstance(x.get("name"), str)}
+        if not names and g:
+            unknown += 1          # a list, but not the pinned shape
+        elif not [n for n in names if "__ANON__" not in n]:
+            groupless += 1
+    else:
+        unknown += 1              # not the pinned shape at all
+
+    uid = (r.get("clientUid") or "").strip()
+    if uid:                       # empty uid is never device identity
+        uid_subs[uid] += 1
+        ip = (r.get("ipAddress") or "").strip()
+        if ip:
+            ip_uids[ip].add(uid)
+        if uid not in uid_meta:
+            uid_meta[uid] = ((r.get("takClient") or "-").replace(" ", "_") or "-",
+                             (r.get("takVersion") or "-").split()[0] or "-")
+
+top_uid, top_n = ("-", 0)
+if uid_subs:
+    top_uid, top_n = uid_subs.most_common(1)[0]
+tc, tv = uid_meta.get(top_uid, ("-", "-"))
+
+# Socket counts come from ss (passed in), uid distinctness from the API above.
+sock = collections.Counter()
+for line in (os.environ.get("PEER_IPS") or "").split():
+    if line.strip():
+        sock[line.strip()] += 1
+top_ip, top_sock, top_ipuids = ("-", 0, 0)
+if sock:
+    top_ip, top_sock = sock.most_common(1)[0]
+    top_ipuids = len(ip_uids.get(top_ip, ()))
+
+out(len(rows), groupless, unknown,
+    top_uid[:64] or "-", top_n, tc[:24] or "-", tv[:24] or "-",
+    top_ip, top_sock, top_ipuids,
+    ",".join(sorted(keys)) or "-")
 ' 2>/dev/null)
 EOF
 [ -z "$SUBS" ] && SUBS=ERR
@@ -185,10 +256,24 @@ fi
 INVISIBLE=$(( EXTERNAL - SUBS ))
 [ "$INVISIBLE" -lt 0 ] && INVISIBLE=0
 
-_log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS unknown_schema=$UNKNOWN invisible=$INVISIBLE"
+# ── W2 (v10.1.47): connection storms ──
+# Two independent predicates. The uid one is the primary signal — it is device
+# identity straight from TAK. The IP one is the backstop for a client storming
+# without ever registering subscriptions, and it is ratio-qualified so a NAT'd
+# agency behind one public address can never look like one storming device.
+STORM_UID=0
+STORM_IP=0
+[ "${TOPUIDN:-0}" -ge "$STORM_UID_SUBS" ] && STORM_UID=1
+if [ "${TOPIPSOCK:-0}" -ge "$STORM_IP_SOCKETS" ]; then
+  _d=${TOPIPUIDS:-0}; [ "$_d" -lt 1 ] && _d=1
+  [ $(( TOPIPSOCK / _d )) -ge "$STORM_IP_RATIO" ] && STORM_IP=1
+fi
+
+_log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS unknown_schema=$UNKNOWN invisible=$INVISIBLE top_uid=$TOPUID/$TOPUIDN top_ip=$TOPIP/$TOPIPSOCK sockets/$TOPIPUIDS uids storm_uid=$STORM_UID storm_ip=$STORM_IP"
 
 # ── 3. Verdict ──
-if [ "$INVISIBLE" -eq 0 ] && [ "$GROUPLESS" -eq 0 ]; then
+if [ "$INVISIBLE" -eq 0 ] && [ "$GROUPLESS" -eq 0 ] \
+   && [ "$STORM_UID" -eq 0 ] && [ "$STORM_IP" -eq 0 ]; then
   _quiet_exit
 fi
 
@@ -207,33 +292,93 @@ fi
 echo "$NOW" > "$COOLDOWN_FILE"
 
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+# v10.1.47 W3: the remedy is per-symptom. 10.1.46 told every reader to restart
+# TAK Server. That is right for an INVISIBLE client and wrong for an account that
+# has no channel assigned — no number of restarts gives an account a channel, and
+# pointing a customer at the wrong remedy costs them a reboot and their trust.
+# It is also wrong for a storm, where the correct action is to look at the client.
 SUBJ="TAK client visibility alert on $SERVER_IDENTIFIER"
+if [ "$STORM_UID" -eq 1 ] || [ "$STORM_IP" -eq 1 ]; then
+  if [ "$INVISIBLE" -eq 0 ] && [ "$GROUPLESS" -eq 0 ]; then
+    SUBJ="TAK connection storm on $SERVER_IDENTIFIER"
+  else
+    SUBJ="TAK client visibility alert + connection storm on $SERVER_IDENTIFIER"
+  fi
+fi
+
+FINDINGS=""
+ACTIONS=""
+
+if [ "$INVISIBLE" -gt 0 ]; then
+  FINDINGS="$FINDINGS
+- INVISIBLE clients: $INVISIBLE
+  Connected on TCP $PORT and passing traffic, but absent from the 8446 client
+  dashboard and they never will appear. They connected while TAK's api JVM was
+  still starting. They do not self-correct.
+  (external clients connected: $EXTERNAL / subscriptions the API reports: $SUBS)"
+  ACTIONS="$ACTIONS
+- For the INVISIBLE clients: restart TAK Server from the console
+  (TAK Server -> Restart). They reconnect into a ready server on their own and
+  reappear with their real channels. If this recurs on every boot, check the boot
+  client gate is engaging:  journalctl -t takguard-boot -b | grep 'client gate'"
+fi
+
+if [ "$GROUPLESS" -gt 0 ]; then
+  FINDINGS="$FINDINGS
+- Subscriptions with no channel (__ANON__): $GROUPLESS
+  Connected and authenticated, but holding no channel, so TAK routes them
+  nothing."
+  ACTIONS="$ACTIONS
+- For the __ANON__ subscriptions: there are two different causes and they need
+  different fixes.
+    * If they appeared after a reboot, they connected while LDAP was still
+      unavailable. Restarting TAK Server clears those.
+    * If they persist after a restart, or the same account keeps coming back
+      __ANON__, the ACCOUNT HAS NO CHANNEL ASSIGNED. Restarting will not fix it.
+      Assign the user a channel (TAK Portal -> the user -> channels), then have
+      them reconnect."
+fi
+
+if [ "$STORM_UID" -eq 1 ]; then
+  FINDINGS="$FINDINGS
+- CONNECTION STORM from one device: $TOPUIDN concurrent connections
+  Device (clientUid): $TOPUID
+  Client / version  : $TOPCLIENT $TOPVER
+  A healthy device holds 1. The alert threshold is $STORM_UID_SUBS."
+fi
+
+if [ "$STORM_IP" -eq 1 ]; then
+  FINDINGS="$FINDINGS
+- CONNECTION STORM from one address: $TOPIPSOCK sockets from $TOPIP
+  Distinct devices behind that address: $TOPIPUIDS
+  A site with many devices spreads its connections across them; this address is
+  concentrating them on very few, which is what a misbehaving client looks like."
+fi
+
+if [ "$STORM_UID" -eq 1 ] || [ "$STORM_IP" -eq 1 ]; then
+  ACTIONS="$ACTIONS
+- For the CONNECTION STORM: nothing has been disconnected, deliberately. Dropping
+  thousands of sockets on a wrong guess is worse than the storm. Identify the
+  device above and check its client build - storms so far have come from
+  pre-release clients, and the fix is on the client side. A single cert used
+  across ATAK / WinTAK / iTAK / TAK Aware at once is NORMAL and is not this:
+  those are separate devices with separate uids."
+fi
+
 BODY="TAK Server has connected clients that it cannot fully account for.
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Sustained for: $FAILS consecutive checks (~$((FAILS * 5)) minutes)
 
-What was measured:
-- External clients connected on TCP $PORT : $EXTERNAL
-- Subscriptions the TAK API reports      : $SUBS
-- Connected but INVISIBLE to the API     : $INVISIBLE
-- Subscriptions with no channel (__ANON__): $GROUPLESS
+WHAT WAS FOUND
+$FINDINGS
 
-What this means:
-- INVISIBLE clients are connected and passing traffic, but do not appear in the
-  8446 client dashboard and never will. They connected while TAK's api JVM was
-  still starting. They do not self-correct.
-- __ANON__ subscriptions are connected and authenticated to nothing: no channels,
-  so TAK routes them nothing. This is the signature of clients that connected
-  while LDAP was unavailable.
+WHAT TO DO
+$ACTIONS
 
-Both usually follow a reboot. Nothing has been disconnected — this is a report.
-
-To clear it: restart TAK Server from the console (TAK Server -> Restart). Affected
-clients reconnect into a ready server on their own and reappear with their real
-channels. If it recurs on every boot, check that the boot client gate is engaging:
-  journalctl -t takguard-boot -b | grep 'client gate'
+Nothing has been disconnected or restarted - this is a report.
 
 History: $LOGFILE
 "
@@ -246,7 +391,7 @@ if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   rm -f "$TMPF"
 fi
 
-_log "ALERT | external=$EXTERNAL subs=$SUBS invisible=$INVISIBLE groupless=$GROUPLESS fails=$FAILS"
-logger -t takguard "client visibility: $INVISIBLE invisible, $GROUPLESS groupless subscription(s)"
+_log "ALERT | external=$EXTERNAL subs=$SUBS invisible=$INVISIBLE groupless=$GROUPLESS storm_uid=$STORM_UID($TOPUID/$TOPUIDN) storm_ip=$STORM_IP($TOPIP/$TOPIPSOCK) fails=$FAILS"
+logger -t takguard "client visibility: $INVISIBLE invisible, $GROUPLESS groupless, storm_uid=$STORM_UID storm_ip=$STORM_IP"
 echo 0 > "$FAIL_FILE"
 exit 0
