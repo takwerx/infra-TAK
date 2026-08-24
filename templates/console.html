@@ -270,7 +270,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="power-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:340px;max-width:90vw;font-family:'JetBrains Mono',monospace">
     <div id="power-pw-title" style="font-size:13px;font-weight:700;color:var(--yellow);margin-bottom:6px">⚠ Power</div>
-    <div id="power-pw-msg" style="font-size:11px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">Enter your console password to confirm.</div>
+    <div id="power-pw-msg" style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">Enter your console password to confirm.</div>
+    <div id="power-pw-hint" style="display:none;font-size:11px;color:var(--text-dim);margin-bottom:16px;line-height:1.55;padding:9px 11px;border:1px solid rgba(234,179,8,.28);border-left:3px solid var(--yellow);border-radius:5px;background:rgba(234,179,8,.06)"></div>
     <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
     <input id="power-pw-input" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmPower()">
     <div id="power-pw-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
@@ -1218,7 +1219,9 @@ function promptPower(action){
     var err=document.getElementById('power-pw-err');
     var ttl=document.getElementById('power-pw-title');
     var msg=document.getElementById('power-pw-msg');
+    var hint=document.getElementById('power-pw-hint');
     var btn=document.getElementById('power-pw-confirm');
+    if(hint){hint.style.display='none';hint.innerHTML='';}
     if(action==='poweroff'){
       if(ttl)ttl.textContent='⚠ Power off this box';
       if(msg)msg.textContent='The box shuts down completely — you will need physical access to power it back on. Enter your console password to confirm.';
@@ -1226,6 +1229,18 @@ function promptPower(action){
     }else{
       if(ttl)ttl.textContent='⚠ Reboot this box';
       if(msg)msg.textContent='The box restarts — you will lose the console for about a minute while it comes back. Enter your console password to confirm.';
+      // v10.1.47 W5: a reboot is the heaviest tool available and it is the one
+      // operators reach for. In the 2026-08-21 incident a reboot was used to fix
+      // a service-level problem (a user could not set a password) and that reboot
+      // started the whole fault chain. Nothing in this dialog said a reboot drops
+      // every EUD, or that a TAK Server restart is the lighter tool. Say both.
+      // The asymmetry is what makes this safe advice: tak-boot-sequencer.sh gates
+      // on uptime < 600s, so a RUNTIME restart keeps LDAP up throughout and a
+      // reboot does not — which is why reboots produce channel-less clients.
+      if(hint){
+        hint.innerHTML='<strong>Every connected EUD drops.</strong> On the way back up, clients that reconnect before TAK finishes starting can come back with no channels, and they do not fix themselves.<br><br>If you are fixing a TAK Server problem — a user cannot log in, set a password, or see channels — use <a href="/takserver" style="color:var(--cyan)">TAK Server &rarr; Restart</a> instead. It restarts the service without dropping the box, keeps LDAP up throughout, and is the right tool for almost everything short of a kernel update.';
+        hint.style.display='block';
+      }
       if(btn){btn.textContent='Reboot';btn.style.background='var(--yellow)';btn.style.color='#0f172a';}
     }
     if(err){err.style.color='var(--red)';err.textContent='';}
