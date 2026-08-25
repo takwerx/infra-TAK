@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.47-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.47-alpha)**
+**Current release: [v10.1.48-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.48-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,26 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.48-alpha — 2026-08-25 — every remaining place the console told you something that was not true
+
+**Headline: an email relay that reported success while it could not send, removal buttons that never asked who you were, and a video editor that trusted anyone claiming to be an administrator. All three are closed.**
+
+**Email Relay could report success over a relay that could not send.** On installs where the console runs without root privileges, the step that builds the credential map your mail provider authenticates against was refused outright — and because the result was thrown away, the deployment still reported "Credentials written and hashed". Postfix then had nothing to authenticate with, so every message queued indefinitely with no sign anything was wrong. That step now runs with the privileges it needs, and if it ever cannot, the deployment fails and tells you, instead of finishing with a green tick over a mail relay that cannot send.
+
+**Removing things now asks for your password.** Five actions that destroy state — removing Caddy, fail2ban, Cesium Tiles, Remote Assist's TURN server, and the "clean up and retry" button that deletes a failed TAK Server install — ran on nothing more than being logged in. Every other removal in the console has always asked you to re-enter your admin password first; these five had quietly drifted out of that set. They now match the rest, and an automated check fails the build if a sixth ever appears.
+
+**The video editor now checks who it is talking to.** When the MediaMTX web editor is configured with single sign-on, it decided whether you were an administrator purely from details attached to the incoming request. On a standard install the editor is reachable only from the machine itself, so this was never exposed; on a split video-server setup it was guarded by a firewall rule alone. It now confirms the request genuinely came from your console before believing any of it — and if it is unsure it falls back to the editor's own login screen, so a misconfiguration can never lock you out.
+
+**Guard Dog now says when nobody is listening.** With no alert address configured, alerts were dropped with no record kept anywhere. Setting an address later has always started them flowing again with no redeployment, but until then the silence was invisible. Every suppressed alert is now recorded, and setting up Guard Dog without a recipient warns you at the time.
+
+**A misleading error on non-root installs is gone.** Installs running without root logged a permission denial on every startup, for a log-rotation rule that is deliberately not granted — that privilege would undermine the very isolation those installs exist to provide. Nothing was ever broken: the console has always enforced the same size limit itself. It simply no longer asks for what it knows it will not be given.
+
+**Also:** removing a saved Wi-Fi network no longer leaves a backup file behind every time.
+
+**Behind this release:** the automated security review that runs across this codebase had, through an error in its own documentation, only ever been reading part of it. It now covers every file that runs with elevated privileges. Two of the fixes above were found the first time it looked at the rest.
+
+**Upgrade:** standard console update. No action needed.
 
 ### v10.1.47-alpha — 2026-08-24 — the startup protection now works on Rocky Linux too, and one device flooding the server no longer does it unseen
 
