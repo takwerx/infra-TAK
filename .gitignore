@@ -9,7 +9,9 @@ __pycache__/
 
 # CloudTAK plugins — plugins get their own repos when ready for GitHub.
 # rapidsos: local-only, not yet tracked.
-# takcad: tracked on dev for internal testing (TAK-CAD server not public yet).
+# takcad: NOT in this repo. It said "tracked on dev for internal testing" until
+# v10.1.48; cloudtak-plugins/takcad/ exists in no branch and never has. The real
+# source is the external dispatcher-plugin repo ([[dispatcher-source-of-truth-repo]]).
 cloudtak-plugins/rapidsos/
 # Screenshots — no longer tracked (attach images inline via the Claude extension).
 screenshots/

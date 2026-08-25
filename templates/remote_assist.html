@@ -220,8 +220,10 @@ function doNBCoturnConfig(){
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
 function doCoturnUninstall(){
+  var pw=prompt('Enter infra-TAK admin password to confirm removal:');
+  if(!pw){return}
   var msg=document.getElementById('coturn-uninstall-msg');msg.style.color='var(--text-dim)';msg.textContent='Uninstalling…';
-  fetch('/api/remote-assist/coturn/uninstall',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+  fetch('/api/remote-assist/coturn/uninstall',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})}).then(function(r){return r.json();}).then(function(d){
     if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Uninstall failed';return;}
     msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});

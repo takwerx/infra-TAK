@@ -45,6 +45,7 @@ import re
 import sys
 import json
 import ipaddress
+import shutil
 import subprocess
 import tempfile
 
@@ -165,7 +166,7 @@ def regen_self_signed_cert(ip):
 
 
 def _have(cmd):
-    return subprocess.run(f'command -v {cmd} >/dev/null 2>&1', shell=True).returncode == 0
+    return shutil.which(cmd) is not None
 
 
 def rescope_firewall(old_ip, new_ip):
@@ -173,6 +174,10 @@ def rescope_firewall(old_ip, new_ip):
     firewalld rich-rules or ufw `from <ip>` rules, matching the formats written by
     /api/firewall/restrict-source. Best-effort and fully logged; never raises."""
     if not old_ip or not _IPV4.match(old_ip):
+        return
+    # new_ip lands in firewall rules; validate it the same way old_ip is.
+    if not new_ip or not _IPV4.match(new_ip):
+        log(f"firewall rescope skipped: new IP {new_ip!r} is not a v4 address")
         return
     # RHEL prefers firewalld; otherwise ufw (consistent with _fw_backend()).
     is_rhel = os.path.exists('/etc/redhat-release')
@@ -202,7 +207,7 @@ def rescope_firewall(old_ip, new_ip):
         return
     if _have('ufw'):
         try:
-            out = subprocess.run('ufw status 2>/dev/null', shell=True,
+            out = subprocess.run(['ufw', 'status'],
                                  capture_output=True, text=True, timeout=12).stdout or ''
         except Exception as e:
             log(f"ufw rule read failed: {str(e)[:120]}")
@@ -224,10 +229,15 @@ def rescope_firewall(old_ip, new_ip):
             port = m.group(1)
             proto = m.group(2) or 'tcp'
             # delete old, add new — ufw rules can't be edited in place.
-            subprocess.run(f'ufw --force delete {action} from {old_ip} to any port {port} proto {proto}',
-                           shell=True, capture_output=True, text=True, timeout=12)
-            subprocess.run(f'ufw {action} from {new_ip} to any port {port} proto {proto}',
-                           shell=True, capture_output=True, text=True, timeout=12)
+            # argv, not a shell string (v10.1.48 W2): every field here is
+            # regex-validated above, but that made the safety incidental —
+            # a shell was never needed to run ufw.
+            subprocess.run(['ufw', '--force', 'delete', action, 'from', old_ip,
+                            'to', 'any', 'port', port, 'proto', proto],
+                           capture_output=True, text=True, timeout=12)
+            subprocess.run(['ufw', action, 'from', new_ip,
+                            'to', 'any', 'port', port, 'proto', proto],
+                           capture_output=True, text=True, timeout=12)
             changed += 1
             log(f"ufw: repinned {action} {port}/{proto} {old_ip} → {new_ip}")
         if not changed:

@@ -157,8 +157,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
 function takPurgeFailed(){
   var btn=document.getElementById('tak-purge-btn');
   var msg=document.getElementById('tak-purge-msg');
+  var pw=prompt('Enter infra-TAK admin password to confirm — this deletes /opt/tak:');
+  if(!pw){return}
   if(btn){btn.disabled=true;btn.textContent='Cleaning up…';}
-  fetch('/api/takserver/purge-failed-install',{method:'POST',headers:{'Content-Type':'application/json'}})
+  fetch('/api/takserver/purge-failed-install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(d.success){

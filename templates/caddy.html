@@ -346,7 +346,9 @@ async function updateDomain(){
 }
 async function caddyUninstall(){
     if(!confirm('Remove Caddy and clear domain configuration?'))return;
-    try{var r=await fetch('/api/caddy/uninstall',{method:'POST'});var d=await r.json();if(d.success)location.reload()}catch(e){alert('Error: '+e.message)}
+    var pw=prompt('Enter infra-TAK admin password to confirm removal:');
+    if(!pw){return}
+    try{var r=await fetch('/api/caddy/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});var d=await r.json();if(d.success){location.reload()}else{alert('Error: '+(d.error||'unknown'))}}catch(e){alert('Error: '+e.message)}
 }
 var _currentSslMode='{{ settings.get("ssl_mode","") }}';
 function toggleSslMode(){

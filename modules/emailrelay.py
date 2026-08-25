@@ -40,6 +40,25 @@ def detect(ctx):
     return {'installed': installed, 'running': running}
 
 
+def _postmap(ctx, path, plog):
+    """Rebuild a postfix lookup table, privileged, and SAY SO if it fails.
+
+    Two faults, both v10.1.48 W2. /etc/postfix is root-owned, so an unwrapped
+    `postmap` is denied outright on a non-root console — and because the result
+    was captured and discarded, the deploy still printed "Credentials written
+    and hashed" over a .db that was never built. Postfix then has no SASL map
+    and mail queues silently. `postmap` is on the broker allow-list precisely
+    for this, so route it and check the return code.
+    """
+    r = subprocess.run(ctx['_sudo_wrap'](['postmap', path]),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        detail = ((r.stderr or '') + (r.stdout or '')).strip()[-300:]
+        plog(f"✗ postmap {path} failed (rc={r.returncode}): {detail or 'no output'}")
+        return False
+    return True
+
+
 def deploy_validate(data):
     """Request-side validation for /deploy and /swap (the byte-identical clone
     collapsed onto one view). Resolves the relay host/port here so the custom
@@ -80,24 +99,32 @@ def deploy(ctx, job, params):
             # hostname -f can return an unresolvable name on some VPS configs, causing
             # mydomain to be derived as "0" and postfix install to fail with
             # "meter mydomain: bad parameter value: 0"
-            fqdn_result = subprocess.run('hostname -f 2>/dev/null || hostname', shell=True, capture_output=True, text=True)
+            fqdn_result = subprocess.run(['hostname', '-f'], capture_output=True, text=True)
+            if fqdn_result.returncode != 0 or not fqdn_result.stdout.strip():
+                fqdn_result = subprocess.run(['hostname'], capture_output=True, text=True)
             fqdn = (settings.get('fqdn') or fqdn_result.stdout.strip() or 'localhost').strip()
             if not fqdn or fqdn == '0':
                 fqdn = settings.get('fqdn', 'localhost')
+            # `fqdn` comes from settings.json — an administrator types it into the
+            # console. It used to be interpolated into a root shell string here
+            # (v10.1.48 W2). The pre-seed lines go in on STDIN instead: no shell,
+            # nothing to quote, and the broker forwards stdin on non-root boxes.
             subprocess.run(
-                f'echo "postfix postfix/mailname string {fqdn}" | debconf-set-selections && '
-                'echo "postfix postfix/main_mailer_type string Internet Site" | debconf-set-selections',
-                shell=True, capture_output=True, timeout=30)
+                ctx['_sudo_wrap'](['debconf-set-selections']),
+                input=(f'postfix postfix/mailname string {fqdn}\n'
+                       'postfix postfix/main_mailer_type string Internet Site\n'),
+                text=True, capture_output=True, timeout=30)
             ok, out = ctx['_pkg_install'](['postfix', 'libsasl2-modules'], log_fn=plog, timeout=300)
             if not ok:
                 # Attempt recovery: set myhostname/mydomain explicitly then retry dpkg --configure
                 plog("⚠ Postfix install hit error, attempting recovery (mydomain fix)...")
-                subprocess.run(
-                    f'postconf -e "myhostname={fqdn}" 2>/dev/null; '
-                    f'postconf -e "mydomain={fqdn.split(".", 1)[-1] if "." in fqdn else fqdn}" 2>/dev/null; '
-                    'dpkg --configure postfix 2>&1 || true',
-                    shell=True, capture_output=True, timeout=60)
-                r = subprocess.run('dpkg -l postfix 2>&1', shell=True, capture_output=True, text=True)
+                mydomain = fqdn.split('.', 1)[-1] if '.' in fqdn else fqdn
+                for _pc in (f'myhostname={fqdn}', f'mydomain={mydomain}'):
+                    subprocess.run(ctx['_sudo_wrap'](['postconf', '-e', _pc]),
+                                   capture_output=True, timeout=30)
+                subprocess.run(ctx['_sudo_wrap'](['dpkg', '--configure', 'postfix']),
+                               capture_output=True, timeout=60)
+                r = subprocess.run(['dpkg', '-l', 'postfix'], capture_output=True, text=True)
                 if 'ii' not in r.stdout:
                     plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
                     job.update({'running': False, 'error': True})
@@ -153,14 +180,20 @@ smtp_generic_maps = hash:/etc/postfix/generic
         plog("📧 Step 3/5 — Writing credentials...")
         sasl_line = f"[{relay_host}]:{relay_port}    {smtp_user}:{smtp_pass}"
         ctx['_write_priv']('/etc/postfix/sasl_passwd', sasl_line + '\n')
-        subprocess.run('postmap /etc/postfix/sasl_passwd', shell=True, capture_output=True)
+        if not _postmap(ctx, '/etc/postfix/sasl_passwd', plog):
+            # Without the hashed map postfix cannot authenticate to the smarthost
+            # and every message queues forever. Fail the deploy rather than report
+            # a relay that is configured but cannot send.
+            plog("✗ SASL credential map could not be built — relay would queue mail silently")
+            job.update({'running': False, 'error': True})
+            return
         subprocess.run(ctx['_sudo_wrap'](['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
 
         # Generic map for from address rewriting
-        hostname = subprocess.run('hostname -f', shell=True, capture_output=True, text=True).stdout.strip()
+        hostname = subprocess.run(['hostname', '-f'], capture_output=True, text=True).stdout.strip()
         generic_line = f"root@{hostname}    {from_addr}"
         ctx['_write_priv']('/etc/postfix/generic', generic_line + '\n')
-        subprocess.run('postmap /etc/postfix/generic', shell=True, capture_output=True)
+        _postmap(ctx, '/etc/postfix/generic', plog)
         plog("✓ Credentials written and hashed")
 
         plog("📧 Step 4/5 — Enabling and starting Postfix...")

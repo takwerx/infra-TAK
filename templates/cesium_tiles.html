@@ -255,8 +255,10 @@ function disableModule(){
 function removeModule(){
     var btn=document.getElementById('ct-remove-btn');
     var st=document.getElementById('ct-remove-status');
+    var pw=prompt('Enter infra-TAK admin password to confirm removal:');
+    if(!pw){return}
     btn.disabled=true;btn.textContent='Removing…';st.textContent='';
-    fetch('/api/cesium-tiles/uninstall',{method:'POST'}).then(r=>r.json()).then(d=>{
+    fetch('/api/cesium-tiles/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})}).then(r=>r.json()).then(d=>{
         if(d.success){window.location.href='/console';}
         else{st.textContent='Error: '+(d.error||'unknown');btn.disabled=false;btn.textContent='Delete everything & remove';}
     }).catch(e=>{st.textContent='Network error';btn.disabled=false;btn.textContent='Delete everything & remove';});
