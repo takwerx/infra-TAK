@@ -33,6 +33,31 @@ from flask import session, request, redirect, jsonify, Response
 
 AK_URL = os.environ.get('AUTHENTIK_API_URL', 'http://127.0.0.1:9090')
 AK_TOKEN = os.environ.get('AUTHENTIK_TOKEN', '')
+
+# Peers whose X-Authentik-* headers we will believe (v10.1.48 W1/W2).
+#
+# `_authentik_auto_auth()` below turns the VALUE of a request header into an admin
+# session. That is only safe if the peer that sent it cannot be anyone — a reverse
+# proxy in front is a deployment fact, not a code control. This is the same defect
+# that made X-Authentik-Username a CRITICAL in the console in v10.1.0; the console's
+# fix (v10.1.1) was a loopback check plus an HMAC'd proxy secret, and this file never
+# got the equivalent because nothing had ever scanned it.
+#
+# Single-box: the editor is bound to 127.0.0.1 and reached only through local Caddy,
+# so the default below is already correct and nothing needs to be set.
+# Split-box: the editor binds 0.0.0.0 so Caddy on the CONSOLE box can reach it, and
+# the console's IP is passed in here (as well as being UFW source-scoped). The
+# firewall rule stops being the only thing standing between a same-subnet peer and
+# an admin session.
+#
+# Unset -> loopback only. infra-TAK writes this into the unit on every path that
+# ships this file (deploy, "Patch web editor", and the startup converge), so a
+# split box gets its console IP before it ever gets this code.
+_DEFAULT_TRUSTED = '127.0.0.1,::1'
+TRUSTED_PROXIES = frozenset(
+    p.strip() for p in os.environ.get('INFRATAK_TRUSTED_PROXIES', _DEFAULT_TRUSTED).split(',')
+    if p.strip()
+) or frozenset(_DEFAULT_TRUSTED.split(','))
 VID_GROUPS = ('vid_private', 'vid_public')
 ADMIN_GROUPS = frozenset({'authentik Admins'})
 VIEWER_GROUPS = frozenset({'vid_private', 'vid_public'})
@@ -87,11 +112,27 @@ def apply_ldap_overlay(app):
     VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/viewer/hlscred', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
 
+    _untrusted_seen = set()
+
     @app.before_request
     def _authentik_auto_auth():
         ak_user = request.headers.get('X-Authentik-Username', '')
         ak_groups_raw = request.headers.get('X-Authentik-Groups', '')
         if not ak_user:
+            return
+        # Peer pin (v10.1.48). Believe identity headers only from a peer that is
+        # supposed to be able to set them. Anyone else is treated as if they sent
+        # no headers at all — they fall through to the editor's own login rather
+        # than being locked out, so a mis-set TRUSTED_PROXIES degrades to "you must
+        # log in", never to "nobody can get in".
+        peer = request.remote_addr or ''
+        if peer not in TRUSTED_PROXIES:
+            if peer not in _untrusted_seen:
+                _untrusted_seen.add(peer)
+                print('[infratak-overlay] ignoring X-Authentik-* headers from untrusted '
+                      'peer %s (trusted: %s). If this is the console/proxy address, set '
+                      'INFRATAK_TRUSTED_PROXIES in mediamtx-webeditor.service.'
+                      % (peer or '<unknown>', ','.join(sorted(TRUSTED_PROXIES))), flush=True)
             return
         groups = [g.strip() for g in ak_groups_raw.split('|') if g.strip()]
         role = 'admin' if any(g in ADMIN_GROUPS for g in groups) else 'viewer'

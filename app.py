@@ -30873,9 +30873,20 @@ def mediamtx_recovery():
         if not copy_ok:
             return jsonify({'error': 'Failed to copy overlay script to target'}), 500
         # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
+        # v10.1.48: this path ships a new overlay but used to leave the unit alone.
+        # The overlay now refuses X-Authentik-* from an unpinned peer, so on a SPLIT
+        # box (editor bound 0.0.0.0, Caddy calling from the console's IP) a stale unit
+        # would mean admins silently drop to the editor's own login. Set the peer list
+        # here too, idempotently, before the restart.
+        _tp_unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        _tp_line = (f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+                    f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}')
         cmd = (
             'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
             "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
+            f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
+            f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
+            f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; "
             'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
         )
         ok_run, out = _module_run(deploy_cfg, cmd, timeout=25)
@@ -31414,6 +31425,10 @@ paths:
             f'Environment=LDAP_ENABLED=1\n'
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
             f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
+            # Split box: the editor binds 0.0.0.0 for Caddy on the console, so the
+            # console's address must be trusted for the overlay's header auth.
+            f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+            f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}\n'
         )
     editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
@@ -32162,6 +32177,10 @@ WantedBy=multi-user.target
                 f'Environment=LDAP_ENABLED=1\n'
                 f'Environment=AUTHENTIK_API_URL=http://127.0.0.1:9090\n'
                 f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
+                # Local box: the editor is loopback-bound, so loopback is the whole
+                # trusted set — written explicitly so the unit states the policy.
+                f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+                f'{_mediamtx_editor_trusted_proxies(settings)}\n'
             )
 
         # Write self-healing overlay script — runs before every service start
@@ -69152,6 +69171,70 @@ WantedBy=multi-user.target
 """
 
 
+_MEDIAMTX_TRUSTED_PROXIES_KEY = 'INFRATAK_TRUSTED_PROXIES'
+
+
+def _mediamtx_editor_trusted_proxies(settings=None, deploy_cfg=None):
+    """Peers whose `X-Authentik-*` headers the MediaMTX editor overlay may believe.
+
+    v10.1.48. The overlay turns the VALUE of a request header into an admin session;
+    that is safe only if the peer is pinned (the v10.1.0 lesson, applied to the file
+    nothing had ever scanned — see mediamtx_ldap_overlay.py).
+
+    Single-box: the editor binds 127.0.0.1 and only local Caddy reaches it, so
+    loopback is the whole answer. Split-box: the editor binds 0.0.0.0 so Caddy on the
+    CONSOLE box can reach it (`app.py` remote deploy), so the console's address has to
+    be trusted too — the UFW source-scope stops being the only control.
+    """
+    peers = ['127.0.0.1', '::1']
+    if settings is None:
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = {}
+    if (deploy_cfg or {}).get('target_mode') == 'remote':
+        # Only the split case needs a non-loopback peer, and only the console's own
+        # address — never a subnet, never a wildcard.
+        for key in ('server_ip', 'fqdn'):
+            val = (settings.get(key) or '').strip()
+            # A comma or space here would break the unit's Environment= line and
+            # silently widen the list; take only a clean single token.
+            if val and ',' not in val and ' ' not in val and val not in peers:
+                peers.append(val)
+    return ','.join(peers)
+
+
+def _unit_text_with_env(txt, key, value):
+    """Return `txt` with exactly one `Environment=key=value` line in [Service].
+
+    Idempotent: replaces an existing line for `key`, else inserts after the last
+    Environment= line (or at the top of [Service] when there is none). Returns the
+    text unchanged when it already says the right thing, so callers can use the
+    identity check to decide whether a daemon-reload/restart is needed.
+    """
+    want = f'Environment={key}={value}'
+    lines = txt.split('\n')
+    out, replaced = [], False
+    for ln in lines:
+        if ln.startswith(f'Environment={key}='):
+            if not replaced:
+                out.append(want)
+                replaced = True
+            continue  # drop any duplicates
+        out.append(ln)
+    if replaced:
+        return '\n'.join(out)
+    last_env = max((i for i, ln in enumerate(out) if ln.startswith('Environment=')),
+                   default=None)
+    if last_env is None:
+        try:
+            last_env = out.index('[Service]')
+        except ValueError:
+            return txt  # not a unit file we recognise — leave it alone
+    out.insert(last_env + 1, want)
+    return '\n'.join(out)
+
+
 def _startup_converge_mediamtx_overlay():
     """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
 
@@ -69212,6 +69295,23 @@ def _startup_converge_mediamtx_overlay():
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
                 changed = True
                 print("Startup migration: removed dead INFRATAK_MEDIAMTX_VETTED from the MediaMTX editor unit", flush=True)
+            # v10.1.48: the overlay above now refuses X-Authentik-* headers from an
+            # unpinned peer. Converge the unit in the SAME pass that ships the file, so
+            # an existing box never runs new overlay + old unit. This is a local editor
+            # (the console box), hence loopback — the split-box case gets the console IP
+            # from the deploy / "Patch web editor" paths, which write the whole unit.
+            if txt:
+                _want = _unit_text_with_env(
+                    txt, _MEDIAMTX_TRUSTED_PROXIES_KEY,
+                    _mediamtx_editor_trusted_proxies())
+                if _want != txt:
+                    _write_priv(unit, _want)
+                    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                                   capture_output=True, timeout=30)
+                    changed = True
+                    print("Startup migration: pinned the MediaMTX editor's trusted "
+                          "header peers (%s)" % _mediamtx_editor_trusted_proxies(),
+                          flush=True)
 
         if changed:
             r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
