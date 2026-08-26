@@ -11487,6 +11487,46 @@ _CONN_VERIFY_PORTS = [
     (80,   "Let's Encrypt renewal (HTTP-01)",                     False),
 ]
 
+
+def _conn_verify_ports(settings):
+    """The base ports PLUS the ports whichever modules are deployed actually need.
+
+    v10.1.49. The matrix only ever probed the five base ports, so every port a
+    module opened afterwards was forwarded-and-unverifiable — the operator found
+    out it was blocked when a client failed, with a client-side error that names
+    nothing.
+
+    GH #62 is exactly that: EUD Remote Assist puts `https://<fqdn>:8448` into the
+    enrolment QR, the deploy opens 8448 in the HOST firewall, and nothing ever
+    checks whether a cloud security group or L4 load balancer is letting it
+    through. The admin portal on 443 works, so everything LOOKS fine, and the
+    phone reports only "Unable to connect". Same shape as
+    [[coraz-tak-ports-no-l4-ingress]].
+
+    Only ports whose module is actually deployed are added — probing 8448 on a box
+    with no Remote Assist would be a permanent red that means nothing.
+    """
+    ports = list(_CONN_VERIFY_PORTS)
+    try:
+        if settings.get('remote_assist_enabled'):
+            ports.append((REMOTE_ASSIST_DEVICE_PORT,
+                          'EUD Remote Assist device enrolment (the QR points here)', True))
+    except Exception:
+        pass
+    try:
+        _mtx = _get_module_deployment_config(settings, 'mediamtx_deployment') or {}
+        if _mtx.get('deployed'):
+            ports.append((8554, 'Video RTSP (MediaMTX)',  True))
+            ports.append((8322, 'Video RTSPS (MediaMTX)', True))
+            # 8890 is SRT over UDP and is deliberately NOT probed: a TCP connect
+            # says nothing about a UDP path, and a connectionless probe cannot
+            # distinguish "open" from "silently dropped". Reporting a made-up
+            # state for it would be the exact defect this whole line of work is
+            # about. It is called out in the UI instead.
+    except Exception:
+        pass
+    return ports
+
 _connectivity_verify_status = {'running': False, 'complete': False, 'error': '', 'result': None}
 
 
@@ -11524,7 +11564,8 @@ def _run_connectivity_verify(settings):
                        'error': 'Nothing to verify yet — connect a relay (or set an FQDN / public IP) first.'})
             return
         required_green = 0
-        for port, label, required in _CONN_VERIFY_PORTS:
+        _verify_ports = _conn_verify_ports(settings)
+        for port, label, required in _verify_ports:
             probe = _conn_verify_tcp(result['target'], port)
             probe['label'] = label
             probe['required'] = required
@@ -11553,7 +11594,7 @@ def _run_connectivity_verify(settings):
             if probe['state'] == 'green' and required:
                 required_green += 1
             result['ports'][str(port)] = probe
-        result['all_green'] = required_green == sum(1 for _, _, req in _CONN_VERIFY_PORTS if req)
+        result['all_green'] = required_green == sum(1 for _, _, req in _verify_ports if req)
         result['required_red'] = sum(1 for p in result['ports'].values() if p.get('required') and p.get('state') == 'red')
         result['unverified'] = sum(1 for p in result['ports'].values() if p.get('state') == 'unverified')
         st.update({'running': False, 'complete': True, 'error': '', 'result': result})
