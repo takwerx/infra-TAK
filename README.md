@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.48-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.48-alpha)**
+**Current release: [v10.1.49-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.49-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.49-alpha — 2026-08-26 — the safety net that was never actually there
+
+**Headline: on Rocky Linux, a split video server's admin ports were left open — the console said it had closed them, and it had not.**
+
+**Video servers on Rocky Linux were not being firewalled at all.** When the video server runs on its own machine, the console configures that machine's firewall: three ports open for streaming, and three deliberately **closed** — the video web editor, its control API, and the raw HLS feed. Those three are meant to be reachable only through the main web address, never directly from the internet. On Rocky Linux the commands used were the Ubuntu ones, so none of them took effect — and every error was suppressed, so the console reported "Ports opened" over a firewall it had never touched. On a Rocky box with both firewall tools installed it was worse still: the rules were accepted by the tool that was switched off, so they looked applied and enforced nothing. The console now detects which firewall the target machine actually uses, applies the right rules, and if any rule fails it says so plainly and warns that the admin ports may be reachable — instead of printing a tick.
+
+**Removing fail2ban from the console now works.** It had no Remove button at all — the only way to uninstall it was to hand-craft an API request. It now removes like every other module, asking for your admin password first.
+
+**TAK Portal now installs from a published release.** It was previously cloned from whatever happened to be on the project's main branch at that moment, which meant two installs on the same day could get different code. It now installs a tagged release and records exactly which one, so "what version is this box running?" has an answer.
+
+**Ports we open are now ports we check.** Verify Reachability tested five fixed ports and nothing else, so anything a module opened later was forwarded but unverifiable. It now also checks the EUD Remote Assist enrolment port when Remote Assist is installed, and the video streaming ports when the video server is — because a port that is open on the machine can still be blocked by a cloud provider's firewall, and until now the only way to discover that was to watch a device fail to enrol with no explanation.
+
+**Upgrade:** standard console update. No action needed.
 
 ### v10.1.48-alpha — 2026-08-25 — every remaining place the console told you something that was not true
 
