@@ -568,6 +568,21 @@ TAK Server filter not yet installed — restart the console to complete setup.
 </div>
 </div>
 
+<!-- v10.1.49 W3: /api/fail2ban/uninstall existed, was @login_required and (since
+     v10.1.48) admin-password-gated, but NO template called it — so fail2ban could
+     not be removed from the console at all, only by hand-crafting an API request.
+     A CLI-only capability is a product defect. Same confirm -> password -> POST
+     pattern as every other module's Remove. -->
+<div class="card" style="margin-top:24px;border-color:rgba(239,68,68,0.35)">
+<div class="section-title" style="color:var(--red)">Remove fail2ban</div>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">
+Stops and uninstalls fail2ban, removes its jail configuration, and clears the saved setup.
+Existing bans are dropped with it. Your firewall rules are not otherwise changed.
+</p>
+<button class="control-btn btn-stop" id="f2b-remove-btn" onclick="fail2banUninstall()">🗑 Remove fail2ban</button>
+<span id="f2b-remove-status" style="margin-left:12px;font-size:13px;color:var(--text-dim)"></span>
+</div>
+
 {% endif %}
 </div>
 <div class="toast" id="toast"></div>
@@ -1807,5 +1822,25 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   loadRecidiveStatus();
   setInterval(loadRecidiveStatus,30000);
 })();
+
+async function fail2banUninstall(){
+  if(!confirm('Remove fail2ban? Active bans are dropped and intrusion protection stops.')){return}
+  var pw=prompt('Enter infra-TAK admin password to confirm removal:');
+  if(!pw){return}
+  var btn=document.getElementById('f2b-remove-btn');
+  var st=document.getElementById('f2b-remove-status');
+  btn.disabled=true;btn.textContent='Removing…';st.textContent='';
+  try{
+    var r=await fetch('/api/fail2ban/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    var d=await r.json();
+    // NB: this route answers {ok:true}, not {success:true} like the other module
+    // uninstalls. Checking d.success would show "Error: unknown" on a SUCCESSFUL
+    // removal and never redirect. Accept either.
+    if(d.ok||d.success){window.location.href='/console';}
+    else{st.textContent='Error: '+(d.error||'unknown');btn.disabled=false;btn.textContent='🗑 Remove fail2ban';}
+  }catch(e){
+    st.textContent='Network error';btn.disabled=false;btn.textContent='🗑 Remove fail2ban';
+  }
+}
 </script>
 {% endblock %}

@@ -929,6 +929,21 @@ CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
 # TAK Video Restreamer constants live in modules/tvr.py (registry-resident since v10.1.24)
 NETBIRD_INSTALL_DIR = os.path.expanduser("~/netbird")
 # EUD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
+TAKPORTAL_REPO = "https://github.com/AdventureSeeker423/TAK-Portal.git"
+# v10.1.49 W2. The clone used to be a `shell=True` f-string against the repo's
+# DEFAULT BRANCH — whatever was on upstream HEAD at deploy time ran on the box,
+# against CLAUDE.md's CJIS bar ("external repos pinned to a tag + commit SHA").
+#
+# It is NOT pinned to a frozen constant, deliberately: TAK Portal ships releases
+# almost daily (1.4.0, 1.3.80 and 1.3.79 landed on three consecutive days), and we
+# have already had to tell operators to move to >= 1.3.59 to clear a real bug
+# ([[takportal-datasync-list-bug]]). A frozen pin would strand every customer on a
+# stale Portal until someone bumped a constant. So we resolve the newest RELEASE
+# TAG and check that out — a deliberate upstream act, recorded in the deploy log
+# and in settings, instead of an anonymous branch tip. Same shape as the CloudTAK
+# deploy's `remote_release_tag`. Freezing it to one version is a live product
+# decision (update cadence vs supply-chain strictness) — see ROADMAP.
+TAKPORTAL_REF_FALLBACK = "1.4.0"   # used only when the releases API is unreachable
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
 REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/eud-remote-assist")
 REMOTE_ASSIST_PORT = 8767
@@ -12879,6 +12894,33 @@ def _deregister_authentik_oauth2_app(settings, app_slug, prov_name, plog=None):
     return True
 
 
+def _takportal_latest_tag(plog=None):
+    """Newest TAK Portal RELEASE tag, or the pinned fallback. Never raises.
+
+    Validated against a strict version shape before it is handed to git — the tag
+    reaches a checkout argument, so an unexpected value must not flow through
+    (same discipline as _ak_tag_is_sane() for the Authentik tag).
+    """
+    # `_ur` is imported PER FUNCTION throughout this file — there is no module-level
+    # binding. Relying on one inside a try/except Exception is how the mediamtx
+    # update checks sat dead from birth: NameError, swallowed, silent wrong answer
+    # ([[apppy-ur-per-function-import-silent-nameerror]]). Import it here explicitly.
+    import urllib.request as _ur
+    tag = None
+    try:
+        req = _ur.Request('https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+                          headers={'Accept': 'application/vnd.github+json',
+                                   'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as r:
+            tag = (json.loads(r.read().decode()) or {}).get('tag_name')
+    except Exception as e:
+        if plog:
+            plog(f"  Could not reach the GitHub releases API ({str(e)[:80]}) — using pinned {TAKPORTAL_REF_FALLBACK}")
+    if not tag or not re.match(r'^v?\d+(\.\d+){1,3}$', str(tag).strip()):
+        return TAKPORTAL_REF_FALLBACK
+    return str(tag).strip()
+
+
 def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
     ak_domain = _get_service_domain(settings, 'authentik')
     portal_domain = _get_service_domain(settings, 'remote_assist')
@@ -24491,6 +24533,87 @@ def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
             return False, str(e)[:200]
 
 
+_MODULE_FW_BACKEND_KEY = '_infratak_fw_backend'
+
+
+def _module_fw_backend(deploy_cfg, log_fn=None):
+    """Which firewall the TARGET box runs — 'ufw' | 'firewalld' | None.
+
+    v10.1.49 W1. The local `_fw_backend()` (app.py) answers for the CONSOLE's box.
+    On a split deploy the module lands on a DIFFERENT machine, which may be a
+    different family entirely — so asking the console is asking the wrong computer.
+    Detected once per deploy and cached on `deploy_cfg`.
+    """
+    cached = deploy_cfg.get(_MODULE_FW_BACKEND_KEY)
+    if cached is not None:
+        return cached or None
+    # Mirror _fw_backend()'s preference: family-native tool first, so a box
+    # converges on one backend deterministically.
+    probe = ("rhel=no; [ -f /etc/redhat-release ] && rhel=yes; "
+             "u=no; command -v ufw >/dev/null 2>&1 && u=yes; "
+             "f=no; command -v firewall-cmd >/dev/null 2>&1 && f=yes; "
+             "echo \"$rhel $u $f\"")
+    ok, out = _module_run(deploy_cfg, probe, timeout=30)
+    be = None
+    if ok:
+        parts = ((out or '').strip().splitlines() or [''])[-1].split()
+        if len(parts) == 3:
+            rhel, have_ufw, have_fwd = (p == 'yes' for p in parts)
+            if rhel:
+                be = 'firewalld' if have_fwd else ('ufw' if have_ufw else None)
+            else:
+                be = 'ufw' if have_ufw else ('firewalld' if have_fwd else None)
+    if log_fn:
+        log_fn(f"  firewall backend on target: {be or 'none detected'}")
+    deploy_cfg[_MODULE_FW_BACKEND_KEY] = be or ''
+    return be
+
+
+def _module_fw(deploy_cfg, verb, port, proto='tcp', log_fn=None):
+    """Open/close a port on the box a module is being deployed to. (ok, msg).
+
+    v10.1.49 W1 — replaces bare `ufw ...` strings in the remote deploy paths.
+    Those were a multiplatform violation (CLAUDE.md: never a bare `ufw`) AND a
+    silent one: written as `ufw allow X 2>/dev/null; ...; true`, they exit 0 on a
+    RHEL target where ufw does not exist, so the deploy printed a tick over a
+    firewall it had not touched. Three of the ports involved are DENIES on the
+    MediaMTX admin surface, and v10.1.48's overlay fix names that firewall rule as
+    its residual control — so on a RHEL remote the control was never applied.
+
+    verb: 'allow' | 'deny' | 'remove'. Local targets delegate to the existing
+    console-side shims; remote targets get the family-correct command here.
+    `deny` on firewalld means "ensure not open" — its default zone already drops
+    what is not opened (same semantics as _fw_deny()).
+    """
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    if deploy_cfg.get('target_mode') != 'remote':
+        if verb == 'allow':
+            return _fw_allow(port, proto)
+        if verb == 'deny':
+            return _fw_deny(port, proto)
+        return _fw_remove(port, proto)
+
+    be = _module_fw_backend(deploy_cfg, log_fn=log_fn)
+    if be is None:
+        # Say it. A target with no firewall is a real posture fact, not a no-op to
+        # swallow — especially for the deny verbs.
+        return True, 'no firewall present on target'
+    if be == 'firewalld':
+        flag = '--add-port' if verb == 'allow' else '--remove-port'
+        cmd = (f"firewall-cmd --zone=public --permanent {flag}={port}/{proto} "
+               f"&& firewall-cmd --reload")
+    else:
+        if verb == 'allow':
+            cmd = f"ufw allow {port}/{proto}"
+        elif verb == 'deny':
+            cmd = f"ufw deny {port}/{proto}"
+        else:
+            cmd = f"ufw --force delete allow {port}/{proto}"
+    ok, out = _module_run(deploy_cfg, cmd, timeout=30)
+    return ok, (out or '').strip()[:300]
+
+
 def _module_copy(deploy_cfg, local_path, remote_path, timeout=30, log_fn=None):
     """Copy a file locally or remotely based on deployment config.
 
@@ -30262,19 +30385,32 @@ def run_takportal_deploy():
         # Step 2: Clone repo
         plog("")
         plog("\u2501\u2501\u2501 Step 2/6: Cloning TAK Portal \u2501\u2501\u2501")
+        _tp_tag = _takportal_latest_tag(plog)
         if os.path.exists(portal_dir):
-            plog("  TAK-Portal directory already exists, pulling latest...")
-            subprocess.run(
-                f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
-                shell=True, capture_output=True, text=True, timeout=60)
+            plog(f"  TAK-Portal directory exists — fetching {_tp_tag}...")
+            subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
+                            'fetch', '--tags', '--force', 'origin'],
+                           capture_output=True, text=True, timeout=120)
+            r = subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
+                                'checkout', '--force', _tp_tag],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                plog(f"  ⚠ Could not check out {_tp_tag}: {(r.stderr or '').strip()[:160]}")
         else:
-            plog("  Cloning from GitHub (shallow, latest only)...")
-            r = subprocess.run(f'git clone --depth 1 https://github.com/AdventureSeeker423/TAK-Portal.git {portal_dir}', shell=True, capture_output=True, text=True, timeout=180)
+            plog(f"  Cloning from GitHub at release {_tp_tag} (shallow)...")
+            r = subprocess.run(['git', 'clone', '--depth', '1', '--branch', _tp_tag,
+                                TAKPORTAL_REPO, portal_dir],
+                               capture_output=True, text=True, timeout=180)
             if r.returncode != 0:
                 plog(f"\u2717 Clone failed: {r.stderr.strip()}")
                 takportal_deploy_status.update({'running': False, 'error': True})
                 return
-        plog("\u2713 Repository ready")
+        # Record what actually landed — an unrecorded version is how "which Portal is
+        # this box on?" becomes unanswerable during a field report.
+        _tp_sha = subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
+                                  'rev-parse', '--short', 'HEAD'],
+                                 capture_output=True, text=True, timeout=30)
+        plog(f"\u2713 Repository ready — {_tp_tag} ({(_tp_sha.stdout or '?').strip()})")
 
         # Step 3: Create .env if missing (exactly as main — no AUTHENTIK_URL here; set in settings.json in Step 6)
         plog("")
@@ -31459,13 +31595,32 @@ paths:
     # Webedit 5080 / API 9898 / HLS 8888 are Tier 3 (Caddy-loopback) — explicitly
     # DENIED here so a regressed bind can't leak the admin surface. Browsers
     # reach the webedit + HLS through Caddy on 443.
-    _module_run(deploy_cfg,
-        # 8890 is SRT — UDP. This opened 8890/tcp until v10.1.10, which held a hole
-        # open on a port nothing listens on while leaving SRT's real port closed.
-        "ufw allow 8554/tcp 2>/dev/null; ufw allow 8322/tcp 2>/dev/null; ufw allow 8890/udp 2>/dev/null; "
-        "ufw deny 8888/tcp 2>/dev/null; ufw deny 5080/tcp 2>/dev/null; ufw deny 9898/tcp 2>/dev/null; true",
-        timeout=15)
-    plog("✓ Ports opened (RTSP/RTSPS/SRT public; webedit/API/HLS loopback only)")
+    # v10.1.49 W1: these six rules used to be one bare-`ufw` shell string ending in
+    # `; true`, with every command silenced by 2>/dev/null. On a RHEL/Rocky target
+    # ufw does not exist, so all six failed, the block still exited 0, and the line
+    # below printed a tick over a firewall that had never been touched. The three
+    # DENY rules are the MediaMTX admin surface, and v10.1.48's overlay header-pin
+    # names this firewall rule as its residual control on split boxes — so on a RHEL
+    # remote that control was silently absent. Route through the family-aware helper
+    # and report what actually happened.
+    # 8890 is SRT — UDP. This opened 8890/tcp until v10.1.10, which held a hole
+    # open on a port nothing listens on while leaving SRT's real port closed.
+    _fw_public = [('allow', 8554, 'tcp'), ('allow', 8322, 'tcp'), ('allow', 8890, 'udp')]
+    _fw_closed = [('deny', 8888, 'tcp'), ('deny', 5080, 'tcp'), ('deny', 9898, 'tcp')]
+    _fw_failed = []
+    for _verb, _port, _proto in _fw_public + _fw_closed:
+        _ok, _msg = _module_fw(deploy_cfg, _verb, _port, _proto, log_fn=plog)
+        if not _ok:
+            _fw_failed.append(f'{_verb} {_port}/{_proto}: {_msg[:120]}')
+    if _fw_failed:
+        # Do NOT claim the ports are set. The deny rules are the admin surface.
+        plog("✗ Firewall rules did NOT all apply on the target:")
+        for _f in _fw_failed:
+            plog(f"    {_f}")
+        plog("  RTSP/RTSPS/SRT may be closed, and — more importantly — the webedit/API/HLS")
+        plog("  admin ports may be REACHABLE. Fix the target's firewall before using this box.")
+    else:
+        plog("✓ Ports set (RTSP/RTSPS/SRT public; webedit/API/HLS closed to the network)")
 
     # Step 7: Caddy on infra-TAK (point stream.* to remote)
     plog("")
