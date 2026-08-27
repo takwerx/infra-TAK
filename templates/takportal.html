@@ -217,8 +217,16 @@ async function portalReconfigure(){
         var r=await fetch('/api/takportal/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'reconfigure'})});
         var d=await r.json();
         if(d.success){
-            if(status){status.style.color='var(--green)';status.textContent=d.message||'Config updated. Reloading...';}
-            setTimeout(function(){window.location.href='/takportal';},1200);
+            // v10.1.51: a partial success is not a green line. When the backend reports
+            // warnings (SSH setup failed, client cert not refreshed) show them in amber and
+            // do NOT navigate away -- the operator needs to read what did not happen.
+            var warned=(d.warnings&&d.warnings.length>0);
+            if(status){
+                status.style.color=warned?'var(--yellow)':'var(--green)';
+                status.textContent=(warned?'\u26a0 ':'')+(d.message||'Config updated. Reloading...');
+            }
+            if(warned){btns.forEach(function(b){b.disabled=false;b.style.opacity='1';});}
+            else{setTimeout(function(){window.location.href='/takportal';},1200);}
         }else{
             if(status){status.style.color='var(--red)';status.textContent='✗ '+(d.error||'Failed');}
             btns.forEach(function(b){b.disabled=false;b.style.opacity='1';});

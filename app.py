@@ -8543,6 +8543,54 @@ def _resolve_core_ip(settings, cfg):
     return core_ip if _valid_core_ip(core_ip) else None
 
 
+# v10.1.51 (W2) — TCP keepalives on the SPLIT-SERVER remote Postgres.
+#
+# On a split box TAK Server's DB is a REAL remote host, not a container on the loopback.
+# Postgres ships tcp_keepalives_idle=7200 (2 h), so nothing probes an idle connection for
+# two hours and any NAT / stateful firewall on the path silently drops it while TAK keeps
+# holding the dead socket. Field evidence (test8, 2026-08-26): HikariCP went
+# total=0/active=0/idle=0/waiting=201 and never rebuilt — 40,534 errors, TAK Server down
+# ~16 h — with Postgres itself up 35 days, reachable, and 9 of 2100 connections in use.
+# Smaller self-healing clusters of the same signature appear on Aug 24 and Aug 25.
+#
+# We already codify exactly these values for the Postgres we deploy in a container
+# (_AUTHENTIK_PG_COMMAND_TAIL) — the remote split DB was simply the one Postgres we
+# configure but never tuned. Same fleet constant, so every split box converges on the same
+# operational state; the sed deletes any existing line first, so this is a convergence
+# write, NOT a max(current, target) that would let an operator's edit outlive the incident.
+#
+# Deliberately keepalives ONLY. idle_session_timeout / idle_in_transaction_session_timeout
+# are right for Authentik's workload and are NOT assumed to be right for TAK's — reaping a
+# TAK session mid-operation is a behavior change nobody has measured. The diagnosed failure
+# is dead sockets, and keepalives are what detect those.
+_SPLIT_DB_KEEPALIVE_LINES = ('tcp_keepalives_idle = 60\\n'
+                             'tcp_keepalives_interval = 10\\n'
+                             'tcp_keepalives_count = 6')
+
+
+# Reusable SSH snippets: discover the PG data dir + service name on a RHEL Server One
+# (PGDG postgresql-15 vs base). Module-level since v10.1.51 so the split-server DEPLOY path
+# and the keepalive RETROFIT below discover the same paths and cannot drift.
+# NB: /var/lib/pgsql is 0700 postgres-owned — the glob MUST run under sudo or it expands to
+# nothing as the SSH login user (the bug that bit the first run: empty PGDATA).
+_PG_REMOTE_PGDATA_SH = ("PGDATA=$(sudo sh -c 'ls -d /var/lib/pgsql/*/data 2>/dev/null' | sort -V | tail -1); "
+                        "[ -z \"$PGDATA\" ] && sudo test -d /var/lib/pgsql/data && PGDATA=/var/lib/pgsql/data; true")
+_PG_REMOTE_PGSVC_SH = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; true')
+
+
+def _pg_keepalive_sh(conf_expr):
+    """Shell that converges tcp_keepalives_* in the postgresql.conf named by conf_expr.
+
+    conf_expr is inserted into the remote shell verbatim and MUST already be quoted by the
+    caller (every call site passes a double-quoted "$PGDATA/postgresql.conf"-style path built
+    on the remote host, never anything derived from user input). Delete-then-append, so a box
+    that already has a value converges instead of accumulating duplicate lines."""
+    return (
+        f'sudo sed -i "/^[[:space:]]*#*[[:space:]]*tcp_keepalives_[a-z]*[[:space:]]*=/d" {conf_expr}; '
+        f'printf "\\n{_SPLIT_DB_KEEPALIVE_LINES}\\n" | sudo tee -a {conf_expr} >/dev/null'
+    )
+
+
 def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     """RHEL/Rocky Server One (DB box) setup — the dnf/PGDG/.noarch.rpm/systemctl/firewalld/
     /var/lib/pgsql mirror of the Debian _setup_server_one, per TAK Server Config Guide 5.7
@@ -8566,9 +8614,8 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     # Reusable SSH snippets: discover the PG data dir + service name (PGDG postgresql-15 vs base).
     # NB: /var/lib/pgsql is 0700 postgres-owned — the glob MUST run under sudo or it expands
     # to nothing as the SSH login user (the bug that bit the first run: empty PGDATA).
-    PGDATA = ("PGDATA=$(sudo sh -c 'ls -d /var/lib/pgsql/*/data 2>/dev/null' | sort -V | tail -1); "
-              "[ -z \"$PGDATA\" ] && sudo test -d /var/lib/pgsql/data && PGDATA=/var/lib/pgsql/data; true")
-    PGSVC = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; true')
+    PGDATA = _PG_REMOTE_PGDATA_SH
+    PGSVC = _PG_REMOTE_PGSVC_SH
 
     # Step 1: repos — EPEL + PGDG (arch/EL-aware) + disable the system postgresql module + CRB.
     repo_cmd = (
@@ -8634,6 +8681,7 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         '[ -z "$PGDATA" ] && { echo NO_PGDATA; exit 0; }; '
         'sudo sed -i "/^[[:space:]]*#*[[:space:]]*listen_addresses[[:space:]]*=/d" "$PGDATA/postgresql.conf"; '
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PGDATA/postgresql.conf\" >/dev/null; "
+        + _pg_keepalive_sh('"$PGDATA/postgresql.conf"') + '; ' +
         'sudo sed -i "s/md5host/md5\\nhost/g" "$PGDATA/pg_hba.conf"; '
         # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
         # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
@@ -8840,6 +8888,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         '[ -n "$PG_MAIN" ] && [ -f "$PG_MAIN/postgresql.conf" ] && '
         "sudo sed -i '/^\\s*#*\\s*listen_addresses\\s*=/d' \"$PG_MAIN/postgresql.conf\" && "
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
+        + _pg_keepalive_sh('"$PG_MAIN/postgresql.conf"') + ' && ' +
         'sudo sed -i "s/md5host/md5\\nhost/g" "$PG_MAIN/pg_hba.conf" && '
         # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
         # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
@@ -9604,6 +9653,112 @@ def _migrate_split_db_tls():
         _p(f"rolled back and takserver restarted; attempt {attempts + 1}/3 recorded — will retry next boot")
     except Exception as e:
         _p(f"error (non-fatal, will retry next boot): {e}")
+
+
+def _split_db_keepalives_state():
+    """Marker for the v10.1.51 keepalive retrofit ('' | 'attempts:N' | 'done:V')."""
+    return (load_settings().get('split_db_keepalives_state') or '').strip()
+
+
+SPLIT_DB_KEEPALIVE_FIX_VERSION = 1
+
+
+def _split_db_keepalives_complete(state=None):
+    st = _split_db_keepalives_state() if state is None else state
+    if not st.startswith('done'):
+        return False
+    try:
+        return int(st.split(':', 1)[1]) >= SPLIT_DB_KEEPALIVE_FIX_VERSION
+    except (IndexError, ValueError):
+        return False
+
+
+def _migrate_split_db_keepalives():
+    """v10.1.51 (W2) retrofit: converge tcp_keepalives_* onto an EXISTING split box's remote
+    Postgres through the normal console update path — no operator SSH, no start.sh
+    (console-path delivery rule). Fresh splits get this from _setup_server_one{,_rhel};
+    this is the pass that reaches the boxes already in the field.
+
+    Why it matters: test8, 2026-08-26 — TAK Server down ~16 h with Postgres up 35 days and
+    9 of 2100 connections in use. HikariCP sat at total=0/active=0/idle=0/waiting=201 and
+    never rebuilt (40,534 errors) because the remote DB shipped tcp_keepalives_idle=7200,
+    so nothing probed the idle link for two hours and the NAT on the path dropped it while
+    TAK held the dead socket. Aug 24 and Aug 25 show the same signature self-healing.
+
+    Deliberately the SAFEST possible migration:
+      * config edit only — no schema, no data, no CoreConfig, no TAK restart
+      * RELOAD, not restart. tcp_keepalives_* are SIGHUP-context, so the DB never goes down
+        and no live connection is dropped; new connections pick the values up
+      * delete-then-append, so a box already carrying a value converges to the fleet
+        constant instead of accumulating duplicate lines or keeping an operator's edit
+      * verifies by reading the file back, and only then marks done. A failure records an
+        attempt and retries on the next console restart (held after 3)."""
+    _p = lambda m: print(f"Split DB keepalives: {m}", flush=True)
+    try:
+        # Later than the TLS retrofit's 90s so the two never touch pg_hba/postgresql.conf
+        # and reload/restart Postgres at the same moment on the same host.
+        time.sleep(150)
+        s = load_settings()
+        cfg = _get_tak_deployment_config(s)
+        if cfg.get('mode') != 'two_server':
+            return
+        state = _split_db_keepalives_state()
+        if _split_db_keepalives_complete(state):
+            return
+        attempts = int(state.split(':', 1)[1]) if state.startswith('attempts:') else 0
+        if attempts >= 3:
+            _p("held after 3 failed attempts — investigate Server One, then clear "
+               "split_db_keepalives_state in settings to re-arm")
+            return
+        s1 = cfg.get('server_one', {})
+        if not (s1.get('host') or '').strip():
+            return
+        ok, out = _ssh_probe(s1, 'echo SSH_OK', timeout=20)
+        if not ok or 'SSH_OK' not in (out or ''):
+            _p("Server One SSH unreachable — will retry next boot: " + (out or '')[:200])
+            return
+
+        # Find postgresql.conf on either family: Debian /etc/postgresql/*/main first, then
+        # the RHEL data dir (same discovery the deploy path uses).
+        cmd = (
+            'PGCONF=""; '
+            'PGM=$(find /etc/postgresql -type d -name main 2>/dev/null | sort -V | tail -1); '
+            '[ -n "$PGM" ] && [ -f "$PGM/postgresql.conf" ] && PGCONF="$PGM/postgresql.conf"; '
+            'if [ -z "$PGCONF" ]; then ' + _PG_REMOTE_PGDATA_SH + '; '
+            '  [ -n "$PGDATA" ] && sudo test -f "$PGDATA/postgresql.conf" && PGCONF="$PGDATA/postgresql.conf"; '
+            'fi; '
+            '[ -z "$PGCONF" ] && { echo NO_PGCONF; exit 0; }; '
+            + _pg_keepalive_sh('"$PGCONF"') + '; '
+            # SIGHUP only. Try every reload spelling; a unit that does not exist is a no-op.
+            'sudo pg_ctlcluster 15 main reload 2>/dev/null; '
+            'sudo systemctl reload postgresql 2>/dev/null; '
+            'sudo systemctl reload postgresql-15 2>/dev/null; '
+            'sudo systemctl reload postgresql-16 2>/dev/null; '
+            'echo "PGCONF=$PGCONF"; '
+            'echo "IDLE=$(sudo grep -c \'^tcp_keepalives_idle = 60\' \"$PGCONF\")"'
+        )
+        ok, out = _ssh_probe(s1, cmd, timeout=60)
+        out = out or ''
+        if 'NO_PGCONF' in out:
+            _p("no postgresql.conf found on Server One — nothing to converge (is the DB "
+               "really on this host?). Not retried as a failure.")
+            return
+        if not ok or 'IDLE=1' not in out:
+            attempts += 1
+            s = load_settings()
+            s['split_db_keepalives_state'] = f'attempts:{attempts}'
+            save_settings(s)
+            _p(f"convergence not confirmed (attempt {attempts}/3) — will retry next boot: "
+               + out.strip()[:300])
+            return
+        s = load_settings()
+        s['split_db_keepalives_state'] = f'done:{SPLIT_DB_KEEPALIVE_FIX_VERSION}'
+        save_settings(s)
+        _p("converged on Server One (tcp_keepalives_idle=60, interval=10, count=6) and "
+           "reloaded Postgres — no restart, no connection dropped. New DB connections now "
+           "detect a dead link in ~2 min instead of never.")
+    except Exception as e:
+        _p(f"error (non-fatal, retries next boot): {e}")
 
 
 def _fetch_db_password_from_server_one(s1_cfg):
@@ -30390,11 +30545,37 @@ def takportal_control():
         # Update config only: push settings into container and restart (no git pull / image build). Preserves user-configured keys (e.g. BRAND_LOGO_URL).
         settings = load_settings()
         settings_json = _takportal_merged_settings_json(settings)
+        # v10.1.51 (W1): every step below reports what it actually did. Update Config used to
+        # discard _takportal_setup_ssh()'s return value and then tell the operator
+        # "(SSH configured)" regardless -- so a portal stuck on "Setup: not run yet" looked
+        # healthy from the console, and an experienced user (field report, 2026-08-27)
+        # concluded his install was broken and started configuring TAK Portal by hand.
+        # It also never refreshed the client cert at all: _takportal_sync_certs() writes
+        # data/certs/tak-client.p12, and it was only ever reachable from the separate
+        # "Sync Portal CA" button on the TAK Server page. A portal reporting
+        # "Client P12 Certificate: Not Installed" could therefore never be fixed by the one
+        # button whose name says it updates the config. Both are now done here, and both
+        # report failure instead of being swallowed.
+        warnings = []
         try:
             cp_ok, cp_err = _takportal_write_settings_json(settings_json)
             if not cp_ok:
                 return jsonify({'success': False, 'error': cp_err or 'docker cp failed'}), 500
-            _takportal_setup_ssh()
+            if not _takportal_setup_ssh():
+                warnings.append('SSH setup did not complete -- TAK Portal will still show '
+                                '"Setup: not run yet" and cannot run TAK commands on the host. '
+                                'Check the console log for the SSH step.')
+            # Certs before the restart so the portal loads the refreshed pair on the way up.
+            # restart=False: we restart below (and _takportal_sync_certs(restart=True) would
+            # also fire the map-channel/group-cache syncs, which do not belong on this path).
+            try:
+                certs_ok, certs_msg = _takportal_sync_certs(restart=False)
+            except Exception as _ce:
+                certs_ok, certs_msg = False, str(_ce)[:200]
+            if not certs_ok:
+                warnings.append(f'client cert / CA not refreshed: {certs_msg}. '
+                                'TAK Portal will report "Client P12 Certificate: Not Installed" '
+                                'and Marti stats will fail.')
             subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
@@ -30421,16 +30602,20 @@ def takportal_control():
               and tp_state.get('app') in ('ok', 'created', 'fixed'))
         msg = 'Config updated and portal restarted.'
         if not chain_summary:
-            # Healer didn't run (Authentik not installed, no token, etc.) — just report container state
-            msg = 'Config updated and portal restarted (SSH configured).'
+            # v10.1.51 (W1): the healer did NOT run (Authentik not installed, no token, ...).
+            # This used to read "Config updated and portal restarted (SSH configured)" -- a
+            # green line claiming two things that had not been checked. Say what happened.
+            msg = 'Config updated and portal restarted. Authentik proxy chain was NOT reconciled (Authentik not installed or no API token).'
         elif ok:
             msg = 'Config updated, portal restarted, and Authentik proxy chain reconciled.'
         elif tp_state:
             msg = (f'Config updated and portal restarted, but Authentik proxy chain heal reported: '
                    f"provider={tp_state.get('provider')}, app={tp_state.get('app')}, outpost={tp_state.get('outpost')}. "
                    f"Check console logs and Authentik admin UI.")
+        if warnings:
+            msg = msg + ' | ' + ' | '.join(warnings)
         return jsonify({'success': True, 'running': running, 'action': action,
-                        'message': msg, 'chain_summary': chain_summary})
+                        'message': msg, 'warnings': warnings, 'chain_summary': chain_summary})
     elif action == 'update':
         # Reset any local changes to tracked files before pulling — the network
         # and hardening patches now live in docker-compose.override.yml (not tracked
@@ -71972,6 +72157,20 @@ def _startup_migrations():
                       "remove any remaining `host ...` rule that is not loopback-only.", flush=True)
         except Exception as _sdt_e:
             print(f"Startup migration: split DB TLS launch error (non-fatal): {_sdt_e}", flush=True)
+
+        # v10.1.51 W2 — retrofit: TCP keepalives on an existing split box's remote Postgres.
+        # Config edit + SIGHUP reload only (no restart, no dropped connection), so it is safe
+        # to run unattended; it still goes in a background thread because it SSHes to Server
+        # One and must never delay console startup. See _migrate_split_db_keepalives for the
+        # test8 outage that motivated it.
+        try:
+            _sdk_cfg = _get_tak_deployment_config(s)
+            if (_sdk_cfg.get('mode') == 'two_server'
+                    and not _split_db_keepalives_complete()):
+                threading.Thread(target=_migrate_split_db_keepalives, daemon=True).start()
+                print("Startup migration: split DB keepalive retrofit launched in background", flush=True)
+        except Exception as _sdk_e:
+            print(f"Startup migration: split DB keepalive launch error (non-fatal): {_sdk_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
         fh_raw = s.get('fedhub_deployment', {})
