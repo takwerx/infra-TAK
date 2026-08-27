@@ -403,9 +403,13 @@ def _caddy_reload_checked(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_er
             return False, reason
         _log(reason + ' — trying restart')
 
+    # The recovery restart gets its OWN budget, never the caller's. A caller that passed a
+    # tight reload timeout is saying "don't block my deploy on a reload", not "give up on
+    # unwedging Caddy" — and this path only runs when the edge is already in trouble.
     try:
         r2 = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
-                            capture_output=True, text=True, timeout=timeout)
+                            capture_output=True, text=True,
+                            timeout=max(timeout, CADDY_RELOAD_TIMEOUT))
         if r2.returncode == 0:
             return True, reason + ' (recovered by restart)'
         detail = (((r2.stdout or '') + '\n' + (r2.stderr or '')).strip() or
