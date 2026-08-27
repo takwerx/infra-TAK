@@ -429,11 +429,12 @@ def deploy(ctx, job, params):
         s['tak_video_restreamer_commit_sha'] = commit_sha
         ctx['save_settings'](s)
         ctx['generate_caddyfile'](s)
-        try:
-            subprocess.run(ctx['_sudo_wrap'](['systemctl', 'reload', 'caddy']), timeout=15, check=True)
+        # v10.1.50: ctx['_caddy_reload'] never raises and never hangs. The try/except that
+        # used to be here could not protect the Authentik block below it from a reload that
+        # blocked past its timeout — Caddy's grace period defaults to eternal, so that was
+        # not hypothetical (see _caddy_reload_checked in app.py).
+        if ctx['_caddy_reload'](plog):
             plog('✓ Caddy reloaded')
-        except Exception as ce:
-            plog(f'  Caddy reload warning: {ce}')
 
         # Optional: register Authentik proxy provider
         ak_token = (ctx['_get_authentik_env_value'](s, 'AUTHENTIK_TOKEN') or
@@ -472,7 +473,7 @@ def uninstall(ctx, job, params):
     s['tak_video_restreamer_enabled'] = False
     ctx['save_settings'](s)
     ctx['generate_caddyfile'](s)
-    subprocess.run(ctx['_sudo_wrap'](['systemctl', 'reload', 'caddy']), timeout=15, capture_output=True)
+    ctx['_caddy_reload']()
     steps.append('Caddy subdomain removed')
     ctx['_deregister_authentik_proxy_app'](s, 'tak-video-restreamer', 'TAK Video Restreamer Proxy')
     steps.append('Authentik proxy app deregistered')

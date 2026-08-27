@@ -309,6 +309,124 @@ def _run_priv_chain(cmds, mode='and', timeout=120, **kw):
     return last
 
 
+# ---------------------------------------------------------------------------
+# Caddy reload — the single choke point (v10.1.50)
+# ---------------------------------------------------------------------------
+# Caddy's grace period defaults to ETERNAL:
+#   "By default, the grace period is eternal, which means connections are never
+#    forcefully closed."  -- https://caddyserver.com/docs/caddyfile/options
+# caddyhttp's App.Stop() therefore calls Shutdown() with a bare context.Background(),
+# so a config reload waits FOREVER on whatever connection happened to be active at
+# that instant. Reproduced on test6 (public box, under constant scanner traffic)
+# 2026-08-26: the reload never returned, its journal stopped dead at "servers
+# shutting down with eternal grace period" and never reached "load complete",
+# systemd killed ExecReload at 90s, and caddy.service stayed wedged in `reloading`
+# until it was restarted. test8, same generated Caddyfile, reloaded in 2ms.
+#
+# CADDY_GRACE_PERIOD (emitted into the Caddyfile global options by
+# _caddy_global_options_lines) is the actual fix — it bounds Shutdown(). This helper
+# is the second half: it makes a reload that misbehaves anyway a NON-EVENT for the
+# caller. Before it, the 49 reload sites in this file split three ways:
+#   * 8 passed NO timeout at all  -> the gunicorn worker thread hung forever. The
+#     console runs 1 worker / 4 threads, so four unlucky reloads take the WHOLE
+#     console down with nothing logged anywhere.
+#   * 19 passed timeout=15 and let subprocess.TimeoutExpired escape into the
+#     caller's `except Exception` -> a cosmetic edge reload FAILED the module
+#     deploy that triggered it. In deploy_nodered() that also skipped the Authentik
+#     SSO block sitting after it, leaving Node-RED deployed but unprotected
+#     (Conner's field report, 2026-08-26 — the report that found all of this).
+#   * 6 already used the correct reload-or-restart chain, but could still raise.
+#
+# Servers are shut down CONCURRENTLY inside App.Stop() (goroutine per server sharing
+# one ctx — verified in caddyhttp/app.go at v2.11.4), so the whole reload is bounded
+# by ONE grace period, not by grace x server-count. That is what makes a timeout
+# comfortably above CADDY_GRACE_PERIOD meaningful rather than arbitrary.
+
+# Fleet constants (CLAUDE.md "Fleet-uniform configuration"): every box converges to
+# the same value. Never per-box, never tier-derived, never operator-preserved.
+CADDY_GRACE_PERIOD = '10s'      # bounds Caddy's own shutdown of the outgoing config
+CADDY_RELOAD_TIMEOUT = 45       # our ceiling per attempt; >> the grace period on purpose
+
+
+def _caddy_reload_checked(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
+    """Reload Caddy. NEVER raises, NEVER blocks forever. Returns (ok, detail).
+
+    `detail` is '' on a clean reload; otherwise a short operator-readable reason.
+    Callers that surface Caddy state to the user want this. Callers that just need
+    the edge refreshed should use _caddy_reload().
+
+    A TIMEOUT always falls back to `systemctl restart caddy`, and that is not
+    negotiable: Caddy parses and applies the new config BEFORE it stops the outgoing
+    one, so a reload that hangs has already accepted the config and is stuck draining.
+    It leaves the unit in `reloading` forever, where every LATER reload on the box
+    fails too. Restart is the only thing that clears it, and TimeoutStopSec bounds it.
+
+    A non-zero RETURN CODE is the opposite case and is why restart_on_error exists.
+    rc!=0 usually means Caddy REFUSED the config — and a refused reload is a safe
+    failure: the running Caddy keeps serving the previous config. Restarting there
+    turns that into a hard outage, because the restart reads the same bad file and
+    Caddy will not come up at all. Pass restart_on_error=False anywhere the caller
+    would rather keep serving the old config than risk that (the fail2ban portal
+    access-log path documents exactly this reasoning). The default stays True because
+    it preserves the behaviour of the six reload-or-restart chains this replaced,
+    whose real target is "Caddy was stopped/paused on this box".
+    """
+    def _log(msg):
+        print('Caddy: ' + msg, flush=True)
+        if plog:
+            try:
+                plog('  \u26a0 Caddy: ' + msg)
+            except Exception:
+                pass
+
+    reason = ''
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                           capture_output=True, text=True, timeout=timeout)
+        if r.returncode == 0:
+            return True, ''
+        reason = (((r.stdout or '') + '\n' + (r.stderr or '')).strip() or
+                  'rc=%d' % r.returncode)[-200:]
+        if not restart_on_error:
+            _log('reload failed (%s) — NOT restarting; Caddy keeps serving the previous '
+                 'config' % reason)
+            return False, reason
+        _log('reload failed (%s) — restarting instead' % reason)
+    except subprocess.TimeoutExpired:
+        reason = ('reload did not return within %ds — the unit is wedged in `reloading`'
+                  % timeout)
+        _log(reason + '; restarting to clear it')
+    except Exception as e:
+        reason = 'reload could not be run: %s' % str(e)[:160]
+        if not restart_on_error:
+            _log(reason)
+            return False, reason
+        _log(reason + ' — trying restart')
+
+    try:
+        r2 = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
+                            capture_output=True, text=True, timeout=timeout)
+        if r2.returncode == 0:
+            return True, reason + ' (recovered by restart)'
+        detail = (((r2.stdout or '') + '\n' + (r2.stderr or '')).strip() or
+                  'rc=%d' % r2.returncode)[-200:]
+        _log('restart also failed: ' + detail)
+        return False, reason + ' | restart also failed: ' + detail
+    except Exception as e:
+        _log('restart could not be run: %s' % str(e)[:160])
+        return False, reason + ' | restart could not be run: %s' % str(e)[:160]
+
+
+def _caddy_reload(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
+    """Fire-and-forget Caddy reload. Never raises. Returns True on success.
+
+    This is what a module deploy/uninstall wants at the point it has just rewritten
+    the Caddyfile: refresh the edge, and if the edge misbehaves say so in the log
+    WITHOUT taking the deploy down with it."""
+    return _caddy_reload_checked(plog=plog, timeout=timeout,
+                                 restart_on_error=restart_on_error)[0]
+
+
 def _priv_pipe(argv, filter_argv, timeout=60, **kw):
     """Replace a shell pipe `PRIV_CMD | FILTER` (the broker runs argv, not a
     shell). Runs the privileged head via _sudo_wrap (broker-mediated), then feeds
@@ -6139,9 +6257,9 @@ def _w1_caddy_regen(log):
                     "deferring to caddy's own reload validation")
             else:
                 log('W1: caddy validate FAILED: %s' % out[-200:]); return False
-    rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-    if rl.returncode != 0:
-        log('W1: caddy reload error: %s' % (rl.stdout or rl.stderr or '')[-160:]); return False
+    _ok, _detail = _caddy_reload_checked(timeout=60)
+    if not _ok:
+        log('W1: caddy reload error: %s' % _detail[-160:]); return False
     log('W1: Caddy reloaded'); return True
 
 def _w1_ufw_lock_console(log):
@@ -10665,7 +10783,7 @@ def netbird_uninstall_api():
             save_settings(settings)
             # Regenerate caddyfile and reload
             generate_caddyfile(settings)
-            _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=90)
+            _caddy_reload(timeout=90)
             _netbird_uninstall_status.update({'running': False, 'complete': True, 'error': False})
         except Exception:
             _netbird_uninstall_status.update({'running': False, 'complete': True, 'error': True})
@@ -13757,7 +13875,7 @@ def remote_assist_uninstall_api():
             settings.pop('remote_assist_version', None)
             save_settings(settings)
             generate_caddyfile(settings)
-            _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=90)
+            _caddy_reload(timeout=90)
             _deregister_authentik_oauth2_app(settings, REMOTE_ASSIST_OIDC_SLUG, 'EUD Remote Assist')
             _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': False})
         except Exception:
@@ -16840,14 +16958,16 @@ def _f2b_selfheal_portal_caddy_log(plog=None):
             # Always reload and CHECK, even if the block was already on disk — the
             # running Caddy may have refused it. reload (never restart) leaves the
             # previous config serving if it is refused again.
-            rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
-                                capture_output=True, text=True, timeout=60)
-            if rl.returncode != 0:
+            # restart_on_error=False keeps the promise the comment above makes: a refused
+            # config must leave the RUNNING Caddy untouched. A restart would read the same
+            # bad file and take the edge down entirely.
+            rl_ok, rl_detail = _caddy_reload_checked(timeout=60, restart_on_error=False)
+            if not rl_ok:
                 _log('fail2ban: Caddy REFUSED the config carrying the portal access log '
                      '(%s). The running config is untouched, but the ON-DISK Caddyfile is '
                      'now unloadable — Caddy would fail to start on reboot. Portal jail '
                      'left on its old logpath.'
-                     % (rl.stdout or rl.stderr or '')[-200:].strip())
+                     % rl_detail[-200:].strip())
                 return False          # do NOT repoint the jail at a log nothing writes
             _log('fail2ban: Caddy accepted the portal access log %s — the takportal jail '
                  'finally has something to read.' % TAKPORTAL_CADDY_LOG)
@@ -23034,7 +23154,7 @@ def _sync_caddy_acme_eab_dropin(cfg=None):
     cfg = load_caddy_acme() if cfg is None else cfg
     env = _caddy_acme_env(cfg)
     if env:
-        # Validate before writing, exactly as _caddy_acme_global_lines() does. The route
+        # Validate before writing, exactly as _caddy_acme_inner_lines() does. The route
         # already validated, but this function also runs off the stored file — and a value
         # carrying a double quote or a newline would break out of `Environment="K=V"` and
         # append arbitrary unit directives. .config is mode 600 so writing it already implies
@@ -23126,12 +23246,14 @@ def _validate_caddy_acme_fields(cfg):
     return True, ''
 
 
-def _caddy_acme_global_lines(cfg=None):
-    """Caddyfile global options block for the operator's CA, or [] when unset/invalid.
+def _caddy_acme_inner_lines(cfg=None):
+    """The operator's ACME issuer directives, indented for the global options block.
 
-    Emitting nothing is the correct default: with no global block Caddy uses Let's Encrypt
-    with its ZeroSSL fallback, which is what every box does today. A box that has never
-    touched this feature must produce a byte-identical Caddyfile.
+    Returns [] when unset/invalid — a box that has never touched this feature emits no
+    ACME directives at all and keeps Caddy's default (Let's Encrypt with ZeroSSL
+    fallback). Split out of the old _caddy_acme_global_lines() in v10.1.50 because the
+    global block is no longer optional: it always carries grace_period now, and Caddy
+    permits exactly ONE global block, which must be the first block in the file.
     """
     cfg = load_caddy_acme() if cfg is None else cfg
     if not cfg or not (cfg.get('acme_ca') or '').strip():
@@ -23144,7 +23266,7 @@ def _caddy_acme_global_lines(cfg=None):
         print('Caddy: stored ACME issuer config is invalid and was NOT emitted — '
               f'{_err}', flush=True)
         return []
-    out = ['{']
+    out = []
     if (cfg.get('email') or '').strip():
         out.append(f"    email {cfg['email'].strip()}")
     out.append(f"    acme_ca {cfg['acme_ca'].strip()}")
@@ -23160,6 +23282,30 @@ def _caddy_acme_global_lines(cfg=None):
         out.append(f'        key_id {{env.{ACME_EAB_ENV_KID}}}')
         out.append(f'        mac_key {{env.{ACME_EAB_ENV_MAC}}}')
         out.append('    }')
+    return out
+
+
+def _caddy_global_options_lines(cfg=None):
+    """The Caddyfile global options block. ALWAYS emitted, on every box.
+
+    v10.1.50 — grace_period is the fix for a reload that hangs forever. Caddy's default
+    grace period is eternal (upstream: https://caddyserver.com/docs/caddyfile/options),
+    so `systemctl reload caddy` waits indefinitely on any connection that is active when
+    the outgoing config is stopped. On a public box under scanner traffic that is a coin
+    flip on every reload; when it loses, the unit wedges in `reloading` and every module
+    deploy that touches the edge fails behind it. See _caddy_reload_checked().
+
+    Caddy allows exactly one global options block and it MUST be the first block in the
+    file ("server block without any key is global configuration, and if used, it must be
+    first"). Comments are not blocks, so the two header lines above it are fine — that
+    was verified with `caddy validate` for the v10.1.41 ACME block and still holds.
+
+    This is the one place the previously-optional block became mandatory, so a box that
+    has never touched the ACME feature no longer produces a byte-identical Caddyfile.
+    That is intended: the grace period is not opt-in.
+    """
+    out = ['{', f'    grace_period {CADDY_GRACE_PERIOD}']
+    out += _caddy_acme_inner_lines(cfg)
     out.append('}')
     out.append('')
     return out
@@ -23176,9 +23322,10 @@ def _caddy_acme_validate_isolated(cfg):
     _caddy_validate_config) is NOT a failure. It means we could not check, and saying
     "invalid" over an inconclusive result is the exact mistake this codebase keeps fixing.
     """
-    lines = _caddy_acme_global_lines(cfg)
-    if not lines:
+    if not _caddy_acme_inner_lines(cfg):
         return False, 'nothing to validate'
+    # Validate the block Caddy will actually see — grace_period and all.
+    lines = _caddy_global_options_lines(cfg)
     probe = '\n'.join(lines) + '\nlocalhost {\n    respond "ok"\n}\n'
     tmp = None
     try:
@@ -23415,15 +23562,12 @@ def caddy_custom_cert():
         return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
 
     # Reload Caddy (graceful — keeps serving old config if the new one is invalid).
-    reload_r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-    reloaded = reload_r.returncode == 0
+    # _caddy_reload_checked already falls back to a restart (e.g. Caddy was stopped or
+    # paused on this box) and cannot raise or hang — see its docstring.
+    reloaded, reload_detail = _caddy_reload_checked(timeout=60)
     if not reloaded:
-        # Fall back to a restart (e.g. Caddy was stopped/paused on this box).
-        restart_r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-        reloaded = restart_r.returncode == 0
-        if not reloaded:
-            return jsonify({'success': False,
-                            'error': f'Cert stored, but Caddy reload failed: {(reload_r.stdout or reload_r.stderr or "").strip()[:300]}'}), 500
+        return jsonify({'success': False,
+                        'error': f'Cert stored, but Caddy reload failed: {reload_detail[:300]}'}), 500
 
     # If TAK Server is installed, re-wire its 8446 enrollment keystore to the custom cert
     # in the background (stops/restarts TAK — disruptive, so it runs off the request).
@@ -23461,11 +23605,9 @@ def caddy_set_ssl_mode():
         generate_caddyfile(settings)
     except Exception as e:
         return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
-    reload_r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-    if reload_r.returncode != 0:
-        restart_r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-        if restart_r.returncode != 0:
-            return jsonify({'success': False, 'error': f'Switched setting, but Caddy reload failed: {(reload_r.stdout or reload_r.stderr or "").strip()[:300]}'}), 500
+    _rl_ok, _rl_detail = _caddy_reload_checked(timeout=60)
+    if not _rl_ok:
+        return jsonify({'success': False, 'error': f'Switched setting, but Caddy reload failed: {_rl_detail[:300]}'}), 500
     # v10.0.9: switching to LE makes Caddy reissue the stream cert with a fresh 0600
     # dir/file, dropping MediaMTX's group-read grant → crash-loop (memory
     # mediamtx-cert-grant-renewal-fragile gap 2). Re-assert the grant once the ACME
@@ -26756,8 +26898,9 @@ def _caddy_validate_or_restore(prev_contents, plog=None):
     back and surface the error. Returns (ok, err) — ok is False ONLY for verdict 'bad'.
 
     This is the GH #59 backstop and it lives at the single choke point on purpose:
-    generate_caddyfile() feeds 67 call sites and 48 `systemctl reload caddy` sites, so a
-    per-call-site fix is not maintainable. Restoring the last-known-parseable file converts
+    generate_caddyfile() feeds 67 call sites, and since v10.1.50 every reload on the box
+    goes through the single _caddy_reload_checked() choke point, so a per-call-site fix is
+    not maintainable. Restoring the last-known-parseable file converts
     the catastrophic failure mode (Caddy cannot start after the next reboot, every proxied
     service down) into an ordinary failed change that the caller's own verification reports.
 
@@ -26974,13 +27117,9 @@ def _startup_caddy_selfheal():
         print('Startup migration: caddy self-heal FAILED — regenerated Caddyfile still does '
               'not parse: %s' % (out2 or '')[-200:], flush=True)
         return
-    rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
-                        capture_output=True, text=True, timeout=60)
-    if rl.returncode != 0:
-        rl = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
-                            capture_output=True, text=True, timeout=90)
+    _rl_ok, _ = _caddy_reload_checked(timeout=60)
     print('Startup migration: \u2713 Caddyfile regenerated and Caddy %s (GH #59 self-heal)'
-          % ('reloaded' if rl.returncode == 0 else 'reload FAILED'), flush=True)
+          % ('reloaded' if _rl_ok else 'reload FAILED'), flush=True)
 
 
 def generate_caddyfile(settings=None):
@@ -27000,7 +27139,7 @@ def generate_caddyfile(settings=None):
     # Emits nothing when unset, so a box that never touches this generates a byte-identical
     # file to before.
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
-    lines += _caddy_acme_global_lines()
+    lines += _caddy_global_options_lines()
     sd = _get_all_service_domains(settings)
 
     def _emit_alias_redirect(alias, canonical):
@@ -27759,7 +27898,7 @@ def _selfheal_cloudtak_stream_route(log):
         return False
     log("CloudTAK video: stale /stream/* route (handle_path → MediaMTX 18888) detected — regenerating Caddyfile")
     generate_caddyfile()
-    _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=60)
+    _caddy_reload(timeout=60)
     log("CloudTAK video: /stream/* now routed to media-infra (:9997) and Caddy reloaded")
     return True
 
@@ -30356,7 +30495,7 @@ def takportal_uninstall():
     try:
         settings = load_settings()
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
         steps.append('Regenerated Caddyfile + reloaded Caddy')
     except Exception as caddy_err:
         steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
@@ -30859,7 +30998,7 @@ def run_takportal_deploy():
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+            _caddy_reload()
             plog(f"  \u2713 Caddy config updated for TAK Portal")
             plog(f"  Open: https://{_get_service_domain(settings, 'takportal')}")
         plog("=" * 50)
@@ -31146,7 +31285,7 @@ def mediamtx_uninstall():
     mediamtx_deploy_log.clear()
     mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
     generate_caddyfile(settings)
-    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+    _caddy_reload()
     steps.append('Updated Caddyfile')
     _deregister_authentik_proxy_app(settings, 'stream', 'MediaMTX', plog=lambda m: steps.append(m.strip()))
     return jsonify({'success': True, 'steps': steps})
@@ -31671,7 +31810,7 @@ paths:
     settings['mediamtx_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+    _caddy_reload()
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
     if mtx_domain:
@@ -32505,7 +32644,7 @@ WantedBy=multi-user.target
         if caddy_running and domain:
             # Update Caddyfile first so Caddy issues the cert
             generate_caddyfile(settings)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+            _caddy_reload()
             mtx_domain = _get_service_domain(settings, 'mediamtx')
             plog(f"✓ Caddyfile updated — {mtx_domain}")
 
@@ -33684,7 +33823,7 @@ def cloudtak_uninstall():
             cloudtak_deploy_log.clear()
             cloudtak_deploy_status.update({'running': False, 'complete': False, 'error': False})
             generate_caddyfile()
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+            _caddy_reload()
             _update_boot_stagger_service()
             cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': None})
         except subprocess.TimeoutExpired:
@@ -35194,11 +35333,11 @@ def run_cloudtak_deploy(cfg=None):
             plog("━━━ Step 6/6: Updating Caddy ━━━")
             if domain:
                 generate_caddyfile(settings)
-                r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
-                if r.returncode == 0:
+                _ok, _d = _caddy_reload_checked()
+                if _ok:
                     plog(f"✓ Caddy updated — map.{domain} routed to remote CloudTAK")
                 else:
-                    plog(f"⚠ Caddy reload issue: {(r.stderr or r.stdout or '').strip()[:140]}")
+                    plog(f"⚠ Caddy reload issue: {_d.strip()[:140]}")
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
             cfg['deployed'] = True
@@ -35689,11 +35828,11 @@ def run_cloudtak_deploy(cfg=None):
         if domain:
             try:
                 generate_caddyfile(settings)
-                r_cd = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
-                if r_cd.returncode == 0:
+                _ok_cd, _d_cd = _caddy_reload_checked()
+                if _ok_cd:
                     plog(f"✓ Caddy updated early — map.{domain} routed (will work as soon as API responds)")
                 else:
-                    plog(f"⚠ Caddy reload: {r_cd.stdout.strip()[:100]}")
+                    plog(f"⚠ Caddy reload: {_d_cd.strip()[:100]}")
             except Exception as _e:
                 plog(f"⚠ Caddy update skipped: {_e}")
 
@@ -35801,11 +35940,11 @@ def run_cloudtak_deploy(cfg=None):
         try:
             if domain:
                 generate_caddyfile(settings)
-                r = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
-                if r.returncode == 0:
+                _ok, _d = _caddy_reload_checked()
+                if _ok:
                     plog(f"✓ Caddy confirmed — map.{domain} and tiles.map.{domain} live")
                 else:
-                    plog(f"⚠ Caddy reload: {r.stdout.strip()[:100]}")
+                    plog(f"⚠ Caddy reload: {_d.strip()[:100]}")
             else:
                 plog("  No domain configured — skipping Caddy (access via port 5000)")
         except Exception as _caddy_e:
@@ -35914,7 +36053,7 @@ def run_cloudtak_redeploy(cfg=None):
             if domain:
                 generate_caddyfile(settings)
                 try:
-                    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=45)
+                    _caddy_reload()
                     plog("✓ Caddy reloaded")
                 except subprocess.TimeoutExpired:
                     plog("⚠ Caddy reload timed out — reload manually if needed")
@@ -36014,7 +36153,7 @@ def run_cloudtak_redeploy(cfg=None):
         if domain:
             generate_caddyfile(settings)
             try:
-                subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=45)
+                _caddy_reload()
                 plog("✓ Caddy reloaded")
             except subprocess.TimeoutExpired:
                 plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
@@ -37129,11 +37268,8 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     s['webodm_deployment'] = _normalize_module_deployment_config(deploy_cfg)
     save_settings(s)
     generate_caddyfile(s)
-    try:
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, check=True)
+    if _caddy_reload(plog):
         plog('✓ Caddy reloaded — TLS cert provisioning started')
-    except Exception as ce:
-        plog(f'  Caddy reload warning: {ce}')
     fqdn = s.get('fqdn', '').strip()
     ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
     if fqdn and ak_token:
@@ -37285,12 +37421,11 @@ def _run_webodm_deploy(settings):
         s['webodm_enabled'] = True
         save_settings(s)
         generate_caddyfile(s)
-        import subprocess as _sp2
-        try:
-            _sp2.run(['systemctl', 'reload', 'caddy'], timeout=15, check=True)
+        # v10.1.50: this site was NOT _sudo_wrap()ped, so it could only ever have worked
+        # while the console ran as root — on a flipped box it raised and was swallowed by
+        # the `except` that used to be here. _caddy_reload() routes through the broker.
+        if _caddy_reload(plog):
             plog('Caddy reloaded — TLS cert provisioning started.')
-        except Exception as ce:
-            plog(f'Caddy reload warning: {ce}')
         fqdn = s.get('fqdn', '').strip()
         ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
         if fqdn and ak_token:
@@ -37552,7 +37687,7 @@ def webodm_uninstall():
     s['webodm_deployment'] = _normalize_module_deployment_config(deploy_cfg)
     save_settings(s)
     generate_caddyfile(s)
-    _sp.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), timeout=15, capture_output=True)
+    _caddy_reload()
     return jsonify({'success': True})
 
 
@@ -38571,7 +38706,7 @@ def nodered_uninstall():
         nodered_deploy_status.update({'running': False, 'complete': False, 'error': False})
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+            _caddy_reload()
             steps.append('Caddyfile updated')
         _deregister_authentik_proxy_app(settings, 'node-red', 'Node-RED Proxy', plog=lambda m: steps.append(m.strip()))
         return jsonify({'success': True, 'steps': steps})
@@ -40532,7 +40667,7 @@ def _run_netbird_deploy(settings):
         settings['netbird_enabled'] = True
         save_settings(settings)
         generate_caddyfile(settings)
-        _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=90)
+        _caddy_reload(timeout=90)
         plog('✓ Caddy routes active — STUN 3478/udp allowed')
 
         fqdn = settings.get('fqdn', 'localhost')
@@ -41410,7 +41545,7 @@ volumes:
     if domain:
         plog("  Updating Caddy...")
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
         plog(f"✓ Caddy updated — https://nodered.{domain}")
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
     if domain and ak_token:
@@ -41606,34 +41741,54 @@ volumes:
             plog("  (no nodered/deploy.sh in repo — skip)")
         plog("")
         plog("━━━ Step 3/3: Updating Caddy ━━━")
+        # v10.1.50: Node-RED is ALREADY RUNNING by the time we get here. Everything below
+        # is edge/SSO wiring, and none of it may be allowed to report the deploy as failed
+        # or — worse — to skip the step after it.
+        #
+        # That is exactly what happened in the field on 2026-08-26: this reload was a bare
+        # subprocess.run(..., timeout=15), Caddy's eternal grace period made the reload
+        # hang, TimeoutExpired escaped into this function's outer `except Exception`, and
+        # the operator saw "✗ Error: ... timed out after 15 seconds" on a Node-RED that was
+        # up and healthy. The Authentik block below it never ran, so the box was left with
+        # nodered.<fqdn> published through Caddy and NO SSO provider behind it.
+        # _caddy_reload() can no longer raise or hang; the try around Authentik closes the
+        # other half, so a failure there is named instead of aborting the whole deploy.
         if domain:
             generate_caddyfile(settings)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
-            plog(f"✓ Caddy updated — open via https://nodered.{domain}")
+            if _caddy_reload(plog):
+                plog(f"✓ Caddy updated — open via https://nodered.{domain}")
+            else:
+                plog(f"  ⚠ Caddy did not reload cleanly — nodered.{domain} may not be")
+                plog(f"    reachable yet. Node-RED itself is running on port 1880.")
         else:
             plog("  No domain configured — access via http://<server>:1880")
         if not nodered_deploy_status.get('cancelled') and domain and os.path.exists(os.path.expanduser('~/authentik/.env')):
-            plog("")
-            plog("━━━ Configuring Authentik for Node-RED ━━━")
-            ak_token = ''
-            with open(os.path.expanduser('~/authentik/.env')) as f:
-                for line in f:
-                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                        ak_token = line.strip().split('=', 1)[1].strip()
+            try:
+                plog("")
+                plog("━━━ Configuring Authentik for Node-RED ━━━")
+                ak_token = ''
+                with open(os.path.expanduser('~/authentik/.env')) as f:
+                    for line in f:
+                        if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
+                            ak_token = line.strip().split('=', 1)[1].strip()
+                            break
+                _ensure_authentik_nodered_app(domain, ak_token, plog, settings=settings)
+                plog("")
+                plog("  Waiting 2 minutes for Authentik outpost to sync...")
+                for i in range(24):
+                    if nodered_deploy_status.get('cancelled'):
+                        plog("  ⚠ Cancelled by user")
                         break
-            _ensure_authentik_nodered_app(domain, ak_token, plog, settings=settings)
-            plog("")
-            plog("  Waiting 2 minutes for Authentik outpost to sync...")
-            for i in range(24):
-                if nodered_deploy_status.get('cancelled'):
-                    plog("  ⚠ Cancelled by user")
-                    break
-                time.sleep(5)
-                remaining = 120 - (i + 1) * 5
-                if remaining > 0 and remaining % 30 == 0:
-                    plog(f"  ⏳ {remaining} seconds remaining...")
-            if not nodered_deploy_status.get('cancelled'):
-                plog("  ✓ Sync complete — Node-RED is ready behind Authentik")
+                    time.sleep(5)
+                    remaining = 120 - (i + 1) * 5
+                    if remaining > 0 and remaining % 30 == 0:
+                        plog(f"  ⏳ {remaining} seconds remaining...")
+                if not nodered_deploy_status.get('cancelled'):
+                    plog("  ✓ Sync complete — Node-RED is ready behind Authentik")
+            except Exception as _ak_e:
+                plog(f"  ✗ Authentik SSO setup for Node-RED FAILED: {str(_ak_e)[:200]}")
+                plog(f"    Node-RED is deployed and running, but nodered.{domain} has no SSO")
+                plog(f"    provider in front of it. Re-run this deploy once Authentik is healthy.")
         plog("")
         if nodered_deploy_status.get('cancelled'):
             plog("Deployment cancelled.")
@@ -43222,7 +43377,7 @@ def authentik_uninstall():
         settings['authentik_deployment']['deployed'] = False
         save_settings(settings)
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+        _caddy_reload()
         steps.append('Updated Caddyfile')
     else:
         ak_dir = os.path.expanduser('~/authentik')
@@ -43242,7 +43397,7 @@ def authentik_uninstall():
         try:
             settings_now = load_settings()
             generate_caddyfile(settings_now)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+            _caddy_reload()
             steps.append('Regenerated Caddyfile + reloaded Caddy')
         except Exception as caddy_err:
             steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
@@ -45234,7 +45389,7 @@ networks:
     settings['authentik_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+    _caddy_reload()
     plog("✓ Caddyfile updated")
 
     # v0.9.12 — remote Authentik firewall (security-hardened):
@@ -54763,8 +54918,7 @@ entries:
                 plog("  ⚠ Authentik HTTP not ready in time — Caddy may 502 briefly; retry in a minute.")
             plog("  Updating Caddy config...")
             generate_caddyfile(settings)
-            _cad_rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
-                                     capture_output=True, text=True, timeout=90)
+            _cad_ok, _cad_detail = _caddy_reload_checked(timeout=90)
             # v10.1.38 (GH #59) — this used to print an unconditional
             # "✓ Caddy config updated for Authentik" and then block 300 s waiting for a
             # certificate on a hostname Caddy had never been asked to serve.
@@ -54810,9 +54964,9 @@ entries:
                 plog(f"    generate_caddyfile() writes that vhost only when Authentik is detected as installed,")
                 plog(f"    so detection is failing on this box — check the Caddy page for the vhost list.")
                 plog(f"    NOTE: the console's own forward_auth is gated on the same signal, so SSO may be off too.")
-            elif _cad_rl.returncode != 0:
+            elif not _cad_ok:
                 plog(f"  ✗ Authentik vhost {_ak_vhost_host} was written, but `systemctl reload caddy` failed"
-                     f" (rc={_cad_rl.returncode}): {(_cad_rl.stderr or _cad_rl.stdout or '').strip()[:160]}")
+                     f": {_cad_detail.strip()[:160]}")
                 plog(f"    The running Caddy is still on the OLD config until this is fixed.")
             else:
                 plog(f"  ✓ Caddy reloaded and now serves {_ak_vhost_host}")
@@ -61026,7 +61180,7 @@ def _sync_webadmin_after_authentik_reconfigure(plog):
         plog("  Syncing WebAdmin (Caddy reload only, no TAK restart)...")
         settings = load_settings()
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
         plog("  ✓ Caddy reloaded.")
     except Exception as e:
         plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
@@ -61037,7 +61191,7 @@ def _run_takserver_update_config():
     settings = load_settings()
     fqdn = settings.get('fqdn', '').strip()
     generate_caddyfile(settings)
-    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+    _caddy_reload()
     takserver_host = _get_service_domain(settings, 'takserver')
     if fqdn and takserver_host:
         caddy_active = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
@@ -61418,7 +61572,7 @@ def takserver_uninstall():
     try:
         settings = load_settings()
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
         steps.append('Regenerated Caddyfile + reloaded Caddy')
     except Exception as caddy_err:
         steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
@@ -63414,7 +63568,7 @@ def run_takserver_upgrade(pkg_path):
             else:
                 ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
         if not _verify_takserver_dpkg_ok(ulog):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
@@ -63526,7 +63680,7 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
             ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
             ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
         _rq = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
         ulog(f"✓ Installed: {_rq}" if _rq.startswith('takserver') else "⚠ rpm -q takserver did not report installed — verify manually")
         ulog("TAK Server update complete.")
@@ -63851,7 +64005,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
             else:
                 ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
 
         if not _verify_takserver_dpkg_ok(ulog):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
@@ -64083,7 +64237,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
             ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
             ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
         generate_caddyfile(settings)
-        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+        _caddy_reload()
         _rq = subprocess.run('rpm -q takserver-core 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
         ulog(f"✓ Installed: {_rq}" if _rq.startswith('takserver-core') else "⚠ rpm -q takserver-core did not report installed — verify manually")
         ulog(""); ulog("=" * 50)
@@ -65233,7 +65387,7 @@ def _deploy_takserver_container(config):
         if settings.get('fqdn'):
             try:
                 generate_caddyfile(settings)
-                subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+                _caddy_reload()
                 log_step("  ✓ Caddy config updated for TAK Server")
             except Exception as _ce:
                 log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
@@ -66037,7 +66191,7 @@ def run_takserver_deploy(config):
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True)
+            _caddy_reload()
             log_step(f"  ✓ Caddy config updated for TAK Server")
 
         # Sync webadmin to Authentik with verification so first 8446 login works without manual fixes.
@@ -68819,7 +68973,7 @@ def _startup_ensure_hardening_posture():
         if w1.get('caddy_login_locked'):
             try:
                 generate_caddyfile()
-                subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=20)
+                _caddy_reload()
                 print('[startup-posture] hardened: Caddy /login SSO-lock re-asserted', flush=True)
             except Exception as _ce:
                 print('[startup-posture] Caddy re-assert warning: %s' % str(_ce)[:140], flush=True)
@@ -71787,7 +71941,7 @@ def _startup_migrations():
         # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
         if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
             generate_caddyfile(s)
-            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+            _caddy_reload()
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
 
         # v10.1.1 (one-time per box): heal the /hls-proxy TLS upstream fleet-wide.
@@ -71802,7 +71956,7 @@ def _startup_migrations():
             try:
                 if detect_modules().get('mediamtx', {}).get('installed'):
                     _hcf = generate_caddyfile(s)
-                    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                    _caddy_reload()
                     _hls_https = ('reverse_proxy https://' in (_hcf or '') and 'tls_server_name' in (_hcf or ''))
                     print(f"Startup migration: Caddyfile regenerated for /hls-proxy TLS upstream "
                           f"(HLS encfix; https_upstream={_hls_https})", flush=True)
@@ -71833,7 +71987,7 @@ def _startup_migrations():
                 try:
                     _cf = generate_caddyfile(s)
                     if _cf and 'request_header -X-Authentik' in _cf:
-                        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                        _caddy_reload()
                         _applied = True
                         break
                     _last_err = 'strip absent from generated Caddyfile'
@@ -71882,7 +72036,7 @@ def _startup_migrations():
                              or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
                             'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
                         if _pa_ok:
-                            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                            _caddy_reload()
                             _pa_applied = True
                             break
                         _pa_err = 'proxy-auth directives absent from generated Caddyfile'
@@ -71922,7 +72076,7 @@ def _startup_migrations():
                         _cbr_applied = True
                         break
                     elif 'route /outpost.goauthentik.io/callback*' in _cf:
-                        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                        _caddy_reload()
                         _cbr_applied = True
                         break
                     else:
@@ -72051,7 +72205,7 @@ def _startup_migrations():
                 # Drop the now-dead RA vhost from Caddy so its subdomain doesn't 502.
                 if (s.get('fqdn') or '').strip():
                     generate_caddyfile(s)
-                    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                    _caddy_reload()
                 print("Startup migration: legacy cfd-remote-assist removed — reinstall EUD Remote Assist from the console to recreate it", flush=True)
             except Exception as e:
                 print(f"Startup migration: error tearing down legacy cfd-remote-assist: {e}", flush=True)
@@ -72101,7 +72255,7 @@ def _startup_migrations():
                     _cad = ''
                 if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
                     generate_caddyfile(s)
-                    _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=60)
+                    _caddy_reload(timeout=60)
                     print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
 
         # Ensure webodm working directories exist when the module is enabled
@@ -72627,7 +72781,7 @@ def _startup_migrations():
                 lambda m: print(f"Startup migration: {m}", flush=True)
             )
             if _ct_labeled:
-                _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=60)
+                _caddy_reload(timeout=60)
                 print(f"Startup migration: relabeled {_ct_labeled} Caddy port(s) for SELinux and reloaded Caddy", flush=True)
         except Exception as caddy_selinux_err:
             print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")
@@ -74946,15 +75100,11 @@ def _post_update_auto_deploy():
                 _s_caddy = load_settings()
                 if (_s_caddy.get('fqdn') or '').strip() and os.path.exists(CADDYFILE_PATH):
                     generate_caddyfile(_s_caddy)
-                    _r_caddy = subprocess.run(
-                        _sudo_wrap(['systemctl', 'reload', 'caddy']),
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20
-                    )
-                    if _r_caddy.returncode == 0:
+                    _c_ok, _c_detail = _caddy_reload_checked()
+                    if _c_ok:
                         print("Post-update: Caddyfile regenerated + reloaded", flush=True)
                     else:
-                        _msg = (_r_caddy.stdout or _r_caddy.stderr or '').strip()[:200]
-                        print(f"Post-update: Caddy reload issue: {_msg}", flush=True)
+                        print(f"Post-update: Caddy reload issue: {_c_detail.strip()[:200]}", flush=True)
             except Exception as _ce:
                 print(f"Post-update: Caddyfile regen skipped: {_ce}", flush=True)
 
@@ -75501,6 +75651,12 @@ _MODULE_CTX = {
     '_host_arch': _host_arch,
     '_ssh_probe': _ssh_probe,
     'generate_caddyfile': generate_caddyfile,
+    # v10.1.50: the ONLY sanctioned way for a module to reload Caddy. A module that
+    # hand-rolls subprocess.run(_sudo_wrap(['systemctl','reload','caddy'])) reopens the
+    # eternal-grace-period hang inside the module registry, where the deploy-job runner's
+    # own except-handler turns it into a failed deploy. /redteam-selfaudit fails the build
+    # on a raw reload anywhere outside _caddy_reload_checked().
+    '_caddy_reload': _caddy_reload,
     'detect_modules': detect_modules,
     'probe_run': _probe_run,        # never-raise status probe (broker-shimmed)
     # emailrelay seams — these helpers stay in app.py this release (the Authentik
