@@ -30557,25 +30557,33 @@ def takportal_control():
         # button whose name says it updates the config. Both are now done here, and both
         # report failure instead of being swallowed.
         warnings = []
+        # Both steps below are only MEANINGFUL when TAK Server is on this box. On a portal
+        # pointed at a REMOTE TAK Server, SSH is configured by hand in the portal's own UI and
+        # there is no /opt/tak/certs/files to sync from -- skipping is the correct outcome, not
+        # a failure, and warning about it every time would leave Update Config permanently amber
+        # on a perfectly healthy split/remote install. Same observable the settings builder uses
+        # (_takportal_build_settings_dict's tak_local), so the two cannot disagree.
+        tak_local = os.path.isdir('/opt/tak')
         try:
             cp_ok, cp_err = _takportal_write_settings_json(settings_json)
             if not cp_ok:
                 return jsonify({'success': False, 'error': cp_err or 'docker cp failed'}), 500
-            if not _takportal_setup_ssh():
-                warnings.append('SSH setup did not complete -- TAK Portal will still show '
-                                '"Setup: not run yet" and cannot run TAK commands on the host. '
-                                'Check the console log for the SSH step.')
-            # Certs before the restart so the portal loads the refreshed pair on the way up.
-            # restart=False: we restart below (and _takportal_sync_certs(restart=True) would
-            # also fire the map-channel/group-cache syncs, which do not belong on this path).
-            try:
-                certs_ok, certs_msg = _takportal_sync_certs(restart=False)
-            except Exception as _ce:
-                certs_ok, certs_msg = False, str(_ce)[:200]
-            if not certs_ok:
-                warnings.append(f'client cert / CA not refreshed: {certs_msg}. '
-                                'TAK Portal will report "Client P12 Certificate: Not Installed" '
-                                'and Marti stats will fail.')
+            if tak_local:
+                if not _takportal_setup_ssh():
+                    warnings.append('SSH setup did not complete -- TAK Portal will still show '
+                                    '"Setup: not run yet" and cannot run TAK commands on the host. '
+                                    'Check the console log for the SSH step.')
+                # Certs before the restart so the portal loads the refreshed pair on the way up.
+                # restart=False: we restart below (and _takportal_sync_certs(restart=True) would
+                # also fire the map-channel/group-cache syncs, which do not belong on this path).
+                try:
+                    certs_ok, certs_msg = _takportal_sync_certs(restart=False)
+                except Exception as _ce:
+                    certs_ok, certs_msg = False, str(_ce)[:200]
+                if not certs_ok:
+                    warnings.append(f'client cert / CA not refreshed: {certs_msg}. '
+                                    'TAK Portal will report "Client P12 Certificate: Not Installed" '
+                                    'and Marti stats will fail.')
             subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
@@ -30612,10 +30620,15 @@ def takportal_control():
             msg = (f'Config updated and portal restarted, but Authentik proxy chain heal reported: '
                    f"provider={tp_state.get('provider')}, app={tp_state.get('app')}, outpost={tp_state.get('outpost')}. "
                    f"Check console logs and Authentik admin UI.")
+        if not tak_local:
+            # Informational, NOT a warning -- see tak_local above. Appended after the chain
+            # message so a remote-TAK box still learns whether Authentik reconciled.
+            msg = msg + ' TAK Server is not on this box, so SSH setup and client-cert sync were skipped (configure those in TAK Portal).'
         if warnings:
             msg = msg + ' | ' + ' | '.join(warnings)
         return jsonify({'success': True, 'running': running, 'action': action,
-                        'message': msg, 'warnings': warnings, 'chain_summary': chain_summary})
+                        'message': msg, 'warnings': warnings, 'tak_local': tak_local,
+                        'chain_summary': chain_summary})
     elif action == 'update':
         # Reset any local changes to tracked files before pulling — the network
         # and hardening patches now live in docker-compose.override.yml (not tracked
