@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.49-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.49-alpha)**
+**Current release: [v10.1.50-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.50-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,17 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.50-alpha — 2026-08-27 — the reload that waits forever
+
+**Headline: applying a web-address change could hang the web server indefinitely, and take the deploy that triggered it down with it.**
+
+**Caddy reloads could hang forever.** Every time the console adds or changes a web address — installing a module, issuing a certificate, switching SSL mode — it asks Caddy to reload its configuration. Caddy's default is to wait *indefinitely* for existing connections to finish before letting go of the old configuration, and we had never told it otherwise. On a server exposed to the internet, where scanners and browsers hold connections open constantly, that wait could simply never end. When it happened, the reload never returned, the web server was left stuck mid-reload, and — worse — **every later configuration change on that machine silently failed to apply**, with nothing to indicate why. Existing sites kept serving the whole time, which is exactly what made it hard to spot. Caddy is now given a bounded ten seconds to hand over, so a reload always completes.
+
+**A deploy could be reported as failed when it had actually succeeded.** Because that reload was the last step of several module installs, a hang was reported as a deployment error on a module that was already installed and running. In Node-RED's case the failure also skipped the single-sign-on setup that ran after it, leaving the module published at its web address with no sign-in in front of it — reachable by nobody, including its owner. Reloading the web server can no longer fail a deploy, report a false error, or skip the steps behind it; if the reload does have trouble it now says so plainly and the deploy continues.
+
+**Machines already stuck are repaired automatically.** Updating to this release detects a web server left in the stuck state, clears it, and applies the new setting — no terminal, no manual restart.
+
 
 ### v10.1.49-alpha — 2026-08-26 — the safety net that was never actually there
 
