@@ -26991,6 +26991,54 @@ def _ak_invalidate_all_sessions(plog=None):
         return (0, 0)
 
 
+def _startup_caddy_grace_period_converge():
+    """v10.1.50 — put grace_period into the Caddyfile on boxes that already have one.
+
+    The emitter fix alone reaches a box only when SOMETHING calls generate_caddyfile(),
+    which in practice means the next module deploy. Measured on the dev fleet the day
+    this shipped: 3 of 5 boxes picked it up from an unrelated startup migration and
+    2 did not — nuc and aws-arm restarted onto the new code still carrying an eternal
+    grace period. A fix that lands on a box only if it happens to deploy something is
+    not a fleet fix, and the failure it leaves behind (a wedged caddy.service, a failed
+    deploy) is exactly what this release exists to stop.
+
+    Console-path delivery ([[feedback-console-path-delivery]]): this rides the console
+    update, never start.sh. Idempotent — the substring test makes it a no-op on every
+    later boot, so it costs one grep on a box that already converged.
+    """
+    if not os.path.exists(CADDYFILE_PATH):
+        return                      # nothing deployed yet; the first write carries it
+    try:
+        cur = _read_priv(CADDYFILE_PATH)
+    except Exception as e:
+        print('Startup migration: grace_period converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if 'grace_period' in cur:
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return                      # generate_caddyfile() no-ops without an FQDN
+    generate_caddyfile(s)
+    # Read back rather than trusting the call — generate_caddyfile() routes through
+    # _caddy_validate_or_restore(), which puts the PREVIOUS file back on a parse failure.
+    # Claiming convergence over a rolled-back write is the mistake this codebase keeps
+    # having to correct.
+    try:
+        if 'grace_period' not in _read_priv(CADDYFILE_PATH):
+            print('Startup migration: ⚠ grace_period converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. This box still has an ETERNAL '
+                  'grace period; `systemctl reload caddy` can hang here.', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_checked(timeout=60)
+    print('Startup migration: ✓ Caddyfile now carries grace_period %s and Caddy %s '
+          '(reload-hang fix)' % (CADDY_GRACE_PERIOD,
+                                 'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
+          flush=True)
+
+
 def _startup_caddy_selfheal():
     """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
 
@@ -73179,6 +73227,14 @@ def _startup_migrations():
         # limping on an unparseable config heals only by luck. Ask Caddy whether the file on
         # disk actually loads; if not, regenerate (without heredocs on Caddy < 2.7) and
         # reload. Runs last, so it judges whatever the migrations above left behind.
+        # v10.1.50: converge grace_period FIRST. _startup_caddy_selfheal() returns early
+        # on a Caddyfile that parses — which is nearly every box — so hanging this off it
+        # would have healed almost nothing.
+        try:
+            _startup_caddy_grace_period_converge()
+        except Exception as _gp_err:
+            print(f"Startup migration: grace_period converge error (non-fatal): {_gp_err}",
+                  flush=True)
         try:
             _startup_caddy_selfheal()
         except Exception as _cs_err:
