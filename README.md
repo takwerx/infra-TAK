@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.50-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.50-alpha)**
+**Current release: [v10.1.51-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.51-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.51-alpha — 2026-08-28 — the button that said it worked
+
+**Headline: "Update config" on the TAK Portal page reported success over two silent failures — including one it was never able to perform at all.**
+
+**The client certificate was never refreshed by "Update config".** Refreshing TAK Portal's client certificate is done by a different routine, which until now could only be reached from **Sync TAK Server CA** on the TAK Server page. So a portal reporting *"Client P12 Certificate: Not Installed"* could not be repaired by the one button whose name says it updates the configuration — no matter how many times it was pressed. A user with an entirely standard installation hit exactly this, concluded his deployment was broken, and began configuring the portal by hand. Nothing about his installation was unusual. "Update config" now refreshes the certificate as part of its job.
+
+**It also claimed SSH was configured without checking.** The result of the SSH setup step was discarded, and the button reported "(SSH configured)" either way — which is why a portal could sit at *"Setup: not run yet"* while the console looked healthy. Both steps now report what actually happened: a partial success shows in amber and names the step that failed, instead of a green line over a silent problem. On a portal pointed at a TAK Server on another machine, where these steps are meant to be skipped, it says so plainly rather than warning about it.
+
+**Split installations: the database link could go dead and never recover.** When TAK Server's database lives on a separate machine, nothing was checking that the connection was still alive. Idle connections were left unprobed for two hours, long enough for network equipment in between to quietly drop them while TAK Server carried on holding a connection that no longer existed. In one case the server was unreachable for roughly sixteen hours with a database that was healthy, reachable, and barely loaded the whole time. Split installations now keep their database connections checked, so a dropped link is detected in about two minutes instead of never. Existing split installations are repaired automatically on update — no restart, and no connection is interrupted.
 
 ### v10.1.50-alpha — 2026-08-27 — the reload that waits forever
 
