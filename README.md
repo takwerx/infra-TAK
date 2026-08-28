@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.52-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.52-alpha)**
+**Current release: [v10.1.53-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.53-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.53-alpha — 2026-08-28 — TAK Portal could sign in to your server and do nothing
+
+**Headline: TAK Portal's connection to your TAK Server has been able to log in but not act — so issuing an integration user's certificate, editing the server config, or restarting TAK Server from the Portal quietly failed. It now works by itself, with no account to create and nothing to type in.**
+
+**Why it happened.** TAK Portal reaches your TAK Server over a private connection that infra-TAK sets up for you. Since the move to running the console as a non-privileged account, the account it signs in as has had no administrative rights at all — deliberately, for safety. TAK Portal can grant itself those rights only if you hand it an administrator password, and that account has no password by design. So the connection came up, looked healthy, and could not carry out a single privileged action. The console made this worse by reporting the step as successful without ever checking it.
+
+**What changes.** infra-TAK now grants that connection exactly the four permissions TAK Portal genuinely needs — issue certificates as the TAK Server account, read and write the server config, run the certificate repair, and restart TAK Server — and nothing else. Notably, this is **narrower than what TAK Portal would set up for itself**: we deliberately withhold the unrestricted file-reading and reboot permissions it would otherwise take, because those would let anything reaching the Portal read every file on the box. The TAK Portal page also gains a **TAK Server SSH Access** panel that shows the real state of the connection — tested live, not assumed — with a Repair button.
+
+**If you were told to create a sudo user or find the `takwerx` password:** you don't need either, and there is no such password. Update the console and the connection configures itself.
+
+**Upgrade note:** ride the normal console update. Boxes running TAK Portal repair themselves on the next update — no terminal, no manual steps. Installs where TAK Server runs in containers (including ARM64) are unaffected and skip this cleanly.
 
 ### v10.1.52-alpha — 2026-08-28 — the port the QR pointed at
 
