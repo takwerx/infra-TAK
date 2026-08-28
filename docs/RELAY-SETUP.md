@@ -211,7 +211,7 @@ oci network security-list update \
   --force
 ```
 
-Refresh the **Security rules** page and you should see 17 ingress rules.
+Refresh the **Security rules** page and you should see 18 ingress rules.
 
 > **Why two pastes?** Editing a long command in a terminal is miserable — the arrow keys scroll
 > through command history instead of moving the cursor, so a mis-paste is easier to start over than
