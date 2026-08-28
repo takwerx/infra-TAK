@@ -510,7 +510,17 @@ async function pollVerify(){
         document.getElementById('verify-status').textContent = d.error;
         return;
       }
-      if(d.result){ renderVerify(d.result); }
+      if(d.result){ renderVerify(d.result); return; }
+      // v10.1.52 (GH #62): a run that ends with NEITHER an error nor a result used to fall
+      // out of here having just cleared the status line -- so the panel went silently blank
+      // and the operator was left staring at nothing. That is also the initial state
+      // ({running:false, error:'', result:null}), so a poll that raced the start, or a worker
+      // that died before setting either field, looked identical to "nothing happened".
+      // Reporter's words: "looks like it is trying to show a error but none is shown."
+      // Never end this branch without saying something.
+      document.getElementById('verify-status').textContent =
+        'The reachability check ended without returning a result. Try Verify Again \u2014 if it keeps '
+        + 'happening, check the console log (journalctl -u takwerx-console) for the verify worker.';
     }
   }catch(e){}
 }

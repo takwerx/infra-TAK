@@ -11506,8 +11506,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '33f6422fc02d6ee9d91c56238537538f706dc111'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'c9c78b6c1734095f4f5b9c51f42b768a797d2a85e01b6998fc6154ac19f03485'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '792e80bfa6a7e9004dadfde0a4807abf5483c89e'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = '52beb8a1584b260e1b4f1e247438224efce3e20f12fc2ec6e780b6298edae20a'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -11785,7 +11785,19 @@ def _conn_verify_ports(settings):
     """
     ports = list(_CONN_VERIFY_PORTS)
     try:
-        if settings.get('remote_assist_enabled'):
+        # v10.1.52 (GH #62 follow-up): detect Remote Assist the same belt-and-braces way the
+        # rest of this file does -- `remote_assist_enabled` alone is NOT a reliable signal.
+        # The v10.1.49 probe gated on that flag by itself, and the reporter came back on the
+        # NEXT release saying "Not seeing the EUD line as a check": the check we added
+        # BECAUSE of his issue did not fire on his box. Every other consumer of this fact
+        # already ORs in the modules dict (see the OIDC_ADMIN_GROUP migration), because a box
+        # deployed before the flag existed -- or through the marketplace path -- has the
+        # module installed and the flag unset. Match them, and fall back to the container
+        # itself so a settings file that has lost both still probes correctly.
+        _ra = bool(settings.get('remote_assist_enabled')) \
+            or 'remote_assist' in (settings.get('modules') or {}) \
+            or os.path.isdir(REMOTE_ASSIST_INSTALL_DIR)
+        if _ra:
             ports.append((REMOTE_ASSIST_DEVICE_PORT,
                           'EUD Remote Assist device enrolment (the QR points here)', True))
     except Exception:
