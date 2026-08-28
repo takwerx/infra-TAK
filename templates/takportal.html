@@ -125,6 +125,17 @@
 </div>
 </div>
 {% endif %}
+<div class="section-title">TAK Server SSH Access</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.6">TAK Portal reaches this host over SSH to issue integration-user certificates, edit CoreConfig and restart TAK Server. This is the channel &mdash; probed live, not assumed.</div>
+<div id="ssh-status-rows" style="font-family:'JetBrains Mono',monospace;font-size:12px;line-height:2">Checking&hellip;</div>
+<div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+<button class="control-btn" id="ssh-repair-btn" onclick="sshRepair()" title="Re-install the portal key and the sudo grant, then re-probe">&#128295; Repair SSH access</button>
+<button class="control-btn" id="ssh-setuser-btn" onclick="sshSetUser()" style="display:none"></button>
+<span id="ssh-status-msg" style="font-size:12px"></span>
+</div>
+<div class="deploy-log" id="ssh-repair-log" style="display:none;margin-top:12px;max-height:220px"></div>
+</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 24px;margin-bottom:24px">
 <div class="portal-collapse-header" onclick="portalSectionToggle(this)">
 <span>Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></span>
@@ -197,6 +208,72 @@ async function showAkPassword(){
         else{display.textContent='Not found';display.style.display='inline'}
     }catch(e){display.textContent='Error';display.style.display='inline'}
 }
+var SSH_DOT={ok:'var(--green)',warn:'var(--yellow)',bad:'var(--red)',na:'var(--text-dim)'};
+async function loadSshStatus(){
+    var box=document.getElementById('ssh-status-rows');
+    if(!box)return;
+    try{
+        var r=await fetch('/api/takportal/ssh-status');
+        var d=await r.json();
+        if(!d.ok){box.textContent='Could not read SSH status.';return}
+        box.innerHTML='';
+        (d.rows||[]).forEach(function(row){
+            var el=document.createElement('div');
+            el.style.cssText='margin-bottom:2px';
+            var dot='<span style="color:'+(SSH_DOT[row.state]||'var(--text-dim)')+'">●</span> ';
+            var lbl='<span style="color:var(--text-dim)">'+row.label+':</span> ';
+            var val='<span style="color:'+(row.state==='bad'?'var(--red)':row.state==='warn'?'var(--yellow)':'var(--cyan)')+'">'+row.value+'</span>';
+            el.innerHTML=dot+lbl+val;
+            box.appendChild(el);
+            if(row.hint){
+                var h=document.createElement('div');
+                h.style.cssText='font-size:11px;color:var(--text-dim);margin:-4px 0 8px 18px;line-height:1.5';
+                h.textContent=row.hint;
+                box.appendChild(h);
+            }
+        });
+        var su=document.getElementById('ssh-setuser-btn');
+        if(su){
+            if(d.user_mismatch&&d.console_user){
+                su.style.display='';
+                su.textContent='Point portal at '+d.console_user;
+            }else{su.style.display='none'}
+        }
+    }catch(e){box.textContent='Could not read SSH status: '+e.message}
+}
+async function sshRepair(){
+    var btn=document.getElementById('ssh-repair-btn');
+    var msg=document.getElementById('ssh-status-msg');
+    var log=document.getElementById('ssh-repair-log');
+    btn.disabled=true;btn.style.opacity='0.5';
+    msg.style.color='var(--text-secondary)';msg.textContent='Repairing…';
+    try{
+        var r=await fetch('/api/takportal/ssh-repair',{method:'POST'});
+        var d=await r.json();
+        if(log){log.style.display='block';log.textContent=(d.log||[]).join('\n')||'(no output)'}
+        if(d.success&&d.verified){msg.style.color='var(--green)';msg.textContent='✓ Verified — privileged mode: '+d.probe}
+        else if(d.success){msg.style.color='var(--yellow)';msg.textContent='⚠ Not verified — privileged mode: '+(d.probe||'unknown')+(d.detail?' ('+d.detail+')':'')}
+        else{msg.style.color='var(--red)';msg.textContent='✗ '+(d.error||'Repair failed')}
+    }catch(e){msg.style.color='var(--red)';msg.textContent='✗ '+e.message}
+    btn.disabled=false;btn.style.opacity='1';
+    loadSshStatus();
+}
+async function sshSetUser(){
+    var btn=document.getElementById('ssh-setuser-btn');
+    var msg=document.getElementById('ssh-status-msg');
+    if(!confirm('Point TAK Portal\'s SSH user at the console user and restart the portal?\n\nOnly do this if the current value was not your deliberate choice.'))return;
+    btn.disabled=true;btn.style.opacity='0.5';
+    msg.style.color='var(--text-secondary)';msg.textContent='Updating…';
+    try{
+        var r=await fetch('/api/takportal/ssh-set-user',{method:'POST'});
+        var d=await r.json();
+        if(d.success){msg.style.color='var(--green)';msg.textContent='✓ SSH user set to '+d.user}
+        else{msg.style.color='var(--red)';msg.textContent='✗ '+(d.error||'Failed')}
+    }catch(e){msg.style.color='var(--red)';msg.textContent='✗ '+e.message}
+    btn.disabled=false;btn.style.opacity='1';
+    loadSshStatus();
+}
+if(document.getElementById('ssh-status-rows'))loadSshStatus();
 async function portalControl(action){
     var btns=document.querySelectorAll('.control-btn');
     btns.forEach(function(b){b.disabled=true;b.style.opacity='0.5'});

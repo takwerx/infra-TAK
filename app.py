@@ -30270,13 +30270,33 @@ def _takportal_build_settings_dict(settings):
         **_portal_email_settings(settings),
         "BRAND_THEME": "dark",
         "BRAND_LOGO_URL": "",
-        "TAK_SSH_HOST": ssh_host,
-        "TAK_SSH_PORT": "22",
-        "TAK_SSH_USER": ssh_user,
-        "TAK_SSH_PRIVATE_KEY_PATH": "data/ssh/tak_ssh_ed25519",
-        "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
-        "TAK_SSH_PASSPHRASE": "",
     }
+    # v10.1.53 (W4): emit the TAK_SSH_* block ONLY when TAK Server is on this box.
+    #
+    # This used to be emitted unconditionally, so a portal deployed BEFORE TAK
+    # Server (or pointed at a remote one) got TAK_SSH_USER="root", port 22 and two
+    # key paths, with a BLANK host — half-configured, and unable to work. And
+    # because v10.1.42 made non-authoritative keys seed-once, that "root" is
+    # non-blank and therefore PINNED: when TAK Server later lands on a non-root
+    # box, we can never correct it to the console user. Emitting nothing leaves
+    # every key blank, so the ordinary seed path fills them in correctly the first
+    # time the box can actually answer the question.
+    #
+    # Boxes already pinned to "root" are NOT healed here. "That 'root' looks like
+    # something we wrote, so overwrite it" is precisely the value-based ownership
+    # test that clobbered a customer's deliberate TAK_SSH_USER=root (Justin
+    # Davis/TN, 2026-08-20) and that v10.1.42 deleted on purpose. The TAK Portal
+    # page surfaces the mismatch and the operator decides — see
+    # /api/takportal/ssh-status.
+    if tak_local:
+        _built.update({
+            "TAK_SSH_HOST": ssh_host,
+            "TAK_SSH_PORT": "22",
+            "TAK_SSH_USER": ssh_user,
+            "TAK_SSH_PRIVATE_KEY_PATH": "data/ssh/tak_ssh_ed25519",
+            "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
+            "TAK_SSH_PASSPHRASE": "",
+        })
     # v10.1.42 (W-P2): TAK_SSH_ONBOARDED used to be written by a SECOND writer inside
     # _takportal_setup_ssh() that bypassed every merge rule. It is emitted here instead — as a
     # seed, and only once the keypair actually exists on disk, so a portal that has never been
@@ -30439,6 +30459,148 @@ def _heal_takportal_authentik_token(plog=None):
         return False
 
 
+# ---------------------------------------------------------------------------
+# v10.1.53 — TAK Portal privileged sudoers grant (console side)
+# ---------------------------------------------------------------------------
+# TAK Portal reaches this host over SSH (container -> host.docker.internal) as the
+# console user, to issue integration-user client certs (makeCert.sh as `tak`),
+# read/write CoreConfig.xml, run its certs-permission repair script and restart
+# takserver. Since the v10.0.5 non-root flip the console user has been password
+# LOCKED with no sudo, and TAK Portal's own bootstrap needs a sudo PASSWORD to
+# install the grant — so it could never run, and TAK_SSH_SUDOERS_CONFIGURED sat
+# "false" on every box in the fleet with nobody looking. Field report: Cory Foy,
+# 2026-08-28. See docs/PLAN-v10.1.53.md.
+#
+# The grant text lives in the BROKER, not here (broker/takwerx_broker.py
+# _takportal_sudoers_text) — the console is not allowed to compose a sudoers file,
+# and '/etc/sudoers.d/' stays in the broker's PATH_DENY_PREFIX. On a root-era box
+# (broker not routing) we import THAT function rather than keeping a second copy:
+# two copies of a sudoers template will drift, and a drifted one is a security bug.
+_BROKER_MOD = None
+
+
+def _broker_module():
+    """Import broker/takwerx_broker.py as a module (root-console path only).
+
+    Verified side-effect free at import: it defines constants and functions, and
+    its logger/socket are created in serve(), not at module scope."""
+    global _BROKER_MOD
+    if _BROKER_MOD is not None:
+        return _BROKER_MOD
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('takwerx_broker', _BROKER_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _BROKER_MOD = mod
+    return mod
+
+
+def _takportal_sudoers(action, log_fn=None):
+    """install | remove | status the TAK Portal sudoers grant.
+
+    Returns (ok, result_dict_or_message). Never raises."""
+    _log = log_fn or (lambda m: None)
+    if action not in ('install', 'remove', 'status'):
+        return False, f'bad action {action!r}'
+    # Non-root console: the fixed-shape broker op. The request carries the action
+    # and nothing else — no username, no content, no paths.
+    if _broker_should_route() and _broker_available():
+        try:
+            r = _broker_request({'op': 'takportal_sudoers', 'action': action}, timeout=60)
+        except BrokerError as e:
+            return False, f'broker unreachable: {e}'
+        except Exception as e:
+            return False, f'broker request failed: {str(e)[:200]}'
+        if not r.get('ok'):
+            return False, (r.get('error') or 'broker refused the request')[:300]
+        return True, r
+    # Root console (root-era boxes, broker not routing): same code path, same
+    # template, same visudo validation — just executed in-process.
+    if os.getuid() != 0:
+        return False, ('console is neither root nor broker-routed — cannot manage '
+                       'the TAK Portal sudoers grant')
+    try:
+        m = _broker_module()
+        m._check_takportal_sudoers({'action': action})
+        r = m._do_takportal_sudoers({'action': action})
+    except Exception as e:
+        # Denied is the broker's own refusal type; anything else is a real fault.
+        return False, str(e)[:300]
+    if not r.get('ok'):
+        return False, (r.get('error') or 'sudoers write failed')[:300]
+    return True, r
+
+
+def _takportal_install_sudoers(log_fn=None):
+    """Install the grant. Returns (ok, message). A box that cannot carry one
+    (no TAK Server, containerized TAK, no `tak` user) is NOT a failure — it is a
+    skip, and the caller says so rather than warning."""
+    ok, r = _takportal_sudoers('status', log_fn=log_fn)
+    if ok and isinstance(r, dict) and not r.get('supported'):
+        msg = f"skipped — {r.get('reason') or 'not supported on this host'}"
+        if log_fn:
+            log_fn(f"  ⏭ TAK Portal sudo grant {msg}")
+        return True, msg
+    ok, r = _takportal_sudoers('install', log_fn=log_fn)
+    if not ok:
+        if log_fn:
+            log_fn(f"  ✗ TAK Portal sudo grant NOT installed: {r}")
+        return False, str(r)
+    if log_fn:
+        log_fn("  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal)")
+    return True, 'installed'
+
+
+def _takportal_remove_sudoers(log_fn=None):
+    """Drop the grant — the privilege must not outlive the module."""
+    ok, r = _takportal_sudoers('remove', log_fn=log_fn)
+    if log_fn:
+        log_fn("  ✓ TAK Portal sudo grant removed" if ok
+               else f"  ⚠ TAK Portal sudo grant not removed: {r}")
+    return ok, ('removed' if ok else str(r))
+
+
+def _takportal_ssh_probe(timeout=20):
+    """Prove, end to end, what TAK Portal will actually be able to do.
+
+    Not an inference from "we copied some files" — this is the same key, the same
+    account and the same sshd the container reaches via host.docker.internal, and
+    it runs the same probe TAK Portal's probePrivilegedMode() runs. Returns one of
+    'root' | 'nopasswd' | 'direct' | 'none' | 'unreachable', plus detail.
+
+    This exists because _takportal_setup_ssh() used to return True having proven
+    nothing, so a portal that could do NOTHING looked healthy from the console —
+    which is how a field user concluded his install was broken and started
+    configuring TAK Portal by hand."""
+    key = os.path.expanduser('~/TAK-Portal/data/ssh/tak_ssh_ed25519')
+    if not os.path.exists(key):
+        return 'none', 'no portal keypair on the host'
+    try:
+        import pwd as _pwd
+        user = _pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return 'none', 'cannot resolve the console user'
+    probe = ("if [ \"$(id -u)\" = 0 ]; then echo root; "
+             "elif sudo -n cat /opt/tak/CoreConfig.xml >/dev/null 2>&1; then echo nopasswd; "
+             "elif sudo -n -u tak id >/dev/null 2>&1; then echo nopasswd; "
+             "elif [ -r /opt/tak/CoreConfig.xml ] && [ -w /opt/tak/CoreConfig.xml ]; then echo direct; "
+             "else echo none; fi")
+    try:
+        r = subprocess.run(['ssh', '-i', key, '-o', 'BatchMode=yes',
+                            '-o', 'StrictHostKeyChecking=no',
+                            '-o', 'UserKnownHostsFile=/dev/null',
+                            '-o', 'ConnectTimeout=8',
+                            f'{user}@127.0.0.1', probe],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return 'unreachable', f'ssh probe failed: {str(e)[:200]}'
+    out = (r.stdout or '').strip().splitlines()
+    verdict = out[-1].strip() if out else ''
+    if verdict in ('root', 'nopasswd', 'direct', 'none'):
+        return verdict, ''
+    return 'unreachable', ((r.stderr or r.stdout or 'no answer from sshd').strip()[:200])
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -30521,7 +30683,32 @@ def _takportal_setup_ssh(log_fn=None):
         #     that already has a value of its own keeps it.
         _takportal_push_settings(restart=False)
 
-        return True
+        # v10.1.53 (W3): the grant that makes this channel able to DO anything.
+        # Without it the portal logs in as a password-locked, sudo-less account
+        # and every privileged call fails — which is the state the whole fleet
+        # was in. A box that cannot carry the grant (remote/containerized TAK)
+        # reports a skip, not a failure.
+        _takportal_install_sudoers(log_fn=log_fn)
+
+        # v10.1.53 (W6): prove it. This function used to return True here having
+        # verified NOTHING beyond "docker cp did not error" — so a portal that
+        # could not run a single privileged command looked healthy from the
+        # console. Now the return value means what its callers already assume it
+        # means: TAK Portal can actually do privileged work on this host.
+        verdict, detail = _takportal_ssh_probe()
+        if verdict in ('root', 'nopasswd'):
+            if log_fn:
+                log_fn(f"  ✓ Verified end-to-end: privileged mode '{verdict}'")
+            return True
+        if log_fn:
+            if verdict == 'direct':
+                log_fn("  ⚠ SSH works but only unprivileged file access — TAK Portal "
+                       "cannot issue integration-user certs or restart TAK Server")
+            elif verdict == 'unreachable':
+                log_fn(f"  ⚠ Could not verify the SSH channel end-to-end: {detail}")
+            else:
+                log_fn(f"  ⚠ SSH connected but privileged commands are unavailable{': ' + detail if detail else ''}")
+        return False
     except Exception as e:
         if log_fn:
             log_fn(f"  ✗ SSH setup error: {e}")
@@ -30583,8 +30770,10 @@ def takportal_control():
             if tak_local:
                 if not _takportal_setup_ssh():
                     warnings.append('SSH setup did not complete -- TAK Portal will still show '
-                                    '"Setup: not run yet" and cannot run TAK commands on the host. '
-                                    'Check the console log for the SSH step.')
+                                    '"Setup: not run yet" and cannot run TAK commands on the host '
+                                    '(no integration-user certs, no CoreConfig edits, no TAK '
+                                    'restart). See the TAK Server SSH access card below for what '
+                                    'exactly is missing.')
                 # Certs before the restart so the portal loads the refreshed pair on the way up.
                 # restart=False: we restart below (and _takportal_sync_certs(restart=True) would
                 # also fire the map-channel/group-cache syncs, which do not belong on this path).
@@ -30732,6 +30921,173 @@ def takportal_container_logs():
             entries.append(line)
     return jsonify({'entries': entries})
 
+@app.route('/api/takportal/ssh-status')
+@login_required
+def takportal_ssh_status():
+    """v10.1.53 (W5): the real state of the container->host SSH channel.
+
+    The console showed NOTHING about this channel — not the target, not the key,
+    not whether privileged commands were possible. So a portal that could not run
+    a single privileged command was indistinguishable from a healthy one, and the
+    only person who found out was the operator, in TAK Portal's own UI, days
+    later (field report: Cory Foy, 2026-08-28).
+
+    Every row below is observed, not inferred."""
+    out = {'ok': True, 'rows': [], 'tak_local': False, 'console_user': ''}
+    try:
+        import pwd as _pwd
+        console_user = _pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        console_user = ''
+    out['console_user'] = console_user
+
+    tak_local = os.path.isdir('/opt/tak')
+    tak_container = _tak_is_container()
+    out['tak_local'] = tak_local and not tak_container
+
+    def row(label, state, value, hint=''):
+        # state: ok | warn | bad | na
+        out['rows'].append({'label': label, 'state': state, 'value': value, 'hint': hint})
+
+    if not tak_local:
+        row('TAK Server', 'na', 'not on this host',
+            'SSH from TAK Portal is configured by hand in the portal UI for a remote TAK Server.')
+        return jsonify(out)
+    if tak_container:
+        row('TAK Server', 'na', 'containerized install',
+            'No host `tak` user and no takserver.service — the portal SSH privilege grant '
+            'does not apply to a containerized TAK Server.')
+        return jsonify(out)
+
+    portal = _takportal_get_existing_settings()
+    portal = portal if isinstance(portal, dict) else {}
+    ssh_user = (portal.get('TAK_SSH_USER') or '').strip()
+    ssh_host = (portal.get('TAK_SSH_HOST') or '').strip()
+    ssh_port = (portal.get('TAK_SSH_PORT') or '22').strip()
+
+    if ssh_user and ssh_host:
+        row('Target', 'ok', f'{ssh_user}@{ssh_host}:{ssh_port}')
+    else:
+        row('Target', 'bad', 'not configured in TAK Portal',
+            'Run Repair below to seed it.')
+
+    # Target mismatch — surfaced, never silently healed. Deciding "that value
+    # looks like ours, overwrite it" is the ownership test that clobbered a
+    # customer's deliberate TAK_SSH_USER=root; the operator decides.
+    out['user_mismatch'] = bool(ssh_user and console_user and ssh_user != console_user)
+    if out['user_mismatch']:
+        row('SSH user', 'warn', f'portal says "{ssh_user}", console runs as "{console_user}"',
+            f'The portal key is installed for {console_user}. If "{ssh_user}" was not your '
+            f'deliberate choice, use "Point portal at {console_user}" below.')
+
+    key = os.path.expanduser('~/TAK-Portal/data/ssh/tak_ssh_ed25519')
+    row('Keypair (host)', 'ok' if os.path.exists(key) else 'bad',
+        key if os.path.exists(key) else 'missing')
+
+    in_container = False
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'tak-portal', 'test', '-f',
+                                       '/usr/src/app/data/ssh/tak_ssh_ed25519']),
+                           capture_output=True, text=True, timeout=10)
+        in_container = (r.returncode == 0)
+    except Exception:
+        pass
+    row('Keypair (container)', 'ok' if in_container else 'bad',
+        'present' if in_container else 'missing')
+
+    trusted = False
+    try:
+        pub = key + '.pub'
+        ak = os.path.expanduser('~/.ssh/authorized_keys')
+        if os.path.exists(pub) and os.path.exists(ak):
+            with open(pub) as f:
+                pk = f.read().strip()
+            with open(ak) as f:
+                trusted = bool(pk) and pk in f.read()
+    except Exception:
+        pass
+    row('Host trust', 'ok' if trusted else 'bad',
+        f'portal key {"in" if trusted else "NOT in"} ~{console_user}/.ssh/authorized_keys')
+
+    ok, grant = _takportal_sudoers('status')
+    if ok and isinstance(grant, dict):
+        if not grant.get('supported'):
+            row('Sudo grant', 'na', grant.get('reason') or 'not supported here')
+        elif grant.get('present') and grant.get('matches'):
+            row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current)')
+        elif grant.get('present'):
+            row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
+                'Run Repair to rewrite it.')
+        else:
+            row('Sudo grant', 'bad', 'not installed',
+                'TAK Portal cannot issue integration-user certs, edit CoreConfig, or restart '
+                'TAK Server without it. Run Repair.')
+    else:
+        row('Sudo grant', 'warn', f'could not be checked: {grant}')
+
+    verdict, detail = _takportal_ssh_probe()
+    out['probe'] = verdict
+    _pv = {
+        'root': ('ok', 'root — full privileged access'),
+        'nopasswd': ('ok', 'nopasswd — TAK Portal can run its privileged commands'),
+        'direct': ('warn', 'direct — file access only; no cert issuance, no TAK restart'),
+        'none': ('bad', 'none — SSH works, but every privileged command fails'),
+        'unreachable': ('warn', f'could not verify: {detail}'),
+    }.get(verdict, ('warn', verdict))
+    row('Privileged mode (live probe)', _pv[0], _pv[1],
+        'Probed over SSH as the console user with the portal key — the same path the '
+        'container uses via host.docker.internal.')
+
+    row("TAK Portal's own view", 'ok' if (portal.get('TAK_SSH_SUDOERS_CONFIGURED') == 'true') else 'warn',
+        f"onboarded={portal.get('TAK_SSH_ONBOARDED', '?')} "
+        f"sudoers_configured={portal.get('TAK_SSH_SUDOERS_CONFIGURED', '?')}",
+        'TAK Portal sets sudoers_configured itself the first time it sees privileged access.')
+    return jsonify(out)
+
+
+@app.route('/api/takportal/ssh-repair', methods=['POST'])
+@login_required
+def takportal_ssh_repair():
+    """Re-run key install + sudo grant, then re-probe. Same code path the deploy
+    uses — there is deliberately no second implementation to drift."""
+    log = []
+    try:
+        ok = _takportal_setup_ssh(log_fn=lambda m: log.append(m))
+        verdict, detail = _takportal_ssh_probe()
+        return jsonify({'success': True, 'verified': ok, 'probe': verdict,
+                        'detail': detail, 'log': log})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300], 'log': log}), 500
+
+
+@app.route('/api/takportal/ssh-set-user', methods=['POST'])
+@login_required
+def takportal_ssh_set_user():
+    """Point TAK Portal's SSH user at the console user — ONLY on an explicit
+    operator click.
+
+    This is the deliberate opposite of an auto-heal. infra-TAK cannot tell its own
+    stale default from a value the operator chose, so it does not try: it shows
+    the mismatch and provides this button. See the v10.1.42 hard stop in
+    CLAUDE.md ("never reintroduce a value-based ownership test")."""
+    try:
+        import pwd as _pwd
+        console_user = _pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return jsonify({'success': False, 'error': 'cannot resolve the console user'}), 500
+    existing = _takportal_get_existing_settings()
+    if not isinstance(existing, dict):
+        return jsonify({'success': False, 'error': 'TAK Portal settings.json not readable'}), 500
+    merged = dict(existing)
+    merged['TAK_SSH_USER'] = console_user
+    ok, err = _takportal_write_settings_json(json.dumps(merged, indent=2))
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 500
+    subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
+                   capture_output=True, text=True, timeout=30)
+    return jsonify({'success': True, 'user': console_user})
+
+
 @app.route('/api/takportal/uninstall', methods=['POST'])
 @login_required
 def takportal_uninstall():
@@ -30747,6 +31103,13 @@ def takportal_uninstall():
     if os.path.exists(portal_dir):
         subprocess.run(f'rm -rf {portal_dir}', shell=True, capture_output=True)
         steps.append('Removed ~/TAK-Portal')
+    # v10.1.53: the sudoers grant exists ONLY to serve TAK Portal — it must not
+    # outlive the module. Leaving it behind would keep a privilege on the box for
+    # a component that is gone, which is exactly the kind of residue an audit
+    # finds and nobody can explain.
+    _sud_ok, _sud_msg = _takportal_remove_sudoers()
+    steps.append('Removed TAK Portal sudo grant' if _sud_ok
+                 else f'TAK Portal sudo grant not removed (non-fatal): {_sud_msg}')
     takportal_deploy_log.clear()
     takportal_deploy_status.update({'running': False, 'complete': False, 'error': False})
     # v0.9.31: regenerate Caddyfile so the takportal.<fqdn> vhost is removed.

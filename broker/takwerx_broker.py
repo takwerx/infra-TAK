@@ -58,6 +58,7 @@ import socketserver
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -448,6 +449,11 @@ PATH_DENY_EXACT = {
     SOCKET_PATH,
 }
 PATH_DENY_PREFIX = (
+    # STILL DENIED, and deliberately so. v10.1.53 added a TAK Portal sudoers
+    # grant — as the fixed-shape `takportal_sudoers` op whose content the BROKER
+    # composes (see _takportal_sudoers_text), NOT by relaxing this line. The
+    # generic write path must never be able to mint a sudoers rule of the
+    # console's own choosing; that would make the console user root outright.
     '/etc/sudoers.d/',                   # no minting new sudoers rules
     # v10.0.8: the broker unit itself is deny-listed (trust anchor), but a
     # systemd DROP-IN under its .d/ dir would override ExecStart/Environment
@@ -2217,6 +2223,230 @@ def _do_disk_reclaim(req):
     return {'ok': True, 'log': log, 'df_after': (df.stdout or '').strip(), 'backup': backup}
 
 
+# ---------------------------------------------------------------------------
+# v10.1.53 — TAK Portal privileged sudoers grant (fixed-shape op)
+# ---------------------------------------------------------------------------
+# WHY THIS IS AN OP AND NOT A PATH_ALLOW ENTRY:
+#   '/etc/sudoers.d/' is in PATH_DENY_PREFIX ("no minting new sudoers rules") and
+#   it STAYS there. A console that can write an arbitrary sudoers file simply IS
+#   root, which is the thing this broker exists to prevent. So the grant ships the
+#   way the mutating LVM ops did (disk_reclaim): a fixed-shape op whose CONTENT
+#   the broker owns. The request carries an action and NOTHING else — no username,
+#   no file content, no paths. The target is the module constant BROKER_USER, so
+#   there is no injection surface to get wrong.
+#
+# WHY THE GRANT EXISTS:
+#   TAK Portal runs in a container and reaches the host over SSH as the console
+#   user to do four things: issue integration-user client certs (makeCert.sh, run
+#   as `tak`), read/write CoreConfig.xml, run its certs-permission repair script,
+#   and restart takserver. Since the v10.0.5 non-root flip that account has been
+#   password-LOCKED with no sudo, and the Portal's own bootstrap needs a sudo
+#   PASSWORD to install this very file — so it can never run, and every privileged
+#   Portal feature has been dead fleet-wide. Field report: Cory Foy, 2026-08-28;
+#   reproduced on test6/test12 (TAK_SSH_SUDOERS_CONFIGURED=false on both).
+#   See docs/PLAN-v10.1.53.md.
+#
+# WHAT WE DELIBERATELY DO NOT GRANT — upstream's own installer grants both:
+#   * (root) NOPASSWD: tail   — unrestricted, i.e. a root READ primitive for every
+#     file on the box (/etc/shadow, the TAK CA key, .config/auth.json), handed to a
+#     network-facing container that holds the SSH private key.
+#   * (root) NOPASSWD: reboot — the console already owns power controls.
+#   Operator decision 2026-08-28. Granting either later is a deliberate widening
+#   with its own /module-scan — never a patch.
+TAKPORTAL_SUDOERS_PATH = '/etc/sudoers.d/tak-portal'
+TAKPORTAL_REPAIR_SCRIPT = '/opt/tak/utils/tak-portal-repair-certs.sh'
+TAKPORTAL_CORECONFIG = '/opt/tak/CoreConfig.xml'
+TAKPORTAL_TAK_USER = 'tak'
+# 'status' is read-only and exists because the console CANNOT read the grant
+# itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
+# born-non-root box the directory is 0750 root:root anyway. Without it the UI
+# would have to guess at the state of a security-relevant file.
+_TAKPORTAL_SUDOERS_ACTIONS = ('install', 'remove', 'status')
+
+# Resolve command paths from these dirs ONLY — never PATH, never shutil.which().
+# On a born-non-root box the console user's PATH leads with /opt/infratak/.shims,
+# which is takwerx-WRITABLE; resolving through it would put a shim path in a
+# NOPASSWD rule and hand the console user unconditional root. Fixed dirs, plus an
+# ownership check on each hit.
+_SUDOERS_BIN_DIRS = ('/usr/bin', '/bin', '/usr/sbin', '/sbin')
+
+
+def _sudoers_safe_binaries(name):
+    """Every standard, root-owned path at which `name` exists, in a stable order.
+
+    Returns a LIST, not one path, on purpose: sudo matches a rule by the
+    fully-qualified path it resolves the command to, and it does not resolve
+    symlinks. On usrmerge systems both /bin/cat and /usr/bin/cat exist and are the
+    same file, but only the string sudo happens to resolve will match a rule. A
+    rule that names the other one never matches — and a non-matching sudoers rule
+    fails SILENTLY (no grant, no error), which is exactly the kind of bug that
+    burns a T&E cycle. Emitting every real path costs a few lines and removes the
+    guess."""
+    out = []
+    for d in _SUDOERS_BIN_DIRS:
+        p = os.path.join(d, name)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if os.path.islink(p):
+            # Keep the LINK path (that is what sudo may resolve to) but validate
+            # the target it points at.
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+        if not os.path.isfile(p):
+            continue
+        # Refuse anything not root-owned or writable by group/other — a NOPASSWD
+        # rule on a non-root-owned binary is a trap door.
+        if st.st_uid != 0 or (st.st_mode & 0o022):
+            continue
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _takportal_sudoers_text(user=BROKER_USER):
+    """The ONE definition of the grant.
+
+    app.py imports THIS function for the root-console path rather than keeping its
+    own copy, so the two can never drift — a drifted sudoers template is a
+    security bug, not a cosmetic one.
+
+    Returns the file content, or raises Denied when the box cannot support the
+    grant (no /opt/tak, containerized TAK, missing `tak` user, unresolvable
+    binaries)."""
+    if not re.match(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
+        raise Denied(f'takportal_sudoers: refusing unsafe user name {user!r}')
+    lines = [
+        '# Managed by infra-TAK (v10.1.53). Do not edit by hand.',
+        '#',
+        '# Lets TAK Portal, over its container->host SSH channel, do the four',
+        '# privileged things it needs on a native TAK Server install. Deliberately',
+        '# NARROWER than the file TAK Portal installs for itself: no `tail` (that',
+        '# is an unrestricted root read of every file on this box) and no `reboot`',
+        '# (the infra-TAK console owns power controls). See docs/PLAN-v10.1.53.md.',
+        f'Defaults:{user} !requiretty',
+    ]
+    need = {}
+    for b in ('cat', 'tee', 'bash', 'systemctl'):
+        paths = _sudoers_safe_binaries(b)
+        if not paths:
+            raise Denied(f'takportal_sudoers: cannot resolve a root-owned {b} in {_SUDOERS_BIN_DIRS}')
+        need[b] = paths
+    for p in need['cat']:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_CORECONFIG}')
+    for p in need['tee']:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_CORECONFIG}')
+        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_REPAIR_SCRIPT}')
+    for p in need['bash']:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_REPAIR_SCRIPT}')
+    for p in need['systemctl']:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {p} restart takserver')
+    # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
+    lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
+    return '\n'.join(lines) + '\n'
+
+
+def _takportal_sudoers_supported():
+    """(ok, reason) — whether this box can carry the grant at all.
+
+    Native TAK only. On a containerized/ARM install /opt/tak is a SYMLINK into the
+    console user's docker bundle, there is no host `tak` user and no
+    takserver.service, so every line of the grant would be meaningless. Skipping
+    is the correct outcome there, and the console says so rather than warning."""
+    if not os.path.isdir('/opt/tak'):
+        return False, 'TAK Server is not installed on this host (/opt/tak missing)'
+    if os.path.islink('/opt/tak'):
+        return False, 'containerized TAK Server (/opt/tak is a symlink) — no host tak user to grant'
+    try:
+        pwd.getpwnam(TAKPORTAL_TAK_USER)
+    except KeyError:
+        return False, f'no `{TAKPORTAL_TAK_USER}` user on this host'
+    try:
+        if pwd.getpwnam(BROKER_USER).pw_uid == 0:
+            return False, f'console user {BROKER_USER} resolves to uid 0 — grant is meaningless'
+    except KeyError:
+        return False, f'console user {BROKER_USER} does not exist'
+    return True, ''
+
+
+def _check_takportal_sudoers(req):
+    action = req.get('action')
+    if action not in _TAKPORTAL_SUDOERS_ACTIONS:
+        raise Denied(f'takportal_sudoers: action must be one of {_TAKPORTAL_SUDOERS_ACTIONS}')
+    # Removing a grant is de-escalation, and 'status' only reports — both are
+    # permitted even on a box that could not RECEIVE a grant (a box that cannot
+    # hold one is exactly where a stale file most wants finding and clearing).
+    if action in ('remove', 'status'):
+        return
+    ok, why = _takportal_sudoers_supported()
+    if not ok:
+        raise Denied(f'takportal_sudoers: {why}')
+    _takportal_sudoers_text()          # raises Denied if the text cannot be built
+
+
+def _do_takportal_sudoers(req):
+    action = req.get('action')
+    if action == 'status':
+        ok, why = _takportal_sudoers_supported()
+        present = os.path.exists(TAKPORTAL_SUDOERS_PATH)
+        matches = False
+        mode = ''
+        if present:
+            try:
+                with open(TAKPORTAL_SUDOERS_PATH) as f:
+                    current = f.read()
+                st = os.stat(TAKPORTAL_SUDOERS_PATH)
+                mode = oct(st.st_mode & 0o777)
+                if ok:
+                    matches = (current == _takportal_sudoers_text())
+            except OSError:
+                pass
+        return {'ok': True, 'present': present, 'matches': matches, 'mode': mode,
+                'supported': ok, 'reason': why, 'path': TAKPORTAL_SUDOERS_PATH}
+    if action == 'remove':
+        try:
+            os.unlink(TAKPORTAL_SUDOERS_PATH)
+            return {'ok': True, 'removed': True, 'path': TAKPORTAL_SUDOERS_PATH}
+        except FileNotFoundError:
+            return {'ok': True, 'removed': False, 'path': TAKPORTAL_SUDOERS_PATH,
+                    'message': 'no grant file present'}
+        except OSError as e:
+            return {'ok': False, 'error': f'could not remove {TAKPORTAL_SUDOERS_PATH}: {e}'}
+
+    content = _takportal_sudoers_text()
+    # Stage in /etc so os.replace() is an atomic same-filesystem rename, and so a
+    # half-written file is never visible inside sudoers.d (sudo reads every file
+    # in that directory on every invocation).
+    fd, tmp = tempfile.mkstemp(dir='/etc', prefix='.tak-portal-sudoers-')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(content)
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, 0o440)
+        visudo = (_sudoers_safe_binaries('visudo') or [None])[0]
+        if not visudo:
+            return {'ok': False, 'error': 'visudo not found — refusing to install an unvalidated sudoers file'}
+        chk = subprocess.run([visudo, '-cf', tmp], capture_output=True, text=True, timeout=20)
+        if chk.returncode != 0:
+            # Never install a file sudo cannot parse: a broken drop-in can take
+            # sudo down for EVERY user on the box, root included.
+            return {'ok': False,
+                    'error': 'visudo rejected the generated grant (not installed): '
+                             + ((chk.stderr or chk.stdout or '').strip()[:300])}
+        os.replace(tmp, TAKPORTAL_SUDOERS_PATH)
+        tmp = None
+        return {'ok': True, 'path': TAKPORTAL_SUDOERS_PATH, 'content': content}
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -2236,6 +2466,8 @@ def _evaluate(req):
             _check_pgminer_scan(req)
         elif op == 'disk_reclaim':
             _check_disk_reclaim(req)
+        elif op == 'takportal_sudoers':
+            _check_takportal_sudoers(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -2317,12 +2549,14 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim'):
+    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
+        elif op == 'takportal_sudoers':
+            summary = f"action={req.get('action')} user={BROKER_USER}"
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -2336,6 +2570,8 @@ def _dispatch(req, peer):
             return _do_pg_restore(req)
         if op == 'disk_reclaim':
             return _do_disk_reclaim(req)
+        if op == 'takportal_sudoers':
+            return _do_takportal_sudoers(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
