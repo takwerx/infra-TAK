@@ -30585,6 +30585,16 @@ def _takportal_ssh_probe(timeout=20):
              "elif sudo -n -u tak id >/dev/null 2>&1; then echo nopasswd; "
              "elif [ -r /opt/tak/CoreConfig.xml ] && [ -w /opt/tak/CoreConfig.xml ]; then echo direct; "
              "else echo none; fi")
+    # StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null are deliberate and
+    # bounded HERE, and must not be copied to a probe with a different target: the
+    # host is the hardcoded loopback literal 127.0.0.1 (never settings, never user
+    # input), so "the host key changed" can only mean this machine's own sshd was
+    # re-keyed. Nothing secret crosses the link — the private key authenticates us
+    # to the server, and the command is a fixed probe string — and an attacker able
+    # to MITM loopback already has root on the box. Strict checking would instead
+    # make the probe fail closed on any box with no known_hosts entry yet, i.e.
+    # report "cannot verify" on a perfectly healthy first run, which is exactly the
+    # false signal this function exists to eliminate.
     try:
         r = subprocess.run(['ssh', '-i', key, '-o', 'BatchMode=yes',
                             '-o', 'StrictHostKeyChecking=no',
