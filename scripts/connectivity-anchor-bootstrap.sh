@@ -51,7 +51,18 @@ MEDIA_PORTS="${MEDIA_PORTS:-8554 8322}"    # 8554 RTSP · 8322 RTSPS
 # the UDP range pinned in our turnserver.conf (min-port=50000/max-port=50050).
 # Without these a relayed box can run Remote Assist locally but no remote peer can
 # ever complete NAT traversal through the relay.
-RA_PORTS="${RA_PORTS:-3479}"               # CoTURN STUN/TURN control channel
+# v10.1.52 (GH #62): 8448 is the EUD Remote Assist DEVICE API — the port the
+# enrolment QR itself encodes (PUBLIC_BASE_URL=https://<host>:8448). It was opened in
+# the box firewall and baked into the QR, but named in NO forward list here, so on a
+# relayed box the phone dialled a port the relay never forwarded and reported only
+# "Unable to connect". The admin portal is on 443 and worked throughout, which is what
+# made it look like a device or app problem. Reported by Eggman1414, who diagnosed it
+# to this script and fixed it by hand with the equivalent DNAT + FORWARD pair.
+#
+# Note this is a DIFFERENT QR from ATAK/iTAK certificate enrolment (8446, in TAK_PORTS
+# above and forwarded since day one). Both are "scan a QR to enrol", which is why a
+# relay walkthrough that exercised 8446 gave no signal about 8448.
+RA_PORTS="${RA_PORTS:-3479 8448}"          # 3479 CoTURN STUN/TURN control · 8448 device API (QR target)
 RA_UDP_RANGE="${RA_UDP_RANGE:-50000:50050}"  # CoTURN relayed media (pinned range)
 # v10.1.28: the console's own port, so a relayed box has the SAME direct-IP
 # backdoor every other box has (README "Recovery / backdoor"). Not forwarding it
