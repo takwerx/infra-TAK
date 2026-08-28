@@ -31038,10 +31038,22 @@ def takportal_ssh_status():
         'Probed over SSH as the console user with the portal key — the same path the '
         'container uses via host.docker.internal.')
 
-    row("TAK Portal's own view", 'ok' if (portal.get('TAK_SSH_SUDOERS_CONFIGURED') == 'true') else 'warn',
+    # TAK_SSH_SUDOERS_CONFIGURED stays "false" on a perfectly healthy v10.1.53 box,
+    # and that is CORRECT: TAK Portal writes that flag only on its OWN bootstrap
+    # path (getPrivilegedMode -> mode "password" -> it installs the sudoers file
+    # itself). When the grant is already in place it probes straight to "nopasswd"
+    # and never has cause to set it. So this row is informational — the live probe
+    # above is the authority, not this flag.
+    #
+    # And we do NOT write it ourselves. It is TAK Portal's statement about an
+    # action TAK Portal took; stamping our fact into their field is the same
+    # mistake as TAK_SSH_LAST_HANDSHAKE_AT (CLAUDE.md: "never write a field whose
+    # meaning you do not own").
+    row("TAK Portal's own flags", 'na',
         f"onboarded={portal.get('TAK_SSH_ONBOARDED', '?')} "
         f"sudoers_configured={portal.get('TAK_SSH_SUDOERS_CONFIGURED', '?')}",
-        'TAK Portal sets sudoers_configured itself the first time it sees privileged access.')
+        'sudoers_configured stays "false" when infra-TAK installed the grant — TAK Portal '
+        'only sets it on its own password-based setup path. The live probe above is what counts.')
     return jsonify(out)
 
 
