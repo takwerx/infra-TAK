@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.51-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.51-alpha)**
+**Current release: [v10.1.52-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.52-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.52-alpha — 2026-08-28 — the port the QR pointed at
+
+**Headline: on a relayed deployment, EUD Remote Assist enrolment could never work — the relay was never told to forward the port the QR code points at.**
+
+**The relay forwarded every port except the one the phone dials.** Remote Assist puts a web address ending in `:8448` into its enrolment QR, and that port was opened on the server and written into the QR — but it was missing from the list of ports the relay forwards. The admin portal sits on a different port and worked perfectly throughout, so everything looked healthy while the phone reported only "Unable to connect". Every relayed deployment running Remote Assist was affected. Relays now forward it, and existing relays repair themselves during a normal console update — no terminal, no manual firewall edits.
+
+One part still needs you: if your relay runs on a cloud provider, the provider's own firewall (security list / NSG) is outside what the console can reach. Existing relays need `8448/tcp` allowed there once, by hand. New setups get it from the updated relay guide, which now lists the port in both the manual steps and the copy-paste rule block.
+
+**"Verify Reachability" was hiding the ports it had just tested.** The panel that proves clients can reach your server was checking every port a module opens — video streaming, Remote Assist enrolment — and then displaying only a fixed handful, silently discarding the rest. So the feature meant to end guesswork about a blocked port showed no row for the very port that was blocked. It now shows every port it tests. Video streaming ports were affected the same way and are fixed by the same change.
+
+**A failed check could show an empty box.** If a reachability run ended without producing a result, the panel cleared itself and displayed nothing at all, which read as "nothing happened" rather than "this failed". It now always says what went wrong.
+
+Reported by a user who diagnosed the relay side himself and wrote it up — thank you.
 
 ### v10.1.51-alpha — 2026-08-28 — the button that said it worked
 
