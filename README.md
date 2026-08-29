@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.53-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.53-alpha)**
+**Current release: [v10.1.54-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.54-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.54-alpha — 2026-08-29 — the TAK Portal update notice had gone quiet
+
+**Headline: infra-TAK stopped telling you when a TAK Portal update was available. On any recent TAK Portal the notice was permanently silent — not occasionally missed, but gone for good. The console now checks for Portal releases itself.**
+
+**Why it happened.** infra-TAK never actually asked whether a newer TAK Portal existed. It watched TAK Portal's own status messages and waited for a particular sentence announcing an update. TAK Portal 1.3.70 reworded that message, and no release from 1.3.70 onward has printed the wording infra-TAK was listening for. The console went on waiting for a sentence that would never be said again and, hearing nothing, told you that you were up to date. On older Portal versions the same notice could go missing for a different reason: the message had simply scrolled past behind ordinary activity. Both cases look identical on screen — "up to date" — which is why this read as intermittent rather than broken, and why a busy install and a quiet one could disagree.
+
+**What changes.** The console now checks the TAK Portal releases directly and compares them against the version you actually have installed, so the notice no longer depends on overhearing a message at the right moment. It is checked at most twice an hour and costs nothing noticeable on page load. An install with no route to the internet stays silent rather than guessing, and still falls back to TAK Portal's own message — in either wording — if it can see one.
+
+**Upgrade note:** ride the normal console update. Nothing to configure, and if a TAK Portal update is waiting for you, the TAK Portal page will say so as soon as the console restarts.
 
 ### v10.1.53-alpha — 2026-08-28 — TAK Portal could sign in to your server and do nothing
 
