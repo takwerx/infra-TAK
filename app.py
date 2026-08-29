@@ -29067,13 +29067,23 @@ def _get_takportal_version_info(fresh=False):
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
-                    # e.g. [update-check] current=1.2.19 latest=1.2.20 update=true
+                    # Portal <= 1.3.69: [update-check] current=1.2.19 latest=1.2.20 update=true
                     m = _re.search(r'latest=([^\s]+)', line)
                     if m:
                         log_latest = m.group(1).strip()
                     if 'update=true' in line:
                         log_update = True
                     break
+                if '[update]' in line:
+                    # Portal >= 1.3.70 dropped [update-check] entirely and replaced it with
+                    # "[update] 1.3.70 \u2192 1.4.3 available", emitted ONCE per new version
+                    # ("periodic checks stay quiet unless an update is available"). Matching
+                    # only the old string is why this went dead for everyone on 1.3.70+.
+                    m = _re.search(r'\[update\].*?(\d[\d.]*)\s+available', line)
+                    if m:
+                        log_latest = m.group(1).strip()
+                        log_update = True
+                        break
 
     # Authoritative: what upstream actually published. Only when we cannot reach
     # GitHub at all do we fall back to whatever the container happened to observe.
