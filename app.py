@@ -964,7 +964,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.53-alpha"
+VERSION = "10.1.54-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -28964,10 +28964,84 @@ def run_caddy_deploy(domain):
         plog(f"✗ Error: {str(e)}")
         caddy_deploy_status.update({'running': False, 'error': True})
 
-def _get_takportal_version_info():
+TAKPORTAL_UPSTREAM_CACHE_TTL = 1800  # 30 min — the dashboard poll hits this; /api/takportal/version bypasses via fresh=True
+
+_takportal_upstream_cache = {'latest': None, 'ts': 0}
+
+
+def _takportal_version_tuple(ver):
+    """Parse a TAK Portal version/tag (1.4.3, v1.4.3) into a comparable tuple."""
+    import re as _re
+    v = (ver or '').strip().lstrip('vV')
+    parts = []
+    for p in v.split('.')[:3]:
+        try:
+            parts.append(int(_re.sub(r'[^0-9].*', '', p) or '0'))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _fetch_takportal_latest(*, fresh=False):
+    """Newest upstream TAK Portal release tag, cached. None if GitHub has never answered.
+
+    Deliberately does NOT reuse _takportal_latest_tag(): that helper falls back to the
+    pinned TAKPORTAL_REF_FALLBACK when the API is unreachable. That pin is a deploy
+    floor, not an observation of what upstream published — comparing an installed
+    version against a hardcoded constant would invent an update badge on any box
+    without internet. Here an unreachable API must yield None (or a stale cache) so
+    the caller can stay silent instead of guessing.
+    """
+    import re as _re
+    import time as _time
+    # `_ur` is imported PER FUNCTION throughout this file — there is no module-level
+    # binding ([[apppy-ur-per-function-import-silent-nameerror]]).
+    import urllib.request as _ur
+    now = _time.time()
+    c = _takportal_upstream_cache
+    # `ts` is the last ATTEMPT, not the last success, so a box that cannot reach
+    # GitHub backs off for a full TTL instead of eating the timeout on every page
+    # render. The cached value (possibly None, possibly stale-but-good) is served
+    # meanwhile — a stale answer beats a blocked page.
+    if not fresh and c.get('ts') and (now - c['ts'] < TAKPORTAL_UPSTREAM_CACHE_TTL):
+        return c.get('latest')
+    c['ts'] = now
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        # Short timeout: this runs inline in the /takportal page render.
+        with _ur.urlopen(req, timeout=6) as resp:
+            tag = (json.loads(resp.read().decode()) or {}).get('tag_name')
+        tag = str(tag or '').strip()
+        if _re.match(r'^v?\d+(\.\d+){1,3}$', tag):
+            c['latest'] = tag.lstrip('vV')
+    except Exception as e:
+        print(f"version-info: takportal GitHub releases fetch failed (non-fatal): {e}", flush=True)
+    return c.get('latest')   # stale cache beats nothing
+
+
+def _get_takportal_version_info(fresh=False):
     """Return {version: str, update_available: bool, latest: str|None} for TAK Portal.
-    Version from package.json; update status from container logs [update-check] line."""
-    import re
+
+    Installed version comes from package.json. The update decision comes from the
+    upstream GitHub release — NOT from the container's own log.
+
+    Until v10.1.54 the only signal was an `[update-check]` line scraped out of
+    `docker logs tak-portal --tail 200`, which made the badge depend on how chatty
+    the container had been since it last emitted that line:
+      * on a busy container the line falls out of the 200-line window — test8 had
+        `latest=1.4.3 update=true` sitting under 635k lines of log, invisible;
+      * a Portal build that never emits the line can never report an update at all
+        (test12: zero occurrences in the whole log);
+      * a stopped container reports nothing.
+    All three render identically to "up to date", so the console stayed quiet on a
+    box that was seven releases behind. The console now asks upstream itself and
+    keeps the log line only as a fallback for when GitHub is unreachable.
+    """
+    import re as _re
     portal_dir = os.path.expanduser('~/TAK-Portal')
     out = {'version': '', 'update_available': False, 'latest': None}
     # Prefer package.json version (semantic version)
@@ -28983,20 +29057,34 @@ def _get_takportal_version_info():
         rv = subprocess.run(f'cd {portal_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
             out['version'] = rv.stdout.strip()
-    # If container is running, parse last [update-check] line for update_available
+    # Fallback signal only: the container's own update-check, if it is still in the
+    # tail window. Widened from 200 to 2000 lines — it is cheap, and at 200 the line
+    # had already scrolled away on every busy box we looked at.
+    log_latest, log_update = None, False
     r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '-q']), capture_output=True, text=True, timeout=5)
     if r.returncode == 0 and (r.stdout or '').strip():
-        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', '200']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', '2000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
                     # e.g. [update-check] current=1.2.19 latest=1.2.20 update=true
-                    m = re.search(r'latest=([^\s]+)', line)
+                    m = _re.search(r'latest=([^\s]+)', line)
                     if m:
-                        out['latest'] = m.group(1).strip()
+                        log_latest = m.group(1).strip()
                     if 'update=true' in line:
-                        out['update_available'] = True
+                        log_update = True
                     break
+
+    # Authoritative: what upstream actually published. Only when we cannot reach
+    # GitHub at all do we fall back to whatever the container happened to observe.
+    latest = _fetch_takportal_latest(fresh=fresh)
+    if latest:
+        out['latest'] = latest
+        if out['version'] and _takportal_version_tuple(latest) > _takportal_version_tuple(out['version']):
+            out['update_available'] = True
+    else:
+        out['latest'] = log_latest
+        out['update_available'] = log_update
     return out
 
 
@@ -30037,7 +30125,7 @@ def api_modules_version():
 @login_required
 def takportal_version_api():
     """Return TAK Portal version and update-available for module/card UI."""
-    info = _get_takportal_version_info()
+    info = _get_takportal_version_info(fresh=True)
     return jsonify(info)
 
 
