@@ -30394,7 +30394,16 @@ def _takportal_update_git(portal_dir, plog=None):
     _log = plog or (lambda m: print(m, flush=True))
     _git = ['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}']
     beta = _takportal_beta_mode()
-    from_version = ((_get_takportal_version_info() or {}).get('version') or '').strip()
+    # package.json directly, not _get_takportal_version_info(): that helper also runs
+    # `docker logs --tail 2000` and hits the GitHub releases API to decide the BADGE.
+    # None of that belongs on the button press, and on a chatty box the log read is
+    # seconds of pure waste inside an operation that already has a build to do.
+    from_version = ''
+    try:
+        with open(os.path.join(portal_dir, 'package.json')) as _pj:
+            from_version = str((json.load(_pj) or {}).get('version') or '').strip()
+    except Exception:
+        pass
     out = {'ok': False, 'channel': 'beta' if beta else 'stable', 'ref': '',
            'from_version': from_version, 'to_version': '', 'rolled_back': False,
            'message': '', 'error': ''}
