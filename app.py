@@ -28964,10 +28964,84 @@ def run_caddy_deploy(domain):
         plog(f"✗ Error: {str(e)}")
         caddy_deploy_status.update({'running': False, 'error': True})
 
-def _get_takportal_version_info():
+TAKPORTAL_UPSTREAM_CACHE_TTL = 1800  # 30 min — the dashboard poll hits this; /api/takportal/version bypasses via fresh=True
+
+_takportal_upstream_cache = {'latest': None, 'ts': 0}
+
+
+def _takportal_version_tuple(ver):
+    """Parse a TAK Portal version/tag (1.4.3, v1.4.3) into a comparable tuple."""
+    import re as _re
+    v = (ver or '').strip().lstrip('vV')
+    parts = []
+    for p in v.split('.')[:3]:
+        try:
+            parts.append(int(_re.sub(r'[^0-9].*', '', p) or '0'))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _fetch_takportal_latest(*, fresh=False):
+    """Newest upstream TAK Portal release tag, cached. None if GitHub has never answered.
+
+    Deliberately does NOT reuse _takportal_latest_tag(): that helper falls back to the
+    pinned TAKPORTAL_REF_FALLBACK when the API is unreachable. That pin is a deploy
+    floor, not an observation of what upstream published — comparing an installed
+    version against a hardcoded constant would invent an update badge on any box
+    without internet. Here an unreachable API must yield None (or a stale cache) so
+    the caller can stay silent instead of guessing.
+    """
+    import re as _re
+    import time as _time
+    # `_ur` is imported PER FUNCTION throughout this file — there is no module-level
+    # binding ([[apppy-ur-per-function-import-silent-nameerror]]).
+    import urllib.request as _ur
+    now = _time.time()
+    c = _takportal_upstream_cache
+    # `ts` is the last ATTEMPT, not the last success, so a box that cannot reach
+    # GitHub backs off for a full TTL instead of eating the timeout on every page
+    # render. The cached value (possibly None, possibly stale-but-good) is served
+    # meanwhile — a stale answer beats a blocked page.
+    if not fresh and c.get('ts') and (now - c['ts'] < TAKPORTAL_UPSTREAM_CACHE_TTL):
+        return c.get('latest')
+    c['ts'] = now
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        # Short timeout: this runs inline in the /takportal page render.
+        with _ur.urlopen(req, timeout=6) as resp:
+            tag = (json.loads(resp.read().decode()) or {}).get('tag_name')
+        tag = str(tag or '').strip()
+        if _re.match(r'^v?\d+(\.\d+){1,3}$', tag):
+            c['latest'] = tag.lstrip('vV')
+    except Exception as e:
+        print(f"version-info: takportal GitHub releases fetch failed (non-fatal): {e}", flush=True)
+    return c.get('latest')   # stale cache beats nothing
+
+
+def _get_takportal_version_info(fresh=False):
     """Return {version: str, update_available: bool, latest: str|None} for TAK Portal.
-    Version from package.json; update status from container logs [update-check] line."""
-    import re
+
+    Installed version comes from package.json. The update decision comes from the
+    upstream GitHub release — NOT from the container's own log.
+
+    Until v10.1.54 the only signal was an `[update-check]` line scraped out of
+    `docker logs tak-portal --tail 200`, which made the badge depend on how chatty
+    the container had been since it last emitted that line:
+      * on a busy container the line falls out of the 200-line window — test8 had
+        `latest=1.4.3 update=true` sitting under 635k lines of log, invisible;
+      * a Portal build that never emits the line can never report an update at all
+        (test12: zero occurrences in the whole log);
+      * a stopped container reports nothing.
+    All three render identically to "up to date", so the console stayed quiet on a
+    box that was seven releases behind. The console now asks upstream itself and
+    keeps the log line only as a fallback for when GitHub is unreachable.
+    """
+    import re as _re
     portal_dir = os.path.expanduser('~/TAK-Portal')
     out = {'version': '', 'update_available': False, 'latest': None}
     # Prefer package.json version (semantic version)
@@ -28983,20 +29057,44 @@ def _get_takportal_version_info():
         rv = subprocess.run(f'cd {portal_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
             out['version'] = rv.stdout.strip()
-    # If container is running, parse last [update-check] line for update_available
+    # Fallback signal only: the container's own update-check, if it is still in the
+    # tail window. Widened from 200 to 2000 lines — it is cheap, and at 200 the line
+    # had already scrolled away on every busy box we looked at.
+    log_latest, log_update = None, False
     r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '-q']), capture_output=True, text=True, timeout=5)
     if r.returncode == 0 and (r.stdout or '').strip():
-        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', '200']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', '2000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
-                    # e.g. [update-check] current=1.2.19 latest=1.2.20 update=true
-                    m = re.search(r'latest=([^\s]+)', line)
+                    # Portal <= 1.3.69: [update-check] current=1.2.19 latest=1.2.20 update=true
+                    m = _re.search(r'latest=([^\s]+)', line)
                     if m:
-                        out['latest'] = m.group(1).strip()
+                        log_latest = m.group(1).strip()
                     if 'update=true' in line:
-                        out['update_available'] = True
+                        log_update = True
                     break
+                if '[update]' in line:
+                    # Portal >= 1.3.70 dropped [update-check] entirely and replaced it with
+                    # "[update] 1.3.70 \u2192 1.4.3 available", emitted ONCE per new version
+                    # ("periodic checks stay quiet unless an update is available"). Matching
+                    # only the old string is why this went dead for everyone on 1.3.70+.
+                    m = _re.search(r'\[update\].*?(\d[\d.]*)\s+available', line)
+                    if m:
+                        log_latest = m.group(1).strip()
+                        log_update = True
+                        break
+
+    # Authoritative: what upstream actually published. Only when we cannot reach
+    # GitHub at all do we fall back to whatever the container happened to observe.
+    latest = _fetch_takportal_latest(fresh=fresh)
+    if latest:
+        out['latest'] = latest
+        if out['version'] and _takportal_version_tuple(latest) > _takportal_version_tuple(out['version']):
+            out['update_available'] = True
+    else:
+        out['latest'] = log_latest
+        out['update_available'] = log_update
     return out
 
 
@@ -30037,7 +30135,7 @@ def api_modules_version():
 @login_required
 def takportal_version_api():
     """Return TAK Portal version and update-available for module/card UI."""
-    info = _get_takportal_version_info()
+    info = _get_takportal_version_info(fresh=True)
     return jsonify(info)
 
 
@@ -30085,11 +30183,17 @@ def takportal_page():
     portal_version = vinfo['version'] or ''
     portal_update_available = vinfo['update_available']
     portal_latest = vinfo['latest']
+    # Which channel Update will follow (TAK Portal's own BETA_MODE). Only read when the
+    # container is up: the reader's docker-cp fallback can spend 15s on a stopped one,
+    # and this is an inline page render. Stable is also the correct answer when we cannot
+    # look — the same fail-closed default _takportal_beta_mode() uses.
+    portal_beta_mode = bool(portal.get('running')) and _takportal_beta_mode()
     takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template('takportal.html',
         settings=settings, portal=portal, container_info=container_info,
         portal_port=portal_port, portal_version=portal_version,
         portal_update_available=portal_update_available, portal_latest=portal_latest,
+        portal_beta_mode=portal_beta_mode,
         takportal_deploy_cfg=takportal_deploy_cfg,
         authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings),
@@ -30164,6 +30268,199 @@ def _takportal_get_existing_settings():
         return json.loads(body) if body else {}
     except Exception:
         return {}
+
+
+# --- TAK Portal update channel (v10.1.55) ------------------------------------
+# TAK Portal ships ONE branch (main) and two update channels, selected by the
+# portal's own "Enable Beta Features" setting (BETA_MODE in its settings.json):
+#
+#   BETA_MODE off / unreadable  ->  the latest published GitHub RELEASE tag
+#   BETA_MODE on                ->  tip of origin/main
+#
+# Deploy has pinned to a release tag since v10.1.49 (_takportal_latest_tag), but
+# Update was a different code path: it ran `git pull --rebase` on whatever branch
+# the clone happened to track, which on a main-tracking box yanked unreleased code
+# the moment anyone pressed the button. This is the Update side of that pin.
+#
+# Upstream's own `./takportal update` implements exactly these rules and is present
+# in every checkout. We do NOT shell out to it, for one reason that is not
+# negotiable: it does `git checkout` and `docker compose up -d --build` in a single
+# uninterruptible step, and our loopback port hardening lives in the git-TRACKED
+# docker-compose.yml (`_patch_takportal_compose_ports` — the override file cannot
+# express it; Compose v5 silently drops `ports: !reset`). A checkout reverts that
+# patch, so a build started by the script publishes the portal on 0.0.0.0:3000,
+# past the Caddy/Authentik forward_auth boundary, and Docker's own iptables rules
+# put it in front of UFW. The patch has to land BETWEEN the checkout and the build,
+# and only an in-process sequence can do that. The channel rules below are kept
+# deliberately identical to the script's so the two cannot drift apart.
+
+
+def _takportal_beta_mode():
+    """True when TAK Portal's own BETA_MODE setting is on.
+
+    Source of truth is the container volume's /usr/src/app/data/settings.json, NOT the
+    git clone and NOT infra-TAK's settings.json — Beta Mode is a TAK Portal setting the
+    operator flips inside the portal, and infra-TAK only reads it.
+
+    Fails CLOSED: an unreadable file, a stopped container, a parse error, or a missing
+    key all mean stable. Never fail open to main — an update that guesses `main` because
+    it could not read a setting is the exact failure this channel logic exists to stop.
+    """
+    try:
+        s = _takportal_get_existing_settings()
+    except Exception:
+        return False
+    if not isinstance(s, dict):
+        return False
+    return str(s.get('BETA_MODE') or '').strip().lower() == 'true'
+
+
+def _takportal_release_tag_strict(portal_dir, plog=None):
+    """Latest published TAK Portal release TAG, or None. Never falls back to the pin.
+
+    Deliberately NOT _takportal_latest_tag(): that helper returns TAKPORTAL_REF_FALLBACK
+    ('1.4.0') when the API is unreachable. That constant is a DEPLOY FLOOR — a version
+    known good enough to install from scratch. Handing it to an UPDATE would silently
+    roll a healthy 1.4.6 box back to 1.4.0 every time GitHub had a bad minute. Same
+    reasoning as _fetch_takportal_latest() and the badge: a pin is not an observation.
+
+    Order matches upstream's `./takportal update`: releases API, then the repo's own
+    tags, then give up. Returning None means the caller must abort, not pull main.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    # `_ur` is imported PER FUNCTION throughout this file — there is no module-level
+    # binding ([[apppy-ur-per-function-import-silent-nameerror]]).
+    import urllib.request as _ur
+    tag = ''
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as r:
+            tag = str((json.loads(r.read().decode()) or {}).get('tag_name') or '').strip()
+    except Exception as e:
+        _log(f"  TAK Portal releases API unreachable ({str(e)[:100]}) — trying git tags")
+    # Keep the tag EXACTLY as upstream published it (with a 'v' if they used one) —
+    # it goes straight to `git checkout`, and a stripped prefix would not resolve.
+    if tag and re.match(r'^v?\d+(\.\d+){1,3}$', tag):
+        return tag
+    try:
+        r = subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
+                            'ls-remote', '--tags', '--refs', 'origin'],
+                           capture_output=True, text=True, timeout=60)
+        best, best_key = None, None
+        for line in (r.stdout or '').splitlines():
+            name = line.strip().rsplit('refs/tags/', 1)[-1].strip()
+            if not re.match(r'^v?\d+\.\d+\.\d+$', name):
+                continue
+            key = _takportal_version_tuple(name)
+            if best_key is None or key > best_key:
+                best, best_key = name, key
+        if best:
+            _log(f"  Using highest release tag from git: {best}")
+            return best
+    except Exception as e:
+        _log(f"  git ls-remote for tags failed: {str(e)[:100]}")
+    return None
+
+
+def _takportal_git_hint(stderr):
+    """Turn a git failure into something the operator can act on, or ''.
+
+    The root-owned-.git case is the one that matters: after the non-root flip a
+    re-homed TAK-Portal carries root-owned objects/refs, `git fetch` as takwerx exits
+    128, and until now the Update route ignored the exit code entirely and rebuilt the
+    OLD tree behind a green "Updated" ([[takportal-update-silent-pull-failure]]).
+    """
+    e = (stderr or '').lower()
+    if 'insufficient permission' in e or 'permission denied' in e:
+        return (' The portal checkout has files this console cannot write (usually root-owned '
+                '.git objects left by an older install). Fix with: '
+                'chown -R $(stat -c %U ~/TAK-Portal) ~/TAK-Portal')
+    if 'could not resolve host' in e or 'unable to access' in e or 'timed out' in e:
+        return ' The box could not reach github.com.'
+    return ''
+
+
+def _takportal_update_git(portal_dir, plog=None):
+    """Move ~/TAK-Portal onto its channel's ref. Returns a dict, never raises.
+
+    {ok, channel, ref, from_version, to_version, rolled_back, message, error}
+
+    Nothing here builds or restarts anything — the caller must re-apply the compose
+    port hardening (which this checkout reverts) BEFORE it builds. See the block
+    comment above _takportal_beta_mode().
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    _git = ['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}']
+    beta = _takportal_beta_mode()
+    from_version = ((_get_takportal_version_info() or {}).get('version') or '').strip()
+    out = {'ok': False, 'channel': 'beta' if beta else 'stable', 'ref': '',
+           'from_version': from_version, 'to_version': '', 'rolled_back': False,
+           'message': '', 'error': ''}
+    if not os.path.isdir(os.path.join(portal_dir, '.git')):
+        out['error'] = f'{portal_dir} is not a git checkout — redeploy TAK Portal instead of updating.'
+        return out
+    # Discard local edits to TRACKED files before moving refs. The only tracked file we
+    # modify is docker-compose.yml (the loopback port patch), and it is re-applied by the
+    # caller after the checkout — so this loses nothing. The untracked
+    # docker-compose.override.yml (networks, extra_hosts) is not touched by git at all.
+    subprocess.run(_git + ['checkout', '--', '.'], capture_output=True, text=True, timeout=30)
+
+    if beta:
+        out['ref'] = 'origin/main'
+        f = subprocess.run(_git + ['fetch', 'origin', 'main', '--force'],
+                           capture_output=True, text=True, timeout=180)
+        if f.returncode != 0:
+            err = (f.stderr or f.stdout or '').strip()[:300]
+            out['error'] = f'git fetch origin main failed: {err}.{_takportal_git_hint(err)}'
+            return out
+        c = subprocess.run(_git + ['checkout', '--force', '-B', 'main', 'origin/main'],
+                           capture_output=True, text=True, timeout=60)
+        if c.returncode != 0:
+            err = (c.stderr or c.stdout or '').strip()[:300]
+            out['error'] = f'git checkout origin/main failed: {err}.{_takportal_git_hint(err)}'
+            return out
+        out['ok'] = True
+        out['message'] = 'Beta Mode is on — updated to the latest beta (main).'
+        _log(f"  {out['message']}")
+        return out
+
+    tag = _takportal_release_tag_strict(portal_dir, plog=_log)
+    if not tag:
+        out['error'] = ('Could not resolve the latest TAK Portal release from GitHub. '
+                        'Nothing was changed — the update deliberately did NOT fall back to '
+                        'the main branch. Check the box\'s access to github.com and retry.')
+        return out
+    out['ref'] = tag
+    out['to_version'] = tag.lstrip('vV')
+    subprocess.run(_git + ['fetch', 'origin', '--tags', '--force'],
+                   capture_output=True, text=True, timeout=180)
+    # A shallow clone (deploy uses --depth 1 --branch <tag>) has exactly one tag, so the
+    # blanket fetch above can come back without the one we need. Ask for it by name.
+    ft = subprocess.run(_git + ['fetch', 'origin', f'refs/tags/{tag}:refs/tags/{tag}', '--force'],
+                        capture_output=True, text=True, timeout=180)
+    if ft.returncode != 0:
+        ft = subprocess.run(_git + ['fetch', 'origin', 'tag', tag, '--force'],
+                            capture_output=True, text=True, timeout=180)
+    c = subprocess.run(_git + ['checkout', '--force', tag], capture_output=True, text=True, timeout=60)
+    if c.returncode != 0:
+        err = ((c.stderr or c.stdout) or (ft.stderr or '')).strip()[:300]
+        out['error'] = f'Could not check out release {tag}: {err}.{_takportal_git_hint(err)}'
+        return out
+    out['ok'] = True
+    # Rollback is intentional and must be SAID, not hidden: a box that lived on main with
+    # Beta Mode on and then turned it off converges DOWN to the newest release.
+    if from_version and _takportal_version_tuple(from_version) > _takportal_version_tuple(tag):
+        out['rolled_back'] = True
+        out['message'] = (f'Rolling back from {from_version} to release {tag} because '
+                          f'Beta Mode is off. Portal data is not reverted.')
+    elif from_version and _takportal_version_tuple(from_version) < _takportal_version_tuple(tag):
+        out['message'] = f'Updated from {from_version} to GitHub Release {tag}.'
+    else:
+        out['message'] = f'Checked out GitHub Release {tag}.'
+    _log(f"  {out['message']}")
+    return out
 
 
 def _takportal_build_settings_dict(settings):
@@ -30841,19 +31138,28 @@ def takportal_control():
                         'message': msg, 'warnings': warnings, 'tak_local': tak_local,
                         'chain_summary': chain_summary})
     elif action == 'update':
-        # Reset any local changes to tracked files before pulling — the network
-        # and hardening patches now live in docker-compose.override.yml (not tracked
-        # by git) so it's safe to discard dirty tracked files without losing anything.
-        subprocess.run(
-            f'git -c safe.directory={portal_dir} -C {portal_dir} checkout -- .',
-            shell=True, capture_output=True, text=True, timeout=15)
-        pull = subprocess.run(
-            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase',
-            shell=True, capture_output=True, text=True, timeout=60)
-        pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
-        # Rewrite the override file so network hardening survives the pull.
-        # Also patch the base compose so port binding is loopback-only
-        # (git pull resets the upstream 0.0.0.0 binding on every update).
+        # v10.1.55: channel-aware, and it no longer pulls a branch.
+        #
+        # This used to be `git pull --rebase` on whatever branch the clone tracked —
+        # a different code path from Deploy, which has pinned to a published release
+        # tag since v10.1.49. On a main-tracking box the button therefore shipped
+        # unreleased TAK Portal code, and the returncode was never checked, so a
+        # checkout that could not fetch at all rebuilt the OLD tree behind a green
+        # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
+        # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
+        # hard 500 with the git error in it.
+        gitr = _takportal_update_git(portal_dir)
+        if not gitr['ok']:
+            return jsonify({'success': False, 'error': gitr['error'],
+                            'channel': gitr['channel']}), 500
+        pull_msg = gitr['message']
+        # ORDER IS LOAD-BEARING. The checkout above reverted docker-compose.yml to
+        # upstream's `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` — a 0.0.0.0 bind that
+        # publishes the portal past the Caddy/Authentik forward_auth boundary, in front
+        # of UFW (Docker writes its own iptables rules). Re-patch it to loopback BEFORE
+        # the build below, never after: "after" means the container comes up exposed and
+        # stays that way until something recreates it. This is also why we do not shell
+        # out to upstream's `./takportal update`, which fuses the checkout and the build.
         _write_takportal_override()
         _patch_takportal_compose_ports(portal_dir)
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=180)
@@ -30892,7 +31198,11 @@ def takportal_control():
         running = 'Up' in (r.stdout or '')
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
-        return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg, 'version': new_version, 'settings_synced': settings_synced, 'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url})
+        return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
+                        'version': new_version, 'settings_synced': settings_synced,
+                        'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url,
+                        'channel': gitr['channel'], 'ref': gitr['ref'],
+                        'from_version': gitr['from_version'], 'rolled_back': gitr['rolled_back']})
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
