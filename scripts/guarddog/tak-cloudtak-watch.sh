@@ -30,34 +30,12 @@ source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 CT_DIR="$(gd_find_stack_dir CloudTAK cloudtak-api-1)"
 [ -z "$CT_DIR" ] && exit 0
 
-# Health: cloudtak-api container running
-STATUS=$(docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null || true)
-if echo "$STATUS" | grep -q "Up"; then
-  echo 0 > "$FAIL_FILE"
-  exit 0
-fi
-
-# Failure
-FAILS=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
-echo "$FAILS" > "$FAIL_FILE"
-
-if [ "$FAILS" -lt "$MAX_FAILS" ]; then
-  exit 0
-fi
-
-# Cooldown
-if [ -f "$COOLDOWN_FILE" ]; then
-  LAST=$(cat "$COOLDOWN_FILE")
-  NOW=$(date +%s)
-  if [ $(( NOW - LAST )) -lt $COOLDOWN_SECS ]; then
-    exit 0
-  fi
-fi
-
-TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-mkdir -p /var/log/takguard
-echo "$TS | restart | CloudTAK container not up — restarting" >> /var/log/takguard/restarts.log
-
+# NOTE (v10.1.55 W6): the media-patch drift check below runs BEFORE the health check
+# on purpose. The health path exits 0 as soon as cloudtak-api is Up, so anything placed
+# after it only runs when CloudTAK is already failing — which is precisely NOT the case
+# we are looking for. The drift we care about is a perfectly healthy CloudTAK whose
+# media container silently lost infra-TAK's HLS profile. Caught in test on test12
+# 2026-08-31: the first cut sat after the early exit and never fired.
 # ── CloudTAK media patch drift (v10.1.55 W6) ─────────────────────────────────
 # infra-TAK is NOT a stock CloudTAK deploy for video. The console writes an HLS
 # profile into cloudtak-media's /mediamtx.yml (and a reaper + SRT fix into its JS)
@@ -110,6 +88,34 @@ Verify: docker exec cloudtak-media-1 grep -E '^hls' /mediamtx.yml
     [ -f "$_DRIFT_STATE" ] && { _log "drift | cloudtak-media HLS profile restored"; rm -f "$_DRIFT_STATE"; }
   fi
 fi
+
+# Health: cloudtak-api container running
+STATUS=$(docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null || true)
+if echo "$STATUS" | grep -q "Up"; then
+  echo 0 > "$FAIL_FILE"
+  exit 0
+fi
+
+# Failure
+FAILS=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "$FAILS" > "$FAIL_FILE"
+
+if [ "$FAILS" -lt "$MAX_FAILS" ]; then
+  exit 0
+fi
+
+# Cooldown
+if [ -f "$COOLDOWN_FILE" ]; then
+  LAST=$(cat "$COOLDOWN_FILE")
+  NOW=$(date +%s)
+  if [ $(( NOW - LAST )) -lt $COOLDOWN_SECS ]; then
+    exit 0
+  fi
+fi
+
+TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+mkdir -p /var/log/takguard
+echo "$TS | restart | CloudTAK container not up — restarting" >> /var/log/takguard/restarts.log
 
 SUBJ="Guard Dog: CloudTAK restarted on $SERVER_IDENTIFIER"
 BODY="CloudTAK container was not running for $FAILS consecutive checks.
