@@ -1,0 +1,74 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The version and platform fields below are required because
+        they routinely decide whether something is an already-shipped fix or a live bug —
+        without them the first reply is always "which version?", which costs you a day.
+  - type: input
+    id: version
+    attributes:
+      label: infra-TAK version
+      description: "`grep '^VERSION' app.py` in your install directory, or read it off the console sidebar."
+      placeholder: "e.g. v10.1.54-alpha"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Ubuntu 22.04
+        - Rocky Linux / RHEL 9
+        - Other (say which below)
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - x86_64
+        - ARM64 / aarch64
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Whatever is relevant — `journalctl -u takwerx-console -n 200`,
+        `/var/log/takguard/restarts.log`, `docker logs <container>`, TAK Server logs.
+        Paste as text rather than a screenshot where you can, so it is searchable.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Anything unusual about the deployment?
+      options:
+        - label: Split/two-server install (TAK Server and console on different hosts)
+        - label: Remote or external Authentik, Caddy, or database
+        - label: Behind a relay, VPN, CGNAT, or cloud load balancer
+        - label: Non-root console install

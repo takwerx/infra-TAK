@@ -2,7 +2,12 @@
    Setup AP page is served to a laptop on an isolated network with no route
    out, where the Google Fonts @import silently failed and Material Symbols
    ligatures rendered as raw words ('visibility' instead of the eye icon).
-   Latin subsets only; icon font subset to the 30 glyphs actually used.
+   Latin subsets only. The icon font is subset to exactly the ligatures the console
+   renders — regenerate it with tools/build-icon-font.sh, never by hand. The list
+   lives in that script so a missing glyph shows up in a diff: the previous ad-hoc
+   subset omitted `dark_mode` (the console is dark by default, so only `light_mode`
+   was ever captured), and light-mode users got a giant literal "DARK_MODE" in the
+   sidebar instead of an icon.
    JetBrains Mono: OFL-1.1 | DM Sans: OFL-1.1 | Material Symbols: Apache-2.0 */
 @font-face {
   font-family: 'JetBrains Mono';

@@ -117,26 +117,59 @@ if [ -n "$AK_DIR" ]; then
   done
   [ $_t -ge $MAX_WAIT_AK ] && _log "Authentik server not healthy after ${MAX_WAIT_AK}s, continuing"
 
-  # Verify LDAP outpost is responding (already started by compose up -d above)
-  _log "Checking LDAP outpost (port 389)..."
+  # v10.1.55 (W5, GH #64): verify the outpost RESOLVES GROUPS, not merely that it binds.
+  #
+  # This used to be `gd_tcp_up 127.0.0.1 389`, which passes the instant the outpost
+  # binds — and an outpost that started before authentik-server published its provider
+  # tree binds perfectly while failing every group search with
+  # "LDAP: error code 1 - Operations Error". TAK routes strictly by group, so every
+  # LDAP client lands in no group and is invisible to everyone, while systemctl
+  # --failed is empty, all containers read Up (healthy), and clients connect and get
+  # callsigns. A total outage presenting as a healthy box (GH #64, 2026-08-31).
+  #
+  # Compose ordering does NOT prevent this on the path that matters. The generated
+  # compose does carry `depends_on: server: condition: service_healthy`, but
+  # depends_on is honoured by `docker compose up` — NOT by the Docker daemon when it
+  # restarts `restart: unless-stopped` containers after a HOST REBOOT, where dockerd
+  # starts them all in parallel. Which is exactly when this was reported.
+  _log "Checking LDAP outpost can resolve groups (not just bind)..."
   _t=0
   _MAX_LDAP=120
+  _ldap_ok=0
   while [ $_t -lt $_MAX_LDAP ]; do
-    if gd_tcp_up 127.0.0.1 389; then
-      _log "LDAP outpost ready (${_t}s)"
+    gd_ldap_groups_ok "$AK_DIR"; _rc=$?
+    if [ $_rc -eq 0 ]; then
+      _log "LDAP outpost resolving groups (${_t}s)"
+      _ldap_ok=1
       break
+    fi
+    if [ $_rc -eq 2 ] && [ $_t -ge 30 ]; then
+      # No ldapsearch / unreadable .env — cannot determine. Fall back to the old
+      # liveness check so we do not recreate the outpost on a box we cannot probe.
+      if gd_tcp_up 127.0.0.1 389; then
+        _log "LDAP outpost bound (group probe unavailable — install ldap-utils/openldap-clients for full verification)"
+        _ldap_ok=1
+        break
+      fi
     fi
     sleep $INTERVAL
     _t=$((_t + INTERVAL))
   done
-  if [ $_t -ge $_MAX_LDAP ]; then
-    _log "LDAP not responding after ${_MAX_LDAP}s — force-recreating LDAP container"
+
+  if [ $_ldap_ok -eq 0 ]; then
+    _log "LDAP outpost NOT resolving groups after ${_MAX_LDAP}s — force-recreating (this is the GH #64 boot race)"
     cd "$AK_DIR" && docker compose up -d --force-recreate ldap 2>/dev/null
     sleep 30
-    if gd_tcp_up 127.0.0.1 389; then
-      _log "LDAP outpost recovered after recreate"
+    if gd_ldap_groups_ok "$AK_DIR"; then
+      _log "LDAP outpost recovered after recreate — groups resolving"
     else
-      _log "LDAP still not responding — Guard Dog will monitor"
+      # Do NOT report this as fine. An outpost that binds without resolving groups is
+      # the failure mode that hides behind every green indicator on the box.
+      _log "ALERT | LDAP outpost still cannot resolve groups after recreate — LDAP users will be placed in NO GROUP and will be invisible to all other clients. Check: docker logs authentik-ldap-1, and the TAK Client Dashboard for a Total-Clients vs rows-displayed mismatch."
+      if [ -x /opt/tak-guarddog/send-alert-email.sh ]; then
+        printf '%s\n' "The Authentik LDAP outpost on $(hostname) is bound but cannot resolve groups after a recreate at boot. Every LDAP-authenticated client will connect, receive a callsign, and then see nobody and be seen by nobody, while all services report healthy. Investigate: docker logs authentik-ldap-1; TAK Client Dashboard Total Clients vs rows displayed." \
+          | /opt/tak-guarddog/send-alert-email.sh "Guard Dog: LDAP outpost cannot resolve groups on $(hostname)" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null || true
+      fi
     fi
   fi
 else

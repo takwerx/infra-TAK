@@ -63,6 +63,54 @@ gd_is_container() { [ "$GD_TAK_MODE" = "container" ]; }
 # Ubuntu / RHEL / ARM. Usage: gd_tcp_up 127.0.0.1 389  -> rc 0 if accepting connects.
 gd_tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
+# v10.1.55 (W5): does the Authentik LDAP outpost actually RESOLVE GROUPS?
+#
+# gd_tcp_up 127.0.0.1 389 is not an answer to that question, and neither is the
+# outpost's own healthcheck. Both pass on an outpost that came up before
+# authentik-server published its provider tree: it binds fine (so TCP 389 accepts
+# and `wget --spider .../outpost.goauthentik.io/ping` returns 200) and then fails
+# EVERY group search with "LDAP: error code 1 - Operations Error". TAK Server routes
+# strictly by group, so every LDAP client is placed in no group and transmits to
+# nobody — while systemctl --failed is empty, all containers are Up (healthy), and
+# clients connect and get callsigns. GH #64, field report 2026-08-31.
+#
+# A bind is not readiness. A SEARCH is. rc 0 with at least one entry is the only
+# signal that separates "bound" from "working".
+#
+# Note this cannot be fixed by compose ordering alone: `depends_on` is honoured by
+# `docker compose up`, NOT by the Docker daemon when it restarts containers at host
+# boot from `restart: unless-stopped`. On a reboot dockerd starts them in parallel.
+# So the check has to be a runtime probe, not a declaration.
+gd_ldap_groups_ok() {
+  local _ak_dir _env _user _pw _basedn _host _out
+  _ak_dir="${1:-$(gd_find_stack_dir authentik authentik-server-1)}"
+  [ -n "$_ak_dir" ] || return 2
+  _env="$_ak_dir/.env"
+  [ -r "$_env" ] || return 2
+  command -v ldapsearch >/dev/null 2>&1 || return 2   # 2 = cannot determine, not "broken"
+
+  _user="$(grep -m1 '^AUTHENTIK_BOOTSTRAP_LDAPSERVICE_USERNAME=' "$_env" 2>/dev/null | cut -d= -f2-)"
+  _pw="$(grep -m1 '^AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD=' "$_env" 2>/dev/null | cut -d= -f2-)"
+  _basedn="$(grep -m1 '^AUTHENTIK_BOOTSTRAP_LDAP_BASEDN=' "$_env" 2>/dev/null | cut -d= -f2-)"
+  [ -n "$_user" ] && [ -n "$_pw" ] && [ -n "$_basedn" ] || return 2
+
+  _host="${2:-127.0.0.1}"
+  # -o nettimeout and -l bound the probe so a wedged outpost cannot hang boot.
+  _out="$(timeout 20 ldapsearch -x -LLL             -H "ldap://${_host}:389"             -D "cn=${_user},ou=users,${_basedn}"             -w "$_pw"             -b "$_basedn"             -s sub -l 10 -z 1             '(objectClass=group)' dn 2>&1)" || {
+    # rc 4 = Size limit exceeded, which means we DID get results (-z 1 capped us).
+    case "$_out" in
+      *"Size limit exceeded"*) return 0 ;;
+    esac
+    return 1
+  }
+  # An empty result set is not proof of health, but "Operations error" is proof of the bug.
+  case "$_out" in
+    *"Operations error"*|*"error code 1"*) return 1 ;;
+  esac
+  [ -n "$_out" ] && return 0
+  return 1
+}
+
 # --- PostgreSQL access (local single-server only; two-server scripts keep their
 # own SSH path and never call these) -----------------------------------------
 # gd_psql_scalar "<sql>" [db]   -> -t -A scalar, stdout, rc passthrough
