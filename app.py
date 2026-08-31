@@ -1065,7 +1065,14 @@ TAKPORTAL_REPO = "https://github.com/AdventureSeeker423/TAK-Portal.git"
 # and in settings, instead of an anonymous branch tip. Same shape as the CloudTAK
 # deploy's `remote_release_tag`. Freezing it to one version is a live product
 # decision (update cadence vs supply-chain strictness) — see ROADMAP.
-TAKPORTAL_REF_FALLBACK = "1.4.0"   # used only when the releases API is unreachable
+TAKPORTAL_REF_FALLBACK = "1.4.6"   # used only when the releases API is unreachable
+# v10.1.55 (W4): bumped 1.4.0 -> 1.4.6. This is the DEPLOY FLOOR — the version an
+# offline box installs when it cannot ask GitHub what the latest release is. It had
+# drifted six releases behind, so an air-gapped deploy silently installed an old
+# Portal. It is EXPECTED to be stale between bumps; that is tolerable for a floor and
+# is exactly why it must never be reused as an update comparison (see
+# _fetch_takportal_latest, which returns None offline precisely so the update badge
+# cannot invent an answer from a constant).
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
 REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/eud-remote-assist")
 REMOTE_ASSIST_PORT = 8767
@@ -16802,8 +16809,11 @@ def _f2b_selfheal_authentik_log_level(plog=None, detail=None):
     before = _ak_server_container_id()
     ok = True
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
-                           capture_output=True, text=True, timeout=300)
+        with _authentik_compose_lock('fail2ban-loglevel', plog=_log) as _locked:  # v10.1.55 W3
+            if not _locked:
+                raise RuntimeError('another healer holds the Authentik compose lock')
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                               capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             ok = False
             _log('fail2ban: Authentik apply returned %s — the new log level takes effect at '
@@ -24005,9 +24015,11 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                 with open(compose_path, 'w') as _f:
                     _f.write(comp)
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST → {_ldap_internal} (internal)")
-                subprocess.run(
-                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
-                )
+                with _authentik_compose_lock('ldap-internal-host', plog=_log) as _locked:  # v10.1.55 W3
+                    if _locked:
+                        subprocess.run(
+                            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
+                        )
                 _log("✓ LDAP container recreated with internal host")
             else:
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST already internal — no change")
@@ -24142,7 +24154,11 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
     if env_changed:
         _log("Env changed — running docker compose down && up -d to apply (this takes ~30s)…")
         try:
-            _run_priv_chain([['docker', 'compose', 'down', '--timeout', '20'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
+            with _authentik_compose_lock('env-changed-downup', plog=_log) as _locked:  # v10.1.55 W3
+                if not _locked:
+                    raise RuntimeError('another healer holds the Authentik compose lock — '
+                                       'env change NOT applied, retry')
+                _run_priv_chain([['docker', 'compose', 'down', '--timeout', '20'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
             _log("✓ Authentik restarted with new env")
         except Exception as e:
             _log(f"⚠ Authentik restart: {e}")
@@ -38815,8 +38831,11 @@ def _authentik_recover_compose_conflict(ak_dir, err, plog):
     for ref in sorted(names):
         plog(f"  Removing conflicting container {ref}...")
         subprocess.run(_sudo_wrap(['docker', 'rm', '-f', ref]), capture_output=True, text=True, timeout=60)
-    r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--remove-orphans']),
-                       cwd=ak_dir, capture_output=True, text=True, timeout=300)
+    with _authentik_compose_lock('conflict-recovery', plog=plog) as _locked:  # v10.1.55 W3
+        if not _locked:
+            raise RuntimeError('Authentik recovery deferred: another healer holds the compose lock')
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--remove-orphans']),
+                           cwd=ak_dir, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(f'Authentik recovery up -d failed: {(r.stderr or r.stdout)[:400]}')
     plog("  ✓ Authentik stack recovered (conflicting containers removed, full up -d)")
@@ -38927,8 +38946,12 @@ services:
             _log("  Authentik LDAP outpost is mid-recreate — waiting for it to settle...")
         time.sleep(5)
     _log("  Recreating Authentik server + worker for SMTP (ldap/db/redis untouched)...")
-    r = subprocess.run(
-        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', '--remove-orphans', 'server', 'worker']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
+    with _authentik_compose_lock('smtp-recreate', plog=_log) as _locked:  # v10.1.55 W3
+        if not _locked:
+            _log("  ⚠ SMTP recreate SKIPPED — another healer holds the Authentik compose lock")
+            return False
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', '--remove-orphans', 'server', 'worker']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         _err = r.stderr or r.stdout or ''
         if 'already in use' in _err:
@@ -43574,7 +43597,9 @@ def _wait_for_authentik_stack_healthy(plog, timeout=240):
                 stopped.append(c)
         if stopped and not healed:
             plog(f"  ⚠ Authentik stack: {', '.join(stopped)} not running — starting the stack (docker compose up -d)…")
-            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+            with _authentik_compose_lock('stack-down-heal', plog=plog) as _locked:  # v10.1.55 W3
+                if _locked:
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             healed = True
             time.sleep(10)
             continue
@@ -48951,6 +48976,166 @@ def _clear_stale_authentik_migration_lock(plog):
         return 0
 
 
+import contextlib   # v10.1.55 (W3): module-level, for the Authentik compose mutex below.
+                   # `fcntl` stays a per-function import like `_ur` elsewhere in this file
+                   # ([[apppy-ur-per-function-import-silent-nameerror]]).
+
+
+# --- Authentik compose mutex (v10.1.55 W3) -----------------------------------
+# TWO independent healers own ~/authentik's compose project and neither knew the
+# other existed:
+#
+#   * Guard Dog — takauthentikguard.timer, EVERY 60 SECONDS, running
+#     /opt/tak-guarddog/tak-authentik-watch.sh, whose escalation path is
+#     `docker compose down --timeout 30 && docker compose up -d`
+#   * this console — _recreate_authentik_server_worker() and half a dozen other
+#     `docker compose up` call sites against the same directory
+#
+# test12, 2026-08-31. Guard Dog was inside a full down+up, waiting for the server
+# to go healthy, when the console's [ak-mr-autotune] force-recreated server+worker
+# underneath it:
+#
+#   00:16:10 tak-authentik-watch.sh:  Container authentik-server-1 Waiting
+#   00:16:29 gunicorn: [ak-mr-autotune] recreating server+worker to apply new values...
+#   00:16:35 tak-authentik-watch.sh: dependency failed to start: container authentik-server-1 exited (0)
+#
+# An interrupted down+up leaves containers behind: authentik-postgresql-1 sat in
+# state `created`, StartedAt=0001-01-01, ExitCode=0, never started, while server and
+# worker spun at 115%/70% CPU against a database that did not exist. Every service
+# reported healthy. The operator saw "Authentik is refreshing" forever.
+#
+# The two parties are a gunicorn process and a bash script under systemd, so this
+# has to be flock(2) on a shared path — NOT the PID-file pattern the spiral monitor
+# uses, which only excludes other workers in the same process family. Both sides
+# speak flock natively: fcntl.flock here, flock(1) in the guard scripts.
+
+# ONE fixed path, deliberately in /tmp, and deliberately NOT "/var/lock if it exists".
+#
+# The first cut of this preferred /var/lock and fell back to /tmp. That is a mutex that
+# does not mutex: on nuc (Rocky 9) /var/lock is a root-owned 0755 symlink to /run/lock,
+# so root's Guard Dog takes /var/lock (the directory exists, so its `[ -d ]` test passes)
+# while the non-root console gets EACCES and falls back to /tmp. Two processes, two
+# different files, zero exclusion — and nothing anywhere would say so. Caught on nuc
+# 2026-08-31 by actually running the two halves against each other; every `[ -d ]`-style
+# probe has this shape, because root passes it and the console does not.
+#
+# /tmp is 1777 on Debian and RHEL alike, so both parties can create and open it. Its
+# sticky bit stops anyone deleting someone else's file, and tmpfiles cleaning a stale
+# lock is harmless — the next caller recreates it. `flock` is advisory and keyed on the
+# inode, so the ONLY thing that matters is that both sides open the same path. Never
+# reintroduce a conditional here: if the two sides can disagree, they eventually will.
+_AK_COMPOSE_LOCK_PATH = '/tmp/takwerx-authentik-compose.lock'
+_AK_COMPOSE_LOCK_WAIT_S = 180   # a full down+up on a slow box is ~60-90s; wait past it
+
+
+def _ak_compose_lock_path():
+    """The shared lock path. Returns it whenever it exists or we can create it.
+
+    Deliberately does NOT require write access. Root's Guard Dog can create this file
+    0644 root-owned (a plain `9>>` redirect obeys root's umask), and the non-root
+    console then cannot open it O_RDWR. The first cut treated that as "no usable lock
+    path" and proceeded UNLOCKED — i.e. the mutex silently disabled itself on exactly
+    the boxes it matters on. Observed on test12 2026-08-31:
+
+        -rw-r--r-- 1 root root 0 /tmp/takwerx-authentik-compose.lock
+        authentik compose lock: no usable lock path — proceeding UNLOCKED
+
+    flock(2) is advisory and needs only an open descriptor — a read-only fd locks
+    exclusively just fine — so an existing unwritable file is still perfectly usable.
+    See the O_RDONLY fallback in _authentik_compose_lock().
+    """
+    p = _AK_COMPOSE_LOCK_PATH
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o666)
+        os.close(fd)
+        try:
+            os.chmod(p, 0o666)   # widen it for the other party; EPERM if they own it
+        except OSError:
+            pass
+        return p
+    except OSError:
+        pass
+    # Exists but we cannot open it read-write (the root-created 0644 case). Still lockable.
+    return p if os.path.exists(p) else None
+
+
+@contextlib.contextmanager
+def _authentik_compose_lock(holder, plog=None, timeout=_AK_COMPOSE_LOCK_WAIT_S):
+    """Serialise a compose operation on ~/authentik against Guard Dog and other workers.
+
+    Yields True when the lock is held, False when it could not be taken. Callers MUST
+    honour a False by skipping the operation — never proceed unlocked. A skipped
+    autotune costs nothing; a collision costs an outage. Never raises: if flock is
+    unavailable the operation proceeds (degraded to today's behaviour) rather than
+    the console losing the ability to manage Authentik at all.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    path = _ak_compose_lock_path()
+    if not path:
+        _log(f"  authentik compose lock: no usable lock path — proceeding UNLOCKED ({holder})")
+        yield True
+        return
+    import fcntl as _fcntl
+    import time as _time
+    fh = None
+    acquired = False
+    writable = False
+    try:
+        try:
+            fh = open(path, 'r+')
+            writable = True
+        except OSError:
+            # Root-owned 0644 (see _ak_compose_lock_path). Lock it read-only rather than
+            # give up — an advisory flock on an O_RDONLY fd excludes exactly the same.
+            fh = open(path, 'r')
+        deadline = _time.time() + timeout
+        waited = False
+        while True:
+            try:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if _time.time() >= deadline:
+                    break
+                if not waited:
+                    _log(f"  authentik compose lock: held by another process — waiting ({holder})")
+                    waited = True
+                _time.sleep(2)
+        if not acquired:
+            _log(f"  authentik compose lock: NOT acquired after {timeout}s — skipping {holder} "
+                 f"(another healer is mid-compose; retrying later is correct)")
+            yield False
+            return
+        if waited:
+            _log(f"  authentik compose lock: acquired after waiting ({holder})")
+        if writable:
+            # Best-effort breadcrumb for whoever is debugging a stuck lock. Never
+            # required, and impossible on the read-only fallback fd.
+            try:
+                fh.seek(0)
+                fh.truncate()
+                fh.write(f"{os.getpid()} {holder}\n")
+                fh.flush()
+            except OSError:
+                pass
+        yield True
+    except Exception as e:
+        _log(f"  authentik compose lock: unavailable ({str(e)[:120]}) — proceeding UNLOCKED ({holder})")
+        yield True
+    finally:
+        if fh is not None:
+            try:
+                if acquired:
+                    _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
 def _recreate_authentik_server_worker(plog, reason):
     """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
 
@@ -48983,13 +49168,22 @@ def _recreate_authentik_server_worker(plog, reason):
     ok = False
     err_text = ''
     try:
-        r = subprocess.run(
-            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server', 'worker']),
-            cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=180
-        )
-        ok = (r.returncode == 0)
-        if not ok:
-            err_text = ((r.stderr or '') + (r.stdout or ''))[:300]
+        # v10.1.55 (W3): serialise against Guard Dog's 60-second takauthentikguard.timer.
+        # This exact call is what aborted Guard Dog's down+up mid-flight on test12 and left
+        # authentik-postgresql-1 created-but-never-started. If the lock cannot be taken we
+        # SKIP — a deferred recreate is free, a collision is an outage.
+        with _authentik_compose_lock(f'recreate:{reason}', plog=plog) as _locked:
+            if not _locked:
+                plog(f"  authentik recreate SKIPPED (reason={reason}) — another healer holds "
+                     f"the compose lock; the caller should retry on its next tick")
+                return False
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server', 'worker']),
+                cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=180
+            )
+            ok = (r.returncode == 0)
+            if not ok:
+                err_text = ((r.stderr or '') + (r.stdout or ''))[:300]
     except Exception as e:
         ok = False
         err_text = f"exception: {e}"[:300]
@@ -51967,9 +52161,11 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
 
     Decision matrix with ASYMMETRIC cooldowns (fast-down, slow-up):
       - autotune disabled in settings                    → no change
-      - fire in last 30 min AND current > floor          → tune DOWN (halve,
+      - a fire NEWER than the last tune AND current > floor → tune DOWN (halve,
         clamped to floor). Cooldown: 2 min between down-tunes — converge
-        fast under fire.
+        fast under fire. v10.1.55 (W2): this used to read "a fire in the last
+        30 min", which is not the same thing — see the comment on the down
+        path for the single-fire runaway that produced.
       - no fire in 6h AND current < min(baseline, ceiling) → tune UP (+25%,
         clamped). Cooldown: 30 min between up-tunes — avoid oscillation.
       - otherwise                                        → no change
@@ -51977,8 +52173,11 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
     The cooldown asymmetry matters: tak-10 (May 2026) showed the original
     symmetric 30-min cooldown was too slow to converge — the box took 5+
     fires inside a single cooldown window. With down-cooldown=2 min, the
-    box halves on every other watchdog tick under sustained pressure
-    (1000 → 500 → 250 → 125 → 100 floor in ~8 min).
+    box halves on every other watchdog tick under sustained pressure —
+    meaning FIVE fires walk it 1000 → 500 → 250 → 125 → 100. It takes five
+    fires, not one: the earlier wording ("1000 → 500 → 250 → 125 → 100 floor
+    in ~8 min") described the v10.1.55 bug, where a single fire did the whole
+    descent on its own.
 
     The starting value baseline for "bump up" is min(starting_value, ceiling).
     Starting value defaults to 1000 (the v0.9.23 migration default) but can
@@ -52010,20 +52209,43 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
         _quiet = (_now - _last_fire_ts) > _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S if _last_fire_ts else True
 
         # ── Tune DOWN path ──
-        if _recent_fire and _current > _floor:
+        # v10.1.55 (W2): the trigger is a fire we have NOT ALREADY ACTED ON — not merely
+        # "a fire happened in the last 30 min". `_recent_fire` compared the newest fire
+        # against a 1800s lookback while the down-cooldown is 120s, so ONE fire kept
+        # satisfying the condition on every evaluation for half an hour and walked
+        # MAX_REQUESTS all the way to the floor. Observed on test12 2026-08-31 from a
+        # single 00:06:35 fire:
+        #   00:09:41 1000->500   "watchdog fired 1x in last 30min (last fire 186s ago)"
+        #   00:13:05  500->250   "watchdog fired 1x in last 30min (last fire 390s ago)"
+        #   00:16:29  250->125   "watchdog fired 1x in last 30min (last fire 594s ago)"
+        #   00:19:40  125->100   "watchdog fired 1x in last 30min (last fire 785s ago)"
+        # `fired 1x` in all four lines — the same fire, counted four times. Each step
+        # force-recreates server+worker (~20s of Authentik downtime) and each is a chance
+        # to collide with Guard Dog's 60-second takauthentikguard.timer, which is how
+        # authentik-postgresql-1 ended up created-but-never-started and the box sat on
+        # "Authentik is refreshing" until someone started it by hand.
+        #
+        # Under genuinely sustained pressure nothing is lost: each NEW fire still steps the
+        # value down after the 120s cooldown, which is the "fast convergence under fire"
+        # the original intent wanted. What is gone is treating one incident as sustained.
+        _fires_since_tune = [_f for _f in _fires if _f > _last_tune_ts]
+        if _fires_since_tune and _current > _floor:
             if _since_tune < _AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S:
                 return (None, None, None)  # tune-down cooldown still in effect
             _new = max(_floor, _current // 2)
             _new_jitter = max(5, _new // 20)
-            _fires_30min = len([_f for _f in _fires if _now - _f < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S])
+            # Report what actually drove THIS decision. The old string reported every fire
+            # in the lookback window, so the log read "fired 1x" while tuning for the
+            # fourth time off that one fire — which is precisely what made the runaway
+            # look like four separate incidents in the journal.
             _reason = (
-                f"DOWN: watchdog fired {_fires_30min}x in last 30min "
+                f"DOWN: {len(_fires_since_tune)} new watchdog fire(s) since last tune "
                 f"(last fire {_now - _last_fire_ts}s ago) — MAX_REQUESTS too high"
             )
             try:
                 _autotune_log(
                     f"DECISION_DOWN | from={_current} to={_new} jitter={_new_jitter} "
-                    f"fires_30min={_fires_30min} last_fire_age_s={_now - _last_fire_ts}"
+                    f"fires_since_tune={len(_fires_since_tune)} last_fire_age_s={_now - _last_fire_ts}"
                 )
             except Exception:
                 pass

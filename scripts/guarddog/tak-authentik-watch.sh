@@ -59,6 +59,82 @@ _cooldown_ok() {
 # on Ubuntu / RHEL / ARM. Usage: _tcp_up 127.0.0.1 389
 _tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
+# ── Authentik compose mutex (v10.1.55 W3) ────────────────────────────────────
+# The console ALSO runs `docker compose` against this same project — from its
+# max-requests autotune, its SMTP recreate, its stack self-heal and several other
+# paths. This script runs every 60 seconds. On test12 (2026-08-31) the console
+# force-recreated server+worker while this script was inside its down+up, waiting
+# for the server to go healthy:
+#
+#   00:16:10  Container authentik-server-1 Waiting
+#   00:16:29  [ak-mr-autotune] recreating server+worker to apply new values...
+#   00:16:35  dependency failed to start: container authentik-server-1 exited (0)
+#
+# The aborted down+up left authentik-postgresql-1 `created` and never started, and
+# Authentik never came back until someone started it by hand. flock(1) here pairs
+# with fcntl.flock in app.py's _authentik_compose_lock() — same file, same semantics.
+# Skipping a tick is free: this script runs again in 60 seconds.
+# ONE fixed path, matching app.py's _AK_COMPOSE_LOCK_PATH exactly. Do NOT make this
+# conditional. The first cut said `/var/lock` when that directory existed, falling back
+# to /tmp otherwise — which silently disabled the whole mutex: /var/lock is root-owned
+# 0755, so THIS script (root, via systemd) took /var/lock while the console (takwerx,
+# non-root on every current box) got EACCES and used /tmp. Two files, no exclusion, no
+# error anywhere. flock is advisory and keyed on the inode: the only thing that matters
+# is that both sides open the same path. /tmp is 1777 on Debian and RHEL alike.
+_AK_LOCK="/tmp/takwerx-authentik-compose.lock"
+_AK_LOCK_WAIT=180
+
+# Run a compose operation under the shared lock. Usage: _ak_compose_locked <tag> <args...>
+# Returns non-zero WITHOUT running anything if the lock cannot be taken in time.
+_ak_compose_locked() {
+  _tag="$1"; shift
+  if ! command -v flock >/dev/null 2>&1; then
+    # util-linux is present on Debian and RHEL alike, so this should not happen —
+    # but degrade to today's behaviour rather than stop managing Authentik.
+    _log "compose-lock | flock unavailable — running $_tag UNLOCKED"
+    docker compose "$@" 2>&1
+    return $?
+  fi
+  ( umask 000; : >> "$_AK_LOCK" ) 2>/dev/null || true
+  chmod 666 "$_AK_LOCK" 2>/dev/null || true
+  exec 9>>"$_AK_LOCK" || { _log "compose-lock | cannot open $_AK_LOCK — running $_tag UNLOCKED"; docker compose "$@" 2>&1; return $?; }
+  if ! flock -w "$_AK_LOCK_WAIT" 9; then
+    _log "compose-lock | NOT acquired after ${_AK_LOCK_WAIT}s — skipping $_tag (console is mid-compose; next tick retries)"
+    exec 9>&-
+    return 1
+  fi
+  docker compose "$@" 2>&1
+  _rc=$?
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  return $_rc
+}
+
+# Full restart under a SINGLE lock hold. A lock taken per-command would release
+# between the `down` and the `up`, and the console slipping in at that instant is
+# the worst possible moment — it is the window that left postgresql created and
+# never started. Down and up are one critical section, not two.
+_ak_compose_restart_locked() {
+  if ! command -v flock >/dev/null 2>&1; then
+    _log "compose-lock | flock unavailable — running full restart UNLOCKED"
+    docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1
+    return $?
+  fi
+  ( umask 000; : >> "$_AK_LOCK" ) 2>/dev/null || true
+  chmod 666 "$_AK_LOCK" 2>/dev/null || true
+  exec 9>>"$_AK_LOCK" || { _log "compose-lock | cannot open $_AK_LOCK — full restart UNLOCKED"; docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1; return $?; }
+  if ! flock -w "$_AK_LOCK_WAIT" 9; then
+    _log "compose-lock | NOT acquired after ${_AK_LOCK_WAIT}s — skipping full restart (console is mid-compose; next tick retries)"
+    exec 9>&-
+    return 1
+  fi
+  docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1
+  _rc=$?
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  return $_rc
+}
+
 # ── HTTP health check (Authentik server) ──
 ak_http_ok() {
   local url code
@@ -99,7 +175,8 @@ Time (UTC): $(_ts)
 Action: Full restart (docker compose down + up -d).
 "
     _alert "$SUBJ" "$BODY"
-    cd "$AK_DIR" && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1
+    # v10.1.55 (W3): down+up is ONE critical section — see _ak_compose_restart_locked.
+  cd "$AK_DIR" && _ak_compose_restart_locked
     echo 0 > "$FAIL_HTTP"
     echo 0 > "$FAIL_LDAP"
     date +%s > "$COOLDOWN_HTTP"
@@ -137,7 +214,7 @@ Time (UTC): $(_ts)
 Action: Force-recreating LDAP container only (docker compose up -d --force-recreate ldap).
 "
       _alert "$SUBJ" "$BODY"
-      cd "$AK_DIR" && docker compose up -d --force-recreate ldap 2>&1
+      cd "$AK_DIR" && _ak_compose_locked "ldap-recreate" up -d --force-recreate ldap   # v10.1.55 W3
       echo 0 > "$FAIL_LDAP"
       date +%s > "$COOLDOWN_LDAP"
     fi
