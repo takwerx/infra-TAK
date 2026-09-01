@@ -295,23 +295,24 @@ function takPurgeFailed(){
 {% elif 'ubuntu' in settings.get('os_type', '') %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
 {% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-X.X-RELEASE-XX.noarch.rpm</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">dnf install ./package.rpm</span> and restarts TAK Server &mdash; your <strong>database is preserved</strong>.</p>
 {% endif %}
-<!-- v10.2.0 W5: the 5.8 / PostgreSQL 18 guided migration card. Renders from the live
-     pre-flight, so it states what THIS box needs rather than a generic warning. -->
-<div id="tak58-card" style="display:none;border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:14px 16px;border-radius:6px;margin-bottom:16px">
-<div id="tak58-title" style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:6px">Upgrading to TAK Server 5.8?</div>
-<div id="tak58-body" style="font-size:12px;color:var(--text-secondary);line-height:1.6">Checking this server&hellip;</div>
-<div id="tak58-facts" style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-top:8px;font-family:'JetBrains Mono',monospace"></div>
-<div id="tak58-actions" style="margin-top:12px;display:none">
-<input type="password" id="tak58-password" placeholder="Console password" autocomplete="off"
-       style="background:#0c0f1a;border:1px solid var(--border);border-radius:6px;padding:8px 10px;color:var(--text);font-size:12px;width:200px;margin-right:8px">
-<button class="control-btn" id="tak58-btn" onclick="tak58Migrate()">Migrate to 5.8 + PostgreSQL 18</button>
-<div style="font-size:11px;color:var(--text-dim);margin-top:8px;line-height:1.5">This backs up first, then upgrades the package and the database as <strong>one operation</strong> &mdash; TAK Server is down for the duration and must not be interrupted. The PostgreSQL 15 cluster is kept on disk as your rollback.</div>
+{% if tak58 and tak58.facts %}{% if tak58.facts.already_migrated %}
+<div style="border-left:3px solid var(--green);background:rgba(34,197,94,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--green);margin-bottom:4px">PostgreSQL {{ tak58.facts.pg_running_major }} &mdash; clear to run TAK Server 5.8+</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">This server has been migrated. Normal updates apply from here.</div>
 </div>
+{% elif tak58.blockers %}
+<div style="border-left:3px solid var(--red);background:rgba(239,68,68,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:4px">TAK Server 5.8 cannot be installed on this server yet</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">{% for b in tak58.blockers %}&bull; {{ b }}<br>{% endfor %}</div>
 </div>
-<div id="tak58-log-wrap" style="display:none;margin-top:16px;margin-bottom:16px">
-<div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">Migration log</div>
-<div id="tak58-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap"></div>
+{% else %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8?</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">5.8 requires <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong> and this server is on <strong>PostgreSQL {{ tak58.facts.pg_running_major }}</strong>. Upload the 5.8 package below and click Update as normal &mdash; the console detects it and runs the whole thing as <strong>one operation</strong>: verified backup, package install, database migration, then restart. TAK Server is down for the duration and must not be interrupted. The PostgreSQL 15 cluster is kept on disk as your rollback.</div>
+<div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-top:8px;font-family:'JetBrains Mono',monospace">database {{ tak58.facts.data_human }} &middot; {{ tak58.facts.avail_human }} free (needs {{ tak58.facts.need_human }}){% if tak58.facts.cot_router_rows is not none %} &middot; cot_router {{ '{:,}'.format(tak58.facts.cot_router_rows) }} rows{% endif %}{% if tak58.facts.pk_rewrite_expected %} &middot; <span style="color:var(--yellow)">id is integer &mdash; full-table rewrite expected</span>{% elif tak58.facts.pk_rewrite_expected is not none %} &middot; id already bigint &mdash; no table rewrite{% endif %}</div>
+{% for w in tak58.warnings %}<div style="font-size:12px;color:var(--yellow);line-height:1.5;margin-top:6px">&#9888; {{ w }}</div>{% endfor %}
 </div>
+{% endif %}{% endif %}
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
 <input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
 <div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>
@@ -898,137 +899,3 @@ loadSnapshots();
 loadSchedule();
 </script>
 <script src="/takserver.js"></script>{% endblock %}
-
-<script>
-/* v10.2.0 W5 — the 5.8 / PG18 migration card. Everything shown here comes from the
-   live pre-flight on THIS box: whether it still needs migrating, how big the database
-   is, whether disk allows a rollback-safe run, and whether the 5.8 schema update will
-   have to rewrite cot_router (which is what actually drives the duration, and is NOT
-   predictable from the TAK version — test6 and test12 run the same version with
-   different id types). Nothing here is a generic warning. */
-let _tak58Timer = null, _tak58Idx = 0;
-
-function _tak58Fmt(b) {
-  if (!b) return '-';
-  const u = ['B','KB','MB','GB','TB']; let i = 0, v = b;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
-}
-
-async function tak58Refresh() {
-  const card = document.getElementById('tak58-card');
-  if (!card) return;
-  let d;
-  try {
-    const r = await fetch('/api/takserver/58-preflight');
-    d = await r.json();
-  } catch (e) { return; }
-  if (!d || !d.ok) return;
-  const f = d.facts || {};
-  const title = document.getElementById('tak58-title');
-  const body = document.getElementById('tak58-body');
-  const facts = document.getElementById('tak58-facts');
-  const actions = document.getElementById('tak58-actions');
-  card.style.display = 'block';
-
-  /* Already on 18 — the green "clear" state. Deliberately only shown once PostgreSQL 18
-     is actually serving, never merely because a migration returned. */
-  if (f.already_migrated || f.pg_running_major >= (f.pg_target_major || 18)) {
-    card.style.borderLeftColor = 'var(--green)';
-    card.style.background = 'rgba(34,197,94,0.08)';
-    title.style.color = 'var(--green)';
-    title.textContent = 'PostgreSQL ' + f.pg_running_major + ' \u2014 clear to run TAK Server 5.8+';
-    body.textContent = 'This server has been migrated. Normal updates apply from here.';
-    facts.textContent = '';
-    actions.style.display = 'none';
-    return;
-  }
-
-  const blockers = d.blockers || [], warnings = d.warnings || [];
-  title.textContent = 'TAK Server 5.8 requires PostgreSQL ' + (f.pg_target_major || 18);
-  body.innerHTML = 'This server is on <strong>PostgreSQL ' + f.pg_running_major +
-    '</strong>. 5.8 will not finish installing until the database is migrated, and doing the two '
-    + 'steps separately leaves TAK Server down in between \u2014 so the console does both as one operation.';
-
-  const rows = [];
-  if (f.data_bytes) rows.push('database ' + _tak58Fmt(f.data_bytes));
-  if (f.avail_bytes) rows.push(_tak58Fmt(f.avail_bytes) + ' free (needs ' + _tak58Fmt(f.need_bytes) + ')');
-  if (f.cot_router_rows != null) rows.push('cot_router ' + f.cot_router_rows.toLocaleString() + ' rows');
-  if (f.pk_rewrite_expected === true) rows.push('cot_router.id is integer \u2014 full-table rewrite expected');
-  if (f.pk_rewrite_expected === false) rows.push('cot_router.id already bigint \u2014 no table rewrite');
-  facts.textContent = rows.join('  \u00b7  ');
-
-  if (blockers.length) {
-    card.style.borderLeftColor = 'var(--red)';
-    card.style.background = 'rgba(239,68,68,0.08)';
-    title.style.color = 'var(--red)';
-    body.innerHTML = '<strong>This server cannot be migrated yet.</strong><br>' +
-      blockers.map(b => '\u2022 ' + b).join('<br>');
-    actions.style.display = 'none';
-    return;
-  }
-  if (warnings.length) {
-    facts.innerHTML = facts.textContent + '<br><span style="color:var(--yellow)">' +
-      warnings.map(w => '\u26a0 ' + w).join('<br>') + '</span>';
-  }
-  actions.style.display = 'block';
-}
-
-async function tak58Migrate() {
-  const pw = (document.getElementById('tak58-password') || {}).value || '';
-  if (!pw) { alert('Enter the console password to confirm.'); return; }
-  if (!confirm('Migrate this server to TAK Server 5.8 and PostgreSQL 18?\n\n' +
-               'TAK Server will be STOPPED for the duration and must not be interrupted. ' +
-               'A verified backup is taken first and the PostgreSQL 15 cluster is kept as rollback.')) return;
-  const btn = document.getElementById('tak58-btn');
-  btn.disabled = true; btn.textContent = 'Migrating\u2026';
-  document.getElementById('tak58-log-wrap').style.display = 'block';
-  document.getElementById('tak58-log').textContent = 'Starting\u2026';
-  _tak58Idx = 0;
-  try {
-    const r = await fetch('/api/takserver/58-migrate', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({password: pw})
-    });
-    const d = await r.json();
-    if (!r.ok || d.error) {
-      document.getElementById('tak58-log').textContent = 'Could not start: ' + (d.error || r.status);
-      btn.disabled = false; btn.textContent = 'Migrate to 5.8 + PostgreSQL 18';
-      return;
-    }
-  } catch (e) {
-    document.getElementById('tak58-log').textContent = 'Could not start: ' + e;
-    btn.disabled = false; btn.textContent = 'Migrate to 5.8 + PostgreSQL 18';
-    return;
-  }
-  document.getElementById('tak58-password').value = '';
-  _tak58Timer = setInterval(tak58PollLog, 2000);
-  tak58PollLog();
-}
-
-async function tak58PollLog() {
-  let d;
-  try {
-    const r = await fetch('/api/takserver/58-migrate/log?index=' + _tak58Idx);
-    d = await r.json();
-  } catch (e) { return; }
-  const el = document.getElementById('tak58-log');
-  if (d.entries && d.entries.length) {
-    if (_tak58Idx === 0) el.textContent = '';
-    el.textContent += d.entries.join('\n') + '\n';
-    _tak58Idx = d.total;
-    el.scrollTop = el.scrollHeight;
-  }
-  if (!d.running && d.complete) {
-    clearInterval(_tak58Timer); _tak58Timer = null;
-    const btn = document.getElementById('tak58-btn');
-    btn.disabled = false;
-    btn.textContent = d.error ? 'Retry migration' : 'Migrate to 5.8 + PostgreSQL 18';
-    /* Re-read the pre-flight rather than assuming: the card's green state must reflect
-       PostgreSQL 18 actually serving, not the fact that the job returned. */
-    tak58Refresh();
-  }
-}
-
-document.addEventListener('DOMContentLoaded', tak58Refresh);
-</script>

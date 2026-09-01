@@ -7844,7 +7844,15 @@ def takserver_page():
     _migrate_done = tak_migrate_status.get('complete', False)
     if _migrate_done and not tak_migrate_status.get('running'):
         tak_migrate_status.update({'complete': False})
+    # v10.2.0 W5: 5.8/PG18 readiness for the update section. Cached (see
+    # _tak_58_preflight_cached) so a page render never waits on `du`, and wrapped
+    # so a probe failure degrades to "no card" rather than a 500 on the whole page.
+    try:
+        _tak58 = _tak_58_preflight_cached() if tak.get('installed') else None
+    except Exception:
+        _tak58 = None
     return render_template('takserver.html',
+        tak58=_tak58,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
         tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
@@ -63230,6 +63238,28 @@ _TAK58_MIN_DISK_RATIO = 1.5          # upgrade-db.sh exits 1 below this
 _TAK58_ROWS_SLOW = 5_000_000         # above this, an integer->bigint rewrite is "hours" territory
 
 
+_tak58_pf_cache = {'at': 0, 'data': None}
+
+
+def _tak_58_preflight_cached(max_age=60):
+    """Cached pre-flight for page RENDERS.
+
+    The real check shells out to `du -sb` on the PostgreSQL data directory, which on
+    a multi-GB database is slow enough to stall a page load. The TAK Server page
+    renders this on every visit, so it reads through a short cache; the migration
+    itself always calls _tak_58_preflight() directly and never a cached verdict.
+    """
+    now = time.time()
+    if _tak58_pf_cache['data'] is not None and (now - _tak58_pf_cache['at']) < max_age:
+        return _tak58_pf_cache['data']
+    try:
+        d = _tak_58_preflight()
+    except Exception:
+        return _tak58_pf_cache['data']
+    _tak58_pf_cache.update({'at': now, 'data': d})
+    return d
+
+
 def _tak_58_preflight():
     """Read-only readiness for the 5.8 + PG18 migration.
 
@@ -63331,6 +63361,10 @@ def _tak_58_preflight():
             facts['pk_rewrite_expected'] = False
 
     facts['pg_target_major'] = TAK_PG_MAJOR
+    # Pre-formatted for the template — Jinja should not be doing byte math.
+    facts['data_human'] = _cotdb_fmt_bytes(facts.get('data_bytes') or 0)
+    facts['avail_human'] = _cotdb_fmt_bytes(facts.get('avail_bytes') or 0)
+    facts['need_human'] = _cotdb_fmt_bytes(facts.get('need_bytes') or 0)
     return {'ready': not blockers, 'blockers': blockers, 'warnings': warnings, 'facts': facts}
 
 
@@ -63471,7 +63505,7 @@ def _tak58_log(msg):
     tak58_log.append(msg)
 
 
-def _tak58_run_upgrade_db(timeout_sec=6 * 3600):
+def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
     """Run the vendor's upgrade-db.sh and stream it. Returns its exit code.
 
     EVERY box in the fleet runs the console as `takwerx`, so every box takes the
@@ -63480,24 +63514,26 @@ def _tak58_run_upgrade_db(timeout_sec=6 * 3600):
     a generic "run any script" allowance would be a hole. Instead W4b adds a
     dedicated op bounded to that one fixed path, the shape `pg_dump` already uses.
     """
+    _L = (log if log is not None else tak58_log).append
+
     if _broker_should_route() and _broker_available():
         # W4b: dedicated broker op, bounded to that one fixed path — no argv, no
         # cwd, and the broker re-checks root-ownership and write permissions at
         # call time before running it. The op is synchronous and returns the full
         # combined output at the end, so nothing streams during the migration;
         # the operator is told to expect that rather than left watching a dead log.
-        _tak58_log('  Running the migration through the privilege broker. Output arrives when it')
-        _tak58_log('  finishes — on a large database this can be hours with no visible progress.')
+        _L('  Running the migration through the privilege broker. Output arrives when it')
+        _L('  finishes — on a large database this can be hours with no visible progress.')
         try:
             resp = _broker_request({'op': 'tak58_upgrade_db', 'timeout': timeout_sec},
                                    timeout=timeout_sec + 60)
         except Exception as e:
-            _tak58_log('  Broker call failed: %s' % str(e)[:300])
+            _L('  Broker call failed: %s' % str(e)[:300])
             return 1
         for line in (resp.get('output') or '').splitlines():
-            tak58_log.append('  ' + line)
+            _L('  ' + line)
         if not resp.get('ok') and resp.get('error'):
-            _tak58_log('  %s' % str(resp.get('error'))[:300])
+            _L('  %s' % str(resp.get('error'))[:300])
         return int(resp.get('returncode') or (0 if resp.get('ok') else 1))
     argv = _sudo_wrap(['sh', _TAK58_UPGRADE_DB_SH])
     proc = subprocess.Popen(argv, cwd='/', stdout=subprocess.PIPE,
@@ -63510,7 +63546,7 @@ def _tak58_run_upgrade_db(timeout_sec=6 * 3600):
         # still works. Noise is not failure — only the exit code decides.
         for line in iter(proc.stdout.readline, ''):
             if line:
-                tak58_log.append('  ' + line.rstrip('\n'))
+                _L('  ' + line.rstrip('\n'))
 
     t = threading.Thread(target=_drain, daemon=True)
     t.start()
@@ -63524,57 +63560,67 @@ def _tak58_run_upgrade_db(timeout_sec=6 * 3600):
     return proc.returncode if proc.returncode is not None else 1
 
 
-def run_takserver_58_migration(pkg_path):
-    """Worker: the whole 5.8 + PG18 migration as one indivisible operation."""
+def run_takserver_58_migration(pkg_path, log=None, status=None):
+    """Worker: the whole 5.8 + PG18 migration as one indivisible operation.
+
+    `log`/`status` let the normal Update button drive this into the log panel the
+    TAK Server page already polls, instead of a second stream the user would have
+    to know about. Defaults keep the standalone API route working.
+    """
+    _log = tak58_log if log is None else log
+    _status = tak58_status if status is None else status
+    def _say(m):
+        _log.append(m)
+
     def fail(msg, wedged=False):
-        _tak58_log(msg)
+        _say(msg)
         if wedged:
-            _tak58_log('')
-            _tak58_log('*** THIS SERVER IS MID-UPGRADE AND TAK IS NOT RUNNING. ***')
-            _tak58_log('The 5.8 package is installed but the database migration did not complete.')
-            _tak58_log('Two ways forward, in order of preference:')
-            _tak58_log('  1. Re-run the database migration:  sudo %s' % _TAK58_UPGRADE_DB_SH)
-            _tak58_log('  2. Restore from the pre-migration backup taken at the start of this run')
-            _tak58_log('     (see the snapshot path above). The PostgreSQL 15 cluster was left')
-            _tak58_log('     intact by design and is still on disk.')
-        tak58_status.update({'running': False, 'complete': True, 'error': True})
+            _say('')
+            _say('*** THIS SERVER IS MID-UPGRADE AND TAK IS NOT RUNNING. ***')
+            _say('The 5.8 package is installed but the database migration did not complete.')
+            _say('Two ways forward, in order of preference:')
+            _say('  1. Re-run the database migration:  sudo %s' % _TAK58_UPGRADE_DB_SH)
+            _say('  2. Restore from the pre-migration backup taken at the start of this run')
+            _say('     (see the snapshot path above). The PostgreSQL 15 cluster was left')
+            _say('     intact by design and is still on disk.')
+        _status.update({'running': False, 'complete': True, 'error': True})
 
     try:
         # 1. Pre-flight — refuse before touching anything.
-        _tak58_log('Checking this server is ready to migrate…')
+        _say('Checking this server is ready to migrate…')
         pf = _tak_58_preflight()
         for w in pf.get('warnings', []):
-            _tak58_log('  NOTE: %s' % w)
+            _say('  NOTE: %s' % w)
         if not pf.get('ready'):
             for b in pf.get('blockers', []):
-                _tak58_log('  BLOCKED: %s' % b)
+                _say('  BLOCKED: %s' % b)
             return fail('Pre-flight failed — nothing was changed on this server.')
         f = pf.get('facts', {})
-        _tak58_log('  PostgreSQL %s → %s, database %s, %s free.'
+        _say('  PostgreSQL %s → %s, database %s, %s free.'
                    % (f.get('pg_running_major'), f.get('pg_target_major'),
                       _cotdb_fmt_bytes(f.get('data_bytes') or 0),
                       _cotdb_fmt_bytes(f.get('avail_bytes') or 0)))
         if f.get('pk_rewrite_expected'):
-            _tak58_log('  This database still has cot_router.id as integer, so the 5.8 schema '
+            _say('  This database still has cot_router.id as integer, so the 5.8 schema '
                        'update will rewrite that table in full. Expect a long window.')
 
         # 2. Backup — verified, not assumed. Refuse to continue without one.
-        _tak58_log('')
-        _tak58_log('Backing up before anything is changed…')
+        _say('')
+        _say('Backing up before anything is changed…')
         bk = _tak_58_backup(plog=_tak58_log)
         if not bk.get('ok'):
             return fail('Backup failed — refusing to migrate without one. %s'
                         % (bk.get('error') or ''))
-        _tak58_log('  Backup: %s' % bk.get('snapshot_path'))
+        _say('  Backup: %s' % bk.get('snapshot_path'))
 
         # 3. Stop TAK.
-        _tak58_log('')
-        _tak58_log('Stopping TAK Server…')
+        _say('')
+        _say('Stopping TAK Server…')
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']),
                        capture_output=True, timeout=300)
 
         # 4. Install the 5.8 package. After this line the box is mid-upgrade.
-        _tak58_log('Installing %s …' % os.path.basename(pkg_path))
+        _say('Installing %s …' % os.path.basename(pkg_path))
         if _distro_family() == 'rhel':
             cmd = 'dnf -y install ' + shlex.quote(pkg_path) + ' 2>&1'
         else:
@@ -63587,20 +63633,20 @@ def run_takserver_58_migration(pkg_path):
         # script below is what finishes it, so a non-zero rc here is reported and
         # then superseded by whether upgrade-db.sh succeeds.
         if rc != 0:
-            _tak58_log('  The package installer stopped short (exit %d). This is expected on a '
+            _say('  The package installer stopped short (exit %d). This is expected on a '
                        'PostgreSQL 15 server — 5.8 refuses to finish until the database is '
                        'migrated. Continuing to the database migration.' % rc)
 
         # 5. The vendor migration. Bare, per D1.
-        _tak58_log('')
-        _tak58_log('Migrating the database from PostgreSQL 15 to %d. This is the long part — do '
+        _say('')
+        _say('Migrating the database from PostgreSQL 15 to %d. This is the long part — do '
                    'not interrupt it. Duration scales with database size, and with whether the '
                    '5.8 schema update has to rewrite cot_router (see the note above).'
                    % TAK_PG_MAJOR)
         if not os.path.exists(_TAK58_UPGRADE_DB_SH):
             return fail('The 5.8 package did not provide %s — cannot migrate the database.'
                         % _TAK58_UPGRADE_DB_SH, wedged=True)
-        rc = _tak58_run_upgrade_db()
+        rc = _tak58_run_upgrade_db(log=_log)
         # The script has no shebang and uses bashisms, so under dash it emits
         # stderr noise (`[: ==: unexpected operator`, `wc: unrecognized option`)
         # while still doing its job. Noise is NOT failure — only the exit code is.
@@ -63609,8 +63655,8 @@ def run_takserver_58_migration(pkg_path):
                         wedged=True)
 
         # 6. Start and verify it is actually SERVING — not merely "active".
-        _tak58_log('')
-        _tak58_log('Starting TAK Server…')
+        _say('')
+        _say('Starting TAK Server…')
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']),
                        capture_output=True, timeout=300)
         post = _tak_58_preflight()
@@ -63619,12 +63665,12 @@ def run_takserver_58_migration(pkg_path):
         if running != TAK_PG_MAJOR:
             return fail('The migration finished but PostgreSQL %s is still serving, not %d.'
                         % (running, TAK_PG_MAJOR), wedged=True)
-        _tak58_log('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
-        _tak58_log('')
-        _tak58_log('Migration complete. The PostgreSQL 15 cluster was left on disk and can be '
+        _say('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
+        _say('')
+        _say('Migration complete. The PostgreSQL 15 cluster was left on disk and can be '
                    'removed once you are satisfied — it is your rollback until then.')
-        _tak58_log('Backup kept at %s' % bk.get('snapshot_path'))
-        tak58_status.update({'running': False, 'complete': True, 'error': False})
+        _say('Backup kept at %s' % bk.get('snapshot_path'))
+        _status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
         fail('Unexpected error: %s' % str(e)[:400], wedged=True)
 
@@ -63733,6 +63779,43 @@ def takserver_update():
     if not os.path.exists('/opt/tak'):
         return jsonify({'error': 'TAK Server not installed. Deploy TAK Server first.'}), 400
     settings = load_settings()
+
+    # ── v10.2.0 W5: 5.8 goes through THIS button, not a second one ──────────
+    # 5.8 needs a PostgreSQL 15->18 migration, which the plain package install
+    # cannot do — it installs, refuses to finish, and leaves TAK down. That used
+    # to be a refusal telling the operator to wait for a future release. It is
+    # now a ROUTE: the same Update button detects a 5.8 artifact on a PG-15 box
+    # and runs the guided migration instead of the plain upgrade, writing to the
+    # same upgrade_log the page already polls. One button, one log, no parallel
+    # path for a user to discover.
+    #
+    # The gate below still fires for anything the migration cannot handle
+    # (container TAK, remote DB) — routing is not the same as always allowing.
+    _pending = []
+    try:
+        _pending = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(('.deb', '.rpm'))]
+    except OSError:
+        pass
+    _is58 = any((_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM for f in _pending)
+    if _is58 and not _tak_is_container():
+        if upgrade_status['running']:
+            return jsonify({'error': 'Update already in progress'}), 409
+        _pf = _tak_58_preflight()
+        if not _pf.get('ready'):
+            return jsonify({'error': 'TAK Server 5.8 cannot be installed on this server yet: '
+                                     + '; '.join(_pf.get('blockers') or ['pre-flight failed'])}), 400
+        _pkg = os.path.join(UPLOAD_DIR, sorted(
+            [f for f in _pending if (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM],
+            key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+        upgrade_log.clear()
+        upgrade_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_58_migration,
+                         args=(_pkg,), kwargs={'log': upgrade_log, 'status': upgrade_status},
+                         daemon=True).start()
+        return jsonify({'success': True, 'migration': True,
+                        'message': 'TAK Server 5.8 detected — running the guided upgrade '
+                                   '(backup, install, database migration to PostgreSQL '
+                                   '%d, restart) as one operation.' % TAK_PG_MAJOR})
     # v10.0.1: a container box must NEVER take the .deb/dpkg/apt upgrade path — it does not
     # upgrade the image and litters the host. Run the data-preserving container upgrade instead:
     # rebuild the image from the new takserver-docker-*.zip while KEEPING the DB volume + certs.
