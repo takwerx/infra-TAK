@@ -52,6 +52,7 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import signal
 import socket
 import socketserver
@@ -1759,6 +1760,74 @@ def _check_pg_dump(req):
         raise Denied(f'pg_dump: only container {_PG_DUMP_CONTAINER} allowed: {container!r}')
 
 
+
+# ── TAK 5.8 database migration (infra-TAK v10.2.0 W4b) ──────────────────────
+# TAK 5.8's package refuses to finish on a PostgreSQL 15 server and tells the
+# operator to run /opt/tak/db-utils/upgrade-db.sh by hand. Between those two
+# steps TAK is DOWN, so infra-TAK drives both as one operation — which means the
+# unprivileged console must be able to run that script.
+#
+# This is a real privilege grant: the script runs as root, calls pg_upgrade,
+# su - postgres, and systemctl. It is bounded as tightly as that allows:
+#   * ONE hard-coded path. Not caller-supplied, not a prefix, not a glob.
+#   * NO caller argv, env, or cwd reaches it.
+#   * The file must be root-owned and not group/world-writable — checked at call
+#     time, not trusted from install time. If a non-root user can rewrite the
+#     script, running it would launder their code to root through us; refusing on
+#     a bad mode is the difference between a bounded grant and a backdoor.
+#   * It must be a regular file, not a symlink (checked with lstat), so a swapped
+#     symlink cannot redirect the grant at another executable.
+# Vendor-owned content is the residual risk we accept: we are choosing to run
+# TAK's migration script as root, deliberately, because the alternative is an
+# operator doing exactly that by hand with the server already down.
+_TAK58_UPGRADE_DB = '/opt/tak/db-utils/upgrade-db.sh'
+
+
+def _check_tak58_upgrade_db(req):
+    if req.get('argv') or req.get('cwd') or req.get('env'):
+        raise Denied('tak58_upgrade_db: takes no argv/cwd/env')
+    try:
+        st = os.lstat(_TAK58_UPGRADE_DB)
+    except OSError:
+        raise Denied(f'tak58_upgrade_db: {_TAK58_UPGRADE_DB} not present '
+                     '(is TAK Server 5.8 installed?)')
+    if stat.S_ISLNK(st.st_mode):
+        raise Denied('tak58_upgrade_db: refusing a symlink')
+    if not stat.S_ISREG(st.st_mode):
+        raise Denied('tak58_upgrade_db: not a regular file')
+    if st.st_uid != 0:
+        raise Denied(f'tak58_upgrade_db: {_TAK58_UPGRADE_DB} is not root-owned '
+                     f'(uid {st.st_uid}) — refusing to run it as root')
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise Denied(f'tak58_upgrade_db: {_TAK58_UPGRADE_DB} is group/world-writable '
+                     f'(mode {oct(st.st_mode & 0o7777)}) — refusing to run it as root')
+    return True
+
+
+def _do_tak58_upgrade_db(req):
+    """Run the vendor migration, streaming combined output back to the caller.
+
+    The script has no shebang and uses bashisms, so /bin/sh (dash on Ubuntu) emits
+    noise while still doing its job — the exit code is the only verdict, and the
+    caller is told as much. Deliberately run under `sh` exactly as the vendor's own
+    instructions do, so we reproduce the supported path rather than a variant.
+    """
+    _check_tak58_upgrade_db(req)
+    sh = shutil.which('sh', path=BROKER_TRUSTED_PATH)
+    if not sh:
+        return {'ok': False, 'error': 'sh not found on trusted PATH'}
+    timeout = min(int(req.get('timeout') or 6 * 3600), 6 * 3600)
+    try:
+        proc = subprocess.run([sh, _TAK58_UPGRADE_DB], cwd='/',
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': f'upgrade-db.sh exceeded {timeout}s'}
+    out = (proc.stdout or b'').decode(errors='replace')
+    return {'ok': proc.returncode == 0, 'returncode': proc.returncode,
+            'output': out[-60000:]}
+
+
 def _do_pg_dump(req):
     path = _abs(req.get('path'))
     db = req.get('db') or 'cot'
@@ -2468,6 +2537,8 @@ def _evaluate(req):
             _check_disk_reclaim(req)
         elif op == 'takportal_sudoers':
             _check_takportal_sudoers(req)
+        elif op == 'tak58_upgrade_db':
+            _check_tak58_upgrade_db(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -2549,7 +2620,8 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers'):
+    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
+              'tak58_upgrade_db'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -2557,6 +2629,8 @@ def _dispatch(req, peer):
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
             summary = f"action={req.get('action')} user={BROKER_USER}"
+        elif op == 'tak58_upgrade_db':
+            summary = _TAK58_UPGRADE_DB
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -2572,6 +2646,8 @@ def _dispatch(req, peer):
             return _do_disk_reclaim(req)
         if op == 'takportal_sudoers':
             return _do_takportal_sudoers(req)
+        if op == 'tak58_upgrade_db':
+            return _do_tak58_upgrade_db(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)

@@ -63460,26 +63460,32 @@ def _tak58_log(msg):
 def _tak58_run_upgrade_db(timeout_sec=6 * 3600):
     """Run the vendor's upgrade-db.sh and stream it. Returns its exit code.
 
-    ⚠ W4b — THIS IS THE NON-ROOT GAP, and it is not a footnote: EVERY box in the
-    fleet runs the console as `takwerx`, so every box takes the broker path here.
-    The broker enforces EXEC_ALLOW, and `/opt/tak/db-utils/upgrade-db.sh` is not on
-    it — nor should it be added as a generic "run any script" hole. The right shape
-    is a DEDICATED broker op (`{'op': 'tak58_upgrade_db'}`), the way `pg_dump`
-    already has one: bounded to that single fixed path, no caller-supplied argv.
-
-    Until that op exists this returns a refusal rather than pretending to work.
-    Root-era boxes (NE-TAK and similar) take the direct path and DO work today,
-    which is exactly the sort of "works on the dev box" asymmetry that must not be
-    discovered in the field — hence the explicit message.
+    EVERY box in the fleet runs the console as `takwerx`, so every box takes the
+    broker path — the direct branch below is only reached on root-era installs.
+    The broker enforces EXEC_ALLOW and `upgrade-db.sh` is deliberately NOT on it;
+    a generic "run any script" allowance would be a hole. Instead W4b adds a
+    dedicated op bounded to that one fixed path, the shape `pg_dump` already uses.
     """
-    argv = _sudo_wrap(['sh', _TAK58_UPGRADE_DB_SH])
     if _broker_should_route() and _broker_available():
-        _tak58_log('  The database migration must run with full privileges. On this server the')
-        _tak58_log('  console runs unprivileged and routes privileged work through the broker,')
-        _tak58_log('  which does not yet carry an entry for the TAK 5.8 database migration.')
-        _tak58_log('  (Tracked as W4b — a dedicated broker op bounded to %s.)'
-                   % _TAK58_UPGRADE_DB_SH)
-        return 126
+        # W4b: dedicated broker op, bounded to that one fixed path — no argv, no
+        # cwd, and the broker re-checks root-ownership and write permissions at
+        # call time before running it. The op is synchronous and returns the full
+        # combined output at the end, so nothing streams during the migration;
+        # the operator is told to expect that rather than left watching a dead log.
+        _tak58_log('  Running the migration through the privilege broker. Output arrives when it')
+        _tak58_log('  finishes — on a large database this can be hours with no visible progress.')
+        try:
+            resp = _broker_request({'op': 'tak58_upgrade_db', 'timeout': timeout_sec},
+                                   timeout=timeout_sec + 60)
+        except Exception as e:
+            _tak58_log('  Broker call failed: %s' % str(e)[:300])
+            return 1
+        for line in (resp.get('output') or '').splitlines():
+            tak58_log.append('  ' + line)
+        if not resp.get('ok') and resp.get('error'):
+            _tak58_log('  %s' % str(resp.get('error'))[:300])
+        return int(resp.get('returncode') or (0 if resp.get('ok') else 1))
+    argv = _sudo_wrap(['sh', _TAK58_UPGRADE_DB_SH])
     proc = subprocess.Popen(argv, cwd='/', stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1)
     if proc.stdout is None:
