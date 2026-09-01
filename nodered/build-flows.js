@@ -539,7 +539,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 240, wires: [['fn_svc_parse']]
   },
   {
@@ -588,7 +588,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 340, wires: [['fn_lyr_parse']]
   },
   {
@@ -640,7 +640,9 @@ const configFlows = [
     func: [
       "const base = msg.payload.url.replace(/\\/+$/, '');",
       "const lid  = msg.payload.layerId;",
-      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=50&f=json';",
+      "// returnGeometry=false: the sample exists to show FIELD VALUES; the geometry of 50",
+      "// rows is pulled and discarded. Same family as the fn_dist bug above.",
+      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=50&returnGeometry=false&f=json';",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
@@ -653,7 +655,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 440, wires: [['fn_smp_parse']]
   },
   {
@@ -697,6 +699,14 @@ const configFlows = [
       "  + '&returnDistinctValues=true'",
       "  + '&orderByFields=' + field",
       "  + '&resultRecordCount=500'",
+      "  // v10.1.56: WITHOUT this, a distinct-values query returns the full GEOMETRY of every",
+      "  // distinct row. Measured on UASWFC_IR_Viewer layer 2 (mop-up buffer, one line of",
+      "  // 176,236 verts): 71,850,398 bytes in 39.7s, versus 557 bytes in 0.24s with it —",
+      "  // 288,000x smaller. The endpoint did not merely run slowly, it HUNG: the http request",
+      "  // node has no timeout and senderr:false, so nothing ever responded and the browser's",
+      "  // fetch died first. Silent on small layers, fatal on real ones, and it affected every",
+      "  // ArcGIS feed's 'Load Values' button, not just this one. Geometry is never read here.",
+      "  + '&returnGeometry=false'",
       "  + '&f=json';",
       "msg._field = msg.payload.field;",
       "return msg;"
@@ -711,7 +721,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 540, wires: [['fn_dist_parse']]
   },
   {
