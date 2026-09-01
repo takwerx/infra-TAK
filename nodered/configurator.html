@@ -2727,7 +2727,7 @@ function renderLayerSetup() {
         '<div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">' +
           '<strong style="color:#2ec4b6">' + (lyr.layerName || ('Layer ' + lyr.layerId)) + '</strong>' +
           '<span style="font-size:0.7rem;color:#64748b">layer ' + lyr.layerId + ' · ' + geom + '</span>' +
-          (dup ? '<span style="font-size:0.7rem;color:#f59e0b">· duplicate entry</span>' : '') +
+          (dup ? '<span title="This layer ID is used by more than one entry — each with its own filter and class field. Created with the Duplicate button." style="font-size:0.7rem;color:#f59e0b">· shares layer ' + lyr.layerId + ' with another entry</span>' : '') +
           '<span style="flex:1"></span>' +
           '<button onclick="dupLayerEntry(' + i + ')" style="font-size:0.72rem;padding:0.25rem 0.6rem">Duplicate</button>' +
           (L.length > 1 ? '<button onclick="rmLayerEntry(' + i + ')" style="font-size:0.72rem;padding:0.25rem 0.6rem;background:#7f1d1d">Remove</button>' : '') +
