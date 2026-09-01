@@ -1898,6 +1898,24 @@ def _do_pg_restore(req):
     if not want or not _hmac.compare_digest(want, _dump_hmac(path)):
         return {'ok': False, 'code': 'DENIED',
                 'error': 'dump failed authenticity check — not a broker-produced snapshot'}
+    # v10.2.0 W3: list_only — prove an archive is READABLE without restoring it.
+    # The console cannot do this itself: broker-written dumps are root-owned 0600,
+    # and `runuser -u postgres -- pg_restore` therefore gets EACCES. Reading the
+    # TOC needs no database at all, so it runs as root here and returns a count.
+    # The HMAC compare above already proves the bytes are intact; parsing the TOC
+    # additionally proves the archive is well-formed, which is what a pre-migration
+    # backup check is actually claiming.
+    if req.get('list_only'):
+        pg_restore = shutil.which('pg_restore', path=BROKER_TRUSTED_PATH)
+        if not pg_restore:
+            return {'ok': False, 'error': 'pg_restore not found on trusted PATH'}
+        proc = subprocess.run([pg_restore, '--list', path],
+                              capture_output=True, timeout=600)
+        out = (proc.stdout or b'').decode(errors='replace')
+        toc = [l for l in out.splitlines() if l.strip() and not l.lstrip().startswith(';')]
+        return {'ok': proc.returncode == 0 and bool(toc),
+                'returncode': proc.returncode, 'toc_entries': len(toc),
+                'error': (proc.stderr or b'').decode(errors='replace')[:400]}
     if req.get('container'):
         docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
         if not docker:

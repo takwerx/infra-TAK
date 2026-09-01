@@ -63405,18 +63405,24 @@ def _tak_58_backup(plog=None):
         out['dump_bytes'] = 0
 
     # Prove it reads. This is the entire point of the wrapper.
+    #
+    # It must go through the broker, not `runuser -u postgres -- pg_restore`: the
+    # broker writes dumps root-owned 0600, so postgres gets EACCES on its own
+    # snapshot. Found the hard way on dev-4 — the migration correctly refused to
+    # proceed, but on a permissions bug rather than a real corruption. Reading a
+    # TOC needs no database, so the broker does it as root, and its HMAC sidecar
+    # check runs first: bytes intact AND archive well-formed.
     plog('  verifying the backup is restorable (pg_restore --list)…')
     try:
-        r = _pg_exec(['pg_restore', '--list', dump_path], timeout=600)
-        toc = [l for l in (r.stdout or '').splitlines()
-               if l.strip() and not l.lstrip().startswith(';')]
-        if r.returncode != 0 or not toc:
-            out['error'] = ('backup verification FAILED — pg_restore could not read the archive '
-                            '(%s). Do not proceed with the migration.'
-                            % ((r.stderr or '').strip()[:200] or 'empty table of contents'))
+        r = _broker_request({'op': 'pg_restore', 'path': dump_path,
+                             'list_only': True, 'timeout': 600}, timeout=660)
+        if not r.get('ok') or not r.get('toc_entries'):
+            out['error'] = ('backup verification FAILED — could not read the archive (%s). '
+                            'Do not proceed with the migration.'
+                            % (str(r.get('error') or '').strip()[:200] or 'empty table of contents'))
             plog(out['error'])
             return out
-        out['toc_entries'] = len(toc)
+        out['toc_entries'] = int(r.get('toc_entries') or 0)
     except Exception as e:
         out['error'] = 'backup verification FAILED: %s' % str(e)[:300]
         plog(out['error'])
