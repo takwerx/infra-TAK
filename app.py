@@ -63235,7 +63235,6 @@ def takserver_security_config_post():
 # and `bigint` respectively. Whether a box pays for SchemaManager's full-table PK
 # rewrite is a property of that box's history, not of its version string.
 _TAK58_MIN_DISK_RATIO = 1.5          # upgrade-db.sh exits 1 below this
-_TAK58_ROWS_SLOW = 5_000_000         # above this, an integer->bigint rewrite is "hours" territory
 
 
 _tak58_pf_cache = {'at': 0, 'data': None}
@@ -63348,17 +63347,31 @@ def _tak_58_preflight():
             facts['cot_router_rows'] = int(rows_s) if rows_s else None
         except Exception:
             facts['cot_router_rows'] = None
-        rowcount = facts.get('cot_router_rows')
+        # MEASURED 2026-09-01 on a 5,000,004-row / 8.1 GB box, and it corrected the plan:
+        # 5.8 does NOT widen cot_router.id. The actual migration is
+        # V101__update_cot_router_chat_id_to_bigint.sql — the CHAT table, which is
+        # typically empty (0 rows here, 18 ms). The release notes' "cot_router.id
+        # integer -> bigint" does not happen: after a full 5.8 migration this box
+        # still reported cot_router.id = integer.
+        #
+        # So there is no expensive full-table rewrite, and warning about one was
+        # wrong. What IS true, and worth telling an operator, is the opposite: a box
+        # old enough to still have `integer` KEEPS it. Newer TAK installs create the
+        # column as bigint (dev-4 on 5.7-RELEASE43 and test12 both did; test6 did
+        # not), and 5.8 ships no migration to fix the old ones — so the 2.1-billion
+        # ceiling those boxes carry is not lifted by upgrading. That is an upstream
+        # gap, not something this release can fix, and it is not a reason to block.
         if idtype == 'integer':
-            facts['pk_rewrite_expected'] = True
-            msg = ('SchemaManager will widen cot_router.id from integer to bigint — a full-table '
-                   'rewrite of the largest table, on top of the database migration.')
-            if rowcount and rowcount >= _TAK58_ROWS_SLOW:
-                msg += (' This table has %s rows; expect a long maintenance window and plan it '
-                        'deliberately.' % f'{rowcount:,}')
-            warnings.append(msg)
+            facts['pk_rewrite_expected'] = False
+            facts['cot_router_id_stays_integer'] = True
+            warnings.append(
+                'This database has cot_router.id as integer. TAK 5.8 does not widen it — its '
+                'schema update only widens cot_router_chat.id — so the column keeps its '
+                '2,147,483,647 row-id ceiling after the upgrade. Nothing to do now; worth '
+                'raising with TAK for boxes with long histories.')
         elif idtype == 'bigint':
             facts['pk_rewrite_expected'] = False
+            facts['cot_router_id_stays_integer'] = False
 
     facts['pg_target_major'] = TAK_PG_MAJOR
     # Pre-formatted for the template — Jinja should not be doing byte math.
