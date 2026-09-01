@@ -3696,7 +3696,7 @@ print(json.dumps(out))
 #     If takserver ever DOES appear in this list, someone added a repo — that is
 #     why _classify_os_updates() flags it loudly instead of ignoring it.
 #   * MediaMTX is /usr/local/bin/mediamtx + a systemd unit — also in no repo.
-#   * PGDG package names are major-versioned (postgresql-15 only ever receives
+#   * PGDG package names are major-versioned (postgresql-<major> only ever receives
 #     15.x), so apt cannot jump a Postgres major on its own. Minors are bug/CVE
 #     fixes that never change on-disk format — the only cost is the restart.
 #   * docker-ce is the exception: Docker ships every version through one `stable`
@@ -8576,13 +8576,41 @@ _SPLIT_DB_KEEPALIVE_LINES = ('tcp_keepalives_idle = 60\\n'
 
 
 # Reusable SSH snippets: discover the PG data dir + service name on a RHEL Server One
-# (PGDG postgresql-15 vs base). Module-level since v10.1.51 so the split-server DEPLOY path
+# (PGDG postgresql-<major> vs base). Module-level since v10.1.51 so the split-server DEPLOY path
 # and the keepalive RETROFIT below discover the same paths and cannot drift.
 # NB: /var/lib/pgsql is 0700 postgres-owned — the glob MUST run under sudo or it expands to
 # nothing as the SSH login user (the bug that bit the first run: empty PGDATA).
+# ── PostgreSQL major version — fleet constants (v10.2.0 W1) ────────────────
+# TAK Server 5.8 requires PostgreSQL 18 (deb Depends: postgresql-18,
+# postgresql-18-postgis-3). 5.7 requires 15 and does NOT tolerate 18, so a box is
+# on exactly one of them and the move is a single guided migration, never a
+# standalone "upgrade Postgres" step.
+#
+# TWO constants on purpose — they are NOT interchangeable:
+#   TAK_PG_MAJOR   what we INSTALL. One fleet constant, no per-box tiering and no
+#                  max(cur, target): every box converges on the same major.
+#   TAK_PG_MAJORS  what we RECOGNISE, newest first. Health checks, service
+#                  discovery and systemd After= lines MUST accept BOTH. A box that
+#                  has not migrated yet is on 15, and a box mid-migration has both
+#                  clusters on disk. Probing only the new major would false-red
+#                  every un-migrated box in the fleet the moment this ships — the
+#                  same failure shape as the RHEL `postgresql-15` false-red that
+#                  the probes below already exist to fix.
+TAK_PG_MAJOR = 18
+TAK_PG_MAJORS = (18, 15)
+# ('postgresql-18', 'postgresql-15') — for systemctl is-active / discovery
+_PG_SVC_UNITS = tuple('postgresql-%d' % m for m in TAK_PG_MAJORS)
+# Debian's unsuffixed meta-service plus every major we recognise. Listing a unit
+# that does not exist in After= is harmless to systemd.
+_PG_SVC_AFTER = ' '.join(['postgresql.service'] + ['postgresql-%d.service' % m for m in TAK_PG_MAJORS])
+
+
 _PG_REMOTE_PGDATA_SH = ("PGDATA=$(sudo sh -c 'ls -d /var/lib/pgsql/*/data 2>/dev/null' | sort -V | tail -1); "
                         "[ -z \"$PGDATA\" ] && sudo test -d /var/lib/pgsql/data && PGDATA=/var/lib/pgsql/data; true")
-_PG_REMOTE_PGSVC_SH = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; true')
+_PG_REMOTE_PGSVC_SH = (
+    'PGSVC=postgresql; for _m in ' + ' '.join(str(m) for m in TAK_PG_MAJORS) + '; do '
+    'systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-$_m" && { PGSVC=postgresql-$_m; break; }; '
+    'done; true')
 
 
 def _pg_keepalive_sh(conf_expr):
@@ -8603,7 +8631,7 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     /var/lib/pgsql mirror of the Debian _setup_server_one, per TAK Server Config Guide 5.7
     (pp.14-16) and the proven single-server RHEL install. The takserver-database .noarch.rpm
     is the DB installer (sets up the cot DB + martiuser, same role as the .deb); we install it,
-    then verify + SELF-HEAL (postgresql-15-setup initdb + start if the rpm didn't) and configure
+    then verify + SELF-HEAL (postgresql-<major>-setup initdb + start if the rpm didn't) and configure
     remote access at the RHEL data dir. Heavily instrumented so the first live run shows exactly
     what the rpm did. All ops run over SSH on Server One (sudo there). Returns (ok, log, db_password)."""
     log = ['Server One detected as RHEL/Rocky family — using dnf / firewalld / systemctl / /var/lib/pgsql path.']
@@ -8618,7 +8646,7 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     el_ver = el_ver if el_ver in ('8', '9') else '9'
     _, _ar = _ssh_probe(s1, 'uname -m', timeout=10)
     el_arch = 'aarch64' if ('aarch64' in (_ar or '') or 'arm64' in (_ar or '')) else 'x86_64'
-    # Reusable SSH snippets: discover the PG data dir + service name (PGDG postgresql-15 vs base).
+    # Reusable SSH snippets: discover the PG data dir + service name (PGDG postgresql-<major> vs base).
     # NB: /var/lib/pgsql is 0700 postgres-owned — the glob MUST run under sudo or it expands
     # to nothing as the SSH login user (the bug that bit the first run: empty PGDATA).
     PGDATA = _PG_REMOTE_PGDATA_SH
@@ -8664,8 +8692,14 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
             log.append((iout or '')[:1000])
     else:
         _, iout = _ssh_probe(s1, (
-            'sudo dnf -y install postgresql15-server postgresql15-contrib postgis34_15 2>&1 || '
-            'sudo dnf -y install postgresql15-server postgresql15-contrib 2>&1; echo RC=$?'), timeout=600)
+            # D2 (PLAN-v10.2.0): the EL PostGIS package name is version-coupled and the
+            # exact PG-18 name is UNVERIFIED on a live Rocky box. Try the known candidates
+            # newest-first, then fall back to server+contrib alone so the install still
+            # completes — and say which one resolved so the log answers D2 for good.
+            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib postgis35_%(m)d 2>&1 || '
+            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib postgis34_%(m)d 2>&1 || '
+            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib 2>&1; echo RC=$?'
+            % {'m': TAK_PG_MAJOR}), timeout=600)
         log.append('vanilla PG15 install: ' + (iout or '')[:300])
 
     # Step 3: ensure the cluster is INITIALIZED + STARTED (self-heal — the rpm may or may not have).
@@ -8879,7 +8913,8 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
                 'sudo apt-get install -y lsb-release && '
                 + _PGDG_REMOTE_SETUP_SH +
                 'sudo apt-get update -qq && '
-                'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-15 postgresql-15-postgis-3'
+                'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y '
+                'postgresql-%d postgresql-%d-postgis-3' % (TAK_PG_MAJOR, TAK_PG_MAJOR)
             )
             ok, out = _ssh_probe(s1, pg_install, timeout=300)
             log.append(out or '')
@@ -9739,8 +9774,8 @@ def _migrate_split_db_keepalives():
             # SIGHUP only. Try every reload spelling; a unit that does not exist is a no-op.
             'sudo pg_ctlcluster 15 main reload 2>/dev/null; '
             'sudo systemctl reload postgresql 2>/dev/null; '
-            'sudo systemctl reload postgresql-15 2>/dev/null; '
-            'sudo systemctl reload postgresql-16 2>/dev/null; '
+            + ''.join('sudo systemctl reload postgresql-%d 2>/dev/null; ' % _m
+                      for _m in sorted(set(TAK_PG_MAJORS) | {16})) +
             'echo "PGCONF=$PGCONF"; '
             'echo "IDLE=$(sudo grep -c \'^tcp_keepalives_idle = 60\' \"$PGCONF\")"'
         )
@@ -19378,8 +19413,9 @@ def _monitor_health_check(monitor_id):
                                    capture_output=True, text=True, timeout=5)
                 return r.returncode == 0 and r.stdout.strip() == 'true'
             # native: Debian/Ubuntu uses the `postgresql` meta-service; RHEL/EL uses
-            # `postgresql-15.service` (PGDG). Either being active means PG is up.
-            for _pgsvc in ('postgresql', 'postgresql-15'):
+            # `postgresql-<major>.service` (PGDG). Either being active means PG is up.
+            # Probes EVERY major in TAK_PG_MAJORS: an un-migrated box is still on 15.
+            for _pgsvc in ('postgresql',) + _PG_SVC_UNITS:
                 r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _pgsvc]), capture_output=True, text=True, timeout=3)
                 if r.returncode == 0 and r.stdout.strip() == 'active':
                     return True
@@ -20198,7 +20234,7 @@ def guarddog_update():
             _settings = load_settings()
             _tak_cfg = _get_tak_deployment_config(_settings)
             _is_two = _tak_cfg.get('mode') == 'two_server'
-            _after = 'network-online.target' if _is_two else 'postgresql.service postgresql-15.service'
+            _after = 'network-online.target' if _is_two else _PG_SVC_AFTER
             _write_priv(av_svc_path, f'[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter={_after}\n\n[Service]\nType=oneshot\nExecStart={av_script}\n')
             _write_priv(av_tmr_path, '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n')
         # CoT DB size timer — install for two-server if missing
@@ -20208,7 +20244,7 @@ def guarddog_update():
             _settings2 = load_settings()
             _tak_cfg2 = _get_tak_deployment_config(_settings2)
             _is_two2 = _tak_cfg2.get('mode') == 'two_server'
-            _after2 = 'network-online.target' if _is_two2 else 'postgresql.service postgresql-15.service'
+            _after2 = 'network-online.target' if _is_two2 else _PG_SVC_AFTER
             _write_priv(cotdb_svc_path, f'[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter={_after2}\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n')
             _write_priv(cotdb_tmr_path, '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # DB repack timer (weekly Sunday 4am) — install if script exists but timer doesn't
@@ -20219,7 +20255,7 @@ def guarddog_update():
             _settings3 = load_settings()
             _tak_cfg3 = _get_tak_deployment_config(_settings3)
             _is_two3 = _tak_cfg3.get('mode') == 'two_server'
-            _after3 = 'network-online.target' if _is_two3 else 'postgresql.service postgresql-15.service'
+            _after3 = 'network-online.target' if _is_two3 else _PG_SVC_AFTER
             _write_priv(rp_svc_path, f'[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter={_after3}\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart={rp_script}\n')
             _write_priv(rp_tmr_path, '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n')
         # Retention guard timer (every 15min) — install if script exists but timer doesn't
@@ -20230,7 +20266,7 @@ def guarddog_update():
             _settings4 = load_settings()
             _tak_cfg4 = _get_tak_deployment_config(_settings4)
             _is_two4 = _tak_cfg4.get('mode') == 'two_server'
-            _after4 = 'network-online.target' if _is_two4 else 'postgresql.service postgresql-15.service'
+            _after4 = 'network-online.target' if _is_two4 else _PG_SVC_AFTER
             _write_priv(rg_svc_path, f'[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter={_after4}\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart={rg_script}\n')
             _write_priv(rg_tmr_path, '[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # Build-cache reclaim timer (daily 4:30am) — install if script exists but timer doesn't.
@@ -21292,13 +21328,13 @@ def run_guarddog_deploy(alert_email):
             units.extend([
                 ('takdbguard.service', '[Unit]\nDescription=TAK PostgreSQL Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-db-watch.sh\n'),
                 ('takdbguard.timer', '[Unit]\nDescription=Run TAK DB monitor every 5 minutes\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=5min\nUnit=takdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takcotdbguard.service', '[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n'),
+                ('takcotdbguard.service', '[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n'),
                 ('takcotdbguard.timer', '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
+                ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
                 ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
+                ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
                 ('takdbrepack.timer', '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n'),
-                ('takretentionguard.service', '[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/opt/tak-guarddog/tak-retention-guard.sh\n'),
+                ('takretentionguard.service', '[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter=' + _PG_SVC_AFTER + '\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/opt/tak-guarddog/tak-retention-guard.sh\n'),
                 ('takretentionguard.timer', '[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         # Optional timers for other services (only if we installed the script)
@@ -21389,7 +21425,7 @@ def run_guarddog_deploy(alert_email):
             # 8089 against 20-30s on the Debian boxes, and its messaging JVM crashed on
             # the way up. Debian's .deb unit runs ExecStartPre as root already, so `+`
             # is a no-op there. This has been broken on RHEL since 10.1.44.
-            _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+            _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target ' + _PG_SVC_AFTER + '\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
@@ -62561,11 +62597,11 @@ def takserver_services():
             })
         else:
             # Native host PostgreSQL: Debian/Ubuntu use the unsuffixed `postgresql`
-            # meta-service; RHEL/EL (PGDG) use `postgresql-15`. EITHER being active
+            # meta-service; RHEL/EL (PGDG) use `postgresql-<major>`. EITHER being active
             # means PG is up. Probing only `postgresql` false-reds every Rocky/RHEL
-            # native box ("PostgreSQL stopped") even though postgresql-15 is serving
+            # native box ("PostgreSQL stopped") even though postgresql-<major> is serving
             # cot fine — same EL/Debian split already handled at the deploy probe.
-            pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql', 'postgresql-15']), capture_output=True, text=True, timeout=5)
+            pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql'] + list(_PG_SVC_UNITS)), capture_output=True, text=True, timeout=5)
             pg_active = 'active' in (pg.stdout or '').split()
             services.append({
                 'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
@@ -65343,7 +65379,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
         for line in (install_out or '').strip().split('\n')[-12:]:
             if line.strip(): upgrade_log.append("  " + line)
         # dnf can exit non-zero on a re-install though the pkg is fine — verify PG + cot on Server One.
-        verify_cmd = ('PGSVC=postgresql-15; systemctl list-unit-files 2>/dev/null | grep -q "^postgresql-15" || PGSVC=postgresql; '
+        verify_cmd = (_PG_REMOTE_PGSVC_SH + ' '
                       'sudo -u postgres psql -lqt 2>/dev/null | grep -qw cot && systemctl is-active "$PGSVC" >/dev/null 2>&1 && echo PG_OK')
         vok, vout = _ssh_probe(s1_cfg, verify_cmd, timeout=15)
         if 'PG_OK' in (vout or ''):
