@@ -63668,16 +63668,20 @@ def takserver_58_migrate_log():
 
 # ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
 # TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
-# package on a PG-15 box through our update flow wedges TAK mid-upgrade
-# (SchemaManager runs against the wrong PG major) and there is no clean way back
-# without a restore. Until the guided migration ships, the console REFUSES 5.8+
-# artifacts. Background: private notes ROADMAP.md, "Ubuntu 24.04 LTS
-# transition", Phase 0.5.
+# package on a PG-15 box through THIS path wedges TAK mid-upgrade: the package
+# refuses to finish, TAK stays down, and nothing migrates the database.
+#
+# v10.2.0 W5: the gate STAYS. Its job changed rather than ended. The guided flow
+# now exists (/api/takserver/58-migrate), so the message points there instead of
+# saying "coming in a future release" — but the old update path is still exactly
+# as dangerous as it always was, and deleting the gate because a better route
+# exists would just re-open the wedge for anyone who uses the wrong button.
 TAK_GATE_BLOCK_FROM = (5, 8)
 TAK_GATE_MESSAGE = (
-    'STOP - TAK Server 5.8+ requires a PostgreSQL 15 to 18 database migration. '
-    'Do not install it manually. Console support for a guided upgrade is coming '
-    'in an upcoming release.'
+    'TAK Server 5.8+ requires a PostgreSQL 15 to 18 database migration, so it cannot go '
+    'through the normal update - that path installs the package and stops, leaving TAK '
+    'Server down. Use the "TAK Server 5.8 requires PostgreSQL 18" card at the top of this '
+    'section instead: it backs up, upgrades and migrates as one operation.'
 )
 # First major.minor after "takserver" in the artifact name. Covers every shape
 # we accept: takserver_5.7-RELEASE43_all.deb, takserver-5.8-RELEASE1.noarch.rpm,
