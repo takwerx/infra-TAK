@@ -1643,7 +1643,7 @@ function pickIcon(iconsetpath, type2525b, label, b64) {
 
 /** Point layers: hide uniform icon row when class mapping is on; keep Step 4 (TTL, labels, remarks) visible. */
 function updatePointStyleNoteVisibility() {
-  var isPoint = state.geometryType === 'esriGeometryPoint';
+  var isPoint = !anyNonPointLayer();
   var cf = (document.getElementById('classField') || {}).value;
   var useClassMapping = !!cf;
   if (!isPoint) {
@@ -1717,11 +1717,34 @@ function decodeVal(field, v) {
 
 // Geometry type ('Point' | 'Polygon' | 'Polyline' | ...) for a given class value, honoring multi-layer (per-layer geometry).
 function classGeom(v) {
+  // v10.1.56 W1-UI: with a per-layer classField the class keys are FIELD VALUES
+  // ('IR Heat Perimeter'), not layer names, so the layerName match below finds
+  // nothing and the edit panel renders neither point nor polygon styling. Both
+  // autoPopulateLayerClasses() and loadLayerClassValues() stamp geometryType onto
+  // the mapping itself, so trust that first.
+  var m = (state.classMappings || {})[v];
+  if (m && m.geometryType) return String(m.geometryType).replace('esriGeometry', '');
   if (state.selectedLayers && state.selectedLayers.length > 1) {
     var lyr = state.selectedLayers.find(function(x) { return x.layerName === v; });
-    return lyr ? (lyr.geometryType || '').replace('esriGeometry', '') : '';
+    if (lyr) return (lyr.geometryType || '').replace('esriGeometry', '');
+    // unknown key on a multi-layer config: if every layer is the same kind, use it
+    var kinds = {};
+    state.selectedLayers.forEach(function(x) { kinds[x.geometryType || ''] = 1; });
+    var only = Object.keys(kinds);
+    if (only.length === 1) return only[0].replace('esriGeometry', '');
+    return '';
   }
   return (state.geometryType || '').replace('esriGeometry', '');
+}
+
+/** True when ANY selected layer is non-point. A multi-layer config whose PRIMARY
+    layer is a point still needs the polygon/line style controls — UASWFC's first
+    layer is IRPoint while layers 1 and 2 are polygon and polyline, and keying the
+    controls off the primary layer alone hid fill/stroke for the whole config. */
+function anyNonPointLayer() {
+  var L = state.selectedLayers || [];
+  if (L.length > 1) return L.some(function(x) { return x.geometryType !== 'esriGeometryPoint'; });
+  return state.geometryType !== 'esriGeometryPoint';
 }
 
 function renderClassMappings() {
@@ -2589,7 +2612,7 @@ async function fetchSelectedLayers() {
     });
     document.getElementById('btnClassLoad').disabled = false;
 
-    document.getElementById('polyStyleFields').style.display = isPoint ? 'none' : '';
+    document.getElementById('polyStyleFields').style.display = anyNonPointLayer() ? '' : 'none';
     updatePointStyleNoteVisibility();
 
     if (multiLayer) {
