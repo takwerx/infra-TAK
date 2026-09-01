@@ -63207,6 +63207,143 @@ def takserver_security_config_post():
     return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
 
 
+# ── TAK 5.8 pre-flight (v10.2.0 W2) ─────────────────────────────────────────
+# READ-ONLY. Mirrors the gates `upgrade-db.sh` enforces internally, but BEFORE
+# anything is touched, so the operator gets a useful refusal instead of a
+# mid-flight abort that leaves TAK wedged between the package install and the DB
+# migration (UPSTREAM-TAK-5.8-RELEASE-NOTES.md §1.1, §3.2a).
+#
+# Three of these mirror the vendor script; two are ours because the vendor's own
+# equivalents are absent or broken:
+#   * it takes NO backup — rollback rests entirely on the 15 cluster surviving,
+#     which is only true if disk holds both. Hence the 1.5x disk gate matters
+#     more to us than to it.
+#   * its Debian cluster check (lines 71-76) tests $? after a backtick assignment
+#     so it reflects the assignment, not pg_lsclusters, and only echoes — never
+#     exits. It is not the safety check it appears to be. We do our own.
+#
+# cot_router.id is inspected LIVE and never inferred from the TAK version:
+# measured 2026-09-01, test6 and test12 both run 5.7-RELEASE8 yet hold `integer`
+# and `bigint` respectively. Whether a box pays for SchemaManager's full-table PK
+# rewrite is a property of that box's history, not of its version string.
+_TAK58_MIN_DISK_RATIO = 1.5          # upgrade-db.sh exits 1 below this
+_TAK58_ROWS_SLOW = 5_000_000         # above this, an integer->bigint rewrite is "hours" territory
+
+
+def _tak_58_preflight():
+    """Read-only readiness for the 5.8 + PG18 migration.
+
+    Returns {'ready': bool, 'blockers': [str], 'warnings': [str], 'facts': {...}}.
+    Never mutates anything. Safe to call on every page render.
+    """
+    facts, blockers, warnings = {}, [], []
+
+    def _sh(argv, timeout=20):
+        try:
+            return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+
+    def _sql(q, db='cot', timeout=20):
+        try:
+            r = _pg_exec(['psql', '-tAX', '-d', db, '-c', q], timeout=timeout)
+            return (r.stdout or '').strip() if r and r.returncode == 0 else None
+        except Exception:
+            return None
+
+    # 1. Topology — D4 is open; container and remote DBs are out of 10.2.0 scope.
+    try:
+        mode, db_host, _db_port = _tak_db_topology()
+    except Exception:
+        mode, db_host = 'local', 'localhost'
+    facts['db_mode'] = mode
+    if mode == 'container':
+        blockers.append('TAK runs its database in a container — the 5.8 guided migration '
+                        'covers native host PostgreSQL only in this release.')
+    elif mode == 'remote':
+        blockers.append('The CoT database is on a remote host (%s). The 5.8 migration must be '
+                        'run there, not from this console, in this release.' % (db_host or 'unknown'))
+
+    # 2. Which major is actually serving, and is 15 present at all?
+    #    upgrade-db.sh exits 1 with "Upgrade will be skipped" if no 15 cluster exists.
+    running_major = None
+    sv = _sql('SHOW server_version_num;', db='postgres')
+    if sv and sv.isdigit():
+        running_major = int(sv) // 10000
+    facts['pg_running_major'] = running_major
+    if running_major is None:
+        blockers.append('Could not determine the running PostgreSQL version — is the database up?')
+    elif running_major >= TAK_PG_MAJOR:
+        facts['already_migrated'] = True
+    elif running_major != 15:
+        blockers.append('PostgreSQL %s is running. TAK 5.8 migrates from 15 only; upgrade-db.sh '
+                        'refuses anything else.' % running_major)
+
+    # 3. Our own cluster check (the vendor's is broken — see header).
+    lsc = _sh(['pg_lsclusters', '--no-header'])
+    if lsc and lsc.returncode == 0:
+        rows = [l.split() for l in (lsc.stdout or '').splitlines() if l.strip()]
+        facts['clusters'] = ['%s/%s %s' % (r[0], r[1], r[3]) for r in rows if len(r) > 3]
+        if running_major == 15 and not any(r and r[0] == '15' for r in rows):
+            blockers.append('No PostgreSQL 15 cluster found — upgrade-db.sh will refuse.')
+
+    # 4. Disk: the new cluster needs 1.5x the old data dir, on ITS partition.
+    datadir = _sql('SHOW data_directory;', db='postgres')
+    facts['data_directory'] = datadir
+    if datadir:
+        du = _sh(['du', '-sb', datadir], timeout=120)
+        target_parent = '/var/lib/pgsql' if datadir.startswith('/var/lib/pgsql') else '/var/lib/postgresql'
+        df = _sh(['df', '-B1', '--output=avail', target_parent], timeout=20)
+        try:
+            used = int((du.stdout or '').split()[0])
+            avail = int((df.stdout or '').splitlines()[-1].strip())
+            need = int(used * _TAK58_MIN_DISK_RATIO)
+            facts['data_bytes'], facts['avail_bytes'], facts['need_bytes'] = used, avail, need
+            if avail < need:
+                blockers.append(
+                    'Not enough disk for a rollback-safe migration: %s free on %s, %s needed '
+                    '(1.5x the %s database). pg_upgrade runs in copy mode so the PostgreSQL 15 '
+                    'cluster survives — that is the only way back if the upgrade fails.'
+                    % (_cotdb_fmt_bytes(avail), target_parent, _cotdb_fmt_bytes(need), _cotdb_fmt_bytes(used)))
+        except Exception:
+            warnings.append('Could not measure free disk space for the new cluster — verify by hand.')
+
+    # 5. The conditional expensive bit: cot_router's PK type and size.
+    if mode == 'local' and running_major:
+        idtype = _sql("SELECT data_type FROM information_schema.columns "
+                      "WHERE table_name = 'cot_router' AND column_name = 'id';")
+        facts['cot_router_id_type'] = idtype or None
+        rows_s = _sql('SELECT count(*) FROM cot_router;', timeout=120)
+        try:
+            facts['cot_router_rows'] = int(rows_s) if rows_s else None
+        except Exception:
+            facts['cot_router_rows'] = None
+        rowcount = facts.get('cot_router_rows')
+        if idtype == 'integer':
+            facts['pk_rewrite_expected'] = True
+            msg = ('SchemaManager will widen cot_router.id from integer to bigint — a full-table '
+                   'rewrite of the largest table, on top of the database migration.')
+            if rowcount and rowcount >= _TAK58_ROWS_SLOW:
+                msg += (' This table has %s rows; expect a long maintenance window and plan it '
+                        'deliberately.' % f'{rowcount:,}')
+            warnings.append(msg)
+        elif idtype == 'bigint':
+            facts['pk_rewrite_expected'] = False
+
+    facts['pg_target_major'] = TAK_PG_MAJOR
+    return {'ready': not blockers, 'blockers': blockers, 'warnings': warnings, 'facts': facts}
+
+
+@app.route('/api/takserver/58-preflight')
+@login_required
+def takserver_58_preflight():
+    """Read-only 5.8/PG18 readiness. Drives the upgrade card; W4 refuses on `ready`."""
+    try:
+        return jsonify({'ok': True, **_tak_58_preflight()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:300]}), 500
+
+
 # ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
 # TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
 # package on a PG-15 box through our update flow wedges TAK mid-upgrade
