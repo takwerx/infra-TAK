@@ -63630,8 +63630,11 @@ def takserver_58_migrate():
     only half of it — see the module comment above."""
     if tak58_status.get('running'):
         return jsonify({'error': 'A migration is already in progress'}), 409
-    if not _check_admin_password((request.get_json(silent=True) or {}).get('password', '')):
-        return jsonify({'error': 'Incorrect console password'}), 403
+    # @login_required proves a session; it does not prove the person at the keyboard
+    # meant to migrate a production database. Same contract as every uninstall route.
+    _gate = _require_admin_password()
+    if _gate is not None:
+        return _gate
     try:
         cands = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(('.deb', '.rpm'))]
     except Exception:
