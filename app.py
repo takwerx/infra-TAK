@@ -63442,11 +63442,19 @@ def _tak_58_backup(plog=None):
 # gate (below) is only holding the fleet safe until it shipped.
 #
 # D1 (operator, 2026-09-01): call `upgrade-db.sh` BARE on both families — TAK's
-# supported path, rather than owning a migration we deviated from. Accepted and
-# stated honestly rather than hidden: on Ubuntu the vendor calls
-# `pg_upgradecluster 15 main` with no `-m`, so it is a full dump/reload — HOURS on
-# a large cot_router, not minutes — and data page checksums end up ON for Ubuntu
-# and OFF for RHEL. Do not "fix" that divergence here without a fresh decision.
+# supported path, rather than owning a migration we deviated from.
+#
+# The two costs that decision accepted are GONE as of 5.8-RELEASE75, verified by
+# extracting the script from the .deb on 2026-09-01: TAK now calls
+# `pg_upgradecluster -m upgrade 15 main` (lines 133/135). In RELEASE65 — which
+# UPSTREAM-TAK-5.8-RELEASE-NOTES.md analysed — the `-m` was absent, so Debian's
+# default `dump` method applied: a full dump/reload (hours) AND, because
+# pg_upgradecluster only passes --no-data-checksums when method eq 'upgrade',
+# data page checksums ON for Ubuntu vs OFF for RHEL. With `-m upgrade` both are
+# fixed upstream: file-level migration, checksums off, platforms uniform.
+#
+# Keep verifying this per release rather than trusting it — it changed once
+# already, and our estimates and our honesty about downtime both depend on it.
 tak58_log = []
 tak58_status = {'running': False, 'complete': False, 'error': False}
 
@@ -63579,9 +63587,10 @@ def run_takserver_58_migration(pkg_path):
 
         # 5. The vendor migration. Bare, per D1.
         _tak58_log('')
-        _tak58_log('Migrating the database from PostgreSQL 15 to %d. This is the long part — on '
-                   'Ubuntu it is a full dump and reload, so allow hours on a large database. Do '
-                   'not interrupt it.' % TAK_PG_MAJOR)
+        _tak58_log('Migrating the database from PostgreSQL 15 to %d. This is the long part — do '
+                   'not interrupt it. Duration scales with database size, and with whether the '
+                   '5.8 schema update has to rewrite cot_router (see the note above).'
+                   % TAK_PG_MAJOR)
         if not os.path.exists(_TAK58_UPGRADE_DB_SH):
             return fail('The 5.8 package did not provide %s — cannot migrate the database.'
                         % _TAK58_UPGRADE_DB_SH, wedged=True)
