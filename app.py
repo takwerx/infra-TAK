@@ -63344,6 +63344,90 @@ def takserver_58_preflight():
         return jsonify({'ok': False, 'error': str(e)[:300]}), 500
 
 
+# ── TAK 5.8 pre-migration backup (v10.2.0 W3) ───────────────────────────────
+# `upgrade-db.sh` takes NO backup — no dump, no snapshot. Its whole rollback story
+# is "the PostgreSQL 15 cluster is left intact", which is true on both families but
+# only helps if disk held both (W2's 1.5x gate) and covers only the database, not
+# CoreConfig or certs.
+#
+# So the backup is ours. It does NOT reinvent one: `_tak_snapshot()` already
+# captures TAK version, CoreConfig.xml, UserAuthenticationFile.xml,
+# /etc/default/takserver, the cot dump and /opt/tak/certs/files/, and it already
+# handles all three topologies (local, two_server, external_db). This wrapper adds
+# the one thing it does not do — PROVING the dump is readable.
+#
+# `_tak_snapshot` sets meta['db_dump'] only when a non-empty file lands. Non-empty
+# is not restorable: a truncated archive has bytes and fails to restore. Since this
+# dump is the only thing standing between an operator and an unrecoverable 5.8
+# migration, "it has bytes" is not a standard worth shipping. `pg_restore --list`
+# parses the archive's table of contents, so truncation and corruption both fail it.
+# Reporting a success we had not established is the fault the whole v10.1.40 release
+# was about; this is the same fault with a database attached.
+
+
+def _tak_58_backup(plog=None):
+    """Snapshot before the 5.8 migration, then PROVE the cot dump reads.
+
+    Returns {'ok', 'label', 'snapshot_path', 'dump_path', 'dump_bytes',
+             'toc_entries', 'error'}. `ok` is True only when pg_restore parsed the
+    archive — never merely because pg_dump exited 0.
+    """
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    label = 'pre-58-%s' % time.strftime('%Y%m%d-%H%M%S')
+    out = {'ok': False, 'label': label,
+           'snapshot_path': os.path.join(SNAPSHOT_DIR, label),
+           'dump_path': None, 'dump_bytes': 0, 'toc_entries': 0, 'error': None}
+
+    ok, meta = _tak_snapshot(label, plog=plog)
+    if not ok:
+        out['error'] = 'snapshot failed: %s' % str(meta)[:300]
+        plog('BACKUP FAILED — %s' % out['error'])
+        return out
+
+    # The snapshot can succeed overall while deliberately skipping the DB dump
+    # (external_db with no pg_dump client, for one). For a migration backup that
+    # is a hard stop, not a warning — the database is the irreplaceable part.
+    if not (isinstance(meta, dict) and meta.get('db_dump')):
+        out['error'] = ('the snapshot completed but captured NO database dump — refusing to '
+                        'treat that as a pre-migration backup.')
+        plog('BACKUP FAILED — %s' % out['error'])
+        return out
+
+    dump_path = os.path.join(out['snapshot_path'], 'cot.pgdump')
+    out['dump_path'] = dump_path
+    try:
+        st = subprocess.run(_sudo_wrap(['stat', '-c', '%s', dump_path]),
+                            capture_output=True, text=True, timeout=20)
+        out['dump_bytes'] = int((st.stdout or '0').strip() or 0)
+    except Exception:
+        out['dump_bytes'] = 0
+
+    # Prove it reads. This is the entire point of the wrapper.
+    plog('  verifying the backup is restorable (pg_restore --list)…')
+    try:
+        r = _pg_exec(['pg_restore', '--list', dump_path], timeout=600)
+        toc = [l for l in (r.stdout or '').splitlines()
+               if l.strip() and not l.lstrip().startswith(';')]
+        if r.returncode != 0 or not toc:
+            out['error'] = ('backup verification FAILED — pg_restore could not read the archive '
+                            '(%s). Do not proceed with the migration.'
+                            % ((r.stderr or '').strip()[:200] or 'empty table of contents'))
+            plog(out['error'])
+            return out
+        out['toc_entries'] = len(toc)
+    except Exception as e:
+        out['error'] = 'backup verification FAILED: %s' % str(e)[:300]
+        plog(out['error'])
+        return out
+
+    out['ok'] = True
+    plog('  backup verified: %s, %d objects in the archive (%s)'
+         % (_cotdb_fmt_bytes(out['dump_bytes']), out['toc_entries'], out['snapshot_path']))
+    return out
+
+
 # ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
 # TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
 # package on a PG-15 box through our update flow wedges TAK mid-upgrade
