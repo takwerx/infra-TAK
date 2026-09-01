@@ -1795,9 +1795,27 @@ def _check_tak58_upgrade_db(req):
         raise Denied('tak58_upgrade_db: refusing a symlink')
     if not stat.S_ISREG(st.st_mode):
         raise Denied('tak58_upgrade_db: not a regular file')
-    if st.st_uid != 0:
-        raise Denied(f'tak58_upgrade_db: {_TAK58_UPGRADE_DB} is not root-owned '
-                     f'(uid {st.st_uid}) — refusing to run it as root')
+    # OWNERSHIP — measured, not assumed. TAK 5.8-RELEASE75 ships this script
+    # `tak:tak` mode 544 (verified on dev-4, 2026-09-01), NOT root-owned, so a
+    # root-only rule refuses every real box. Accept root or the `tak` service
+    # account that the package installs it under, and nothing else.
+    #
+    # Residual risk, stated plainly rather than engineered around: the `tak` user
+    # can chmod and rewrite a file it owns, so tak -> root is reachable through
+    # this op. That is NOT a risk we introduce — TAK's own documented instruction
+    # is `sudo /opt/tak/db-utils/upgrade-db.sh`, which grants exactly the same
+    # thing to exactly the same user, and TAK Server already runs as `tak`. We
+    # automate the vendor's step; we do not widen it. What we DO add over the
+    # manual path is the write-permission check below: a script any *other* local
+    # user could edit is refused outright.
+    _allowed_uids = {0}
+    try:
+        _allowed_uids.add(pwd.getpwnam('tak').pw_uid)
+    except KeyError:
+        pass
+    if st.st_uid not in _allowed_uids:
+        raise Denied(f'tak58_upgrade_db: {_TAK58_UPGRADE_DB} is owned by uid {st.st_uid}, '
+                     'expected root or the tak service account — refusing to run it as root')
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise Denied(f'tak58_upgrade_db: {_TAK58_UPGRADE_DB} is group/world-writable '
                      f'(mode {oct(st.st_mode & 0o7777)}) — refusing to run it as root')
