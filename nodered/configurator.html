@@ -1724,9 +1724,32 @@ function classGeom(v) {
   // the mapping itself, so trust that first.
   var m = (state.classMappings || {})[v];
   if (m && m.geometryType) return String(m.geometryType).replace('esriGeometry', '');
+  // Configs saved before geometryType was stamped on class mappings (and any config
+  // whose class keys are FIELD VALUES rather than layer names) have nothing to match
+  // on. The CoT type is a reliable tell for points at least: b-m-p-* is a Spot Map,
+  // a-* is an atom. u-d-f is a drawn shape but does not say polygon vs polyline, so
+  // that case still falls through to the layer scan below.
+  if (m && m.cotType) {
+    var ct = String(m.cotType);
+    if (ct.indexOf('b-m-p') === 0 || ct.indexOf('a-') === 0) return 'Point';
+  }
   if (state.selectedLayers && state.selectedLayers.length > 1) {
     var lyr = state.selectedLayers.find(function(x) { return x.layerName === v; });
     if (lyr) return (lyr.geometryType || '').replace('esriGeometry', '');
+    // A class key that is a FIELD VALUE usually appears verbatim in exactly one
+    // layer entry's WHERE clause, because that is how the layer was scoped to it
+    // (e.g. FeatureCategory IN ('IR Heat Perimeter','IR Intense Heat',...) on the
+    // polygon entry, and the line entry carries 'Mopup Buffer'). Free, no round
+    // trip, and it is the only thing that separates Polygon from Polyline for a
+    // config saved before geometryType was stamped on class mappings.
+    var hits = state.selectedLayers.filter(function(x) {
+      return x.where && String(x.where).indexOf("'" + v + "'") !== -1;
+    });
+    if (hits.length === 1) return (hits[0].geometryType || '').replace('esriGeometry', '');
+    if (hits.length > 1) {
+      var k = {}; hits.forEach(function(x) { k[x.geometryType || ''] = 1; });
+      if (Object.keys(k).length === 1) return Object.keys(k)[0].replace('esriGeometry', '');
+    }
     // unknown key on a multi-layer config: if every layer is the same kind, use it
     var kinds = {};
     state.selectedLayers.forEach(function(x) { kinds[x.geometryType || ''] = 1; });
@@ -1766,14 +1789,19 @@ function renderClassMappings() {
         ? '<img src="data:image/png;base64,' + m.iconB64 + '" style="width:22px;height:22px;object-fit:contain;vertical-align:middle">'
         : '<span style="color:#555;font-size:0.75rem">no icon</span>';
       var colorDot = m.color
-        ? '<span style="display:inline-block;width:14px;height:14px;background:' + m.color + ';border-radius:50%;vertical-align:middle;border:1px solid #555"></span>'
+        ? '<span title="' + m.color + '" style="display:inline-block;width:14px;height:14px;background:' + m.color + ';border-radius:50%;vertical-align:middle;border:1px solid #555"></span>'
         : '<span style="color:#555;font-size:0.7rem">none</span>';
-      styleChip = iconThumb + ' ' + colorDot;
+      styleChip = (m.iconB64 ? iconThumb + ' ' : '') + colorDot;
     } else {
       var uStroke = (document.getElementById('strokeColor') || {}).value || '#FF0000';
       var uFill = (document.getElementById('fillColor') || {}).value || '#FF0000';
       var sC = (m.strokeColor != null && m.strokeColor !== '') ? m.strokeColor : uStroke;
-      styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:14px;height:14px;background:transparent;border:2px solid ' + sC + ';border-radius:3px;vertical-align:middle"></span>';
+      if (gm === 'Polyline') {
+        // a line is a line — a bordered box reads as a polygon and misleads
+        styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:18px;height:0;border-top:3px solid ' + sC + ';vertical-align:middle"></span>';
+      } else {
+        styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:14px;height:14px;background:transparent;border:2px solid ' + sC + ';border-radius:3px;vertical-align:middle"></span>';
+      }
       if (gm === 'Polygon') {
         var fC = (m.fillColor != null && m.fillColor !== '') ? m.fillColor : uFill;
         styleChip += ' <span title="fill ' + fC + '" style="display:inline-block;width:14px;height:14px;background:' + fC + ';opacity:0.6;border-radius:3px;vertical-align:middle"></span>';
@@ -2775,6 +2803,41 @@ function rmLayerEntry(i) {
   if (!state.selectedLayers || state.selectedLayers.length <= 1) return;
   state.selectedLayers.splice(i, 1);
   renderLayerSetup();
+}
+
+/* Best-effort: give every class mapping a geometryType by asking each layer entry
+   which values its classField actually holds. Heuristics (cotType, WHERE-clause
+   containment) cover most cases for free, but not all — a layer entry with a
+   classField and NO category filter, like UASWFC's line layer, names none of its
+   values anywhere in the config, so 'Mopup Buffer' is unresolvable without asking.
+   One request per layer entry that has a classField, only when something is still
+   unknown, and the result is persisted the next time the config is saved. Failures
+   are ignored: this only sharpens a UI swatch. */
+async function stampClassGeometry() {
+  var L = (state.selectedLayers || []).filter(function(x) { return x.classField; });
+  if (!L.length) return;
+  var unknown = Object.keys(state.classMappings || {}).filter(function(k) {
+    return k !== '_default' && !(state.classMappings[k] || {}).geometryType && !classGeom(k);
+  });
+  if (!unknown.length) return;
+  for (var i = 0; i < L.length; i++) {
+    var lyr = L[i];
+    try {
+      var res = await fetch('/arcgis-tak/arcgis/distinct', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: state.serviceUrl, layerId: lyr.layerId, field: lyr.classField })
+      });
+      var data = await res.json();
+      if (data.error) continue;
+      (data.values || []).forEach(function(v) {
+        var k = v != null ? String(v).trim() : '';
+        if (!k) return;
+        var m = state.classMappings[k];
+        if (m && !m.geometryType) { m.geometryType = lyr.geometryType; m.layerId = lyr.layerId; }
+      });
+    } catch (e) { /* best effort */ }
+  }
+  renderClassMappings();
 }
 
 /* Load distinct values for ONE layer entry's classField and merge them into the
@@ -5083,6 +5146,8 @@ async function selectConfig(idx) {
     }
     state.classValues = Object.keys(state.classMappings).filter(function(k) { return k !== '_default'; });
     renderClassMappings();
+    // fills in any geometryType the free heuristics could not resolve, then re-renders
+    stampClassGeometry();
   } else {
     state.classMappings = {};
     state.classValues = [];
