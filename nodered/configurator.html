@@ -1807,8 +1807,19 @@ function renderClassMappings() {
         styleChip += ' <span title="fill ' + fC + '" style="display:inline-block;width:14px;height:14px;background:' + fC + ';opacity:0.6;border-radius:3px;vertical-align:middle"></span>';
       }
     }
+    // v10.1.56 W1-UI: name the geometry outright. A mixed-geometry config puts points,
+    // polygons and lines in one flat list and the swatch alone is easy to misread at a
+    // glance — especially a thin line against a box border.
+    var geomTag = '';
+    if (gm) {
+      var gLabel = (gm === 'Point' || gm === 'MultiPoint') ? 'POINT'
+                 : (gm === 'Polyline' ? 'LINE' : (gm === 'Polygon' ? 'POLY' : gm.toUpperCase()));
+      var gColor = gLabel === 'POINT' ? '#2ec4b6' : (gLabel === 'LINE' ? '#f59e0b' : '#94a3b8');
+      geomTag = '<span style="font-size:0.62rem;font-weight:700;letter-spacing:0.05em;color:' + gColor +
+                ';border:1px solid ' + gColor + ';border-radius:3px;padding:1px 4px;flex-shrink:0">' + gLabel + '</span>';
+    }
     var rmkCount = (m.remarksFields && m.remarksFields.length) || 0;
-    var summary = styleChip
+    var summary = geomTag + ' ' + styleChip
       + (m.customLabel ? ' <span style="color:#94a3b8;font-size:0.75rem">' + m.customLabel + '</span>' : '')
       + (m.cotType ? ' <span style="color:#666;font-size:0.7rem">' + m.cotType + '</span>' : '')
       + (rmkCount ? ' <span style="color:#666;font-size:0.7rem">' + rmkCount + ' remarks</span>' : '');
