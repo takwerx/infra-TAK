@@ -63428,6 +63428,220 @@ def _tak_58_backup(plog=None):
     return out
 
 
+# ── TAK 5.8 guided migration (v10.2.0 W4) ───────────────────────────────────
+# ONE operation, deliberately. The 5.8 package detects PG 15 and REFUSES to
+# finish, printing "Please manually run sudo /opt/tak/db-utils/upgrade-db.sh".
+# Between that refusal and the DB script completing, the box is a broken server:
+# package installed, schema not migrated, TAK down. An operator who does the
+# first half by hand and stops there has an outage and no obvious way back.
+#
+# So there is NO button that performs half of this. The route below runs
+# pre-flight → backup → stop → install → upgrade-db.sh → start → verify, and if
+# it fails after the package landed it says so in those words and names the two
+# ways out. That single property is the reason this release exists; the version
+# gate (below) is only holding the fleet safe until it shipped.
+#
+# D1 (operator, 2026-09-01): call `upgrade-db.sh` BARE on both families — TAK's
+# supported path, rather than owning a migration we deviated from. Accepted and
+# stated honestly rather than hidden: on Ubuntu the vendor calls
+# `pg_upgradecluster 15 main` with no `-m`, so it is a full dump/reload — HOURS on
+# a large cot_router, not minutes — and data page checksums end up ON for Ubuntu
+# and OFF for RHEL. Do not "fix" that divergence here without a fresh decision.
+tak58_log = []
+tak58_status = {'running': False, 'complete': False, 'error': False}
+
+_TAK58_UPGRADE_DB_SH = '/opt/tak/db-utils/upgrade-db.sh'
+
+
+def _tak58_log(msg):
+    tak58_log.append(msg)
+
+
+def _tak58_run_upgrade_db(timeout_sec=6 * 3600):
+    """Run the vendor's upgrade-db.sh and stream it. Returns its exit code.
+
+    ⚠ W4b — THIS IS THE NON-ROOT GAP, and it is not a footnote: EVERY box in the
+    fleet runs the console as `takwerx`, so every box takes the broker path here.
+    The broker enforces EXEC_ALLOW, and `/opt/tak/db-utils/upgrade-db.sh` is not on
+    it — nor should it be added as a generic "run any script" hole. The right shape
+    is a DEDICATED broker op (`{'op': 'tak58_upgrade_db'}`), the way `pg_dump`
+    already has one: bounded to that single fixed path, no caller-supplied argv.
+
+    Until that op exists this returns a refusal rather than pretending to work.
+    Root-era boxes (NE-TAK and similar) take the direct path and DO work today,
+    which is exactly the sort of "works on the dev box" asymmetry that must not be
+    discovered in the field — hence the explicit message.
+    """
+    argv = _sudo_wrap(['sh', _TAK58_UPGRADE_DB_SH])
+    if _broker_should_route() and _broker_available():
+        _tak58_log('  The database migration must run with full privileges. On this server the')
+        _tak58_log('  console runs unprivileged and routes privileged work through the broker,')
+        _tak58_log('  which does not yet carry an entry for the TAK 5.8 database migration.')
+        _tak58_log('  (Tracked as W4b — a dedicated broker op bounded to %s.)'
+                   % _TAK58_UPGRADE_DB_SH)
+        return 126
+    proc = subprocess.Popen(argv, cwd='/', stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        return 1
+
+    def _drain():
+        # No shebang + bashisms mean dash emits noise on Ubuntu while the script
+        # still works. Noise is not failure — only the exit code decides.
+        for line in iter(proc.stdout.readline, ''):
+            if line:
+                tak58_log.append('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        t.join(timeout=5)
+        raise
+    t.join(timeout=5)
+    return proc.returncode if proc.returncode is not None else 1
+
+
+def run_takserver_58_migration(pkg_path):
+    """Worker: the whole 5.8 + PG18 migration as one indivisible operation."""
+    def fail(msg, wedged=False):
+        _tak58_log(msg)
+        if wedged:
+            _tak58_log('')
+            _tak58_log('*** THIS SERVER IS MID-UPGRADE AND TAK IS NOT RUNNING. ***')
+            _tak58_log('The 5.8 package is installed but the database migration did not complete.')
+            _tak58_log('Two ways forward, in order of preference:')
+            _tak58_log('  1. Re-run the database migration:  sudo %s' % _TAK58_UPGRADE_DB_SH)
+            _tak58_log('  2. Restore from the pre-migration backup taken at the start of this run')
+            _tak58_log('     (see the snapshot path above). The PostgreSQL 15 cluster was left')
+            _tak58_log('     intact by design and is still on disk.')
+        tak58_status.update({'running': False, 'complete': True, 'error': True})
+
+    try:
+        # 1. Pre-flight — refuse before touching anything.
+        _tak58_log('Checking this server is ready to migrate…')
+        pf = _tak_58_preflight()
+        for w in pf.get('warnings', []):
+            _tak58_log('  NOTE: %s' % w)
+        if not pf.get('ready'):
+            for b in pf.get('blockers', []):
+                _tak58_log('  BLOCKED: %s' % b)
+            return fail('Pre-flight failed — nothing was changed on this server.')
+        f = pf.get('facts', {})
+        _tak58_log('  PostgreSQL %s → %s, database %s, %s free.'
+                   % (f.get('pg_running_major'), f.get('pg_target_major'),
+                      _cotdb_fmt_bytes(f.get('data_bytes') or 0),
+                      _cotdb_fmt_bytes(f.get('avail_bytes') or 0)))
+        if f.get('pk_rewrite_expected'):
+            _tak58_log('  This database still has cot_router.id as integer, so the 5.8 schema '
+                       'update will rewrite that table in full. Expect a long window.')
+
+        # 2. Backup — verified, not assumed. Refuse to continue without one.
+        _tak58_log('')
+        _tak58_log('Backing up before anything is changed…')
+        bk = _tak_58_backup(plog=_tak58_log)
+        if not bk.get('ok'):
+            return fail('Backup failed — refusing to migrate without one. %s'
+                        % (bk.get('error') or ''))
+        _tak58_log('  Backup: %s' % bk.get('snapshot_path'))
+
+        # 3. Stop TAK.
+        _tak58_log('')
+        _tak58_log('Stopping TAK Server…')
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']),
+                       capture_output=True, timeout=300)
+
+        # 4. Install the 5.8 package. After this line the box is mid-upgrade.
+        _tak58_log('Installing %s …' % os.path.basename(pkg_path))
+        if _distro_family() == 'rhel':
+            cmd = 'dnf -y install ' + shlex.quote(pkg_path) + ' 2>&1'
+        else:
+            cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
+                   + shlex.quote(pkg_path) + ' 2>&1')
+        rc = _tak_upgrade_apt_install_streamed(cmd, os.path.dirname(pkg_path) or '/tmp',
+                                               tak58_log, timeout_sec=1800)
+        # The package is EXPECTED to complain about pg15 and stop short — that is
+        # the documented 5.8 behaviour, not an install failure. The database
+        # script below is what finishes it, so a non-zero rc here is reported and
+        # then superseded by whether upgrade-db.sh succeeds.
+        if rc != 0:
+            _tak58_log('  The package installer stopped short (exit %d). This is expected on a '
+                       'PostgreSQL 15 server — 5.8 refuses to finish until the database is '
+                       'migrated. Continuing to the database migration.' % rc)
+
+        # 5. The vendor migration. Bare, per D1.
+        _tak58_log('')
+        _tak58_log('Migrating the database from PostgreSQL 15 to %d. This is the long part — on '
+                   'Ubuntu it is a full dump and reload, so allow hours on a large database. Do '
+                   'not interrupt it.' % TAK_PG_MAJOR)
+        if not os.path.exists(_TAK58_UPGRADE_DB_SH):
+            return fail('The 5.8 package did not provide %s — cannot migrate the database.'
+                        % _TAK58_UPGRADE_DB_SH, wedged=True)
+        rc = _tak58_run_upgrade_db()
+        # The script has no shebang and uses bashisms, so under dash it emits
+        # stderr noise (`[: ==: unexpected operator`, `wc: unrecognized option`)
+        # while still doing its job. Noise is NOT failure — only the exit code is.
+        if rc != 0:
+            return fail('The database migration failed (exit %d). See the output above.' % rc,
+                        wedged=True)
+
+        # 6. Start and verify it is actually SERVING — not merely "active".
+        _tak58_log('')
+        _tak58_log('Starting TAK Server…')
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']),
+                       capture_output=True, timeout=300)
+        post = _tak_58_preflight()
+        pf2 = post.get('facts', {})
+        running = pf2.get('pg_running_major')
+        if running != TAK_PG_MAJOR:
+            return fail('The migration finished but PostgreSQL %s is still serving, not %d.'
+                        % (running, TAK_PG_MAJOR), wedged=True)
+        _tak58_log('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
+        _tak58_log('')
+        _tak58_log('Migration complete. The PostgreSQL 15 cluster was left on disk and can be '
+                   'removed once you are satisfied — it is your rollback until then.')
+        _tak58_log('Backup kept at %s' % bk.get('snapshot_path'))
+        tak58_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        fail('Unexpected error: %s' % str(e)[:400], wedged=True)
+
+
+@app.route('/api/takserver/58-migrate', methods=['POST'])
+@login_required
+def takserver_58_migrate():
+    """Start the guided 5.8 + PG18 migration. There is deliberately no way to run
+    only half of it — see the module comment above."""
+    if tak58_status.get('running'):
+        return jsonify({'error': 'A migration is already in progress'}), 409
+    if not _check_admin_password((request.get_json(silent=True) or {}).get('password', '')):
+        return jsonify({'error': 'Incorrect console password'}), 403
+    try:
+        cands = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(('.deb', '.rpm'))]
+    except Exception:
+        cands = []
+    pkgs = [f for f in cands if (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM]
+    if not pkgs:
+        return jsonify({'error': 'Upload the TAK Server 5.8 package (.deb or .rpm) first.'}), 400
+    pkg = os.path.join(UPLOAD_DIR, sorted(
+        pkgs, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+    tak58_log.clear()
+    tak58_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_takserver_58_migration, args=(pkg,), daemon=True).start()
+    return jsonify({'success': True, 'package': os.path.basename(pkg)})
+
+
+@app.route('/api/takserver/58-migrate/log')
+@login_required
+def takserver_58_migrate_log():
+    idx = int(request.args.get('index', 0))
+    return jsonify({'entries': tak58_log[idx:], 'total': len(tak58_log),
+                    'running': tak58_status['running'],
+                    'complete': tak58_status['complete'],
+                    'error': tak58_status['error']})
+
+
 # ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
 # TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
 # package on a PG-15 box through our update flow wedges TAK mid-upgrade
