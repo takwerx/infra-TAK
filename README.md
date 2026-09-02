@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.56-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.56-alpha)**
+**Current release: [v10.1.57-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.57-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.57-alpha — 2026-09-02 — updating TAK Portal no longer deletes its configuration
+
+**Headline: updating TAK Portal could delete the file it needs to start, taking the service offline with no error that explained why. It cannot any more.**
+
+**Why it mattered.** TAK Portal used to keep its `.env` configuration file inside its own source tree. In release 1.4.7 the project stopped tracking that file, which is the correct thing for them to do — but it meant that updating a portal from 1.4.6 or earlier removed the copy on your server. The portal then refused to start at all, because the file it is told to read no longer existed.
+
+The failure was quiet in the worst way. The update reported only "Build failed", with none of the underlying error. The old container kept running on the previous version, so the service looked healthy while actually being one restart away from not starting. Several installs hit this and had to be repaired by hand over SSH.
+
+**What changes.** The update now protects `.env` across the version change and puts it back if the upgrade removes it. On a portal that never had one, it seeds the file from the project's own example. If the build fails for any reason, the real error is shown instead of a generic message, and the console records it.
+
+This release also repairs a portal checkout the console could no longer write to — a leftover from older installs that made Update fail with a permissions error and no way forward from the browser. And the update channel is now visible before you press the button: if Beta Mode is switched on inside TAK Portal, the console says so, marks the card, and asks for confirmation before installing development code rather than a published release.
+
+**Also fixed.** Guard Dog alert emails stopped being delivered in v10.1.48 and have not been sent since. Every watcher — disk, memory, certificates, database, TAK Server, CloudTAK — was affected. Alerts are working again.
+
+**Upgrading.** Update the console as usual. If your TAK Portal is already stopped and will not start, update the console first, then press Update on the TAK Portal card — it will restore the missing file and bring the portal back. If you customised `.env` by hand and it was already lost, those values will need re-entering; the file is restored with the project's defaults.
 
 ### v10.1.56-alpha — 2026-09-02 — one map feed can now come from layers that do not match
 
