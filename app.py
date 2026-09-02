@@ -30614,7 +30614,10 @@ def _takportal_update_git(portal_dir, plog=None):
             return out
         _takportal_restore_env(portal_dir, _saved_env, plog=_log)
         out['ok'] = True
-        out['message'] = 'Beta Mode is on — updated to the latest beta (main).'
+        out['message'] = ('Beta Mode is ON in TAK Portal, so this followed the development '
+                          'tip (main) rather than a published release. To track releases '
+                          'instead, turn off "Enable Beta Features" inside TAK Portal — it is '
+                          'TAK Portal\'s setting, not infra-TAK\'s.')
         _log(f"  {out['message']}")
         return out
 
