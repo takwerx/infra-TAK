@@ -8700,12 +8700,16 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
             log.append((iout or '')[:1000])
     else:
         _, iout = _ssh_probe(s1, (
-            # D2 (PLAN-v10.2.0): the EL PostGIS package name is version-coupled and the
-            # exact PG-18 name is UNVERIFIED on a live Rocky box. Try the known candidates
-            # newest-first, then fall back to server+contrib alone so the install still
-            # completes — and say which one resolved so the log answers D2 for good.
-            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib postgis35_%(m)d 2>&1 || '
-            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib postgis34_%(m)d 2>&1 || '
+            # D2 ANSWERED 2026-09-01 — read out of TAK's OWN hardened 5.8 image
+            # (docker/Dockerfile.hardened-takserver-db in
+            # takserver-docker-hardened-5.8-RELEASE-75.zip), which installs:
+            #     postgresql18-server postgresql18 postgis36_18
+            # So the EL PostGIS package for PG18 is `postgis36_%(m)d`, NOT the
+            # postgis34_/postgis35_ this code guessed at first. Taking the name from
+            # the vendor's own build is the only source that cannot drift from what
+            # 5.8 actually expects. contrib stays in our set because TAK's setup.sql
+            # creates the pgcrypto extension, which lives there on EL.
+            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib postgis36_%(m)d 2>&1 || '
             'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib 2>&1; echo RC=$?'
             % {'m': TAK_PG_MAJOR}), timeout=600)
         log.append('vanilla PG15 install: ' + (iout or '')[:300])
