@@ -30426,6 +30426,13 @@ def _takportal_update_git(portal_dir, plog=None):
     if not os.path.isdir(os.path.join(portal_dir, '.git')):
         out['error'] = f'{portal_dir} is not a git checkout — redeploy TAK Portal instead of updating.'
         return out
+
+    # The checkout must be writable by whoever runs the console BEFORE any git touches it.
+    # Root-owned objects left by a root-era clone make `git fetch` exit 128, which is what
+    # kept Update broken on re-homed boxes long after the error was being reported properly.
+    _healed, _heal_err = _module_checkout_ownership_selfheal(portal_dir, plog=_log)
+    if _heal_err:
+        _log(f'  ownership self-heal did not complete: {_heal_err}')
     # Discard local edits to TRACKED files before moving refs. The only tracked file we
     # modify is docker-compose.yml (the loopback port patch), and it is re-applied by the
     # caller after the checkout — so this loses nothing. The untracked
@@ -70017,6 +70024,71 @@ def _startup_ensure_broker():
                       f'{(_sr.stderr or _sr.stdout or "").strip()[:200]}', flush=True)
     except Exception as _se:
         print(f'Startup migration: shim regen warning (non-fatal): {_se}', flush=True)
+
+
+def _module_checkout_ownership_selfheal(mod_dir, plog=None):
+    """Re-own a module git checkout the console must be able to write. Returns (healed, error).
+
+    Same fault as _repo_ownership_selfheal(), different tree. A module dir re-homed by the
+    non-root flip keeps root-owned entries from its root-era clone; `git fetch` as takwerx
+    then dies with
+
+        error: insufficient permission for adding an object to repository database .git/objects
+        fatal: failed to write object / fatal: unpack-objects failed   (exit 128)
+
+    and the update cannot land. v10.1.55 W1 made that visible instead of silently rebuilding
+    the old tree, and _takportal_git_hint() tells the operator to run chown by hand -- but
+    neither FIXED it, so the button stayed broken. Found again on test12 2026-09-02: TAK
+    Portal 1.4.8 published 16:42Z, operator pressed Update 16:59Z, both fetch forms exited
+    128, box stayed on 1.4.6 with 166 root-owned entries under .git (199 across the tree).
+
+    A console that can diagnose this can repair it: `chown -R -h` on a module dir is already
+    inside the broker rulebook (HOME_MODULE_DIRS / ROOT_MODULE_DIRS cover every name in
+    MODULE_DIR_NAMES), so this needs no new privilege. -h re-owns symlinks rather than
+    following them, exactly as the console-repo carve-out requires.
+
+    No-op as root -- a root-owned checkout is the correct state on a root-era box.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    if os.getuid() == 0:
+        return False, ''
+    uid = os.getuid()
+    offenders = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(mod_dir):
+            for name in dirnames + filenames:
+                try:
+                    if os.lstat(os.path.join(dirpath, name)).st_uid != uid:
+                        offenders.append(os.path.relpath(os.path.join(dirpath, name), mod_dir))
+                        if len(offenders) > 400:   # enough to prove it; don't walk a huge tree twice
+                            raise StopIteration
+                except OSError:
+                    continue
+    except StopIteration:
+        pass
+    except Exception as e:
+        return False, f'ownership scan failed: {e}'
+    if not offenders:
+        return False, ''
+    import pwd as _pwd
+    import grp as _grp
+    try:
+        user = _pwd.getpwuid(uid).pw_name
+        group = _grp.getgrgid(os.getgid()).gr_name
+    except Exception:
+        user, group = str(uid), str(os.getgid())
+    _log(f'  {len(offenders)} foreign-owned entr(y/ies) in {mod_dir} '
+         f'(e.g. {", ".join(offenders[:3])}) -- re-owning to {user}:{group} before git')
+    try:
+        r = subprocess.run(_sudo_wrap(['chown', '-R', '-h', f'{user}:{group}', mod_dir]),
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return False, f'chown error: {e}'
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or '').strip()[:300]
+        return False, f'chown failed (rc={r.returncode}): {err}'
+    _log(f'  {mod_dir} re-owned to {user}:{group}')
+    return True, ''
 
 
 def _startup_repo_ownership_heal():
