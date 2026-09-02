@@ -63671,6 +63671,23 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             return fail('The database migration failed (exit %d). See the output above.' % rc,
                         wedged=True)
 
+        # Finish the package. On Debian the 5.8 install DELIBERATELY exits non-zero on a
+        # PG-15 box ("A pg15 install has been detected…"), so dpkg is left holding a
+        # half-configured takserver even after the database migration succeeds and TAK
+        # runs perfectly well. Nothing looks wrong until the NEXT apt operation on that
+        # box reports "1 not fully installed or removed" and refuses — which is how this
+        # was found: an uninstall on dev-4 could not purge the package (2026-09-02).
+        # dpkg --configure -a is idempotent and a no-op when nothing is pending.
+        if _distro_family() != 'rhel':
+            _say('')
+            _say('Finishing the package installation…')
+            _cfg_rc = _run_dpkg_configure_a(_say, _log)
+            if _cfg_rc != 0:
+                _say('  WARNING: dpkg --configure -a returned %d. TAK Server may still be '
+                     'running correctly, but the package is not fully registered — the next '
+                     'apt operation on this server will report it. Run '
+                     '`sudo dpkg --configure -a` and check the output.' % _cfg_rc)
+
         # 6. Start and verify it is actually SERVING — not merely "active".
         _say('')
         _say('Starting TAK Server…')
