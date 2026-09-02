@@ -30492,6 +30492,68 @@ def _takportal_git_hint(stderr):
     return ''
 
 
+def _takportal_preserve_env(portal_dir, plog=None):
+    """Snapshot TAK Portal's .env before a checkout moves refs. Returns bytes or None.
+
+    Upstream TRACKED `.env` up to 1.4.6, then replaced it with `.env.example` and
+    gitignored it (`c78964be` "updated env ignore", shipped in 1.4.7/1.4.8). Git deletes
+    a working-tree file that is tracked in the source tree and absent from the target
+    tree, and `checkout --force` does it without a word — so updating a box across that
+    boundary DESTROYS the operator's .env. `docker compose` then refuses to start:
+
+        env file /home/takwerx/TAK-Portal/.env not found
+
+    and because the build fails, the OLD container keeps running with its environment
+    baked in from creation. The box looks healthy and is actually one restart away from
+    a portal that cannot start at all. Found on test12 2026-09-02.
+
+    Snapshot BEFORE `git checkout -- .` as well as before the ref move: while .env was
+    tracked, that discard-local-edits step reverts an operator's customisations to it.
+
+    This is the [[third-party-app-config-is-operator-owned]] rule in its most literal
+    form — .env is TAK Portal's file, we do not own a single key in it, and a full-tree
+    checkout is a destructive operation against it.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    src = os.path.join(portal_dir, '.env')
+    try:
+        if os.path.isfile(src):
+            with open(src, 'rb') as f:
+                return f.read()
+    except Exception as e:
+        _log(f'  could not read .env before checkout (continuing): {e}')
+    return None
+
+
+def _takportal_restore_env(portal_dir, saved, plog=None):
+    """Put .env back if the checkout removed it. Never overwrites an existing file.
+
+    Restore-if-missing only. If the checkout left .env alone (the normal case once a box
+    is past the 1.4.6 boundary) this does nothing at all — we must not write over a file
+    the operator may have edited between the snapshot and here.
+
+    With no snapshot to restore, seed once from upstream's .env.example, which is the
+    convention 1.4.7+ ships. Seeding a MISSING file is allowed; overwriting is not.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    dst = os.path.join(portal_dir, '.env')
+    if os.path.exists(dst):
+        return
+    try:
+        if saved is not None:
+            with open(dst, 'wb') as f:
+                f.write(saved)
+            _log('  .env was removed by the checkout (upstream stopped tracking it) — restored')
+            return
+        example = os.path.join(portal_dir, '.env.example')
+        if os.path.isfile(example):
+            with open(example, 'rb') as s, open(dst, 'wb') as d:
+                d.write(s.read())
+            _log('  no .env present — seeded from .env.example')
+    except Exception as e:
+        _log(f'  could not restore .env: {e}')
+
+
 def _takportal_update_git(portal_dir, plog=None):
     """Move ~/TAK-Portal onto its channel's ref. Returns a dict, never raises.
 
@@ -30527,6 +30589,9 @@ def _takportal_update_git(portal_dir, plog=None):
     _healed, _heal_err = _module_checkout_ownership_selfheal(portal_dir, plog=_log)
     if _heal_err:
         _log(f'  ownership self-heal did not complete: {_heal_err}')
+    # Snapshot .env FIRST — before the discard below and before any ref moves. Upstream
+    # tracked it through 1.4.6, so both steps can destroy it (v10.1.57 W9).
+    _saved_env = _takportal_preserve_env(portal_dir, plog=_log)
     # Discard local edits to TRACKED files before moving refs. The only tracked file we
     # modify is docker-compose.yml (the loopback port patch), and it is re-applied by the
     # caller after the checkout — so this loses nothing. The untracked
@@ -30547,6 +30612,7 @@ def _takportal_update_git(portal_dir, plog=None):
             err = (c.stderr or c.stdout or '').strip()[:300]
             out['error'] = f'git checkout origin/main failed: {err}.{_takportal_git_hint(err)}'
             return out
+        _takportal_restore_env(portal_dir, _saved_env, plog=_log)
         out['ok'] = True
         out['message'] = 'Beta Mode is on — updated to the latest beta (main).'
         _log(f"  {out['message']}")
@@ -30574,6 +30640,7 @@ def _takportal_update_git(portal_dir, plog=None):
         err = ((c.stderr or c.stdout) or (ft.stderr or '')).strip()[:300]
         out['error'] = f'Could not check out release {tag}: {err}.{_takportal_git_hint(err)}'
         return out
+    _takportal_restore_env(portal_dir, _saved_env, plog=_log)
     out['ok'] = True
     # Rollback is intentional and must be SAID, not hidden: a box that lived on main with
     # Beta Mode on and then turned it off converges DOWN to the newest release.
@@ -31288,12 +31355,31 @@ def takportal_control():
         # out to upstream's `./takportal update`, which fuses the checkout and the build.
         _write_takportal_override()
         _patch_takportal_compose_ports(portal_dir)
-        build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=180)
+        # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
+        # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
+        # time out here on a slower box, and TimeoutExpired was not caught, so it
+        # surfaced as an unhandled 500 with no explanation at all.
+        try:
+            build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
+                                   cwd=portal_dir, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
+            print(f'[takportal] update: {plog_msg}', flush=True)
+            return jsonify({'success': False, 'error': plog_msg}), 500
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
         if build.returncode != 0:
+            # v10.1.57 W9: `err` was computed here and then THROWN AWAY — the response
+            # said only "Build failed. Container may have stopped", and nothing was
+            # logged, so the actual reason existed nowhere. On test12 the real message
+            # was one line ("env file .env not found") and it took a manual re-run of
+            # the build to see it. Report what the build actually said, and journal it.
             err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
-            return jsonify({'success': False, 'error': 'Build failed. Container may have stopped — try Start below or check container logs.'}), 500
+            print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
+            return jsonify({'success': False,
+                            'error': f'Build failed: {err}',
+                            'hint': 'The previous container may still be running the old version. '
+                                    'Check the container logs, fix the cause, and press Update again.'}), 500
         settings_synced = False
         settings_sync_error = ''
         cloudtak_url = ''
