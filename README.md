@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.55-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.55-alpha)**
+**Current release: [v10.1.56-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.56-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,24 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.56-alpha — 2026-09-02 — one map feed can now come from layers that do not match
+
+**Headline: a single ArcGIS feed can now pull from several layers that store their data differently — and a set of long-standing faults that made map markers render as plain white dots, flattened large shapes, and hung the "Load Values" button have been fixed.**
+
+**Why it mattered.** Public GIS services often split one product across several layers — points, outlines and lines — and those layers frequently disagree about details like which column holds the timestamp. The console previously assumed every layer in a feed matched, so a service like that had to be set up as three or four separate feeds pointing at one map. Each one had to be edited by hand whenever anything changed, and it was easy for them to drift out of step with each other.
+
+**What changes.** A feed can now hold several layers, each with its own time column, its own grouping column, and its own filter — and the same layer can appear twice with different settings, so one point layer can be split into two differently styled sets. There is a new Layer Setup step that shows a card per layer and only offers columns that layer actually has, which makes the mismatch that used to break these feeds impossible to configure.
+
+**Fixes that apply to every ArcGIS feed, not just new ones.**
+
+- Map markers ignored the color you chose and drew as white. Colors now work.
+- Large outlines and long lines were being simplified far too aggressively, so a detailed fire perimeter or a long boundary line arrived on the map as a coarse approximation. Detail is now allocated in proportion to a shape's size, so big shapes keep their form while small ones stay light. Existing feeds are unaffected — measured, not assumed.
+- The "Load Values" button could hang forever on any layer with real geometry, because the lookup was downloading the full shape of every row to read a list of names. It now returns in well under a second.
+- Shapes can be drawn without the center dot and label that used to appear in the middle of the map.
+- A feed whose data updates less often than its time window could quietly expire off devices while the console reported it healthy. How long data lives on a device is now set separately from how far back the feed looks.
+
+**Upgrade note:** ride the normal console update. Existing feeds keep working exactly as they are and need no changes. The new Layer Setup step only appears when a feed uses more than one layer.
 
 ### v10.1.55-alpha — 2026-08-31 — a reboot could leave every user connected and invisible
 
