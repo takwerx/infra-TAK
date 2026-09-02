@@ -13322,6 +13322,9 @@ def _run_remote_assist_deploy(settings):
         plog('━━━ Step 3/6: Cloning Repository ━━━')
         if os.path.isdir(os.path.join(ra_dir, '.git')):
             plog(f'  Repo already at {ra_dir} — pulling latest...')
+            _h, _he = _module_checkout_ownership_selfheal(ra_dir, plog=plog)
+            if _he:
+                plog(f'  ownership self-heal did not complete: {_he}')
             _remote_assist_restore_tracked_files(ra_dir)
             r = _sp.run(['git', '-C', ra_dir, 'pull', '--ff-only'], capture_output=True, text=True, timeout=120)
             plog((r.stdout + r.stderr).strip() or '(no output)')
@@ -13572,6 +13575,9 @@ def _run_remote_assist_update():
     try:
         settings = load_settings()
         plog('━━━ Step 1/5: Pulling latest source ━━━')
+        _h, _he = _module_checkout_ownership_selfheal(ra_dir, plog=plog)
+        if _he:
+            plog(f'  ownership self-heal did not complete: {_he}')
         _remote_assist_restore_tracked_files(ra_dir)
         # Ensure remote URL is correct (handles repository rename)
         _sp.run(['git', '-C', ra_dir, 'remote', 'set-url', 'origin', REMOTE_ASSIST_REPO],
@@ -31557,6 +31563,12 @@ def run_takportal_deploy():
         _tp_tag = _takportal_latest_tag(plog)
         if os.path.exists(portal_dir):
             plog(f"  TAK-Portal directory exists — fetching {_tp_tag}...")
+            # Same root-owned-checkout trap as the Update path (v10.1.57 W7). A redeploy
+            # over an existing re-homed clone hits it identically, and this fetch does
+            # not check its return code at all.
+            _h, _he = _module_checkout_ownership_selfheal(portal_dir, plog=plog)
+            if _he:
+                plog(f"  ownership self-heal did not complete: {_he}")
             subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
                             'fetch', '--tags', '--force', 'origin'],
                            capture_output=True, text=True, timeout=120)
@@ -36128,7 +36140,12 @@ def _cloudtak_git_prep(cloudtak_dir, plog):
         MinIO's live S3 data), which is ROOT-owned and NOT gitignored. Add it to
         .git/info/exclude so git status/checkout never tries to walk or touch a
         tree the non-root console can neither read into nor modify.
-    Both writes land in the takwerx-owned .git, so plain file IO works non-root."""
+    Both writes land in the takwerx-owned .git, so plain file IO works non-root --
+    an assumption that is FALSE on a box re-homed from a root-era clone, which is
+    why the ownership heal below runs first (v10.1.57 W8)."""
+    _healed, _herr = _module_checkout_ownership_selfheal(cloudtak_dir, plog=plog)
+    if _herr:
+        plog(f"  ownership self-heal did not complete: {_herr}")
     try:
         _lock = os.path.join(cloudtak_dir, '.git', 'index.lock')
         if os.path.exists(_lock):
@@ -70026,8 +70043,8 @@ def _startup_ensure_broker():
         print(f'Startup migration: shim regen warning (non-fatal): {_se}', flush=True)
 
 
-def _module_checkout_ownership_selfheal(mod_dir, plog=None):
-    """Re-own a module git checkout the console must be able to write. Returns (healed, error).
+def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
+    """Re-own the parts of a module checkout git must write. Returns (healed, error).
 
     Same fault as _repo_ownership_selfheal(), different tree. A module dir re-homed by the
     non-root flip keeps root-owned entries from its root-era clone; `git fetch` as takwerx
@@ -70042,33 +70059,50 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None):
     Portal 1.4.8 published 16:42Z, operator pressed Update 16:59Z, both fetch forms exited
     128, box stayed on 1.4.6 with 166 root-owned entries under .git (199 across the tree).
 
-    A console that can diagnose this can repair it: `chown -R -h` on a module dir is already
-    inside the broker rulebook (HOME_MODULE_DIRS / ROOT_MODULE_DIRS cover every name in
-    MODULE_DIR_NAMES), so this needs no new privilege. -h re-owns symlinks rather than
-    following them, exactly as the console-repo carve-out requires.
+    NOT a blanket `chown -R` on the module dir. Some module trees contain deliberately
+    root-owned data: ~/CloudTAK/.docker-store/ is MinIO's live S3 bind-mount (see
+    _cloudtak_git_prep), and re-owning it to takwerx would corrupt a running service to fix
+    a git problem. So:
 
-    No-op as root -- a root-owned checkout is the correct state on a root-era box.
+      * .git/ is healed recursively -- it is never a bind-mount, and it is what breaks fetch.
+      * worktree offenders are enumerated and chowned BY PATH, so nothing we did not
+        actually see gets touched.
+      * `prune` names directories to skip entirely; .docker-store is always pruned.
+
+    `chown -R -h` / `chown -h` on a module dir already passes the broker rulebook via
+    HOME_MODULE_DIRS / ROOT_MODULE_DIRS (every name in MODULE_DIR_NAMES). -h re-owns
+    symlinks rather than following them, as the console-repo carve-out requires.
+
+    No-op as root -- a root-owned checkout is correct on a root-era box.
     """
     _log = plog or (lambda m: print(m, flush=True))
     if os.getuid() == 0:
         return False, ''
+    if not os.path.isdir(mod_dir):
+        return False, ''
     uid = os.getuid()
-    offenders = []
+    skip = {'.docker-store'} | set(prune)
+    git_dirty, work_offenders = False, []
+    _CAP = 400
     try:
         for dirpath, dirnames, filenames in os.walk(mod_dir):
+            dirnames[:] = [d for d in dirnames if d not in skip]
             for name in dirnames + filenames:
+                full = os.path.join(dirpath, name)
                 try:
-                    if os.lstat(os.path.join(dirpath, name)).st_uid != uid:
-                        offenders.append(os.path.relpath(os.path.join(dirpath, name), mod_dir))
-                        if len(offenders) > 400:   # enough to prove it; don't walk a huge tree twice
-                            raise StopIteration
+                    if os.lstat(full).st_uid == uid:
+                        continue
                 except OSError:
                     continue
-    except StopIteration:
-        pass
+                rel = os.path.relpath(full, mod_dir)
+                if rel == '.git' or rel.startswith('.git' + os.sep):
+                    git_dirty = True
+                    continue          # healed wholesale below; do not enumerate 10k objects
+                if len(work_offenders) < _CAP:
+                    work_offenders.append(full)
     except Exception as e:
         return False, f'ownership scan failed: {e}'
-    if not offenders:
+    if not git_dirty and not work_offenders:
         return False, ''
     import pwd as _pwd
     import grp as _grp
@@ -70077,17 +70111,30 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None):
         group = _grp.getgrgid(os.getgid()).gr_name
     except Exception:
         user, group = str(uid), str(os.getgid())
-    _log(f'  {len(offenders)} foreign-owned entr(y/ies) in {mod_dir} '
-         f'(e.g. {", ".join(offenders[:3])}) -- re-owning to {user}:{group} before git')
-    try:
-        r = subprocess.run(_sudo_wrap(['chown', '-R', '-h', f'{user}:{group}', mod_dir]),
-                           capture_output=True, text=True, timeout=180)
-    except Exception as e:
-        return False, f'chown error: {e}'
-    if r.returncode != 0:
-        err = (r.stderr or r.stdout or '').strip()[:300]
-        return False, f'chown failed (rc={r.returncode}): {err}'
-    _log(f'  {mod_dir} re-owned to {user}:{group}')
+    owner = f'{user}:{group}'
+    _log(f'  {mod_dir}: foreign-owned entries found '
+         f'(.git={"yes" if git_dirty else "no"}, worktree={len(work_offenders)}) '
+         f'-- re-owning to {owner} before git')
+    errs = []
+
+    def _chown(args, what):
+        try:
+            r = subprocess.run(_sudo_wrap(['chown'] + args), capture_output=True,
+                               text=True, timeout=180)
+        except Exception as e:
+            errs.append(f'{what}: {e}')
+            return
+        if r.returncode != 0:
+            errs.append(f'{what}: rc={r.returncode} '
+                        f'{(r.stderr or r.stdout or "").strip()[:200]}')
+
+    if git_dirty:
+        _chown(['-R', '-h', owner, os.path.join(mod_dir, '.git')], '.git')
+    for i in range(0, len(work_offenders), 100):
+        _chown(['-h', owner] + work_offenders[i:i + 100], f'worktree batch {i // 100 + 1}')
+    if errs:
+        return False, '; '.join(errs[:3])
+    _log(f'  {mod_dir} re-owned to {owner}')
     return True, ''
 
 
