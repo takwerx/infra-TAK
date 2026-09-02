@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.57-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.57-alpha)**
+**Current release: [v10.1.58-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.58-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.58-alpha — 2026-09-02 — the console now tells you when your server restarted, and why
+
+**Headline: Guard Dog can now see that your server was restarted — including when your hosting provider does it without telling you — and alerts that could not be delivered are no longer thrown away.**
+
+**Why it mattered.** infra-TAK had no restart detection at all. A server could be shut down and brought back repeatedly and the console would show nothing, because nothing ever looked. One deployment was powered off ten times by its hosting provider over two months; the operator spent days investigating a certificate he had changed, because there was no other explanation available to him. The evidence was in the system log the whole time.
+
+**What changes.** After every restart the console works out *why* the machine went down and records it: a planned reboot, a shutdown ordered by the virtualization platform, a power loss or hard reset with no clean shutdown, a kernel fault, or memory exhaustion. A new **Restarts & downtime** panel on the Guard Dog page shows how long the server has been up and how many unexpected restarts it has had in the last week, with the cause of each. Anything other than a deliberate reboot also sends an alert. Planned reboots are recorded but never alerted on, so a normal restart stays quiet.
+
+This works the same on a virtual machine, a cloud instance and a bare-metal server — it does not depend on any one platform's tooling.
+
+**Alerts are no longer lost.** An alert raised while the console was busy starting up was previously attempted once and discarded, because the "already reported" marker was set whether or not the message actually went out. On a loaded server the console can take several minutes to become responsive after a restart, which is exactly when problems get noticed — so this was losing alerts at the worst possible moment. Alerts now retry until they are delivered.
+
+**Fewer false alarms.** A CloudTAK video configuration check could email about a problem the console had already fixed seconds earlier — and then advise restarting the console, which was what caused it. It now waits to confirm the problem is real before alerting, and says plainly what it means when it does.
+
+**Upgrading.** Update the console as usual. Restart history begins accumulating from the next restart.
 
 ### v10.1.57-alpha — 2026-09-02 — updating TAK Portal no longer deletes its configuration
 
