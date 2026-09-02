@@ -20666,7 +20666,6 @@ def _guarddog_spiral_correlation_check(cl_waiting):
             pass
 
 
-@app.route('/api/guarddog/send-alert-email', methods=['POST'])
 def _guarddog_alert_recipient_warning(settings=None):
     """Return a warning string when Guard Dog has no alert recipient, else ''.
 
@@ -20686,6 +20685,7 @@ def _guarddog_alert_recipient_warning(settings=None):
             'effect immediately; no redeploy needed).')
 
 
+@app.route('/api/guarddog/send-alert-email', methods=['POST'])
 def guarddog_send_alert_email():
     """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email)."""
     if request.remote_addr not in ('127.0.0.1', '::1'):
