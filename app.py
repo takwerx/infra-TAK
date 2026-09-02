@@ -30210,6 +30210,9 @@ def takportal_page():
     # and this is an inline page render. Stable is also the correct answer when we cannot
     # look — the same fail-closed default _takportal_beta_mode() uses.
     portal_beta_mode = bool(portal.get('running')) and _takportal_beta_mode()
+    # Separate from the fail-closed value above: the badge must be able to say
+    # "unknown" instead of silently implying "release". See _takportal_beta_channel_state.
+    portal_channel = _takportal_beta_channel_state() if portal.get('running') else 'unknown'
     takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template('takportal.html',
         settings=settings, portal=portal, container_info=container_info,
@@ -30315,6 +30318,26 @@ def _takportal_get_existing_settings():
 # put it in front of UFW. The patch has to land BETWEEN the checkout and the build,
 # and only an in-process sequence can do that. The channel rules below are kept
 # deliberately identical to the script's so the two cannot drift apart.
+
+
+def _takportal_beta_channel_state():
+    """'beta' | 'release' | 'unknown' — for DISPLAY only. Never guesses.
+
+    _takportal_beta_mode() fails CLOSED, which is right for CHOOSING a channel: never
+    ship main because a read failed. It is wrong for a BADGE. On test8 the card rendered
+    with no beta marker one second after a container recreate while settings.json
+    actually said BETA_MODE='true' — the read had simply not succeeded yet, and the page
+    presented that failure as "you are on the release channel". A display that turns
+    "could not read" into a confident claim is how the operator ends up surprised by the
+    channel at click time, which is the whole complaint this exists to answer.
+    """
+    try:
+        s = _takportal_get_existing_settings()
+    except Exception:
+        return 'unknown'
+    if not isinstance(s, dict) or 'BETA_MODE' not in s:
+        return 'unknown'
+    return 'beta' if str(s.get('BETA_MODE') or '').strip().lower() == 'true' else 'release'
 
 
 def _takportal_beta_mode():
