@@ -20815,6 +20815,84 @@ def guarddog_notifications_pause():
                                 else 'Alerts paused until you resume them.')})
 
 
+@app.route('/api/guarddog/restarts')
+@login_required
+def guarddog_restarts_api():
+    """Recent restarts with WHY, from tak-restart-watch.sh's history file (v10.1.57 W5).
+
+    Deliberately NOT folded into /api/guarddog/health: that route is served from a warm
+    cache so the page can paint colours in ~1s, and this is a small file read that would
+    only add latency to it.
+
+    The point of this endpoint is that the customer's OWN console can say "your hosting
+    provider shut you down". helpnow was power-cycled ten times by its host and the
+    operator spent days blaming a certificate he had changed, because nothing anywhere
+    told him otherwise.
+    """
+    def _uptime_s():
+        try:
+            with open('/proc/uptime') as _u:
+                return int(float(_u.read().split()[0]))
+        except Exception:
+            return 0
+
+    def _iso_ts(s):
+        """Seconds since epoch from the watcher's short-iso stamps, or 0.
+
+        strptime('%z'), not datetime.fromisoformat(): journalctl -o short-iso emits
+        '2026-08-31T00:57:29-0700' (no colon in the offset), and fromisoformat only
+        learned to accept that in Python 3.11. Ubuntu 22.04 — the baseline platform —
+        ships 3.10, so fromisoformat would raise there and silently zero every count.
+        """
+        if not s or s == 'unknown':
+            return 0
+        for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.strptime(s, fmt).timestamp()
+            except Exception:
+                continue
+        return 0
+
+    path = '/var/lib/takguard/restart-history.jsonl'
+    entries = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue          # a torn line is not a reason to fail the card
+    except FileNotFoundError:
+        # No file yet = the watcher has not run a boot since install. That is "nothing
+        # to report", NOT an error, and the card must not shout about it.
+        return jsonify({'success': True, 'supported': True, 'entries': [],
+                        'window_days': 7, 'unexpected_7d': 0, 'uptime_seconds': _uptime_s()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+
+    entries = entries[-50:]
+    entries.reverse()                 # newest first
+    cutoff = time.time() - 7 * 86400
+    unexpected = 0
+    for e in entries:
+        # OPERATOR is a deliberate reboot and is not counted against the box.
+        if (e.get('verdict') or '') == 'OPERATOR':
+            continue
+        try:
+            when = e.get('booted_at') or ''
+            ts = _iso_ts(when)
+        except Exception:
+            ts = 0
+        if ts >= cutoff:
+            unexpected += 1
+    return jsonify({'success': True, 'supported': True, 'entries': entries,
+                    'window_days': 7, 'unexpected_7d': unexpected,
+                    'uptime_seconds': _uptime_s()})
+
+
 @app.route('/api/guarddog/notifications/status')
 @login_required
 def guarddog_notifications_status():

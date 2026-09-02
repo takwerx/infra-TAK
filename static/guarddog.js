@@ -9,6 +9,31 @@ function gdApplyDockerLogLimits(){var btn=document.getElementById('gd-docker-lim
 function gdPollLog(){var logEl=document.getElementById('gd-deploy-log');function poll(){fetch('/api/guarddog/deploy/log?index='+gdLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
 if(d.entries&&d.entries.length){if(gdLogIndex===0&&logEl)logEl.textContent='';if(logEl){logEl.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);logEl.scrollTop=logEl.scrollHeight;}gdLogIndex+=d.entries.length;}
 if(!d.running){clearInterval(gdLogInterval);var btn=document.getElementById('gd-deploy-btn');if(btn)btn.disabled=false;if(d.complete){if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'Deploy complete. Refreshing...';setTimeout(function(){location.reload();},2000);}else if(d.error){var lc=document.getElementById('gd-log-card');if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'\u2717 Deployment failed (see log above).';if(lc&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';lc.insertBefore(b,lc.querySelector('.log-box')||lc.firstChild);}if(btn){btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\ud83d\udc15 Deploy Guard Dog';btn.style.background='';startGuarddogDeploy();};}}}});}poll();gdLogInterval=setInterval(poll,800);}
+/* v10.1.57 W5: say WHY the box last went down. helpnow was power-cycled ten times by its
+   host while the console showed nothing, and the operator blamed a cert he had changed.
+   The whole value here is that the customer's OWN console names the cause. */
+var GD_RESTART_LABEL={HYPERVISOR_POWEROFF:'Powered off by the hosting provider',EXTERNAL:'Shut down from outside the OS',UNCLEAN:'Stopped without shutting down',PANIC:'Kernel panic',OOM:'Out of memory',OPERATOR:'Planned reboot'};
+function gdFmtDown(s){if(s===null||s===undefined)return'unknown';if(s<120)return s+'s';if(s<7200)return Math.round(s/60)+' min';return Math.floor(s/3600)+'h '+Math.round((s%3600)/60)+'m';}
+function gdLoadRestarts(){var card=document.getElementById('gd-restarts-card');var list=document.getElementById('gd-restarts-list');var sum=document.getElementById('gd-restarts-summary');var ban=document.getElementById('gd-restarts-banner');if(!card||!list)return;
+fetch('/api/guarddog/restarts',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(!d.success){card.style.display='none';return;}
+card.style.display='block';
+var n=d.unexpected_7d||0;var up=gdFmtDown(d.uptime_seconds);
+if(ban)ban.className='status-banner '+(n>0?'stopped':'running');
+if(sum)sum.textContent=(n>0?(n+' unexpected restart'+(n===1?'':'s')+' in the last '+d.window_days+' days'):'No unexpected restarts in the last '+d.window_days+' days')+' — up '+up;
+var e=d.entries||[];
+if(e.length===0){list.innerHTML='<span style="color:var(--text-dim)">No restarts recorded yet. This fills in the next time the server reboots.</span>';return;}
+list.innerHTML=e.slice(0,10).map(function(x){
+var lab=GD_RESTART_LABEL[x.verdict]||x.verdict||'Unknown';
+var planned=(x.verdict==='OPERATOR');
+var col=planned?'var(--text-dim)':'var(--red)';
+return '<div style="padding:6px 0;border-bottom:1px solid var(--border)">'
++'<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">'
++'<span style="color:'+col+'">'+lab+'</span>'
++'<span style="color:var(--text-dim)">down '+gdFmtDown(x.down_seconds)+'</span></div>'
++'<div style="color:var(--text-dim);font-size:11px">came back '+(x.booted_at||'unknown')+'</div></div>';}).join('');
+}).catch(function(){card.style.display='none';});}
+
 (function(){var gdDeploying=document.body.getAttribute('data-gd-deploying')==='true';if(gdDeploying){var c=document.getElementById('gd-log-card');if(c)c.style.display='block';gdPollLog();}})();
 var gdUpdateMsgTimer=null;
 function gdUpdate(){var btn=document.getElementById('gd-update-btn');var msg=document.getElementById('gd-update-msg');if(!btn)return;btn.disabled=true;clearTimeout(gdUpdateMsgTimer);if(msg){msg.textContent='Updating...';msg.style.color='var(--text-dim)';}fetch('/api/guarddog/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){btn.disabled=false;if(!msg)return;if(d.success){msg.textContent='✓ '+(d.message||'Updated — refreshing…');msg.style.color='var(--green)';gdRefreshHealth();gdRefreshMonitorHealth();setTimeout(function(){location.reload();},1500);}else{msg.textContent=d.error||'Update failed';msg.style.color='var(--red)';}}).catch(function(e){btn.disabled=false;if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}});}
@@ -545,4 +570,5 @@ function gdResumeAlerts(){gdSetPause(false,'');}
     setInterval(gdLoadPauseState,60000);
   }
   gdRenderEmailChips();
+  gdLoadRestarts();
 })();

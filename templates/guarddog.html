@@ -81,6 +81,20 @@
   {% endif %}
 
   {% if gd.installed %}
+  <div class="card" id="gd-restarts-card" style="display:none">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <span>Restarts &amp; downtime</span>
+      <button class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdLoadRestarts()">Refresh</button>
+    </div>
+    <div id="gd-restarts-banner" class="status-banner" style="margin-bottom:12px"><div class="dot"></div><span id="gd-restarts-summary">Loading…</span></div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">
+      Why this server last went down. A planned reboot is normal and is not counted or alerted.
+      Anything else — your hosting provider powering the VM off, a hard stop with no shutdown,
+      a kernel panic — is counted here and emails your alert address.
+    </p>
+    <div id="gd-restarts-list" style="font-size:12px"></div>
+  </div>
+
   <div class="card"><div class="card-title">Monitors</div>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Per-service health and checks. Expand a row to see what Guard Dog is monitoring.</p>
     <div class="guard-list">
