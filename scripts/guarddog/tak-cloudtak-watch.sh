@@ -86,7 +86,6 @@ if docker inspect cloudtak-media-1 >/dev/null 2>&1; then
       date +%s > "$_DRIFT_PENDING"
       _log "drift | first detection — deferring alert one interval to let the console's converger finish"
     elif [ ! -f "$_DRIFT_STATE" ]; then
-      date +%s > "$_DRIFT_STATE"
       SUBJ_D="Guard Dog: CloudTAK video config drift on $SERVER_IDENTIFIER"
       BODY_D="cloudtak-media is missing infra-TAK's HLS profile (/mediamtx.yml), and it
 did NOT come back on its own.
@@ -112,7 +111,22 @@ Check it yourself:
 To fix: restart the infra-TAK console (systemctl restart takwerx-console) — its
 converger re-applies the profile. A CloudTAK rebuild is NOT required and will not help.
 "
-      echo -e "$BODY_D" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ_D" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null || true
+      # v10.1.58 W13: close the once-per-episode gate ONLY on successful delivery.
+      #
+      # This used to write $_DRIFT_STATE BEFORE sending, so the episode was marked
+      # reported whether or not the mail left the box. Measured on test12
+      # 2026-09-02: after a console restart the console took 318s to answer, the
+      # drift alert fired 83s into that window, logged "console unreachable" — and
+      # the gate had already closed, so it was attempted once and lost forever.
+      # A watcher that runs every minute had all the retries it needed and used none.
+      #
+      # Leaving $_DRIFT_PENDING in place means the next run re-enters this branch
+      # and tries again, so the alert survives a console that is merely busy.
+      if echo -e "$BODY_D" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ_D" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null; then
+        date +%s > "$_DRIFT_STATE"
+      else
+        _log "drift | alert NOT delivered (console unreachable?) — episode left open, will retry next check"
+      fi
     fi
   else
     if [ -f "$_DRIFT_PENDING" ] && [ ! -f "$_DRIFT_STATE" ]; then

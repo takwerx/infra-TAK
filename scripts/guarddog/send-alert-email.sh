@@ -56,7 +56,8 @@ if [ -z "$CODE" ] || [ "$CODE" = "000" ]; then
 fi
 
 case "$RESP" in
-    '') if [ -z "$CODE" ] || [ "$CODE" = "000" ]; then
+    '') _RC=3
+        if [ -z "$CODE" ] || [ "$CODE" = "000" ]; then
             # No HTTP response at all: console down, wrong port, TLS refused.
             logger -t guarddog-alert -- \
                 "NOT SENT (console unreachable on :${CONSOLE_PORT}): ${SUBJ}" 2>/dev/null
@@ -72,6 +73,24 @@ case "$RESP" in
     *'"success": true'*|*'"success":true'*)
         logger -t guarddog-alert -- "sent: ${SUBJ}" 2>/dev/null ;;
     *)  logger -t guarddog-alert -- \
-            "NOT SENT (console error HTTP ${CODE}): ${SUBJ} -- ${RESP}" 2>/dev/null ;;
+            "NOT SENT (console error HTTP ${CODE}): ${SUBJ} -- ${RESP}" 2>/dev/null
+        _RC=3 ;;
 esac
-exit 0
+
+# v10.1.58 W13: report DELIVERY STATUS to the caller.
+#   0 = delivered, or deliberately suppressed (no recipient configured)
+#   3 = NOT sent (console unreachable, misrouted, or an error)
+#
+# Until now this always exited 0, so a watcher had no way to know its alert had
+# been dropped. Watchers gate themselves with an "alert once per episode" state
+# file, and they write it whether or not the mail left the box — so an alert
+# raised while the console was still starting CONSUMED the episode and was lost
+# permanently, with no retry. Observed on test12 2026-09-02: the console was
+# still running startup migrations 83s after a restart, the drift alert fired
+# into that window, logged "console unreachable", and the once-gate closed
+# behind it.
+#
+# This does NOT make alerting failure fatal to a watcher — that rule stands.
+# Callers still run this without `set -e`; the code is advisory, and is used to
+# decide whether the episode may be marked as reported.
+exit ${_RC:-0}
