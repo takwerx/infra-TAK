@@ -63643,8 +63643,16 @@ def _tak_58_preflight():
         mode, db_host = 'local', 'localhost'
     facts['db_mode'] = mode
     if mode == 'container':
-        blockers.append('TAK runs its database in a container — the 5.8 guided migration '
-                        'covers native host PostgreSQL only in this release.')
+        # Supported since W8b, by a different mechanism: TAK's documented export/import
+        # between the old PG15 container and the new PG18 one, because PostgreSQL 18
+        # cannot start on a PG15 data directory. Not a blocker any more, but the facts
+        # below (disk sizing off a host data dir, pg_upgrade assumptions) do not apply,
+        # so say so rather than reporting host numbers that mean nothing here.
+        facts['container_migration'] = True
+        warnings.append('This is a container deployment, so the upgrade exports the database '
+                        'and re-imports it into a PostgreSQL %d container rather than '
+                        'upgrading in place. That is row-by-row and takes considerably longer '
+                        'than a native migration on the same amount of data.' % TAK_PG_MAJOR)
     elif mode == 'remote':
         blockers.append('The CoT database is on a remote host (%s). The 5.8 migration must be '
                         'run there, not from this console, in this release.' % (db_host or 'unknown'))
@@ -64096,6 +64104,157 @@ def _tak58_container_import(container, src_path, pw, say):
     return True
 
 
+def _tak58_volume_copy(src, dst, say):
+    """Copy a docker volume's contents to another volume, as the rollback artifact.
+
+    Docker cannot rename a volume, and the container upgrade has to hand the new PG18
+    image an EMPTY volume - PostgreSQL 18 refuses to start on a PG15 data directory,
+    which is exactly why the existing run_takserver_upgrade_container() (which
+    deliberately PRESERVES the volume) cannot be used for 5.8 as-is.
+    So the old data is copied aside first and never deleted.
+    """
+    r = subprocess.run(_sudo_wrap(['docker', 'volume', 'create', dst]),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        say(f'  Could not create the rollback volume {dst}: {(r.stderr or "").strip()[:160]}')
+        return False
+    r = subprocess.run(_sudo_wrap([
+        'docker', 'run', '--rm', '--user', '0',
+        '-v', f'{src}:/from', '-v', f'{dst}:/to',
+        '--entrypoint', 'sh', TAK_CONTAINER, '-c', 'cp -a /from/. /to/ 2>&1']),
+        capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0:
+        say(f'  Could not copy {src} -> {dst}: {(r.stderr or r.stdout or "").strip()[:200]}')
+        return False
+    say(f'  PostgreSQL 15 data preserved in volume {dst} — this is your rollback.')
+    return True
+
+
+def run_takserver_58_container_migration(zip_path, log=None, status=None):
+    """Container 5.8 migration: export from the PG15 container, rebuild, import into PG18.
+
+    NOT a variant of the native path. TAK documents this as an export/import between
+    two containers (docker/README_hardened_docker.md) because PostgreSQL 18 will not
+    start on a PG15 data directory, so there is nothing for pg_upgrade to do in place.
+
+    Order matters and is dictated by --data-only: the new container must already carry
+    the 5.8 schema (its own init runs SchemaManager) before the data goes in.
+    """
+    _log = upgrade_log if log is None else log
+    _status = upgrade_status if status is None else status
+
+    def _say(m):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        _log.append(entry); print(entry, flush=True)
+
+    def fail(msg, rollback_note=None):
+        _say(f'✗ {msg}')
+        if rollback_note:
+            _say('')
+            _say(rollback_note)
+        _status.update({'running': False, 'complete': True, 'error': True})
+
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    old_vol = f'{TAK_DB_VOLUME}_pre58_{stamp}'
+    export_path = f'{SNAPSHOT_DIR}/pre-58-container-{stamp}/{_TAK58_EXPORT_NAME}'
+    try:
+        _say('Checking this server is ready to migrate…')
+        if not _tak_is_container():
+            return fail('This is not a container deployment.')
+        pw = _tak58_db_password()
+        if not pw:
+            return fail('Could not read the database password from CoreConfig.xml.')
+        pg15 = _tak58_container_pgbin(TAK_DB_CONTAINER, 15)
+        if not pg15:
+            return fail(f'{TAK_DB_CONTAINER} is not running PostgreSQL 15 — nothing to migrate '
+                        f'from, or the container is down.')
+
+        # Row counts BEFORE, from the live database. This is the only thing that can
+        # prove the import later; a psql exit code cannot.
+        before = _tak58_container_counts(TAK_DB_CONTAINER, pg15, pw)
+        if not before:
+            return fail('Could not read row counts from the current database — refusing to '
+                        'migrate without a baseline to verify against.')
+        total_before = sum(before.values())
+        _say(f'  {len(before)} tables, {total_before:,} rows to move.')
+
+        # 1. Export — this IS the backup, and it is verified before anything is touched.
+        _say('')
+        _say('Backing up before anything is changed…')
+        if not _tak58_container_export(TAK_DB_CONTAINER, export_path, pw, _say):
+            return fail('Backup/export failed — refusing to migrate without one.')
+        _say(f'  Backup: {export_path}')
+
+        # 2. Preserve the old volume. PG18 cannot start on a PG15 data dir, so the live
+        #    volume must be emptied — the copy is what makes that reversible.
+        _say('')
+        _say('Preserving the PostgreSQL 15 data…')
+        if not _tak58_volume_copy(TAK_DB_VOLUME, old_vol, _say):
+            return fail('Could not preserve the PostgreSQL 15 volume — refusing to continue, '
+                        'because emptying it would then be irreversible.')
+
+        # 3. Empty the live volume so the new PG18 container initialises cleanly and
+        #    creates the 5.8 schema.
+        _say('')
+        _say('Rebuilding on TAK Server 5.8…')
+        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]),
+                       capture_output=True, timeout=120)
+        subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]),
+                       capture_output=True, timeout=60)
+
+        # 4. Reuse the existing container upgrade to unpack, build and start. It preserves
+        #    certs / CoreConfig / UserAuthenticationFile, which is what we want; the volume
+        #    it would have preserved is already gone, so its fresh init builds 5.8's schema.
+        run_takserver_upgrade_container(zip_path)
+        if _status is not upgrade_status and upgrade_status.get('error'):
+            return fail('The container rebuild failed — see the output above.',
+                        f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
+                        f'is at {export_path}.')
+
+        # 5. The new DB container must be up, on 18, with the 5.8 schema already applied.
+        pg18 = _tak58_container_pgbin(TAK_DB_CONTAINER, TAK_PG_MAJOR)
+        if not pg18:
+            return fail(f'The new {TAK_DB_CONTAINER} is not running PostgreSQL {TAK_PG_MAJOR}.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        sv = _tak58_schema_version()
+        if sv is not None and sv < _TAK58_MIN_SCHEMA_VERSION:
+            return fail(f'The new database did not build the 5.8 schema (schema_version {sv}) — '
+                        f'importing data into a pre-5.8 schema would corrupt it.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+
+        # 6. Import, then PROVE it by comparing counts.
+        _say('')
+        if not _tak58_container_import(TAK_DB_CONTAINER, export_path, pw, _say):
+            return fail('The data import failed.',
+                        f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
+                        f'is at {export_path}.')
+        after = _tak58_container_counts(TAK_DB_CONTAINER, pg18, pw)
+        if not after:
+            return fail('Could not read row counts after the import — cannot confirm the data '
+                        'arrived, so this is being treated as a failure.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        total_after = sum(after.values())
+        missing = {t: (before[t], after.get(t, 0)) for t in before
+                   if after.get(t, 0) < before[t]}
+        if missing:
+            detail = ', '.join(f'{t} {a:,}/{b:,}' for t, (b, a) in list(missing.items())[:6])
+            return fail(f'The import lost rows: {detail}. '
+                        f'{total_after:,} of {total_before:,} rows arrived.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol} and the export is at '
+                        f'{export_path}. Do NOT put this server into service.')
+        _say(f'  Import verified: {total_after:,} rows across {len(after)} tables '
+             f'(source had {total_before:,}).')
+
+        _say('')
+        _say(f'Migration complete. The PostgreSQL 15 data is kept in volume {old_vol} and can be '
+             f'removed once you are satisfied — it is your rollback until then.')
+        _say(f'Backup kept at {export_path}')
+        _status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        fail(f'Unexpected error: {str(e)[:400]}',
+             f'If the migration had started, PostgreSQL 15 data may be in volume {old_vol}.')
+
+
 def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
     """Run the vendor's upgrade-db.sh and stream it. Returns its exit code.
 
@@ -64424,6 +64583,29 @@ def takserver_update():
     except OSError:
         pass
     _is58 = any((_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM for f in _pending)
+    if _is58 and _tak_is_container():
+        # Container 5.8: PostgreSQL 18 will not start on a PG15 data directory, so the
+        # existing data-preserving container upgrade cannot be used - it deliberately
+        # keeps the volume. Route to the export/import migration instead.
+        if upgrade_status['running']:
+            return jsonify({'error': 'Update already in progress'}), 409
+        _zips = [f for f in os.listdir(UPLOAD_DIR)
+                 if f.lower().endswith('.zip') and 'docker' in f.lower()]
+        if not _zips:
+            return jsonify({'error': 'Container 5.8 upgrade: upload the takserver-docker '
+                                     'hardened .zip bundle.'}), 400
+        _zip = os.path.join(UPLOAD_DIR, sorted(
+            _zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+        upgrade_log.clear()
+        upgrade_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_58_container_migration,
+                         args=(_zip,), kwargs={'log': upgrade_log, 'status': upgrade_status},
+                         daemon=True).start()
+        return jsonify({'success': True, 'migration': True, 'container': True,
+                        'message': 'TAK Server 5.8 detected on a container deployment — '
+                                   'exporting the database, rebuilding on PostgreSQL %d, then '
+                                   'importing. The PostgreSQL 15 volume is preserved as your '
+                                   'rollback.' % TAK_PG_MAJOR})
     if _is58 and not _tak_is_container():
         if upgrade_status['running']:
             return jsonify({'error': 'Update already in progress'}), 409
