@@ -28609,6 +28609,18 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}"); return False
     subprocess.run(_sudo_wrap(['cp', _tmp_p12, p12]), capture_output=True)
+    # The hardened 5.8 images run as tak:0, NOT root, so a root-owned 0600 p12 is
+    # unreadable by the keytool in Step B:
+    #   keytool error: java.io.FileNotFoundException: takserver-le.p12 (Permission denied)
+    # and the deploy silently falls back to the self-signed cert on 8446 - the port
+    # ATAK ENROLLS against. Measured on a fresh hardened container deploy, dev-4
+    # 2026-09-03: 8446 served CN=INT-CA-01 instead of the ACME cert.
+    # Group 0 + 0640 is the same model _container_own_tree() uses for the bundle, and
+    # it is what the container's gid already is; on the host, group 0 is root, so the
+    # server's private key gains no new readers. _container_own_tree() cannot cover
+    # this file - it runs during deploy, and this cert is installed afterwards.
+    subprocess.run(_sudo_wrap(['chown', ':0', p12]), capture_output=True)
+    subprocess.run(_sudo_wrap(['chmod', '640', p12]), capture_output=True)
     try:
         os.remove(_tmp_p12)
     except Exception:
