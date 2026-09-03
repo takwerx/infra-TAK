@@ -26120,37 +26120,47 @@ def _container_readable(path, log=None):
 
 
 def _container_own_tree(root, log=None):
-    """Give the hardened container's `tak:0` user access to a mounted bundle tree.
+    """Give the hardened container's `tak:0` user access to the mounted bundle.
 
-    Read access on one file is not enough: TAK's cert scripts WRITE into
-    /opt/tak/certs/files (ca-do-not-share.key, crl_index.txt, the JKS/P12 stores), so
-    the container needs rwX across the tree, not just r on cert-metadata.sh. Measured
-    on dev-4 2026-09-03, running as uid 1001:
+    The hardened 5.8 images run as tak:0 / postgres:0, NOT root, so a tree written by
+    the console user (uid 1000, gid 1000) is unreadable and unwritable inside the
+    container. Measured on dev-4 2026-09-03, as uid 1001:
 
         ./makeRootCa.sh: line 6: cert-metadata.sh: Permission denied
         genrsa: Can't open "ca-do-not-share.key" for writing, Permission denied
         touch: cannot touch 'crl_index.txt': Permission denied
 
-    Group 0 + g+rwX matches TAK's own hardened model - their DB image does
-    `chown -R postgres:0` and puts the service user in group 0 - so the container's
-    gid 0 carries the access and no world bits are needed.
+    Group 0 + g+rwX matches TAK's own hardened model (their DB image does
+    `chown -R postgres:0` and puts the service user in group 0), and the container's
+    gid IS 0, so no world bits are needed.
+
+    Done from INSIDE a root container rather than on the host, because the host route
+    does not work and fails QUIETLY: `chgrp` is not in the broker allowlist at all, and
+    `chown` is path-checked, so on the bundle tree it returns success while changing
+    nothing. Both were tried first and both looked like they had worked - the unpack
+    chown set gid 0 on the bundle root while `tak/certs` (recreated later in the
+    deploy) stayed gid 1000, and cert generation kept failing with an error message
+    two directories away from the cause.
     """
+    tak_real = os.path.realpath(root)
     try:
-        r1 = subprocess.run(_sudo_wrap(['chown', '-R', ':0', root]),
-                            capture_output=True, text=True, timeout=120)
-        r2 = subprocess.run(_sudo_wrap(['chmod', '-R', 'g+rwX', root]),
-                            capture_output=True, text=True, timeout=120)
-        ok = (r1.returncode == 0 and r2.returncode == 0)
+        r = subprocess.run(_sudo_wrap([
+            'docker', 'run', '--rm', '--user', '0',
+            '-v', f'{tak_real}:/mnt/takown',
+            '--entrypoint', 'sh', TAK_CONTAINER, '-c',
+            'chown -R :0 /mnt/takown && chmod -R g+rwX /mnt/takown']),
+            capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            if log:
+                log(f"  granted the container's tak:0 user access to {tak_real} (group 0, g+rwX)")
+            return True
         if log:
-            if ok:
-                log(f"  granted the container's tak:0 user access to {root} (group 0, g+rwX)")
-            else:
-                log(f"  WARNING: could not fully set container ownership on {root}: "
-                    f"{((r1.stderr or '') + (r2.stderr or '')).strip()[:160]}")
-        return ok
+            log(f"  WARNING: could not set container ownership on {tak_real}: "
+                f"{(r.stderr or r.stdout or '').strip()[:200]}")
+        return False
     except Exception as e:
         if log:
-            log(f"  WARNING: container ownership setup failed on {root}: {str(e)[:120]}")
+            log(f"  WARNING: container ownership setup failed on {tak_real}: {str(e)[:150]}")
         return False
 
 
@@ -67201,10 +67211,8 @@ def _deploy_takserver_container(config):
         if _fixed:
             log_step(f"  repaired {_fixed} bundle script(s) shipped without the execute bit "
                      f"(upstream packaging issue — the DB container entrypoint is one of them)")
-        # The hardened images run as tak:0 / postgres:0, not root, so the mounted bundle
-        # must be group-0 accessible or in-container cert generation cannot read its
-        # config or write its keys. See _container_own_tree().
-        _container_own_tree(TAK_DOCKER_ROOT, log_step)
+        # Ownership is fixed AFTER the images exist (see the cert step) - it is done
+        # from inside a root container, which cannot run before the image is built.
         # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
         try:
             # Only consider dirs that are an actual bundle (_tak_is_bundle_dir: either naming),
@@ -67311,6 +67319,11 @@ def _deploy_takserver_container(config):
             log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
 
         # ── Step 6/9: Certificates (docker exec; files land in symlinked /opt/tak) ─
+        # The hardened images run as tak:0, not root, and the deploy recreates parts of
+        # the bundle (notably tak/certs) after unpack - so re-assert container ownership
+        # HERE, immediately before the cert scripts run as that non-root user.
+        if _tak_is_container():
+            _container_own_tree(os.path.realpath('/opt/tak'), log_step)
         log_step(""); log_step("━━━ Step 6/9: Generating Certificates ━━━")
         log_step(f"  Root CA: {root_ca} | Intermediate CA: {int_ca}")
         run_cmd('rm -rf /opt/tak/certs/files', check=False)
