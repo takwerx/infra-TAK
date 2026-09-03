@@ -67101,6 +67101,39 @@ def _deploy_takserver_container(config):
         except Exception as _ze:
             log_step(f"✗ Failed to extract the takserver-docker bundle: {str(_ze)[:200]}")
             deploy_status.update({'error': True, 'running': False}); return
+        # UPSTREAM PACKAGING BUG (5.8 hardened, verified 2026-09-03): several db-utils
+        # scripts are recorded in the zip WITHOUT the execute bit, while their siblings
+        # in the same directory have it:
+        #
+        #   -rw-rw-rw-  db-utils/configureInDocker.sh     <- the DB container's ENTRYPOINT
+        #   -rw-rw-rw-  db-utils/upgrade-db.sh
+        #   -rw-rw-rw-  db-utils/takserver-setup-db.sh
+        #   -rwxrwxrwx  db-utils/start.sh, configure.sh, restore-data.sh, ...
+        #
+        # Docker execs the entrypoint directly, so the database container cannot start
+        # at all: `OCI runtime create failed: exec: ".../configureInDocker.sh":
+        # permission denied` (exit 126). This is not our extraction losing modes — the
+        # loop above faithfully restores external_attr, and the zip genuinely records
+        # 0666. It affects anyone deploying this bundle, not just us.
+        #
+        # Repair it rather than special-casing filenames: every .sh in a TAK bundle is
+        # meant to be runnable, and chmod +x on an already-executable file is a no-op.
+        _fixed = 0
+        for _root, _dirs, _files in os.walk(TAK_DOCKER_ROOT):
+            for _f in _files:
+                if not _f.endswith('.sh'):
+                    continue
+                _fp = os.path.join(_root, _f)
+                try:
+                    _m = os.stat(_fp).st_mode
+                    if not (_m & 0o111):
+                        os.chmod(_fp, _m | 0o755 & 0o7777)
+                        _fixed += 1
+                except OSError:
+                    pass
+        if _fixed:
+            log_step(f"  repaired {_fixed} bundle script(s) shipped without the execute bit "
+                     f"(upstream packaging issue — the DB container entrypoint is one of them)")
         # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
         try:
             # Only consider dirs that are an actual bundle (_tak_is_bundle_dir: either naming),
