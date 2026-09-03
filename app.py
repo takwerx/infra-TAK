@@ -28694,7 +28694,8 @@ TAK_FP=$(docker exec {TAK_CONTAINER} keytool -list -rfc -keystore "$JKS" -storep
 log "Refreshing TAK keystore from Caddy's current cert..."
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" -out "$P12" -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
 docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt"
-chown 1000:1000 "$JKS" "$P12" 2>/dev/null || true
+chown :0 "$JKS" "$P12" 2>/dev/null || true
+chmod 640 "$JKS" "$P12" 2>/dev/null || true
 docker restart {TAK_CONTAINER}
 log "TAK keystore refreshed and container restarted."
 '''
@@ -65690,8 +65691,12 @@ def _tak_rollback(label, plog=None):
             subprocess.run(_sudo_wrap(['cp','-p',uaf_src,uaf_dst]), capture_output=True, check=True)
             # Match the ownership convention used elsewhere for /opt/tak files.
             subprocess.run(
-                _sudo_wrap(['chown', ('1000:1000' if _tak_is_container() else 'tak:tak'), '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
+                _sudo_wrap(['chown', (':0' if _tak_is_container() else 'tak:tak'),
+                            '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
             )
+            if _tak_is_container():
+                subprocess.run(_sudo_wrap(['chmod', '640', '/opt/tak/UserAuthenticationFile.xml']),
+                               capture_output=True, timeout=10)
             plog("  rollback: UserAuthenticationFile.xml restored")
         except Exception as e:
             plog(f"  rollback: UserAuthenticationFile.xml restore failed: {e}")
@@ -65716,8 +65721,12 @@ def _tak_rollback(label, plog=None):
             subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             # Restore ownership (tak:tak) on certs
             subprocess.run(
-                _sudo_wrap(['chown', '-R', ('1000:1000' if _tak_is_container() else 'tak:tak'), '/opt/tak/certs/files']), capture_output=True, timeout=15
+                _sudo_wrap(['chown', '-R', (':0' if _tak_is_container() else 'tak:tak'),
+                            '/opt/tak/certs/files']), capture_output=True, timeout=15
             )
+            if _tak_is_container():
+                subprocess.run(_sudo_wrap(['chmod', '-R', 'g+rwX', '/opt/tak/certs/files']),
+                               capture_output=True, timeout=15)
             plog("  rollback: certs/ restored")
         except Exception as e:
             plog(f"  rollback: certs restore failed: {e}")
@@ -68247,9 +68256,12 @@ def _deploy_takserver_container(config):
             log_step(f"  ✗ cert-metadata.sh patch failed: {_e}")
         _patch_openssl_string_mask(log_step)
         _patch_cert_metadata_password(cert_pass)
-        # Container TAK user is uid 1000 — chown so makeCert (run as that user
-        # inside the container) can write the cert files on the shared mount.
-        run_cmd('chown -R 1000:1000 /opt/tak/certs 2>/dev/null; true', check=False)
+        # chown so makeCert (run as the image's user inside the container) can write
+        # the cert files on the shared mount. NB the uid is NOT stable across image
+        # eras — the pre-hardened image ran cert-gen as root, the hardened 5.8 image
+        # runs as tak:0 (uid 1001, gid 0). Group 0 covers both; a hardcoded 1000 covers
+        # neither, and is what broke the 8446 keystore (see _install_le_cert_on_8446_container).
+        run_cmd('chown -R :0 /opt/tak/certs 2>/dev/null; chmod -R g+rwX /opt/tak/certs 2>/dev/null; true', check=False)
         # v10.0.1/v10.0.5 (ARM container): generate certs in a ONE-SHOT `docker run` container
         # that mounts the shared bundle — NOT `docker exec` into the init-pass service container.
         # The init container crash-loops until certs exist (TAK's entrypoint exits with no
