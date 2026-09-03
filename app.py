@@ -1865,6 +1865,40 @@ def _tak_is_container():
 # works unchanged; only binary EXECUTION (makeCert/keytool/UserManager) needs
 # `docker exec`. Mirrors the proven installTAK docker sequence.
 TAK_CONTAINER = 'takserver'          # app container name (and image tag)
+
+# -- TAK docker bundle layout (v10.2.0 W8) ---------------------------------
+# The Dockerfile names CHANGED in 5.8, and "hardened" is now the only container
+# bundle TAK publishes (operator, 2026-09-02):
+#
+#   5.7 and earlier   docker/Dockerfile.takserver            docker/Dockerfile.takserver-db
+#   5.8 hardened      docker/Dockerfile.hardened-takserver   docker/Dockerfile.hardened-takserver-db
+#
+# Hardcoding either name breaks the other, so resolve from what the bundle
+# actually contains. Verified against takserver-docker-hardened-5.8-RELEASE-75.zip,
+# whose DB image is built on registry.access.redhat.com/ubi10/ubi:10.2 with PGDG
+# EL-10 (postgresql18 + postgis36_18), NOT the old postgres:15.1 base.
+_TAK_DOCKERFILES = (
+    ('docker/Dockerfile.hardened-takserver', 'docker/Dockerfile.hardened-takserver-db'),
+    ('docker/Dockerfile.takserver',          'docker/Dockerfile.takserver-db'),
+)
+
+
+def _tak_bundle_dockerfiles(ctx):
+    """(app_dockerfile, db_dockerfile) relative to `ctx`, newest naming first.
+
+    Returns (None, None) when `ctx` is not a TAK docker bundle - callers use that
+    to reject a directory rather than guessing at a filename.
+    """
+    for app_df, db_df in _TAK_DOCKERFILES:
+        if os.path.isfile(os.path.join(ctx, app_df)) and os.path.isfile(os.path.join(ctx, db_df)):
+            return app_df, db_df
+    return None, None
+
+
+def _tak_is_bundle_dir(path):
+    """True when `path` looks like an unpacked takserver-docker bundle (any era)."""
+    return _tak_bundle_dockerfiles(path)[0] is not None
+
 TAK_DB_CONTAINER = 'takserver-db'    # db container name
 TAK_DOCKER_NET = 'takserver'         # docker network
 TAK_DB_VOLUME = 'takserver_pgsql'    # named volume for postgres data
@@ -65671,7 +65705,7 @@ def run_takserver_upgrade_container(zip_path):
             return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
         entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
                    if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
-                   and os.path.isfile(os.path.join(TAK_DOCKER_ROOT, d, 'docker', 'Dockerfile.takserver'))
+                   and _tak_is_bundle_dir(os.path.join(TAK_DOCKER_ROOT, d))
                    and os.path.join(TAK_DOCKER_ROOT, d) != old_ctx]
         entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
         if not entries:
@@ -65699,9 +65733,13 @@ def run_takserver_upgrade_container(zip_path):
 
         # 4) Build the new-version images.
         ulog("Step 4/6: Building new TAK Server images (minutes on arm64)...")
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1'):
+        _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
+        if not _app_df:
+            log_step('X No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
+            return False
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1'):
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
             return _fail("TAK Server image build failed.")
         ulog("✓ Images built")
 
@@ -67061,18 +67099,19 @@ def _deploy_takserver_container(config):
             deploy_status.update({'error': True, 'running': False}); return
         # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
         try:
-            # Only consider dirs that are an actual bundle (have docker/Dockerfile.takserver),
+            # Only consider dirs that are an actual bundle (_tak_is_bundle_dir: either naming),
             # and pick the NEWEST (the one just extracted) so a leftover dir from a prior
             # version can never shadow the upload even if cleanup somehow left one behind.
             entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
                        if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
-                       and os.path.isfile(os.path.join(TAK_DOCKER_ROOT, d, 'docker', 'Dockerfile.takserver'))]
+                       and _tak_is_bundle_dir(os.path.join(TAK_DOCKER_ROOT, d))]
             entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
             build_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0]) if entries else TAK_DOCKER_ROOT
         except Exception:
             build_ctx = TAK_DOCKER_ROOT
         tak_dir = os.path.join(build_ctx, 'tak')
-        if not os.path.isfile(os.path.join(build_ctx, 'docker', 'Dockerfile.takserver')):
+        _app_df, _db_df = _tak_bundle_dockerfiles(build_ctx)
+        if not _app_df:
             log_step(f"✗ Dockerfile.takserver not found under {build_ctx}/docker — is this an official takserver-docker zip?")
             deploy_status.update({'error': True, 'running': False}); return
         log_step(f"  Build context: {build_ctx}")
@@ -67084,10 +67123,11 @@ def _deploy_takserver_container(config):
 
         # ── Step 3/9: Build images (multi-arch base → native arm64 build) ───
         log_step(""); log_step("━━━ Step 3/9: Building TAK Server images ━━━")
-        log_step("  (first build pulls postgres:15.1 + eclipse-temurin:17-jammy — minutes on arm64)")
-        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1', "Building takserver_db image..."):
+        log_step("  (first build pulls the bundle's base images — minutes on arm64)")
+        log_step(f'  bundle layout: {_app_df} / {_db_df}')
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
-        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1', "Building takserver image..."):
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
             log_step("✗ takserver image build failed."); deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ Images built")
 
