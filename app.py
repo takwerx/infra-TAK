@@ -64019,109 +64019,190 @@ def _tak58_db_password():
         return None
 
 
+_TAK58_PG_BIN_LAYOUTS = ('/usr/pgsql-{major}/bin', '/usr/lib/postgresql/{major}/bin')
+_TAK58_EXPORT_IN_CONTAINER = f'/tmp/{_TAK58_EXPORT_NAME}'
+
+
 def _tak58_container_pgbin(container, major):
-    """Path to psql for `major` inside `container`, or None if absent."""
-    r = subprocess.run(_sudo_wrap(['docker', 'exec', container,
-                                   'test', '-x', f'/usr/pgsql-{major}/bin/psql']),
-                       capture_output=True, timeout=60)
-    return f'/usr/pgsql-{major}/bin/psql' if r.returncode == 0 else None
+    """Directory holding psql/pg_dump for PostgreSQL `major` inside `container`, or None.
 
-
-def _tak58_container_counts(container, pgbin, pw):
-    """{table: rowcount} for the cot DB inside `container`, or None.
-
-    Used to PROVE an import landed. A psql exit code of 0 says the file was read,
-    not that the rows arrived - the same distinction that hid a failed SchemaManager
-    behind upgrade-db.sh's exit 0 on the native path.
+    Two layouts exist in the fleet: PGDG on UBI (`/usr/pgsql-N/bin` — the hardened 5.8
+    images) and the Debian official image (`/usr/lib/postgresql/N/bin` — what the
+    pre-hardened 5.7 bundle's Dockerfile.takserver-db builds FROM postgres:15.1). Every
+    customer migrating from 5.7 is on the second, so probing only the first reported
+    "not running PostgreSQL 15" against a container that was.
     """
-    sql = ("select relname||' '||n_live_tup from pg_stat_user_tables "
-           "where n_live_tup > 0 order by relname")
+    for layout in _TAK58_PG_BIN_LAYOUTS:
+        d = layout.format(major=major)
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'test', '-x', f'{d}/psql']),
+                           capture_output=True, timeout=60)
+        if r.returncode == 0:
+            return d
+    return None
+
+
+def _tak58_container_psql(container, pgbin, pw, sql, timeout=300):
+    """One console-authored SQL statement as martiuser over TCP inside `container`.
+    Returns stdout, or None when psql failed. Never pass request-derived SQL here."""
     try:
         r = subprocess.run(_sudo_wrap([
             'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
-            pgbin, '-h', 'localhost', '-U', 'martiuser', '-d', 'cot', '-tAc', sql]),
-            capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            return None
-        out = {}
-        for line in (r.stdout or '').splitlines():
-            parts = line.strip().split()
-            if len(parts) == 2 and parts[1].isdigit():
-                out[parts[0]] = int(parts[1])
-        return out
+            f'{pgbin}/psql', '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
+            '-tAX', '-c', sql]), capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _tak58_container_counts(container, pgbin, pw):
+    """{table: EXACT row count} for the cot DB inside `container` (non-empty tables), or None.
+
+    Used to PROVE an import landed. A psql exit code of 0 says the file was read, not
+    that the rows arrived — the same distinction that hid a failed SchemaManager behind
+    upgrade-db.sh's exit 0 on the native path. count(*), not pg_stat_user_tables'
+    n_live_tup: that is an estimate the stats collector drifts on, and an estimate is
+    not evidence.
+    """
+    sql = ("select relname||' '||(xpath('/row/c/text()', query_to_xml("
+           "'select count(*) as c from '||quote_ident(schemaname)||'.'||quote_ident(relname),"
+           " false, true, '')))[1]::text from pg_stat_user_tables order by relname")
+    out = _tak58_container_psql(container, pgbin, pw, sql, timeout=1800)
+    if out is None:
+        return None
+    counts = {}
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 0:
+            counts[parts[0]] = int(parts[1])
+    return counts
+
+
+def _tak58_container_schema_version(container, pgbin, pw):
+    """Highest successfully-applied TAK schema version inside `container`, or None."""
+    out = _tak58_container_psql(
+        container, pgbin, pw,
+        'select coalesce(max(version::int), 0) from schema_version where success')
+    s = (out or '').strip()
+    return int(s) if s.isdigit() else None
 
 
 def _tak58_container_export(container, dest_path, pw, say):
-    """Export cot data from the OLD container. Returns bytes written, or 0 on failure.
+    """Export cot data from the OLD container to dest_path on the host. Bytes written, or 0.
 
-    Verified, not assumed: an export that produces a file with no INSERT statements
-    is a failure even though psql exited 0.
+    pg_dump, not psql. TAK's README_hardened_docker.md shows `psql --data-only
+    --column-inserts --disable-triggers`; those are pg_dump options and psql rejects
+    them. The first version of this helper copied the README verbatim.
+
+    The dump is written INSIDE the container, verified there, then `docker cp`'d out:
+    streaming it through the exec proxy would hit the broker's 32 MiB per-response
+    cap, and a host-side `sh -c '… > file'` is denied outright (sh is on the broker's
+    deny list). Every fleet box runs the console as takwerx through the broker, so
+    either would have failed everywhere.
     """
     pgbin = _tak58_container_pgbin(container, 15)
     if not pgbin:
         say(f'  {container} has no PostgreSQL 15 client — cannot export from it.')
         return 0
     say(f'  Exporting the database from {container} (row-by-row; this is the slow part)…')
+    t0 = time.time()
     try:
-        _makedirs_priv(os.path.dirname(dest_path))
-    except Exception:
-        pass
-    cmd = (f"docker exec -e PGPASSWORD={shlex.quote(pw)} {shlex.quote(container)} "
-           f"{shlex.quote(pgbin)} -h localhost -U martiuser -d cot "
-           f"--data-only --column-inserts --disable-triggers")
-    try:
-        with open(dest_path, 'wb') as fh:
-            proc = subprocess.run(_sudo_wrap(['sh', '-c', cmd]), stdout=fh,
-                                  stderr=subprocess.PIPE, timeout=6 * 3600)
-        if proc.returncode != 0:
-            say(f'  Export failed: {(proc.stderr or b"").decode(errors="replace")[:200]}')
-            return 0
-        size = os.path.getsize(dest_path)
+        r = subprocess.run(_sudo_wrap([
+            'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
+            f'{pgbin}/pg_dump', '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
+            '--data-only', '--column-inserts', '--disable-triggers',
+            '-f', _TAK58_EXPORT_IN_CONTAINER]),
+            capture_output=True, text=True, timeout=6 * 3600)
     except Exception as e:
         say(f'  Export failed: {str(e)[:200]}')
         return 0
+    if r.returncode != 0:
+        say(f'  Export failed: {(r.stderr or "").strip()[:300]}')
+        return 0
+    # Verify where the file is. An export with no INSERT statements is a failure even
+    # though pg_dump exited 0.
+    size, inserts = 0, -1
+    try:
+        w = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'wc', '-c',
+                                       _TAK58_EXPORT_IN_CONTAINER]),
+                           capture_output=True, text=True, timeout=300)
+        size = int((w.stdout or '0').split()[0])
+        g = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'grep', '-c',
+                                       '^INSERT INTO', _TAK58_EXPORT_IN_CONTAINER]),
+                           capture_output=True, text=True, timeout=1800)
+        inserts = int((g.stdout or '0').strip() or 0)
+    except Exception:
+        pass
     if size <= 0:
         say('  Export produced an empty file — refusing to treat that as a backup.')
         return 0
-    try:
-        g = subprocess.run(_sudo_wrap(['grep', '-c', '^INSERT INTO', dest_path]),
-                           capture_output=True, text=True, timeout=300)
-        inserts = int((g.stdout or '0').strip() or 0)
-    except Exception:
-        inserts = -1
     if inserts == 0:
         say('  Export contains no INSERT statements — the database looked empty. '
             'Refusing to continue on an export that captured nothing.')
         return 0
+    # Copy the backup out to the host. Root-side docker cp; nothing crosses the socket.
+    try:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    except PermissionError:
+        _makedirs_priv(os.path.dirname(dest_path))
+    r = subprocess.run(_sudo_wrap(['docker', 'cp', f'{container}:{_TAK58_EXPORT_IN_CONTAINER}',
+                                   dest_path]), capture_output=True, text=True, timeout=3600)
+    hsize = os.path.getsize(dest_path) if os.path.exists(dest_path) else -1
+    if r.returncode != 0 or hsize != size:
+        say(f'  Could not copy the export out of the container '
+            f'({(r.stderr or "").strip()[:160] or f"host copy is {hsize} bytes, container file is {size}"}).')
+        return 0
     say(f'  Exported {_cotdb_fmt_bytes(size)}'
-        + (f', {inserts:,} INSERT statements' if inserts > 0 else ''))
+        + (f', {inserts:,} INSERT statements' if inserts > 0 else '')
+        + f', in {int(time.time() - t0)} s')
     return size
 
 
 def _tak58_container_import(container, src_path, pw, say):
-    """Import the export into the NEW container. Returns True only if rows landed."""
+    """Import the export into the NEW container. True only if psql ran to the end.
+
+    psql exits 0 even when individual statements fail, so this reports how many were
+    rejected and what they were — but it is the caller's row-count comparison that
+    decides whether the import counts as having worked.
+    """
     pgbin = _tak58_container_pgbin(container, TAK_PG_MAJOR)
     if not pgbin:
         say(f'  {container} has no PostgreSQL {TAK_PG_MAJOR} client — cannot import into it.')
         return False
     say(f'  Copying the export into {container}…')
     r = subprocess.run(_sudo_wrap(['docker', 'cp', src_path,
-                                   f'{container}:/tmp/{_TAK58_EXPORT_NAME}']),
+                                   f'{container}:{_TAK58_EXPORT_IN_CONTAINER}']),
                        capture_output=True, text=True, timeout=3600)
     if r.returncode != 0:
         say(f'  Copy into the container failed: {(r.stderr or "").strip()[:200]}')
         return False
     say('  Importing (row-by-row — allow a long window on a large database)…')
+    t0 = time.time()
+    # Output stays inside the container: a per-row "INSERT 0 1" for every statement,
+    # or a wall of errors, would exceed the broker's response cap and kill the call.
     r = subprocess.run(_sudo_wrap([
-        'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
-        pgbin, '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
-        '-f', f'/tmp/{_TAK58_EXPORT_NAME}']), capture_output=True, text=True,
-        timeout=12 * 3600)
+        'docker', 'exec', '-e', f'PGPASSWORD={pw}', container, 'sh', '-c',
+        f'{pgbin}/psql -h localhost -U martiuser -d cot -q -v ON_ERROR_STOP=0 '
+        f'-f {_TAK58_EXPORT_IN_CONTAINER} >/tmp/cot_import.out 2>/tmp/cot_import.err']),
+        capture_output=True, text=True, timeout=12 * 3600)
     if r.returncode != 0:
-        say(f'  Import failed: {(r.stderr or "").strip()[:300]}')
+        say(f'  Import failed (psql exit {r.returncode}): {(r.stderr or "").strip()[:300]}')
         return False
+    try:
+        e = subprocess.run(_sudo_wrap([
+            'docker', 'exec', container, 'sh', '-c',
+            "grep -c 'ERROR' /tmp/cot_import.err; grep 'ERROR' /tmp/cot_import.err "
+            "| cut -c1-150 | sort | uniq -c | sort -rn | head -8"]),
+            capture_output=True, text=True, timeout=600)
+        lines = [l for l in (e.stdout or '').splitlines() if l.strip()]
+        nerr = int(lines[0].strip()) if lines and lines[0].strip().isdigit() else -1
+        if nerr > 0:
+            say(f'  {nerr:,} statement(s) were rejected during the import — the row-count '
+                f'comparison below decides whether that matters:')
+            for l in lines[1:]:
+                say('    ' + l.strip())
+    except Exception:
+        pass
+    say(f'  Import finished in {int(time.time() - t0)} s')
     return True
 
 
@@ -64132,7 +64213,8 @@ def _tak58_volume_copy(src, dst, say):
     image an EMPTY volume - PostgreSQL 18 refuses to start on a PG15 data directory,
     which is exactly why the existing run_takserver_upgrade_container() (which
     deliberately PRESERVES the volume) cannot be used for 5.8 as-is.
-    So the old data is copied aside first and never deleted.
+    So the old data is copied aside first and never deleted. The caller stops the
+    database container first so the copy is a consistent, cleanly-shut-down cluster.
     """
     r = subprocess.run(_sudo_wrap(['docker', 'volume', 'create', dst]),
                        capture_output=True, text=True, timeout=60)
@@ -64177,7 +64259,25 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
 
     stamp = time.strftime('%Y%m%d-%H%M%S')
     old_vol = f'{TAK_DB_VOLUME}_pre58_{stamp}'
-    export_path = f'{SNAPSHOT_DIR}/pre-58-container-{stamp}/{_TAK58_EXPORT_NAME}'
+    # OUTSIDE the bundle tree. On a container box /opt/tak is a symlink INTO the
+    # current bundle dir, and the rebuild below deletes that dir — an export kept
+    # under /opt/tak/snapshots would be gone before the import needed it.
+    export_path = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'pre-58-container-{stamp}',
+                               _TAK58_EXPORT_NAME)
+    _started = 'Started TAK Server messaging Microservice'
+    _msglog = '/opt/tak/logs/takserver-messaging.log'
+
+    def _messaging_starts():
+        """How many times TAK has logged its messaging start — a counter, so a restart
+        can be waited on even though the old start line is still in the file."""
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'grep', '-c',
+                                       _started, _msglog]), capture_output=True, text=True,
+                           timeout=60)
+        s = (r.stdout or '').strip()
+        return int(s) if s.isdigit() else 0
+
+    t_all = time.time()
+    t_down = None
     try:
         _say('Checking this server is ready to migrate…')
         if not _tak_is_container():
@@ -64200,21 +64300,34 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
         _say(f'  {len(before)} tables, {total_before:,} rows to move.')
 
         # 1. Export — this IS the backup, and it is verified before anything is touched.
+        #    TAK keeps serving while it runs; downtime has not started yet.
         _say('')
-        _say('Backing up before anything is changed…')
+        _say('Backing up before anything is changed (TAK Server stays up for this)…')
+        t0 = time.time()
         if not _tak58_container_export(TAK_DB_CONTAINER, export_path, pw, _say):
             return fail('Backup/export failed — refusing to migrate without one.')
+        export_secs = int(time.time() - t0)
         _say(f'  Backup: {export_path}')
 
-        # 2. Preserve the old volume. PG18 cannot start on a PG15 data dir, so the live
-        #    volume must be emptied — the copy is what makes that reversible.
+        # 2. Stop TAK. Downtime starts here. The database is stopped too so the volume
+        #    copy below is a cleanly-shut-down cluster, not a torn copy of a live one.
         _say('')
+        _say('Stopping TAK Server — downtime starts now…')
+        t_down = time.time()
+        subprocess.run(_sudo_wrap(['docker', 'stop', TAK_CONTAINER, TAK_DB_CONTAINER]),
+                       capture_output=True, timeout=300)
+
+        # 3. Preserve the old volume. PG18 cannot start on a PG15 data dir, so the live
+        #    volume must be emptied — the copy is what makes that reversible.
         _say('Preserving the PostgreSQL 15 data…')
         if not _tak58_volume_copy(TAK_DB_VOLUME, old_vol, _say):
+            subprocess.run(_sudo_wrap(['docker', 'start', TAK_DB_CONTAINER, TAK_CONTAINER]),
+                           capture_output=True, timeout=300)
             return fail('Could not preserve the PostgreSQL 15 volume — refusing to continue, '
-                        'because emptying it would then be irreversible.')
+                        'because emptying it would then be irreversible. TAK Server has been '
+                        'started again on 5.7.')
 
-        # 3. Empty the live volume so the new PG18 container initialises cleanly and
+        # 4. Empty the live volume so the new PG18 container initialises cleanly and
         #    creates the 5.8 schema.
         _say('')
         _say('Rebuilding on TAK Server 5.8…')
@@ -64223,28 +64336,41 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
         subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]),
                        capture_output=True, timeout=60)
 
-        # 4. Reuse the existing container upgrade to unpack, build and start. It preserves
+        # 5. Reuse the existing container upgrade to unpack, build and start. It preserves
         #    certs / CoreConfig / UserAuthenticationFile, which is what we want; the volume
         #    it would have preserved is already gone, so its fresh init builds 5.8's schema.
-        run_takserver_upgrade_container(zip_path)
-        if _status is not upgrade_status and upgrade_status.get('error'):
+        #    It writes the SAME status dict the Update panel polls, so it is told not to
+        #    mark the job complete — the data has not moved yet.
+        run_takserver_upgrade_container(zip_path, mark_complete=False)
+        if upgrade_status.get('error'):
             return fail('The container rebuild failed — see the output above.',
                         f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
                         f'is at {export_path}.')
+        _status.update({'running': True, 'complete': False, 'error': False})
 
-        # 5. The new DB container must be up, on 18, with the 5.8 schema already applied.
+        # 6. The new DB container must be up, on 18, with the 5.8 schema already applied.
         pg18 = _tak58_container_pgbin(TAK_DB_CONTAINER, TAK_PG_MAJOR)
         if not pg18:
             return fail(f'The new {TAK_DB_CONTAINER} is not running PostgreSQL {TAK_PG_MAJOR}.',
                         f'PostgreSQL 15 data is intact in volume {old_vol}.')
-        sv = _tak58_schema_version()
-        if sv is not None and sv < _TAK58_MIN_SCHEMA_VERSION:
+        sv = _tak58_container_schema_version(TAK_DB_CONTAINER, pg18, pw)
+        if sv is None:
+            return fail('Could not read schema_version from the new database — cannot confirm '
+                        'the 5.8 schema exists, so refusing to import into it.',
+                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        if sv < _TAK58_MIN_SCHEMA_VERSION:
             return fail(f'The new database did not build the 5.8 schema (schema_version {sv}) — '
                         f'importing data into a pre-5.8 schema would corrupt it.',
                         f'PostgreSQL 15 data is intact in volume {old_vol}.')
+        _say(f'  New database: PostgreSQL {TAK_PG_MAJOR}, schema_version {sv}.')
 
-        # 6. Import, then PROVE it by comparing counts.
+        # 7. Import with TAK stopped: it must not write to the database mid-import, and it
+        #    has to re-read everything afterwards — its caches were built on an empty schema.
         _say('')
+        _say('Loading the data into the new database…')
+        starts_before = _messaging_starts()
+        subprocess.run(_sudo_wrap(['docker', 'stop', TAK_CONTAINER]), capture_output=True,
+                       timeout=300)
         if not _tak58_container_import(TAK_DB_CONTAINER, export_path, pw, _say):
             return fail('The data import failed.',
                         f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
@@ -64264,7 +64390,31 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
                         f'PostgreSQL 15 data is intact in volume {old_vol} and the export is at '
                         f'{export_path}. Do NOT put this server into service.')
         _say(f'  Import verified: {total_after:,} rows across {len(after)} tables '
-             f'(source had {total_before:,}).')
+             f'(source had {total_before:,} across {len(before)}).')
+
+        # 8. Start TAK on the migrated data and wait for it to actually serve.
+        _say('')
+        _say('Starting TAK Server 5.8 on the migrated database…')
+        subprocess.run(_sudo_wrap(['docker', 'start', TAK_CONTAINER]), capture_output=True,
+                       timeout=120)
+        _up = False
+        for waited in range(0, 600, 10):
+            time.sleep(10)
+            if _messaging_starts() > starts_before:
+                _up = True
+                break
+            if waited and waited % 60 == 0:
+                _say(f'  ⏳ {waited // 60} min …')
+        if not _up:
+            return fail('TAK Server did not report its messaging service started within 10 '
+                        'minutes of the import.',
+                        f'The data is in the new database (verified by row count). PostgreSQL 15 '
+                        f'data is also intact in volume {old_vol}. Check `docker logs '
+                        f'{TAK_CONTAINER}`.')
+        down_secs = int(time.time() - t_down)
+        _say(f'  TAK Server is serving again. Downtime {down_secs} s '
+             f'(the {export_secs} s export ran before it, live); '
+             f'{int(time.time() - t_all)} s end to end.')
 
         _say('')
         _say(f'Migration complete. The PostgreSQL 15 data is kept in volume {old_vol} and can be '
@@ -66290,7 +66440,7 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
 
 
-def run_takserver_upgrade_container(zip_path):
+def run_takserver_upgrade_container(zip_path, mark_complete=True):
     """v10.0.1 — DATA-PRESERVING container upgrade. Rebuilds the TAK Server image from the new
     takserver-docker-*.zip and recreates the containers while KEEPING the database (the
     TAK_DB_VOLUME named volume) and the existing CA/certs + CoreConfig + UserAuthenticationFile.
@@ -66298,7 +66448,12 @@ def run_takserver_upgrade_container(zip_path):
     the old one (both inside the allowlisted bundle root) and carries certs/CoreConfig over in
     place, NEVER `docker volume rm`s the DB, and does NO cert-gen / DB re-provision. Logs to
     upgrade_log/upgrade_status (the Update panel). SACRED: the DB volume must never be removed
-    on this path — that is the whole point of an upgrade vs a redeploy."""
+    on this path — that is the whole point of an upgrade vs a redeploy.
+
+    mark_complete=False leaves upgrade_status 'running' at the end: the 5.8 container
+    migration calls this as a STEP (rebuild) and has the data import still to do, and
+    the Update panel stops polling — and reloads the page as "Update complete" — the
+    moment it sees running=False."""
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         upgrade_log.append(entry); print(entry, flush=True)
@@ -66339,6 +66494,7 @@ def run_takserver_upgrade_container(zip_path):
                         except OSError: pass
         except Exception as e:
             return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
+        _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
         entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
                    if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
                    and _tak_is_bundle_dir(os.path.join(TAK_DOCKER_ROOT, d))
@@ -66371,13 +66527,17 @@ def run_takserver_upgrade_container(zip_path):
         ulog("Step 4/6: Building new TAK Server images (minutes on arm64)...")
         _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
         if not _app_df:
-            log_step('X No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
-            return False
+            return _fail('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
             return _fail("TAK Server image build failed.")
         ulog("✓ Images built")
+        # The hardened 5.8 images run as tak:0 / postgres:0, not root, and the tree they
+        # mount was written by the console user (and the certs carried over from the old
+        # bundle keep their old ownership). Same fix as the deploy path, same reason —
+        # a no-op on the pre-hardened images, which run as root inside the container.
+        _container_own_tree(new_tak, ulog)
 
         # 5) Recreate the containers on the SAME volume + network. NO `docker volume rm`.
         ulog("Step 5/6: Recreating containers (DB volume reused)...")
@@ -66424,8 +66584,11 @@ def run_takserver_upgrade_container(zip_path):
         except Exception as _tpe:
             ulog(f"  ⚠ TAK Portal cert sync skipped: {str(_tpe)[:120]}")
         ulog("")
-        ulog("✓ Container upgrade complete — database and certificates preserved.")
-        upgrade_status.update({'running': False, 'complete': True, 'error': False})
+        if mark_complete:
+            ulog("✓ Container upgrade complete — database and certificates preserved.")
+            upgrade_status.update({'running': False, 'complete': True, 'error': False})
+        else:
+            ulog("✓ Containers rebuilt — continuing.")
     except Exception as e:
         ulog(f"✗ Container upgrade failed: {str(e)[:200]}")
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
@@ -67674,6 +67837,48 @@ def _tak_container_running(name):
 
 
 @_with_authentik_deploy_guard
+def _tak_bundle_repair_exec_bits(root, log=None):
+    """Make every .sh under an unpacked TAK docker bundle executable.
+
+    UPSTREAM PACKAGING BUG (5.8 hardened, verified 2026-09-03): several db-utils
+    scripts are recorded in the zip WITHOUT the execute bit, while their siblings
+    in the same directory have it:
+
+      -rw-rw-rw-  db-utils/configureInDocker.sh     <- the DB container's ENTRYPOINT
+      -rw-rw-rw-  db-utils/upgrade-db.sh
+      -rw-rw-rw-  db-utils/takserver-setup-db.sh
+      -rwxrwxrwx  db-utils/start.sh, configure.sh, restore-data.sh, ...
+
+    Docker execs the entrypoint directly, so the database container cannot start
+    at all: `OCI runtime create failed: exec: ".../configureInDocker.sh":
+    permission denied` (exit 126). This is not our extraction losing modes — the
+    zipfile loops faithfully restore external_attr, and the zip genuinely records
+    0666. It affects anyone deploying this bundle, not just us.
+
+    Repair it rather than special-casing filenames: every .sh in a TAK bundle is
+    meant to be runnable, and chmod +x on an already-executable file is a no-op.
+    Shared by the fresh container deploy and the container upgrade — the upgrade
+    unpacks the same bundle and would otherwise hit the same exit 126.
+    """
+    fixed = 0
+    for _root, _dirs, _files in os.walk(root):
+        for _f in _files:
+            if not _f.endswith('.sh'):
+                continue
+            _fp = os.path.join(_root, _f)
+            try:
+                _m = os.stat(_fp).st_mode
+                if not (_m & 0o111):
+                    os.chmod(_fp, _m | 0o755 & 0o7777)
+                    fixed += 1
+            except OSError:
+                pass
+    if fixed and log:
+        log(f"  repaired {fixed} bundle script(s) shipped without the execute bit "
+            f"(upstream packaging issue — the DB container entrypoint is one of them)")
+    return fixed
+
+
 def _deploy_takserver_container(config):
     """v10.0.1 — Deploy TAK Server as Docker containers from the official
     takserver-docker-*.zip. Used on arm64 (forced — no native arm TAK package)
@@ -67733,39 +67938,7 @@ def _deploy_takserver_container(config):
         except Exception as _ze:
             log_step(f"✗ Failed to extract the takserver-docker bundle: {str(_ze)[:200]}")
             deploy_status.update({'error': True, 'running': False}); return
-        # UPSTREAM PACKAGING BUG (5.8 hardened, verified 2026-09-03): several db-utils
-        # scripts are recorded in the zip WITHOUT the execute bit, while their siblings
-        # in the same directory have it:
-        #
-        #   -rw-rw-rw-  db-utils/configureInDocker.sh     <- the DB container's ENTRYPOINT
-        #   -rw-rw-rw-  db-utils/upgrade-db.sh
-        #   -rw-rw-rw-  db-utils/takserver-setup-db.sh
-        #   -rwxrwxrwx  db-utils/start.sh, configure.sh, restore-data.sh, ...
-        #
-        # Docker execs the entrypoint directly, so the database container cannot start
-        # at all: `OCI runtime create failed: exec: ".../configureInDocker.sh":
-        # permission denied` (exit 126). This is not our extraction losing modes — the
-        # loop above faithfully restores external_attr, and the zip genuinely records
-        # 0666. It affects anyone deploying this bundle, not just us.
-        #
-        # Repair it rather than special-casing filenames: every .sh in a TAK bundle is
-        # meant to be runnable, and chmod +x on an already-executable file is a no-op.
-        _fixed = 0
-        for _root, _dirs, _files in os.walk(TAK_DOCKER_ROOT):
-            for _f in _files:
-                if not _f.endswith('.sh'):
-                    continue
-                _fp = os.path.join(_root, _f)
-                try:
-                    _m = os.stat(_fp).st_mode
-                    if not (_m & 0o111):
-                        os.chmod(_fp, _m | 0o755 & 0o7777)
-                        _fixed += 1
-                except OSError:
-                    pass
-        if _fixed:
-            log_step(f"  repaired {_fixed} bundle script(s) shipped without the execute bit "
-                     f"(upstream packaging issue — the DB container entrypoint is one of them)")
+        _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, log_step)
         # Ownership is fixed AFTER the images exist (see the cert step) - it is done
         # from inside a root container, which cannot run before the image is built.
         # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
