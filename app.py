@@ -62903,13 +62903,17 @@ def upload_takserver_package():
                 return jsonify({'error': f'.rpm uploaded but system is {os_type}. Need a takserver .deb.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'rpm', 'size_mb': sz})
         elif fn.endswith('.zip') and 'docker' in fn.lower():
-            # official takserver-docker-*.zip — the CONTAINER path. amd64 must use its
-            # native package (.deb/.rpm); arm64 is container-only here, so it takes the
-            # zip. (The TAK deb/rpm are arch-neutral — _all/.noarch — but arm64 deploys
-            # via the container path: it's the supported, field-validated arm path.)
-            if _arch != 'arm64':
-                os.remove(fp)
-                return jsonify({'error': f'Docker .zip uploaded but this is an amd64 {os_type} system — upload the native takserver {_native_ext}. (The docker .zip is the arm64 path.)'}), 400
+            # official takserver-docker-*.zip - the CONTAINER path.
+            #
+            # v10.2.0: amd64 may now upload this. The container path was always
+            # described as "arm64, or operator-selected on amd64" (see the block
+            # comment by TAK_CONTAINER) and the deploy route has always honoured an
+            # explicit install_method='container' on any arch - but this validation
+            # rejected the only artifact that path needs, so on amd64 it was
+            # unreachable through the UI. The two now agree.
+            #
+            # arm64 remains container-ONLY, enforced above: .deb and .rpm are still
+            # rejected there. This widens amd64; it does not loosen arm64.
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'docker', 'size_mb': sz})
         elif fn.endswith('.key') or 'gpg' in fn.lower():
             results['gpg_key'] = {'filename': fn, 'filepath': fp, 'size_mb': sz}
