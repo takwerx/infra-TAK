@@ -63535,6 +63535,100 @@ def _tak58_log(msg):
     tak58_log.append(msg)
 
 
+# ── 5.8 schema verification + the EL md5->scram heal (v10.2.0) ──────────────
+# `upgrade-db.sh` exits 0 and prints "Database updated with SchemaManager.jar"
+# EVEN WHEN SchemaManager failed. Measured on Rocky 9.8, 2026-09-03: SchemaManager
+# logged `FATAL: password authentication failed for user "martiuser"`, the script
+# still exited 0, and the console reported "Migration complete" over a database
+# still on schema_version 99. TAK Server 5.8 was left running against a 5.7 schema
+# — a broken server that reports healthy.
+#
+# So the exit code is not evidence. We ask the database instead.
+_TAK58_MIN_SCHEMA_VERSION = 100     # V100 adds flow_tags/username to cot_router
+
+
+def _tak58_schema_version():
+    """Highest successfully-applied TAK schema version, or None if unreadable."""
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'cot', '-c',
+                      'select coalesce(max(version::int), 0) from schema_version where success'],
+                     timeout=60)
+        if r and r.returncode == 0 and (r.stdout or '').strip().isdigit():
+            return int(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _tak58_heal_md5_scram(say):
+    """Re-hash the TAK DB password under scram-sha-256, then re-run TAK's schema setup.
+
+    ROOT CAUSE (EL only, measured on Rocky 9.8 2026-09-03): TAK's 5.8 package installs
+    a pg_hba.conf demanding `scram-sha-256`, but `pg_upgrade` carries the old cluster's
+    password over as an **md5 hash**, and an md5 hash cannot satisfy scram — there is no
+    way to derive a scram verifier from it. So martiuser cannot authenticate to the new
+    cluster and SchemaManager silently fails. Debian escapes this because
+    `pg_upgradecluster` keeps the old cluster's pg_hba (md5), so nothing changes.
+
+    Re-issuing ALTER USER ... PASSWORD with password_encryption=scram-sha-256 stores a
+    scram verifier for the SAME password, which is why this needs no new credential and
+    changes nothing the operator has to know about. The password is read from CoreConfig
+    and never logged.
+    """
+    try:
+        cc = _read_coreconfig() or ''
+    except Exception:
+        cc = ''
+    m = re.search(r'<connection[^>]*password="([^"]+)"', cc)
+    if not m:
+        say('  Could not read the database password from CoreConfig.xml — cannot repair '
+            'authentication automatically.')
+        return False
+    pw = m.group(1)
+    say('  The new cluster requires scram-sha-256 but the migrated password is an md5 hash, '
+        'so TAK could not authenticate to update the schema. Re-encoding the same password '
+        'under scram-sha-256…')
+    try:
+        # Console-authored SQL only. The password is parameterised through psql's own
+        # quoting via a dollar-quoted literal chosen not to collide with the value.
+        tag = '$tak58pw$'
+        if tag.strip('$') in pw:
+            say('  Password contains the quoting tag — refusing to build this statement.')
+            return False
+        r = _pg_exec(['psql', '-q', '-d', 'postgres', '-c',
+                      "SET password_encryption = 'scram-sha-256'; "
+                      "ALTER USER martiuser PASSWORD %s%s%s;" % (tag, pw, tag)], timeout=60)
+        if not r or r.returncode != 0:
+            say('  Could not re-encode the password: %s'
+                % ((getattr(r, 'stderr', '') or '').strip()[:200]))
+            return False
+    except Exception as e:
+        say('  Could not re-encode the password: %s' % str(e)[:200])
+        return False
+    say('  Re-running TAK\'s database setup…')
+    rc = _tak58_run_setup_db()
+    if rc != 0:
+        say('  TAK database setup returned %d after the password repair.' % rc)
+    return True
+
+
+def _tak58_run_setup_db(timeout_sec=3600):
+    """Run TAK's takserver-setup-db.sh (which runs SchemaManager). Returns exit code."""
+    script = '/opt/tak/db-utils/takserver-setup-db.sh'
+    if not os.path.exists(script):
+        return 127
+    if _broker_should_route() and _broker_available():
+        try:
+            resp = _broker_request({'op': 'tak58_setup_db', 'timeout': timeout_sec},
+                                   timeout=timeout_sec + 60)
+            return int(resp.get('returncode') or (0 if resp.get('ok') else 1))
+        except Exception:
+            return 1
+    r = subprocess.run(_sudo_wrap(['sh', script]), capture_output=True, text=True,
+                       timeout=timeout_sec)
+    return r.returncode
+
+
 def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
     """Run the vendor's upgrade-db.sh and stream it. Returns its exit code.
 
@@ -63683,6 +63777,25 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
         if rc != 0:
             return fail('The database migration failed (exit %d). See the output above.' % rc,
                         wedged=True)
+
+        # The vendor script's exit code is NOT evidence that the schema updated — it
+        # exits 0 even when SchemaManager failed to authenticate. Ask the database.
+        _sv = _tak58_schema_version()
+        if _sv is not None and _sv < _TAK58_MIN_SCHEMA_VERSION:
+            _say('')
+            _say('The database migrated but the 5.8 schema updates did not apply '
+                 '(schema_version %d). Repairing…' % _sv)
+            _tak58_heal_md5_scram(_say)
+            _sv2 = _tak58_schema_version()
+            if _sv2 is None or _sv2 < _TAK58_MIN_SCHEMA_VERSION:
+                return fail('The 5.8 schema updates could not be applied (schema_version %s). '
+                            'TAK Server 5.8 must NOT be run against a pre-5.8 schema — it will '
+                            'appear healthy and behave incorrectly. See the output above.'
+                            % (_sv2 if _sv2 is not None else 'unknown'), wedged=True)
+            _say('  Schema updates applied — now at version %d.' % _sv2)
+        elif _sv is None:
+            _say('  WARNING: could not read schema_version to confirm the 5.8 schema updates '
+                 'applied. Verify by hand before putting this server back in service.')
 
         # Finish the package. On Debian the 5.8 install DELIBERATELY exits non-zero on a
         # PG-15 box ("A pg15 install has been detected…"), so dpkg is left holding a
