@@ -30,6 +30,7 @@ docs/*
 !docs/AUTHENTIK-LOGIN-BRANDING.md
 !docs/RELAY-SETUP.md
 !docs/DDNS-SETUP.md
+!docs/MODULE-DEVELOPMENT.md
 memory-bank/
 .cursor/
 .cursorrules
