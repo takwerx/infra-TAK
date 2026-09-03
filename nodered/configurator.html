@@ -307,6 +307,18 @@
     <div id="layerStatus"></div>
   </div>
 
+  <!-- Step 2b: per-layer overrides (v10.1.56 W1-UI) -->
+  <div class="step disabled" id="step2b">
+    <h2>2b. Layer Setup <span style="font-size:0.75rem;color:#64748b;font-weight:400">— per-layer overrides</span></h2>
+    <label>Layers of one service can carry different schemas. Anything you set here overrides the
+    config-level values from steps 3 / 3b / 3c <em>for that layer only</em>. Leave a field blank to
+    use the config-level value. A layer may appear more than once with different settings — use
+    <strong>Duplicate</strong> to split one layer into two feeds (e.g. points classed by intensity,
+    and the same layer's other categories classed by category).</label>
+    <div id="layerSetupCards" style="margin-top:0.8rem"></div>
+    <div id="layerSetupNote" style="margin-top:0.6rem;font-size:0.78rem;color:#64748b"></div>
+  </div>
+
   <!-- Step 3 -->
   <div class="step disabled" id="step3">
     <h2>3. Field Mapping</h2>
@@ -1631,7 +1643,7 @@ function pickIcon(iconsetpath, type2525b, label, b64) {
 
 /** Point layers: hide uniform icon row when class mapping is on; keep Step 4 (TTL, labels, remarks) visible. */
 function updatePointStyleNoteVisibility() {
-  var isPoint = state.geometryType === 'esriGeometryPoint';
+  var isPoint = !anyNonPointLayer();
   var cf = (document.getElementById('classField') || {}).value;
   var useClassMapping = !!cf;
   if (!isPoint) {
@@ -1705,11 +1717,57 @@ function decodeVal(field, v) {
 
 // Geometry type ('Point' | 'Polygon' | 'Polyline' | ...) for a given class value, honoring multi-layer (per-layer geometry).
 function classGeom(v) {
+  // v10.1.56 W1-UI: with a per-layer classField the class keys are FIELD VALUES
+  // ('IR Heat Perimeter'), not layer names, so the layerName match below finds
+  // nothing and the edit panel renders neither point nor polygon styling. Both
+  // autoPopulateLayerClasses() and loadLayerClassValues() stamp geometryType onto
+  // the mapping itself, so trust that first.
+  var m = (state.classMappings || {})[v];
+  if (m && m.geometryType) return String(m.geometryType).replace('esriGeometry', '');
+  // Configs saved before geometryType was stamped on class mappings (and any config
+  // whose class keys are FIELD VALUES rather than layer names) have nothing to match
+  // on. The CoT type is a reliable tell for points at least: b-m-p-* is a Spot Map,
+  // a-* is an atom. u-d-f is a drawn shape but does not say polygon vs polyline, so
+  // that case still falls through to the layer scan below.
+  if (m && m.cotType) {
+    var ct = String(m.cotType);
+    if (ct.indexOf('b-m-p') === 0 || ct.indexOf('a-') === 0) return 'Point';
+  }
   if (state.selectedLayers && state.selectedLayers.length > 1) {
     var lyr = state.selectedLayers.find(function(x) { return x.layerName === v; });
-    return lyr ? (lyr.geometryType || '').replace('esriGeometry', '') : '';
+    if (lyr) return (lyr.geometryType || '').replace('esriGeometry', '');
+    // A class key that is a FIELD VALUE usually appears verbatim in exactly one
+    // layer entry's WHERE clause, because that is how the layer was scoped to it
+    // (e.g. FeatureCategory IN ('IR Heat Perimeter','IR Intense Heat',...) on the
+    // polygon entry, and the line entry carries 'Mopup Buffer'). Free, no round
+    // trip, and it is the only thing that separates Polygon from Polyline for a
+    // config saved before geometryType was stamped on class mappings.
+    var hits = state.selectedLayers.filter(function(x) {
+      return x.where && String(x.where).indexOf("'" + v + "'") !== -1;
+    });
+    if (hits.length === 1) return (hits[0].geometryType || '').replace('esriGeometry', '');
+    if (hits.length > 1) {
+      var k = {}; hits.forEach(function(x) { k[x.geometryType || ''] = 1; });
+      if (Object.keys(k).length === 1) return Object.keys(k)[0].replace('esriGeometry', '');
+    }
+    // unknown key on a multi-layer config: if every layer is the same kind, use it
+    var kinds = {};
+    state.selectedLayers.forEach(function(x) { kinds[x.geometryType || ''] = 1; });
+    var only = Object.keys(kinds);
+    if (only.length === 1) return only[0].replace('esriGeometry', '');
+    return '';
   }
   return (state.geometryType || '').replace('esriGeometry', '');
+}
+
+/** True when ANY selected layer is non-point. A multi-layer config whose PRIMARY
+    layer is a point still needs the polygon/line style controls — UASWFC's first
+    layer is IRPoint while layers 1 and 2 are polygon and polyline, and keying the
+    controls off the primary layer alone hid fill/stroke for the whole config. */
+function anyNonPointLayer() {
+  var L = state.selectedLayers || [];
+  if (L.length > 1) return L.some(function(x) { return x.geometryType !== 'esriGeometryPoint'; });
+  return state.geometryType !== 'esriGeometryPoint';
 }
 
 function renderClassMappings() {
@@ -1731,21 +1789,37 @@ function renderClassMappings() {
         ? '<img src="data:image/png;base64,' + m.iconB64 + '" style="width:22px;height:22px;object-fit:contain;vertical-align:middle">'
         : '<span style="color:#555;font-size:0.75rem">no icon</span>';
       var colorDot = m.color
-        ? '<span style="display:inline-block;width:14px;height:14px;background:' + m.color + ';border-radius:50%;vertical-align:middle;border:1px solid #555"></span>'
+        ? '<span title="' + m.color + '" style="display:inline-block;width:14px;height:14px;background:' + m.color + ';border-radius:50%;vertical-align:middle;border:1px solid #555"></span>'
         : '<span style="color:#555;font-size:0.7rem">none</span>';
-      styleChip = iconThumb + ' ' + colorDot;
+      styleChip = (m.iconB64 ? iconThumb + ' ' : '') + colorDot;
     } else {
       var uStroke = (document.getElementById('strokeColor') || {}).value || '#FF0000';
       var uFill = (document.getElementById('fillColor') || {}).value || '#FF0000';
       var sC = (m.strokeColor != null && m.strokeColor !== '') ? m.strokeColor : uStroke;
-      styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:14px;height:14px;background:transparent;border:2px solid ' + sC + ';border-radius:3px;vertical-align:middle"></span>';
+      if (gm === 'Polyline') {
+        // a line is a line — a bordered box reads as a polygon and misleads
+        styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:18px;height:0;border-top:3px solid ' + sC + ';vertical-align:middle"></span>';
+      } else {
+        styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:14px;height:14px;background:transparent;border:2px solid ' + sC + ';border-radius:3px;vertical-align:middle"></span>';
+      }
       if (gm === 'Polygon') {
         var fC = (m.fillColor != null && m.fillColor !== '') ? m.fillColor : uFill;
         styleChip += ' <span title="fill ' + fC + '" style="display:inline-block;width:14px;height:14px;background:' + fC + ';opacity:0.6;border-radius:3px;vertical-align:middle"></span>';
       }
     }
+    // v10.1.56 W1-UI: name the geometry outright. A mixed-geometry config puts points,
+    // polygons and lines in one flat list and the swatch alone is easy to misread at a
+    // glance — especially a thin line against a box border.
+    var geomTag = '';
+    if (gm) {
+      var gLabel = (gm === 'Point' || gm === 'MultiPoint') ? 'POINT'
+                 : (gm === 'Polyline' ? 'LINE' : (gm === 'Polygon' ? 'POLY' : gm.toUpperCase()));
+      var gColor = gLabel === 'POINT' ? '#2ec4b6' : (gLabel === 'LINE' ? '#f59e0b' : '#94a3b8');
+      geomTag = '<span style="font-size:0.62rem;font-weight:700;letter-spacing:0.05em;color:' + gColor +
+                ';border:1px solid ' + gColor + ';border-radius:3px;padding:1px 4px;flex-shrink:0">' + gLabel + '</span>';
+    }
     var rmkCount = (m.remarksFields && m.remarksFields.length) || 0;
-    var summary = styleChip
+    var summary = geomTag + ' ' + styleChip
       + (m.customLabel ? ' <span style="color:#94a3b8;font-size:0.75rem">' + m.customLabel + '</span>' : '')
       + (m.cotType ? ' <span style="color:#666;font-size:0.7rem">' + m.cotType + '</span>' : '')
       + (rmkCount ? ' <span style="color:#666;font-size:0.7rem">' + rmkCount + ' remarks</span>' : '');
@@ -2577,11 +2651,13 @@ async function fetchSelectedLayers() {
     });
     document.getElementById('btnClassLoad').disabled = false;
 
-    document.getElementById('polyStyleFields').style.display = isPoint ? 'none' : '';
+    document.getElementById('polyStyleFields').style.display = anyNonPointLayer() ? '' : 'none';
     updatePointStyleNoteVisibility();
 
     if (multiLayer) {
       autoPopulateLayerClasses();
+      enable('2b');
+      renderLayerSetup();
     }
 
     enable(3); enable('3b'); enable('3c'); enable(4); enable(5);
@@ -2590,6 +2666,225 @@ async function fetchSelectedLayers() {
   } finally {
     setLoading('btnLoadLayers', false);
   }
+}
+
+/* ── Step 2b: per-layer overrides (v10.1.56 W1-UI) ─────────────────────────────
+   The engine resolves every one of these as "layer entry value, else config-level
+   value" (build-flows.js FN_BUILD_QUERY), so the UI mirrors that: blank here means
+   fall through to steps 3/3b/3c. A single-layer config never sees this step and
+   behaves exactly as before.
+
+   Why this exists: UASWFC_IR_Viewer needs FOUR different (timeField, classField,
+   where) triples off ONE service — its three layers use PointDateTime /
+   PolygonDateTime / LineDateTime, and its IRLine layer has CreateDate AND
+   DateCurrent 100% NULL, so no single config-level timeField works. Before this,
+   that meant four separate configs for one feed into one mission. */
+
+function _lyrFieldsFor(lyr) {
+  // state.layerFields is keyed by the layer's ORIGINAL name from service discovery.
+  // Entries here can be renamed (to tell duplicates apart) and duplicated, so a
+  // name lookup alone orphans the schema the moment a user renames an entry.
+  // Resolve by name first, then fall back to any sibling entry with the same
+  // layerId whose original name is still in the map, then the primary layer.
+  var LF = state.layerFields || {};
+  if (LF[lyr.layerName]) return LF[lyr.layerName];
+  var sibs = (state.selectedLayers || []).filter(function(x) { return x.layerId === lyr.layerId; });
+  for (var i = 0; i < sibs.length; i++) if (LF[sibs[i].layerName]) return LF[sibs[i].layerName];
+  var byId = (state.layers || []).filter(function(x) { return x.id === lyr.layerId; })[0];
+  if (byId && LF[byId.name]) return LF[byId.name];
+  return state.fields || [];
+}
+function _lyrOpts(lyr, cur, types) {
+  var out = '<option value="">(use config-level)</option>';
+  _lyrFieldsFor(lyr).forEach(function(f) {
+    if (types && types.indexOf(f.type) === -1) return;
+    var sel = (String(cur || '') === f.name) ? ' selected' : '';
+    out += '<option value="' + f.name + '"' + sel + '>' + f.name +
+           ' (' + f.type.replace('esriFieldType', '') + ')</option>';
+  });
+  return out;
+}
+var _DATE_T   = ['esriFieldTypeDate'];
+var _CLASS_T  = ['esriFieldTypeString', 'esriFieldTypeSmallInteger', 'esriFieldTypeInteger'];
+
+function renderLayerSetup() {
+  var host = document.getElementById('layerSetupCards');
+  var note = document.getElementById('layerSetupNote');
+  if (!host) return;
+  var L = state.selectedLayers || [];
+  if (L.length < 2) {
+    host.innerHTML = '<div style="color:#64748b;font-size:0.85rem">Single layer — nothing to override. ' +
+                     'Steps 3 / 3b / 3c apply directly.</div>';
+    if (note) note.textContent = '';
+    return;
+  }
+  var html = '';
+  L.forEach(function(lyr, i) {
+    var geom = (lyr.geometryType || '').replace('esriGeometry', '') || '?';
+    var dup  = L.filter(function(x) { return x.layerId === lyr.layerId; }).length > 1;
+    html +=
+      '<div style="border:1px solid #1a1a4e;border-radius:8px;padding:0.8rem;margin-bottom:0.7rem;background:#0d0d2b">' +
+        '<div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">' +
+          '<strong style="color:#2ec4b6">' + (lyr.layerName || ('Layer ' + lyr.layerId)) + '</strong>' +
+          '<span style="font-size:0.7rem;color:#64748b">layer ' + lyr.layerId + ' · ' + geom + '</span>' +
+          (dup ? '<span title="This layer ID is used by more than one entry — each with its own filter and class field. Created with the Duplicate button." style="font-size:0.7rem;color:#f59e0b">· shares layer ' + lyr.layerId + ' with another entry</span>' : '') +
+          '<span style="flex:1"></span>' +
+          '<button onclick="dupLayerEntry(' + i + ')" style="font-size:0.72rem;padding:0.25rem 0.6rem">Duplicate</button>' +
+          (L.length > 1 ? '<button onclick="rmLayerEntry(' + i + ')" style="font-size:0.72rem;padding:0.25rem 0.6rem;background:#7f1d1d">Remove</button>' : '') +
+        '</div>' +
+        '<div class="field-grid">' +
+          '<div><label>Entry name</label>' +
+            '<input type="text" value="' + String(lyr.layerName || '').replace(/"/g, '&quot;') + '" ' +
+            'oninput="setLyr(' + i + ',\'layerName\',this.value)" ' +
+            'title="Must be unique — it separates duplicate entries of the same layer in the UID"></div>' +
+          '<div><label>Time field</label><select onchange="setLyr(' + i + ',\'timeField\',this.value)">' +
+            _lyrOpts(lyr, lyr.timeField, _DATE_T) + '</select></div>' +
+          '<div><label>Class field</label>' +
+            '<div style="display:flex;gap:0.3rem">' +
+              '<select style="flex:1" onchange="setLyr(' + i + ',\'classField\',this.value);renderLayerSetup()">' +
+              _lyrOpts(lyr, lyr.classField, _CLASS_T) + '</select>' +
+              (lyr.classField ? '<button onclick="loadLayerClassValues(' + i + ')" style="font-size:0.72rem;padding:0.25rem 0.5rem;white-space:nowrap">Load values</button>' : '') +
+            '</div></div>' +
+        '</div>' +
+        '<div style="margin-top:0.5rem"><label>WHERE clause for this layer</label>' +
+          '<input type="text" placeholder="(use config-level filter)" ' +
+          'value="' + String(lyr.where || '').replace(/"/g, '&quot;') + '" ' +
+          'oninput="setLyr(' + i + ',\'where\',this.value)" style="width:100%;font-family:monospace;font-size:0.78rem"></div>' +
+        '<div class="field-grid" style="margin-top:0.5rem">' +
+          '<div><label>Deduplicate by</label>' +
+            '<input type="text" placeholder="(none) — comma-separate for a composite key" ' +
+            'value="' + (Array.isArray(lyr.dedupField) ? lyr.dedupField.join(', ') : String(lyr.dedupField || '')).replace(/"/g, '&quot;') + '" ' +
+            'oninput="setLyrDedup(' + i + ',this.value)" style="width:100%"></div>' +
+          '<div><label>Keep all rows at the winning timestamp</label>' +
+            '<select onchange="setLyr(' + i + ',\'dedupKeepAll\',this.value===\'true\')">' +
+              '<option value="false"' + (lyr.dedupKeepAll ? '' : ' selected') + '>No — collapse to one row</option>' +
+              '<option value="true"'  + (lyr.dedupKeepAll ? ' selected' : '') + '>Yes — multi-feature product</option>' +
+            '</select></div>' +
+        '</div>' +
+      '</div>';
+  });
+  host.innerHTML = html;
+  var names = L.map(function(x) { return x.layerName; });
+  var clash = names.some(function(n, i) { return names.indexOf(n) !== i; });
+  if (note) {
+    note.innerHTML = clash
+      ? '<span style="color:#f87171">Two entries share a name — give each a unique Entry name or their features will collide on the same UID.</span>'
+      : L.length + ' layer entries. Blank fields fall back to steps 3 / 3b / 3c.';
+  }
+}
+
+function setLyr(i, k, v) {
+  if (!state.selectedLayers[i]) return;
+  var _old = state.selectedLayers[i].layerName;
+  if (v === '' || v == null) delete state.selectedLayers[i][k];
+  else state.selectedLayers[i][k] = v;
+  if (k === 'layerName') {
+    // carry the schema across to the new key so the dropdowns keep working
+    if (state.layerFields && _old && state.layerFields[_old] && v && !state.layerFields[v]) {
+      state.layerFields[v] = state.layerFields[_old];
+    }
+    var note = document.getElementById('layerSetupNote');
+    var names = state.selectedLayers.map(function(x) { return x.layerName; });
+    var clash = names.some(function(n, j) { return names.indexOf(n) !== j; });
+    if (note) note.innerHTML = clash
+      ? '<span style="color:#f87171">Two entries share a name — give each a unique Entry name or their features will collide on the same UID.</span>'
+      : state.selectedLayers.length + ' layer entries. Blank fields fall back to steps 3 / 3b / 3c.';
+  }
+}
+function setLyrDedup(i, v) {
+  if (!state.selectedLayers[i]) return;
+  var parts = String(v || '').split(',').map(function(x) { return x.trim(); }).filter(Boolean);
+  if (parts.length === 0) delete state.selectedLayers[i].dedupField;
+  else if (parts.length === 1) state.selectedLayers[i].dedupField = parts[0];
+  else state.selectedLayers[i].dedupField = parts;
+}
+function dupLayerEntry(i) {
+  var src = state.selectedLayers[i];
+  if (!src) return;
+  var copy = JSON.parse(JSON.stringify(src));
+  copy.layerName = String(src.layerName || ('Layer ' + src.layerId)) + ' (2)';
+  state.selectedLayers.splice(i + 1, 0, copy);
+  // the copy shares the source layer's schema, keyed by name
+  if (state.layerFields && state.layerFields[src.layerName]) {
+    state.layerFields[copy.layerName] = state.layerFields[src.layerName];
+  }
+  renderLayerSetup();
+}
+function rmLayerEntry(i) {
+  if (!state.selectedLayers || state.selectedLayers.length <= 1) return;
+  state.selectedLayers.splice(i, 1);
+  renderLayerSetup();
+}
+
+/* Best-effort: give every class mapping a geometryType by asking each layer entry
+   which values its classField actually holds. Heuristics (cotType, WHERE-clause
+   containment) cover most cases for free, but not all — a layer entry with a
+   classField and NO category filter, like UASWFC's line layer, names none of its
+   values anywhere in the config, so 'Mopup Buffer' is unresolvable without asking.
+   One request per layer entry that has a classField, only when something is still
+   unknown, and the result is persisted the next time the config is saved. Failures
+   are ignored: this only sharpens a UI swatch. */
+async function stampClassGeometry() {
+  var L = (state.selectedLayers || []).filter(function(x) { return x.classField; });
+  if (!L.length) return;
+  var unknown = Object.keys(state.classMappings || {}).filter(function(k) {
+    return k !== '_default' && !(state.classMappings[k] || {}).geometryType && !classGeom(k);
+  });
+  if (!unknown.length) return;
+  for (var i = 0; i < L.length; i++) {
+    var lyr = L[i];
+    try {
+      var res = await fetch('/arcgis-tak/arcgis/distinct', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: state.serviceUrl, layerId: lyr.layerId, field: lyr.classField })
+      });
+      var data = await res.json();
+      if (data.error) continue;
+      (data.values || []).forEach(function(v) {
+        var k = v != null ? String(v).trim() : '';
+        if (!k) return;
+        var m = state.classMappings[k];
+        if (m && !m.geometryType) { m.geometryType = lyr.geometryType; m.layerId = lyr.layerId; }
+      });
+    } catch (e) { /* best effort */ }
+  }
+  renderClassMappings();
+}
+
+/* Load distinct values for ONE layer entry's classField and merge them into the
+   class map, so step 3c can style them. Without this a per-layer classField is
+   settable but unusable: step 3c's loader only ever queries the primary layer. */
+async function loadLayerClassValues(i) {
+  var lyr = state.selectedLayers[i];
+  if (!lyr || !lyr.classField) { alert('Set a Class field for this layer first.'); return; }
+  try {
+    var res = await fetch('/arcgis-tak/arcgis/distinct', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: state.serviceUrl, layerId: lyr.layerId, field: lyr.classField })
+    });
+    var data = await res.json();
+    if (data.error) { alert('Error: ' + data.error); return; }
+    var vals = (data.values || []).map(function(v) { return v != null ? String(v).trim() : ''; });
+    var added = 0, blank = false;
+    vals.forEach(function(v) {
+      if (!v) { blank = true; return; }
+      if (state.classValues.indexOf(v) === -1) { state.classValues.push(v); added++; }
+      if (!state.classMappings[v]) {
+        state.classMappings[v] = { enabled: true, cotType: '', iconsetpath: '', color: '',
+                                   layerId: lyr.layerId, geometryType: lyr.geometryType };
+      }
+    });
+    // A blank class value is real data, not an error — it resolves to classes._default
+    // at render time (UASWFC: 716 of 761 heat points carry no IntensityClass).
+    if (blank && !state.classMappings._default) {
+      state.classMappings._default = { enabled: true, cotType: '', iconsetpath: '', color: '' };
+    }
+    renderClassMappings();
+    var note = document.getElementById('layerSetupNote');
+    if (note) note.textContent = 'Loaded ' + added + ' class value(s) from ' + lyr.classField +
+      ' on ' + lyr.layerName + (blank ? ' — blank values present, styled by _default.' : '.') +
+      ' Style them in step 3c.';
+  } catch (e) { alert('Failed: ' + e.message); }
 }
 
 function autoPopulateLayerClasses() {
@@ -4483,9 +4778,14 @@ function resetForm() {
   document.getElementById('kmlSaveStatus').textContent = '';
   document.getElementById('kmlConfigOutput').textContent = '';
 
-  ['step2','step3','step3b','step4','step5'].forEach(function(id) {
-    document.getElementById(id).classList.add('disabled');
+  // v10.1.56 W1-UI: step3c was missing from this list — after a reset the Class
+  // Mapping step stayed interactive with stale content from the previous config.
+  ['step2','step2b','step3','step3b','step3c','step4','step5'].forEach(function(id) {
+    var _el = document.getElementById(id);
+    if (_el) _el.classList.add('disabled');
   });
+  var _ls = document.getElementById('layerSetupCards'); if (_ls) _ls.innerHTML = '';
+  var _ln = document.getElementById('layerSetupNote');  if (_ln) _ln.textContent = '';
 
   document.getElementById('svcStatus').innerHTML = '';
   document.getElementById('layerStatus').innerHTML = '';
@@ -4741,6 +5041,25 @@ async function selectConfig(idx) {
     });
     onLayerCheck();
     await fetchSelectedLayers();
+    // v10.1.56 W1-UI: fetchSelectedLayers() REBUILDS state.selectedLayers from live
+    // service metadata — three keys only — so every per-layer override, and any
+    // duplicate entry of the same layerId, is destroyed by the call above. Restore
+    // the saved array wholesale; it is the authoritative record and already carries
+    // layerId/layerName/geometryType. Without this, reopening a saved multi-layer
+    // config silently drops it back to one entry per layer with no overrides.
+    state.selectedLayers = JSON.parse(JSON.stringify(c.source.layers));
+    // duplicate entries share the source layer's schema, which is keyed by name
+    state.selectedLayers.forEach(function(lyr) {
+      if (state.layerFields && !state.layerFields[lyr.layerName]) {
+        var byId = (c.source.layers || []).filter(function(x) { return x.layerId === lyr.layerId; });
+        for (var k = 0; k < byId.length; k++) {
+          if (state.layerFields[byId[k].layerName]) { state.layerFields[lyr.layerName] = state.layerFields[byId[k].layerName]; break; }
+        }
+        if (!state.layerFields[lyr.layerName]) state.layerFields[lyr.layerName] = state.fields || [];
+      }
+    });
+    enable('2b');
+    renderLayerSetup();
   } else if (c.source.layerId != null) {
     var cb = document.querySelector('.layerCb[value="' + c.source.layerId + '"]');
     if (cb) cb.checked = true;
@@ -4838,6 +5157,8 @@ async function selectConfig(idx) {
     }
     state.classValues = Object.keys(state.classMappings).filter(function(k) { return k !== '_default'; });
     renderClassMappings();
+    // fills in any geometryType the free heuristics could not resolve, then re-renders
+    stampClassGeometry();
   } else {
     state.classMappings = {};
     state.classValues = [];

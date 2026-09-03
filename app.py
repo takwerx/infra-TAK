@@ -964,7 +964,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.56-alpha"
+VERSION = "10.1.59-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -13416,6 +13416,9 @@ def _run_remote_assist_deploy(settings):
         plog('━━━ Step 3/6: Cloning Repository ━━━')
         if os.path.isdir(os.path.join(ra_dir, '.git')):
             plog(f'  Repo already at {ra_dir} — pulling latest...')
+            _h, _he = _module_checkout_ownership_selfheal(ra_dir, plog=plog)
+            if _he:
+                plog(f'  ownership self-heal did not complete: {_he}')
             _remote_assist_restore_tracked_files(ra_dir)
             r = _sp.run(['git', '-C', ra_dir, 'pull', '--ff-only'], capture_output=True, text=True, timeout=120)
             plog((r.stdout + r.stderr).strip() or '(no output)')
@@ -13666,6 +13669,9 @@ def _run_remote_assist_update():
     try:
         settings = load_settings()
         plog('━━━ Step 1/5: Pulling latest source ━━━')
+        _h, _he = _module_checkout_ownership_selfheal(ra_dir, plog=plog)
+        if _he:
+            plog(f'  ownership self-heal did not complete: {_he}')
         _remote_assist_restore_tracked_files(ra_dir)
         # Ensure remote URL is correct (handles repository rename)
         _sp.run(['git', '-C', ra_dir, 'remote', 'set-url', 'origin', REMOTE_ASSIST_REPO],
@@ -20761,7 +20767,6 @@ def _guarddog_spiral_correlation_check(cl_waiting):
             pass
 
 
-@app.route('/api/guarddog/send-alert-email', methods=['POST'])
 def _guarddog_alert_recipient_warning(settings=None):
     """Return a warning string when Guard Dog has no alert recipient, else ''.
 
@@ -20781,6 +20786,7 @@ def _guarddog_alert_recipient_warning(settings=None):
             'effect immediately; no redeploy needed).')
 
 
+@app.route('/api/guarddog/send-alert-email', methods=['POST'])
 def guarddog_send_alert_email():
     """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email)."""
     if request.remote_addr not in ('127.0.0.1', '::1'):
@@ -20902,6 +20908,84 @@ def guarddog_notifications_pause():
     return jsonify({'success': True, 'paused': True, 'until': until,
                     'message': (f'Alerts paused for {duration}.' if duration
                                 else 'Alerts paused until you resume them.')})
+
+
+@app.route('/api/guarddog/restarts')
+@login_required
+def guarddog_restarts_api():
+    """Recent restarts with WHY, from tak-restart-watch.sh's history file (v10.1.57 W5).
+
+    Deliberately NOT folded into /api/guarddog/health: that route is served from a warm
+    cache so the page can paint colours in ~1s, and this is a small file read that would
+    only add latency to it.
+
+    The point of this endpoint is that the customer's OWN console can say "your hosting
+    provider shut you down". helpnow was power-cycled ten times by its host and the
+    operator spent days blaming a certificate he had changed, because nothing anywhere
+    told him otherwise.
+    """
+    def _uptime_s():
+        try:
+            with open('/proc/uptime') as _u:
+                return int(float(_u.read().split()[0]))
+        except Exception:
+            return 0
+
+    def _iso_ts(s):
+        """Seconds since epoch from the watcher's short-iso stamps, or 0.
+
+        strptime('%z'), not datetime.fromisoformat(): journalctl -o short-iso emits
+        '2026-08-31T00:57:29-0700' (no colon in the offset), and fromisoformat only
+        learned to accept that in Python 3.11. Ubuntu 22.04 — the baseline platform —
+        ships 3.10, so fromisoformat would raise there and silently zero every count.
+        """
+        if not s or s == 'unknown':
+            return 0
+        for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.strptime(s, fmt).timestamp()
+            except Exception:
+                continue
+        return 0
+
+    path = '/var/lib/takguard/restart-history.jsonl'
+    entries = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue          # a torn line is not a reason to fail the card
+    except FileNotFoundError:
+        # No file yet = the watcher has not run a boot since install. That is "nothing
+        # to report", NOT an error, and the card must not shout about it.
+        return jsonify({'success': True, 'supported': True, 'entries': [],
+                        'window_days': 7, 'unexpected_7d': 0, 'uptime_seconds': _uptime_s()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+
+    entries = entries[-50:]
+    entries.reverse()                 # newest first
+    cutoff = time.time() - 7 * 86400
+    unexpected = 0
+    for e in entries:
+        # OPERATOR is a deliberate reboot and is not counted against the box.
+        if (e.get('verdict') or '') == 'OPERATOR':
+            continue
+        try:
+            when = e.get('booted_at') or ''
+            ts = _iso_ts(when)
+        except Exception:
+            ts = 0
+        if ts >= cutoff:
+            unexpected += 1
+    return jsonify({'success': True, 'supported': True, 'entries': entries,
+                    'window_days': 7, 'unexpected_7d': unexpected,
+                    'uptime_seconds': _uptime_s()})
 
 
 @app.route('/api/guarddog/notifications/status')
@@ -21230,6 +21314,10 @@ def run_guarddog_deploy(alert_email):
             # visibility watcher. Both are fleet-wide — the gate no-ops on a box
             # with no firewall backend, the watcher no-ops until TAK is up.
             'tak-client-gate.sh', 'tak-session-watch.sh',
+            # v10.1.57 W4: classify the previous boot and say WHY the box went down.
+            # Guard Dog had no restart detection at all — a customer box was power-cycled
+            # ten times by its host and the console had nothing to say about it.
+            'tak-restart-watch.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
@@ -21365,6 +21453,9 @@ def run_guarddog_deploy(alert_email):
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
             ('tak-metrics-collector.service', _METRICS_COLLECTOR_UNIT),
+            # Boot-time oneshot, no timer: there is exactly one previous boot to classify
+            # per boot. Ordered after the console because the alert relay lives on :5001.
+            ('takrestartwatch.service', '[Unit]\nDescription=Guard Dog Unexpected-Restart Detector\nAfter=network-online.target takwerx-console.service\nWants=network-online.target\n\n[Service]\nType=oneshot\nTimeoutStartSec=300\nExecStart=/opt/tak-guarddog/tak-restart-watch.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
             ('tak-post-start.service', '[Unit]\nDescription=Guard Dog Post-Start Orchestrator (starts Authentik, TAK Portal, CloudTAK after TAK)\nAfter=takserver.service docker.service\nWants=takserver.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=1200\nExecStart=/opt/tak-guarddog/tak-post-start.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
         ]
         # Two-server: remote DB monitor instead of local PG monitors
@@ -21598,6 +21689,9 @@ def run_guarddog_deploy(alert_email):
         # v0.9.12 A6: source-scope UFW for Guard Dog health endpoint
         _auto_harden_guarddog_8080(settings, plog=plog)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-post-start.service']), capture_output=True, text=True, timeout=5)
+        # v10.1.57 W4: boot oneshot, so it needs enabling the same way — a timer would
+        # never fire it (there is exactly one previous boot to classify, at boot).
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'takrestartwatch.service']), capture_output=True, text=True, timeout=5)
         plog("✓ Boot orchestrator enabled (staggered start: TAK → Authentik → TAK Portal → CloudTAK)")
         for f in ['process_alert_sent', 'disk_alert_sent', 'db_alert_sent', 'cotdb_alert_sent', 'network_alert_sent', 'cert_alert_sent']:
             p = os.path.join('/var/lib/takguard', f)
@@ -30376,6 +30470,9 @@ def takportal_page():
     # and this is an inline page render. Stable is also the correct answer when we cannot
     # look — the same fail-closed default _takportal_beta_mode() uses.
     portal_beta_mode = bool(portal.get('running')) and _takportal_beta_mode()
+    # Separate from the fail-closed value above: the badge must be able to say
+    # "unknown" instead of silently implying "release". See _takportal_beta_channel_state.
+    portal_channel = _takportal_beta_channel_state() if portal.get('running') else 'unknown'
     takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template('takportal.html',
         settings=settings, portal=portal, container_info=container_info,
@@ -30483,6 +30580,26 @@ def _takportal_get_existing_settings():
 # deliberately identical to the script's so the two cannot drift apart.
 
 
+def _takportal_beta_channel_state():
+    """'beta' | 'release' | 'unknown' — for DISPLAY only. Never guesses.
+
+    _takportal_beta_mode() fails CLOSED, which is right for CHOOSING a channel: never
+    ship main because a read failed. It is wrong for a BADGE. On test8 the card rendered
+    with no beta marker one second after a container recreate while settings.json
+    actually said BETA_MODE='true' — the read had simply not succeeded yet, and the page
+    presented that failure as "you are on the release channel". A display that turns
+    "could not read" into a confident claim is how the operator ends up surprised by the
+    channel at click time, which is the whole complaint this exists to answer.
+    """
+    try:
+        s = _takportal_get_existing_settings()
+    except Exception:
+        return 'unknown'
+    if not isinstance(s, dict) or 'BETA_MODE' not in s:
+        return 'unknown'
+    return 'beta' if str(s.get('BETA_MODE') or '').strip().lower() == 'true' else 'release'
+
+
 def _takportal_beta_mode():
     """True when TAK Portal's own BETA_MODE setting is on.
 
@@ -30570,6 +30687,68 @@ def _takportal_git_hint(stderr):
     return ''
 
 
+def _takportal_preserve_env(portal_dir, plog=None):
+    """Snapshot TAK Portal's .env before a checkout moves refs. Returns bytes or None.
+
+    Upstream TRACKED `.env` up to 1.4.6, then replaced it with `.env.example` and
+    gitignored it (`c78964be` "updated env ignore", shipped in 1.4.7/1.4.8). Git deletes
+    a working-tree file that is tracked in the source tree and absent from the target
+    tree, and `checkout --force` does it without a word — so updating a box across that
+    boundary DESTROYS the operator's .env. `docker compose` then refuses to start:
+
+        env file /home/takwerx/TAK-Portal/.env not found
+
+    and because the build fails, the OLD container keeps running with its environment
+    baked in from creation. The box looks healthy and is actually one restart away from
+    a portal that cannot start at all. Found on test12 2026-09-02.
+
+    Snapshot BEFORE `git checkout -- .` as well as before the ref move: while .env was
+    tracked, that discard-local-edits step reverts an operator's customisations to it.
+
+    This is the [[third-party-app-config-is-operator-owned]] rule in its most literal
+    form — .env is TAK Portal's file, we do not own a single key in it, and a full-tree
+    checkout is a destructive operation against it.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    src = os.path.join(portal_dir, '.env')
+    try:
+        if os.path.isfile(src):
+            with open(src, 'rb') as f:
+                return f.read()
+    except Exception as e:
+        _log(f'  could not read .env before checkout (continuing): {e}')
+    return None
+
+
+def _takportal_restore_env(portal_dir, saved, plog=None):
+    """Put .env back if the checkout removed it. Never overwrites an existing file.
+
+    Restore-if-missing only. If the checkout left .env alone (the normal case once a box
+    is past the 1.4.6 boundary) this does nothing at all — we must not write over a file
+    the operator may have edited between the snapshot and here.
+
+    With no snapshot to restore, seed once from upstream's .env.example, which is the
+    convention 1.4.7+ ships. Seeding a MISSING file is allowed; overwriting is not.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    dst = os.path.join(portal_dir, '.env')
+    if os.path.exists(dst):
+        return
+    try:
+        if saved is not None:
+            with open(dst, 'wb') as f:
+                f.write(saved)
+            _log('  .env was removed by the checkout (upstream stopped tracking it) — restored')
+            return
+        example = os.path.join(portal_dir, '.env.example')
+        if os.path.isfile(example):
+            with open(example, 'rb') as s, open(dst, 'wb') as d:
+                d.write(s.read())
+            _log('  no .env present — seeded from .env.example')
+    except Exception as e:
+        _log(f'  could not restore .env: {e}')
+
+
 def _takportal_update_git(portal_dir, plog=None):
     """Move ~/TAK-Portal onto its channel's ref. Returns a dict, never raises.
 
@@ -30598,6 +30777,16 @@ def _takportal_update_git(portal_dir, plog=None):
     if not os.path.isdir(os.path.join(portal_dir, '.git')):
         out['error'] = f'{portal_dir} is not a git checkout — redeploy TAK Portal instead of updating.'
         return out
+
+    # The checkout must be writable by whoever runs the console BEFORE any git touches it.
+    # Root-owned objects left by a root-era clone make `git fetch` exit 128, which is what
+    # kept Update broken on re-homed boxes long after the error was being reported properly.
+    _healed, _heal_err = _module_checkout_ownership_selfheal(portal_dir, plog=_log)
+    if _heal_err:
+        _log(f'  ownership self-heal did not complete: {_heal_err}')
+    # Snapshot .env FIRST — before the discard below and before any ref moves. Upstream
+    # tracked it through 1.4.6, so both steps can destroy it (v10.1.57 W9).
+    _saved_env = _takportal_preserve_env(portal_dir, plog=_log)
     # Discard local edits to TRACKED files before moving refs. The only tracked file we
     # modify is docker-compose.yml (the loopback port patch), and it is re-applied by the
     # caller after the checkout — so this loses nothing. The untracked
@@ -30618,8 +30807,12 @@ def _takportal_update_git(portal_dir, plog=None):
             err = (c.stderr or c.stdout or '').strip()[:300]
             out['error'] = f'git checkout origin/main failed: {err}.{_takportal_git_hint(err)}'
             return out
+        _takportal_restore_env(portal_dir, _saved_env, plog=_log)
         out['ok'] = True
-        out['message'] = 'Beta Mode is on — updated to the latest beta (main).'
+        out['message'] = ('Beta Mode is ON in TAK Portal, so this followed the development '
+                          'tip (main) rather than a published release. To track releases '
+                          'instead, turn off "Enable Beta Features" inside TAK Portal — it is '
+                          'TAK Portal\'s setting, not infra-TAK\'s.')
         _log(f"  {out['message']}")
         return out
 
@@ -30645,6 +30838,7 @@ def _takportal_update_git(portal_dir, plog=None):
         err = ((c.stderr or c.stdout) or (ft.stderr or '')).strip()[:300]
         out['error'] = f'Could not check out release {tag}: {err}.{_takportal_git_hint(err)}'
         return out
+    _takportal_restore_env(portal_dir, _saved_env, plog=_log)
     out['ok'] = True
     # Rollback is intentional and must be SAID, not hidden: a box that lived on main with
     # Beta Mode on and then turned it off converges DOWN to the newest release.
@@ -31359,12 +31553,31 @@ def takportal_control():
         # out to upstream's `./takportal update`, which fuses the checkout and the build.
         _write_takportal_override()
         _patch_takportal_compose_ports(portal_dir)
-        build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=180)
+        # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
+        # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
+        # time out here on a slower box, and TimeoutExpired was not caught, so it
+        # surfaced as an unhandled 500 with no explanation at all.
+        try:
+            build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
+                                   cwd=portal_dir, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
+            print(f'[takportal] update: {plog_msg}', flush=True)
+            return jsonify({'success': False, 'error': plog_msg}), 500
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
         if build.returncode != 0:
+            # v10.1.57 W9: `err` was computed here and then THROWN AWAY — the response
+            # said only "Build failed. Container may have stopped", and nothing was
+            # logged, so the actual reason existed nowhere. On test12 the real message
+            # was one line ("env file .env not found") and it took a manual re-run of
+            # the build to see it. Report what the build actually said, and journal it.
             err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
-            return jsonify({'success': False, 'error': 'Build failed. Container may have stopped — try Start below or check container logs.'}), 500
+            print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
+            return jsonify({'success': False,
+                            'error': f'Build failed: {err}',
+                            'hint': 'The previous container may still be running the old version. '
+                                    'Check the container logs, fix the cause, and press Update again.'}), 500
         settings_synced = False
         settings_sync_error = ''
         cloudtak_url = ''
@@ -31722,6 +31935,12 @@ def run_takportal_deploy():
         _tp_tag = _takportal_latest_tag(plog)
         if os.path.exists(portal_dir):
             plog(f"  TAK-Portal directory exists — fetching {_tp_tag}...")
+            # Same root-owned-checkout trap as the Update path (v10.1.57 W7). A redeploy
+            # over an existing re-homed clone hits it identically, and this fetch does
+            # not check its return code at all.
+            _h, _he = _module_checkout_ownership_selfheal(portal_dir, plog=plog)
+            if _he:
+                plog(f"  ownership self-heal did not complete: {_he}")
             subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
                             'fetch', '--tags', '--force', 'origin'],
                            capture_output=True, text=True, timeout=120)
@@ -36293,7 +36512,12 @@ def _cloudtak_git_prep(cloudtak_dir, plog):
         MinIO's live S3 data), which is ROOT-owned and NOT gitignored. Add it to
         .git/info/exclude so git status/checkout never tries to walk or touch a
         tree the non-root console can neither read into nor modify.
-    Both writes land in the takwerx-owned .git, so plain file IO works non-root."""
+    Both writes land in the takwerx-owned .git, so plain file IO works non-root --
+    an assumption that is FALSE on a box re-homed from a root-era clone, which is
+    why the ownership heal below runs first (v10.1.57 W8)."""
+    _healed, _herr = _module_checkout_ownership_selfheal(cloudtak_dir, plog=plog)
+    if _herr:
+        plog(f"  ownership self-heal did not complete: {_herr}")
     try:
         _lock = os.path.join(cloudtak_dir, '.git', 'index.lock')
         if os.path.exists(_lock):
@@ -71055,6 +71279,101 @@ def _startup_ensure_broker():
                       f'{(_sr.stderr or _sr.stdout or "").strip()[:200]}', flush=True)
     except Exception as _se:
         print(f'Startup migration: shim regen warning (non-fatal): {_se}', flush=True)
+
+
+def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
+    """Re-own the parts of a module checkout git must write. Returns (healed, error).
+
+    Same fault as _repo_ownership_selfheal(), different tree. A module dir re-homed by the
+    non-root flip keeps root-owned entries from its root-era clone; `git fetch` as takwerx
+    then dies with
+
+        error: insufficient permission for adding an object to repository database .git/objects
+        fatal: failed to write object / fatal: unpack-objects failed   (exit 128)
+
+    and the update cannot land. v10.1.55 W1 made that visible instead of silently rebuilding
+    the old tree, and _takportal_git_hint() tells the operator to run chown by hand -- but
+    neither FIXED it, so the button stayed broken. Found again on test12 2026-09-02: TAK
+    Portal 1.4.8 published 16:42Z, operator pressed Update 16:59Z, both fetch forms exited
+    128, box stayed on 1.4.6 with 166 root-owned entries under .git (199 across the tree).
+
+    NOT a blanket `chown -R` on the module dir. Some module trees contain deliberately
+    root-owned data: ~/CloudTAK/.docker-store/ is MinIO's live S3 bind-mount (see
+    _cloudtak_git_prep), and re-owning it to takwerx would corrupt a running service to fix
+    a git problem. So:
+
+      * .git/ is healed recursively -- it is never a bind-mount, and it is what breaks fetch.
+      * worktree offenders are enumerated and chowned BY PATH, so nothing we did not
+        actually see gets touched.
+      * `prune` names directories to skip entirely; .docker-store is always pruned.
+
+    `chown -R -h` / `chown -h` on a module dir already passes the broker rulebook via
+    HOME_MODULE_DIRS / ROOT_MODULE_DIRS (every name in MODULE_DIR_NAMES). -h re-owns
+    symlinks rather than following them, as the console-repo carve-out requires.
+
+    No-op as root -- a root-owned checkout is correct on a root-era box.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    if os.getuid() == 0:
+        return False, ''
+    if not os.path.isdir(mod_dir):
+        return False, ''
+    uid = os.getuid()
+    skip = {'.docker-store'} | set(prune)
+    git_dirty, work_offenders = False, []
+    _CAP = 400
+    try:
+        for dirpath, dirnames, filenames in os.walk(mod_dir):
+            dirnames[:] = [d for d in dirnames if d not in skip]
+            for name in dirnames + filenames:
+                full = os.path.join(dirpath, name)
+                try:
+                    if os.lstat(full).st_uid == uid:
+                        continue
+                except OSError:
+                    continue
+                rel = os.path.relpath(full, mod_dir)
+                if rel == '.git' or rel.startswith('.git' + os.sep):
+                    git_dirty = True
+                    continue          # healed wholesale below; do not enumerate 10k objects
+                if len(work_offenders) < _CAP:
+                    work_offenders.append(full)
+    except Exception as e:
+        return False, f'ownership scan failed: {e}'
+    if not git_dirty and not work_offenders:
+        return False, ''
+    import pwd as _pwd
+    import grp as _grp
+    try:
+        user = _pwd.getpwuid(uid).pw_name
+        group = _grp.getgrgid(os.getgid()).gr_name
+    except Exception:
+        user, group = str(uid), str(os.getgid())
+    owner = f'{user}:{group}'
+    _log(f'  {mod_dir}: foreign-owned entries found '
+         f'(.git={"yes" if git_dirty else "no"}, worktree={len(work_offenders)}) '
+         f'-- re-owning to {owner} before git')
+    errs = []
+
+    def _chown(args, what):
+        try:
+            r = subprocess.run(_sudo_wrap(['chown'] + args), capture_output=True,
+                               text=True, timeout=180)
+        except Exception as e:
+            errs.append(f'{what}: {e}')
+            return
+        if r.returncode != 0:
+            errs.append(f'{what}: rc={r.returncode} '
+                        f'{(r.stderr or r.stdout or "").strip()[:200]}')
+
+    if git_dirty:
+        _chown(['-R', '-h', owner, os.path.join(mod_dir, '.git')], '.git')
+    for i in range(0, len(work_offenders), 100):
+        _chown(['-h', owner] + work_offenders[i:i + 100], f'worktree batch {i // 100 + 1}')
+    if errs:
+        return False, '; '.join(errs[:3])
+    _log(f'  {mod_dir} re-owned to {owner}')
+    return True, ''
 
 
 def _startup_repo_ownership_heal():

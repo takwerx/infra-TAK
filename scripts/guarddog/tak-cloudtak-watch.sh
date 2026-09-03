@@ -62,30 +62,78 @@ if docker inspect cloudtak-media-1 >/dev/null 2>&1; then
     docker exec cloudtak-media-1 grep -q "$_k" /mediamtx.yml 2>/dev/null || _hls_ok=0
   done
   _DRIFT_STATE="$STATE_DIR/cloudtak_media_drift"
+  _DRIFT_PENDING="$STATE_DIR/cloudtak_media_drift_pending"
   if [ "$_hls_ok" -eq 0 ]; then
     _log "drift | cloudtak-media HLS profile MISSING — container was recreated outside the console; CoT video will black-screen until reconverged"
-    # Alert once per drift episode, not every minute.
-    if [ ! -f "$_DRIFT_STATE" ]; then
-      date +%s > "$_DRIFT_STATE"
+    # v10.1.57 W12: TWO-STRIKE. Do not alert on first sight.
+    #
+    # The console recreates CloudTAK itself during post-update security hardening and
+    # re-heals the media patch immediately afterwards. On test12 2026-09-02 that ran:
+    #   19:39:36  "CloudTAK recreated with hardened port bindings"   (console)
+    #   19:39:41  docker recreates cloudtak-media-1                  (profile wiped)
+    #   19:39:42  "cloudtak-media healed (HLS=mpegts/alwaysRemux)"   (console, +1s)
+    #   19:39:43  ALERT EMAIL SENT                                   (+1s, already fixed)
+    # The operator was emailed about damage the console had caused AND repaired one
+    # second earlier, and told to fix it by restarting the console — the very action
+    # that triggered the recreate. An alert that fires inside a self-heal window is
+    # noise, and noise is how a real alert gets ignored later.
+    #
+    # Real drift (a manual --build, a restart policy, an OOM recreate) is NOT repaired
+    # by anything and persists until the next console restart, i.e. for hours. Costing
+    # it one extra check interval loses nothing; suppressing the self-healed case
+    # is the entire point.
+    if [ ! -f "$_DRIFT_PENDING" ]; then
+      date +%s > "$_DRIFT_PENDING"
+      _log "drift | first detection — deferring alert one interval to let the console's converger finish"
+    elif [ ! -f "$_DRIFT_STATE" ]; then
       SUBJ_D="Guard Dog: CloudTAK video config drift on $SERVER_IDENTIFIER"
-      BODY_D="cloudtak-media lost infra-TAK's HLS profile (/mediamtx.yml).
+      BODY_D="cloudtak-media is missing infra-TAK's HLS profile (/mediamtx.yml), and it
+did NOT come back on its own.
 
-This happens when the container is recreated by something the console did not drive
-(a manual docker compose --build, a restart policy, an OOM recreate). Stock MediaMTX
-takes ~7s to produce a playable playlist, which loses to CloudTAK's ~7s player retry
-budget, so CoT video shows a black screen while the stream itself is fine.
+infra-TAK writes an HLS profile into this container after every recreate it drives, so
+a brief loss during a console-driven update is normal and self-repairs within seconds —
+that case is deliberately NOT reported. This alert means the profile was still missing
+on a second consecutive check, so something recreated the container outside the console
+(a manual docker compose --build, a restart policy, an OOM recreate) and nothing has
+put it back.
+
+Impact: stock MediaMTX takes ~7s to produce a playable playlist, which loses to
+CloudTAK's ~7s player retry budget, so CoT video shows a black screen while the stream
+itself is perfectly fine.
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')
-Fix: restart the infra-TAK console (systemctl restart takwerx-console) — its
-converger re-applies the profile. A CloudTAK rebuild is NOT required and will not help.
 
-Verify: docker exec cloudtak-media-1 grep -E '^hls' /mediamtx.yml
+Check it yourself:
+  docker exec cloudtak-media-1 grep -E '^hls' /mediamtx.yml
+  (expect hlsVariant: mpegts, hlsSegmentCount: 3, hlsSegmentDuration: 500ms)
+
+To fix: restart the infra-TAK console (systemctl restart takwerx-console) — its
+converger re-applies the profile. A CloudTAK rebuild is NOT required and will not help.
 "
-      echo -e "$BODY_D" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ_D" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null || true
+      # v10.1.58 W13: close the once-per-episode gate ONLY on successful delivery.
+      #
+      # This used to write $_DRIFT_STATE BEFORE sending, so the episode was marked
+      # reported whether or not the mail left the box. Measured on test12
+      # 2026-09-02: after a console restart the console took 318s to answer, the
+      # drift alert fired 83s into that window, logged "console unreachable" — and
+      # the gate had already closed, so it was attempted once and lost forever.
+      # A watcher that runs every minute had all the retries it needed and used none.
+      #
+      # Leaving $_DRIFT_PENDING in place means the next run re-enters this branch
+      # and tries again, so the alert survives a console that is merely busy.
+      if echo -e "$BODY_D" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ_D" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null; then
+        date +%s > "$_DRIFT_STATE"
+      else
+        _log "drift | alert NOT delivered (console unreachable?) — episode left open, will retry next check"
+      fi
     fi
   else
-    [ -f "$_DRIFT_STATE" ] && { _log "drift | cloudtak-media HLS profile restored"; rm -f "$_DRIFT_STATE"; }
+    if [ -f "$_DRIFT_PENDING" ] && [ ! -f "$_DRIFT_STATE" ]; then
+      _log "drift | cloudtak-media HLS profile restored before the alert threshold — self-healed, not reported"
+    fi
+    [ -f "$_DRIFT_STATE" ] && _log "drift | cloudtak-media HLS profile restored"
+    rm -f "$_DRIFT_STATE" "$_DRIFT_PENDING"
   fi
 fi
 

@@ -539,7 +539,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 240, wires: [['fn_svc_parse']]
   },
   {
@@ -588,7 +588,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 340, wires: [['fn_lyr_parse']]
   },
   {
@@ -640,7 +640,9 @@ const configFlows = [
     func: [
       "const base = msg.payload.url.replace(/\\/+$/, '');",
       "const lid  = msg.payload.layerId;",
-      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=50&f=json';",
+      "// returnGeometry=false: the sample exists to show FIELD VALUES; the geometry of 50",
+      "// rows is pulled and discarded. Same family as the fn_dist bug above.",
+      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=50&returnGeometry=false&f=json';",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
@@ -653,7 +655,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 440, wires: [['fn_smp_parse']]
   },
   {
@@ -697,6 +699,14 @@ const configFlows = [
       "  + '&returnDistinctValues=true'",
       "  + '&orderByFields=' + field",
       "  + '&resultRecordCount=500'",
+      "  // v10.1.56: WITHOUT this, a distinct-values query returns the full GEOMETRY of every",
+      "  // distinct row. Measured on UASWFC_IR_Viewer layer 2 (mop-up buffer, one line of",
+      "  // 176,236 verts): 71,850,398 bytes in 39.7s, versus 557 bytes in 0.24s with it —",
+      "  // 288,000x smaller. The endpoint did not merely run slowly, it HUNG: the http request",
+      "  // node has no timeout and senderr:false, so nothing ever responded and the browser's",
+      "  // fetch died first. Silent on small layers, fatal on real ones, and it affected every",
+      "  // ArcGIS feed's 'Load Values' button, not just this one. Geometry is never read here.",
+      "  + '&returnGeometry=false'",
       "  + '&f=json';",
       "msg._field = msg.payload.field;",
       "return msg;"
@@ -711,7 +721,7 @@ const configFlows = [
     method: 'GET', ret: 'obj', paytoqs: 'ignore',
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
+    senderr: false, timeout: 30000, headers: [],
     x: 620, y: 540, wires: [['fn_dist_parse']]
   },
   {
@@ -1858,7 +1868,18 @@ const FN_PARSE_COT = [
   "var fillArgb = hexArgb(fColor, fillAlphaFloat);",
   "var now = new Date();",
   "var tm = ttlMs(cfg);",
-  "var staleMs = tm > 0 ? tm : 3600000;",
+  "// v10.1.54 W1: TTL has always done DOUBLE DUTY — the server-side query window AND the CoT",
+  "// stale time — and those want different values whenever a feed's update cadence is slower than",
+  "// its window. UASWFC: a 48h window is right for volume, but fires are not flown nightly, so with",
+  "// no new data the engine reports '0 streamed, N unchanged' (healthy) while every CoT already on",
+  "// the devices quietly expires. Measured live: perimeter stale 2026-08-31 still being served on",
+  "// 2026-09-01. ATAK keeps showing stale items; TAKAware drops them — which is the whole reason",
+  "// this feed rendered in one client and not the other while the CoT was byte-identical in shape",
+  "// to CA AIR INTEL, which never expires because its TTL is 15 days for both jobs.",
+  "// staleValue/staleUnit decouple them; absent = previous behaviour exactly.",
+  "var _stCfg = { ttlValue: cfg.staleValue, ttlUnit: cfg.staleUnit, ttlHours: null };",
+  "var _stMs = (cfg.staleValue != null && cfg.staleValue !== '') ? ttlMs(_stCfg) : 0;",
+  "var staleMs = _stMs > 0 ? _stMs : (tm > 0 ? tm : 3600000);",
   "var stale = new Date(now.getTime() + staleMs);",
   "var classField = (cfg.classField && String(cfg.classField).trim()) || null;",
   "var layerClass = msg._layerName || '';",
@@ -1903,7 +1924,7 @@ const FN_PARSE_COT = [
   "var _PT_CAP = (features.length <= 150) ? 400 : (features.length <= 500 ? 150 : (features.length <= 1500 ? 80 : 40));",
   "// Salt the per-feature change-hash with the resolved style + class mappings so a color/style/class",
   "// edit (which doesn't touch geometry or label fields) still changes the hash and forces a re-push.",
-  "var _COT_FMT = 7;",
+  "var _COT_FMT = 8;",
   "var _GEOM_CEIL = 6000;",
   "var _STYLE_SALT = djb2(JSON.stringify(cfg.style || {}) + '|' + JSON.stringify(cfg.classes || {}) + '|' + (cfg.classField || '') + '|' + JSON.stringify(cfg.domains || {}));",
   "function _perpDist(p, a, b) {",
