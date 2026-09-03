@@ -64232,10 +64232,12 @@ def _tak58_container_export(container, dest_path, pw, say):
             'Refusing to continue on an export that captured nothing.')
         return 0
     # Copy the backup out to the host. Root-side docker cp; nothing crosses the socket.
+    dest_dir = os.path.dirname(dest_path)
     try:
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        os.chmod(dest_dir, 0o700)
     except PermissionError:
-        _makedirs_priv(os.path.dirname(dest_path))
+        _makedirs_priv(dest_dir, mode=0o700)
     r = subprocess.run(_sudo_wrap(['docker', 'cp', f'{container}:{_TAK58_EXPORT_IN_CONTAINER}',
                                    dest_path]), capture_output=True, text=True, timeout=7300,
                        env=_tak58_long_env())
@@ -64244,6 +64246,13 @@ def _tak58_container_export(container, dest_path, pw, say):
         say(f'  Could not copy the export out of the container '
             f'({(r.stderr or "").strip()[:160] or f"host copy is {hsize} bytes, container file is {size}"}).')
         return 0
+    # The dump is the whole CoT database in plaintext, and `docker cp` lands it
+    # root-owned 0644 - world-readable on a box that may hold CJI. Lock it down, and
+    # drop the in-container copy now that it is safely on the host (it is the same
+    # 28 GB again inside the container's writable layer).
+    subprocess.run(_sudo_wrap(['chmod', '600', dest_path]), capture_output=True, timeout=60)
+    subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f',
+                               _TAK58_EXPORT_IN_CONTAINER]), capture_output=True, timeout=300)
     say(f'  Exported {_cotdb_fmt_bytes(size)}'
         + (f', {inserts:,} INSERT statements' if inserts > 0 else '')
         + f', in {int(time.time() - t0)} s')
@@ -64501,6 +64510,10 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
                         f'{export_path}. Do NOT put this server into service.')
         _say(f'  Import verified: {total_after:,} rows across {len(after)} tables '
              f'(source had {total_before:,} across {len(before)}).')
+        # Counts match, so the in-container copy of the dump has served its purpose.
+        # Reclaim it (28 GB on a 900k-row database) - the host copy stays as the backup.
+        subprocess.run(_sudo_wrap(['docker', 'exec', TAK_DB_CONTAINER, 'rm', '-f',
+                                   _TAK58_EXPORT_IN_CONTAINER]), capture_output=True, timeout=300)
 
         # 8. Start TAK on the migrated data and wait for it to actually serve.
         _say('')
