@@ -300,6 +300,18 @@ function takPurgeFailed(){
 <div style="font-size:13px;font-weight:600;color:var(--green);margin-bottom:4px">PostgreSQL {{ tak58.facts.pg_running_major }} &mdash; clear to run TAK Server 5.8+</div>
 <div style="font-size:12px;color:var(--text-secondary);line-height:1.5">This server has been migrated. Normal updates apply from here.</div>
 </div>
+{% elif tak58.facts.external_db %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8 on a managed database</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">5.8 requires <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong> and this server's database is on <strong>PostgreSQL {{ tak58.facts.pg_running_major }}</strong>. It is a <strong>managed database</strong>, so only your provider can upgrade the engine &mdash; the console cannot do it for you, and it will keep refusing a 5.8 install until the database is on {{ tak58.facts.pg_target_major }} so you cannot end up half-migrated.</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-top:10px">
+<strong style="color:var(--text-primary)">Three steps, in this order:</strong><br>
+1. Snapshot the instance, then upgrade it to PostgreSQL {{ tak58.facts.pg_target_major }} in the AWS RDS or Azure console.<br>
+2. Confirm TAK's database user can still sign in afterwards &mdash; a provider upgrade can leave the stored password in an older format, and the symptom is a server that looks healthy with its schema never migrated.<br>
+3. Come back here, upload the 5.8 package and click Update. This card turns green once {{ tak58.facts.pg_target_major }} is actually serving.
+</div>
+<div style="font-size:12px;margin-top:10px"><a href="https://github.com/takwerx/infra-TAK/blob/main/docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Step-by-step guide &#8599;</a></div>
+</div>
 {% elif tak58.blockers %}
 <div style="border-left:3px solid var(--red);background:rgba(239,68,68,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
 <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:4px">TAK Server 5.8 cannot be installed on this server yet</div>

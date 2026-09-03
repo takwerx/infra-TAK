@@ -63654,8 +63654,29 @@ def _tak_58_preflight():
                         'upgrading in place. That is row-by-row and takes considerably longer '
                         'than a native migration on the same amount of data.' % TAK_PG_MAJOR)
     elif mode == 'remote':
-        blockers.append('The CoT database is on a remote host (%s). The 5.8 migration must be '
-                        'run there, not from this console, in this release.' % (db_host or 'unknown'))
+        # 'remote' covers two DIFFERENT situations and they need different answers.
+        # _tak_db_topology() cannot tell them apart (it only sees a non-loopback host in
+        # CoreConfig), so read the deployment mode: a two-server DB is a host we manage
+        # over SSH, a managed/external DB is one we fundamentally cannot upgrade.
+        try:
+            _dep_mode = (_get_tak_deployment_config(load_settings()) or {}).get('mode') or ''
+        except Exception:
+            _dep_mode = ''
+        facts['deployment_mode'] = _dep_mode
+        if _dep_mode == 'external_db':
+            facts['external_db'] = True
+            blockers.append(
+                'This server uses a managed database (%s). TAK Server 5.8 requires PostgreSQL '
+                '%d, and a managed engine can only be upgraded by the provider — AWS RDS or '
+                'Azure, in their own console. Upgrade the instance to PostgreSQL %d first, '
+                'confirm TAK can still authenticate to it, then return here and run the update. '
+                'Step-by-step: docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md'
+                % (db_host or 'remote host', TAK_PG_MAJOR, TAK_PG_MAJOR))
+        else:
+            blockers.append(
+                'The CoT database is on a separate server (%s). The 5.8 migration has to run '
+                'on that host, and driving a two-server migration from here is not supported '
+                'in this release.' % (db_host or 'unknown'))
 
     # 2. Which major is actually serving, and is 15 present at all?
     #    upgrade-db.sh exits 1 with "Upgrade will be skipped" if no 15 cluster exists.
