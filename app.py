@@ -64359,7 +64359,13 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
         if rollback_note:
             _say('')
             _say(rollback_note)
-        _status.update({'running': False, 'complete': True, 'error': True})
+        # complete=False on a failure. The Update panel checks `complete` BEFORE
+        # `error` (static/takserver.js pollUpgradeLog), so complete=True here made a
+        # failed migration render as "Update complete - Done. Refreshing..." and
+        # reload the page out from under the operator. Observed on dev-4 2026-09-03
+        # when the import hit the broker timeout. run_takserver_upgrade_container()'s
+        # own _fail() already had this right.
+        _status.update({'running': False, 'complete': False, 'error': True})
 
     stamp = time.strftime('%Y%m%d-%H%M%S')
     old_vol = f'{TAK_DB_VOLUME}_pre58_{stamp}'
@@ -64608,7 +64614,7 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             _say('  2. Restore from the pre-migration backup taken at the start of this run')
             _say('     (see the snapshot path above). The PostgreSQL 15 cluster was left')
             _say('     intact by design and is still on disk.')
-        _status.update({'running': False, 'complete': True, 'error': True})
+        _status.update({'running': False, 'complete': False, 'error': True})
 
     try:
         # 1. Pre-flight — refuse before touching anything.
