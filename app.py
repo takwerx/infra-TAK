@@ -64048,6 +64048,58 @@ _TAK58_PG_BIN_LAYOUTS = ('/usr/pgsql-{major}/bin', '/usr/lib/postgresql/{major}/
 _TAK58_EXPORT_IN_CONTAINER = f'/tmp/{_TAK58_EXPORT_NAME}'
 
 
+def _tak58_long_env():
+    """Environment for a broker call that legitimately runs longer than the broker's
+    600 s default (docker cp of a multi-GB export, a volume copy). The broker clamps
+    to its own MAX_TIMEOUT; anything that could exceed even that runs detached instead
+    (see _tak58_container_run_detached)."""
+    env = dict(os.environ)
+    env['TAKWERX_BROKER_TIMEOUT'] = '7200'
+    return env
+
+
+def _tak58_container_run_detached(container, pw, shell_cmd, tag, say, progress=None,
+                                  timeout=12 * 3600, every=30):
+    """Run `shell_cmd` INSIDE `container` detached, then poll until it writes its exit code.
+
+    Measured on dev-4 2026-09-03: the first import attempt died at exactly 600 s with
+    `takwerx_broker: TIMEOUT: command timed out` — the broker's per-exec ceiling, not
+    psql's. A multi-GB pg_dump/psql cannot be held open through the broker at all, so
+    the command is started with `docker exec -d`, writes `$?` to /tmp/<tag>.rc when it
+    finishes, and each poll is its own short broker call. `progress()` (optional)
+    returns a string logged once a minute so a long import is visibly alive.
+    Returns the command's exit code, or None on timeout.
+    """
+    rc_path = f'/tmp/{tag}.rc'
+    subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f', rc_path]),
+                   capture_output=True, timeout=60)
+    r = subprocess.run(_sudo_wrap([
+        'docker', 'exec', '-d', '-e', f'PGPASSWORD={pw}', container, 'sh', '-c',
+        f'{shell_cmd}; echo $? > {rc_path}']), capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        say(f'  Could not start {tag} in {container}: {(r.stderr or "").strip()[:200]}')
+        return None
+    t0 = time.time()
+    last_note = 0
+    while time.time() - t0 < timeout:
+        time.sleep(every)
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'cat', rc_path]),
+                           capture_output=True, text=True, timeout=60)
+        s = (r.stdout or '').strip()
+        if r.returncode == 0 and s.lstrip('-').isdigit():
+            return int(s)
+        if progress and time.time() - last_note >= 60:
+            last_note = time.time()
+            try:
+                note = progress()
+            except Exception:
+                note = None
+            if note:
+                say(f'  … {note} ({int(time.time() - t0) // 60} min)')
+    say(f'  {tag} did not finish within {timeout // 3600} h.')
+    return None
+
+
 def _tak58_container_pgbin(container, major):
     """Directory holding psql/pg_dump for PostgreSQL `major` inside `container`, or None.
 
@@ -64128,20 +64180,35 @@ def _tak58_container_export(container, dest_path, pw, say):
     if not pgbin:
         say(f'  {container} has no PostgreSQL 15 client — cannot export from it.')
         return 0
-    say(f'  Exporting the database from {container} (row-by-row; this is the slow part)…')
+    # Shape of the export, measured on dev-4 2026-09-03 with 896,510 cot_router rows:
+    # TAK's documented `--column-inserts` alone produced a 28 GB file (cot_router.groups is
+    # bit(32768) and every row carries a 32,768-character B'000…' literal) that imported at
+    # ~380 rows/s - one implicit transaction, and one fsync, per row. --rows-per-insert
+    # batches 500 rows per statement (column names kept: 5.8 added columns to cot_router,
+    # so positional inserts would be wrong), --on-conflict-do-nothing skips the rows the
+    # fresh 5.8 schema seeds itself (schema_version, default groups) instead of erroring
+    # on each, and the import side turns synchronous_commit off for the session.
+    say(f'  Exporting the database from {container} (this is the slow part)…')
     t0 = time.time()
-    try:
-        r = subprocess.run(_sudo_wrap([
-            'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
-            f'{pgbin}/pg_dump', '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
-            '--data-only', '--column-inserts', '--disable-triggers',
-            '-f', _TAK58_EXPORT_IN_CONTAINER]),
-            capture_output=True, text=True, timeout=6 * 3600)
-    except Exception as e:
-        say(f'  Export failed: {str(e)[:200]}')
-        return 0
-    if r.returncode != 0:
-        say(f'  Export failed: {(r.stderr or "").strip()[:300]}')
+
+    def _export_progress():
+        w = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'wc', '-c',
+                                       _TAK58_EXPORT_IN_CONTAINER]),
+                           capture_output=True, text=True, timeout=60)
+        n = int((w.stdout or '0').split()[0]) if w.returncode == 0 else 0
+        return f'{_cotdb_fmt_bytes(n)} written so far'
+
+    rc = _tak58_container_run_detached(
+        container, pw,
+        f'{pgbin}/pg_dump -h localhost -U martiuser -d cot --data-only --column-inserts '
+        f'--rows-per-insert=500 --on-conflict-do-nothing --disable-triggers '
+        f'-f {_TAK58_EXPORT_IN_CONTAINER} 2>/tmp/cot_export.err',
+        'cot_export', say, progress=_export_progress)
+    if rc != 0:
+        e = subprocess.run(_sudo_wrap(['docker', 'exec', container, 'head', '-c', '300',
+                                       '/tmp/cot_export.err']), capture_output=True, text=True,
+                           timeout=60)
+        say(f'  Export failed (pg_dump exit {rc}): {(e.stdout or "").strip()[:300]}')
         return 0
     # Verify where the file is. An export with no INSERT statements is a failure even
     # though pg_dump exited 0.
@@ -64170,7 +64237,8 @@ def _tak58_container_export(container, dest_path, pw, say):
     except PermissionError:
         _makedirs_priv(os.path.dirname(dest_path))
     r = subprocess.run(_sudo_wrap(['docker', 'cp', f'{container}:{_TAK58_EXPORT_IN_CONTAINER}',
-                                   dest_path]), capture_output=True, text=True, timeout=3600)
+                                   dest_path]), capture_output=True, text=True, timeout=7300,
+                       env=_tak58_long_env())
     hsize = os.path.getsize(dest_path) if os.path.exists(dest_path) else -1
     if r.returncode != 0 or hsize != size:
         say(f'  Could not copy the export out of the container '
@@ -64196,21 +64264,32 @@ def _tak58_container_import(container, src_path, pw, say):
     say(f'  Copying the export into {container}…')
     r = subprocess.run(_sudo_wrap(['docker', 'cp', src_path,
                                    f'{container}:{_TAK58_EXPORT_IN_CONTAINER}']),
-                       capture_output=True, text=True, timeout=3600)
+                       capture_output=True, text=True, timeout=7300, env=_tak58_long_env())
     if r.returncode != 0:
         say(f'  Copy into the container failed: {(r.stderr or "").strip()[:200]}')
         return False
-    say('  Importing (row-by-row — allow a long window on a large database)…')
+    say('  Importing (allow a long window on a large database)…')
     t0 = time.time()
-    # Output stays inside the container: a per-row "INSERT 0 1" for every statement,
-    # or a wall of errors, would exceed the broker's response cap and kill the call.
-    r = subprocess.run(_sudo_wrap([
-        'docker', 'exec', '-e', f'PGPASSWORD={pw}', container, 'sh', '-c',
+    # Output stays inside the container: a per-statement tag for every INSERT, or a wall
+    # of errors, would exceed the broker's response cap and kill the call.
+    # synchronous_commit=off for this session only: each batched INSERT still commits,
+    # but the session does not wait for the WAL fsync — the data is on disk within
+    # wal_writer_delay, and a crash mid-import is a failed migration either way
+    # (the row-count gate decides, and the PG15 volume is untouched).
+    def _import_progress():
+        out = _tak58_container_psql(container, pgbin, pw,
+            "select coalesce(sum(n_live_tup),0) from pg_stat_user_tables", timeout=60)
+        s = (out or '').strip()
+        return f'about {int(s):,} rows landed' if s.isdigit() else None
+
+    rc = _tak58_container_run_detached(
+        container, pw,
         f'{pgbin}/psql -h localhost -U martiuser -d cot -q -v ON_ERROR_STOP=0 '
-        f'-f {_TAK58_EXPORT_IN_CONTAINER} >/tmp/cot_import.out 2>/tmp/cot_import.err']),
-        capture_output=True, text=True, timeout=12 * 3600)
-    if r.returncode != 0:
-        say(f'  Import failed (psql exit {r.returncode}): {(r.stderr or "").strip()[:300]}')
+        f'-c "set synchronous_commit = off" '
+        f'-f {_TAK58_EXPORT_IN_CONTAINER} >/tmp/cot_import.out 2>/tmp/cot_import.err',
+        'cot_import', say, progress=_import_progress)
+    if rc != 0:
+        say(f'  Import failed (psql exit {rc}).')
         return False
     try:
         e = subprocess.run(_sudo_wrap([
@@ -64250,7 +64329,7 @@ def _tak58_volume_copy(src, dst, say):
         'docker', 'run', '--rm', '--user', '0',
         '-v', f'{src}:/from', '-v', f'{dst}:/to',
         '--entrypoint', 'sh', TAK_CONTAINER, '-c', 'cp -a /from/. /to/ 2>&1']),
-        capture_output=True, text=True, timeout=3600)
+        capture_output=True, text=True, timeout=7300, env=_tak58_long_env())
     if r.returncode != 0:
         say(f'  Could not copy {src} -> {dst}: {(r.stderr or r.stdout or "").strip()[:200]}')
         return False
