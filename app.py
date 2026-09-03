@@ -63744,6 +63744,134 @@ def _tak58_run_setup_db(timeout_sec=3600):
     return r.returncode
 
 
+# -- 5.8 container migration: export/import between two live DB containers ---
+# TAK documents the container upgrade as an export/import, NOT an in-place
+# migration (docker/README_hardened_docker.md, "postgres database version
+# upgrades"). The old container is the only one with /usr/pgsql-15/bin/psql, so it
+# must stay alive to export from; the new one must already carry the 5.8 schema
+# (its init runs SchemaManager) because the dump is --data-only.
+#
+# `--column-inserts` is row-by-row and far slower than the native pg_upgrade path.
+# The native 142 s / 181 s figures do NOT transfer here - container downtime is its
+# own measurement.
+_TAK58_EXPORT_NAME = 'cot_data.sql'
+
+
+def _tak58_db_password():
+    """The cot DB password from CoreConfig, or None. Never logged."""
+    try:
+        m = re.search(r'<connection[^>]*password="([^"]+)"', _read_coreconfig() or '')
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _tak58_container_pgbin(container, major):
+    """Path to psql for `major` inside `container`, or None if absent."""
+    r = subprocess.run(_sudo_wrap(['docker', 'exec', container,
+                                   'test', '-x', f'/usr/pgsql-{major}/bin/psql']),
+                       capture_output=True, timeout=60)
+    return f'/usr/pgsql-{major}/bin/psql' if r.returncode == 0 else None
+
+
+def _tak58_container_counts(container, pgbin, pw):
+    """{table: rowcount} for the cot DB inside `container`, or None.
+
+    Used to PROVE an import landed. A psql exit code of 0 says the file was read,
+    not that the rows arrived - the same distinction that hid a failed SchemaManager
+    behind upgrade-db.sh's exit 0 on the native path.
+    """
+    sql = ("select relname||' '||n_live_tup from pg_stat_user_tables "
+           "where n_live_tup > 0 order by relname")
+    try:
+        r = subprocess.run(_sudo_wrap([
+            'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
+            pgbin, '-h', 'localhost', '-U', 'martiuser', '-d', 'cot', '-tAc', sql]),
+            capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            return None
+        out = {}
+        for line in (r.stdout or '').splitlines():
+            parts = line.strip().split()
+            if len(parts) == 2 and parts[1].isdigit():
+                out[parts[0]] = int(parts[1])
+        return out
+    except Exception:
+        return None
+
+
+def _tak58_container_export(container, dest_path, pw, say):
+    """Export cot data from the OLD container. Returns bytes written, or 0 on failure.
+
+    Verified, not assumed: an export that produces a file with no INSERT statements
+    is a failure even though psql exited 0.
+    """
+    pgbin = _tak58_container_pgbin(container, 15)
+    if not pgbin:
+        say(f'  {container} has no PostgreSQL 15 client — cannot export from it.')
+        return 0
+    say(f'  Exporting the database from {container} (row-by-row; this is the slow part)…')
+    try:
+        _makedirs_priv(os.path.dirname(dest_path))
+    except Exception:
+        pass
+    cmd = (f"docker exec -e PGPASSWORD={shlex.quote(pw)} {shlex.quote(container)} "
+           f"{shlex.quote(pgbin)} -h localhost -U martiuser -d cot "
+           f"--data-only --column-inserts --disable-triggers")
+    try:
+        with open(dest_path, 'wb') as fh:
+            proc = subprocess.run(_sudo_wrap(['sh', '-c', cmd]), stdout=fh,
+                                  stderr=subprocess.PIPE, timeout=6 * 3600)
+        if proc.returncode != 0:
+            say(f'  Export failed: {(proc.stderr or b"").decode(errors="replace")[:200]}')
+            return 0
+        size = os.path.getsize(dest_path)
+    except Exception as e:
+        say(f'  Export failed: {str(e)[:200]}')
+        return 0
+    if size <= 0:
+        say('  Export produced an empty file — refusing to treat that as a backup.')
+        return 0
+    try:
+        g = subprocess.run(_sudo_wrap(['grep', '-c', '^INSERT INTO', dest_path]),
+                           capture_output=True, text=True, timeout=300)
+        inserts = int((g.stdout or '0').strip() or 0)
+    except Exception:
+        inserts = -1
+    if inserts == 0:
+        say('  Export contains no INSERT statements — the database looked empty. '
+            'Refusing to continue on an export that captured nothing.')
+        return 0
+    say(f'  Exported {_cotdb_fmt_bytes(size)}'
+        + (f', {inserts:,} INSERT statements' if inserts > 0 else ''))
+    return size
+
+
+def _tak58_container_import(container, src_path, pw, say):
+    """Import the export into the NEW container. Returns True only if rows landed."""
+    pgbin = _tak58_container_pgbin(container, TAK_PG_MAJOR)
+    if not pgbin:
+        say(f'  {container} has no PostgreSQL {TAK_PG_MAJOR} client — cannot import into it.')
+        return False
+    say(f'  Copying the export into {container}…')
+    r = subprocess.run(_sudo_wrap(['docker', 'cp', src_path,
+                                   f'{container}:/tmp/{_TAK58_EXPORT_NAME}']),
+                       capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0:
+        say(f'  Copy into the container failed: {(r.stderr or "").strip()[:200]}')
+        return False
+    say('  Importing (row-by-row — allow a long window on a large database)…')
+    r = subprocess.run(_sudo_wrap([
+        'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
+        pgbin, '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
+        '-f', f'/tmp/{_TAK58_EXPORT_NAME}']), capture_output=True, text=True,
+        timeout=12 * 3600)
+    if r.returncode != 0:
+        say(f'  Import failed: {(r.stderr or "").strip()[:300]}')
+        return False
+    return True
+
+
 def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
     """Run the vendor's upgrade-db.sh and stream it. Returns its exit code.
 
