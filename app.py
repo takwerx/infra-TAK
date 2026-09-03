@@ -28634,7 +28634,16 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
         log_fn(f"  ⚠ JKS conversion failed: {(r.stderr or r.stdout).strip()[:200]}"); return False
-    subprocess.run(_sudo_wrap(['chown', '1000:1000', jks, p12]))
+    # NOT `chown 1000:1000`. That was the PRE-hardened image's uid; the hardened 5.8
+    # image runs as tak:0 = uid 1001, gid 0 (`docker exec takserver id`, dev-4
+    # 2026-09-03), so the hardcoded uid re-locked both files away from the very
+    # process that reads them. It survived only because the JKS landed 0644 - i.e.
+    # the server's private key was world-readable on the host, which is its own
+    # problem on a box that may hold CJI.
+    # Group 0 + 0640 is uid-independent: it is the container user's gid on both
+    # image eras, and on the host group 0 is root.
+    subprocess.run(_sudo_wrap(['chown', ':0', jks, p12]), capture_output=True)
+    subprocess.run(_sudo_wrap(['chmod', '640', jks, p12]), capture_output=True)
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
     # Step C: patch CoreConfig 8446 connector → LetsEncrypt keystore (host-side via symlink).
     # TAK-in-container preserves CoreConfig across docker restart (verified), so no stop-first.
