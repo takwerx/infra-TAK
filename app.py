@@ -1895,6 +1895,31 @@ def _tak_bundle_dockerfiles(ctx):
     return None, None
 
 
+def _tak_db_volume_mount(ctx):
+    """`--mount` spec for the TAK DB named volume, chosen by the bundle's image era.
+
+    Pre-hardened images (Dockerfile.takserver-db, FROM postgres:15.1) initdb into
+    /var/lib/postgresql/<PGVER>/data and declare no VOLUME of their own, so the named
+    volume is mounted at the PARENT and the cluster lands at <volume>/15/data.
+
+    The hardened images (Dockerfile.hardened-takserver-db) declare
+    `VOLUME /var/lib/postgresql/data` and initdb there at build time. Mounting the parent
+    leaves that declared path to an ANONYMOUS volume Docker creates per container, so the
+    live database is not in takserver_pgsql at all and the next `docker rm` + `run`
+    abandons it. Measured on dev-4 2026-09-03 — `docker inspect takserver-db`:
+
+        volume takserver_pgsql -> /var/lib/postgresql
+        volume da5cc271…       -> /var/lib/postgresql/data     <- the real cluster
+
+    with the "data-preserving" container upgrade reporting "database preserved" over
+    a database SchemaManager had just built from nothing. So the hardened image gets the
+    named volume at exactly the path it declares.
+    """
+    _app_df, db_df = _tak_bundle_dockerfiles(ctx)
+    dest = '/var/lib/postgresql/data' if (db_df and 'hardened' in db_df.lower()) else '/var/lib/postgresql'
+    return f'--mount source={TAK_DB_VOLUME},destination={dest}'
+
+
 def _tak_is_bundle_dir(path):
     """True when `path` looks like an unpacked takserver-docker bundle (any era)."""
     return _tak_bundle_dockerfiles(path)[0] is not None
@@ -66553,7 +66578,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # 5) Recreate the containers on the SAME volume + network. NO `docker volume rm`.
         ulog("Step 5/6: Recreating containers (DB volume reused)...")
         rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
-        rc(f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
+        rc(f'docker run {_tak_db_volume_mount(new_ctx)} '
            f'-v {shlex.quote(new_tak)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
            f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db', timeout=120)
         time.sleep(8)
@@ -68017,7 +68042,7 @@ def _deploy_takserver_container(config):
         # keeps the old/empty-password role and auth fails.
         run_cmd(f'docker volume rm {TAK_DB_VOLUME} >/dev/null 2>&1; docker volume create {TAK_DB_VOLUME} >/dev/null 2>&1; true', check=False)
         run_cmd(
-            f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
+            f'docker run {_tak_db_volume_mount(build_ctx)} '
             f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
             f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db',
             "Starting database container...")
