@@ -67319,11 +67319,6 @@ def _deploy_takserver_container(config):
             log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
 
         # ── Step 6/9: Certificates (docker exec; files land in symlinked /opt/tak) ─
-        # The hardened images run as tak:0, not root, and the deploy recreates parts of
-        # the bundle (notably tak/certs) after unpack - so re-assert container ownership
-        # HERE, immediately before the cert scripts run as that non-root user.
-        if _tak_is_container():
-            _container_own_tree(os.path.realpath('/opt/tak'), log_step)
         log_step(""); log_step("━━━ Step 6/9: Generating Certificates ━━━")
         log_step(f"  Root CA: {root_ca} | Intermediate CA: {int_ca}")
         run_cmd('rm -rf /opt/tak/certs/files', check=False)
@@ -67388,6 +67383,13 @@ def _deploy_takserver_container(config):
                 deploy_status.update({'running': False, 'error': True})
                 return False
             return True
+        # LAST thing before the cert scripts run. It has to be here, not earlier:
+        # _write_priv() rewrites cert-metadata.sh a few lines above and resets it to
+        # 0600 uid 1000, so an ownership fix applied before that write is undone by it.
+        # The scripts run as the image's non-root user and read that file for $DIR and
+        # $CAPASS, so if it is unreadable they fail with a misleading missing-config.cfg.
+        if _tak_is_container():
+            _container_own_tree(os.path.realpath('/opt/tak'), log_step)
         log_step(f"Creating Root CA: {root_ca}...")
         if not _certrun(f'cd /opt/tak/certs && echo "{root_ca}" | ./makeRootCa.sh', f"Root CA {root_ca}"):
             return
