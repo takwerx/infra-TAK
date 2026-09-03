@@ -64748,12 +64748,23 @@ def takserver_update():
     #
     # The gate below still fires for anything the migration cannot handle
     # (container TAK, remote DB) — routing is not the same as always allowing.
-    _pending = []
+    # The 5.8 detection must see the artifact a CONTAINER box actually uploads — the
+    # takserver-docker .zip. Listing only .deb/.rpm here meant _is58 was never true on a
+    # container box, so a 5.8 zip fell through to the data-preserving container upgrade
+    # (a PG18 image on the PG15 volume) whenever the gate let it — measured on dev-4
+    # 2026-09-03: the route answered a plain {"success": true} and rebuilt on 5.8 with
+    # the migration never invoked.
+    _pending, _pending_zips = [], []
     try:
-        _pending = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(('.deb', '.rpm'))]
+        for f in os.listdir(UPLOAD_DIR):
+            if f.endswith(('.deb', '.rpm')):
+                _pending.append(f)
+            elif f.lower().endswith('.zip') and 'docker' in f.lower():
+                _pending_zips.append(f)
     except OSError:
         pass
-    _is58 = any((_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM for f in _pending)
+    _is58 = any((_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM
+                for f in (_pending_zips if _tak_is_container() else _pending))
     if _is58 and _tak_is_container():
         # Container 5.8: PostgreSQL 18 will not start on a PG15 data directory, so the
         # existing data-preserving container upgrade cannot be used - it deliberately
