@@ -26087,6 +26087,34 @@ def _sanitize_cert_field(value, field_name):
     return value
 
 
+def _container_readable(path, log=None):
+    """Make a bundle file readable by the TAK container's non-root user.
+
+    The HARDENED 5.8 images run as `tak:0` (uid 1001, gid 0), not root. Files we
+    write through the /opt/tak mount land 0600 owned by the console user (uid 1000),
+    so the container simply cannot read them. Measured on dev-4 2026-09-03: the
+    container's read of cert-metadata.sh returned DENIED, which made makeRootCa.sh
+    source nothing - no $DIR, no $CAPASS - and fail with a misleading
+    `Can't open "../config.cfg"` plus `Keystore password must be at least 6
+    characters`. The real cause is two directories away from the error message.
+
+    Older non-hardened images ran as root, where 0600 was readable, which is why
+    this never surfaced before 5.8.
+
+    Group 0 + group-read is the tightest thing that works: the container's gid IS 0,
+    so it needs no world bit. cert-metadata.sh carries CAPASS, so we do not make it
+    world-readable.
+    """
+    try:
+        subprocess.run(_sudo_wrap(['chgrp', '0', path]), capture_output=True, timeout=20)
+        subprocess.run(_sudo_wrap(['chmod', '640', path]), capture_output=True, timeout=20)
+        return True
+    except Exception as e:
+        if log:
+            log(f"  could not make {path} container-readable: {str(e)[:120]}")
+        return False
+
+
 def _patch_openssl_string_mask(log_fn=None):
     """Patch system openssl.cnf to use PrintableString instead of UTF8String.
 
@@ -67276,6 +67304,11 @@ def _deploy_takserver_container(config):
                         lines[i] = f'{indent}{var}="{safe}"\n'
                         break
             _write_priv(cm_path, ''.join(lines))
+            # The hardened 5.8 image runs as tak:0 (uid 1001), not root, so a 0600
+            # file owned by the console user is unreadable inside the container and
+            # cert generation fails with a misleading config.cfg error. See
+            # _container_readable().
+            _container_readable(cm_path, log_step)
         except Exception as _e:
             log_step(f"  ✗ cert-metadata.sh patch failed: {_e}")
         _patch_openssl_string_mask(log_step)
