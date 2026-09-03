@@ -28798,14 +28798,18 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # install(1) reads the /tmp source (broker source-permissive) and writes the
     # allowlisted /opt/tak dest as tak:tak in one step (replaces mv + chown).
+    # Mode 0640, not 0644: this keystore holds the server's TLS PRIVATE KEY, and TAK
+    # runs as `tak`, so nothing needs world read. (The container path had the same
+    # 0644 and is now 0640 too.)
     subprocess.run(_sudo_wrap([
-        'install', '-o', 'tak', '-g', 'tak', '-m', '644',
+        'install', '-o', 'tak', '-g', 'tak', '-m', '640',
         '/tmp/takserver-le.jks', '/opt/tak/certs/files/takserver-le.jks']),
         capture_output=True, text=True)
-    try:
-        os.remove('/tmp/takserver-le.jks')  # console-owned /tmp scratch; direct
-    except OSError:
-        pass
+    for _scratch in ('/tmp/takserver-le.jks', '/tmp/takserver-le.p12'):
+        try:
+            os.remove(_scratch)  # console-owned /tmp scratch; direct
+        except OSError:
+            pass
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
 
     # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
