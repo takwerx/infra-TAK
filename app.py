@@ -8699,20 +8699,33 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
             log.append('takserver-database rpm install output:')
             log.append((iout or '')[:1000])
     else:
+        # No takserver-database package was supplied, so there is nothing to resolve
+        # dependencies FROM and we have to name the packages ourselves.
+        #
+        # This is the ONLY place that does. Everywhere else — the native deploy and the
+        # branch above — installs a TAK package and lets dnf/apt resolve, which is
+        # strictly better: TAK's own packages declare exactly what they need, verified
+        # 2026-09-02 by reading them:
+        #
+        #   takserver / takserver-database 5.8  ->  postgresql18-server postgresql18-contrib
+        #                                           postgis36_18 postgis36_18-utils
+        #   takserver / takserver-database 5.7  ->  postgresql15-server postgresql15-contrib
+        #                                           postgis33_15 postgis33_15-utils
+        #
+        # So the vendor already answers "which PostgreSQL", per artifact, and any list we
+        # hardcode is wrong for every other TAK version and goes stale at 5.9. Naming them
+        # here is a fallback, not a policy — note it also has to include the -utils
+        # subpackage the real dependency set carries, which the first version of this list
+        # omitted. PostGIS is version-coupled per PG major (postgis33_15 vs postgis36_18),
+        # so it cannot be derived from TAK_PG_MAJOR alone.
+        _pgis = {18: 'postgis36_18', 15: 'postgis33_15'}.get(TAK_PG_MAJOR)
+        _pkgs = 'postgresql%(m)d-server postgresql%(m)d-contrib' % {'m': TAK_PG_MAJOR}
+        _full = (_pkgs + ' ' + _pgis + ' ' + _pgis + '-utils') if _pgis else _pkgs
         _, iout = _ssh_probe(s1, (
-            # D2 ANSWERED 2026-09-01 — read out of TAK's OWN hardened 5.8 image
-            # (docker/Dockerfile.hardened-takserver-db in
-            # takserver-docker-hardened-5.8-RELEASE-75.zip), which installs:
-            #     postgresql18-server postgresql18 postgis36_18
-            # So the EL PostGIS package for PG18 is `postgis36_%(m)d`, NOT the
-            # postgis34_/postgis35_ this code guessed at first. Taking the name from
-            # the vendor's own build is the only source that cannot drift from what
-            # 5.8 actually expects. contrib stays in our set because TAK's setup.sql
-            # creates the pgcrypto extension, which lives there on EL.
-            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib postgis36_%(m)d 2>&1 || '
-            'sudo dnf -y install postgresql%(m)d-server postgresql%(m)d-contrib 2>&1; echo RC=$?'
-            % {'m': TAK_PG_MAJOR}), timeout=600)
-        log.append('vanilla PG15 install: ' + (iout or '')[:300])
+            'sudo dnf -y install ' + _full + ' 2>&1 || '
+            'sudo dnf -y install ' + _pkgs + ' 2>&1; echo RC=$?'), timeout=600)
+        log.append('PostgreSQL %d install (no database package supplied): %s'
+                   % (TAK_PG_MAJOR, (iout or '')[:300]))
 
     # Step 3: ensure the cluster is INITIALIZED + STARTED (self-heal — the rpm may or may not have).
     init_cmd = (
