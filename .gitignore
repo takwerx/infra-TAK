@@ -30,6 +30,7 @@ docs/*
 !docs/AUTHENTIK-LOGIN-BRANDING.md
 !docs/RELAY-SETUP.md
 !docs/DDNS-SETUP.md
+!docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md
 memory-bank/
 .cursor/
 .cursorrules
