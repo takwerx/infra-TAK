@@ -8199,26 +8199,66 @@ def takserver_external_db_provision():
         plog(f'  Azure PostgreSQL detected — granting azure_pg_admin to {app_user}...')
         ok, out = run_sql(f'GRANT azure_pg_admin TO {app_user};', 'grant azure_pg_admin', use_db='postgres')
         plog(f'  {"✓" if ok else "✗"} azure_pg_admin grant: {out if not ok else "OK"}')
-        # Pre-create required extensions as admin — Azure blocks CREATE EXTENSION for non-superusers
-        # even with IF NOT EXISTS, so SchemaManager (running as app_user) would fail without this.
-        azure_exts = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
-        plog(f'  Azure: pre-creating required extensions as {admin_user}...')
-        ext_failures = []
-        for ext in azure_exts:
-            ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {ext};', f'create ext {ext}', use_db=db_name)
+
+    # Step 3c: the extensions TAK's schema needs, created by the ADMIN in the target
+    # database — for EVERY managed provider, not just Azure.
+    #
+    # This used to run only on the Azure branch, on the theory that RDS's
+    # rds_superuser grant above let TAK create them itself. It does not: on an
+    # external database TAK's own db-utils setup script never runs against the
+    # instance — only SchemaManager does — and SchemaManager's very first migration
+    # calls AddGeometryColumn(). Measured on a fresh RDS PostgreSQL 18 instance,
+    # 2026-09-04:
+    #
+    #   Migration of schema "public" to version "7 - create base schema" failed!
+    #   ERROR: function addgeometrycolumn(...) does not exist
+    #   -> SchemaManager exited 2, cot had only `plpgsql`, schema_version stayed 0
+    #
+    # and the deploy still reported DEPLOYMENT COMPLETE, leaving TAK 5.8 running
+    # against a database with no schema. A fresh install on AWS RDS could not have
+    # worked at all.
+    #
+    # postgis is REQUIRED — without it the schema cannot build, so failing to create
+    # it is fatal and says so. The rest are best-effort: TAK's own setup creates them
+    # on a local install, but a managed provider may not offer every one, and none of
+    # them stop the base schema.
+    if is_rds or is_azure:
+        _req_ext = 'postgis'
+        _opt_ext = ['fuzzystrmatch', 'postgis_topology', 'address_standardizer', 'pgcrypto']
+        _provider = 'Azure' if is_azure else 'AWS RDS'
+        plog(f'  {_provider}: creating the extensions TAK needs, as {admin_user}...')
+        ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {_req_ext};',
+                          f'create ext {_req_ext}', use_db=db_name)
+        plog(f'  {"✓" if ok else "✗"} {_req_ext}: {out if not ok else "OK"}')
+        if not ok:
+            if is_azure:
+                msg = (
+                    'PostGIS could not be created in the database and TAK\'s schema cannot be '
+                    'built without it. On Azure this normally means the extension is not '
+                    'whitelisted: Azure Portal → your PostgreSQL Flexible Server → Server '
+                    'parameters → search "azure.extensions" → add POSTGIS (and FUZZYSTRMATCH, '
+                    'POSTGIS_TOPOLOGY, ADDRESS_STANDARDIZER, PGCRYPTO) → Save, then re-run '
+                    'Provision Database. Reported: %s' % (out or 'unknown error'))
+            else:
+                msg = (
+                    'PostGIS could not be created in the database and TAK\'s schema cannot be '
+                    'built without it. Confirm the instance offers PostGIS for this engine '
+                    'version and that the admin user may create extensions. Reported: %s'
+                    % (out or 'unknown error'))
+            plog(f'  ✗ {msg}')
+            return jsonify({'success': False, 'error': msg, 'log': log,
+                            'extensions_not_whitelisted': True}), 400
+        _opt_missing = []
+        for ext in _opt_ext:
+            ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {ext};', f'create ext {ext}',
+                              use_db=db_name)
             plog(f'  {"✓" if ok else "△"} {ext}: {out if not ok else "OK"}')
             if not ok:
-                ext_failures.append(ext)
-        if ext_failures:
-            missing = ', '.join(e.upper() for e in ext_failures)
-            msg = (
-                f'Azure extensions not whitelisted: {missing}. '
-                f'Go to Azure Portal → your PostgreSQL Flexible Server → Server parameters → '
-                f'search "azure.extensions" → add: FUZZYSTRMATCH, POSTGIS, POSTGIS_TOPOLOGY, '
-                f'ADDRESS_STANDARDIZER, PGCRYPTO → Save. Then re-run Provision Database.'
-            )
-            plog(f'  ✗ Extension pre-creation failed — {msg}')
-            return jsonify({'success': False, 'error': msg, 'log': log, 'extensions_not_whitelisted': True}), 400
+                _opt_missing.append(ext)
+        if _opt_missing:
+            plog('  △ Not available on this instance: %s. PostGIS is present, so the base '
+                 'schema will build; note these in case a later TAK feature needs them.'
+                 % ', '.join(_opt_missing))
 
     # Step 4: Grant schema privileges (must connect to the target database)
     plog(f'  Granting schema privileges...')
@@ -63727,6 +63767,28 @@ def _tak58_managed_pg_major(edb):
     return int(out) // 10000, ''
 
 
+def _tak58_external_schema_version(edb):
+    """schema_version reached on a MANAGED database, or None. Read as the app user."""
+    host = (edb.get('host') or '').strip()
+    if not host or not _safe_migration_db_host(host):
+        return None
+    pw = edb.get('password') or ''
+    if not pw:
+        return None
+    try:
+        r = subprocess.run(
+            ['psql', '-h', host, '-p', str(int(edb.get('port') or 5432)),
+             '-U', (edb.get('user') or 'martiuser'), '-d', (edb.get('name') or 'cot'),
+             '-c', 'select coalesce(max(version::int), 0) from schema_version where success',
+             '--no-password', '-t', '-A'],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, PGPASSWORD=pw))
+    except Exception:
+        return None
+    out = (r.stdout or '').strip()
+    return int(out) if r.returncode == 0 and out.isdigit() else None
+
+
 def _tak_58_preflight():
     """Read-only readiness for the 5.8 + PG18 migration.
 
@@ -69215,10 +69277,33 @@ def run_takserver_deploy(config):
             for line in sm_out.strip().split('\n')[:30]:
                 if line.strip():
                     deploy_log.append(f"  {line.rstrip()}")
-            if sm_r.returncode == 0 or 'SchemaManager complete' in sm_out or 'already up to date' in sm_out.lower():
-                log_step("✓ SchemaManager upgrade complete (RDS schema ready)")
+            # Do not trust the exit code, and do not settle for a warning. Measured on a
+            # fresh RDS PostgreSQL 18 instance 2026-09-04: SchemaManager exited 2 with
+            # "function addgeometrycolumn(...) does not exist" (PostGIS was never created
+            # in the target database), the deploy logged this as a WARNING, went on to
+            # report "DEPLOYMENT COMPLETE", and left TAK 5.8 running against a database
+            # whose schema_version was 0. Ask the database what version it reached.
+            _edb_sv = _tak58_external_schema_version(config.get('external_db') or {})
+            if _edb_sv is not None and _edb_sv >= _TAK58_MIN_SCHEMA_VERSION:
+                log_step(f"✓ SchemaManager complete — managed database at schema_version {_edb_sv}")
+            elif sm_r.returncode == 0 and _edb_sv is None:
+                # Ran clean but we could not read it back (no psql client, say). Say so
+                # rather than claiming either outcome.
+                # log_step auto-captures anything carrying the warning marker, so no
+                # explicit append here (that would list it twice in the summary).
+                log_step("⚠ SchemaManager reported success but the schema version could not be "
+                         "read back from the managed database — verify it by hand before "
+                         "putting this server into service.")
             else:
-                log_step(f"⚠ SchemaManager exited {sm_r.returncode} — check logs above. TAK Server may still start if schema was partially applied.")
+                log_step(f"✗ SchemaManager did not build the schema (exit {sm_r.returncode}, "
+                         f"schema_version {_edb_sv if _edb_sv is not None else 'unreadable'}). "
+                         f"TAK Server will start but the database is not usable — check the "
+                         f"output above. The most common cause is PostGIS missing from the "
+                         f"database: re-run Provision Database, which creates it.")
+                deploy_warnings.append(
+                    'The managed database schema was NOT built (schema_version %s) — this server '
+                    'is not usable until that is fixed'
+                    % (_edb_sv if _edb_sv is not None else 'unreadable'))
 
         run_cmd('systemctl start takserver')
         log_step("Waiting 10 minutes for full initialization before promoting admin...")
