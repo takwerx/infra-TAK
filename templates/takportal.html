@@ -119,7 +119,7 @@
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div class="svc-grid">
 {% for c in container_info.containers %}
-<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'Up' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div></div>
+<div class="svc-card" onclick="filterLogs('{{ c.service }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if ('unhealthy' in c.status or 'Up' not in c.status) else 'var(--green)' }}" id="svc-{{ c.name }}" title="compose service: {{ c.service }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if ('unhealthy' in c.status or 'Up' not in c.status) else 'var(--green)' }}">● {{ c.status or 'not running' }}</div></div>
 {% endfor %}
 <div class="svc-card" onclick="filterLogs('')" style="cursor:pointer" id="svc-all"><div class="svc-name">all containers</div><div class="svc-status" style="color:var(--text-dim)">● combined</div></div>
 </div>
@@ -454,11 +454,23 @@ function pollDeployLog(){
     });
 }
 
+// v10.1.59: TAK Portal is a compose project — the log pane shows every service
+// (prefixed), or one service when its card is clicked. filterLogs() existed only as an
+// onclick target before this and was never defined.
+var logService='';
+function filterLogs(svc){
+    logService=svc||'';
+    document.querySelectorAll('.svc-card').forEach(function(c){c.style.outline='';});
+    var sel=document.getElementById(logService?('svc-'+logService):'svc-all');
+    if(!sel){document.querySelectorAll('.svc-card').forEach(function(c){if(c.getAttribute('title')==='compose service: '+logService)sel=c;});}
+    if(sel)sel.style.outline='2px solid var(--cyan)';
+    loadContainerLogs();
+}
 async function loadContainerLogs(){
     var el=document.getElementById('container-log');
     if(!el)return;
     try{
-        var r=await fetch('/api/takportal/logs?lines=80');
+        var r=await fetch('/api/takportal/logs?lines=80'+(logService?('&service='+encodeURIComponent(logService)):''));
         var d=await r.json();
         el.textContent='';
         if(d.entries&&d.entries.length>0){

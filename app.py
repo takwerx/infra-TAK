@@ -2851,12 +2851,15 @@ def detect_modules():
     # v10.0.5 non-root: a root-era TAK-Portal lives in /root/TAK-Portal, invisible to the
     # takwerx console — union the home-dir check with the tak-portal container (broker shims).
     _tp_home = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
-    _tpc = _run('docker ps -a --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-    portal_installed = _tp_home or bool((_tpc.stdout or '').strip())
-    portal_running = False
-    if portal_installed:
-        r = _run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        portal_running = 'Up' in (r.stdout or '')
+    # v10.1.59: the portal is a compose PROJECT. "installed" = compose file or a web
+    # container in any state; "running" = the WEB service is running — a worker or
+    # Postgres being up must not make a dead web UI look healthy (PLAN-v10.1.59).
+    try:
+        _tp_web = _takportal_web_container(all_states=True)
+    except Exception:
+        _tp_web = None
+    portal_installed = _tp_home or _tp_web is not None
+    portal_running = bool(_tp_web and _tp_web.get('running'))
     modules['takportal'] = {'name': 'TAK Portal', 'installed': portal_installed, 'running': portal_running,
         'description': 'User & certificate management with Authentik', 'icon': '👥', 'route': '/takportal', 'priority': 3}
     # MediaMTX (local or remote deployment)
@@ -18890,8 +18893,7 @@ def _guarddog_health_check(service_id):
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return resp.status in (200, 302, 301)
         if service_id == 'takportal':
-            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
-            return bool(r.stdout and 'Up' in r.stdout)
+            return _takportal_web_running()  # v10.1.59: the WEB service, exact — not a substring
         if service_id == 'mediamtx':
             settings = load_settings()
             mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -19600,8 +19602,7 @@ def _monitor_health_check(monitor_id):
             except Exception:
                 return False
         if monitor_id == 'takportal_ctr':
-            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
-            return bool(r.stdout and 'Up' in r.stdout)
+            return _takportal_web_running()  # v10.1.59: the WEB service, exact — not a substring
         if monitor_id == 'cloudtak_ctr':
             settings = load_settings()
             cfg = _get_cloudtak_deployment_config(settings)
@@ -26278,9 +26279,208 @@ def _ensure_infratak_network_for_authentik():
     _connect_container_to_infratak_network('authentik-server-1')
 
 
+# --- TAK Portal is a Compose PROJECT, not one container (v10.1.59) -------------------
+#
+# Upstream TAK Portal is splitting its compose file into web + worker (+ Postgres, + maybe
+# a map runtime). Every console path therefore drives the project through `docker compose`
+# in ~/TAK-Portal, and finds the WEB UI container by its compose SERVICE label — never by
+# `docker ps --filter name=tak-portal`, which is a SUBSTRING match that `tak-portal-worker`
+# satisfies while the web container is down, and never with `docker restart tak-portal`,
+# which leaves the worker and Postgres exactly where they were. PLAN-v10.1.59.
+
+TAKPORTAL_WEB_SERVICE = 'tak-portal'   # upstream's SERVICE_NAME in ./takportal
+
+
+def _takportal_dir():
+    return os.path.expanduser('~/TAK-Portal')
+
+
+def _takportal_project_name(portal_dir=None):
+    """The compose project name: COMPOSE_PROJECT_NAME from the project .env when set,
+    else the directory basename normalized the way Compose does it (lowercase, only
+    [a-z0-9_-], leading junk stripped) — 'TAK-Portal' -> 'tak-portal'."""
+    portal_dir = portal_dir or _takportal_dir()
+    try:
+        env_path = os.path.join(portal_dir, '.env')
+        if os.path.exists(env_path):
+            for line in (_read_priv(env_path) or '').splitlines():
+                if line.strip().startswith('COMPOSE_PROJECT_NAME='):
+                    v = line.strip().split('=', 1)[1].strip().strip('"').strip("'")
+                    if v:
+                        return v
+    except Exception:
+        pass
+    base = os.path.basename(portal_dir.rstrip('/')).lower()
+    base = re.sub(r'[^a-z0-9_-]', '', base).lstrip('_-')
+    return base or 'tak-portal'
+
+
+def _takportal_compose(args, timeout=120, portal_dir=None, **kw):
+    """`docker compose <args>` against the WHOLE TAK Portal project (cwd = ~/TAK-Portal)."""
+    portal_dir = portal_dir or _takportal_dir()
+    if 'stdout' not in kw and 'stderr' not in kw:
+        kw.setdefault('capture_output', True)
+    kw.setdefault('text', True)
+    return subprocess.run(_sudo_wrap(['docker', 'compose'] + list(args)), cwd=portal_dir,
+                          timeout=timeout, **kw)
+
+
+def _takportal_project_containers(all_states=True):
+    """Every container in the project: [{id, name, service, status, running}], from the
+    compose labels Docker stamps on each container (`com.docker.compose.project` /
+    `.service`) — exact matches, one cheap `docker ps`, no compose file parse, so it also
+    works when .env is missing. Falls back to an EXACT-name `docker ps` (`^tak-portal$`)
+    for a pre-compose or foreign checkout — never a substring match."""
+    out = []
+    fmt = '{{.ID}}|||{{.Names}}|||{{.Status}}|||{{.State}}|||{{.Label "com.docker.compose.service"}}'
+    try:
+        cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
+              ['--filter', f'label=com.docker.compose.project={_takportal_project_name()}', '--format', fmt]
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or '').splitlines():
+            parts = line.strip().split('|||')
+            if len(parts) < 2 or not parts[1]:
+                continue
+            out.append({'id': parts[0] or parts[1], 'name': parts[1],
+                        'status': parts[2] if len(parts) > 2 else '',
+                        'running': (parts[3].strip().lower() == 'running') if len(parts) > 3 else False,
+                        'service': parts[4].strip() if len(parts) > 4 else ''})
+    except Exception:
+        out = []
+    if out:
+        return out
+    try:
+        cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
+              ['--filter', 'name=^tak-portal$', '--format', fmt]
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or '').splitlines():
+            parts = line.strip().split('|||')
+            if len(parts) >= 2 and parts[1] == 'tak-portal':
+                out.append({'id': parts[0] or parts[1], 'name': parts[1],
+                            'status': parts[2] if len(parts) > 2 else '',
+                            'running': (parts[3].strip().lower() == 'running') if len(parts) > 3 else False,
+                            'service': (parts[4].strip() if len(parts) > 4 else '') or TAKPORTAL_WEB_SERVICE})
+    except Exception:
+        pass
+    return out
+
+
+def _takportal_web_container(all_states=False):
+    """The WEB UI service's container record, or None. Resolved by compose service label
+    (falling back to the exact container name), never by substring. all_states=False
+    means "running only"."""
+    for c in _takportal_project_containers(all_states=True):
+        if c['service'] == TAKPORTAL_WEB_SERVICE or (not c['service'] and c['name'] == 'tak-portal'):
+            if all_states or c['running']:
+                return c
+    return None
+
+
+def _takportal_web_running():
+    return _takportal_web_container() is not None
+
+
+def _takportal_web_status():
+    return (_takportal_web_container(all_states=True) or {}).get('status', '')
+
+
+def _takportal_ref(all_states=True):
+    """What `docker exec/cp/inspect/logs` get handed: the web container's ID. Returns the
+    literal 'tak-portal' when nothing exists so the caller's error reads sensibly."""
+    return (_takportal_web_container(all_states=all_states) or {}).get('id') or 'tak-portal'
+
+
+def _takportal_restart(timeout=120):
+    """Restart the WHOLE project (`docker compose restart`) — a worker must pick up a new
+    settings.json / cert too. Never `docker restart tak-portal`. Falls back to the web
+    container only when compose cannot run (no compose file). True on success."""
+    try:
+        if os.path.exists(os.path.join(_takportal_dir(), 'docker-compose.yml')):
+            r = _takportal_compose(['restart'], timeout=timeout)
+            if r.returncode == 0:
+                return True
+            print(f"[takportal] compose restart rc={r.returncode}: "
+                  f"{((r.stderr or r.stdout) or '').strip()[:200]}", flush=True)
+    except Exception as e:
+        print(f"[takportal] compose restart error: {str(e)[:200]}", flush=True)
+    cid = (_takportal_web_container(all_states=True) or {}).get('id')
+    if not cid:
+        return False
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'restart', cid]), capture_output=True, text=True,
+                           timeout=max(30, timeout // 2))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _takportal_up(extra=None, timeout=180, **kw):
+    """`docker compose up -d [extra...]` for the whole project."""
+    return _takportal_compose(['up', '-d'] + list(extra or []), timeout=timeout, **kw)
+
+
+def _takportal_app_services(portal_dir=None):
+    """Compose services that run the TAK Portal APP image — the ones that need our
+    extra_hosts / infratak network: any service with a `build:`, plus any service whose
+    `image:` is the tag a build service publishes. Third-party images (Postgres, ...) are
+    excluded on purpose: they have no business on the shared network. Web first.
+    ['tak-portal'] whenever the file cannot be parsed."""
+    portal_dir = portal_dir or _takportal_dir()
+    try:
+        import yaml as _yaml
+        with open(os.path.join(portal_dir, 'docker-compose.yml')) as f:
+            doc = _yaml.safe_load(f) or {}
+        svcs = doc.get('services') or {}
+        if not isinstance(svcs, dict) or not svcs:
+            return [TAKPORTAL_WEB_SERVICE]
+        built_images = {str(s.get('image')) for s in svcs.values()
+                        if isinstance(s, dict) and 'build' in s and s.get('image')}
+        names = [str(n) for n, s in svcs.items()
+                 if isinstance(s, dict) and ('build' in s or (s.get('image') and str(s.get('image')) in built_images))]
+        if not names:
+            return [TAKPORTAL_WEB_SERVICE]
+        names.sort(key=lambda n: (n != TAKPORTAL_WEB_SERVICE, n))
+        return names
+    except Exception:
+        return [TAKPORTAL_WEB_SERVICE]
+
+
+def _takportal_compose_exposed_ports(portal_dir=None):
+    """Published ports in docker-compose.yml NOT bound to 127.0.0.1 (call AFTER
+    _patch_takportal_compose_ports). Long-syntax `published:` entries are reported here,
+    not rewritten. [] when clean or unreadable."""
+    portal_dir = portal_dir or _takportal_dir()
+    found = []
+    try:
+        import yaml as _yaml
+        with open(os.path.join(portal_dir, 'docker-compose.yml')) as f:
+            doc = _yaml.safe_load(f) or {}
+        for n, s in (doc.get('services') or {}).items():
+            if not isinstance(s, dict):
+                continue
+            for p in (s.get('ports') or []):
+                if isinstance(p, dict):
+                    if p.get('published') not in (None, '') and str(p.get('host_ip') or '') != '127.0.0.1':
+                        found.append(f"{n}: published {p.get('published')} (host_ip={p.get('host_ip') or 'unset = all interfaces'})")
+                else:
+                    ps = str(p)
+                    if not ps.startswith('127.0.0.1:'):
+                        found.append(f"{n}: {ps}")
+    except Exception:
+        return []
+    return found
+
+
 def _ensure_infratak_network_for_portal():
-    """Connect TAK Portal container to the infratak network."""
-    _connect_container_to_infratak_network('tak-portal')
+    """Connect every TAK Portal APP container (web, worker, ...) to the infratak network."""
+    app_svcs = set(_takportal_app_services())
+    connected = 0
+    for c in _takportal_project_containers(all_states=False):
+        if c['service'] in app_svcs or (not c['service'] and c['name'] == 'tak-portal'):
+            _connect_container_to_infratak_network(c['id'])
+            connected += 1
+    if not connected:
+        _connect_container_to_infratak_network('tak-portal')
 
 
 def _write_takportal_override():
@@ -26324,17 +26524,26 @@ def _write_takportal_override():
         _extra_hosts = "      - \"host.docker.internal:host-gateway\"\n"
         if settings.get('fqdn') and tak_dns and os.path.isdir('/opt/tak'):
             _extra_hosts += f"      - \"{tak_dns}:host-gateway\"\n"
+        # v10.1.59: one block per APP service (web, worker, ...) — a worker on the app image
+        # needs the same host aliases and the infratak network as the web UI. Postgres and
+        # other third-party images are left out (_takportal_app_services). Byte-identical
+        # to the old output for the single-service upstream file, so no fleet recreate.
+        _svc_blocks = ''
+        for _svc in _takportal_app_services(portal_dir):
+            _svc_blocks += (
+                f"  {_svc}:\n"
+                "    extra_hosts:\n"
+                f"{_extra_hosts}"
+                "    networks:\n"
+                "      - default\n"
+                f"      - {INFRATAK_DOCKER_NETWORK}\n"
+            )
         content = (
             "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
             "# Port hardening is applied directly to docker-compose.yml by\n"
             "# _patch_takportal_compose_ports() (compose-version-agnostic).\n"
             "services:\n"
-            "  tak-portal:\n"
-            "    extra_hosts:\n"
-            f"{_extra_hosts}"
-            "    networks:\n"
-            "      - default\n"
-            f"      - {INFRATAK_DOCKER_NETWORK}\n"
+            f"{_svc_blocks}"
             "\n"
             "networks:\n"
             "  default: {}\n"
@@ -26418,6 +26627,19 @@ def _patch_takportal_compose_ports(portal_dir=None):
         content = _re.sub(
             r'(\s+- ")(\$\{WEB_UI_PORT:-3000\}:\$\{WEB_UI_PORT:-3000\})"',
             r'\g<1>127.0.0.1:\g<2>"',
+            content
+        )
+        # v10.1.59: upstream's compose is growing extra services (worker, Postgres, ...).
+        # ANY short-syntax "HOST:CONTAINER" published port without a host IP is a 0.0.0.0
+        # bind in front of UFW, past the Caddy/Authentik boundary — e.g. a future
+        # `5432:5432` on the portal's Postgres. Prefix every such entry with 127.0.0.1.
+        # The ${WEB_UI_PORT} rule above is unchanged (it already ran); this catches the
+        # rest. A line that already carries a host IP has three colon-separated parts and
+        # does not match. Long-syntax `published:` is reported by
+        # _takportal_compose_exposed_ports(), not rewritten.
+        content = _re.sub(
+            r'(?m)^(\s+-\s+"?)((?:\$\{[A-Za-z_][A-Za-z0-9_]*(?::-\d+)?\}|\d+):(?:\$\{[A-Za-z_][A-Za-z0-9_]*(?::-\d+)?\}|\d+)(?:/(?:tcp|udp))?)("?)[ \t]*$',
+            r'\g<1>127.0.0.1:\g<2>\g<3>',
             content
         )
         if content != orig:
@@ -29171,9 +29393,9 @@ def _get_takportal_version_info(fresh=False):
     # tail window. Widened from 200 to 2000 lines — it is cheap, and at 200 the line
     # had already scrolled away on every busy box we looked at.
     log_latest, log_update = None, False
-    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '-q']), capture_output=True, text=True, timeout=5)
-    if r.returncode == 0 and (r.stdout or '').strip():
-        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', '2000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+    _web_cid = (_takportal_web_container() or {}).get('id')
+    if _web_cid:
+        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', _web_cid, '--tail', '2000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
@@ -30261,15 +30483,14 @@ def takportal_page():
     # Get container info if running
     container_info = {}
     if portal.get('running'):
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Names}}|||{{.Status}}']), capture_output=True, text=True)
-        if r.stdout.strip():
-            containers = []
-            for line in r.stdout.strip().split('\n'):
-                if line.strip():
-                    parts = line.strip().split('|||')
-                    containers.append({'name': parts[0] if len(parts) > 0 else 'tak-portal', 'status': parts[1] if len(parts) > 1 else ''})
+        # v10.1.59: every container in the compose project (web, worker, Postgres, ...),
+        # web first; the headline status is the WEB service's.
+        containers = [{'name': c['name'], 'service': c['service'] or c['name'], 'status': c['status']}
+                      for c in _takportal_project_containers(all_states=True)]
+        containers.sort(key=lambda c: (c['service'] != TAKPORTAL_WEB_SERVICE, c['name']))
+        if containers:
             container_info['containers'] = containers
-            container_info['status'] = containers[0]['status'] if containers else ''
+            container_info['status'] = _takportal_web_status() or containers[0]['status']
     # Get portal port from .env if exists.
     # _read_priv, not open(): v10.1.9 W7 hardened module .env files to 600 and they are
     # root-owned, so a non-root console gets PermissionError and this whole page 500s
@@ -30357,7 +30578,7 @@ def _takportal_get_existing_settings():
     the whole file from our defaults, clobbering operator values on any redeploy."""
     try:
         r = subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
         if r.returncode == 0 and (r.stdout or '').strip():
             return json.loads(r.stdout.strip())
     except Exception:
@@ -30369,7 +30590,7 @@ def _takportal_get_existing_settings():
         import io as _io
         import tarfile as _tarfile
         cp = subprocess.run(
-            _sudo_wrap(['docker', 'cp', 'tak-portal:/usr/src/app/data/settings.json', '-']),
+            _sudo_wrap(['docker', 'cp', f'{_takportal_ref()}:/usr/src/app/data/settings.json', '-']),
             capture_output=True, timeout=15)
         if cp.returncode != 0 or not cp.stdout:
             return {}
@@ -30892,7 +31113,7 @@ def _takportal_write_settings_json(settings_json, plog=None):
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(settings_json)
-            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
+            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f'{_takportal_ref()}:/usr/src/app/data/settings.json']),
                                 capture_output=True, text=True, timeout=20)
         finally:
             try:
@@ -30916,9 +31137,7 @@ def _takportal_push_settings(plog=None, restart=True):
     portal isn't running or the push failed. Never raises."""
     _log = plog or (lambda m: print(m, flush=True))
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'tak-portal']),
-                           capture_output=True, text=True, timeout=8)
-        if (r.stdout or '').strip() != 'true':
+        if not _takportal_web_running():
             return False
         settings = load_settings()
         ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings), plog=_log)
@@ -30926,10 +31145,9 @@ def _takportal_push_settings(plog=None, restart=True):
             _log(f"  takportal settings push: docker cp failed: {err}")
             return False
         if restart:
-            rs = subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
-                                capture_output=True, text=True, timeout=30)
-            if rs.returncode != 0:
-                _log(f"  takportal settings push: restart returned {rs.returncode}")
+            # v10.1.59: the whole project, so a worker picks the new settings up too.
+            if not _takportal_restart():
+                _log("  takportal settings push: project restart failed")
         return True
     except Exception as e:
         _log(f"  takportal settings push error (non-fatal): {e}")
@@ -30950,9 +31168,7 @@ def _heal_takportal_authentik_token(plog=None):
     token can be read. Best-effort; never raises."""
     _log = plog or (lambda m: print(m, flush=True))
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'tak-portal']),
-                           capture_output=True, text=True, timeout=8)
-        if (r.stdout or '').strip() != 'true':
+        if not _takportal_web_running():
             return False  # container not running — nothing to heal / can't push
         existing = _takportal_get_existing_settings()
         if not isinstance(existing, dict):
@@ -31181,15 +31397,16 @@ def _takportal_setup_ssh(log_fn=None):
                 log_fn("  ✓ Public key already in authorized_keys")
 
         # Copy keypair into running container
+        _web = _takportal_ref()  # v10.1.59: the WEB service's container, resolved — not a name guess
         subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'mkdir', '-p', '/usr/src/app/data/ssh']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', _web, 'mkdir', '-p', '/usr/src/app/data/ssh']), capture_output=True, text=True, timeout=10)
         subprocess.run(
-            _sudo_wrap(['docker', 'cp', priv_key, 'tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'cp', priv_key, f'{_web}:/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
         subprocess.run(
-            _sudo_wrap(['docker', 'cp', pub_key, 'tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519.pub']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'cp', pub_key, f'{_web}:/usr/src/app/data/ssh/tak_ssh_ed25519.pub']), capture_output=True, text=True, timeout=10)
         # Ensure correct permissions inside container
         subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'chmod', '600', '/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', _web, 'chmod', '600', '/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
         if log_fn:
             log_fn("  ✓ SSH keys copied into TAK Portal container")
 
@@ -31311,7 +31528,7 @@ def takportal_control():
                     warnings.append(f'client cert / CA not refreshed: {certs_msg}. '
                                     'TAK Portal will report "Client P12 Certificate: Not Installed" '
                                     'and Marti stats will fail.')
-            subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+            _takportal_restart()  # v10.1.59: whole project (web + worker + ...)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
         # v0.9.31: run the full Authentik proxy chain heal for all deployed
@@ -31330,8 +31547,7 @@ def takportal_control():
         except Exception:
             pass
         time.sleep(2)
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-        running = 'Up' in (r.stdout or '')
+        running = _takportal_web_running()
         tp_state = (chain_summary or {}).get('takportal', {})
         ok = (tp_state.get('provider') in ('ok', 'created', 'fixed', 'adopted')
               and tp_state.get('app') in ('ok', 'created', 'fixed'))
@@ -31381,6 +31597,8 @@ def takportal_control():
         # out to upstream's `./takportal update`, which fuses the checkout and the build.
         _write_takportal_override()
         _patch_takportal_compose_ports(portal_dir)
+        for _ep in _takportal_compose_exposed_ports(portal_dir):
+            print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
         # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
         # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
         # time out here on a slower box, and TimeoutExpired was not caught, so it
@@ -31422,7 +31640,7 @@ def takportal_control():
             cp_ok, cp_err = _takportal_write_settings_json(settings_json)
             if cp_ok:
                 _takportal_setup_ssh()
-                subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+                _takportal_restart()  # v10.1.59: whole project
                 settings_synced = True
             else:
                 settings_sync_error = cp_err or 'docker cp failed'
@@ -31432,8 +31650,7 @@ def takportal_control():
         time.sleep(3)
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-        running = 'Up' in (r.stdout or '')
+        running = _takportal_web_running()
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
         return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
@@ -31444,8 +31661,7 @@ def takportal_control():
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
-    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-    running = 'Up' in r.stdout
+    running = _takportal_web_running()
     return jsonify({'success': True, 'running': running, 'action': action})
 
 @app.route('/api/takportal/deploy', methods=['POST'])
@@ -31470,8 +31686,21 @@ def takportal_deploy_log_api():
 @login_required
 def takportal_container_logs():
     """Get recent container logs"""
-    lines = request.args.get('lines', 50, type=int)
-    r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+    lines = max(1, min(request.args.get('lines', 50, type=int) or 50, 2000))
+    # v10.1.59: the whole compose project (service-prefixed lines), or one service via
+    # ?service=. Falls back to the web container's own log when compose cannot run.
+    service = (request.args.get('service') or '').strip()
+    if service and not re.match(r'^[A-Za-z0-9_.-]{1,64}$', service):
+        return jsonify({'error': 'invalid service'}), 400
+    r = None
+    if os.path.exists(os.path.join(_takportal_dir(), 'docker-compose.yml')):
+        try:
+            r = _takportal_compose(['logs', '--no-color', '--tail', str(lines)] + ([service] if service else []),
+                                   timeout=15, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except Exception:
+            r = None
+    if r is None or r.returncode != 0 or not (r.stdout or '').strip():
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', _takportal_ref(), '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
     entries = []
     skip_lines = {'npm error', 'npm ERR', 'signal SIGTERM', 'command failed', 'A complete log of this run'}
     for line in (r.stdout.strip().split('\n') if r.stdout.strip() else []):
@@ -31544,7 +31773,7 @@ def takportal_ssh_status():
 
     in_container = False
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'tak-portal', 'test', '-f',
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', _takportal_ref(), 'test', '-f',
                                        '/usr/src/app/data/ssh/tak_ssh_ed25519']),
                            capture_output=True, text=True, timeout=10)
         in_container = (r.returncode == 0)
@@ -31653,8 +31882,7 @@ def takportal_ssh_set_user():
     ok, err = _takportal_write_settings_json(json.dumps(merged, indent=2))
     if not ok:
         return jsonify({'success': False, 'error': err}), 500
-    subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
-                   capture_output=True, text=True, timeout=30)
+    _takportal_restart()  # v10.1.59: whole project
     return jsonify({'success': True, 'user': console_user})
 
 
@@ -31877,6 +32105,14 @@ def run_takportal_deploy():
 
         if _patch_takportal_compose_network():
             plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
+        # v10.1.59: loopback-bind every published port BEFORE the first build. Deploy never
+        # called this — only the startup migration and the post-update hook did — so a fresh
+        # install ran on 0.0.0.0:3000 (in front of UFW; Docker writes its own iptables rules)
+        # until the next console restart.
+        if _patch_takportal_compose_ports(portal_dir):
+            plog("  ✓ Published ports bound to 127.0.0.1 in docker-compose.yml (Caddy is the only way in)")
+        for _ep in _takportal_compose_exposed_ports(portal_dir):
+            plog(f"  ⚠ published port NOT bound to loopback: {_ep}")
 
         plog("  Building image (this may take a minute)...")
         # Build + create the container WITHOUT starting it. The first boot otherwise
@@ -31926,8 +32162,7 @@ def run_takportal_deploy():
         # Wait for container to be healthy
         plog("  Waiting for container...")
         time.sleep(5)
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-        if 'Up' in r.stdout:
+        if _takportal_web_running():
             plog("\u2713 TAK Portal is running")
         else:
             plog("\u26a0 Container may not be fully started yet")
@@ -32002,8 +32237,8 @@ def run_takportal_deploy():
         else:
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
-        # Restart container to pick up settings
-        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+        # Restart the whole project to pick up settings (v10.1.59: web + worker + ...)
+        _takportal_restart()
         time.sleep(3)
         plog("\u2713 TAK Portal restarted with new settings")
 
@@ -39721,11 +39956,22 @@ def _update_boot_stagger_service():
     Called after any module deploy or uninstall so it always reflects current state.
     Startup order: Authentik DB -> Authentik -> TAK Portal -> CloudTAK."""
     try:
+        # v10.1.59: TAK Portal is a compose PROJECT (web + worker + Postgres ...). Stop and
+        # start every container it has, and start it with `docker compose up -d` in the
+        # project dir so services come up in dependency order — `docker start tak-portal`
+        # started the web container alone and left a worker/Postgres to chance.
+        _tp_dir = _takportal_dir()
+        try:
+            _tp_names = [c['name'] for c in _takportal_project_containers(all_states=True)] or ['tak-portal']
+        except Exception:
+            _tp_names = ['tak-portal']
+        _tp_compose = (os.path.exists(os.path.join(_tp_dir, 'docker-compose.yml'))
+                       and "'" not in _tp_dir and ' ' not in _tp_dir)
         BOOT_ORDER = [
             ('Authentik DB', ['authentik-postgresql-1'], 5),
             ('Authentik', ['authentik-server-1', 'authentik-worker-1'], 10),
             ('Authentik LDAP', ['authentik-ldap-1'], 5),
-            ('TAK Portal', ['tak-portal'], 5),
+            ('TAK Portal', _tp_names, 5),
             ('CloudTAK DB', ['cloudtak-postgis-1'], 5),
             ('CloudTAK', ['cloudtak-api-1', 'cloudtak-tiles-1', 'cloudtak-events-1', 'cloudtak-store-1', 'cloudtak-media-1'], 0),
         ]
@@ -39737,7 +39983,10 @@ def _update_boot_stagger_service():
         for label, containers, sleep_after in BOOT_ORDER:
             present = [c for c in containers if c in existing]
             if present:
-                steps.append(f'echo "Starting {label}..." && docker start {" ".join(present)}')
+                if label == 'TAK Portal' and _tp_compose:
+                    steps.append(f'echo "Starting {label}..." && ((cd {_tp_dir} && docker compose up -d) || docker start {" ".join(present)})')
+                else:
+                    steps.append(f'echo "Starting {label}..." && docker start {" ".join(present)}')
                 if sleep_after > 0:
                     steps.append(f'sleep {sleep_after}')
         if not steps:
@@ -45195,7 +45444,7 @@ def _idp_bridge_portal_file(path):
     absent/unreadable (the caller decides whether that's a skip or an error)."""
     try:
         r = subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', path]),
+            _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', path]),
             capture_output=True, text=True, timeout=15)
         if r.returncode != 0 or not (r.stdout or '').strip():
             return None
@@ -53350,10 +53599,7 @@ def _takportal_admin_guardrail(plog_fn=None):
         _portal_dir = os.path.expanduser('~/TAK-Portal')
         if not os.path.isdir(_portal_dir):
             return
-        _ps = subprocess.run(
-            _sudo_wrap(['docker', 'ps', '--filter', 'name=^tak-portal$', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10
-        )
-        if 'tak-portal' not in (_ps.stdout or ''):
+        if not _takportal_web_running():
             return
 
         _existing = _takportal_get_existing_settings()
@@ -62456,7 +62702,7 @@ def takserver_rotate_rootca():
             log("  TAK Server restarting...")
 
             # Copy new certs to TAK Portal if it's running
-            portal_running = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode == 0
+            portal_running = _takportal_web_running()
             if portal_running:
                 log("  Updating TAK Portal certificates...")
                 # v10.0.1: delegate to _takportal_sync_certs — temp-file re-encode
@@ -65224,8 +65470,7 @@ def run_takserver_upgrade_container(zip_path):
         # the containers, so the Portal must refresh its client cert + CA and reconnect, or
         # webadmin/enrollment via the Portal breaks. Same helper, same as the native rotation.
         try:
-            _pr = subprocess.run(_sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10)
-            if 'tak-portal' in (_pr.stdout or ''):
+            if _takportal_web_running():  # v10.1.59: exact web-service check, not a substring
                 ulog("Re-syncing TAK Portal certs + reconnecting to the upgraded TAK Server...")
                 _tp_ok, _tp_msg = _takportal_sync_certs(plog=ulog, restart=True)
                 ulog(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
@@ -66889,7 +67134,7 @@ def _deploy_takserver_container(config):
         # cleanly if TAK Portal isn't installed. See memory
         # takportal-stale-client-cert-on-redeploy.
         try:
-            if _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode == 0:
+            if _takportal_web_running():
                 log_step(""); log_step("━━━ Refreshing TAK Portal certs (CA changed on redeploy) ━━━")
                 _tp_ok, _tp_msg = _takportal_sync_certs(plog=log_step, restart=True)
                 log_step(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
@@ -67994,7 +68239,7 @@ def _takportal_sync_map_channels(plog=None):
     if not os.path.exists(uaf):
         return
     # Portal must be installed (container present, running or not) — else nothing to sync for.
-    if _priv_pipe(['docker', 'ps', '-a', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode != 0:
+    if _takportal_web_container(all_states=True) is None:
         return
     # 1. Live channel list from Marti (REST; DB-agnostic).
     data, err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/all')
@@ -68062,7 +68307,7 @@ def _takportal_sync_map_channels(plog=None):
     ET.ElementTree(root).write(_buf, xml_declaration=True, encoding='unicode')
     _write_priv(uaf, _buf.getvalue())
     _log(f"admin bridge (+bootstrap cert) channel membership {old_count} -> {len(target)}; restarting tak-portal")
-    subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=90)
+    _takportal_restart(timeout=120)  # v10.1.59: whole project
 
 
 def _tak_sync_admin_group_cache(plog=None):
@@ -68167,11 +68412,12 @@ def _takportal_sync_certs(plog=None, restart=False):
     def _log(m):
         if plog:
             plog(m)
-    r = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal'])
-    if r.returncode != 0:
+    _webc = _takportal_web_container()  # v10.1.59: the WEB service, resolved by compose label
+    if _webc is None:
         return (False, 'TAK Portal container is not running')
+    _web = _webc['id']
     cert_dir = '/opt/tak/certs/files'
-    subprocess.run(_sudo_wrap(['docker', 'exec', 'tak-portal', 'mkdir', '-p', '/usr/src/app/data/certs']), capture_output=True, text=True)
+    subprocess.run(_sudo_wrap(['docker', 'exec', _web, 'mkdir', '-p', '/usr/src/app/data/certs']), capture_output=True, text=True)
     cert_pass = _get_tak_cert_password(load_settings())
     # --- client cert: admin.p12 -> modern PKCS12 -> tak-client.p12 ---
     ok_client = False
@@ -68222,11 +68468,11 @@ def _takportal_sync_certs(plog=None, restart=False):
         except OSError:
             pass
         if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-            subprocess.run(_sudo_wrap(['docker', 'cp', modern_p12, 'tak-portal:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
+            subprocess.run(_sudo_wrap(['docker', 'cp', modern_p12, f'{_web}:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
             _log("  ✓ tak-client.p12 refreshed (admin.p12 re-encoded to modern PKCS12)")
             ok_client = True
         else:
-            subprocess.run(_sudo_wrap(['docker', 'cp', admin_p12, 'tak-portal:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
+            subprocess.run(_sudo_wrap(['docker', 'cp', admin_p12, f'{_web}:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
             _log("  ⚠ tak-client.p12 copied in LEGACY format (re-encode failed — portal may not read it)")
             ok_client = True
         try:
@@ -68263,7 +68509,7 @@ def _takportal_sync_certs(plog=None, restart=False):
                 f.write('\n'.join(bundle_parts) + '\n')
             tak_ca_src = ca_bundle_path
     if tak_ca_src:
-        subprocess.run(_sudo_wrap(['docker', 'cp', tak_ca_src, 'tak-portal:/usr/src/app/data/certs/tak-ca.pem']), capture_output=True, text=True, timeout=10)
+        subprocess.run(_sudo_wrap(['docker', 'cp', tak_ca_src, f'{_web}:/usr/src/app/data/certs/tak-ca.pem']), capture_output=True, text=True, timeout=10)
         _log("  ✓ tak-ca.pem refreshed (server CA chain)")
         ok_ca = True
         if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
@@ -68274,7 +68520,7 @@ def _takportal_sync_certs(plog=None, restart=False):
     else:
         _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
     if restart and (ok_client or ok_ca):
-        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+        _takportal_restart()  # v10.1.59: whole project
         # v10.1.x (PLAN-v10.1.4 item 5): a restart-intent cert resync can follow a TAK
         # redeploy that regenerated UserAuthenticationFile.xml (admin reset to __ANON__).
         # Re-assert the map bridge's channel membership so /map isn't empty until the
@@ -68304,8 +68550,7 @@ def takserver_sync_portal_ca():
     (data/certs/tak-client.p12) and the CA (data/certs/tak-ca.pem), then restart.
     v10.0.1: previously copied ONLY the CA, which left a stale/legacy client cert
     after a CA change → Marti stats 503. Now delegates to _takportal_sync_certs."""
-    r = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal'])
-    if r.returncode != 0:
+    if not _takportal_web_running():
         return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
     ok, msg = _takportal_sync_certs(restart=True)
     if not ok:
@@ -71523,7 +71768,7 @@ def _startup_harden_tak_portal_ports():
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
-                    _sudo_wrap(['docker', 'inspect', 'tak-portal', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
+                    _sudo_wrap(['docker', 'inspect', _takportal_ref(), '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                 )
                 _bindings = json.loads(_ins.stdout.strip() or '{}')
                 if not _bindings.get('3000/tcp'):
@@ -73877,9 +74122,9 @@ def _startup_migrations():
         # Ensure the shared infratak Docker network exists and containers are connected
         # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
         try:
-            portal_up = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=tak-portal']), capture_output=True, text=True, timeout=5)
+            portal_up = _takportal_web_running()
             ak_up = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=authentik-server-1']), capture_output=True, text=True, timeout=5)
-            if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
+            if portal_up and (ak_up.stdout or '').strip():
                 _patch_takportal_compose_network()
                 _patch_authentik_compose_network()
                 _ensure_infratak_network_for_authentik()
@@ -75308,8 +75553,7 @@ def _post_update_auto_deploy():
                 portal_dir = os.path.expanduser('~/TAK-Portal')
                 if os.path.exists(portal_dir):
                     try:
-                        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
-                        if 'Up' in (r.stdout or ''):
+                        if _takportal_web_running():
                             print("Post-update: auto-reconfiguring TAK Portal")
                             _auto_deploy_active['takportal'] = True
                             try:
@@ -75319,7 +75563,7 @@ def _post_update_auto_deploy():
                                 _takportal_setup_ssh()
                                 _ensure_infratak_network_for_authentik()
                                 _ensure_infratak_network_for_portal()
-                                subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+                                _takportal_restart()  # v10.1.59: whole project
                                 _sync_authentik_takportal_provider_url(settings)
                                 print("Post-update: TAK Portal config updated and restarted (infratak network connected)")
                             finally:
@@ -76477,7 +76721,7 @@ def _post_update_auto_deploy():
                     if not _needs_recreate:
                         try:
                             _ins = subprocess.run(
-                                _sudo_wrap(['docker', 'inspect', 'tak-portal', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
+                                _sudo_wrap(['docker', 'inspect', _takportal_ref(), '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                             )
                             _bindings = json.loads(_ins.stdout.strip() or '{}')
                             if not _bindings.get('3000/tcp'):
