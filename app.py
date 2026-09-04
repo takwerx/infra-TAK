@@ -63307,11 +63307,21 @@ def upload_takserver_package():
         # with the wrong package by accident.
         _arch = _host_arch()
         _native_ext = '.rpm' if _distro_family() == 'rhel' else '.deb'
+        # A `takserver-database` package is the ONE artifact that legitimately belongs to
+        # the other family: in a two-server deployment it is installed on Server One,
+        # over SSH, and _setup_server_one() explicitly probes that host's OS and
+        # dispatches to the RHEL path when it differs from the console's ("the DB box
+        # (Server One) can be a DIFFERENT OS family than the console"). The deploy also
+        # already accepts either extension from uploads. Only this gate disagreed, so an
+        # Ubuntu core could never stage the .rpm its own Rocky Server One needs, and the
+        # mixed-family split-box the code supports was unreachable through the UI.
+        # arm64 stays container-only either way — that is not about families.
+        _is_db_pkg = 'database' in fn.lower()
         if fn.endswith('.deb'):
             if _arch == 'arm64':
                 os.remove(fp)
                 return jsonify({'error': f'.deb uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
-            if _distro_family() == 'rhel':
+            if _distro_family() == 'rhel' and not _is_db_pkg:
                 os.remove(fp)
                 return jsonify({'error': f'.deb uploaded but system is {os_type} (RHEL family). Need a takserver .rpm.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'deb', 'size_mb': sz})
@@ -63319,7 +63329,7 @@ def upload_takserver_package():
             if _arch == 'arm64':
                 os.remove(fp)
                 return jsonify({'error': f'.rpm uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
-            if _distro_family() != 'rhel':
+            if _distro_family() != 'rhel' and not _is_db_pkg:
                 os.remove(fp)
                 return jsonify({'error': f'.rpm uploaded but system is {os_type}. Need a takserver .deb.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'rpm', 'size_mb': sz})
