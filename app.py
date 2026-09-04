@@ -63666,6 +63666,48 @@ def _tak_58_preflight_cached(max_age=60):
     return d
 
 
+def _tak58_managed_pg_major(edb):
+    """(major, detail) for a MANAGED database, read over TCP. (None, why) if unknown.
+
+    The 5.8 pre-flight used the local `_sql()` helper for this, which runs
+    `runuser -u postgres -- psql` against the LOCAL cluster. On an external_db box
+    that is the wrong server entirely: measured on dev5 2026-09-03 it reported
+    PostgreSQL 18 (the box's own cluster) for an RDS instance running 15.19, which
+    would have set already_migrated=True on a database that had not been touched.
+
+    Same shape as the external-DB Test Connection check: psql over TCP with
+    PGPASSWORD, host validated first. `postgres` rather than `cot`, because the
+    application database may not exist before provisioning.
+    """
+    host = (edb.get('host') or '').strip()
+    if not host:
+        return None, 'no database host configured'
+    if not _safe_migration_db_host(host):
+        return None, 'configured host is not a plain IP or DNS name'
+    try:
+        port = int(edb.get('port') or 5432)
+    except (TypeError, ValueError):
+        return None, 'invalid port'
+    user = (edb.get('user') or 'martiuser').strip()
+    pw = edb.get('password') or ''
+    if not pw:
+        return None, 'no stored password — run Provision Database first'
+    try:
+        r = subprocess.run(
+            ['psql', '-h', host, '-p', str(port), '-U', user, '-d', 'postgres',
+             '-c', 'SHOW server_version_num;', '--no-password', '-t', '-A'],
+            capture_output=True, text=True, timeout=20,
+            env=dict(os.environ, PGPASSWORD=pw))
+    except FileNotFoundError:
+        return None, 'no psql client on this host to query the managed database with'
+    except Exception as e:
+        return None, str(e)[:160]
+    out = (r.stdout or '').strip()
+    if r.returncode != 0 or not out.isdigit():
+        return None, ((r.stderr or r.stdout or 'psql failed').strip()[:160])
+    return int(out) // 10000, ''
+
+
 def _tak_58_preflight():
     """Read-only readiness for the 5.8 + PG18 migration.
 
@@ -63716,13 +63758,40 @@ def _tak_58_preflight():
         facts['deployment_mode'] = _dep_mode
         if _dep_mode == 'external_db':
             facts['external_db'] = True
-            blockers.append(
-                'This server uses a managed database (%s). TAK Server 5.8 requires PostgreSQL '
-                '%d, and a managed engine can only be upgraded by the provider — AWS RDS or '
-                'Azure, in their own console. Upgrade the instance to PostgreSQL %d first, '
-                'confirm TAK can still authenticate to it, then return here and run the update. '
-                'Step-by-step: docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md'
-                % (db_host or 'remote host', TAK_PG_MAJOR, TAK_PG_MAJOR))
+            # Ask the MANAGED instance, not the local cluster, and gate the refusal on
+            # the answer. The refusal used to be unconditional, which made the very
+            # instruction it gives impossible to satisfy: an operator who upgraded their
+            # RDS/Azure instance to 18 as told came back to the same blocker, for ever.
+            try:
+                _edb_cfg = (_get_tak_deployment_config(load_settings())
+                            or {}).get('external_db') or {}
+            except Exception:
+                _edb_cfg = {}
+            _mm, _mwhy = _tak58_managed_pg_major(_edb_cfg)
+            facts['managed_pg_major'] = _mm
+            if _mm is None:
+                blockers.append(
+                    'Could not read the PostgreSQL version of the managed database (%s): %s. '
+                    'TAK Server 5.8 requires PostgreSQL %d and this cannot be confirmed, so the '
+                    'upgrade will not start — proceeding blind is how a server ends up running '
+                    '5.8 against a database it cannot use.'
+                    % (db_host or 'remote host', _mwhy or 'unknown error', TAK_PG_MAJOR))
+            elif _mm < TAK_PG_MAJOR:
+                blockers.append(
+                    'This server uses a managed database (%s) running PostgreSQL %d. TAK Server '
+                    '5.8 requires PostgreSQL %d, and a managed engine can only be upgraded by the '
+                    'provider — AWS RDS or Azure, in their own console. Upgrade the instance to '
+                    'PostgreSQL %d first, confirm TAK can still authenticate to it, then return '
+                    'here and run the update. Step-by-step: '
+                    'docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md'
+                    % (db_host or 'remote host', _mm, TAK_PG_MAJOR, TAK_PG_MAJOR))
+            else:
+                warnings.append(
+                    'The managed database (%s) is already on PostgreSQL %d, so there is no engine '
+                    'upgrade for this release to do. Installing 5.8 will run its schema update '
+                    'against that instance — take a provider-side snapshot first, because the '
+                    'schema change is not something this console can roll back for you.'
+                    % (db_host or 'remote host', _mm))
         else:
             blockers.append(
                 'The CoT database is on a separate server (%s). The 5.8 migration has to run '
@@ -63732,11 +63801,17 @@ def _tak_58_preflight():
     # 2. Which major is actually serving, and is 15 present at all?
     #    upgrade-db.sh exits 1 with "Upgrade will be skipped" if no 15 cluster exists.
     running_major = None
-    sv = _sql('SHOW server_version_num;', db='postgres')
-    if sv and sv.isdigit():
-        running_major = int(sv) // 10000
-    facts['pg_running_major'] = running_major
-    if running_major is None:
+    if facts.get('external_db'):
+        # Already answered over TCP above; the local cluster (if any) is irrelevant here
+        # and asking it is what produced the wrong number in the first place.
+        running_major = facts.get('managed_pg_major')
+        facts['pg_running_major'] = running_major
+    else:
+        sv = _sql('SHOW server_version_num;', db='postgres')
+        if sv and sv.isdigit():
+            running_major = int(sv) // 10000
+        facts['pg_running_major'] = running_major
+    if running_major is None and not facts.get('external_db'):
         blockers.append('Could not determine the running PostgreSQL version — is the database up?')
     elif running_major >= TAK_PG_MAJOR:
         facts['already_migrated'] = True
@@ -63745,7 +63820,10 @@ def _tak_58_preflight():
                         'refuses anything else.' % running_major)
 
     # 3. Our own cluster check (the vendor's is broken — see header).
-    lsc = _sh(['pg_lsclusters', '--no-header'])
+    #    Local-cluster and local-disk facts describe a machine that, on a managed
+    #    database, is not the one running PostgreSQL. Reporting them there is noise
+    #    at best and a false blocker at worst.
+    lsc = None if facts.get('external_db') else _sh(['pg_lsclusters', '--no-header'])
     if lsc and lsc.returncode == 0:
         rows = [l.split() for l in (lsc.stdout or '').splitlines() if l.strip()]
         facts['clusters'] = ['%s/%s %s' % (r[0], r[1], r[3]) for r in rows if len(r) > 3]
@@ -63753,7 +63831,7 @@ def _tak_58_preflight():
             blockers.append('No PostgreSQL 15 cluster found — upgrade-db.sh will refuse.')
 
     # 4. Disk: the new cluster needs 1.5x the old data dir, on ITS partition.
-    datadir = _sql('SHOW data_directory;', db='postgres')
+    datadir = None if facts.get('external_db') else _sql('SHOW data_directory;', db='postgres')
     facts['data_directory'] = datadir
     if datadir:
         du = _sh(['du', '-sb', datadir], timeout=120)
