@@ -63075,10 +63075,29 @@ def takserver_uninstall():
         except Exception:
             pass
         steps.append('Container TAK removed (containers, volume, network, ~/tak-docker)')
-    # Stop service
-    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
-    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
-    steps.append('Stopped TAK Server')
+    # Stop service.
+    #
+    # A slow shutdown must NOT abort the uninstall. `systemctl stop takserver` on a
+    # busy 5.8 box regularly exceeds 90 s (measured on a Rocky 9 box with ~1M rows,
+    # 2026-09-03), and subprocess.run raises TimeoutExpired. That exception was
+    # unhandled, so the route 500'd and every step below it - package purge,
+    # /opt/tak removal, database cleanup - never ran. The operator got "Internal
+    # Server Error" and a half-removed server: package still installed, unit in
+    # `failed`, /opt/tak still on disk. The next deploy then lands on that mess.
+    #
+    # Graceful stop is a courtesy here; the SIGKILL below is what actually
+    # guarantees the processes are gone. So allow longer, and on timeout say so and
+    # carry on to the kill rather than abandoning the uninstall.
+    _stopped_cleanly = True
+    for _unit_cmd in (['systemctl', 'stop', 'takserver'], ['systemctl', 'disable', 'takserver']):
+        try:
+            subprocess.run(_sudo_wrap(_unit_cmd), capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            _stopped_cleanly = False
+        except Exception:
+            _stopped_cleanly = False
+    steps.append('Stopped TAK Server' if _stopped_cleanly else
+                 'TAK Server did not stop within 5 minutes — killed instead (uninstall continued)')
     # Kill any remaining processes
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
     steps.append('Killed remaining processes')
