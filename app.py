@@ -9185,6 +9185,24 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
 
     # Step 5 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
     tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+
+    # Same final gate as the RHEL path: every step above logs warnings and carries on, so
+    # without this a Server One with no martiuser and no tables is handed back as a
+    # success and the operator finds out when the core 500s at login. Ask the database.
+    _, _final = _ssh_probe(s1, (
+        "cd /tmp && sudo -u postgres psql -tAXc \"select count(*) from pg_roles where "
+        "rolname='martiuser'\" 2>/dev/null; "
+        "cd /tmp && sudo -u postgres psql -tAX -d cot -c \"select count(*) from "
+        "information_schema.tables where table_schema='public'\" 2>/dev/null"), timeout=40)
+    _vals = [t for t in (_final or '').split() if t.isdigit()]
+    _roles = int(_vals[0]) if len(_vals) > 0 else 0
+    _tables = int(_vals[1]) if len(_vals) > 1 else 0
+    log.append(f'Server One verification: martiuser={"present" if _roles else "MISSING"}, '
+               f'cot public tables={_tables}.')
+    if not _roles or _tables < 1:
+        log.append('✗ Server One is not usable as a TAK database: the core would fail at first '
+                   'login with "relation ... does not exist". Fix this before deploying Server Two.')
+        return False, log, db_password, tls_pem
     return True, log, db_password, tls_pem
 
 
@@ -10416,7 +10434,15 @@ def takserver_two_server_deploy_server_two():
             return jsonify({'success': False, 'error': 'Core package install (dnf) failed on Server Two — check the deploy log for the dnf error.', 'log': log}), 400
     else:
         try:
-            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', f'./{core_pkg}']], 'and', timeout=600, cwd=UPLOAD_DIR)
+            # --allow-downgrades: installing an OLDER core than the box currently has is a
+            # downgrade, and apt refuses with "Packages were downgraded and -y was used
+            # without --allow-downgrades". The single-server deploy already carries this
+            # flag for exactly that reason; the two-server core install never got it, so
+            # standing a 5.7 pair up on a box that had touched 5.8 failed outright
+            # (dev-4, 2026-09-04) — which is precisely how anyone tests an upgrade.
+            r = _run_priv_chain([['apt-get', 'update', '-qq'],
+                                 ['apt-get', 'install', '-y', '--allow-downgrades',
+                                  f'./{core_pkg}']], 'and', timeout=600, cwd=UPLOAD_DIR)
             log.append(r.stdout or '')
             log.append(r.stderr or '')
             if r.returncode != 0:
