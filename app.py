@@ -8203,28 +8203,38 @@ def takserver_external_db_provision():
     # Step 3c: the extensions TAK's schema needs, created by the ADMIN in the target
     # database — for EVERY managed provider, not just Azure.
     #
-    # This used to run only on the Azure branch, on the theory that RDS's
-    # rds_superuser grant above let TAK create them itself. It does not: on an
-    # external database TAK's own db-utils setup script never runs against the
-    # instance — only SchemaManager does — and SchemaManager's very first migration
-    # calls AddGeometryColumn(). Measured on a fresh RDS PostgreSQL 18 instance,
-    # 2026-09-04:
+    # This used to run only on the Azure branch, and on TAK 5.7 that was CORRECT for
+    # AWS: 5.7's own migrations created the extensions, so granting rds_superuser was
+    # enough and RDS installs and updates worked with nothing else —
+    #
+    #   5.7  V7__create_base_schema.sql:14   CREATE EXTENSION IF NOT EXISTS postgis;
+    #   5.7  V9__create_resource_hash.sql:9  CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    #
+    # **TAK 5.8 removed those lines.** No migration in 5.8's SchemaManager creates any
+    # extension; the vendor moved it to db-utils/setup.sql, which is run by
+    # takserver-setup-db.sh — and that script only ever runs on a LOCAL install. On an
+    # external database the console runs SchemaManager directly, so on 5.8 nothing
+    # creates PostGIS and the first migration that needs it dies. Measured on a fresh
+    # RDS PostgreSQL 18 instance, 2026-09-04:
     #
     #   Migration of schema "public" to version "7 - create base schema" failed!
     #   ERROR: function addgeometrycolumn(...) does not exist
     #   -> SchemaManager exited 2, cot had only `plpgsql`, schema_version stayed 0
     #
     # and the deploy still reported DEPLOYMENT COMPLETE, leaving TAK 5.8 running
-    # against a database with no schema. A fresh install on AWS RDS could not have
-    # worked at all.
+    # against a database with no schema. This is an UPSTREAM 5.8 regression against
+    # every managed-database deployment, and it hits upgrades as well as fresh
+    # installs — Azure escapes it only because of the pre-create below.
     #
-    # postgis is REQUIRED — without it the schema cannot build, so failing to create
-    # it is fatal and says so. The rest are best-effort: TAK's own setup creates them
-    # on a local install, but a managed provider may not offer every one, and none of
-    # them stop the base schema.
+    # The list mirrors TAK's own setup.sql rather than guessing: postgis and pgcrypto,
+    # and NOT fuzzystrmatch / postgis_topology / address_standardizer — setup.sql
+    # explicitly DROPs the first two as "unneeded extensions put in place by setup
+    # scripts for schema versions 7-12". The old Azure list created all five and hard
+    # -failed provisioning if the tenant had not whitelisted them, i.e. it demanded
+    # operators whitelist extensions TAK deletes.
     if is_rds or is_azure:
         _req_ext = 'postgis'
-        _opt_ext = ['fuzzystrmatch', 'postgis_topology', 'address_standardizer', 'pgcrypto']
+        _opt_ext = ['pgcrypto']
         _provider = 'Azure' if is_azure else 'AWS RDS'
         plog(f'  {_provider}: creating the extensions TAK needs, as {admin_user}...')
         ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {_req_ext};',
@@ -8236,9 +8246,9 @@ def takserver_external_db_provision():
                     'PostGIS could not be created in the database and TAK\'s schema cannot be '
                     'built without it. On Azure this normally means the extension is not '
                     'whitelisted: Azure Portal → your PostgreSQL Flexible Server → Server '
-                    'parameters → search "azure.extensions" → add POSTGIS (and FUZZYSTRMATCH, '
-                    'POSTGIS_TOPOLOGY, ADDRESS_STANDARDIZER, PGCRYPTO) → Save, then re-run '
-                    'Provision Database. Reported: %s' % (out or 'unknown error'))
+                    'parameters → search "azure.extensions" → add POSTGIS and PGCRYPTO → '
+                    'Save, then re-run Provision Database. Reported: %s'
+                    % (out or 'unknown error'))
             else:
                 msg = (
                     'PostGIS could not be created in the database and TAK\'s schema cannot be '
