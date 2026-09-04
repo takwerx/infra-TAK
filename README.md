@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.58-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.58-alpha)**
+**Current release: [v10.1.59-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.59-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,13 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.59-alpha — 2026-09-04 — TAK Portal keeps working as it grows into multiple containers
+
+**Headline: the console now manages TAK Portal as a whole application, not a single container — so when TAK Portal adds its own background worker and database, every button keeps starting, stopping, updating and health-checking all of them together.**
+
+**Why it matters.** TAK Portal is moving from one container to several — a web interface, a background worker, and its own database. The console used to assume TAK Portal was exactly one container. On the new layout that assumption would have quietly started only the web interface on an update and left the worker and database stopped, while the dashboard still showed green — because a health check that matches container names by substring is satisfied by any one of them. Start, Stop, Restart, Update, Update Config, the certificate sync, Guard Dog's auto-recovery, and the boot-time startup order now all act on the complete TAK Portal application. The database's data is left untouched across application rebuilds. This is a compatibility release: on today's single-container TAK Portal nothing changes, and the console is ready for the split whenever it lands.
+
 
 ### v10.1.58-alpha — 2026-09-02 — the console now tells you when your server restarted, and why
 
