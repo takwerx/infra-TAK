@@ -8910,10 +8910,16 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         log.append('cot database or martiuser missing after the rpm install (this host already '
                    'had a PostgreSQL cluster, so the rpm skipped its own setup) — running TAK\'s '
                    'takserver-setup-db.sh.')
+        # `-f`, not `-x`: TAK ships db-utils scripts mode 0544, so they are executable by
+        # root and NOT by the SSH user doing the test — the guard reported
+        # NO_SETUP_DB_SCRIPT for a script that was sitting right there (dev5, 2026-09-04).
+        # Same upstream packaging habit as the container bundle's missing execute bits.
+        # Run it through `sudo bash` so the mode does not matter, and with stdin closed so
+        # a prompt cannot hang the deploy.
         _, _setup_out = _ssh_probe(s1, (
-            'if [ -x /opt/tak/db-utils/takserver-setup-db.sh ]; then '
-            'cd /opt/tak/db-utils && sudo ./takserver-setup-db.sh 2>&1 | tail -12; '
-            'else echo NO_SETUP_DB_SCRIPT; fi'), timeout=300)
+            'if [ -f /opt/tak/db-utils/takserver-setup-db.sh ]; then '
+            'cd /opt/tak/db-utils && sudo bash ./takserver-setup-db.sh </dev/null 2>&1 | tail -14; '
+            'else echo NO_SETUP_DB_SCRIPT; fi'), timeout=600)
         log.append('takserver-setup-db.sh: ' + (_setup_out or '')[:400])
         _, _need_out = _ssh_probe(s1, _need_sql, timeout=30)
         _need = [t for t in (_need_out or '').split() if t.isdigit()]
