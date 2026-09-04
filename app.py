@@ -8888,6 +8888,42 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     _, fout = _ssh_probe(s1, fw_cmd, timeout=40)
     log.append('firewalld: ' + ('db port scoped to core, ssh allowed.' if 'FW_DONE' in (fout or '') else (fout or '')[:200]))
 
+    # Step 5b: make sure the cot DB and martiuser actually EXIST.
+    #
+    # The takserver-database rpm only provisions them as part of its initdb; on a host
+    # that ALREADY has a PostgreSQL cluster the install prints "Data directory is not
+    # empty!", skips that work, and leaves no role and no database — while every step
+    # after it carries on. Measured on dev5 2026-09-04 (a box with a pre-existing PG18
+    # cluster): the deploy reported success with `db_password_captured: true`, and the
+    # server had `postgres template0 template1` and exactly one role. A redeploy, or any
+    # box that has ever run PostgreSQL, lands here.
+    #
+    # TAK ships the fix: db-utils/takserver-setup-db.sh, which their own comments call a
+    # manual post-install step. Run it when, and only when, the role or database is absent.
+    _need_sql = ("sudo -u postgres psql -tAXc \"select count(*) from pg_roles where "
+                 "rolname='martiuser'\" 2>/dev/null; "
+                 "sudo -u postgres psql -tAXc \"select count(*) from pg_database where "
+                 "datname='cot'\" 2>/dev/null")
+    _, _need_out = _ssh_probe(s1, _need_sql, timeout=30)
+    _need = [t for t in (_need_out or '').split() if t.isdigit()]
+    if len(_need) < 2 or _need[0] == '0' or _need[1] == '0':
+        log.append('cot database or martiuser missing after the rpm install (this host already '
+                   'had a PostgreSQL cluster, so the rpm skipped its own setup) — running TAK\'s '
+                   'takserver-setup-db.sh.')
+        _, _setup_out = _ssh_probe(s1, (
+            'if [ -x /opt/tak/db-utils/takserver-setup-db.sh ]; then '
+            'cd /opt/tak/db-utils && sudo ./takserver-setup-db.sh 2>&1 | tail -12; '
+            'else echo NO_SETUP_DB_SCRIPT; fi'), timeout=300)
+        log.append('takserver-setup-db.sh: ' + (_setup_out or '')[:400])
+        _, _need_out = _ssh_probe(s1, _need_sql, timeout=30)
+        _need = [t for t in (_need_out or '').split() if t.isdigit()]
+        if len(_need) < 2 or _need[0] == '0' or _need[1] == '0':
+            log.append('✗ Server One still has no martiuser role and/or no cot database. The core '
+                       'cannot use this database, so stopping here rather than handing back a '
+                       'server that will fail at first login.')
+            return False, log, ''
+        log.append('✓ cot database and martiuser now present on Server One.')
+
     # Step 6: capture + verify the DB password (platform-neutral helpers — already work on RHEL).
     db_password, _ = _fetch_db_password_from_server_one(s1)
     if db_password:
@@ -8921,6 +8957,26 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
                        '(8446 login will 500). Output: ' + (scout or '')[:400])
     # Step 8 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
     tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+
+    # Final gate. Everything above logs warnings and carries on, and this function used to
+    # `return True` regardless — so a Server One with no martiuser, no tables and a password
+    # that failed validation was handed back as a success, and the operator only found out
+    # when the core 500'd at login. Ask the database instead: the role, the database, and
+    # actual tables in it.
+    _, _final = _ssh_probe(s1, (
+        "sudo -u postgres psql -tAXc \"select count(*) from pg_roles where rolname='martiuser'\" "
+        "2>/dev/null; "
+        "sudo -u postgres psql -tAX -d cot -c \"select count(*) from information_schema.tables "
+        "where table_schema='public'\" 2>/dev/null"), timeout=40)
+    _vals = [t for t in (_final or '').split() if t.isdigit()]
+    _roles = int(_vals[0]) if len(_vals) > 0 else 0
+    _tables = int(_vals[1]) if len(_vals) > 1 else 0
+    log.append(f'Server One verification: martiuser={"present" if _roles else "MISSING"}, '
+               f'cot public tables={_tables}.')
+    if not _roles or _tables < 1:
+        log.append('✗ Server One is not usable as a TAK database: the core would fail at first '
+                   'login with "relation ... does not exist". Fix this before deploying Server Two.')
+        return False, log, db_password, tls_pem
     return True, log, db_password, tls_pem
 
 
