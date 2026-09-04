@@ -55,6 +55,12 @@ Two routes, and the choice is about downtime:
 RDS runs pre-upgrade checks and will refuse if something in the database is incompatible. **Read
 what it says rather than retrying** — it is usually specific and actionable.
 
+**The step people miss:** after you pick the new engine version and press Continue, RDS shows a
+summary page with a **Scheduling of modifications** choice, and it defaults to *Apply during the
+next scheduled maintenance window*. Leave that default and **nothing happens now** — the instance
+stays Available, still on the old version, and it looks like the upgrade silently failed. Choose
+**Apply immediately** if you intend to upgrade during your planned window.
+
 ### Azure Database for PostgreSQL Flexible Server
 
 Flexible Server supports an in-place **major version upgrade** from the portal or CLI: stop the
@@ -66,6 +72,10 @@ server, choose the target major version, upgrade. The server is unavailable duri
 available and enabled for PostgreSQL 18 — on managed services PostGIS is an extension the provider
 offers per engine version, and the available version changes with the engine. If PostGIS is
 missing or too old after the upgrade, TAK's schema work will fail.
+
+In practice the provider handles this for you: on an RDS instance taken from PostgreSQL 15 to 18,
+PostGIS moved from 3.4.6 to 3.6.3 as part of the same upgrade, with nothing to do by hand. Confirm
+it rather than assume it — the check is in the next section.
 
 ---
 
