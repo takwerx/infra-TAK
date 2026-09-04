@@ -63990,7 +63990,14 @@ def _tak_58_preflight():
     # 2. Which major is actually serving, and is 15 present at all?
     #    upgrade-db.sh exits 1 with "Upgrade will be skipped" if no 15 cluster exists.
     running_major = None
-    if facts.get('external_db'):
+    if facts.get('db_mode') == 'remote' and not facts.get('external_db'):
+        # Two-server: the database is on Server One, so there is no local cluster to ask.
+        # Without this the pre-flight added "Could not determine the running PostgreSQL
+        # version — is the database up?" underneath the real blocker, which reads as a
+        # second, unrelated fault and sends the operator looking at a database that is
+        # running perfectly well (dev-4 + dev-6, 2026-09-04).
+        facts['pg_running_major'] = None
+    elif facts.get('external_db'):
         # Already answered over TCP above; the local cluster (if any) is irrelevant here
         # and asking it is what produced the wrong number in the first place.
         running_major = facts.get('managed_pg_major')
@@ -64001,13 +64008,13 @@ def _tak_58_preflight():
             running_major = int(sv) // 10000
         facts['pg_running_major'] = running_major
     if running_major is None:
-        # A managed DB has already said why, in a better message, just above; adding a
+        # A remote database - two-server or managed - has already said why, in a better message, just above; adding a
         # second blocker here would only repeat it. What must NOT happen is falling
         # through to the comparisons below with None - that raised
         # "'>=' not supported between instances of 'NoneType' and 'int'" and turned the
         # whole pre-flight into a 500, so the operator saw a broken page instead of the
         # refusal. Caught by the wrong-password control on dev5, 2026-09-03.
-        if not facts.get('external_db'):
+        if not facts.get('external_db') and facts.get('db_mode') != 'remote':
             blockers.append('Could not determine the running PostgreSQL version — is the '
                             'database up?')
     elif running_major >= TAK_PG_MAJOR:
