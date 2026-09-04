@@ -65233,6 +65233,44 @@ def takserver_update():
     if _is58 and not _tak_is_container():
         if upgrade_status['running']:
             return jsonify({'error': 'Update already in progress'}), 409
+        # ── v10.2.0 W9: split-box 5.8 ────────────────────────────────────
+        # A two-server pair used to hit the generic pre-flight and be told the
+        # migration "is not supported in this release" — true when it was written,
+        # and a dead end for every split-box customer once 5.8 became mandatory.
+        # The database half simply happens on Server One over SSH.
+        _ts_cfg = _get_tak_deployment_config(settings)
+        if (_ts_cfg or {}).get('mode') == 'two_server':
+            _s1 = (_ts_cfg.get('server_one') or {})
+            if not (_s1.get('host') or '').strip():
+                return jsonify({'error': 'Two-server mode is set but Server One has no host '
+                                         'configured.'}), 400
+            _is_rhel = _distro_family() == 'rhel'
+            _exts = ('.rpm',) if _is_rhel else ('.deb',)
+            _all = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(_exts)]
+            _core = next((f for f in _all if 'core' in f.lower()
+                          and (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM), '')
+            # The database package belongs to SERVER ONE's family, which may differ from
+            # this host's (see the upload gate — that is why it is accepted either way).
+            _dbp = next((f for f in os.listdir(UPLOAD_DIR)
+                         if 'database' in f.lower() and f.endswith(('.deb', '.rpm'))
+                         and (_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM), '')
+            if not _core or not _dbp:
+                return jsonify({'error': 'Two-server 5.8 upgrade needs BOTH the 5.8 '
+                                         'takserver-core package for this host and the 5.8 '
+                                         'takserver-database package for Server One. Upload '
+                                         'both, then try again.'}), 400
+            upgrade_log.clear()
+            upgrade_status.update({'running': True, 'complete': False, 'error': False})
+            threading.Thread(target=run_takserver_58_two_server_migration,
+                             args=(os.path.join(UPLOAD_DIR, _core),
+                                   os.path.join(UPLOAD_DIR, _dbp), _s1, _ts_cfg),
+                             kwargs={'log': upgrade_log, 'status': upgrade_status},
+                             daemon=True).start()
+            return jsonify({'success': True, 'migration': True, 'two_server': True,
+                            'message': 'TAK Server 5.8 detected on a two-server deployment — '
+                                       'backing up and migrating the database on Server One '
+                                       '(%s) to PostgreSQL %d, then upgrading this core.'
+                                       % (_s1.get('host'), TAK_PG_MAJOR)})
         _pf = _tak_58_preflight()
         if not _pf.get('ready'):
             return jsonify({'error': 'TAK Server 5.8 cannot be installed on this server yet: '
@@ -67053,6 +67091,304 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
     except Exception as e:
         ulog(f"✗ Container upgrade failed: {str(e)[:200]}")
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
+
+# ==========================================================================
+# v10.2.0 W9 — the two-server 5.8 migration
+# ==========================================================================
+# Until now the console refused this outright ("driving a two-server migration from
+# here is not supported in this release"), which was honest but left every split-box
+# customer with no path to a MANDATORY release. The work is the same as the
+# single-server migration, only the database half happens on Server One over SSH:
+# TAK's own upgrade-db.sh does the PostgreSQL 15->18 move, and we do what the
+# single-server path already learned to do around it — verify the backup can be read,
+# and never trust upgrade-db.sh's exit code (it prints "Database updated" and exits 0
+# with the schema unapplied; see _tak58_run_upgrade_db).
+
+def _tak58_s1_sql(s1, sql, db='postgres', timeout=120):
+    """One psql query on Server One as the postgres role. Returns stripped stdout or None.
+    `cd /tmp` first: postgres cannot read the SSH user's home and psql warns noisily."""
+    ok, out = _ssh_probe(
+        s1, 'cd /tmp && sudo -u postgres psql -tAX -d %s -c %s 2>/dev/null'
+            % (shlex.quote(db), shlex.quote(sql)), timeout=timeout)
+    if not ok:
+        return None
+    val = (out or '').strip().splitlines()
+    return val[-1].strip() if val else None
+
+
+def _tak58_s1_pg_major(s1):
+    """PostgreSQL major actually serving on Server One, or None."""
+    v = _tak58_s1_sql(s1, 'SHOW server_version_num;')
+    return int(v) // 10000 if v and v.isdigit() else None
+
+
+def _tak58_s1_schema_version(s1):
+    """Highest applied TAK schema version on Server One, or None if unreadable."""
+    v = _tak58_s1_sql(s1, 'select coalesce(max(version::int), 0) from schema_version '
+                          'where success', db='cot')
+    return int(v) if v and v.isdigit() else None
+
+
+def _tak58_s1_preflight(s1, say):
+    """Read-only readiness of Server One. Returns (ok, facts)."""
+    facts = {}
+    major = _tak58_s1_pg_major(s1)
+    facts['pg_major'] = major
+    if major is None:
+        say('✗ Could not read the PostgreSQL version on Server One — is it up and reachable?')
+        return False, facts
+    say('  Server One is running PostgreSQL %d.' % major)
+    if major >= TAK_PG_MAJOR:
+        facts['already'] = True
+        say('  Server One is already on PostgreSQL %d — the database half is done.' % major)
+        return True, facts
+    if major != 15:
+        say('✗ Server One runs PostgreSQL %d. TAK 5.8 migrates from 15 only.' % major)
+        return False, facts
+    # Disk, on the partition the data directory actually lives on. Same 1.5x rule as the
+    # single-server path: pg_upgrade runs in copy mode, so the old cluster survives — and
+    # that surviving cluster IS the rollback.
+    datadir = _tak58_s1_sql(s1, 'SHOW data_directory;')
+    facts['data_directory'] = datadir
+    if datadir:
+        ok, out = _ssh_probe(s1, 'sudo du -sb %s 2>/dev/null | cut -f1; df -B1 --output=avail %s '
+                                 '2>/dev/null | tail -1' % (shlex.quote(datadir),
+                                                            shlex.quote(datadir)), timeout=180)
+        nums = [int(t) for t in (out or '').split() if t.isdigit()]
+        if len(nums) >= 2:
+            used, avail = nums[0], nums[1]
+            need = int(used * _TAK58_MIN_DISK_RATIO)
+            facts.update({'data_bytes': used, 'avail_bytes': avail, 'need_bytes': need})
+            say('  Database %s, %s free on Server One (need %s).'
+                % (_cotdb_fmt_bytes(used), _cotdb_fmt_bytes(avail), _cotdb_fmt_bytes(need)))
+            if avail < need:
+                say('✗ Not enough disk on Server One for a rollback-safe migration: %s free, '
+                    '%s needed (1.5x the database). pg_upgrade copies, so the PostgreSQL 15 '
+                    'cluster survives — that is the only way back.'
+                    % (_cotdb_fmt_bytes(avail), _cotdb_fmt_bytes(need)))
+                return False, facts
+        else:
+            say('  ⚠ Could not measure disk on Server One — verify by hand before continuing.')
+    return True, facts
+
+
+def _tak58_s1_backup(s1, say):
+    """pg_dump the cot database ON Server One and prove the archive is readable.
+
+    Same reason as the single-server backup: `pg_dump` exiting 0 is not evidence. The
+    first W3 attempt produced an archive that could not be read back, and only
+    `pg_restore --list` caught it.
+    """
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    path = '/var/lib/postgresql/tak58-pre-migration-%s.dump' % stamp
+    say('  Backing up the cot database on Server One…')
+    ok, out = _ssh_probe(s1, 'sudo -u postgres pg_dump -Fc -d cot -f %s 2>&1; echo RC=$?'
+                             % shlex.quote(path), timeout=6 * 3600)
+    if 'RC=0' not in (out or ''):
+        say('✗ Backup failed on Server One: %s' % (out or '')[:300])
+        return None
+    ok, out = _ssh_probe(s1, 'sudo stat -c %%s %s 2>/dev/null; sudo -u postgres pg_restore '
+                             '--list %s >/dev/null 2>&1; echo LIST_RC=$?'
+                             % (shlex.quote(path), shlex.quote(path)), timeout=1800)
+    size = next((int(t) for t in (out or '').split() if t.isdigit()), 0)
+    if 'LIST_RC=0' not in (out or '') or size <= 0:
+        say('✗ The backup on Server One is not readable (%s) — refusing to migrate without a '
+            'restorable one.' % (out or '')[:200])
+        return None
+    say('  ✓ Backup verified readable on Server One: %s (%s)' % (path, _cotdb_fmt_bytes(size)))
+    return path
+
+
+def _tak58_s1_run_upgrade_db(s1, say, timeout=6 * 3600):
+    """Run TAK's own upgrade-db.sh on Server One. Returns its exit code (or None).
+
+    Mode 0544, so `sudo bash` rather than executing it directly — same packaging habit
+    that made the Server One repair look for a script it could not execute.
+    """
+    say('  Running TAK\'s upgrade-db.sh on Server One. On a large database this takes a '
+        'long time and prints nothing until it finishes.')
+    ok, out = _ssh_probe(s1, 'if [ -f %s ]; then cd /opt/tak/db-utils && sudo bash %s '
+                             '</dev/null 2>&1 | tail -25; echo RC=${PIPESTATUS[0]}; '
+                             'else echo NO_UPGRADE_DB_SH; fi'
+                             % (shlex.quote(_TAK58_UPGRADE_DB_SH), shlex.quote(_TAK58_UPGRADE_DB_SH)),
+                         timeout=timeout)
+    for line in (out or '').strip().splitlines()[-20:]:
+        if line.strip():
+            say('    ' + line.rstrip()[:180])
+    if 'NO_UPGRADE_DB_SH' in (out or ''):
+        say('✗ %s is not on Server One — is the 5.8 database package installed there?'
+            % _TAK58_UPGRADE_DB_SH)
+        return None
+    m = re.search(r'RC=(\d+)', out or '')
+    return int(m.group(1)) if m else None
+
+
+def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg,
+                                          log=None, status=None):
+    """TAK 5.8 + PostgreSQL 18 on a split-box pair. Core here, database on Server One.
+
+    Order follows TAK's guide and the single-server migration: back up first and PROVE
+    the backup is readable, upgrade the core, upgrade the database package on Server
+    One, let TAK's own upgrade-db.sh do the 15->18 move there, then verify by asking
+    the database rather than trusting an exit code.
+
+    The rollback is the PostgreSQL 15 cluster, which pg_upgrade leaves behind in copy
+    mode — plus the verified dump. Neither is deleted.
+    """
+    _log = upgrade_log if log is None else log
+    _status = upgrade_status if status is None else status
+    s1_host = (s1_cfg.get('host') or '').strip()
+
+    def say(m):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        _log.append(entry); print(entry, flush=True)
+
+    def fail(msg, note=None):
+        say(f'✗ {msg}')
+        if note:
+            say('')
+            say(note)
+        _status.update({'running': False, 'complete': False, 'error': True})
+
+    t_all = time.time()
+    try:
+        say('=' * 50)
+        say('TAK Server 5.8 — two-server migration')
+        say(f'  Core (this host): {os.path.basename(core_pkg_path)}')
+        say(f'  Server One ({s1_host}): {os.path.basename(db_pkg_path)}')
+        say('=' * 50)
+
+        say('')
+        say('Checking Server One is ready…')
+        ok, facts = _tak58_s1_preflight(s1_cfg, say)
+        if not ok:
+            return fail('Server One is not ready to migrate. Nothing has been changed.')
+        rows_before = _tak58_s1_sql(s1_cfg, 'select count(*) from cot_router', db='cot')
+        if rows_before and rows_before.isdigit():
+            say(f'  cot_router holds {int(rows_before):,} rows before the migration.')
+
+        backup = None
+        if not facts.get('already'):
+            say('')
+            say('Backing up before anything is changed…')
+            backup = _tak58_s1_backup(s1_cfg, say)
+            if not backup:
+                return fail('Refusing to migrate without a restorable backup.')
+
+        say('')
+        say('Stopping TAK Server on the core…')
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True,
+                       timeout=300)
+        t_down = time.time()
+
+        say('')
+        say('Upgrading the core to 5.8…')
+        if _distro_family() == 'rhel':
+            cmd = 'dnf -y install ' + shlex.quote(core_pkg_path) + ' 2>&1'
+        else:
+            cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
+                   + shlex.quote(core_pkg_path) + ' 2>&1')
+        r = subprocess.run(_sudo_wrap(['sh', '-c', cmd]), capture_output=True, text=True,
+                           timeout=1800, env=_broker_shim_env())
+        for line in ((r.stdout or '') + (r.stderr or '')).strip().splitlines()[-8:]:
+            say('    ' + line[:170])
+        # Ask the package manager what is actually installed, on either family.
+        _q = ("rpm -q --qf '%{VERSION}' takserver-core 2>/dev/null"
+              if _distro_family() == 'rhel' else
+              "dpkg-query -W -f '${Version}' takserver-core 2>/dev/null")
+        _iv = (subprocess.run(_q, shell=True, capture_output=True, text=True,
+                              timeout=30).stdout or '').strip()
+        if not _iv.startswith('5.8'):
+            return fail(f'The core package did not install (reports {_iv or "nothing"}) — TAK '
+                        f'Server is stopped and the database has not been touched.',
+                        f'Server One is untouched and your backup is at {backup}.'
+                        if backup else 'Server One is untouched.')
+        say('  ✓ Core upgraded.')
+
+        if facts.get('already'):
+            say('')
+            say('Server One is already on PostgreSQL %d — skipping the database migration.'
+                % TAK_PG_MAJOR)
+        else:
+            say('')
+            say(f'Upgrading the database package on Server One ({s1_host})…')
+            ok, out = _scp_to_host(s1_cfg, db_pkg_path, '/tmp/', timeout=1800)
+            if not ok:
+                return fail('Could not copy the database package to Server One: '
+                            + (out or '')[:200],
+                            f'Nothing on Server One has changed. Backup: {backup}')
+            db_name = os.path.basename(db_pkg_path)
+            if db_name.endswith('.rpm'):
+                inst = f'cd /tmp && sudo dnf -y install ./{shlex.quote(db_name)} 2>&1'
+            else:
+                inst = (f'cd /tmp && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y '
+                        f'--allow-downgrades ./{shlex.quote(db_name)} 2>&1')
+            ok, out = _ssh_probe(s1_cfg, inst + '; echo RC=$?', timeout=1800)
+            for line in (out or '').strip().splitlines()[-10:]:
+                if line.strip():
+                    say('    ' + line.rstrip()[:170])
+            # The package is EXPECTED to stop short and tell you to run upgrade-db.sh
+            # ("A pg15 install has been detected"), so its exit code is not the verdict.
+            say('')
+            say('Migrating PostgreSQL 15 → %d on Server One…' % TAK_PG_MAJOR)
+            rc = _tak58_s1_run_upgrade_db(s1_cfg, say)
+            if rc is None:
+                return fail('The database migration could not be started on Server One.',
+                            f'The PostgreSQL 15 cluster is untouched and your backup is at '
+                            f'{backup}.')
+
+            # upgrade-db.sh exits 0 and prints "Database updated with SchemaManager.jar" even
+            # when SchemaManager failed. Ask the database instead.
+            major_after = _tak58_s1_pg_major(s1_cfg)
+            sv = _tak58_s1_schema_version(s1_cfg)
+            say(f'  Server One now reports PostgreSQL {major_after}, schema_version {sv}.')
+            if major_after != TAK_PG_MAJOR or sv is None or sv < _TAK58_MIN_SCHEMA_VERSION:
+                return fail(
+                    f'Server One did not finish the migration (PostgreSQL {major_after}, '
+                    f'schema_version {sv}). upgrade-db.sh exits 0 even when its schema step '
+                    f'fails, which is why this is checked rather than assumed.',
+                    f'The PostgreSQL 15 cluster is still on Server One and is your rollback; '
+                    f'the verified dump is at {backup}. TAK Server here is stopped and on 5.8 '
+                    f'— do not put it into service until Server One is fixed.')
+            rows_after = _tak58_s1_sql(s1_cfg, 'select count(*) from cot_router', db='cot')
+            if rows_before and rows_after and rows_before.isdigit() and rows_after.isdigit():
+                say(f'  Rows: {int(rows_before):,} before, {int(rows_after):,} after.')
+                if int(rows_after) < int(rows_before):
+                    return fail(
+                        f'Server One lost rows in the migration: {int(rows_after):,} of '
+                        f'{int(rows_before):,}.',
+                        f'The PostgreSQL 15 cluster survives on Server One and the dump is at '
+                        f'{backup}. Do NOT put this server into service.')
+
+        say('')
+        say('Starting TAK Server on the migrated database…')
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True,
+                       timeout=300)
+        up = False
+        for waited in range(0, 900, 15):
+            time.sleep(15)
+            _lp = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True,
+                                 capture_output=True, text=True, timeout=10)
+            if ':8089' in (_lp.stdout or ''):
+                up = True
+                break
+            if waited and waited % 120 == 0:
+                say(f'  ⏳ {waited // 60} min …')
+        if not up:
+            return fail('TAK Server did not start listening on 8089 within 15 minutes.',
+                        'The database migrated and was verified; this is the core. Check '
+                        '`journalctl -u takserver` and /opt/tak/logs/.')
+        say(f'  ✓ TAK Server is serving again. {int(time.time() - t_down)} s of downtime, '
+            f'{int(time.time() - t_all)} s end to end.')
+        say('')
+        say('Migration complete. On Server One the PostgreSQL 15 cluster is still on disk and '
+            'is your rollback until you remove it.')
+        if backup:
+            say(f'Backup kept on Server One at {backup}')
+        _status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        fail(f'Unexpected error: {str(e)[:400]}')
 
 
 def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg):
