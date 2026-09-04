@@ -69293,7 +69293,17 @@ def run_takserver_deploy(config):
             # in the target database), the deploy logged this as a WARNING, went on to
             # report "DEPLOYMENT COMPLETE", and left TAK 5.8 running against a database
             # whose schema_version was 0. Ask the database what version it reached.
-            _edb_sv = _tak58_external_schema_version(config.get('external_db') or {})
+            # NB `config['external_db']` on this path is a BOOLEAN flag, not the
+            # connection block — reading it as a dict raised
+            # "'bool' object has no attribute 'get'" and turned the deploy's own
+            # verification step into a FATAL ERROR (dev5, 2026-09-04). The connection
+            # details live in the saved deployment config.
+            try:
+                _edb_conn = (_get_tak_deployment_config(load_settings())
+                             or {}).get('external_db') or {}
+            except Exception:
+                _edb_conn = {}
+            _edb_sv = _tak58_external_schema_version(_edb_conn)
             if _edb_sv is not None and _edb_sv >= _TAK58_MIN_SCHEMA_VERSION:
                 log_step(f"✓ SchemaManager complete — managed database at schema_version {_edb_sv}")
             elif sm_r.returncode == 0 and _edb_sv is None:
