@@ -64546,6 +64546,17 @@ def _tak58_container_import(container, src_path, pw, say):
     if r.returncode != 0:
         say(f'  Copy into the container failed: {(r.stderr or "").strip()[:200]}')
         return False
+    # `docker cp` lands the file root-owned with the SOURCE's mode, and the host copy is
+    # deliberately 0600 (it is the whole CoT database in the clear). The hardened image
+    # runs psql as postgres, not root, so the import died on its own backup:
+    #   /tmp/cot_data.sql: Permission denied      -> psql exit 1
+    # Measured on aws-arm 2026-09-04 — the first migration run after that hardening, which
+    # is exactly why this did not show up on the x86 run before it. Hand the file to the
+    # database user rather than widening it: 0640, owned by postgres, group 0.
+    subprocess.run(_sudo_wrap(['docker', 'exec', '-u', '0', container, 'sh', '-c',
+                               f'chown postgres:0 {_TAK58_EXPORT_IN_CONTAINER} && '
+                               f'chmod 640 {_TAK58_EXPORT_IN_CONTAINER}']),
+                   capture_output=True, timeout=300)
     say('  Importing (allow a long window on a large database)…')
     t0 = time.time()
     # Output stays inside the container: a per-statement tag for every INSERT, or a wall
