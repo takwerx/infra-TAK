@@ -31647,6 +31647,7 @@ def takportal_control():
         except Exception as e:
             settings_sync_error = str(e)[:300]
         subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
+        _update_boot_stagger_service()  # v10.1.59: the project may have gained services
         time.sleep(3)
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
@@ -75565,6 +75566,10 @@ def _post_update_auto_deploy():
                                 _ensure_infratak_network_for_portal()
                                 _takportal_restart()  # v10.1.59: whole project
                                 _sync_authentik_takportal_provider_url(settings)
+                                # v10.1.59: the boot sequencer used to be regenerated only by a
+                                # deploy/uninstall, so an existing box would keep `docker start
+                                # tak-portal` (web only) until its next deploy. Converge it here.
+                                _update_boot_stagger_service()
                                 print("Post-update: TAK Portal config updated and restarted (infratak network connected)")
                             finally:
                                 _auto_deploy_active.pop('takportal', None)
