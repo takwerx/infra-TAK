@@ -177,12 +177,14 @@ def d_archive():
 # ── whole events ─────────────────────────────────────────────────────────────
 
 def pli_event(uid, etype, callsign, lat, lon, hae, speed_mps, course_deg, team, role,
-              stale_s, now=None, sensor=None, video=None, remarks=None):
-    """A unit's position report (what ATAK calls SA / PLI)."""
+              stale_s, now=None, sensor=None, video=None, remarks=None, sensor_azimuth=None):
+    """A unit's position report (what ATAK calls SA / PLI). `sensor_azimuth` overrides the
+    cone's look direction (a sweeping radar); it defaults to the course."""
     details = [d_contact(callsign), d_group(team, role), d_track(speed_mps, course_deg),
                d_takv(), d_uid(callsign), d_status(), d_precision()]
     if sensor:
-        details.append(d_sensor(course_deg, sensor.get('fov', 60.0), sensor.get('range_m', 1000.0),
+        az = course_deg if sensor_azimuth is None else sensor_azimuth
+        details.append(d_sensor(az, sensor.get('fov', 60.0), sensor.get('range_m', 1000.0),
                                 sensor.get('vfov', 45.0), sensor.get('elevation', 0.0)))
     if video:
         details.append(d_video(callsign, video, f'{uid}-video'))

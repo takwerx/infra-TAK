@@ -34540,6 +34540,29 @@ CLOUDTAK_PLUGINS = [
         'author': 'takwerx',
         'license': 'Proprietary',
     },
+    {
+        'key': 'taksim',
+        'name': 'TAK Simulator',
+        'description': (
+            'Design and direct a simulation on the CloudTAK map: drop a sweeping radar, '
+            'aircraft, vessels and ground units, steer them live (go to, orbit, hold, course, '
+            'altitude, lost link), fire chat / CASEVAC / 911, draw shapes, save the layout as a '
+            'scenario, and clear everything with one button. Drives the TAK Simulator engine on '
+            'this box — everything stays on the simulation channel unless a real channel is '
+            'deliberately confirmed. Requires the TAK Simulator module (dev channel).'
+        ),
+        # v10.1.61 W11: ships in this repo (local_path → copied, never symlinked, into
+        # web/plugins/taksim; server_path → api/stateless/routes/plugin-taksim.ts). Not
+        # auto-installed by the simulator deploy — a CloudTAK rebuild is 5–10 min — the
+        # Simulator page offers an "Install CloudTAK panel" button that calls the plugin
+        # action route. Dev-only until the module leaves the dev channel.
+        'local_path': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cloudtak-plugins', 'taksim', 'plugin'),
+        'server_path': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cloudtak-plugins', 'taksim', 'server'),
+        'install_dir': 'taksim',
+        'requires': 'CloudTAK 13.45+',
+        'author': 'TAKWERX',
+        'license': 'AGPL-3.0-or-later',
+    },
 ]
 
 cloudtak_plugin_log = []
@@ -36239,6 +36262,36 @@ def _cloudtak_build_override_yml(settings):
                             and bool(settings.get('console_cert_docker_san'))
                             and os.path.isfile(console_cert_src))
 
+    # v10.1.61 W10: when the TAK Simulator is deployed on this box, the api container joins
+    # the private `infratak` network (the one Portal <-> Authentik already use) and learns
+    # where the engine is plus its bearer token, so the CloudTAK plugin's server route
+    # (plugin-taksim.ts) can drive the engine. The browser never sees the token. Local
+    # CloudTAK only: a remote CloudTAK has neither the network nor the engine. The network
+    # is declared external, so make sure it exists before compose reads this file.
+    _sim_env_block = ''
+    _sim_net_block = ''
+    _sim_networks_top = ''
+    if settings.get('simulator_enabled') and not _ct_is_remote:
+        _ensure_infratak_docker_network()
+        _sim_tok = ''.join(c for c in (settings.get('simulator_control_token') or '') if c.isalnum() or c in '_-')
+        _sim_env_block = (
+            '      # v10.1.61 W10: TAK Simulator engine — reachable on the private infratak\n'
+            '      # network only, bearer-gated; consumed by the CloudTAK plugin server route.\n'
+            '      TAKSIM_ENGINE_URL: "http://tak-simulator:5090"\n'
+            f'      TAKSIM_ENGINE_TOKEN: "{_sim_tok}"\n'
+        )
+        _sim_net_block = (
+            '    networks:\n'
+            '      - default\n'
+            f'      - {INFRATAK_DOCKER_NETWORK}\n'
+        )
+        _sim_networks_top = (
+            '\nnetworks:\n'
+            '  default: {}\n'
+            f'  {INFRATAK_DOCKER_NETWORK}:\n'
+            '    external: true\n'
+        )
+
     # W5/W5e media-infra pin — arch-conditional, see the comment in the template below.
     media_image = ('ghcr.io/dfpc-coe/media-infra:v9.1.1'
                    if (settings.get('arch') or '').lower() in ('arm64', 'aarch64')
@@ -36275,7 +36328,7 @@ services:
     extra_hosts:
 {hosts_block}
     environment:
-{tls_env_block}{cert_vol_block}
+{tls_env_block}{_sim_env_block}{cert_vol_block}{_sim_net_block}
   events:
     extra_hosts:
 {hosts_block}
@@ -36304,7 +36357,45 @@ services:
   postgis:
     environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
-"""
+{_sim_networks_top}"""
+
+
+def _cloudtak_refresh_override(plog=None):
+    """v10.1.61 W10: rewrite CloudTAK's compose override from current settings and, when
+    it changed, recreate ONLY the api service (`up -d --no-deps api`). The simulator module
+    calls this on deploy and uninstall so the api container joins / leaves the infratak
+    network and gets / loses the engine URL + token. Local CloudTAK only; a no-op when it
+    is not installed here. Returns (changed, message)."""
+    _log = plog or (lambda m: print(m, flush=True))
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    if not (os.path.exists(os.path.join(ct_dir, 'docker-compose.yml'))
+            or os.path.exists(os.path.join(ct_dir, 'compose.yaml'))):
+        return False, 'CloudTAK is not installed on this box'
+    settings = load_settings()
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return False, 'CloudTAK runs on a remote host — nothing to link'
+    except Exception:
+        pass
+    override_path = os.path.join(ct_dir, 'docker-compose.override.yml')
+    new = _cloudtak_build_override_yml(settings)
+    old = ''
+    if os.path.exists(override_path):
+        with open(override_path) as f:
+            old = f.read()
+    if old.strip() == new.strip():
+        return False, 'CloudTAK override already current'
+    with open(override_path, 'w') as f:
+        f.write(new)
+    try:
+        os.chmod(override_path, 0o600)      # may carry the engine token
+    except OSError:
+        pass
+    _log('  CloudTAK override rewritten — recreating the api container (no other service touched)...')
+    r = _broker_compose(ct_dir, 'up -d --no-deps api', timeout=240)
+    if r.returncode != 0:
+        return True, f'override written but the api recreate failed: {(r.stderr or r.stdout or "")[-300:]}'
+    return True, 'CloudTAK api container recreated with the new override'
 
 
 # --- CloudTAK embedded-MediaMTX (cloudtak-media) self-heal scripts (v0.9.48) ----
@@ -77702,9 +77793,12 @@ _MODULE_CTX = {
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
-    # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION
+    # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
+    # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
     '_get_tak_deployment_config': _get_tak_deployment_config,
     '_get_authentik_api_url': _get_authentik_api_url,
+    '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
+    '_cloudtak_refresh_override': _cloudtak_refresh_override,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at

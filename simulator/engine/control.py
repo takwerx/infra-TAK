@@ -17,8 +17,12 @@
 """Control API (PLAN v10.1.61 §4.2): a bearer-token JSON HTTP server the console talks to.
 
 Published by compose on 127.0.0.1:5090 only; inside the container it listens on its own
-network namespace. Every request needs `Authorization: Bearer <token>` (compared in
-constant time); bodies are capped at 2 MB; nothing here takes a file path from a client.
+network namespace, which since W10 is also joined to the private `infratak` Docker network
+so the CloudTAK API container can reach it by name. Every request needs
+`Authorization: Bearer <token>` (compared in constant time); bodies are capped at 2 MB;
+nothing here takes a file path from a client.
+
+Director routes (W9): POST /live, POST /cmd, POST /save, GET /state.
 """
 import hmac
 import json
@@ -89,6 +93,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {'lines': eng.log_lines(500)})
         if path == '/scenarios':
             return self._send(200, {'scenarios': eng.list_scenarios()})
+        if path == '/state':
+            return self._send(200, eng.state())
         return self._send(404, {'error': 'not found'})
 
     def do_POST(self):
@@ -103,6 +109,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == '/run':
                 return self._send(200, eng.start_run(body))
+            if path == '/live':
+                return self._send(200, eng.start_live(body))
+            if path == '/cmd':
+                return self._send(200, eng.command(body))
+            if path == '/save':
+                return self._send(200, eng.save(body))
             if path == '/validate':
                 doc = sc.validate(body.get('scenario') if 'scenario' in body else body)
                 return self._send(200, {'valid': True, 'summary': sc.summarize(doc)})
@@ -114,8 +126,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {'ok': eng.stop(), 'state': eng.run.state if eng.run else 'idle'})
         except sc.ScenarioError as e:
             return self._send(400, {'error': 'invalid scenario or parameters', 'errors': e.errors[:20]})
+        except LookupError as e:
+            return self._send(404, {'error': str(e)[:300]})
         except RuntimeError as e:
             return self._send(409, {'error': str(e)[:300]})
+        except OSError as e:
+            return self._send(500, {'error': str(e)[:300]})
+        except Exception as e:          # a bug must answer, not drop the connection
+            eng.log(f'control: {path} failed: {type(e).__name__}: {str(e)[:200]}')
+            return self._send(500, {'error': f'internal error: {type(e).__name__}'})
         return self._send(404, {'error': 'not found'})
 
 

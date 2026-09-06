@@ -16,12 +16,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Engine orchestration: configuration from the environment, scenario catalog, lanes, one
 run at a time (PLAN v10.1.61 §4.2). The control API (control.py) is a thin JSON front on
-this class; the console's module routes are its only client."""
+this class; its clients are the console's module routes and, since the companion PLAN
+(W9–W11), the CloudTAK plugin's server route over the private `infratak` network."""
 import collections
 import glob
 import json
 import os
 import re
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
@@ -31,6 +33,14 @@ from .lane import Lane
 from .sim import Run
 
 LANE_FILE_RE = re.compile(r'lane-([A-Za-z0-9][A-Za-z0-9_-]{0,15})\.pem')
+LANES_FILE = 'lanes.json'          # {lane_id: channel}, written by the console next to the certs
+
+# The director's empty session (W9 /live): no entities, no timeline — units arrive by /cmd.
+LIVE_DOC = {
+    'name': 'live', 'title': 'Live session',
+    'story': 'Directed from the map: units, shapes and events arrive through the command API.',
+    'duration_s': sc.MAX_DURATION_S, 'loop': False, 'entities': [], 'events': [],
+}
 
 
 def config_from_env(env=None):
@@ -86,6 +96,22 @@ class Engine:
     def _lane_cert(self, lane_id):
         return os.path.join(self.cfg['cert_dir'], f'lane-{lane_id}.pem')
 
+    def default_lanes(self):
+        """`/certs/lanes.json` -> a `run.lanes` payload for every enrolled lane on its recorded
+        channel (W9). The console writes the file at deploy and on every lane change; a
+        lane without a cert, or a channel that is not a string, is skipped."""
+        path = os.path.join(self.cfg['cert_dir'], LANES_FILE)
+        try:
+            with open(path, 'rb') as f:
+                m = json.loads(f.read().decode('utf-8'))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(m, dict):
+            return {}
+        avail = set(self.lane_ids_available())
+        return {str(k): {'channel': v} for k, v in m.items()
+                if str(k) in avail and isinstance(v, str) and sc.CHANNEL_RE.fullmatch(v)}
+
     # ── scenarios ─────────────────────────────────────────────────────────
     def list_scenarios(self):
         out = []
@@ -118,31 +144,96 @@ class Engine:
     # ── runs ──────────────────────────────────────────────────────────────
     def start_run(self, payload):
         """Validate, build lanes, connect, activate channels, start. Raises ScenarioError
-        for anything the operator can fix; RuntimeError for a busy engine or a dead server."""
+        for anything the operator can fix; RuntimeError for a busy engine or a dead server.
+        A payload without `lanes` runs on every enrolled lane at its recorded channel."""
+        if isinstance(payload, dict) and 'lanes' not in payload:
+            payload = dict(payload, lanes=self.default_lanes())
+        return self._start(payload, live=False)
+
+    def start_live(self, payload):
+        """W9 `/live`: an empty run the director fills through /cmd. Same gate as /run —
+        same lane rules, same typed confirmation for a real channel — 409 while any run
+        exists."""
+        if not isinstance(payload, dict):
+            raise sc.ScenarioError(['live: body must be a JSON object'])
+        unknown = sorted(set(payload) - {'center', 'lanes', 'tempo', 'exercise', 'confirm_exercise'})
+        if unknown:
+            raise sc.ScenarioError([f'live.{k}: unknown key' for k in unknown])
+        run_payload = {
+            'scenario': dict(LIVE_DOC), 'center': payload.get('center'),
+            'lanes': payload['lanes'] if 'lanes' in payload else self.default_lanes(),
+            'tempo': payload.get('tempo', 1), 'exercise': payload.get('exercise', False),
+            'confirm_exercise': payload.get('confirm_exercise', ''),
+            'default_channel': self.cfg['default_channel'], 'loop': False,
+        }
+        return self._start(run_payload, live=True)
+
+    def _start(self, payload, live):
         with self._lock:
             if self.run is not None and self.run.state in ('running', 'paused', 'stopping'):
                 raise RuntimeError('a scenario is already running — stop it first')
             params = sc.validate_run_params(payload, self.lane_ids_available())
-            doc = self.load_scenario(params['scenario'])
-            needed = {e['lane'] for e in doc['entities']} | {ev.get('lane') or doc['defaults']['lane'] for ev in doc['events']}
-            if doc['generate']:
-                needed.add(doc['generate']['lane'])
+            if not params['lanes']:
+                raise sc.ScenarioError(['run.lanes: no enrolled lane to send on — deploy or add a lane in the console'])
+            if live:
+                doc = sc.validate(params['scenario'], 'live', live=True)
+                needed = set(params['lanes'])
+                if doc['defaults']['lane'] not in needed:
+                    doc['defaults']['lane'] = sorted(needed)[0]
+            else:
+                doc = self.load_scenario(params['scenario'])
+                needed = {e['lane'] for e in doc['entities']} | {ev.get('lane') or doc['defaults']['lane'] for ev in doc['events']}
+                if doc['generate']:
+                    needed.add(doc['generate']['lane'])
             missing = sorted(needed - set(params['lanes']))
             if missing:
                 raise sc.ScenarioError([f'scenario uses lane {m!r} but no channel was assigned to it' for m in missing])
             if not self.cfg['tak_host'] and not self.cfg['dry_run']:
                 raise RuntimeError('SIM_TAK_HOST is not set')
+            # A lane's channel is a fact the console established (Authentik membership +
+            # enrollment) and recorded in lanes.json — never something a request may
+            # relabel. The console's own /run path calls _ensure_lane first, but a request
+            # through the CloudTAK plugin route arrives from any authenticated CloudTAK
+            # user, so the label in the body is checked against the record here (W9
+            # security review, finding 1). A missing lanes.json (an install that has not
+            # been rebuilt since W9) leaves only the console as a client — allowed, logged.
+            truth = self.default_lanes()
+            have_truth = os.path.isfile(os.path.join(self.cfg['cert_dir'], LANES_FILE))
+            for lid, spec in params['lanes'].items():
+                if lid not in needed:
+                    continue
+                if lid in truth:
+                    if spec['channel'] != truth[lid]['channel']:
+                        raise sc.ScenarioError([f'run.lanes.{lid}.channel: lane {lid} is enrolled on '
+                                                f'{truth[lid]["channel"]!r}, not {spec["channel"]!r} — re-target '
+                                                f'the lane in the console; a run cannot relabel it'])
+                elif have_truth:
+                    raise sc.ScenarioError([f'run.lanes.{lid}: lane {lid} is not registered by the console'])
+                else:
+                    self.log(f'lane {lid}: no lanes.json — trusting the caller\'s channel {spec["channel"]!r} (rebuild the engine from the console to pin it)')
+            # The simulation channel is engine configuration, not a request field: the body's
+            # default_channel (kept for the console's compatibility) is ignored.
+            default_channel = self.cfg['default_channel']
+            # Isolation policy, enforced here so every front end (console page, CloudTAK
+            # plugin, curl) meets the same gate: a lane on anything but the simulation
+            # channel needs the channel names typed back, exactly (W9).
+            real = sorted({spec['channel'] for lid, spec in params['lanes'].items()
+                           if lid in needed and spec['channel'] != default_channel})
+            if real and params['confirm_exercise'] != ', '.join(real):
+                raise sc.ScenarioError([f'run.confirm_exercise: sending on a real channel needs the typed '
+                                        f'confirmation {", ".join(real)!r}'])
 
             lanes = {}
             for lid, spec in params['lanes'].items():
                 if lid not in needed:
                     continue
                 exercise = bool(spec['exercise'] or params['exercise']
-                                or spec['channel'] != params['default_channel'])
+                                or spec['channel'] != default_channel)
                 lanes[lid] = Lane(lid, spec['channel'], self._lane_cert(lid), self.cfg['ca_file'],
                                   self.cfg['tak_host'], self.cfg['tak_port'], self.cfg['tak_api_port'],
                                   exercise=exercise, log=self.log, dry_run=self.cfg['dry_run'])
-            self.log(f'run request: scenario={doc["name"]} center={params["center"][0]:.5f},{params["center"][1]:.5f} '
+            self.log(f'{"live session" if live else "run"} request: scenario={doc["name"]} '
+                     f'center={params["center"][0]:.5f},{params["center"][1]:.5f} '
                      f'tempo={params["tempo"]}x lanes={{{", ".join(f"{k}->{v.channel}{" (EXERCISE)" if v.exercise else ""}" for k, v in lanes.items())}}}')
             for ln in lanes.values():
                 ln.start()
@@ -155,7 +246,7 @@ class Engine:
                     ln.stop()
                 errs = '; '.join(f'lane {ln.id}: {ln.last_error or "no connection"}' for ln in dead)
                 raise RuntimeError(f'could not connect to TAK Server {self.cfg["tak_host"]}:{self.cfg["tak_port"]} — {errs}')
-            run = Run(doc, params, lanes, self.log, self.cfg['video_base'], params['default_channel'])
+            run = Run(doc, params, lanes, self.log, self.cfg['video_base'], default_channel, live=live)
             run.start()
             self.run = run
             if self.cfg['activate_groups']:
@@ -165,8 +256,9 @@ class Engine:
                 # up with a membership change (~30 s cache). Runs off the request thread.
                 threading.Thread(target=self._activate_all, args=(run, list(lanes.values())),
                                  name='activate', daemon=True).start()
-            return {'started': True, 'scenario': doc['name'], 'entities': len(run.entities),
-                    'events': len(run.events), 'lanes': {k: v.channel for k, v in lanes.items()}}
+            return {'started': True, 'live': live, 'scenario': doc['name'], 'entities': len(run.entities),
+                    'events': len(run.events), 'lanes': {k: v.channel for k, v in lanes.items()},
+                    'exercise': {k: v.exercise for k, v in lanes.items()}}
 
     def _activate_all(self, run, lanes):
         time.sleep(1.5)
@@ -210,6 +302,47 @@ class Engine:
             return False
         r.stop(reason)
         return True
+
+    # ── director (W9) ─────────────────────────────────────────────────────
+    def command(self, body):
+        r = self.run
+        if r is None or r.state not in ('running', 'paused'):
+            raise RuntimeError('no run in progress — start a live session or a scenario first')
+        return r.command(body)
+
+    def state(self):
+        r = self.run
+        if r is None:
+            return {'state': 'idle', 'run': None, 'entities': [], 'objects': []}
+        return r.snapshot()
+
+    def save(self, body):
+        """POST /save: the live layout -> /scenarios/upload-<hex>.json (validated first).
+        Only upload-* names are ever written; a preset cannot be overwritten from here."""
+        r = self.run
+        if r is None or r.state not in ('running', 'paused'):
+            raise RuntimeError('no run in progress — nothing to save')
+        p = sc.validate_save_params(body)
+        name = p['name'] or f'{sc.UPLOAD_PREFIX}{secrets.token_hex(4)}'
+        doc = r.layout_doc(p['title'], name)
+        path = os.path.join(self.cfg['scenario_dir'], f'{name}.json')
+        if os.path.exists(path):
+            # a caller-chosen name never replaces an existing upload (security review, finding 2c)
+            raise RuntimeError(f'a scenario named {name!r} already exists — pick another name or omit it')
+        tmp = f'{path}.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(doc, f, indent=1)
+            os.replace(tmp, path)
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise OSError(f'could not write {name}.json in the scenarios folder ({e.strerror or e}) — '
+                          f'is the scenarios mount read-write?')
+        self.log(f'layout saved as {name} ({doc["title"]!r}: {len(doc["entities"])} unit(s), {len(doc["events"])} object(s))')
+        return {'saved': name, 'file': f'{name}.json', 'summary': sc.summarize(doc)}
 
     def status(self):
         r = self.run

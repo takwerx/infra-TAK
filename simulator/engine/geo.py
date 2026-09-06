@@ -35,6 +35,15 @@ def to_latlon(center, east_m, north_m):
     return lat, lon
 
 
+def from_latlon(center, lat, lon):
+    """(east_m, north_m) plane offset of a lat/lon from `center` — the exact inverse of
+    to_latlon, so a director's map click lands where the click was."""
+    lat0, lon0 = center
+    north = math.radians(lat - lat0) * EARTH_RADIUS_M
+    east = math.radians(lon - lon0) * EARTH_RADIUS_M * math.cos(math.radians(lat0))
+    return east, north
+
+
 def heading_deg(dx, dy):
     """Compass heading (0 = north, 90 = east) of a plane vector."""
     return math.degrees(math.atan2(dx, dy)) % 360.0

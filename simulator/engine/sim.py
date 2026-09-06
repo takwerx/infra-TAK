@@ -22,13 +22,22 @@ both movement and the timeline; pause freezes it. Every UID the run ever emitted
 remembered so that stop — operator Stop, natural end, SIGTERM, or the container dying —
 sends a `t-x-d-d` delete for each one and closes the lanes. Short `stale_s` covers the
 crash case the delete cannot.
+
+Director commands (companion PLAN, W9): the control thread validates a command and puts it
+on a queue; the loop thread drains the queue at the top of every tick and applies it. The
+control thread never touches an entity — it waits for the loop's answer.
 """
 import math
+import queue
 import random
 import threading
 import time
 
 from . import cot, geo
+from . import scenario as sc
+
+CMD_TIMEOUT_S = 10.0
+HEADING_LIMIT_M = 2 * sc.MAX_OFFSET_M      # a `heading` path holds at 400 km from center
 
 
 class Governor:
@@ -61,7 +70,7 @@ class Governor:
 class Entity:
     __slots__ = ('spec', 'uid', 'callsign', 'team', 'role', 'lane', 'type', 'pos', 'heading',
                  'speed', 'alive', 'next_emit', 'wp_idx', 'wp_pause_until', 'angle', 'walk_area',
-                 'walk_center', 'walk_radius', 'start_pos', 'emitted')
+                 'walk_center', 'walk_radius', 'start_pos', 'emitted', 'lostlink', 'orbit_entry')
 
     def __init__(self, spec, uid, rng, areas):
         self.spec = spec
@@ -72,6 +81,8 @@ class Entity:
         self.lane = spec['lane']
         self.type = spec['type']
         self.emitted = False
+        self.lostlink = False       # director "lost link": stop reporting, no delete (W9)
+        self.orbit_entry = None     # plane point to fly to before an orbit begins (W9)
         p = spec['path']
         self.walk_area = None
         self.walk_center = None
@@ -104,12 +115,41 @@ class Entity:
         self.wp_idx = 1 if self.spec['path']['kind'] == 'waypoints' else 0
         self.wp_pause_until = 0.0
         self.angle = 0.0
+        self.orbit_entry = None
+
+    def set_path(self, path):
+        """Live re-path (director command): keep the position, pick the new path up from
+        here. An orbit is entered smoothly — the unit flies to the nearest point on the
+        circle (straight ahead by `radius_m` when it is already at the center) and then
+        circles, instead of teleporting onto the ring."""
+        self.spec['path'] = path
+        kind = path['kind']
+        self.wp_idx = 1 if kind == 'waypoints' else 0
+        self.wp_pause_until = 0.0
+        self.orbit_entry = None
+        if kind == 'orbit':
+            c = path['center']
+            ang = (self.heading if geo.dist(self.pos, c) < 1.0
+                   else geo.heading_deg(self.pos[0] - c[0], self.pos[1] - c[1]))
+            self.angle = ang
+            self.orbit_entry = geo.orbit_point(c, path['radius_m'], ang)
 
     def advance(self, sim_dt, sim_t, rng):
         p = self.spec['path']
         kind = p['kind']
         if kind == 'static' or sim_dt <= 0:
             self.speed = 0.0
+            return
+        if kind == 'heading':
+            self.heading = p['heading_deg']
+            step = p['speed_mps'] * sim_dt
+            h = math.radians(self.heading)
+            cand = (self.pos[0] + step * math.sin(h), self.pos[1] + step * math.cos(h))
+            if abs(cand[0]) > HEADING_LIMIT_M or abs(cand[1]) > HEADING_LIMIT_M:
+                self.speed = 0.0            # off the plane's edge: hold rather than wrap the globe
+                return
+            self.pos = cand
+            self.speed = p['speed_mps']
             return
         if kind == 'waypoints':
             pts = p['points']
@@ -132,6 +172,19 @@ class Entity:
                 if p['pause_s'] > 0:
                     self.wp_pause_until = sim_t + p['pause_s']
         elif kind == 'orbit':
+            if self.orbit_entry is not None:
+                step = p['speed_mps'] * sim_dt
+                tgt = self.orbit_entry
+                new_pos, arrived = geo.step_toward(self.pos, tgt, step)
+                if not arrived:
+                    self.heading = geo.heading_deg(tgt[0] - self.pos[0], tgt[1] - self.pos[1])
+                self.pos = new_pos
+                self.speed = p['speed_mps']
+                if arrived:
+                    self.orbit_entry = None
+                    c = p['center']
+                    self.angle = geo.heading_deg(self.pos[0] - c[0], self.pos[1] - c[1])
+                return
             omega = math.degrees(p['speed_mps'] / p['radius_m']) * sim_dt
             self.angle = (self.angle + (omega if p['clockwise'] else -omega)) % 360.0
             self.pos = geo.orbit_point(p['center'], p['radius_m'], self.angle)
@@ -155,13 +208,17 @@ class Entity:
 
 
 class Run:
-    def __init__(self, doc, params, lanes, log, video_base=None, default_channel='tak_simulation'):
+    def __init__(self, doc, params, lanes, log, video_base=None, default_channel='tak_simulation',
+                 live=False):
         self.doc = doc
         self.params = params
         self.lanes = lanes                      # lane_id -> Lane
         self.log = log
         self.video_base = (video_base or '').rstrip('/') or None
         self.default_channel = default_channel
+        self.live = bool(live)                  # director session: empty doc, units via /cmd
+        self._cmdq = queue.Queue()
+        self._spawn_seq = 0
         self.center = params['center']
         self.tempo = float(params['tempo'])
         self.loop = doc['loop'] if params.get('loop') is None else bool(params['loop'])
@@ -220,6 +277,9 @@ class Run:
 
     def _latlon(self, pos):
         return geo.to_latlon(self.center, pos[0], pos[1])
+
+    def _plane(self, lat, lon):
+        return geo.from_latlon(self.center, lat, lon)
 
     def _send(self, lane_id, uid, etype, xml, block=False):
         lane = self.lanes[lane_id]
@@ -293,6 +353,7 @@ class Run:
             now = time.monotonic()
             dt = now - last
             last = now
+            self._drain_commands()
             if self.state != 'running':
                 time.sleep(tick)
                 continue
@@ -308,6 +369,7 @@ class Run:
                 else:
                     break
             time.sleep(tick)
+        self._drain_commands(fail=RuntimeError('run has ended'))
         if not self._stop_evt.is_set():
             self._cleanup('completed')
 
@@ -326,7 +388,7 @@ class Run:
 
     def _emit_due(self):
         for e in self.entities:
-            if not e.alive or self.sim_t < e.next_emit:
+            if not e.alive or e.lostlink or self.sim_t < e.next_emit:
                 continue
             gov = self.governors.get(e.lane)
             if gov is None or not gov.take():
@@ -336,10 +398,15 @@ class Run:
 
     def _emit_pli(self, e):
         lat, lon = self._latlon(e.pos)
+        sensor = e.spec.get('sensor')
+        azimuth = None
+        if sensor and sensor.get('sweep_deg_s'):
+            # radar sweep: the cone rotates at sweep_deg_s on top of the heading (W9)
+            azimuth = (e.heading + self.sim_t * sensor['sweep_deg_s']) % 360.0
         xml = cot.pli_event(e.uid, e.type, self._callsign(e.lane, e.callsign), lat, lon,
                             e.spec['hae_m'], e.speed, e.heading, e.team, e.role, e.spec['stale_s'],
-                            sensor=e.spec.get('sensor'), video=self._video_url(e),
-                            remarks=e.spec.get('remarks'))
+                            sensor=sensor, video=self._video_url(e),
+                            remarks=e.spec.get('remarks'), sensor_azimuth=azimuth)
         e.emitted = True
         self._send(e.lane, e.uid, e.type, xml)
 
@@ -372,9 +439,10 @@ class Run:
             self._send(p['lane'], uid, p['type'], p['build']())
             p['next'] = self.sim_t + p['refresh']
 
-    def _add_persistent(self, uid, lane_id, etype, build, stale_s):
+    def _add_persistent(self, uid, lane_id, etype, build, stale_s, meta=None):
         self.persistent[uid] = {'lane': lane_id, 'type': etype, 'build': build,
-                                'refresh': max(5.0, stale_s / 2.0), 'next': self.sim_t + max(5.0, stale_s / 2.0)}
+                                'refresh': max(5.0, stale_s / 2.0), 'next': self.sim_t + max(5.0, stale_s / 2.0),
+                                **(meta or {})}
         self.governors[lane_id].wait()
         self._send(lane_id, uid, etype, build())
 
@@ -413,7 +481,8 @@ class Run:
             title = self._callsign(lane_id, ev['title'])
             build = lambda: cot.casevac_event(uid, title, lat, lon, ev['urgent'], ev['priority'], ev['routine'],
                                               ev['litter'], ev['ambulatory'], ev['remarks'], stale_s=ev['stale_s'])
-            self._add_persistent(uid, lane_id, 'b-r-f-h-c', build, ev['stale_s'])
+            self._add_persistent(uid, lane_id, 'b-r-f-h-c', build, ev['stale_s'],
+                                 {'id': ev['id'], 'kind': 'casevac', 'callsign': ev['title'], 'ev': ev})
             self.log(f't+{ev["at_s"]:.0f}s CASEVAC {ev["title"]}')
         elif kind in ('emergency', 'emergency_cancel'):
             e = self.by_id[ev['from']]
@@ -429,14 +498,17 @@ class Run:
                 def build(e=e, cs=cs, alert=ev['alert']):
                     lat, lon = self._latlon(e.pos)
                     return cot.emergency_event(e.uid, e.type, cs, lat, lon, alert, False)
-                self._add_persistent(uid, e.lane, cot.EMERGENCY_TYPES.get(ev['alert'], 'b-a-o-tbl'), build, 90.0)
+                self._add_persistent(uid, e.lane, cot.EMERGENCY_TYPES.get(ev['alert'], 'b-a-o-tbl'), build, 90.0,
+                                     {'id': f'{ev["from"]}-911', 'kind': 'emergency', 'callsign': e.callsign,
+                                      'ev': {'kind': 'emergency', 'at_s': 0, 'from': ev['from'], 'alert': ev['alert']}})
                 self.log(f't+{ev["at_s"]:.0f}s EMERGENCY {ev["alert"]} from {e.callsign}')
         elif kind == 'marker':
             uid = f'SIM-{self.name}-{ev["id"]}'
             lat, lon = self._latlon(ev['at'])
             cs = self._callsign(lane_id, ev['callsign'])
             build = lambda: cot.marker_event(uid, ev['type'], cs, lat, lon, ev['remarks'], stale_s=ev['stale_s'])
-            self._add_persistent(uid, lane_id, ev['type'], build, ev['stale_s'])
+            self._add_persistent(uid, lane_id, ev['type'], build, ev['stale_s'],
+                                 {'id': ev['id'], 'kind': 'marker', 'callsign': ev['callsign'], 'ev': ev})
             self.log(f't+{ev["at_s"]:.0f}s marker {ev["callsign"]} ({ev["type"]})')
         elif kind == 'route':
             uid = f'SIM-{self.name}-{ev["id"]}'
@@ -444,7 +516,8 @@ class Run:
             cs = self._callsign(lane_id, ev['callsign'])
             color = cot.argb(ev['color'])
             build = lambda: cot.route_event(uid, cs, pts, color, stale_s=ev['stale_s'])
-            self._add_persistent(uid, lane_id, 'b-m-r', build, ev['stale_s'])
+            self._add_persistent(uid, lane_id, 'b-m-r', build, ev['stale_s'],
+                                 {'id': ev['id'], 'kind': 'route', 'callsign': ev['callsign'], 'ev': ev})
             self.log(f't+{ev["at_s"]:.0f}s route {ev["callsign"]} ({len(pts)} points)')
         elif kind == 'polygon':
             uid = f'SIM-{self.name}-{ev["id"]}'
@@ -452,7 +525,8 @@ class Run:
             cs = self._callsign(lane_id, ev['callsign'])
             stroke, fill = cot.argb(ev['stroke']), cot.argb(ev['fill'], ev['fill_alpha'])
             build = lambda: cot.polygon_event(uid, cs, pts, stroke, fill, stale_s=ev['stale_s'], remarks=ev['remarks'])
-            self._add_persistent(uid, lane_id, 'u-d-f', build, ev['stale_s'])
+            self._add_persistent(uid, lane_id, 'u-d-f', build, ev['stale_s'],
+                                 {'id': ev['id'], 'kind': 'polygon', 'callsign': ev['callsign'], 'ev': ev})
             self.log(f't+{ev["at_s"]:.0f}s polygon {ev["callsign"]} ({len(pts)} vertices)')
         elif kind == 'circle':
             uid = f'SIM-{self.name}-{ev["id"]}'
@@ -460,7 +534,8 @@ class Run:
             cs = self._callsign(lane_id, ev['callsign'])
             stroke, fill = cot.argb(ev['stroke']), cot.argb(ev['fill'], ev['fill_alpha'])
             build = lambda: cot.circle_event(uid, cs, lat, lon, ev['radius_m'], stroke, fill, stale_s=ev['stale_s'], remarks=ev['remarks'])
-            self._add_persistent(uid, lane_id, 'u-d-c-c', build, ev['stale_s'])
+            self._add_persistent(uid, lane_id, 'u-d-c-c', build, ev['stale_s'],
+                                 {'id': ev['id'], 'kind': 'circle', 'callsign': ev['callsign'], 'ev': ev})
             self.log(f't+{ev["at_s"]:.0f}s circle {ev["callsign"]} r={ev["radius_m"]:.0f}m')
         elif kind == 'spawn':
             e = self.by_id[ev['entity']]
@@ -493,7 +568,7 @@ class Run:
     def stats(self):
         alive = sum(1 for e in self.entities if e.alive)
         return {
-            'scenario': self.name, 'title': self.doc['title'], 'state': self.state,
+            'scenario': self.name, 'title': self.doc['title'], 'state': self.state, 'live': self.live,
             'started_at': self.started_at, 'ended_at': self.ended_at, 'ended_reason': self.ended_reason,
             'uptime_s': (round(time.time() - self.started_at) if self.started_at and not self.ended_at
                          else (round(self.ended_at - self.started_at) if self.started_at else 0)),
@@ -505,3 +580,224 @@ class Run:
             'max_msgs_per_sec': self.max_mps,
             'lanes': [ln.stats() for ln in self.lanes.values()],
         }
+
+    # ── director (W9): commands, state, layout ──────────────────────────────
+    def _object_ids(self):
+        return {p['id'] for p in self.persistent.values() if p.get('id')}
+
+    def _new_id(self):
+        while True:
+            self._spawn_seq += 1
+            cand = f'u{self._spawn_seq}'
+            if cand not in self.by_id:
+                return cand
+
+    def command(self, raw):
+        """Validate a director command on the caller's thread, queue it, and wait for the
+        loop thread to apply it. Returns the state after the change. Raises ScenarioError
+        (bad command), LookupError (no such unit/object) or RuntimeError (run not live)."""
+        if self.state not in ('running', 'paused'):
+            raise RuntimeError('no run in progress — start a live session or a scenario first')
+        if isinstance(raw, dict) and raw.get('op') == 'spawn' and not raw.get('id'):
+            raw = dict(raw, id=self._new_id())
+        cmd = sc.validate_cmd(raw, self._plane, set(self.by_id), self._object_ids(),
+                              set(self.lanes), self.doc['defaults'])
+        fut = {'done': threading.Event()}
+        self._cmdq.put((cmd, fut))
+        if not fut['done'].wait(CMD_TIMEOUT_S):
+            raise RuntimeError('the engine did not apply the command in time')
+        if 'error' in fut:
+            raise fut['error']
+        return fut['result']
+
+    def _drain_commands(self, fail=None):
+        while True:
+            try:
+                cmd, fut = self._cmdq.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if fail is not None:
+                    raise fail
+                fut['result'] = self._apply(cmd)
+            except Exception as ex:      # the answer travels back to the control thread
+                fut['error'] = ex
+            finally:
+                fut['done'].set()
+
+    def _apply(self, cmd):
+        op = cmd['op']
+        if op == 'spawn':
+            spec = cmd['entity']
+            if spec['id'] in self.by_id:
+                raise sc.ScenarioError([f'cmd.id: an entity with id {spec["id"]!r} already exists'])
+            if spec['lane'] not in self.lanes:
+                raise sc.ScenarioError([f'cmd.lane: this run is not connected on lane {spec["lane"]!r}'])
+            e = Entity(spec, f'SIM-{self.name}-{spec["id"]}', self.rng, self.doc['areas'])
+            e.alive = True
+            e.next_emit = self.sim_t
+            self.entities.append(e)
+            self.by_id[spec['id']] = e
+            self.log(f'director: spawn {e.callsign} ({e.type}) at t+{self.sim_t:.0f}s on lane {e.lane}'
+                     f'{" path=" + spec["path"]["kind"] if spec["path"]["kind"] != "static" else ""}')
+            return self._entity_state(e)
+        if op == 'tempo':
+            self.tempo = float(cmd['tempo'])
+            self.log(f'director: tempo {self.tempo:g}x')
+            return {'tempo': self.tempo}
+        if op == 'event':
+            ev = dict(cmd['event'], at_s=self.sim_t)
+            self._fire(ev)
+            self.events_fired += 1
+            uid = f'SIM-{self.name}-{ev["id"]}' if ev.get('id') else None
+            if uid and uid in self.persistent:
+                return self._object_state(uid)
+            return {'fired': ev['kind']}
+        if op == 'remove':
+            e = self.by_id.get(cmd['id'])
+            if e is not None:
+                self._remove_entity(e)
+                self.log(f'director: remove {e.callsign}')
+                return {'removed': cmd['id'], 'entity': True}
+            uid = f'SIM-{self.name}-{cmd["id"]}'
+            if uid in self.persistent:
+                self._remove_persistent(uid)
+                self.log(f'director: remove object {cmd["id"]}')
+                return {'removed': cmd['id'], 'object': True}
+            raise LookupError(f'nothing with id {cmd["id"]!r} to remove')
+        e = self.by_id.get(cmd['id'])
+        if e is None:
+            raise LookupError(f'no entity with id {cmd["id"]!r}')
+        if op == 'goto':
+            e.set_path({'kind': 'waypoints', 'points': [e.pos, tuple(cmd['to'])],
+                        'speed_mps': cmd['speed_mps'], 'loop': False, 'pause_s': 0.0})
+        elif op == 'route':
+            e.set_path({'kind': 'waypoints', 'points': [e.pos] + [tuple(p) for p in cmd['points']],
+                        'speed_mps': cmd['speed_mps'], 'loop': cmd['loop'], 'pause_s': 0.0})
+        elif op == 'orbit':
+            center = tuple(cmd['center']) if cmd['center'] is not None else e.pos
+            e.set_path({'kind': 'orbit', 'center': center, 'radius_m': cmd['radius_m'],
+                        'speed_mps': cmd['speed_mps'], 'clockwise': cmd['clockwise']})
+        elif op == 'heading':
+            e.set_path({'kind': 'heading', 'at': e.pos, 'heading_deg': cmd['heading_deg'],
+                        'speed_mps': cmd['speed_mps']})
+            if cmd['hae_m'] is not None:
+                e.spec['hae_m'] = cmd['hae_m']
+        elif op == 'hold':
+            e.set_path({'kind': 'static', 'at': e.pos})
+        elif op == 'alt':
+            e.spec['hae_m'] = cmd['hae_m']
+        elif op == 'lostlink':
+            e.lostlink = cmd['on']
+        elif op == 'rename':
+            e.callsign = cmd['callsign']
+        elif op == 'team':
+            e.team = cmd['team']
+            if cmd['role']:
+                e.role = cmd['role']
+        if not e.alive:
+            e.alive = True
+        if not e.lostlink:
+            e.next_emit = self.sim_t           # show the change on the next tick
+        self.log(f'director: {op} {e.callsign}'
+                 + (f' -> {cmd["heading_deg"]:.0f}° {cmd["speed_mps"]:g} m/s' if op == 'heading' else '')
+                 + (f' r={cmd["radius_m"]:.0f}m {cmd["speed_mps"]:g} m/s' if op == 'orbit' else '')
+                 + (f' {cmd["speed_mps"]:g} m/s' if op in ('goto', 'route') else '')
+                 + (f' {cmd["hae_m"]:.0f} m' if op == 'alt' else '')
+                 + (f' {"ON" if cmd["on"] else "off"}' if op == 'lostlink' else ''))
+        return self._entity_state(e)
+
+    def _remove_entity(self, e):
+        self._remove_persistent(f'{e.uid}-9-1-1')     # its 911 beacon, if one is up
+        self._despawn(e)
+        self.by_id.pop(e.spec['id'], None)
+        try:
+            self.entities.remove(e)
+        except ValueError:
+            pass
+
+    def _entity_state(self, e):
+        lat, lon = self._latlon(e.pos)
+        return {
+            'id': e.spec['id'], 'uid': e.uid, 'callsign': e.callsign, 'type': e.type,
+            'team': e.team, 'role': e.role, 'lane': e.lane,
+            'lat': round(lat, 7), 'lon': round(lon, 7), 'hae_m': e.spec['hae_m'],
+            'heading': round(e.heading, 1), 'speed_mps': round(e.speed, 2),
+            'alive': e.alive, 'lostlink': e.lostlink, 'emitted': e.emitted,
+            'path_kind': e.spec['path']['kind'],
+            'sensor': e.spec.get('sensor'), 'video': bool(e.spec.get('video')),
+        }
+
+    def _object_state(self, uid, p=None):
+        p = self.persistent[uid] if p is None else p
+        return {'uid': uid, 'id': p.get('id'), 'kind': p.get('kind'), 'callsign': p.get('callsign'),
+                'type': p['type'], 'lane': p['lane']}
+
+    def snapshot(self):
+        """GET /state: everything a map front end needs to draw its unit list (2 s poll)."""
+        return {
+            'state': self.state, 'run': self.stats(),
+            'entities': [self._entity_state(e) for e in list(self.entities)],
+            'objects': [self._object_state(uid, p) for uid, p in list(self.persistent.items())],
+        }
+
+    def _layout_path(self, e):
+        p = e.spec['path']
+        kind = p['kind']
+        if kind == 'static':
+            return {'kind': 'static', 'at': list(e.pos)}
+        if kind == 'heading':
+            return {'kind': 'heading', 'at': list(e.pos), 'heading_deg': p['heading_deg'], 'speed_mps': p['speed_mps']}
+        if kind == 'orbit':
+            return {'kind': 'orbit', 'center': list(p['center']), 'radius_m': p['radius_m'],
+                    'speed_mps': p['speed_mps'], 'clockwise': p['clockwise']}
+        if kind == 'waypoints':
+            return {'kind': 'waypoints', 'points': [list(q) for q in p['points']], 'speed_mps': p['speed_mps'],
+                    'loop': p['loop'], 'pause_s': p['pause_s']}
+        out = {'kind': 'random_walk', 'speed_mps': p['speed_mps'], 'turn_deg_s': p['turn_deg_s']}
+        if p.get('area'):
+            out['area'] = p['area']
+        elif p.get('polygon'):
+            out['polygon'] = [list(q) for q in p['polygon']]
+        else:
+            out['start'] = list(p['start'])
+            out['radius_m'] = p['radius_m']
+        return out
+
+    def layout_doc(self, title, name):
+        """POST /save: the live layout as a scenario document — every live unit at its
+        current position (paths preserved), every persistent object as an `at_s: 0`
+        event — validated, so what is written always loads again."""
+        ents = []
+        for e in list(self.entities):
+            if not e.alive:
+                continue
+            spec = e.spec
+            ent = {'id': spec['id'], 'callsign': e.callsign, 'type': e.type, 'team': e.team,
+                   'role': e.role, 'lane': e.lane, 'path': self._layout_path(e),
+                   'interval_s': spec['interval_s'], 'stale_s': spec['stale_s'], 'hae_m': spec['hae_m']}
+            for k in ('remarks', 'sensor', 'video'):
+                if spec.get(k):
+                    ent[k] = spec[k] if isinstance(spec[k], str) else dict(spec[k])
+            ents.append(ent)
+        events = [_plain(dict(p['ev'], at_s=0)) for p in list(self.persistent.values()) if p.get('ev')]
+        doc = {
+            'name': name, 'title': title,
+            'story': f'Layout saved from a live session: {len(ents)} unit(s), {len(events)} object(s).',
+            'version': sc.SCHEMA_VERSION, 'duration_s': 3600, 'loop': True, 'default_tempo': 1,
+            'defaults': dict(self.doc['defaults']),
+            'areas': {k: [list(q) for q in v] for k, v in self.doc['areas'].items()},
+            'entities': ents, 'events': events,
+        }
+        return sc.validate(doc, name)
+
+
+def _plain(obj):
+    """Tuples -> lists, recursively, so a normalized event serializes as the schema reads it."""
+    if isinstance(obj, tuple):
+        return [_plain(x) for x in obj]
+    if isinstance(obj, list):
+        return [_plain(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _plain(v) for k, v in obj.items()}
+    return obj
