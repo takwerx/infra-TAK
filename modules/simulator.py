@@ -532,6 +532,32 @@ def _ensure_network(ctx, plog):
         plog(f'  ✓ docker network {SIM_INFRATAK_NETWORK} present')
 
 
+SIM_CLOUDTAK_PLUGIN_DIR = os.path.expanduser('~/CloudTAK/api/web/plugins/taksim')   # catalog install_dir 'taksim'
+
+
+def _cloudtak_state(ctx, settings):
+    """What the page needs for its CloudTAK row (W13): is CloudTAK here, where is the map,
+    is the TAK Simulator panel (the `taksim` CloudTAK plugin) installed."""
+    installed = False
+    try:
+        installed = bool(ctx['detect_modules']().get('cloudtak', {}).get('installed'))
+    except Exception:
+        pass
+    fqdn = (settings.get('fqdn') or '').strip()
+    custom = (settings.get('cloudtak_map_domain') or '').strip()
+    if custom:
+        host = custom if '.' in custom or not fqdn else f'{custom}.{fqdn}'
+    else:
+        host = f'map.{fqdn}' if fqdn else ''
+    return {
+        'installed': installed,
+        'map_url': f'https://{host}' if host and installed else '',
+        'panel_url': f'https://{host}/menu/taksim' if host and installed else '',
+        'plugin_installed': os.path.isdir(SIM_CLOUDTAK_PLUGIN_DIR),
+        'plugin_key': 'taksim',
+    }
+
+
 def _link_cloudtak(ctx, plog):
     """Rewrite CloudTAK's override from current settings and recreate its api container
     when needed (W10): with `simulator_enabled` set, the api joins `infratak` and gets
@@ -912,7 +938,8 @@ def register(ctx):
         st, res = _ctl(settings, 'GET', '/status', timeout=8)
         out = {'engine': res if st == 200 else None, 'engine_error': None if st == 200 else res.get('error'),
                'lanes': _lanes_view(), 'default': SIM_DEFAULT_CHANNEL,
-               'version': get_version_info(ctx)}
+               'version': get_version_info(ctx),
+               'cloudtak': _cloudtak_state(ctx, settings)}
         return jsonify(out)
 
     def logs_view():

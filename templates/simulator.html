@@ -105,8 +105,10 @@ table.lanes{width:100%;border-collapse:collapse;font-size:12px}table.lanes th{fo
     <div style="font-size:13px;color:var(--text-secondary);line-height:1.6">
       1. In <a href="{{ takportal_url or '#' }}" target="_blank" style="color:var(--cyan)">TAK Portal</a>, add the viewers to the <span class="mono" style="color:var(--text-primary)">{{ default_channel[4:]|e }}</span> channel.<br>
       2. In ATAK / iTAK / WinTAK, open Channels and toggle <span class="mono" style="color:var(--text-primary)">{{ default_channel[4:]|e }}</span> on to see the exercise — off to get the real picture back.<br>
-      3. WebTAK, CloudTAK and the Portal map follow the same membership.
+      3. WebTAK, CloudTAK and the Portal map follow the same membership.<br>
+      4. Direct it from the CloudTAK map — drop a radar, aircraft, vessels and ground units, steer them live: <span id="ctakRow" class="note">checking CloudTAK…</span>
     </div>
+    <div id="ctakLogWrap" style="display:none;margin-top:8px"><div class="log-box" id="ctakLog" style="max-height:140px"></div></div>
     <div class="note" style="margin-top:10px">Every simulated object carries <span class="mono">EXERCISE EXERCISE EXERCISE</span> in its remarks. Units on a real channel are prefixed <span class="mono">EX-</span>.</div>
   </div>
 </div>
@@ -252,8 +254,21 @@ function refreshStatus(){ api('/api/simulator/status').then(r=>{ const e=r.d.eng
   const rows=lanes.length?lanes:(r.d.lanes||[]).map(l=>({id:l.id,channel:l.channel,connected:null,sent:'—',msgs_per_s:'—',dropped:'—',last_error:''}));
   tb.innerHTML=rows.length?rows.map(l=>'<tr><td>'+esc(l.id)+'</td><td>'+esc(l.channel)+(l.exercise?' <span class="pill pill-stop">exercise</span>':'')+'</td><td>'+(l.connected===null?'<span class="note">idle</span>':(l.connected?'<span style="color:var(--green)">● connected</span>':'<span style="color:var(--red)">● down</span>'))+'</td><td>'+esc(l.sent)+'</td><td>'+esc(l.msgs_per_s)+'</td><td>'+esc(l.dropped)+'</td><td class="note">'+esc(l.last_error||'')+'</td></tr>').join(''):'<tr><td colspan="7" class="note">No lanes yet.</td></tr>';
   if(r.d.engine_error) document.getElementById('runMsg').textContent='✗ '+r.d.engine_error;
+  renderCloudtak(r.d.cloudtak);
   if(live!==(lastState==='running'||lastState==='paused')) fetchLogs(); lastState=state;
   clearTimeout(statusTimer); statusTimer=setTimeout(refreshStatus, live?2000:8000); }).catch(()=>{ clearTimeout(statusTimer); statusTimer=setTimeout(refreshStatus,8000); }); }
+let ctakInstalling=false;
+function renderCloudtak(c){ const row=document.getElementById('ctakRow'); if(!row||ctakInstalling) return;
+  if(!c||!c.installed){ row.innerHTML='CloudTAK is not installed on this box.'; return; }
+  if(c.plugin_installed){ row.innerHTML='<a href="'+esc(c.panel_url)+'" target="_blank" rel="noopener" style="color:var(--cyan)">Open in CloudTAK ↗</a> <span class="note">(menu → TAK Simulator; hard-refresh CloudTAK after an install)</span>'; return; }
+  row.innerHTML='<button class="btn btn-primary" style="font-size:11px" id="ctakInstallBtn" onclick="installPanel()">Install CloudTAK panel</button> <span class="note">rebuilds the CloudTAK API image, 5–10 min</span>'; }
+function installPanel(){ const b=document.getElementById('ctakInstallBtn'); if(b) b.disabled=true; ctakInstalling=true;
+  document.getElementById('ctakRow').innerHTML='<span class="note">Installing the TAK Simulator panel into CloudTAK…</span>'; document.getElementById('ctakLogWrap').style.display='';
+  api('/api/cloudtak/plugins/action',{method:'POST',body:JSON.stringify({plugin:'taksim',action:'install'})}).then(r=>{ if(!r.ok||!r.d.ok){ ctakInstalling=false; document.getElementById('ctakRow').innerHTML='✗ '+esc(r.d.error||'could not start the install'); return; } pollPanel(); }); }
+function pollPanel(){ api('/api/cloudtak/plugins/log?index=0').then(r=>{ const d=r.d; const box=document.getElementById('ctakLog'); box.innerHTML=(d.entries||[]).map(l=>'<div>'+esc(l)+'</div>').join(''); box.scrollTop=box.scrollHeight;
+  if(d.running){ setTimeout(pollPanel,4000); return; } ctakInstalling=false;
+  if(d.complete&&!d.error){ document.getElementById('ctakRow').innerHTML='<span style="color:var(--green)">✓ installed</span> — close every CloudTAK tab and reopen it (its service worker caches the old bundle).'; refreshStatus(); }
+  else document.getElementById('ctakRow').innerHTML='✗ install failed — see the log above (the plugin catalog on the CloudTAK page has the same log).'; }).catch(()=>setTimeout(pollPanel,5000)); }
 function fetchLogs(){ api('/api/simulator/logs').then(r=>{ const box=document.getElementById('engLog'); box.innerHTML=(r.d.lines||[]).map(l=>'<div>'+esc(l)+'</div>').join('')||'<div class="note">(no log lines yet)</div>'; box.scrollTop=box.scrollHeight; }); }
 function uploadScenario(inp){ const f=inp.files[0]; if(!f) return; const msg=document.getElementById('uploadMsg'); if(f.size>1000000){ msg.textContent='✗ larger than 1 MB'; return; } const fd=new FormData(); fd.append('file',f); msg.textContent='Validating…';
   api('/api/simulator/scenarios/upload',{method:'POST',body:fd}).then(r=>{ if(r.ok){ msg.textContent='✓ saved as '+r.d.saved; loadScenarios().then(()=>selectScen(r.d.saved)); } else msg.textContent='✗ '+(r.d.error||'rejected')+(r.d.errors?': '+r.d.errors.slice(0,3).join('; '):''); inp.value=''; }); }
