@@ -1,0 +1,47 @@
+{
+  "title": "Law enforcement perimeter",
+  "story": "A suspect on foot after a vehicle stop: patrol units converge and set a four-corner perimeter, K9 tracks, air support orbits, a unit hits a 911 beacon during the take-down, and it is cancelled once the suspect is in custody.",
+  "version": 1,
+  "duration_s": 900,
+  "loop": true,
+  "default_tempo": 2,
+  "warn": "This preset uses a 911 emergency beacon and hostile markers. Keep it on the simulation channel unless the exercise director has cleared a real channel.",
+  "defaults": {"interval_s": 4, "stale_s": 60, "team": "Dark Blue", "role": "Team Member", "lane": "1"},
+  "areas": {
+    "block": [[-350, -350], [350, -350], [350, 350], [-350, 350]]
+  },
+  "entities": [
+    {"id": "dispatch", "callsign": "DISPATCH", "type": "a-f-G-U-C", "team": "White", "role": "HQ", "path": {"kind": "static", "at": [3000, -3000]}},
+    {"id": "u21", "callsign": "UNIT 21", "type": "a-f-G-E-V-C", "team": "Dark Blue", "role": "Team Lead",
+     "path": {"kind": "waypoints", "speed_mps": 15, "loop": false, "points": [[-2500, -1800], [-900, -700], [-500, -500], [-500, -500]]}},
+    {"id": "u34", "callsign": "UNIT 34", "type": "a-f-G-E-V-C", "spawn_at_s": 30,
+     "path": {"kind": "waypoints", "speed_mps": 16, "loop": false, "points": [[2800, -1500], [900, -600], [500, -500]]}},
+    {"id": "u17", "callsign": "UNIT 17", "type": "a-f-G-E-V-C", "spawn_at_s": 45,
+     "path": {"kind": "waypoints", "speed_mps": 16, "loop": false, "points": [[2600, 2200], [800, 700], [500, 500]]}},
+    {"id": "u09", "callsign": "UNIT 09", "type": "a-f-G-E-V-C", "spawn_at_s": 60,
+     "path": {"kind": "waypoints", "speed_mps": 15, "loop": false, "points": [[-2700, 2000], [-900, 700], [-500, 500]]}},
+    {"id": "k9", "callsign": "K9 UNIT 5", "type": "a-f-G-U-C", "team": "Brown", "role": "K9", "spawn_at_s": 200, "interval_s": 3,
+     "path": {"kind": "waypoints", "speed_mps": 2.0, "loop": false, "points": [[-500, -500], [-200, -250], [50, -80], [180, 120], [230, 210]]}},
+    {"id": "suspect", "callsign": "SUSPECT", "type": "a-h-G", "team": "Red", "role": "Team Member", "interval_s": 5, "despawn_at_s": 560,
+     "path": {"kind": "random_walk", "area": "block", "speed_mps": 1.3, "turn_deg_s": 60}},
+    {"id": "air", "callsign": "AIR 3", "type": "a-f-A-M-H", "team": "Blue", "hae_m": 350, "interval_s": 2, "spawn_at_s": 150,
+     "sensor": {"fov": 30, "range_m": 700, "vfov": 25, "elevation": -45}, "video": {"stream": "air3"},
+     "path": {"kind": "orbit", "center": [0, 0], "radius_m": 600, "speed_mps": 35, "clockwise": true}}
+  ],
+  "events": [
+    {"at_s": 0, "kind": "marker", "id": "stop", "callsign": "VEHICLE STOP", "type": "a-h-G-E-V-C", "at": [-600, -600], "remarks": "Suspect vehicle, abandoned"},
+    {"at_s": 10, "kind": "chat", "from": "dispatch", "text": "All units, suspect fled on foot northbound from the vehicle stop. Male, dark hoodie."},
+    {"at_s": 90, "kind": "polygon", "id": "perim", "callsign": "PERIMETER", "stroke": "#0a84ff", "fill": "#0a84ff", "fill_alpha": 25, "points": [[-500, -500], [500, -500], [500, 500], [-500, 500]]},
+    {"at_s": 95, "kind": "chat", "from": "u21", "text": "Unit 21 has the southwest corner. Perimeter is up, hold your corners."},
+    {"at_s": 160, "kind": "chat", "from": "air", "text": "Air 3 overhead, FLIR on the block."},
+    {"at_s": 210, "kind": "chat", "from": "k9", "text": "K9 5 starting the track from the vehicle."},
+    {"at_s": 400, "kind": "chat", "from": "air", "text": "Air 3 has one subject in the yard, northeast quadrant."},
+    {"at_s": 480, "kind": "emergency", "from": "k9", "alert": "911 Alert"},
+    {"at_s": 482, "kind": "chat", "from": "dispatch", "text": "911 from K9 5. Units 17 and 34 close in."},
+    {"at_s": 540, "kind": "emergency_cancel", "from": "k9"},
+    {"at_s": 545, "kind": "chat", "from": "k9", "text": "K9 5 code 4, suspect in custody. Cancel the alert."},
+    {"at_s": 560, "kind": "marker", "id": "custody", "callsign": "IN CUSTODY", "type": "a-n-G", "at": [230, 210], "remarks": "Suspect detained"},
+    {"at_s": 700, "kind": "remove", "id": "perim"},
+    {"at_s": 705, "kind": "chat", "from": "u21", "text": "Perimeter down. Units clear when able. EXERCISE EXERCISE EXERCISE."}
+  ]
+}

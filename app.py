@@ -3055,6 +3055,20 @@ def detect_modules():
             'icon_url': '/static/logos/tak-video-restreamer-logo.png',
             'route': '/tak-video-restreamer', 'priority': 13, 'conflicts': ['mediamtx']}
 
+    # TAK Simulator — registry-resident (modules/simulator.py, v10.1.61). Dev-channel gate
+    # (guide §10): the tile exists only on dev-channel boxes or where it is already installed.
+    _sim_desc = mod_registry.MODULES.get('simulator')
+    if _sim_desc:
+        try:
+            _sim_state = _sim_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _sim_state = {}
+        if _sim_state.get('installed') or (settings.get('update_channel') or 'main').strip().lower() == 'dev':
+            modules['simulator'] = {'name': _sim_desc['name'],
+                'installed': bool(_sim_state.get('installed')), 'running': bool(_sim_state.get('running')),
+                'description': _sim_desc['description'], 'icon': _sim_desc['icon'],
+                'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': []}
+
     # NetBird VPN
     netbird_enabled = settings.get('netbird_enabled', False)
     netbird_running = False
@@ -3486,6 +3500,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
         parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
+    simm = modules.get('simulator', {})
+    if simm.get('installed'):
+        parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -14243,6 +14260,7 @@ def guarddog_page():
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
@@ -18941,6 +18959,11 @@ def _guarddog_health_check(service_id):
                 _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer']),
                 capture_output=True, text=True, timeout=5)
             return r.stdout.strip() == 'true'
+        if service_id == 'simulator':
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-simulator']),
+                capture_output=True, text=True, timeout=5)
+            return (r.stdout or '').strip() == 'true'
         if service_id == 'nodered':
             settings = load_settings()
             nr_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
@@ -19016,6 +19039,7 @@ def _guarddog_service_monitor_ids(settings):
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'tak_video_restreamer': ['tvr_http'],
+        'simulator': ['simulator_ctr'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
         'updates': ['updates_check'],
@@ -19045,6 +19069,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('mediamtx')
     if modules.get('tak_video_restreamer', {}).get('installed'):
         ids.append('tak_video_restreamer')
+    if modules.get('simulator', {}).get('installed'):
+        ids.append('simulator')
     if modules.get('nodered', {}).get('installed'):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
@@ -19681,6 +19707,11 @@ def _monitor_health_check(monitor_id):
                     return resp.status == 200
             except Exception:
                 return False
+        if monitor_id == 'simulator_ctr':
+            # v10.1.61: container liveness only — a stopped scenario is normal (PLAN §4.5)
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-simulator']),
+                               capture_output=True, text=True, timeout=5)
+            return (r.stdout or '').strip() == 'true'
         if monitor_id == 'takportal_ctr':
             return _takportal_web_running()  # v10.1.59: the WEB service, exact — not a substring
         if monitor_id == 'cloudtak_ctr':
@@ -30538,6 +30569,9 @@ def get_all_module_versions():
     if modules.get('tak_video_restreamer', {}).get('installed'):
         # registry-resident since v10.1.24 — modules/tvr.py owns the SHA compare
         _set('tak_video_restreamer', lambda: mod_registry.tvr.get_version_info(mod_registry.get_ctx()))
+    if modules.get('simulator', {}).get('installed'):
+        # v10.1.61: engine ships inside the console — 'update' = rebuild on a version change
+        _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
@@ -39322,6 +39356,54 @@ def tvr_page():
         deploying=_tvr_job.get('running', False),
         deploy_log=_tvr_job.get('log', []),
         deploy_error=_tvr_job.get('error', False),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+@app.route('/simulator')
+@login_required
+def simulator_page():
+    """TAK Simulator page (v10.1.61) — registry module; dev-channel gated like its tile."""
+    from flask import make_response, abort
+    settings = load_settings()
+    modules = detect_modules()
+    sim = modules.get('simulator', {})
+    if not mod_registry.MODULES.get('simulator') or (
+            not sim and (settings.get('update_channel') or 'main').strip().lower() != 'dev'):
+        abort(404)
+    sim_vinfo = mod_registry.simulator.get_version_info(mod_registry.get_ctx()) if sim.get('installed') else {}
+    _job = mod_registry.job_state('simulator')
+    preflight = []
+    if not sim.get('installed'):
+        import socket as _sock
+
+        def _tcp(port):
+            try:
+                with _sock.create_connection(('127.0.0.1', port), timeout=2):
+                    return True
+            except OSError:
+                return False
+        _ak_tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                   or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        _drc, _dv = _docker_probe()
+        preflight = [
+            {'label': 'TAK Server installed on this box', 'ok': bool(modules.get('takserver', {}).get('installed')), 'detail': ''},
+            {'label': 'Authentik installed (lane identities are LDAP users)', 'ok': bool(_ak_tok), 'detail': ''},
+            {'label': 'TAK Server streaming port 8089 reachable', 'ok': _tcp(8089), 'detail': '127.0.0.1:8089'},
+            {'label': 'TAK Server enrollment port 8446 reachable', 'ok': _tcp(8446), 'detail': '127.0.0.1:8446'},
+            {'label': 'Docker present', 'ok': _drc == 0, 'detail': _dv if _drc == 0 else 'installed during deploy if missing'},
+        ]
+    preflight_ok = all(p['ok'] for p in preflight if not p['label'].startswith('Docker')) if preflight else True
+    _tp_host = _get_service_domain(settings, 'takportal') if modules.get('takportal', {}).get('installed') else ''
+    r = make_response(render_template('simulator.html',
+        settings=settings, modules=modules, sim=sim, sim_vinfo=sim_vinfo,
+        sim_lanes=list(settings.get('simulator_lanes') or []),
+        default_channel=settings.get('simulator_default_channel') or 'tak_simulation',
+        takportal_url=f'https://{_tp_host}' if _tp_host else '',
+        preflight=preflight, preflight_ok=preflight_ok,
+        fqdn=settings.get('fqdn', ''), server_ip=settings.get('server_ip', ''),
+        deploying=_job.get('running', False), deploy_log=_job.get('log', []), deploy_error=_job.get('error', False),
         metrics=get_system_metrics(), version=VERSION))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
@@ -69604,6 +69686,14 @@ def run_full_uninstall():
             plog(f"⚠ TAK Video Restreamer removal error (non-fatal): {e}")
         plog("✓ TAK Video Restreamer removed")
 
+        # 1c. TAK Simulator — v10.1.61: registry uninstall path (modules/simulator.py).
+        plog("━━━ TAK Simulator ━━━")
+        try:
+            mod_registry.uninstall_module('simulator', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ TAK Simulator removal error (non-fatal): {e}")
+        plog("✓ TAK Simulator removed")
+
         # 2. TAK Portal
         plog("━━━ TAK Portal ━━━")
         portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -77612,6 +77702,10 @@ _MODULE_CTX = {
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
+    # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION
+    '_get_tak_deployment_config': _get_tak_deployment_config,
+    '_get_authentik_api_url': _get_authentik_api_url,
+    'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
 # import with a clear message (smoke.py py_compiles modules/*.py pre-pull), not
