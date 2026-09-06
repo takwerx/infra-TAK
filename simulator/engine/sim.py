@@ -119,9 +119,10 @@ class Entity:
 
     def set_path(self, path):
         """Live re-path (director command): keep the position, pick the new path up from
-        here. An orbit is entered smoothly — the unit flies to the nearest point on the
-        circle (straight ahead by `radius_m` when it is already at the center) and then
-        circles, instead of teleporting onto the ring."""
+        here. An orbit is entered smoothly, never by teleporting onto the ring: a unit
+        already on the circle (an "orbit here" built tangentially by the director) starts
+        circling at once; otherwise it flies to the nearest point on the circle (straight
+        ahead by `radius_m` when it sits at the center) and then circles."""
         self.spec['path'] = path
         kind = path['kind']
         self.wp_idx = 1 if kind == 'waypoints' else 0
@@ -129,10 +130,13 @@ class Entity:
         self.orbit_entry = None
         if kind == 'orbit':
             c = path['center']
-            ang = (self.heading if geo.dist(self.pos, c) < 1.0
-                   else geo.heading_deg(self.pos[0] - c[0], self.pos[1] - c[1]))
-            self.angle = ang
-            self.orbit_entry = geo.orbit_point(c, path['radius_m'], ang)
+            d = geo.dist(self.pos, c)
+            if abs(d - path['radius_m']) < 1.0:
+                self.angle = geo.heading_deg(self.pos[0] - c[0], self.pos[1] - c[1])
+            else:
+                ang = self.heading if d < 1.0 else geo.heading_deg(self.pos[0] - c[0], self.pos[1] - c[1])
+                self.angle = ang
+                self.orbit_entry = geo.orbit_point(c, path['radius_m'], ang)
 
     def advance(self, sim_dt, sim_t, rng):
         p = self.spec['path']
@@ -675,7 +679,15 @@ class Run:
             e.set_path({'kind': 'waypoints', 'points': [e.pos] + [tuple(p) for p in cmd['points']],
                         'speed_mps': cmd['speed_mps'], 'loop': cmd['loop'], 'pause_s': 0.0})
         elif op == 'orbit':
-            center = tuple(cmd['center']) if cmd['center'] is not None else e.pos
+            if cmd['center'] is not None:
+                center = tuple(cmd['center'])
+            else:
+                # "orbit here": a circle THROUGH the current position, entered tangentially —
+                # the center sits one radius to the side of the current heading, so the
+                # unit starts turning right now (no entry leg, no teleport).
+                r = cmd['radius_m']
+                h = math.radians(e.heading + (90.0 if cmd['clockwise'] else -90.0))
+                center = (e.pos[0] + r * math.sin(h), e.pos[1] + r * math.cos(h))
             e.set_path({'kind': 'orbit', 'center': center, 'radius_m': cmd['radius_m'],
                         'speed_mps': cmd['speed_mps'], 'clockwise': cmd['clockwise']})
         elif op == 'heading':

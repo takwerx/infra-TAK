@@ -36383,12 +36383,17 @@ def _cloudtak_refresh_override(plog=None):
     if os.path.exists(override_path):
         with open(override_path) as f:
             old = f.read()
+    if settings.get('simulator_enabled'):
+        try:
+            os.chmod(override_path, 0o600)  # carries the engine token — also when another
+        except OSError:                     # writer (startup migration) left it at 644
+            pass
     if old.strip() == new.strip():
         return False, 'CloudTAK override already current'
     with open(override_path, 'w') as f:
         f.write(new)
     try:
-        os.chmod(override_path, 0o600)      # may carry the engine token
+        os.chmod(override_path, 0o600)
     except OSError:
         pass
     _log('  CloudTAK override rewritten — recreating the api container (no other service touched)...')
@@ -72151,6 +72156,8 @@ def _startup_harden_cloudtak_ports():
                     _of.write(_new_override)
                 _override_changed = True
                 print("Startup migration: CloudTAK override refreshed (removed stale ports: !reset)")
+            if _settings.get('simulator_enabled'):
+                os.chmod(_override_path, 0o600)     # v10.1.61 W10: carries the engine token
         except Exception:
             pass
         _changed = _patch_cloudtak_compose_ports(_ct_dir)
