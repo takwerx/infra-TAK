@@ -964,7 +964,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.59-alpha"
+VERSION = "10.1.60-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -4702,11 +4702,11 @@ def forward_auth():
     if session.get('authenticated'):
         return '', 200
     # Redirect to console login so user can log in and retry (Caddy passes this response to the client)
-    settings = load_settings()
-    fqdn = (settings.get('fqdn') or '').split(':')[0]
-    if fqdn:
-        login_url = f"https://infratak.{fqdn}/login"
-        return redirect(login_url, code=302)
+    # v10.1.60 (W5, GH #65): the console's PUBLIC host, honouring `infratak_domain` — not a
+    # hardcoded infratak.<fqdn>.
+    host = _console_public_host(load_settings())
+    if host:
+        return redirect(f"https://{host}/login", code=302)
     return '', 401
 
 @app.route('/console')
@@ -4794,6 +4794,35 @@ WIDLE_STATE_KEY = 'WIDLE_sso'
 # (Confirm the exact path on a live forward_auth box before declaring the gap closed.)
 AK_FORWARD_AUTH_SIGNOUT = '/outpost.goauthentik.io/sign_out'
 
+
+def _console_public_host(settings=None):
+    """The console's PUBLIC hostname — the per-box `infratak_domain` override when the
+    operator set one, else `infratak.<fqdn>`. '' when no FQDN is configured.
+
+    v10.1.60 (W5, GH #65): three places built this by hand as `infratak.<fqdn>` — the
+    forward_auth login redirect, the idle-lock sign-out fallback, and the W-IDLE apply
+    step (which also picked the Authentik proxy provider by the substring 'infratak'
+    in its external host). An operator whose console is served at `infra.<domain>`
+    matched none of them, so the Hardened Posture idle lock signed the browser out
+    against a host that does not exist. Caddy and the certificate check already derive
+    the host from the service-domain map (`_get_service_domain`); this is the same
+    answer, in one place."""
+    try:
+        s = settings if settings is not None else (load_settings() or {})
+        host = (_get_service_domain(s, 'infratak') or '').strip().split(':')[0]
+        if host:
+            return host
+        fqdn = (s.get('fqdn') or '').strip().split(':')[0]
+        return f'infratak.{fqdn}' if fqdn else ''
+    except Exception:
+        return ''
+
+
+def _console_signout_url(settings=None):
+    """Absolute forward_auth sign-out URL on the console's public host, or ''."""
+    host = _console_public_host(settings)
+    return f'https://{host}{AK_FORWARD_AUTH_SIGNOUT}' if host else ''
+
 def _widle_sso_logout_active(h):
     """v0.9.56 W-IDLE — True when an idle lock must force a TRUE SSO re-prompt by signing the
     browser out of the forward_auth outpost (not merely clearing the Flask session). Requires:
@@ -4846,15 +4875,16 @@ def _enforce_session_idle_lock():
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
             session.clear()  # local lock always holds, regardless of what follows
             if _widle_sso_logout_active(h):
-                # Sign out of the forward_auth outpost so the next request re-prompts. Use the
-                # ABSOLUTE SSO URL captured at apply time — request.host/host_url are the loopback
-                # upstream Caddy proxies to (127.0.0.1:5001), not the SSO vhost. Lazily fall back to
-                # https://infratak.<fqdn> for sessions armed before this URL was stored.
-                surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
+                # Sign out of the forward_auth outpost so the next request re-prompts. Must be an
+                # ABSOLUTE URL on the SSO vhost — request.host/host_url are the loopback upstream
+                # Caddy proxies to (127.0.0.1:5001). v10.1.60 (W5, GH #65): resolve it LIVE from
+                # the console's public host (honours `infratak_domain`); the value captured at
+                # W-IDLE apply time is only a fallback, because on a box armed before this fix it
+                # holds the hardcoded infratak.<fqdn> that sent an operator with a custom console
+                # hostname to a host that does not exist.
+                surl = _console_signout_url()
                 if not surl:
-                    fqdn = (load_settings() or {}).get('fqdn')
-                    if fqdn:
-                        surl = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
+                    surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
                 if surl:
                     return redirect(surl)
             return redirect(url_for('login'))
@@ -4902,20 +4932,24 @@ def _hardening_control_widle():
         # request.host_url are the loopback origin, not the SSO vhost. Derive it from the
         # infra-TAK proxy provider's external_host (fallback: https://infratak.<fqdn>).
         ak_url, ak_headers, settings = _w1_ak_ctx()
-        signout_url = None
+        # v10.1.60 (W5, GH #65): the console's public host is the source of truth (it honours
+        # `infratak_domain`); the Authentik proxy provider is matched by that exact host, not
+        # by the substring 'infratak' — which an operator serving the console at
+        # infra.<domain> never matched, so they got the hardcoded fallback and a dead host.
+        console_host = _console_public_host(settings)
+        signout_url = _console_signout_url(settings) or None
         try:
-            if ak_url:
+            if ak_url and console_host:
                 for p in _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', []):
                     eh = (p.get('external_host') or '').rstrip('/')
-                    if eh and 'infratak' in eh:
+                    if eh and eh.lower() == ('https://' + console_host).lower():
                         signout_url = eh + AK_FORWARD_AUTH_SIGNOUT
                         break
+                else:
+                    log('W-IDLE: no Authentik proxy provider on https://%s — using it anyway '
+                        '(the proxy chain healer converges the provider to this host)' % console_host)
         except Exception as e:
             log('W-IDLE: proxy lookup failed (%s)' % str(e)[:80])
-        if not signout_url:
-            fqdn = (settings or {}).get('fqdn')
-            if fqdn:
-                signout_url = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
         h.setdefault('applied', {})[WIDLE_STATE_KEY] = {
             'mode': 'sso_signout', 'signout_path': AK_FORWARD_AUTH_SIGNOUT, 'signout_url': signout_url}
         log('W-IDLE: SSO idle-lock re-prompt armed (sign-out → %s)'
@@ -19022,6 +19056,51 @@ def _guarddog_monitored_service_ids(settings):
     return ids
 
 
+# --- Guard Dog maintenance windows (v10.1.60 W4) ---------------------------------
+# A restart the console itself asked for is not an outage. The in-memory health cache
+# (rebuilt every _GD_PAGE_CACHE_TTL seconds) used to read "web container not running"
+# during the 10-15 s a TAK Portal Update / Restart / Update Config / post-upgrade
+# reconfigure keeps the container down, and the console then wore the "Guard Dog has an
+# active alert" banner after every upgrade (field report, test12, 2026-09-06). The shell
+# guards under /opt/tak-guarddog already debounce (three consecutive one-minute misses)
+# and are untouched — this is only the console's own picture of itself.
+#
+# Inside a window a NON-ok probe result is replaced by the service's previous cached
+# verdict: a healthy portal being restarted stays green; a portal that was already red
+# stays red until a probe actually reads ok. It never fails open on a box that was down,
+# and a window never outlives its deadline — a build that hangs still surfaces.
+_gd_maintenance = {}
+_gd_maintenance_lock = threading.Lock()
+
+
+def _gd_maintenance_begin(service_id, seconds=180):
+    """Declare `service_id` under console-driven maintenance for `seconds` from now.
+    Replaces any earlier deadline, so a caller that opened a long window for a build
+    shrinks it to a short grace once the build is over."""
+    try:
+        with _gd_maintenance_lock:
+            _gd_maintenance[service_id] = time.time() + max(0, int(seconds))
+    except Exception:
+        pass
+
+
+def _gd_in_maintenance(service_id):
+    try:
+        with _gd_maintenance_lock:
+            return time.time() < _gd_maintenance.get(service_id, 0)
+    except Exception:
+        return False
+
+
+def _gd_maintenance_verdict(service_id, fresh):
+    """`fresh` is the verdict just computed ('ok'|'fail'|'caution'|None). Inside a
+    maintenance window a non-ok result yields the previous cached verdict instead."""
+    if fresh == 'ok' or fresh is None or not _gd_in_maintenance(service_id):
+        return fresh
+    prev = (_guarddog_page_cache.get('health') or {}).get(service_id)
+    return prev if prev is not None else fresh
+
+
 def _guarddog_run_one_service(sid, monitor_ids):
     """Run checks for one service (multi-monitor or single). Returns (sid, 'ok'|'fail'|'caution'|None)."""
     if monitor_ids:
@@ -19035,11 +19114,11 @@ def _guarddog_run_one_service(sid, monitor_ids):
         if all(vals):
             return (sid, 'ok')
         if not any(vals):
-            return (sid, 'fail')
-        return (sid, 'caution')
+            return (sid, _gd_maintenance_verdict(sid, 'fail'))
+        return (sid, _gd_maintenance_verdict(sid, 'caution'))
     val = _guarddog_health_check(sid)
     if val is not None:
-        return (sid, 'ok' if val else 'fail')
+        return (sid, 'ok' if val else _gd_maintenance_verdict(sid, 'fail'))
     return (sid, None)
 
 
@@ -19299,11 +19378,12 @@ def _compute_guarddog_overall():
                     vals.append(v)
             if not vals:
                 continue
-            result[sid] = 'ok' if all(vals) else ('fail' if not any(vals) else 'caution')
+            result[sid] = _gd_maintenance_verdict(
+                sid, 'ok' if all(vals) else ('fail' if not any(vals) else 'caution'))
         else:
             val = _guarddog_health_check(sid)
             if val is not None:
-                result[sid] = 'ok' if val else 'fail'
+                result[sid] = _gd_maintenance_verdict(sid, 'ok' if val else 'fail')
     return _guarddog_overall_from_result(result)
 
 
@@ -26391,23 +26471,43 @@ def _takportal_ref(all_states=True):
 
 
 def _takportal_restart(timeout=120):
-    """Restart the WHOLE project (`docker compose restart`) — a worker must pick up a new
-    settings.json / cert too. Never `docker restart tak-portal`. Falls back to the web
-    container only when compose cannot run (no compose file). True on success."""
+    """Restart the TAK Portal APP services (web + worker + anything else built from the
+    portal image) so they pick up a new settings.json / cert / SSH key. NEVER the database.
+
+    v10.1.59 restarted the whole project. v10.1.60 (W2) scopes it to
+    _takportal_app_services() with `--no-deps`, because upstream's main now carries a
+    Postgres service and `docker compose restart <service>` follows depends_on by default
+    ("--no-deps: Don't restart dependent services",
+    https://docs.docker.com/reference/cli/docker/compose/restart/). A bare restart of the
+    web service therefore SIGTERMs Postgres underneath it — on nuc (2026-09-06) that killed
+    the web process 3 s into the new stack's first boot with an uncaught
+    `terminating connection due to administrator command`, mid JSON->Postgres import.
+    Nothing we push is read by Postgres, so it never needs the bounce; upstream's own
+    updater deliberately leaves it running for the same reason
+    ([[takportal-main-postgres-three-container]]).
+
+    Never `docker restart tak-portal` by name. Fallback when compose cannot run (no compose
+    file) or rejects the flag (plugin older than v2.20): plain `docker restart` of every APP
+    container by ID — `docker restart` never follows dependencies. True on success."""
+    svcs = []
+    _gd_maintenance_begin('takportal', 120)  # v10.1.60 W4: a restart we asked for is not an outage
     try:
         if os.path.exists(os.path.join(_takportal_dir(), 'docker-compose.yml')):
-            r = _takportal_compose(['restart'], timeout=timeout)
+            svcs = _takportal_app_services()
+            r = _takportal_compose(['restart', '--no-deps'] + svcs, timeout=timeout)
             if r.returncode == 0:
                 return True
-            print(f"[takportal] compose restart rc={r.returncode}: "
+            print(f"[takportal] compose restart --no-deps {' '.join(svcs)} rc={r.returncode}: "
                   f"{((r.stderr or r.stdout) or '').strip()[:200]}", flush=True)
     except Exception as e:
         print(f"[takportal] compose restart error: {str(e)[:200]}", flush=True)
-    cid = (_takportal_web_container(all_states=True) or {}).get('id')
-    if not cid:
+    app_svcs = set(svcs or [TAKPORTAL_WEB_SERVICE])
+    cids = [c['id'] for c in _takportal_project_containers(all_states=True)
+            if c['service'] in app_svcs or (not c['service'] and c['name'] == 'tak-portal')]
+    if not cids:
         return False
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'restart', cid]), capture_output=True, text=True,
+        r = subprocess.run(_sudo_wrap(['docker', 'restart'] + cids), capture_output=True, text=True,
                            timeout=max(30, timeout // 2))
         return r.returncode == 0
     except Exception:
@@ -26416,6 +26516,7 @@ def _takportal_restart(timeout=120):
 
 def _takportal_up(extra=None, timeout=180, **kw):
     """`docker compose up -d [extra...]` for the whole project."""
+    _gd_maintenance_begin('takportal', max(180, int(timeout) + 60))  # v10.1.60 W4
     return _takportal_compose(['up', '-d'] + list(extra or []), timeout=timeout, **kw)
 
 
@@ -31470,6 +31571,7 @@ def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
     if action == 'start':
+        _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=120)
@@ -31478,9 +31580,16 @@ def takportal_control():
     elif action == 'stop':
         subprocess.run(_sudo_wrap(['docker', 'compose', 'down']), cwd=portal_dir, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
+        # v10.1.60 (W2): this was `compose down` + `compose up -d` — a full teardown that
+        # took the portal's Postgres with it every time the operator pressed Restart.
+        # `up -d` alone recreates only the services whose config changed (so the network
+        # and port patches below still converge) and leaves a healthy Postgres running;
+        # the app services are then restarted explicitly, never their database.
+        _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
-        _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=portal_dir)
+        _takportal_up(timeout=120)
+        _takportal_restart()
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
     elif action == 'reconfigure':
@@ -31599,6 +31708,41 @@ def takportal_control():
         _patch_takportal_compose_ports(portal_dir)
         for _ep in _takportal_compose_exposed_ports(portal_dir):
             print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
+        # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
+        # build, not after. Both live under /usr/src/app/data, which is the project's named
+        # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
+        # the CURRENT container is exactly what the NEW containers read on their first boot,
+        # and nothing has to be restarted afterwards. The old order (build, cp, then a
+        # whole-project `compose restart`) bounced Postgres ~3 s into the new stack's first
+        # boot; on nuc (2026-09-06) that landed mid JSON->Postgres import (file 6/13) and only
+        # upstream's per-file checkpointing made boot 2 finish it. A first migration is the
+        # one boot that must not be interrupted. Verified after the build (below), never
+        # assumed. [[takportal-main-postgres-three-container]]
+        settings_synced = False
+        settings_sync_error = ''
+        cloudtak_url = ''
+        settings_json = ''
+        try:
+            settings = load_settings()
+            settings_json = _takportal_merged_settings_json(settings)
+            try:
+                cloudtak_url = (json.loads(settings_json) or {}).get('CLOUDTAK_URL', '')
+            except Exception:
+                pass
+            # `docker cp` works on a stopped container; it needs SOME container to exist.
+            if _takportal_project_containers(all_states=True):
+                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+                if cp_ok:
+                    settings_synced = True
+                    _takportal_setup_ssh()
+                else:
+                    settings_sync_error = cp_err or 'docker cp failed'
+        except Exception as e:
+            settings_sync_error = str(e)[:300]
+        # v10.1.60 (W4): the recreate at the end of this build takes the web container
+        # down for 10-15 s. Open a window that outlives the build's own timeout; it is
+        # shrunk to a short grace as soon as the route knows the outcome (below).
+        _gd_maintenance_begin('takportal', 900 + 180)
         # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
         # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
         # time out here on a slower box, and TimeoutExpired was not caught, so it
@@ -31609,6 +31753,7 @@ def takportal_control():
         except subprocess.TimeoutExpired:
             plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
             print(f'[takportal] update: {plog_msg}', flush=True)
+            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
             return jsonify({'success': False, 'error': plog_msg}), 500
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -31620,38 +31765,50 @@ def takportal_control():
             # the build to see it. Report what the build actually said, and journal it.
             err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
             print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
+            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
             return jsonify({'success': False,
                             'error': f'Build failed: {err}',
                             'hint': 'The previous container may still be running the old version. '
                                     'Check the container logs, fix the cause, and press Update again.'}), 500
-        settings_synced = False
-        settings_sync_error = ''
-        cloudtak_url = ''
+        # v10.1.60 (W1): verify the NEW stack booted on the settings written above — read
+        # them back from the new web container and compare every authoritative key we set.
+        # A miss (no container existed before the build, or a checkout whose data dir is a
+        # bind mount rather than the named volume) is the ONLY case that writes again and
+        # restarts — and that restart is app-services-only (W2): Postgres is never touched.
         try:
-            settings = load_settings()
-            settings_json = _takportal_merged_settings_json(settings)
-            cloudtak_url = ''
-            try:
-                import json as json_mod
-                portal_settings = json_mod.loads(settings_json)
-                cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
-            except Exception:
-                pass
-            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
-            if cp_ok:
-                _takportal_setup_ssh()
-                _takportal_restart()  # v10.1.59: whole project
-                settings_synced = True
-            else:
-                settings_sync_error = cp_err or 'docker cp failed'
+            _want = json.loads(settings_json) if settings_json else {}
+            _have = _takportal_get_existing_settings() or {}
+            _keys = [k for k in TAKPORTAL_AUTHORITATIVE_KEYS if _want.get(k)]
+            # An unreadable file after a successful pre-build write is a read failure, not
+            # evidence the write was lost — do not restart a booting stack over it.
+            _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
+                      if _have else ([] if settings_synced else list(_keys)))
+            if settings_json and _have == {} and settings_synced:
+                print('[takportal] update: could not read settings.json back from the new web '
+                      'container — leaving the stack alone (pre-build write succeeded)', flush=True)
+            if settings_json and (not settings_synced or _stale):
+                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+                if cp_ok:
+                    settings_synced = True
+                    settings_sync_error = ''
+                    _takportal_setup_ssh()
+                    _takportal_restart()  # app services only — never Postgres (W2)
+                    print('[takportal] update: settings were not on the data volume after the build '
+                          f'(stale: {", ".join(_stale) or "no pre-build write"}) — wrote them again '
+                          'and restarted the app services', flush=True)
+                else:
+                    settings_sync_error = cp_err or 'docker cp failed'
         except Exception as e:
-            settings_sync_error = str(e)[:300]
+            settings_sync_error = settings_sync_error or str(e)[:300]
         subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
         _update_boot_stagger_service()  # v10.1.59: the project may have gained services
         time.sleep(3)
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
         running = _takportal_web_running()
+        # W4: the build is over — shrink the window to a boot grace (the app itself takes
+        # a few seconds to answer), then Guard Dog's own verdict rules again.
+        _gd_maintenance_begin('takportal', 90 if running else 15)
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
         return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
@@ -32123,6 +32280,7 @@ def run_takportal_deploy():
         # install. We seed real settings.json into the created container below, then
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
+        _gd_maintenance_begin('takportal', 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
