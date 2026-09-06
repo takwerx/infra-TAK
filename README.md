@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.59-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.59-alpha)**
+**Current release: [v10.1.60-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.60-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,21 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.60-alpha — 2026-09-06 — updating TAK Portal no longer interrupts its own first start
+
+**Headline: the console used to restart TAK Portal a few seconds after building it — which, on the new database-backed TAK Portal, landed in the middle of its first data migration. It no longer restarts what it just built, it never restarts TAK Portal's database, Guard Dog watches every part of TAK Portal, and the console stops raising a Guard Dog alert about a restart it asked for itself.**
+
+**Why it matters.** TAK Portal's development branch now runs as three containers: the web interface, a background worker, and its own database. On its first start it migrates the portal's existing data into that database. The console's **Update** button wrote TAK Portal's settings after the build and then restarted the whole application to pick them up. On the new layout that restart arrived about three seconds into the first start, stopped the database underneath the web process, and interrupted the migration. Nothing was lost — TAK Portal resumes an interrupted migration exactly where it stopped — but the first start of a database is the one moment that must not be interrupted, and the restart was never needed in the first place.
+
+**What changes.**
+- **Update writes settings first and does not restart.** TAK Portal's settings and SSH keys are placed on its data volume *before* the build, so the new containers start with them. After the build the console reads them back and only rewrites and restarts if something is missing.
+- **The database is never bounced.** Every console-driven TAK Portal restart — Update Config, certificate sync, the SSH user change, the post-upgrade reconfigure — now restarts only the application containers. Docker Compose restarts a service's dependencies by default, which is how a routine restart had begun taking the database down with it. The **Restart** button on the TAK Portal card no longer tears the whole application down either.
+- **Guard Dog watches all of TAK Portal.** Its health check used to look only at the web container, so a stopped worker or database left the console showing green while TAK Portal served its "stack down" page. It now checks every service the application declares, recovers whatever is missing, and names it in the alert.
+- **No false Guard Dog alert after an upgrade.** Restarting TAK Portal keeps its web container down for ten to fifteen seconds. If the console's health refresh happened to land in that window, the "Guard Dog has an active alert" banner appeared after every upgrade. The console now knows when it is the one restarting TAK Portal and does not alarm about it; a real outage still raises the banner within half a minute.
+- **Hardened Posture logout goes to the right address (#65).** When the console is served on a custom hostname rather than the default `infratak.` subdomain, the 30-minute idle lock signed the browser out against a hostname that did not exist. The sign-out and login redirects now use the console's real public hostname.
+
+**Upgrading.** Update the console as usual. No TAK Portal action is needed; the next TAK Portal update or restart uses the new behavior automatically.
 
 ### v10.1.59-alpha — 2026-09-04 — TAK Portal keeps working as it grows into multiple containers
 
