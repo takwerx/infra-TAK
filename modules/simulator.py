@@ -415,7 +415,9 @@ def _ensure_lane(ctx, lane_id, channel, plog):
     lanes.sort(key=lambda r: r['id'])
     settings['simulator_lanes'] = lanes
     ctx['save_settings'](settings)
-    if changed and not created:
+    if need_enroll:
+        _audit(f'lane {lane_id} ({username}) enrolled on {channel}')
+    elif changed:
         _audit(f'lane {lane_id} ({username}) channel -> {channel}')
     return rec
 
