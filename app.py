@@ -19022,6 +19022,51 @@ def _guarddog_monitored_service_ids(settings):
     return ids
 
 
+# --- Guard Dog maintenance windows (v10.1.60 W4) ---------------------------------
+# A restart the console itself asked for is not an outage. The in-memory health cache
+# (rebuilt every _GD_PAGE_CACHE_TTL seconds) used to read "web container not running"
+# during the 10-15 s a TAK Portal Update / Restart / Update Config / post-upgrade
+# reconfigure keeps the container down, and the console then wore the "Guard Dog has an
+# active alert" banner after every upgrade (field report, test12, 2026-09-06). The shell
+# guards under /opt/tak-guarddog already debounce (three consecutive one-minute misses)
+# and are untouched — this is only the console's own picture of itself.
+#
+# Inside a window a NON-ok probe result is replaced by the service's previous cached
+# verdict: a healthy portal being restarted stays green; a portal that was already red
+# stays red until a probe actually reads ok. It never fails open on a box that was down,
+# and a window never outlives its deadline — a build that hangs still surfaces.
+_gd_maintenance = {}
+_gd_maintenance_lock = threading.Lock()
+
+
+def _gd_maintenance_begin(service_id, seconds=180):
+    """Declare `service_id` under console-driven maintenance for `seconds` from now.
+    Replaces any earlier deadline, so a caller that opened a long window for a build
+    shrinks it to a short grace once the build is over."""
+    try:
+        with _gd_maintenance_lock:
+            _gd_maintenance[service_id] = time.time() + max(0, int(seconds))
+    except Exception:
+        pass
+
+
+def _gd_in_maintenance(service_id):
+    try:
+        with _gd_maintenance_lock:
+            return time.time() < _gd_maintenance.get(service_id, 0)
+    except Exception:
+        return False
+
+
+def _gd_maintenance_verdict(service_id, fresh):
+    """`fresh` is the verdict just computed ('ok'|'fail'|'caution'|None). Inside a
+    maintenance window a non-ok result yields the previous cached verdict instead."""
+    if fresh == 'ok' or fresh is None or not _gd_in_maintenance(service_id):
+        return fresh
+    prev = (_guarddog_page_cache.get('health') or {}).get(service_id)
+    return prev if prev is not None else fresh
+
+
 def _guarddog_run_one_service(sid, monitor_ids):
     """Run checks for one service (multi-monitor or single). Returns (sid, 'ok'|'fail'|'caution'|None)."""
     if monitor_ids:
@@ -19035,11 +19080,11 @@ def _guarddog_run_one_service(sid, monitor_ids):
         if all(vals):
             return (sid, 'ok')
         if not any(vals):
-            return (sid, 'fail')
-        return (sid, 'caution')
+            return (sid, _gd_maintenance_verdict(sid, 'fail'))
+        return (sid, _gd_maintenance_verdict(sid, 'caution'))
     val = _guarddog_health_check(sid)
     if val is not None:
-        return (sid, 'ok' if val else 'fail')
+        return (sid, 'ok' if val else _gd_maintenance_verdict(sid, 'fail'))
     return (sid, None)
 
 
@@ -19299,11 +19344,12 @@ def _compute_guarddog_overall():
                     vals.append(v)
             if not vals:
                 continue
-            result[sid] = 'ok' if all(vals) else ('fail' if not any(vals) else 'caution')
+            result[sid] = _gd_maintenance_verdict(
+                sid, 'ok' if all(vals) else ('fail' if not any(vals) else 'caution'))
         else:
             val = _guarddog_health_check(sid)
             if val is not None:
-                result[sid] = 'ok' if val else 'fail'
+                result[sid] = _gd_maintenance_verdict(sid, 'ok' if val else 'fail')
     return _guarddog_overall_from_result(result)
 
 
@@ -26410,6 +26456,7 @@ def _takportal_restart(timeout=120):
     file) or rejects the flag (plugin older than v2.20): plain `docker restart` of every APP
     container by ID — `docker restart` never follows dependencies. True on success."""
     svcs = []
+    _gd_maintenance_begin('takportal', 120)  # v10.1.60 W4: a restart we asked for is not an outage
     try:
         if os.path.exists(os.path.join(_takportal_dir(), 'docker-compose.yml')):
             svcs = _takportal_app_services()
@@ -26435,6 +26482,7 @@ def _takportal_restart(timeout=120):
 
 def _takportal_up(extra=None, timeout=180, **kw):
     """`docker compose up -d [extra...]` for the whole project."""
+    _gd_maintenance_begin('takportal', max(180, int(timeout) + 60))  # v10.1.60 W4
     return _takportal_compose(['up', '-d'] + list(extra or []), timeout=timeout, **kw)
 
 
@@ -31489,6 +31537,7 @@ def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
     if action == 'start':
+        _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=120)
@@ -31497,9 +31546,16 @@ def takportal_control():
     elif action == 'stop':
         subprocess.run(_sudo_wrap(['docker', 'compose', 'down']), cwd=portal_dir, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
+        # v10.1.60 (W2): this was `compose down` + `compose up -d` — a full teardown that
+        # took the portal's Postgres with it every time the operator pressed Restart.
+        # `up -d` alone recreates only the services whose config changed (so the network
+        # and port patches below still converge) and leaves a healthy Postgres running;
+        # the app services are then restarted explicitly, never their database.
+        _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
-        _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=portal_dir)
+        _takportal_up(timeout=120)
+        _takportal_restart()
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
     elif action == 'reconfigure':
@@ -31649,6 +31705,10 @@ def takportal_control():
                     settings_sync_error = cp_err or 'docker cp failed'
         except Exception as e:
             settings_sync_error = str(e)[:300]
+        # v10.1.60 (W4): the recreate at the end of this build takes the web container
+        # down for 10-15 s. Open a window that outlives the build's own timeout; it is
+        # shrunk to a short grace as soon as the route knows the outcome (below).
+        _gd_maintenance_begin('takportal', 900 + 180)
         # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
         # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
         # time out here on a slower box, and TimeoutExpired was not caught, so it
@@ -31659,6 +31719,7 @@ def takportal_control():
         except subprocess.TimeoutExpired:
             plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
             print(f'[takportal] update: {plog_msg}', flush=True)
+            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
             return jsonify({'success': False, 'error': plog_msg}), 500
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -31670,6 +31731,7 @@ def takportal_control():
             # the build to see it. Report what the build actually said, and journal it.
             err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
             print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
+            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
             return jsonify({'success': False,
                             'error': f'Build failed: {err}',
                             'hint': 'The previous container may still be running the old version. '
@@ -31710,6 +31772,9 @@ def takportal_control():
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
         running = _takportal_web_running()
+        # W4: the build is over — shrink the window to a boot grace (the app itself takes
+        # a few seconds to answer), then Guard Dog's own verdict rules again.
+        _gd_maintenance_begin('takportal', 90 if running else 15)
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
         return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
@@ -32181,6 +32246,7 @@ def run_takportal_deploy():
         # install. We seed real settings.json into the created container below, then
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
+        _gd_maintenance_begin('takportal', 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
