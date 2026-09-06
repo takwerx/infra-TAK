@@ -4702,11 +4702,11 @@ def forward_auth():
     if session.get('authenticated'):
         return '', 200
     # Redirect to console login so user can log in and retry (Caddy passes this response to the client)
-    settings = load_settings()
-    fqdn = (settings.get('fqdn') or '').split(':')[0]
-    if fqdn:
-        login_url = f"https://infratak.{fqdn}/login"
-        return redirect(login_url, code=302)
+    # v10.1.60 (W5, GH #65): the console's PUBLIC host, honouring `infratak_domain` — not a
+    # hardcoded infratak.<fqdn>.
+    host = _console_public_host(load_settings())
+    if host:
+        return redirect(f"https://{host}/login", code=302)
     return '', 401
 
 @app.route('/console')
@@ -4794,6 +4794,35 @@ WIDLE_STATE_KEY = 'WIDLE_sso'
 # (Confirm the exact path on a live forward_auth box before declaring the gap closed.)
 AK_FORWARD_AUTH_SIGNOUT = '/outpost.goauthentik.io/sign_out'
 
+
+def _console_public_host(settings=None):
+    """The console's PUBLIC hostname — the per-box `infratak_domain` override when the
+    operator set one, else `infratak.<fqdn>`. '' when no FQDN is configured.
+
+    v10.1.60 (W5, GH #65): three places built this by hand as `infratak.<fqdn>` — the
+    forward_auth login redirect, the idle-lock sign-out fallback, and the W-IDLE apply
+    step (which also picked the Authentik proxy provider by the substring 'infratak'
+    in its external host). An operator whose console is served at `infra.<domain>`
+    matched none of them, so the Hardened Posture idle lock signed the browser out
+    against a host that does not exist. Caddy and the certificate check already derive
+    the host from the service-domain map (`_get_service_domain`); this is the same
+    answer, in one place."""
+    try:
+        s = settings if settings is not None else (load_settings() or {})
+        host = (_get_service_domain(s, 'infratak') or '').strip().split(':')[0]
+        if host:
+            return host
+        fqdn = (s.get('fqdn') or '').strip().split(':')[0]
+        return f'infratak.{fqdn}' if fqdn else ''
+    except Exception:
+        return ''
+
+
+def _console_signout_url(settings=None):
+    """Absolute forward_auth sign-out URL on the console's public host, or ''."""
+    host = _console_public_host(settings)
+    return f'https://{host}{AK_FORWARD_AUTH_SIGNOUT}' if host else ''
+
 def _widle_sso_logout_active(h):
     """v0.9.56 W-IDLE — True when an idle lock must force a TRUE SSO re-prompt by signing the
     browser out of the forward_auth outpost (not merely clearing the Flask session). Requires:
@@ -4846,15 +4875,16 @@ def _enforce_session_idle_lock():
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
             session.clear()  # local lock always holds, regardless of what follows
             if _widle_sso_logout_active(h):
-                # Sign out of the forward_auth outpost so the next request re-prompts. Use the
-                # ABSOLUTE SSO URL captured at apply time — request.host/host_url are the loopback
-                # upstream Caddy proxies to (127.0.0.1:5001), not the SSO vhost. Lazily fall back to
-                # https://infratak.<fqdn> for sessions armed before this URL was stored.
-                surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
+                # Sign out of the forward_auth outpost so the next request re-prompts. Must be an
+                # ABSOLUTE URL on the SSO vhost — request.host/host_url are the loopback upstream
+                # Caddy proxies to (127.0.0.1:5001). v10.1.60 (W5, GH #65): resolve it LIVE from
+                # the console's public host (honours `infratak_domain`); the value captured at
+                # W-IDLE apply time is only a fallback, because on a box armed before this fix it
+                # holds the hardcoded infratak.<fqdn> that sent an operator with a custom console
+                # hostname to a host that does not exist.
+                surl = _console_signout_url()
                 if not surl:
-                    fqdn = (load_settings() or {}).get('fqdn')
-                    if fqdn:
-                        surl = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
+                    surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
                 if surl:
                     return redirect(surl)
             return redirect(url_for('login'))
@@ -4902,20 +4932,24 @@ def _hardening_control_widle():
         # request.host_url are the loopback origin, not the SSO vhost. Derive it from the
         # infra-TAK proxy provider's external_host (fallback: https://infratak.<fqdn>).
         ak_url, ak_headers, settings = _w1_ak_ctx()
-        signout_url = None
+        # v10.1.60 (W5, GH #65): the console's public host is the source of truth (it honours
+        # `infratak_domain`); the Authentik proxy provider is matched by that exact host, not
+        # by the substring 'infratak' — which an operator serving the console at
+        # infra.<domain> never matched, so they got the hardcoded fallback and a dead host.
+        console_host = _console_public_host(settings)
+        signout_url = _console_signout_url(settings) or None
         try:
-            if ak_url:
+            if ak_url and console_host:
                 for p in _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', []):
                     eh = (p.get('external_host') or '').rstrip('/')
-                    if eh and 'infratak' in eh:
+                    if eh and eh.lower() == ('https://' + console_host).lower():
                         signout_url = eh + AK_FORWARD_AUTH_SIGNOUT
                         break
+                else:
+                    log('W-IDLE: no Authentik proxy provider on https://%s — using it anyway '
+                        '(the proxy chain healer converges the provider to this host)' % console_host)
         except Exception as e:
             log('W-IDLE: proxy lookup failed (%s)' % str(e)[:80])
-        if not signout_url:
-            fqdn = (settings or {}).get('fqdn')
-            if fqdn:
-                signout_url = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
         h.setdefault('applied', {})[WIDLE_STATE_KEY] = {
             'mode': 'sso_signout', 'signout_path': AK_FORWARD_AUTH_SIGNOUT, 'signout_url': signout_url}
         log('W-IDLE: SSO idle-lock re-prompt armed (sign-out → %s)'
