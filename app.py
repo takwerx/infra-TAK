@@ -26391,23 +26391,42 @@ def _takportal_ref(all_states=True):
 
 
 def _takportal_restart(timeout=120):
-    """Restart the WHOLE project (`docker compose restart`) — a worker must pick up a new
-    settings.json / cert too. Never `docker restart tak-portal`. Falls back to the web
-    container only when compose cannot run (no compose file). True on success."""
+    """Restart the TAK Portal APP services (web + worker + anything else built from the
+    portal image) so they pick up a new settings.json / cert / SSH key. NEVER the database.
+
+    v10.1.59 restarted the whole project. v10.1.60 (W2) scopes it to
+    _takportal_app_services() with `--no-deps`, because upstream's main now carries a
+    Postgres service and `docker compose restart <service>` follows depends_on by default
+    ("--no-deps: Don't restart dependent services",
+    https://docs.docker.com/reference/cli/docker/compose/restart/). A bare restart of the
+    web service therefore SIGTERMs Postgres underneath it — on nuc (2026-09-06) that killed
+    the web process 3 s into the new stack's first boot with an uncaught
+    `terminating connection due to administrator command`, mid JSON->Postgres import.
+    Nothing we push is read by Postgres, so it never needs the bounce; upstream's own
+    updater deliberately leaves it running for the same reason
+    ([[takportal-main-postgres-three-container]]).
+
+    Never `docker restart tak-portal` by name. Fallback when compose cannot run (no compose
+    file) or rejects the flag (plugin older than v2.20): plain `docker restart` of every APP
+    container by ID — `docker restart` never follows dependencies. True on success."""
+    svcs = []
     try:
         if os.path.exists(os.path.join(_takportal_dir(), 'docker-compose.yml')):
-            r = _takportal_compose(['restart'], timeout=timeout)
+            svcs = _takportal_app_services()
+            r = _takportal_compose(['restart', '--no-deps'] + svcs, timeout=timeout)
             if r.returncode == 0:
                 return True
-            print(f"[takportal] compose restart rc={r.returncode}: "
+            print(f"[takportal] compose restart --no-deps {' '.join(svcs)} rc={r.returncode}: "
                   f"{((r.stderr or r.stdout) or '').strip()[:200]}", flush=True)
     except Exception as e:
         print(f"[takportal] compose restart error: {str(e)[:200]}", flush=True)
-    cid = (_takportal_web_container(all_states=True) or {}).get('id')
-    if not cid:
+    app_svcs = set(svcs or [TAKPORTAL_WEB_SERVICE])
+    cids = [c['id'] for c in _takportal_project_containers(all_states=True)
+            if c['service'] in app_svcs or (not c['service'] and c['name'] == 'tak-portal')]
+    if not cids:
         return False
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'restart', cid]), capture_output=True, text=True,
+        r = subprocess.run(_sudo_wrap(['docker', 'restart'] + cids), capture_output=True, text=True,
                            timeout=max(30, timeout // 2))
         return r.returncode == 0
     except Exception:
@@ -31599,6 +31618,37 @@ def takportal_control():
         _patch_takportal_compose_ports(portal_dir)
         for _ep in _takportal_compose_exposed_ports(portal_dir):
             print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
+        # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
+        # build, not after. Both live under /usr/src/app/data, which is the project's named
+        # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
+        # the CURRENT container is exactly what the NEW containers read on their first boot,
+        # and nothing has to be restarted afterwards. The old order (build, cp, then a
+        # whole-project `compose restart`) bounced Postgres ~3 s into the new stack's first
+        # boot; on nuc (2026-09-06) that landed mid JSON->Postgres import (file 6/13) and only
+        # upstream's per-file checkpointing made boot 2 finish it. A first migration is the
+        # one boot that must not be interrupted. Verified after the build (below), never
+        # assumed. [[takportal-main-postgres-three-container]]
+        settings_synced = False
+        settings_sync_error = ''
+        cloudtak_url = ''
+        settings_json = ''
+        try:
+            settings = load_settings()
+            settings_json = _takportal_merged_settings_json(settings)
+            try:
+                cloudtak_url = (json.loads(settings_json) or {}).get('CLOUDTAK_URL', '')
+            except Exception:
+                pass
+            # `docker cp` works on a stopped container; it needs SOME container to exist.
+            if _takportal_project_containers(all_states=True):
+                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+                if cp_ok:
+                    settings_synced = True
+                    _takportal_setup_ssh()
+                else:
+                    settings_sync_error = cp_err or 'docker cp failed'
+        except Exception as e:
+            settings_sync_error = str(e)[:300]
         # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
         # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
         # time out here on a slower box, and TimeoutExpired was not caught, so it
@@ -31624,28 +31674,36 @@ def takportal_control():
                             'error': f'Build failed: {err}',
                             'hint': 'The previous container may still be running the old version. '
                                     'Check the container logs, fix the cause, and press Update again.'}), 500
-        settings_synced = False
-        settings_sync_error = ''
-        cloudtak_url = ''
+        # v10.1.60 (W1): verify the NEW stack booted on the settings written above — read
+        # them back from the new web container and compare every authoritative key we set.
+        # A miss (no container existed before the build, or a checkout whose data dir is a
+        # bind mount rather than the named volume) is the ONLY case that writes again and
+        # restarts — and that restart is app-services-only (W2): Postgres is never touched.
         try:
-            settings = load_settings()
-            settings_json = _takportal_merged_settings_json(settings)
-            cloudtak_url = ''
-            try:
-                import json as json_mod
-                portal_settings = json_mod.loads(settings_json)
-                cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
-            except Exception:
-                pass
-            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
-            if cp_ok:
-                _takportal_setup_ssh()
-                _takportal_restart()  # v10.1.59: whole project
-                settings_synced = True
-            else:
-                settings_sync_error = cp_err or 'docker cp failed'
+            _want = json.loads(settings_json) if settings_json else {}
+            _have = _takportal_get_existing_settings() or {}
+            _keys = [k for k in TAKPORTAL_AUTHORITATIVE_KEYS if _want.get(k)]
+            # An unreadable file after a successful pre-build write is a read failure, not
+            # evidence the write was lost — do not restart a booting stack over it.
+            _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
+                      if _have else ([] if settings_synced else list(_keys)))
+            if settings_json and _have == {} and settings_synced:
+                print('[takportal] update: could not read settings.json back from the new web '
+                      'container — leaving the stack alone (pre-build write succeeded)', flush=True)
+            if settings_json and (not settings_synced or _stale):
+                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+                if cp_ok:
+                    settings_synced = True
+                    settings_sync_error = ''
+                    _takportal_setup_ssh()
+                    _takportal_restart()  # app services only — never Postgres (W2)
+                    print('[takportal] update: settings were not on the data volume after the build '
+                          f'(stale: {", ".join(_stale) or "no pre-build write"}) — wrote them again '
+                          'and restarted the app services', flush=True)
+                else:
+                    settings_sync_error = cp_err or 'docker cp failed'
         except Exception as e:
-            settings_sync_error = str(e)[:300]
+            settings_sync_error = settings_sync_error or str(e)[:300]
         subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
         _update_boot_stagger_service()  # v10.1.59: the project may have gained services
         time.sleep(3)

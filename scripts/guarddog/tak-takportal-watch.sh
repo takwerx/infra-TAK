@@ -37,15 +37,36 @@ if [ -z "$PROJECT" ]; then
   PROJECT="$(basename "$PORTAL_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[_-]*//')"
 fi
 
-# Health: the WEB service's container is running (exact, via compose labels). Fall back
-# to an exact container-name match for a pre-compose checkout — never a substring.
-WEB_STATE="$(docker ps --filter "label=com.docker.compose.project=${PROJECT}" \
-                       --filter "label=com.docker.compose.service=${WEB_SERVICE}" \
-                       --format '{{.State}}' 2>/dev/null | head -1)"
-if [ -z "$WEB_STATE" ]; then
-  WEB_STATE="$(docker ps --filter 'name=^tak-portal$' --format '{{.State}}' 2>/dev/null | head -1)"
+# Health: EVERY service in the project is running — web, worker, Postgres (v10.1.60 W3).
+# Upstream's main runs on Postgres now, and a dead Postgres or worker leaves the web
+# container "running" while the portal serves its stack-down page — the web-only check
+# (v10.1.59) stayed green through exactly that. Services come from the compose file
+# itself (so an upstream rename or a new service is picked up without a script change);
+# each is resolved by its compose labels, one-off `run` containers excluded. Falls back to
+# the web-only check when compose cannot read the project (pre-compose checkout, no .env).
+DOWN=""
+SERVICES="$(cd "$PORTAL_DIR" 2>/dev/null && docker compose config --services 2>/dev/null | tr -d '\r')"
+if [ -n "$SERVICES" ]; then
+  for SVC in $SERVICES; do
+    ST="$(docker ps -a --filter "label=com.docker.compose.project=${PROJECT}" \
+                      --filter "label=com.docker.compose.service=${SVC}" \
+                      --filter "label=com.docker.compose.oneoff=False" \
+                      --format '{{.State}}' 2>/dev/null | head -1)"
+    [ "$ST" = "running" ] || DOWN="${DOWN}${SVC}(${ST:-missing}) "
+  done
+  WEB_STATE="running"; case " $DOWN" in *" ${WEB_SERVICE}("*) WEB_STATE="down";; esac
+else
+  # Pre-compose / unreadable project: the WEB service's container, exact match — never a
+  # substring (`name=tak-portal` also matches tak-portal-worker while the web UI is down).
+  WEB_STATE="$(docker ps --filter "label=com.docker.compose.project=${PROJECT}" \
+                         --filter "label=com.docker.compose.service=${WEB_SERVICE}" \
+                         --format '{{.State}}' 2>/dev/null | head -1)"
+  if [ -z "$WEB_STATE" ]; then
+    WEB_STATE="$(docker ps --filter 'name=^tak-portal$' --format '{{.State}}' 2>/dev/null | head -1)"
+  fi
+  [ "$WEB_STATE" = "running" ] || DOWN="${WEB_SERVICE}(${WEB_STATE:-missing}) "
 fi
-if [ "$WEB_STATE" = "running" ]; then
+if [ -z "$DOWN" ]; then
   echo 0 > "$FAIL_FILE"
   exit 0
 fi
@@ -79,10 +100,10 @@ else
   ACTION="docker start tak-portal (compose unavailable — web container only)"
   if docker start tak-portal >>/var/log/takguard/restarts.log 2>&1; then RESULT="ok"; else RESULT="FAILED"; fi
 fi
-echo "$TS | restart | TAK Portal web service not running — recovered via ${ACTION}: ${RESULT}" >> /var/log/takguard/restarts.log
+echo "$TS | restart | TAK Portal service(s) not running: ${DOWN}— recovered via ${ACTION}: ${RESULT}" >> /var/log/takguard/restarts.log
 
 SUBJ="Guard Dog: TAK Portal restarted on $SERVER_IDENTIFIER"
-BODY="TAK Portal's web service was not running for $FAILS consecutive checks.
+BODY="TAK Portal service(s) not running for $FAILS consecutive checks: ${DOWN}
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
