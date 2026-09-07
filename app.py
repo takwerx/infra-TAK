@@ -34562,6 +34562,9 @@ CLOUDTAK_PLUGINS = [
         'requires': 'CloudTAK 13.45+',
         'author': 'TAKWERX',
         'license': 'AGPL-3.0-or-later',
+        # Listed only on dev-channel boxes (or wherever it is already installed, so it can
+        # still be updated/removed after a channel flip) — same gate as the module's tile.
+        'dev_only': True,
     },
 ]
 
@@ -35718,9 +35721,12 @@ def _detect_cloudtak_plugins():
     ct_dir = os.path.expanduser('~/CloudTAK')
     plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
     result = []
+    _dev_box = (load_settings().get('update_channel') or 'main').strip().lower() == 'dev'
     for p in CLOUDTAK_PLUGINS:
         install_path = os.path.join(plugins_base, p['install_dir'])
         installed = os.path.isdir(install_path) or os.path.islink(install_path)
+        if p.get('dev_only') and not _dev_box and not installed:
+            continue        # v10.1.61: dev-only plugins stay out of a main-channel catalog
         is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
