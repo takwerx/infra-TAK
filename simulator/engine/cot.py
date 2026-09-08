@@ -35,6 +35,13 @@ from urllib.parse import urlsplit
 
 EXERCISE_REMARK = 'EXERCISE EXERCISE EXERCISE'
 ENGINE_VERSION = os.environ.get('SIM_VERSION', 'dev')
+# `how` for a sensor's track of a detected target (PLAN v10.1.62 W2). The CoT spec's
+# machine-derived codes (MITRE, "Cursor-on-Target Message Router User's Guide", the `how`
+# field) are: m-i mensurated (a measured position), m-g GPS, m-m magnetic, m-s simulated,
+# m-f fused (corroborated from several sources), m-c configured, m-p predicted, m-r relayed.
+# There is no dedicated "sensor track" code; a single sensor's own measurement is `m-i` —
+# `m-f` would claim a fusion this engine deliberately does not do. Fallback: `m-g`.
+TRACK_HOW = 'm-i'
 XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 
 # ATAK team colors and roles (validated by scenario.py; used here only for defaults)
@@ -191,6 +198,21 @@ def pli_event(uid, etype, callsign, lat, lon, hae, speed_mps, course_deg, team, 
     details.append(d_remarks(remarks or EXERCISE_REMARK))
     return build_event(uid, etype, lat, lon, hae, how='m-g', stale_s=stale_s, now=now,
                        ce=10.0, le=10.0, details=details)
+
+
+def track_event(uid, etype, callsign, lat, lon, hae, speed_mps, course_deg, sensor_uid, sensor_type,
+                sensor_callsign, stale_s, ce=50.0, now=None):
+    """A sensor's track of a target it detected (PLAN v10.1.62 W2): an unknown-domain atom
+    (`a-u-S` / `a-u-A` / `a-u-G` unless the scenario says otherwise) named by the sensor,
+    linked to the SENSOR as its parent so a client can show who saw it, with the reported
+    position error as `ce`. Deliberately nothing of the target's own identity — no link to
+    its uid, no name, no MMSI: the point of the drill is that the sensor does not know
+    who it is looking at."""
+    details = [d_contact(callsign), d_track(speed_mps, course_deg),
+               d_link(sensor_uid, sensor_type, 'p-p'),
+               d_remarks(f'Detected by {sensor_callsign} — {EXERCISE_REMARK}')]
+    return build_event(uid, etype, lat, lon, hae, how=TRACK_HOW, stale_s=stale_s, now=now,
+                       ce=ce, le=9999999.0, details=details)
 
 
 def chat_event(sender_uid, sender_type, sender_callsign, text, lat, lon, room='All Chat Rooms',

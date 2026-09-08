@@ -29,11 +29,19 @@ Director commands (companion PLAN, W9) arrive with absolute `{lat, lon}` positio
 engine hands `validate_cmd` a `to_plane` callable and every position is converted to the
 same plane offsets before the ordinary path/event validators run — one validator, one
 coordinate space.
+
+Schema v2 (PLAN v10.1.62 W1): an entity may be `silent` (it moves but never reports
+itself; a sensor reports it as `detected_type` when it enters the footprint), a `sensor`
+may carry a `detect` block (what it detects: kinds, altitude band, position error,
+detection probability, track stale, and which REAL CoT type prefixes in the channel count
+as targets), and a document may record the `center` it was laid out at so a saved layout
+can be reopened where it was made. Every v1 document validates unchanged — every new key
+defaults to v1 behavior.
 """
 import json
 import re
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ── caps (fleet constants; a run parameter may raise the message rate, nothing else) ──
 MAX_DOC_BYTES = 1_000_000
@@ -54,6 +62,11 @@ MAX_GENERATE = 2500
 TEMPOS = (1, 2, 4, 10)
 DEFAULT_MAX_MSGS_PER_SEC = 200    # per lane — fleet constant (§4.3 rate governor)
 MAX_MSGS_PER_SEC_CEILING = 5000   # what a load run may ask for, never persisted
+# v2 detection caps (W2 performance guard: detection is O(sensors × targets) per tick)
+MAX_DETECT_SENSORS = 50           # sensors with a `detect` block in one run
+MAX_DETECTABLE = 500              # silent targets in one run
+MAX_ERROR_M = 5000.0              # Gaussian position error a sensor may report with
+MAX_OBSERVE = 8                   # real-traffic CoT type prefixes one sensor may observe
 
 ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,31}')
 NAME_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,40}')
@@ -70,13 +83,18 @@ ROLES = ('Team Member', 'Team Lead', 'HQ', 'Sniper', 'Medic', 'Forward Observer'
 EMERGENCIES = ('911 Alert', 'Ring The Bell', 'In Contact', 'Geo-fence Breached')
 
 PATH_KINDS = ('waypoints', 'random_walk', 'orbit', 'static', 'heading')
+DETECT_KINDS = ('air', 'sea', 'ground')
+# CoT battle dimension (third field of an `a-…` type) -> detection domain. Subsurface and
+# space fold into the nearest of the three kinds a sensor can be told to detect.
+_DIMENSION_DOMAIN = {'A': 'air', 'P': 'air', 'S': 'sea', 'U': 'sea', 'G': 'ground'}
+_DOMAIN_UNKNOWN_TYPE = {'air': 'a-u-A', 'sea': 'a-u-S', 'ground': 'a-u-G'}
 EVENT_KINDS = ('chat', 'casevac', 'emergency', 'emergency_cancel', 'marker', 'route', 'polygon',
                'circle', 'spawn', 'despawn', 'callsign', 'team', 'remove')
 MAX_SWEEP_DEG_S = 360.0
 
 # ── director commands (W9): ops the live `/cmd` API accepts ──────────────────
 CMD_OPS = ('spawn', 'goto', 'route', 'orbit', 'heading', 'hold', 'alt', 'lostlink', 'rename',
-           'team', 'remove', 'event', 'tempo')
+           'team', 'remove', 'event', 'tempo', 'detect')
 CMD_EVENT_KINDS = ('chat', 'casevac', 'emergency', 'emergency_cancel', 'marker', 'route',
                    'polygon', 'circle', 'remove')
 CMD_PATH_KINDS = ('static', 'orbit', 'heading', 'waypoints', 'random_walk')
@@ -84,8 +102,23 @@ _CMD_KEYS = ('op', 'id', 'callsign', 'type', 'at', 'to', 'points', 'center', 'ra
              'clockwise', 'loop', 'heading_deg', 'hae_m', 'on', 'team', 'role', 'lane', 'interval_s',
              'stale_s', 'sensor', 'video', 'path', 'remarks', 'kind', 'from', 'text', 'room', 'title',
              'urgent', 'priority', 'routine', 'litter', 'ambulatory', 'alert', 'color', 'stroke',
-             'fill', 'fill_alpha', 'tempo')
+             'fill', 'fill_alpha', 'tempo', 'silent', 'detected_type', 'detected_callsign', 'detect')
 UPLOAD_PREFIX = 'upload-'
+
+
+def domain_of(cot_type):
+    """'air' / 'sea' / 'ground' for a CoT type (`a-<affiliation>-<dimension>-…`); anything
+    that is not an atom, or has no dimension, counts as ground."""
+    parts = (cot_type or '').split('-')
+    if len(parts) < 3 or parts[0] != 'a':
+        return 'ground'
+    return _DIMENSION_DOMAIN.get(parts[2].upper(), 'ground')
+
+
+def default_detected_type(cot_type):
+    """What a sensor reports a target of this type as when the scenario does not say:
+    the *unknown* atom of the same domain (a-u-S / a-u-A / a-u-G)."""
+    return _DOMAIN_UNKNOWN_TYPE[domain_of(cot_type)]
 
 
 class ScenarioError(ValueError):
@@ -224,10 +257,56 @@ def _validate_path(v, path, areas, spec):
     return out
 
 
+def _validate_detect(v, d, path, interval_s):
+    """A sensor's `detect` block (v2). `interval_s` is the sensor's own report interval —
+    the default track stale is twice that, never under 10 s (W2 drops a track that has
+    been outside the footprint longer than this)."""
+    o = v.obj(d, path, allowed=('kinds', 'alt_min_m', 'alt_max_m', 'error_m', 'p_detect',
+                                'track_stale_s', 'observe'))
+    if o is None:
+        return None
+    kinds_in = o.get('kinds', list(DETECT_KINDS))
+    kinds = None
+    if not isinstance(kinds_in, (list, tuple)) or not kinds_in or len(kinds_in) > len(DETECT_KINDS):
+        v.err(f'{path}.kinds', f'must be a non-empty list of {", ".join(DETECT_KINDS)}')
+    else:
+        kinds = []
+        for i, k in enumerate(kinds_in):
+            kk = v.choice(k, f'{path}.kinds[{i}]', DETECT_KINDS)
+            if kk is not None and kk not in kinds:
+                kinds.append(kk)
+    observe_in = o.get('observe', [])
+    observe = None
+    if not isinstance(observe_in, (list, tuple)) or len(observe_in) > MAX_OBSERVE:
+        v.err(f'{path}.observe', f'must be a list of at most {MAX_OBSERVE} CoT type prefixes')
+    else:
+        observe = []
+        for i, p in enumerate(observe_in):
+            pp = v.string(p, f'{path}.observe[{i}]', 40, COT_TYPE_RE)
+            if pp is not None and pp not in observe:
+                observe.append(pp)
+    base = float(interval_s) if interval_s is not None else 5.0
+    out = {
+        'kinds': kinds,
+        'alt_min_m': v.number(o.get('alt_min_m', -500), f'{path}.alt_min_m', -500, MAX_HAE_M),
+        'alt_max_m': v.number(o.get('alt_max_m', MAX_HAE_M), f'{path}.alt_max_m', -500, MAX_HAE_M),
+        'error_m': v.number(o.get('error_m', 0), f'{path}.error_m', 0, MAX_ERROR_M),
+        'p_detect': v.number(o.get('p_detect', 1), f'{path}.p_detect', 0, 1),
+        'track_stale_s': v.number(o.get('track_stale_s', max(10.0, 2.0 * base)), f'{path}.track_stale_s',
+                                  MIN_STALE_S, MAX_STALE_S),
+        'observe': observe,
+    }
+    if (out['alt_min_m'] is not None and out['alt_max_m'] is not None
+            and out['alt_min_m'] > out['alt_max_m']):
+        v.err(f'{path}.alt_min_m', 'must not exceed alt_max_m')
+    return out
+
+
 def _validate_entity(v, e, path, areas, defaults):
     o = v.obj(e, path, allowed=('id', 'callsign', 'type', 'team', 'role', 'lane', 'path',
                                 'interval_s', 'stale_s', 'hae_m', 'spawn_at_s', 'despawn_at_s',
-                                'sensor', 'video', 'remarks'),
+                                'sensor', 'video', 'remarks',
+                                'silent', 'detected_type', 'detected_callsign'),
               required=('id', 'callsign', 'type', 'path'))
     if o is None:
         return None
@@ -250,12 +329,22 @@ def _validate_entity(v, e, path, areas, defaults):
         'remarks': (None if o.get('remarks') is None
                     else v.string(o.get('remarks'), f'{path}.remarks', MAX_TEXT)),
         'sensor': None, 'video': None,
+        # v2: a silent entity never reports itself — it exists on the wire only as the
+        # track(s) of the sensor(s) that see it, typed `detected_type` (default: the
+        # unknown atom of its domain) and named by the sensor unless `detected_callsign`.
+        'silent': v.boolean(o.get('silent', False), f'{path}.silent'),
+        'detected_type': (v.string(o['detected_type'], f'{path}.detected_type', 40, COT_TYPE_RE)
+                          if o.get('detected_type') is not None
+                          else default_detected_type(o.get('type') if isinstance(o.get('type'), str) else '')),
+        'detected_callsign': (None if o.get('detected_callsign') is None
+                              else v.string(o['detected_callsign'], f'{path}.detected_callsign', 32)),
     }
     # An explicit null means "none" — a normalized document (what the console writes for an
     # upload and what /save writes for a layout) carries `"sensor": null`, and it must
     # validate again on reload.
     if o.get('sensor') is not None:
-        s = v.obj(o['sensor'], f'{path}.sensor', allowed=('fov', 'range_m', 'vfov', 'elevation', 'sweep_deg_s'))
+        s = v.obj(o['sensor'], f'{path}.sensor', allowed=('fov', 'range_m', 'vfov', 'elevation', 'sweep_deg_s',
+                                                          'detect'))
         if s is not None:
             out['sensor'] = {
                 'fov': v.number(s.get('fov', 60), f'{path}.sensor.fov', 1, 360),
@@ -265,6 +354,9 @@ def _validate_entity(v, e, path, areas, defaults):
                 # radar-style sweep: the cone's azimuth advances this many degrees per simulated
                 # second on top of the entity's heading (0 = fixed, looks along the heading)
                 'sweep_deg_s': v.number(s.get('sweep_deg_s', 0), f'{path}.sensor.sweep_deg_s', 0, MAX_SWEEP_DEG_S),
+                # v2: absent/null = the cone is drawn but detects nothing (v1 behavior)
+                'detect': (None if s.get('detect') is None
+                           else _validate_detect(v, s['detect'], f'{path}.sensor.detect', out['interval_s'])),
             }
     if o.get('video') is not None:
         vd = v.obj(o['video'], f'{path}.video', allowed=('stream',), required=('stream',))
@@ -395,7 +487,7 @@ def validate(doc, name=None, live=False):
     v = _V()
     o = v.obj(doc, '$', allowed=('name', 'title', 'story', 'version', 'duration_s', 'loop',
                                  'defaults', 'areas', 'entities', 'events', 'generate', 'warn',
-                                 'default_tempo'),
+                                 'default_tempo', 'center'),
               required=('title', 'duration_s'))
     if o is None:
         raise ScenarioError(v.errors)
@@ -408,7 +500,15 @@ def validate(doc, name=None, live=False):
         'loop': v.boolean(o.get('loop', False), '$.loop'),
         'warn': (None if o.get('warn') is None else v.string(o['warn'], '$.warn', MAX_TEXT)),
         'default_tempo': v.choice(o.get('default_tempo', 1), '$.default_tempo', TEMPOS),
+        # v2: where the layout was made (written by /save) so it can be reopened there
+        # (W3 `recenter: false`); a preset has none — it runs wherever the operator centers it.
+        'center': None,
     }
+    if o.get('center') is not None:
+        c = v.obj(o['center'], '$.center', allowed=('lat', 'lon'), required=('lat', 'lon'))
+        if c is not None:
+            out['center'] = {'lat': v.number(c.get('lat'), '$.center.lat', -90, 90),
+                             'lon': v.number(c.get('lon'), '$.center.lon', -180, 180)}
     d = v.obj(o.get('defaults', {}), '$.defaults', allowed=('interval_s', 'stale_s', 'team', 'role', 'lane')) or {}
     defaults = {
         'interval_s': v.number(d.get('interval_s', 5), '$.defaults.interval_s', MIN_INTERVAL_S, MAX_INTERVAL_S),
@@ -451,6 +551,12 @@ def validate(doc, name=None, live=False):
         ids.add(ne['id'])
         entities.append(ne)
     out['entities'] = entities
+    n_detect = sum(1 for e in entities if e['sensor'] and e['sensor'].get('detect'))
+    if n_detect > MAX_DETECT_SENSORS:
+        v.err('$.entities', f'more than {MAX_DETECT_SENSORS} sensors with detection enabled')
+    n_silent = sum(1 for e in entities if e['silent'])
+    if n_silent > MAX_DETECTABLE:
+        v.err('$.entities', f'more than {MAX_DETECTABLE} silent targets')
 
     evs_in = o.get('events', [])
     if not isinstance(evs_in, list):
@@ -634,7 +740,8 @@ def validate_cmd(cmd, to_plane, entity_ids, object_ids, lane_ids, defaults):
         if eid is not None and eid in entity_ids:
             v.err('cmd.id', f'an entity with id {eid!r} already exists')
         e_in = {k: o[k] for k in ('id', 'callsign', 'type', 'team', 'role', 'lane', 'interval_s',
-                                  'stale_s', 'hae_m', 'sensor', 'video', 'remarks') if k in o}
+                                  'stale_s', 'hae_m', 'sensor', 'video', 'remarks',
+                                  'silent', 'detected_type', 'detected_callsign') if k in o}
         e_in['path'] = (_cmd_path(v, o['path'], 'cmd.path', at, to_plane) if o.get('path') is not None
                         else {'kind': 'static', 'at': list(at)})
         if e_in['path'] is None:
@@ -699,6 +806,13 @@ def validate_cmd(cmd, to_plane, entity_ids, object_ids, lane_ids, defaults):
         out['event'] = _validate_event(v, ev, 'cmd', entity_ids, defaults)
     elif op == 'tempo':
         out['tempo'] = v.choice(o.get('tempo'), 'cmd.tempo', TEMPOS)
+    elif op == 'detect':
+        # turn detection on (a detect block) or off (null) on a live sensor; the engine
+        # fills `track_stale_s` from the unit's own interval before validation when the
+        # caller left it out, and rejects the op for a unit without a sensor
+        out['id'] = ent()
+        out['detect'] = (None if o.get('detect') is None
+                         else _validate_detect(v, o['detect'], 'cmd.detect', defaults['interval_s']))
     if v.errors:
         raise ScenarioError(v.errors)
     return out
@@ -732,4 +846,7 @@ def summarize(doc):
         'generate': ({'count': doc['generate']['count'], 'count_min': doc['generate']['count_min'],
                       'count_max': doc['generate']['count_max']} if doc['generate'] else None),
         'video': any(e['video'] for e in doc['entities']),
+        # v2: what the picker says next to the counts ("3 sensors detecting, 5 silent targets")
+        'silent': sum(1 for e in doc['entities'] if e['silent']),
+        'sensors_detecting': sum(1 for e in doc['entities'] if e['sensor'] and e['sensor'].get('detect')),
     }

@@ -30,12 +30,14 @@ from datetime import datetime, timezone
 
 from . import scenario as sc
 from .lane import Lane
-from .sim import Run
+from .sim import Run, _plain
 
 LANE_FILE_RE = re.compile(r'lane-([A-Za-z0-9][A-Za-z0-9_-]{0,15})\.pem')
 LANES_FILE = 'lanes.json'          # {lane_id: channel}, written by the console next to the certs
 
 # The director's empty session (W9 /live): no entities, no timeline — units arrive by /cmd.
+# With `from` (W3, PLAN v10.1.62) the session opens ON a saved scenario instead — see
+# Engine._live_doc_from.
 LIVE_DOC = {
     'name': 'live', 'title': 'Live session',
     'story': 'Directed from the map: units, shapes and events arrive through the command API.',
@@ -153,20 +155,74 @@ class Engine:
     def start_live(self, payload):
         """W9 `/live`: an empty run the director fills through /cmd. Same gate as /run —
         same lane rules, same typed confirmation for a real channel — 409 while any run
-        exists."""
+        exists.
+
+        `from: '<scenario name>'` (W3, PLAN v10.1.62) opens a saved scenario — preset or
+        upload — for editing: its units, areas and t+0 objects are placed at once, later
+        timeline events are left out (a live session has no clock-driven story; the
+        answer says how many). `recenter` (default true) places the layout at the
+        request's `center`; false reopens it at the center it was saved with (a layout
+        without one — every preset — falls back to the request's center, logged)."""
         if not isinstance(payload, dict):
             raise sc.ScenarioError(['live: body must be a JSON object'])
-        unknown = sorted(set(payload) - {'center', 'lanes', 'tempo', 'exercise', 'confirm_exercise'})
+        unknown = sorted(set(payload) - {'center', 'lanes', 'tempo', 'exercise', 'confirm_exercise',
+                                         'from', 'recenter'})
         if unknown:
             raise sc.ScenarioError([f'live.{k}: unknown key' for k in unknown])
+        doc, center, opened = dict(LIVE_DOC), payload.get('center'), None
+        if payload.get('from') is not None:
+            src_name = payload['from']
+            if not isinstance(src_name, str):
+                raise sc.ScenarioError(['live.from: must be the name of a preset or an upload'])
+            recenter = payload.get('recenter', True)
+            if not isinstance(recenter, bool):
+                raise sc.ScenarioError(['live.recenter: must be true or false'])
+            src = self.load_scenario(src_name)          # ScenarioError for a bad/unknown name
+            doc, opened = self._live_doc_from(src)
+            if not recenter:
+                if src['center'] is not None:
+                    center = dict(src['center'])
+                else:
+                    self.log(f'live: {src_name} has no saved center — placed at the request center')
         run_payload = {
-            'scenario': dict(LIVE_DOC), 'center': payload.get('center'),
+            'scenario': doc, 'center': center,
             'lanes': payload['lanes'] if 'lanes' in payload else self.default_lanes(),
             'tempo': payload.get('tempo', 1), 'exercise': payload.get('exercise', False),
             'confirm_exercise': payload.get('confirm_exercise', ''),
             'default_channel': self.cfg['default_channel'], 'loop': False,
         }
-        return self._start(run_payload, live=True)
+        res = self._start(run_payload, live=True)
+        if opened is not None:
+            res.update(opened)
+            self.log(f'live: opened {opened["from"]} for editing — {res["entities"]} unit(s), '
+                     f'{res["events"]} object(s) placed; {opened["dropped_events"]} timeline event(s) left out'
+                     + (f', {opened["delayed_units_placed"]} delayed unit(s) placed now' if opened['delayed_units_placed'] else '')
+                     + (', generate block left out' if opened['generate_dropped'] else ''))
+        return res
+
+    @staticmethod
+    def _live_doc_from(src):
+        """A validated scenario -> the document a live session opens on (W3): every unit
+        placed now (delayed spawns / despawns cleared — a layout editor shows everything),
+        `at_s: 0` persistent objects kept, every other timeline event and any generate
+        block left out. Returns (doc, what-was-left-out) for the answer and the log."""
+        keep = ('marker', 'route', 'polygon', 'circle', 'casevac')
+        events = [ev for ev in src['events'] if ev['at_s'] == 0 and ev['kind'] in keep]
+        entities, delayed = [], 0
+        for e in src['entities']:
+            e = dict(e)
+            if e['spawn_at_s'] > 0 or e['despawn_at_s'] is not None:
+                delayed += 1
+            e['spawn_at_s'], e['despawn_at_s'] = 0.0, None
+            entities.append(e)
+        doc = {
+            'name': 'live', 'title': src['title'], 'story': src['story'], 'warn': src['warn'],
+            'duration_s': sc.MAX_DURATION_S, 'loop': False, 'default_tempo': src['default_tempo'],
+            'defaults': dict(src['defaults']), 'areas': src['areas'], 'center': src['center'],
+            'entities': entities, 'events': events,
+        }
+        return _plain(doc), {'from': src['name'], 'dropped_events': len(src['events']) - len(events),
+                             'delayed_units_placed': delayed, 'generate_dropped': bool(src['generate'])}
 
     def _start(self, payload, live):
         with self._lock:
@@ -180,6 +236,8 @@ class Engine:
                 needed = set(params['lanes'])
                 if doc['defaults']['lane'] not in needed:
                     doc['defaults']['lane'] = sorted(needed)[0]
+                # a session opened on a saved layout (W3) must be connected on every lane it uses
+                needed |= {e['lane'] for e in doc['entities']} | {ev.get('lane') or doc['defaults']['lane'] for ev in doc['events']}
             else:
                 doc = self.load_scenario(params['scenario'])
                 needed = {e['lane'] for e in doc['entities']} | {ev.get('lane') or doc['defaults']['lane'] for ev in doc['events']}

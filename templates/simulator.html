@@ -222,7 +222,7 @@ function renderScenarios(){ const box=document.getElementById('scenList'); if(!s
   box.innerHTML=scenarios.map(s=>{ const bad=!s.valid; return '<div class="scen-card'+(selected===s.name?' sel':'')+(bad?' bad':'')+'" onclick="'+(bad?'':'selectScen(\''+esc(s.name)+'\')')+'">'+
     (s.upload?'<button class="del" title="Delete upload" onclick="event.stopPropagation();deleteScenario(\''+esc(s.name)+'\')">✕</button>':'')+
     '<h4>'+esc(s.title||s.name)+'</h4><p>'+esc(bad?('Invalid: '+(s.errors||[]).slice(0,2).join('; ')):(s.story||''))+'</p>'+
-    (bad?'':'<div class="meta">'+esc(s.entities)+' entities · '+esc(s.events)+' events · '+Math.round(s.duration_s/60)+' min'+(s.loop?' · loop':'')+(s.video?' · video':'')+(s.upload?' · upload':' · preset')+'</div>')+'</div>'; }).join('');
+    (bad?'':'<div class="meta">'+esc(s.entities)+' entities · '+esc(s.events)+' events · '+Math.round(s.duration_s/60)+' min'+(s.loop?' · loop':'')+(s.video?' · video':'')+(s.sensors_detecting?' · '+esc(s.sensors_detecting)+' detecting':'')+(s.silent?' · '+esc(s.silent)+' silent':'')+(s.upload?' · upload':' · preset')+'</div>')+'</div>'; }).join('');
 }
 function selectScen(name){ selected=name; renderScenarios(); const s=scenarios.find(x=>x.name===name)||{}; document.getElementById('tempo').value=String(s.default_tempo||1);
   const lp=document.getElementById('loadParams'); if(s.generate){ lp.style.display=''; document.getElementById('genCount').value=s.generate.count; document.getElementById('genCount').placeholder=s.generate.count_min+'–'+s.generate.count_max; } else lp.style.display='none';

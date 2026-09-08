@@ -188,7 +188,7 @@
                                     :value='sc.name'
                                     :disabled='!sc.valid'
                                 >
-                                    {{ sc.title || sc.name }} ({{ sc.entities }} units, {{ Math.round((sc.duration_s || 0) / 60) }} min{{ sc.valid ? '' : ' — invalid' }})
+                                    {{ sc.title || sc.name }} ({{ sc.entities }} units{{ sc.sensors_detecting ? `, ${sc.sensors_detecting} detecting` : '' }}{{ sc.silent ? `, ${sc.silent} silent` : '' }}, {{ Math.round((sc.duration_s || 0) / 60) }} min{{ sc.valid ? '' : ' — invalid' }})
                                 </option>
                             </select>
                             <button
@@ -197,6 +197,14 @@
                                 @click='doRunPreset'
                             >
                                 Run at map center
+                            </button>
+                            <button
+                                class='btn btn-sm btn-outline-secondary text-nowrap'
+                                :disabled='busy || running || !presetName'
+                                title='Start a live session with this scenario already placed at the map center — move units, add or remove them, then save it as a new layout'
+                                @click='doOpenForEditing'
+                            >
+                                Open for editing
                             </button>
                         </div>
                     </div>
@@ -643,6 +651,12 @@
                         <span class='fw-semibold'>Save layout</span>
                     </div>
                     <div class='card-body py-2 px-2 small'>
+                        <div
+                            v-if='openedFrom && running'
+                            class='text-muted mb-1'
+                        >
+                            Opened from <strong>{{ openedFrom.title }}</strong> (<code>{{ openedFrom.name }}</code>). Saving writes a new layout; the original is kept — delete it on the console page if you no longer want it.
+                        </div>
                         <div class='d-flex gap-1 align-items-center'>
                             <input
                                 v-model='saveTitle'
@@ -709,8 +723,10 @@ const shapeName = ref('');
 const circleRadius = ref(500);
 const saveTitle = ref('');
 const saved = ref<SaveResult | null>(null);
+const openedFrom = ref<{ name: string; title: string } | null>(null);   // the scenario this live session was opened on (W3)
 
 const running = computed(() => !!status.value && (status.value.state === 'running' || status.value.state === 'paused'));
+watch(running, (v) => { if (!v) openedFrom.value = null; });   // a stopped session was opened from nothing
 const entities = computed<SimEntity[]>(() => state.value?.entities ?? []);
 const objects = computed<SimObject[]>(() => state.value?.objects ?? []);
 const simChannel = computed(() => channelName(status.value?.default_channel || 'tak_simulation'));
@@ -918,7 +934,27 @@ async function doStartLive() {
     if (r) {
         confirmNeeded.value = '';
         confirmText.value = '';
+        openedFrom.value = null;
         flash(`Live session started on ${Object.entries(r.lanes).map(([k, v]) => `lane ${k} → ${channelName(v)}`).join(', ')}`);
+        await refresh();
+        await loadChannels();
+    }
+}
+
+async function doOpenForEditing() {
+    const src = scenarios.value.find(s => s.name === presetName.value);
+    if (!src) return;
+    const r = await guarded(() => startLive({
+        center: mapCenter(), tempo: tempo.value, from: src.name, recenter: true,
+        confirm_exercise: confirmNeeded.value ? confirmText.value.trim() : undefined,
+    }));
+    if (r) {
+        confirmNeeded.value = '';
+        confirmText.value = '';
+        openedFrom.value = { name: src.name, title: src.title || src.name };
+        if (!saveTitle.value) saveTitle.value = `${src.title || src.name} (edited)`;
+        flash(`Opened ${src.title || src.name} for editing: ${r.entities} unit(s), ${r.events} object(s) placed`
+            + (r.dropped_events ? `; ${r.dropped_events} timeline event(s) left out` : ''));
         await refresh();
         await loadChannels();
     }
@@ -932,6 +968,7 @@ async function doRunPreset() {
     if (r) {
         confirmNeeded.value = '';
         confirmText.value = '';
+        openedFrom.value = null;
         flash(`Running ${r.scenario}: ${r.entities} units, ${r.events} events`);
         await refresh();
         await loadChannels();

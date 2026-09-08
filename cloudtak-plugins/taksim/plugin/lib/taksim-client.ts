@@ -120,6 +120,9 @@ export interface ScenarioSummary {
     entities?: number;
     events?: number;
     lanes?: string[];
+    silent?: number;               // v2: targets that never report themselves
+    sensors_detecting?: number;    // v2: sensors with a detect block
+    center?: LatLon | null;        // v2: where a saved layout was made
     valid: boolean;
     errors?: string[];
 }
@@ -187,6 +190,8 @@ export interface LiveParams {
     lanes?: Record<string, { channel: string; exercise?: boolean }>;
     exercise?: boolean;
     confirm_exercise?: string;
+    from?: string;                 // open a saved scenario (preset or upload) for editing (v10.1.62 W3)
+    recenter?: boolean;            // default true: place it at `center`; false: where it was saved
 }
 
 export interface RunParams {
@@ -208,6 +213,10 @@ export interface StartResult {
     events: number;
     lanes: Record<string, string>;
     exercise: Record<string, boolean>;
+    from?: string;                 // present when the live session was opened on a saved scenario
+    dropped_events?: number;       // timeline events (after t+0) a live session leaves out
+    delayed_units_placed?: number;
+    generate_dropped?: boolean;
 }
 
 export interface SaveResult {
