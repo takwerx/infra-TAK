@@ -63594,6 +63594,23 @@ def upload_takserver_package():
         fn = secure_filename(raw_name)
         if not fn:
             return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
+        # Normalize the EXTENSION to lower case before anything looks at it.
+        #
+        # Every classifier here, and ~25 `endswith('.deb')` sites downstream in the
+        # deploy/update routes, are case-sensitive. A file that arrives as
+        # TAKSERVER-DOCKER-HARDENED-5.8-RELEASE-75.ZIP therefore matched none of them:
+        # it uploaded, sat in the uploads directory, and was invisible to every path
+        # that goes looking for a bundle — "infra-TAK seems to not find it, because it
+        # is named differently" (GH #66, 2026-09-08). tak.gov hands out mixed-case
+        # names, and an operator renaming a file should not be a prerequisite.
+        #
+        # Doing it once, here, fixes the classifiers below AND every downstream reader,
+        # because what lands on disk now ends in a lower-case extension. The base name
+        # is left alone: it is what the version parser reads, and that regex is already
+        # case-insensitive.
+        _stem, _ext = os.path.splitext(fn)
+        if _ext and _ext != _ext.lower():
+            fn = _stem + _ext.lower()
         fp = os.path.join(UPLOAD_DIR, fn)
         f.save(fp)
         sz = round(os.path.getsize(fp) / (1024*1024), 1)
@@ -63683,6 +63700,11 @@ def upload_fedhub_package():
         fn = secure_filename(raw_name)
         if not fn:
             return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
+        # Same lower-casing as the TAK Server upload: a `.DEB` from tak.gov would
+        # otherwise be rejected outright as "must be a .deb file" (GH #66).
+        _stem, _ext = os.path.splitext(fn)
+        if _ext and _ext != _ext.lower():
+            fn = _stem + _ext.lower()
         if not fn.endswith('.deb'):
             return jsonify({'error': 'Federation Hub upload must be a .deb file'}), 400
         fp = os.path.join(UPLOAD_DIR, fn)
