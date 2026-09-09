@@ -76971,6 +76971,7 @@ def _post_update_auto_deploy():
                             pass
 
                     # 4. Write hardened override (always, idempotent)
+                    _override_written = False
                     try:
                         _override_path = os.path.join(_cloudtak_dir, 'docker-compose.override.yml')
                         _settings = load_settings()
@@ -76985,6 +76986,7 @@ def _post_update_auto_deploy():
                         if _existing.strip() != _new_override.strip():
                             with open(_override_path, 'w') as _of:
                                 _of.write(_new_override)
+                            _override_written = True
                             print("  CloudTAK override updated (postgis/store host ports locked down)")
                     except Exception as _ove:
                         print(f"  WARNING: override write failed: {_ove}")
@@ -76993,6 +76995,7 @@ def _post_update_auto_deploy():
                     # `ports: !reset` in the override is NOT used because Docker
                     # Compose v5.x (shipped with Docker Engine 27+) resolves that
                     # YAML tag to null, dropping ALL port bindings silently.
+                    _base_patched = False
                     try:
                         _base_patched = _patch_cloudtak_compose_ports(_cloudtak_dir)
                         if _base_patched:
@@ -77033,22 +77036,44 @@ def _post_update_auto_deploy():
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
 
-                    # 7. Recreate the stack only if clean. Compromised installs
-                    #    stay STOPPED until operator does Remove + Reinstall.
-                    if not _compromised:
+                    # 7. Recreate the stack only if clean AND something above changed.
+                    #    Compromised installs stay STOPPED until operator does Remove + Reinstall.
+                    #    Until 2026-09-09 this recreated the WHOLE stack (api, postgis, store,
+                    #    media, …) unconditionally on every post-update run — a ~40 s CloudTAK
+                    #    outage plus the media re-heal for every console update on every box,
+                    #    even when the override and the base compose were already hardened
+                    #    (test6: three console restarts in an hour, three recreates, nothing
+                    #    had changed). The startup migration that covers the same ground
+                    #    already gates on "changed, or the 127.0.0.1:5000 binding is absent";
+                    #    this is the same gate.
+                    _needs_recreate = _override_written or _base_patched
+                    if not _compromised and not _needs_recreate:
                         try:
-                            _rec = subprocess.run(
-                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+                            _ins = subprocess.run(
+                                _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                             )
-                            if _rec.returncode == 0:
-                                print("  CloudTAK recreated with hardened port bindings")
-                                # v0.9.48 (Part B+C/D): force-recreate reverted cloudtak-media
-                                # to image default — re-apply self-heal (HLS + ephemeral reaper).
-                                _cloudtak_media_hls_heal(wait=True)
-                            else:
-                                print(f"  WARNING: CloudTAK recreate returned {_rec.returncode}: {(_rec.stdout or '')[:200]}")
-                        except Exception as _re:
-                            print(f"  WARNING: CloudTAK recreate failed: {_re}")
+                            if not (json.loads(_ins.stdout.strip() or '{}')).get('5000/tcp'):
+                                _needs_recreate = True
+                                print("  CloudTAK 127.0.0.1:5000 binding absent — recreating")
+                        except Exception:
+                            _needs_recreate = True      # cannot tell: keep the old behavior
+                    if not _compromised:
+                        if not _needs_recreate:
+                            print("  CloudTAK already hardened — stack left running (no recreate)")
+                        else:
+                            try:
+                                _rec = subprocess.run(
+                                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+                                )
+                                if _rec.returncode == 0:
+                                    print("  CloudTAK recreated with hardened port bindings")
+                                    # v0.9.48 (Part B+C/D): force-recreate reverted cloudtak-media
+                                    # to image default — re-apply self-heal (HLS + ephemeral reaper).
+                                    _cloudtak_media_hls_heal(wait=True)
+                                else:
+                                    print(f"  WARNING: CloudTAK recreate returned {_rec.returncode}: {(_rec.stdout or '')[:200]}")
+                            except Exception as _re:
+                                print(f"  WARNING: CloudTAK recreate failed: {_re}")
                     else:
                         print("  CloudTAK left STOPPED pending operator Remove + Reinstall")
 
