@@ -78,6 +78,7 @@ import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, sh
 import hmac
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
@@ -36033,9 +36034,18 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             try:
                 _req = urllib.request.Request('http://127.0.0.1:5000/api/server', method='GET')
                 with urllib.request.urlopen(_req, timeout=5) as _resp:
-                    if _resp.status == 200:
+                    if _resp.status < 500:
                         _api_up = True
                         break
+            except urllib.error.HTTPError as _he:
+                # /api/server answers 401 "No Auth Present" to an anonymous probe — that IS
+                # the API up and bound. Requiring a 200 here meant this loop could never
+                # succeed: every plugin install/update sat out the full 10 minutes and then
+                # printed the "not confirmed up" warning on a healthy box (test6, 2026-09-09).
+                # Same rule as the deploy-time probe: anything below 500 is alive.
+                if _he.code < 500:
+                    _api_up = True
+                    break
             except Exception:
                 pass
             if _i >= 3:  # give a healthy start ~60s of grace before probing for the loop
