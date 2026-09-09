@@ -36416,6 +36416,23 @@ def _cloudtak_refresh_override(plog=None):
     r = _broker_compose(ct_dir, 'up -d --no-deps api', timeout=240)
     if r.returncode != 0:
         return True, f'override written but the api recreate failed: {(r.stderr or r.stdout or "")[-300:]}'
+    # v10.1.62 T&E finding (nuc, 2026-09-09): recreating the api container from its image
+    # wipes the sprite-regen guard the icon self-heal patches in, and a box carrying one
+    # undecodable icon then crash-loops on `vipspng: libpng read error` at API boot
+    # (dfpc-coe/CloudTAK#1623) — RestartCount 20 within 18 min, nothing watching, because
+    # only the console boot, the CloudTAK update and the plugin-rebuild paths armed the
+    # watch. This is the third recreate path; it arms the same self-gating 8-check /
+    # ~15-min watch (a docker inspect every 2 min on a healthy box).
+    def _simlink_icon_watch():
+        for _i in range(8):
+            time.sleep(90 if _i == 0 else 120)
+            try:
+                _selfheal_cloudtak_corrupt_icons(
+                    plog=lambda m: print(f"[simlink-iconheal] {m}", flush=True))
+            except Exception:
+                pass
+    threading.Thread(target=_simlink_icon_watch, daemon=True, name='cloudtak-simlink-icon-heal').start()
+    _log('  (sprite-regen self-heal armed for the next ~15 min — dfpc-coe/CloudTAK#1623)')
     return True, 'CloudTAK api container recreated with the new override'
 
 
