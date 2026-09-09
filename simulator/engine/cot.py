@@ -184,11 +184,22 @@ def d_archive():
 # ── whole events ─────────────────────────────────────────────────────────────
 
 def pli_event(uid, etype, callsign, lat, lon, hae, speed_mps, course_deg, team, role,
-              stale_s, now=None, sensor=None, video=None, remarks=None, sensor_azimuth=None):
+              stale_s, now=None, sensor=None, video=None, remarks=None, sensor_azimuth=None,
+              eud=True):
     """A unit's position report (what ATAK calls SA / PLI). `sensor_azimuth` overrides the
-    cone's look direction (a sweeping radar); it defaults to the course."""
-    details = [d_contact(callsign), d_group(team, role), d_track(speed_mps, course_deg),
-               d_takv(), d_uid(callsign), d_status(), d_precision()]
+    cone's look direction (a sweeping radar); it defaults to the course.
+
+    `eud=True` is a person with a TAK device: the report carries the team/role tag plus the
+    device details, and clients draw the team-colored member marker. `eud=False` is a
+    ship, aircraft, vehicle, sensor site — anything that is not a TAK user: no team tag,
+    no device details, so clients draw the MIL-STD-2525 symbol of the CoT type instead
+    (CloudTAK `renderedIcon`: a report WITH a group is "its team coloured skittle" and
+    never a symbol; ATAK does the same)."""
+    if eud:
+        details = [d_contact(callsign), d_group(team, role), d_track(speed_mps, course_deg),
+                   d_takv(), d_uid(callsign), d_status(), d_precision()]
+    else:
+        details = [d_contact(callsign), d_track(speed_mps, course_deg), d_precision()]
     if sensor:
         az = course_deg if sensor_azimuth is None else sensor_azimuth
         details.append(d_sensor(az, sensor.get('fov', 60.0), sensor.get('range_m', 1000.0),

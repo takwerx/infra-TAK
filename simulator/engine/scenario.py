@@ -102,7 +102,7 @@ _CMD_KEYS = ('op', 'id', 'callsign', 'type', 'at', 'to', 'points', 'center', 'ra
              'clockwise', 'loop', 'heading_deg', 'hae_m', 'on', 'team', 'role', 'lane', 'interval_s',
              'stale_s', 'sensor', 'video', 'path', 'remarks', 'kind', 'from', 'text', 'room', 'title',
              'urgent', 'priority', 'routine', 'litter', 'ambulatory', 'alert', 'color', 'stroke',
-             'fill', 'fill_alpha', 'tempo', 'silent', 'detected_type', 'detected_callsign', 'detect')
+             'fill', 'fill_alpha', 'tempo', 'silent', 'detected_type', 'detected_callsign', 'detect', 'eud')
 UPLOAD_PREFIX = 'upload-'
 
 
@@ -113,6 +113,16 @@ def domain_of(cot_type):
     if len(parts) < 3 or parts[0] != 'a':
         return 'ground'
     return _DIMENSION_DOMAIN.get(parts[2].upper(), 'ground')
+
+
+def default_eud(cot_type):
+    """Does a unit of this type report like a person carrying a TAK device? Only friendly
+    ground personnel (`a-f-G-U…`) do by default. An EUD's report carries the team/role tag,
+    and every TAK client draws a report WITH that tag as the team-colored member marker
+    and one WITHOUT it as the MIL-STD-2525 symbol of its CoT type (CloudTAK `renderedIcon`:
+    "a Contact renders as its team coloured skittle"). So a ship, an aircraft, a radar or a
+    vehicle must NOT carry it, or it shows as a colored dot instead of a ship."""
+    return (cot_type or '').startswith('a-f-G-U')
 
 
 def default_detected_type(cot_type):
@@ -306,7 +316,7 @@ def _validate_entity(v, e, path, areas, defaults):
     o = v.obj(e, path, allowed=('id', 'callsign', 'type', 'team', 'role', 'lane', 'path',
                                 'interval_s', 'stale_s', 'hae_m', 'spawn_at_s', 'despawn_at_s',
                                 'sensor', 'video', 'remarks',
-                                'silent', 'detected_type', 'detected_callsign'),
+                                'silent', 'detected_type', 'detected_callsign', 'eud'),
               required=('id', 'callsign', 'type', 'path'))
     if o is None:
         return None
@@ -338,6 +348,10 @@ def _validate_entity(v, e, path, areas, defaults):
                           else default_detected_type(o.get('type') if isinstance(o.get('type'), str) else '')),
         'detected_callsign': (None if o.get('detected_callsign') is None
                               else v.string(o['detected_callsign'], f'{path}.detected_callsign', 32)),
+        # v2: an EUD (a person with a TAK device) reports team/role/device and renders as
+        # the team marker; anything else renders as the 2525 symbol of its type
+        'eud': v.boolean(o.get('eud', default_eud(o.get('type') if isinstance(o.get('type'), str) else '')),
+                         f'{path}.eud'),
     }
     # An explicit null means "none" — a normalized document (what the console writes for an
     # upload and what /save writes for a layout) carries `"sensor": null`, and it must
@@ -741,7 +755,7 @@ def validate_cmd(cmd, to_plane, entity_ids, object_ids, lane_ids, defaults):
             v.err('cmd.id', f'an entity with id {eid!r} already exists')
         e_in = {k: o[k] for k in ('id', 'callsign', 'type', 'team', 'role', 'lane', 'interval_s',
                                   'stale_s', 'hae_m', 'sensor', 'video', 'remarks',
-                                  'silent', 'detected_type', 'detected_callsign') if k in o}
+                                  'silent', 'detected_type', 'detected_callsign', 'eud') if k in o}
         e_in['path'] = (_cmd_path(v, o['path'], 'cmd.path', at, to_plane) if o.get('path') is not None
                         else {'kind': 'static', 'at': list(at)})
         if e_in['path'] is None:

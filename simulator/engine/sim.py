@@ -281,6 +281,7 @@ class Run:
                     'interval_s': float(interval), 'stale_s': g['stale_s'], 'hae_m': 0.0,
                     'spawn_at_s': 0.0, 'despawn_at_s': None, 'remarks': None, 'sensor': None, 'video': None,
                     'silent': False, 'detected_type': sc.default_detected_type(g['type']), 'detected_callsign': None,
+                    'eud': sc.default_eud(g['type']),
                 }
                 e = Entity(spec, f'SIM-{self.name}-gen{i}', self.rng, doc['areas'])
                 self.entities.append(e)
@@ -445,7 +446,8 @@ class Run:
         xml = cot.pli_event(e.uid, e.type, self._callsign(e.lane, e.callsign), lat, lon,
                             e.spec['hae_m'], e.speed, e.heading, e.team, e.role, e.spec['stale_s'],
                             sensor=sensor, video=self._video_url(e),
-                            remarks=e.spec.get('remarks'), sensor_azimuth=azimuth)
+                            remarks=e.spec.get('remarks'), sensor_azimuth=azimuth,
+                            eud=e.spec.get('eud', True))
         e.emitted = True
         self._send(e.lane, e.uid, e.type, xml)
 
@@ -959,6 +961,7 @@ class Run:
             'path_kind': e.spec['path']['kind'],
             'sensor': e.spec.get('sensor'), 'video': bool(e.spec.get('video')),
             'silent': e.silent, 'detected_type': e.detected_type, 'detected_callsign': e.detected_callsign,
+            'eud': e.spec.get('eud', True),
             'seen_by': seen.get(e.spec['id'], []),
         }
 
@@ -1025,6 +1028,8 @@ class Run:
                 ent['detected_type'] = e.detected_type
                 if e.detected_callsign:
                     ent['detected_callsign'] = e.detected_callsign
+            if spec.get('eud', True) != sc.default_eud(e.type):
+                ent['eud'] = spec['eud']
             ents.append(ent)
         events = [_plain(dict(p['ev'], at_s=0)) for p in list(self.persistent.values()) if p.get('ev')]
         doc = {
