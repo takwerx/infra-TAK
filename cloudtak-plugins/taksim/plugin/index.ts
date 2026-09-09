@@ -15,6 +15,7 @@ import type { PluginAPI, PluginInstance, MenuItemConfig } from '../../plugin.ts'
 import { IconRadar } from '@tabler/icons-vue';
 import TakSimMain from './components/TakSimMain.vue';
 import { setPluginApi } from './lib/taksim-store.ts';
+import { dockSim } from './lib/float-pane.ts';
 
 const MENU_KEY = 'plugin-taksim';
 const ROUTE_NAME = 'home-menu-taksim';
@@ -53,6 +54,12 @@ export default class TakSimPlugin implements PluginInstance {
         // here would make the following enable() fail with "route not found".
         try {
             this.api.menu.remove(MENU_KEY);
+        } catch {
+            /* ignore */
+        }
+        // Also retract the floating pane if detached (a no-op on the load-time disable()).
+        try {
+            dockSim();
         } catch {
             /* ignore */
         }

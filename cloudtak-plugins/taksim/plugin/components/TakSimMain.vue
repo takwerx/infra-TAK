@@ -1,5 +1,9 @@
 <template>
-    <MenuTemplate name='TAK Simulator'>
+    <component
+        :is='floating ? "div" : MenuTemplate'
+        v-bind='floating ? {} : { name: "TAK Simulator" }'
+        :class='floating ? "overflow-auto h-100" : ""'
+    >
         <div class='px-2 pb-3'>
             <!-- ── errors / notices ─────────────────────────────────────────── -->
             <div
@@ -44,9 +48,23 @@
                 </button>
             </div>
 
+            <!-- ── floating elsewhere: this anchored view collapses so the panel is not driven twice ── -->
+            <div
+                v-if='floatedElsewhere'
+                class='p-3 text-center text-muted small d-flex flex-column align-items-center gap-2'
+            >
+                <span>The simulator panel is floating over the map.</span>
+                <button
+                    class='btn btn-sm btn-outline-primary'
+                    @click='dockSim()'
+                >
+                    Dock back to panel
+                </button>
+            </div>
+
             <!-- ── not installed ────────────────────────────────────────────── -->
             <div
-                v-if='status && !status.installed'
+                v-else-if='status && !status.installed'
                 class='alert alert-secondary small'
             >
                 TAK Simulator is not deployed on this box. Deploy it from the infra-TAK console
@@ -70,6 +88,14 @@
                             class='badge ms-auto'
                             :class='stateBadgeClass'
                         >{{ stateLabel }}</span>
+                        <button
+                            v-if='!floating'
+                            class='btn btn-sm btn-link p-0 text-muted'
+                            title='Pop the panel out as a floating window over the map'
+                            @click='popOutSim()'
+                        >
+                            <IconExternalLink :size='16' />
+                        </button>
                     </div>
                     <div class='card-body py-2 px-2 small'>
                         <div
@@ -287,6 +313,51 @@
                             </div>
                         </div>
                         <div class='d-flex flex-wrap gap-2 align-items-center mb-1'>
+                            <label
+                                class='form-check form-check-inline mb-0'
+                                title='A hidden target never reports itself — it is on the map only as the track of a sensor that sees it'
+                            >
+                                <input
+                                    v-model='form.silent'
+                                    type='checkbox'
+                                    class='form-check-input'
+                                >
+                                <span class='form-check-label'>Hidden target</span>
+                            </label>
+                            <template v-if='form.silent'>
+                                <span>seen as</span>
+                                <select
+                                    v-model='form.detectedType'
+                                    class='form-select form-select-sm w-auto'
+                                >
+                                    <option value=''>
+                                        unknown (by domain)
+                                    </option>
+                                    <option value='a-u-S'>
+                                        unknown surface
+                                    </option>
+                                    <option value='a-u-A'>
+                                        unknown air
+                                    </option>
+                                    <option value='a-u-G'>
+                                        unknown ground
+                                    </option>
+                                </select>
+                            </template>
+                            <label
+                                v-else
+                                class='form-check form-check-inline mb-0'
+                                title='A person with a TAK device reports team and role and draws as the team marker; a ship, aircraft, vehicle or sensor draws as its 2525 symbol'
+                            >
+                                <input
+                                    v-model='form.eud'
+                                    type='checkbox'
+                                    class='form-check-input'
+                                >
+                                <span class='form-check-label'>Team marker (TAK user)</span>
+                            </label>
+                        </div>
+                        <div class='d-flex flex-wrap gap-2 align-items-center mb-1'>
                             <label class='form-check form-check-inline mb-0'>
                                 <input
                                     v-model='form.sensorOn'
@@ -317,6 +388,80 @@
                                     class='form-control form-control-sm'
                                     style='width:70px'
                                 >
+                            </template>
+                        </div>
+                        <div
+                            v-if='form.sensorOn'
+                            class='d-flex flex-wrap gap-2 align-items-center mb-1'
+                        >
+                            <label
+                                class='form-check form-check-inline mb-0'
+                                title='Hidden targets inside the cone become tracks named by this sensor (one track per sensor that sees them)'
+                            >
+                                <input
+                                    v-model='form.detectOn'
+                                    type='checkbox'
+                                    class='form-check-input'
+                                >
+                                <span class='form-check-label'>Detects</span>
+                            </label>
+                            <template v-if='form.detectOn'>
+                                <label
+                                    v-for='k in DETECT_KINDS'
+                                    :key='k'
+                                    class='form-check form-check-inline mb-0'
+                                >
+                                    <input
+                                        v-model='form.detKinds'
+                                        type='checkbox'
+                                        class='form-check-input'
+                                        :value='k'
+                                    >
+                                    <span class='form-check-label'>{{ k }}</span>
+                                </label>
+                                <span title='position error the track is reported with (1 sigma)'>± m</span>
+                                <input
+                                    v-model.number='form.detErr'
+                                    type='number'
+                                    min='0'
+                                    max='5000'
+                                    class='form-control form-control-sm'
+                                    style='width:70px'
+                                >
+                                <span title='chance a look inside the cone acquires the target'>hit %</span>
+                                <input
+                                    v-model.number='form.detPct'
+                                    type='number'
+                                    min='0'
+                                    max='100'
+                                    class='form-control form-control-sm'
+                                    style='width:70px'
+                                >
+                                <span title='altitude band it sees, feet'>alt ft</span>
+                                <input
+                                    v-model.number='form.detAltMinFt'
+                                    type='number'
+                                    class='form-control form-control-sm'
+                                    style='width:80px'
+                                >
+                                <span>–</span>
+                                <input
+                                    v-model.number='form.detAltMaxFt'
+                                    type='number'
+                                    class='form-control form-control-sm'
+                                    style='width:80px'
+                                >
+                                <label
+                                    class='form-check form-check-inline mb-0'
+                                    title='Also report real AIS vessels the channel carries (the lane must be in that channel)'
+                                >
+                                    <input
+                                        v-model='form.detAis'
+                                        type='checkbox'
+                                        class='form-check-input'
+                                    >
+                                    <span class='form-check-label'>real AIS too</span>
+                                </label>
                             </template>
                         </div>
                         <div class='d-flex gap-2 align-items-center mb-2'>
@@ -399,11 +544,22 @@
                                 @click='selectUnit(u)'
                             >
                                 <span
-                                    :class='u.lostlink ? "text-danger" : (u.emitted ? "text-success" : "text-muted")'
-                                    :title='u.lostlink ? "lost link" : (u.emitted ? "reporting" : "not yet reported")'
+                                    :class='u.lostlink ? "text-danger" : (u.silent ? "text-secondary" : (u.emitted ? "text-success" : "text-muted"))'
+                                    :title='u.lostlink ? "lost link" : (u.silent ? "hidden — never reports itself" : (u.emitted ? "reporting" : "not yet reported"))'
                                 >●</span>
                                 <span class='fw-semibold text-truncate'>{{ u.callsign }}</span>
                                 <span class='text-muted text-truncate'>{{ typeLabel(u.type) }}</span>
+                                <span
+                                    v-if='u.silent'
+                                    class='badge'
+                                    :class='u.seen_by.length ? "bg-warning text-dark" : "bg-dark"'
+                                    :title='u.seen_by.length ? "seen by " + seenByNames(u).join(", ") : "hidden — no sensor sees it"'
+                                >{{ u.seen_by.length ? 'seen by ' + u.seen_by.length : 'hidden' }}</span>
+                                <span
+                                    v-else-if='u.sensor && u.sensor.detect'
+                                    class='badge bg-info text-dark'
+                                    title='detection on'
+                                >detecting</span>
                                 <span class='ms-auto text-muted text-nowrap'>{{ mToFt(u.hae_m) }} ft · {{ Math.round(u.heading) }}° · {{ mpsToKt(u.speed_mps) }} kt</span>
                             </div>
                             <div
@@ -447,6 +603,16 @@
                                         @click='cmd({ op: "lostlink", id: u.id, on: !u.lostlink })'
                                     >
                                         {{ u.lostlink ? 'Link restored' : 'Lost link' }}
+                                    </button>
+                                    <button
+                                        v-if='u.sensor'
+                                        class='btn btn-sm'
+                                        :class='u.sensor.detect ? "btn-info" : "btn-outline-info"'
+                                        :disabled='busy'
+                                        :title='u.sensor.detect ? "Detection is on — click to switch it off (its tracks are deleted)" : "Switch detection on: hidden targets inside the cone become tracks"'
+                                        @click='toggleDetect(u)'
+                                    >
+                                        {{ u.sensor.detect ? 'Detecting' : 'Detect' }}
                                     </button>
                                     <button
                                         class='btn btn-sm btn-outline-danger ms-auto'
@@ -555,6 +721,36 @@
                                     </button>
                                 </div>
                             </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ── 3b. Detections (v10.1.62) ───────────────────────────── -->
+                <div
+                    v-if='detections.length'
+                    class='card mb-2'
+                >
+                    <div class='card-header py-2 px-2 d-flex align-items-center gap-2'>
+                        <IconRadar :size='16' />
+                        <span class='fw-semibold'>Detections</span>
+                        <span class='badge bg-secondary ms-auto'>{{ detections.length }}</span>
+                    </div>
+                    <div class='card-body p-0 small'>
+                        <div
+                            v-for='d in detections'
+                            :key='d.uid'
+                            class='d-flex align-items-center gap-2 px-2 py-1 border-bottom'
+                        >
+                            <span class='text-truncate'>{{ entityName(d.sensor) }}</span>
+                            <span class='text-muted'>→</span>
+                            <span class='fw-semibold text-truncate'>{{ d.callsign }}</span>
+                            <span class='text-muted text-truncate'>{{ d.type }}</span>
+                            <span
+                                v-if='d.real'
+                                class='badge bg-warning text-dark'
+                                title='a real track observed in the channel'
+                            >real</span>
+                            <span class='ms-auto text-muted text-nowrap'>{{ Math.round(d.since_s) }}s</span>
                         </div>
                     </div>
                 </div>
@@ -689,21 +885,27 @@
                 </div>
             </template>
         </div>
-    </MenuTemplate>
+    </component>
 </template>
 
 <script setup lang='ts'>
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue';
 import type { Map as MapLibreMap, MapMouseEvent } from 'maplibre-gl';
 import MenuTemplate from '../../../src/components/CloudTAK/util/MenuTemplate.vue';
-import { IconRadar, IconPlus, IconUsers, IconPolygon, IconDeviceFloppy, IconCrosshair } from '@tabler/icons-vue';
-import { getMap } from '../lib/taksim-store.ts';
+import { IconRadar, IconPlus, IconUsers, IconPolygon, IconDeviceFloppy, IconCrosshair, IconExternalLink } from '@tabler/icons-vue';
+import { getMap, taksimState } from '../lib/taksim-store.ts';
+import { popOutSim, dockSim } from '../lib/float-pane.ts';
 import {
     getStatus, getState, getScenarios, getUserChannels, startLive, startRun, sendCmd, saveLayout,
     pause, resume, stop, TakSimError,
 } from '../lib/taksim-client.ts';
-import type { EngineStatus, SimState, SimEntity, SimObject, ScenarioSummary, LatLon, Cmd, Tempo, SaveResult } from '../lib/taksim-client.ts';
-import { UNIT_KINDS, UNIT_GROUPS, TEAMS, EMERGENCIES, TEMPOS, unitKind, ktToMps, mpsToKt, ftToM, mToFt, typeLabel } from '../lib/units.ts';
+import type { EngineStatus, SimState, SimEntity, SimObject, SimDetection, ScenarioSummary, LatLon, Cmd, Tempo, SaveResult, DetectSpec, DetectKind } from '../lib/taksim-client.ts';
+import { UNIT_KINDS, UNIT_GROUPS, TEAMS, EMERGENCIES, TEMPOS, DETECT_KINDS, unitKind, ktToMps, mpsToKt, ftToM, mToFt, typeLabel, defaultEud } from '../lib/units.ts';
+
+// floating: this instance lives inside the floating pane (TakSimFloat) rather than the
+// side menu; the anchored instance collapses while the pane is up (v10.1.62).
+const props = defineProps<{ floating?: boolean }>();
+const floatedElsewhere = computed(() => taksimState.floating && !props.floating);
 
 // ── state ─────────────────────────────────────────────────────────────────────
 const status = ref<EngineStatus | null>(null);
@@ -729,6 +931,15 @@ const running = computed(() => !!status.value && (status.value.state === 'runnin
 watch(running, (v) => { if (!v) openedFrom.value = null; });   // a stopped session was opened from nothing
 const entities = computed<SimEntity[]>(() => state.value?.entities ?? []);
 const objects = computed<SimObject[]>(() => state.value?.objects ?? []);
+const detections = computed<SimDetection[]>(() => state.value?.detections ?? []);
+
+function entityName(id: string): string {
+    return entities.value.find(e => e.id === id)?.callsign ?? id;
+}
+
+function seenByNames(u: SimEntity): string[] {
+    return u.seen_by.map(entityName);
+}
 const simChannel = computed(() => channelName(status.value?.default_channel || 'tak_simulation'));
 const stateLabel = computed(() => status.value ? status.value.state : 'connecting…');
 const stateBadgeClass = computed(() => {
@@ -761,6 +972,10 @@ const channelWarning = computed(() => {
 const form = reactive({
     kind: 'ground', callsign: 'ALPHA 1', team: 'Cyan', altFt: 0, speedKt: 3,
     sensorOn: false, fov: 60, rangeM: 1000, sweep: 0, videoOn: false, stream: '', lat: '', lon: '',
+    // v10.1.62: hidden targets, team-marker choice, detection
+    silent: false, detectedType: '', eud: true,
+    detectOn: false, detKinds: ['air', 'sea', 'ground'] as DetectKind[], detErr: 50, detPct: 100,
+    detAltMinFt: -1600, detAltMaxFt: 98000, detAis: false,
 });
 watch(() => form.kind, (key) => {
     const k = unitKind(key);
@@ -775,7 +990,46 @@ watch(() => form.kind, (key) => {
         form.sweep = k.sensor.sweep_deg_s;
     }
     form.videoOn = !!k.video;
+    form.silent = !!k.silent;
+    form.detectedType = k.detected_type ?? '';
+    form.eud = k.eud ?? defaultEud(k.type);
+    form.detectOn = false;                       // a sensor starts as a cone; Detects is a choice
+    if (k.detect) {
+        form.detKinds = [...k.detect.kinds];
+        form.detErr = k.detect.error_m;
+    } else {
+        form.detKinds = ['air', 'sea', 'ground'];
+        form.detErr = 50;
+    }
+    form.detPct = 100;
+    form.detAltMinFt = -1600;
+    form.detAltMaxFt = 98000;
+    form.detAis = false;
 });
+
+// The detect block the Add-unit form describes (a sensor with Detects on), or null.
+function detectFromForm(): DetectSpec | null {
+    if (!form.sensorOn || !form.detectOn || !form.detKinds.length) return null;
+    const d: DetectSpec = { kinds: [...form.detKinds], error_m: Math.max(0, form.detErr || 0) };
+    const p = Math.min(100, Math.max(0, form.detPct));
+    if (p < 100) d.p_detect = p / 100;
+    if (Number.isFinite(form.detAltMinFt) && form.detAltMinFt > -1600) d.alt_min_m = ftToM(form.detAltMinFt);
+    if (Number.isFinite(form.detAltMaxFt) && form.detAltMaxFt < 98000) d.alt_max_m = ftToM(form.detAltMaxFt);
+    if (form.detAis) d.observe = ['a-n-S'];
+    return d;
+}
+
+// Detect on/off on a live sensor: on = the kind's defaults (or everything), off = null,
+// which also deletes the tracks it holds.
+async function toggleDetect(u: SimEntity) {
+    if (!u.sensor) return;
+    if (u.sensor.detect) {
+        await cmd({ op: 'detect', id: u.id, detect: null });
+        return;
+    }
+    const k = UNIT_KINDS.find(x => x.type === u.type && x.detect);
+    await cmd({ op: 'detect', id: u.id, detect: k?.detect ? { kinds: [...k.detect.kinds], error_m: k.detect.error_m } : { kinds: ['air', 'sea', 'ground'], error_m: 50 } });
+}
 
 function nextCallsign(base: string): string {
     // "ALPHA 1" → "ALPHA 2" when a unit with that callsign already exists.
@@ -1009,8 +1263,18 @@ function spawnCmd(at: LatLon): Cmd {
         op: 'spawn', callsign: form.callsign.trim() || k.callsign, type: k.type, at,
         hae_m: ftToM(form.altFt || 0), team: form.team, interval_s: k.interval_s, stale_s: k.stale_s,
     };
-    if (form.sensorOn) c.sensor = { fov: form.fov, range_m: form.rangeM, sweep_deg_s: form.sweep };
+    if (form.sensorOn) {
+        c.sensor = { fov: form.fov, range_m: form.rangeM, sweep_deg_s: form.sweep };
+        const d = detectFromForm();
+        if (d) c.sensor.detect = d;
+    }
     if (form.videoOn && form.stream.trim()) c.video = { stream: form.stream.trim() };
+    if (form.silent) {
+        c.silent = true;
+        if (form.detectedType) c.detected_type = form.detectedType;
+    } else if (form.eud !== defaultEud(k.type)) {
+        c.eud = form.eud;
+    }
     return c;
 }
 

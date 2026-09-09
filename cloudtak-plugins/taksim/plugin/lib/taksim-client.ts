@@ -23,12 +23,26 @@ export interface LatLon {
     lon: number;
 }
 
+export type DetectKind = 'air' | 'sea' | 'ground';
+
+// What a sensor detects (schema v2, v10.1.62): absent/null = the cone is drawn but sees nothing.
+export interface DetectSpec {
+    kinds: DetectKind[];
+    alt_min_m?: number;
+    alt_max_m?: number;
+    error_m?: number;              // Gaussian position error the track is reported with
+    p_detect?: number;             // 0–1 per look
+    track_stale_s?: number;        // default: 2 × the sensor's interval, min 10 s
+    observe?: string[];            // CoT type prefixes of REAL traffic to treat as targets (W4)
+}
+
 export interface SensorSpec {
     fov: number;
     range_m: number;
     vfov?: number;
     elevation?: number;
     sweep_deg_s?: number;
+    detect?: DetectSpec | null;
 }
 
 export interface LaneStats {
@@ -57,6 +71,8 @@ export interface RunStats {
     events_total: number;
     persistent_objects: number;
     uids_emitted: number;
+    tracks_live?: number;          // v2: sensor tracks currently held
+    tracks_total?: number;         // v2: acquisitions this run
     lanes: LaneStats[];
 }
 
@@ -90,6 +106,23 @@ export interface SimEntity {
     path_kind: string;
     sensor: SensorSpec | null;
     video: boolean;
+    silent: boolean;               // v2: never reports itself — exists on the map only as sensor tracks
+    detected_type: string;         // v2: what a sensor reports it as (a-u-S / a-u-A / a-u-G by default)
+    detected_callsign: string | null;
+    eud: boolean;                  // v2: a person with a TAK device (team marker) vs a platform (2525 symbol)
+    seen_by: string[];             // v2: ids of the sensors currently tracking it
+}
+
+// One sensor's track of one target (v2). `target` is the entity id, or `r<hex>` for a real track.
+export interface SimDetection {
+    sensor: string;
+    target: string;
+    uid: string;
+    callsign: string;
+    type: string;
+    lane: string;
+    since_s: number;
+    real: boolean;
 }
 
 export interface SimObject {
@@ -106,6 +139,7 @@ export interface SimState {
     run: RunStats | null;
     entities: SimEntity[];
     objects: SimObject[];
+    detections?: SimDetection[];   // v2
 }
 
 export interface ScenarioSummary {
@@ -157,6 +191,10 @@ export interface SpawnCmd {
     video?: { stream: string };
     remarks?: string;
     path?: SpawnPath;
+    silent?: boolean;              // v2 hidden target
+    detected_type?: string;
+    detected_callsign?: string;
+    eud?: boolean;
 }
 
 export type EventCmd =
@@ -182,6 +220,7 @@ export type Cmd =
     | { op: 'team'; id: string; team: string; role?: string }
     | { op: 'remove'; id: string }
     | { op: 'tempo'; tempo: Tempo }
+    | { op: 'detect'; id: string; detect: DetectSpec | null }
     | EventCmd;
 
 export interface LiveParams {
