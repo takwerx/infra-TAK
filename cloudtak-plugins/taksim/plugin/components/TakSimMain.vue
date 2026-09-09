@@ -452,15 +452,16 @@
                                     style='width:80px'
                                 >
                                 <label
-                                    class='form-check form-check-inline mb-0'
-                                    title='Also report real AIS vessels the channel carries (the lane must be in that channel)'
+                                    class='form-check form-check-inline mb-0 text-muted'
+                                    title='Report real AIS vessels the channel carries as well — arrives with the next release'
                                 >
                                     <input
                                         v-model='form.detAis'
                                         type='checkbox'
                                         class='form-check-input'
+                                        disabled
                                     >
-                                    <span class='form-check-label'>real AIS too</span>
+                                    <span class='form-check-label'>real AIS too (next release)</span>
                                 </label>
                             </template>
                         </div>

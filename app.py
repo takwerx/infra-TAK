@@ -72207,10 +72207,10 @@ def _startup_harden_cloudtak_ports():
                 _ins = subprocess.run(
                     _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                 )
-                _bindings = json.loads(_ins.stdout.strip() or '{}')
-                if not _bindings.get('5000/tcp'):
+                _b = (json.loads(_ins.stdout.strip() or '{}')).get('5000/tcp') or []
+                if not _b or any((x or {}).get('HostIp') not in ('127.0.0.1', '::1') for x in _b):
                     _needs_recreate = True
-                    print("Startup migration: CloudTAK 127.0.0.1:5000 binding absent — recreating")
+                    print("Startup migration: CloudTAK api is not bound to 127.0.0.1:5000 only — recreating")
             except Exception:
                 pass
         if _needs_recreate:
@@ -76987,6 +76987,10 @@ def _post_update_auto_deploy():
                             with open(_override_path, 'w') as _of:
                                 _of.write(_new_override)
                             _override_written = True
+                            try:
+                                os.chmod(_override_path, 0o600)   # carries TAKSIM_ENGINE_TOKEN when the simulator is on
+                            except OSError:
+                                pass
                             print("  CloudTAK override updated (postgis/store host ports locked down)")
                     except Exception as _ove:
                         print(f"  WARNING: override write failed: {_ove}")
@@ -77052,9 +77056,12 @@ def _post_update_auto_deploy():
                             _ins = subprocess.run(
                                 _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                             )
-                            if not (json.loads(_ins.stdout.strip() or '{}')).get('5000/tcp'):
+                            _b = (json.loads(_ins.stdout.strip() or '{}')).get('5000/tcp') or []
+                            # present is not enough: a HostIp of "" or 0.0.0.0 is published on every
+                            # interface (security review 2026-09-09, finding 1) — recreate that too
+                            if not _b or any((x or {}).get('HostIp') not in ('127.0.0.1', '::1') for x in _b):
                                 _needs_recreate = True
-                                print("  CloudTAK 127.0.0.1:5000 binding absent — recreating")
+                                print("  CloudTAK api is not bound to 127.0.0.1:5000 only — recreating")
                         except Exception:
                             _needs_recreate = True      # cannot tell: keep the old behavior
                     if not _compromised:
