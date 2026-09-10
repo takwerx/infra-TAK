@@ -5,7 +5,10 @@ anyone watching in ATAK, iTAK, WinTAK, WebTAK, CloudTAK or TAK Portal sees a liv
 technology demonstration, or a load test. Nothing changes on the clients, and nothing reaches a
 user who did not opt in.
 
-It ships with infra-TAK v10.1.61 on the **dev** update channel first.
+It needs **CloudTAK on the same box**: the marketplace card stays greyed out, and a deploy is
+refused, until CloudTAK is deployed. That is a dependency, not an update-channel restriction —
+every channel offers it. Once the Simulator is installed its log, controls and removal stay
+reachable even if CloudTAK is later removed.
 
 ## What it is for
 
@@ -39,9 +42,10 @@ channel never sees a simulated beacon.
 
 ## Deploying
 
-Marketplace → **TAK Simulator** → Deploy. Pre-flight checks that TAK Server is installed on this
-box, that Authentik is installed (the lane identities are LDAP users), that ports 8089 and 8446
-answer locally, and that Docker is present. The deploy then:
+Marketplace → **TAK Simulator** → Deploy. Pre-flight checks that CloudTAK is deployed on this box
+(the card reads *Requires CloudTAK — deploy CloudTAK first, then return here* until it is), that
+TAK Server is installed, that Authentik is installed (the lane identities are LDAP users), that
+ports 8089 and 8446 answer locally, and that Docker is present. The deploy then:
 
 1. creates the `tak_simulation` group,
 2. creates the `sim-lane-1` service account and enrolls a certificate for it over TAK's own
@@ -138,11 +142,15 @@ Reference:
   friendly ground unit, `a-f-G-E-V-C` vehicle, `a-f-A-M-H` helicopter, `a-f-A-M-H-Q` rotary
   drone, `a-f-G-E-S` sensor, `a-h-G` hostile, `a-n-G` neutral), `team` (ATAK team color name),
   `role`, `lane`, `path`, `interval_s` (0.5–600), `stale_s` (5–86400), `hae_m`, `spawn_at_s`,
-  `despawn_at_s`, optional `sensor` (`fov`, `range_m`, `vfov`, `elevation`; azimuth follows
-  heading), optional `video` (`stream` name), optional `remarks`.
+  `despawn_at_s`, optional `sensor` (`fov`, `range_m`, `vfov`, `elevation`, `sweep_deg_s`; azimuth
+  follows heading, and a sweep advances it that many degrees per simulated second for a radar),
+  optional `video` (`stream` name), optional `remarks`, plus the detection keys below (`silent`,
+  `detected_type`, `detected_callsign`, `eud`).
 - **Paths** — `waypoints` (`points`, `speed_mps`, `loop`, `pause_s`), `random_walk` (inside a
   named `area`, an inline `polygon`, or a `radius_m` around `start`; `speed_mps`, `turn_deg_s`),
-  `orbit` (`center`, `radius_m`, `speed_mps`, `clockwise`), `static` (`at`).
+  `orbit` (`center`, `radius_m`, `speed_mps`, `clockwise`), `static` (`at`), `heading` (`at`,
+  `heading_deg`, `speed_mps` — a straight course held until something changes it, which is what
+  the panel's **Set course** writes).
 - **Events** — `chat`, `casevac`, `emergency` / `emergency_cancel` (`alert`: `911 Alert`, `Ring The
   Bell`, `In Contact`, `Geo-fence Breached`), `marker`, `route`, `polygon`, `circle`, `spawn`,
   `despawn`, `callsign`, `team`, `remove`. Markers, shapes, routes and CASEVACs persist (they are
@@ -150,9 +158,54 @@ Reference:
 - **`generate`** — for load runs: `count`, `count_min`, `count_max`, `callsign_prefix`, `type`,
   `team`, `role`, `lane`, `radius_m`, `interval_s`, `stale_s`, `speed_mps`. The page exposes
   count, interval and the per-lane rate cap as run parameters.
-- **Caps** — 2500 entities, 500 events, 500 points per path or shape, 1 MB per file, offsets
-  within ±200 km, and a per-lane rate governor of 200 messages per second (raised per run for the
-  load preset only).
+- **Caps** — 2500 entities, 500 events, 500 points per path or shape, 50 sensors with detection
+  enabled, 500 hidden targets, 1 MB per file, offsets within ±200 km, 400 m/s, 30 km altitude, and
+  a per-lane rate governor of 200 messages per second (raised per run for the load preset only).
+- **`center`** — written by **Save layout**, so a saved picture reopens where it was made. Presets
+  carry none; they run wherever you center them.
+
+### Sensors that detect, and targets that hide
+
+A sensor cone on its own is only drawn. Give it a `detect` block and it starts producing tracks:
+any **hidden** entity inside the cone is reported by that sensor, and by every other sensor that
+also sees it, so two radars on one contact give you two tracks.
+
+```json
+{
+  "id": "radar1", "callsign": "COASTAL RADAR", "type": "a-f-G-E-S",
+  "path": { "kind": "static", "at": [0, 0] },
+  "sensor": {
+    "fov": 360, "range_m": 40000, "vfov": 30, "elevation": 0, "sweep_deg_s": 60,
+    "detect": { "kinds": ["sea", "air"], "error_m": 120, "p_detect": 0.8,
+                "alt_min_m": -50, "alt_max_m": 8000 }
+  }
+}
+```
+
+```json
+{
+  "id": "contact1", "callsign": "UNKNOWN VESSEL", "type": "a-u-S-X-M",
+  "silent": true, "detected_callsign": "TRACK 041",
+  "path": { "kind": "waypoints", "speed_mps": 6, "loop": false,
+            "points": [[-30000, 12000], [-5000, 4000], [15000, -8000]] }
+}
+```
+
+- **`detect`** — `kinds` (`air`, `sea`, `ground`), `alt_min_m` / `alt_max_m` (the altitude band it
+  sees), `error_m` (1-sigma position error the track is reported with), `p_detect` (0–1, the chance
+  a look acquires the target), `track_stale_s` (default: twice the sensor's report interval, never
+  under 10 s — a track outside the cone longer than this is dropped), and `observe` (up to 8 CoT
+  type prefixes of **real** traffic on the channel that should also be reported as tracks).
+- **`silent`** — the entity moves but never reports itself. It exists on the wire only as somebody's
+  track. Without a sensor that sees it, it is invisible, which is the point.
+- **`detected_type`** — what a sensor calls it. Defaults to the unknown atom of its domain:
+  `a-u-A` air, `a-u-S` sea, `a-u-G` ground. **`detected_callsign`** names the track; without one the
+  sensor names it.
+- **`eud`** — whether the unit reports like a person carrying a TAK device. It defaults correctly:
+  on for friendly ground personnel (`a-f-G-U…`), off for everything else. Leave it alone. A report
+  that carries the team/role tag draws as the team-colored marker on every TAK client, and one
+  without it draws as the MIL-STD-2525 symbol for its type — so forcing it on a ship or an aircraft
+  turns your frigate into a colored dot.
 
 ## Directing it from the CloudTAK map
 
@@ -160,21 +213,31 @@ With CloudTAK on the same box, the Simulator page offers **Install CloudTAK pane
 the CloudTAK API image, 5–10 minutes; close every CloudTAK tab afterwards, its service worker
 caches the old bundle). CloudTAK then has a **TAK Simulator** tool in its menu:
 
-- **Session** — start a live session at the map center, or run a preset there; tempo, pause,
-  resume, and **Stop (clears everything)**. The panel warns when you are not in the channel the
-  traffic goes to, because then you would see nothing.
+- **Session** — start an empty live session at the map center, **Run at map center** with a preset,
+  or **Open for editing**, which places a preset at the center as a live session you can move,
+  add to, thin out and save again as a new layout. Tempo, pause, resume, and **Stop (clears
+  everything)**. The panel warns when you are not in the channel the traffic goes to, because then
+  you would see nothing.
 - **Add unit** — pick a type (ground, vehicle, hostile, helicopter, fixed wing, UAS, ADS-B
   aircraft, vessel, AIS vessel, radar site, fixed camera), callsign, team, altitude in feet, speed
   in knots, an optional sensor cone (FOV, range, and a sweep for a radar) and video stream, then
-  **Place on map** and click.
+  **Place on map** and click. Two checkboxes matter: **Hidden target** makes a unit that never
+  reports itself (it appears only as the track of a sensor that sees it), and **Team marker (TAK
+  user)** controls team-marker versus 2525 rendering — its default is right, see `eud` above.
+- **Detects** — on a unit with a sensor cone, switch detection on and pick what it sees (air, sea,
+  ground), the position error, the hit chance and the altitude band. Hidden targets crossing the
+  cone become tracks named by that sensor; switching it off deletes those tracks.
 - **Units** — every live unit with altitude, heading and speed. Per unit: Go To (click the map),
   Route (several clicks), Orbit here, Hold, Set course / altitude, Lost link (the unit stops
   reporting and goes stale on every client, it is not deleted), chat, 911 and its cancel, a
   CASEVAC at its position, Remove.
 - **Shapes & markers** — marker, CASEVAC, circle, polygon and route by map clicks (Enter or Esc
   finishes a polygon or route).
-- **Save layout** — writes the current picture as an uploaded scenario, which appears in the
-  preset list here and on the console page.
+- **Save layout** — writes the current picture as an uploaded scenario, which appears in the preset
+  list here and on the console page. It records the map center it was built at, so it reopens in
+  place. The file it writes is ordinary scenario JSON: pull it off the box and hand-tune it if you
+  want it exact. **Building the first version on the map and then editing the JSON is the fastest
+  way to author a scenario, and the document is valid by construction.**
 
 Nothing is sent from the browser. Every action goes to the engine on the box, which sends on
 its enrolled lane exactly as a scripted run does: the same channel isolation, the same

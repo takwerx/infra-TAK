@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.62-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.62-alpha)**
+**Current release: [v10.1.63-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.63-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.63-alpha — 2026-09-10 — Container installs work again, TAK keeps its own Java, and the Simulator reaches everyone
+
+**Headline: a fresh container TAK Server install had stopped working for everyone, on every platform — that is fixed — and TAK Server is now pinned to the Java it actually needs, so an unrelated package install can no longer break client enrollment days later.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.63-alpha
+
+**Why it matters.** Two of these were silent failures: the kind where everything looks healthy and one specific thing is quietly dead. A container install failed at the image build with an apt error that named a Debian mirror, not TAK. And a TAK Server could run perfectly for days after someone installed an unrelated tool, then come back from a routine reboot unable to enroll a single new client — while the map, existing clients, federation and CloudTAK all kept working normally.
+
+**What changes.**
+- **Container TAK Server installs build again.** The base image TAK Server's database is built from reached end of life, and its package sources moved; the build began failing partway through for every new install, on x86 and ARM alike. infra-TAK now repairs the bundle's package sources before building. Affects 5.7 and 5.8 bundles equally — it was never a TAK version problem.
+- **TAK Server is pinned to Java 17.** TAK reaches into internals that Java 21 removed, so on any other Java version new client enrollments fail with an HTTP 500 while everything else looks fine. Installing an unrelated tool that pulls in a newer Java could hand it over silently, and the breakage only appeared at the next restart — potentially days later. TAK now keeps its own Java regardless of what else is installed, the console shows which Java it is running on, and Guard Dog alerts if it is ever wrong.
+- **The TAK Simulator is available to everyone.** It shipped last release but only appeared for consoles on the dev update channel. It is now on the marketplace for everyone, greyed out with an explanation until CloudTAK is deployed, since the director panel lives inside CloudTAK.
+- **TAK Portal shows the right version in Beta Mode**, and the console now says which channel that version came from instead of showing a bare number that looked out of date.
 
 ### v10.1.62-alpha — 2026-09-09 — TAK Simulator: a scripted traffic engine, a CloudTAK director panel, and sensors that detect
 
