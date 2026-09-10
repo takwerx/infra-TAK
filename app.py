@@ -19680,16 +19680,18 @@ def _monitor_health_check(monitor_id):
                 return None
             # The API JVM's own flag — `takserver-api` matches TAK's launcher SHELL
             # (/usr/bin/dash), which would have made this monitor red on every healthy box.
-            _pg = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
-                                 capture_output=True, text=True, timeout=5)
-            _pid = (_pg.stdout or '').split()
+            _pid = _tak_api_pid()
             if not _pid:
                 return None          # TAK not running — the process monitor owns that
-            _exe = _trusted_java_exe(_pid[0])   # argv is attacker-chosen — see the helper
-            if not _exe:
-                return None          # unreadable, or not a root-owned system binary
-            _jr = subprocess.run([_exe, '-version'], capture_output=True, text=True, timeout=20)
-            _jv = (_jr.stderr or '') + (_jr.stdout or '')
+            _exe = _trusted_java_exe(_pid)   # argv is attacker-chosen — see the helper
+            if _exe:
+                _jr = subprocess.run([_exe, '-version'], capture_output=True, text=True, timeout=20)
+                _jv = (_jr.stderr or '') + (_jr.stdout or '')
+            else:
+                # Non-root console cannot read /proc/<tak pid>/exe — take the root watcher's
+                # reading rather than reporting unknown forever on most of the fleet.
+                _kv = _jvm_status_from_guarddog(_pid)
+                _jv = (_kv or {}).get('version', '')
             if not _jv.strip():
                 return None          # unknown is grey, never a false red
             return ('version "17.' in _jv) or ('version "17"' in _jv)
@@ -70495,6 +70497,48 @@ def _trusted_java_exe(pid):
     return exe
 
 
+def _tak_api_pid():
+    """PID of the TAK API JVM, or None. `pgrep` works as any user — only reading
+    /proc/<pid>/exe is privileged, which is what _trusted_java_exe handles."""
+    try:
+        r = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
+                           capture_output=True, text=True, timeout=5)
+        pids = (r.stdout or '').split()
+        return pids[0] if pids else None
+    except Exception:
+        return None
+
+
+def _jvm_status_from_guarddog(api_pid):
+    """The Guard Dog watcher's view of the running JVM, or None.
+
+    The console runs as `takwerx` on every hardened box while TAK's JVMs run as `tak`, so
+    os.path.realpath('/proc/<pid>/exe') raises PermissionError here — measured on test12
+    during the v10.1.63 T&E, where the TAK Server card showed no JVM at all and the Guard Dog
+    dot could never leave grey. Degrading to "unknown" was correct (a false red would be
+    worse) but it made the whole thing invisible on most of the fleet.
+
+    tak-jvm-watch.sh runs as root from systemd and already writes /var/lib/takguard/jvm_status
+    world-readable, so the console reads that instead of re-deriving what it cannot see.
+
+    Trusted only when it describes the JVM running RIGHT NOW: the recorded pid must match the
+    live API pid, and the file must be fresh. A stale file after the timer dies would otherwise
+    keep displaying a JVM that is no longer running, which is the confidently-wrong output this
+    whole work item exists to prevent.
+    """
+    path = '/var/lib/takguard/jvm_status'
+    try:
+        if not os.path.isfile(path) or (time.time() - os.path.getmtime(path)) > 2700:
+            return None                      # missing, or older than 45 min (timer is 15 min)
+        with open(path) as f:
+            kv = dict(l.split('=', 1) for l in f.read().splitlines() if '=' in l)
+    except Exception:
+        return None
+    if not api_pid or kv.get('pid') != str(api_pid):
+        return None                          # describes a JVM that is no longer the live one
+    return kv
+
+
 def _running_tak_jvm_version():
     """Short JVM version for the TAK Server card (e.g. '17.0.11'), or '' if unknown.
 
@@ -70507,17 +70551,20 @@ def _running_tak_jvm_version():
             return ''
         # -Dspring.profiles.active=api is the API JVM's own flag. `takserver-api` matches
         # the launcher shell (/usr/bin/dash) instead — verified on test6 and test12.
-        pg = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
-                            capture_output=True, text=True, timeout=5)
-        pids = (pg.stdout or '').split()
-        if not pids:
+        pid = _tak_api_pid()
+        if not pid:
             return ''
-        exe = _trusted_java_exe(pids[0])     # argv is attacker-chosen — see the helper
-        if not exe:
-            return ''
-        r = subprocess.run([exe, '-version'], capture_output=True, text=True, timeout=20)
-        m = re.search(r'version "([^"]+)"', (r.stderr or '') + (r.stdout or ''))
-        return m.group(1) if m else ''
+        exe = _trusted_java_exe(pid)         # argv is attacker-chosen — see the helper
+        if exe:                              # console is root: read it directly
+            r = subprocess.run([exe, '-version'], capture_output=True, text=True, timeout=20)
+            m = re.search(r'version "([^"]+)"', (r.stderr or '') + (r.stdout or ''))
+            return m.group(1) if m else ''
+        kv = _jvm_status_from_guarddog(pid)  # non-root console: use the watcher's reading
+        if kv:
+            m = re.search(r'version "([^"]+)"', kv.get('version', ''))
+            if m:
+                return m.group(1)
+        return ''
     except Exception:
         return ''
 
