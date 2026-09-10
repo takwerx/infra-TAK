@@ -1849,6 +1849,78 @@ def _tak_install_method():
         pass
     return 'container' if _host_arch() == 'arm64' else 'native'
 
+def _patch_tak_db_dockerfile(build_ctx, log_fn=None):
+    """Make BBN's takserver-db image buildable again on an EOL Debian base. Idempotent.
+
+    GH #69 (dh2-io, 2026-09-10). `postgres:15.1` is Debian bullseye, which is EOL: its security
+    Release file expired, AND its package pool moved off deb.debian.org to archive.debian.org.
+    BBN's Dockerfile.takserver-db runs
+
+        RUN apt-get update && apt install -y postgresql-15-postgis-3 openjdk-17-jdk
+
+    which now exits 100 at Step 3/9 and takes every container TAK deploy with it. The issue was
+    filed as ARM64 and is NOT arch-specific — reproduced identically on x86_64 and aarch64 the
+    day it was reported. Every fresh container install was broken on every platform.
+
+    **Two obvious fixes are wrong, and both were measured to be wrong before this one was
+    written.** (1) `-o Acquire::Check-Valid-Until=false` alone clears the expiry and then every
+    package 404s, because the pool is gone from the live mirror. (2) Repointing every
+    deb.debian.org URL at archive.debian.org then fails on `bullseye-security`: measured
+    2026-09-10, `archive.debian.org/debian-security/dists/bullseye-security/Release` is **404**
+    while `debian/dists/bullseye` and `bullseye-updates` are both 200. The security suite is not
+    on the archive at all, so the line has to be DELETED rather than rewritten — and because
+    BBN chains `apt-get update && apt install`, a single unreachable source is fatal rather than
+    a warning.
+
+    Deliberately conservative:
+      * BBN's package list is carried over from their own RUN line, never hardcoded, so a
+        bundle that installs something else still gets what it asked for;
+      * a Dockerfile whose RUN line we do not recognise is left EXACTLY as shipped and the
+        deploy continues — we do not fail a build over a bundle we cannot parse;
+      * the sed is a no-op on any base that is not deb.debian.org/bullseye, so a future bundle
+        on a newer postgres is untouched;
+      * Acquire::Check-Valid-Until=false is scoped to this one RUN inside a pinned EOL base
+        image. archive.debian.org Release files are frozen and therefore permanently "expired"
+        by design, so the flag is what makes the archive usable at all. It is NOT a host apt
+        setting and must not be generalised into one.
+    """
+    _log = log_fn or (lambda m: print(m, flush=True))
+    df = os.path.join(build_ctx, 'docker', 'Dockerfile.takserver-db')
+    if not os.path.isfile(df):
+        return False
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read Dockerfile.takserver-db: {str(e)[:120]} — building as shipped)")
+        return False
+    if 'archive.debian.org' in src:
+        return False                      # already patched (re-deploy / upgrade re-run)
+    m = re.search(r'(?m)^RUN\s+apt-get\s+update\s*&&\s*apt(?:-get)?\s+install\s+-y\s+(.+)$', src)
+    if not m:
+        _log("  (Dockerfile.takserver-db has an unrecognised install line — building as shipped)")
+        return False
+    pkgs = m.group(1).strip()
+    # Delete the security suite FIRST (it does not exist on the archive), then repoint what
+    # does. Order matters: repointing first would leave an archive.debian.org/debian-security
+    # line that 404s and kills the &&-chain.
+    fixed = (
+        "RUN sed -i -e '/debian-security/d'"
+        " -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' /etc/apt/sources.list"
+        " && apt-get -o Acquire::Check-Valid-Until=false update"
+        f" && apt-get -o Acquire::Check-Valid-Until=false install -y {pkgs}"
+    )
+    try:
+        with open(df, 'w') as f:
+            f.write(src[:m.start()] + fixed + src[m.end():])
+    except Exception as e:
+        _log(f"  (could not patch Dockerfile.takserver-db: {str(e)[:120]} — building as shipped)")
+        return False
+    _log("  Patched Dockerfile.takserver-db for EOL Debian bullseye (GH #69): apt sources → "
+         "archive.debian.org. Without this the db image build fails on every platform.")
+    return True
+
+
 def _tak_is_container():
     """True when TAK Server runs as a container (vs native systemd service).
     The control shim (Phase 3) routes systemctl/exec sites on this."""
@@ -65931,6 +66003,7 @@ def run_takserver_upgrade_container(zip_path):
 
         # 4) Build the new-version images.
         ulog("Step 4/6: Building new TAK Server images (minutes on arm64)...")
+        _patch_tak_db_dockerfile(new_ctx, ulog)         # GH #69 — EOL bullseye, see the helper
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1'):
@@ -67316,6 +67389,7 @@ def _deploy_takserver_container(config):
         # ── Step 3/9: Build images (multi-arch base → native arm64 build) ───
         log_step(""); log_step("━━━ Step 3/9: Building TAK Server images ━━━")
         log_step("  (first build pulls postgres:15.1 + eclipse-temurin:17-jammy — minutes on arm64)")
+        _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1', "Building takserver image..."):
