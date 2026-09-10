@@ -70582,7 +70582,8 @@ def _pin_takserver_jvm(plog=None):
         alt_err = str(e)[:160]
     if alt_err:
         _log(f"\u2139 box-wide java alternative left as-is ({alt_err}). TAK Server is still "
-             f"pinned to JDK 17 by its systemd drop-in, which does not depend on /usr/bin/java.")
+             f"pinned to JDK 17 by its /opt/tak/setenv.sh entry, which its launchers source "
+             f"before invoking java — so this does not depend on /usr/bin/java.")
 
     # 4. NOT held. `apt-mark hold` / `dnf versionlock` on the JDK 17 packages was in the
     #    plan (Tom's item 2) and it is deliberately not done: a hold also freezes JDK 17's
