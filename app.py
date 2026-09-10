@@ -70470,6 +70470,12 @@ def _pin_takserver_jvm(plog=None):
     (the takserver deploy paths), Debian/Ubuntu did nothing at all — no `--set`, no hold, no
     JAVA_HOME — and Ubuntu 22.04 is our documented baseline and Tom's platform.
 
+    **What actually does the pinning: `/opt/tak/setenv.sh`.** TAK's launchers run
+    `. ./setenv.sh` and then invoke a bare `java`, so an `export PATH=<jdk17>/bin:$PATH` in
+    that file decides the JVM. The systemd drop-in cannot: `takserver.service` merely runs
+    /etc/init.d/takserver, which starts separate sysv-generated units, whose init scripts
+    `su tak -c ./takserver-api.sh` — and `su` resets PATH. Verified on test6, 2026-09-10.
+
     Container TAK is immune (the JVM is inside the image) and is skipped: there is no host
     takserver.service to hang a drop-in on.
 
@@ -70495,8 +70501,15 @@ def _pin_takserver_jvm(plog=None):
     changed = []
     fam = _distro_family()
 
-    # 1. systemd drop-in. JAVA_HOME for the scripts that honor it; the PATH prepend is what
-    #    makes a launcher's bare `java` resolve to 17 without patching BBN's own scripts.
+    # 1. systemd drop-in on takserver.service. BELT, NOT BRACES — measured on test6 during
+    #    the v10.1.63 T&E: this does NOT reach the JVMs. `takserver.service` only runs
+    #    /etc/init.d/takserver, which calls `service takserver-api start` etc. — those are
+    #    SEPARATE sysv-generated units that inherit nothing from it, and their init scripts
+    #    then `su tak -c ./takserver-api.sh`, which resets PATH anyway. A drop-in on the
+    #    generated units would be defeated by the same `su`. Step 2 (setenv.sh) is what
+    #    actually pins the JVM. This stays because it is correct for anything that ever runs
+    #    java directly under takserver.service, and it costs nothing — but do not mistake it
+    #    for the fix, and do not delete step 2 believing this covers it.
     dropin = ('[Service]\n'
               f'Environment=JAVA_HOME={home}\n'
               f'Environment=PATH={home}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n')
@@ -70527,14 +70540,31 @@ def _pin_takserver_jvm(plog=None):
                  f"{_TAK_SETENV_JVM_B}\n")
         stripped = re.sub(rf'{re.escape(_TAK_SETENV_JVM_A)}.*?{re.escape(_TAK_SETENV_JVM_B)}\n?',
                           '', setenv_cur, flags=re.DOTALL)
-        new_setenv = block + stripped
+        # APPEND, never prepend. Two reasons, both found on test6 during the v10.1.63 T&E:
+        # prepending pushed BBN's `#!/bin/sh` off line 1, and — worse — anything setenv.sh
+        # sets later would then override our PATH. Upstream happens not to set PATH today,
+        # so prepending worked by luck; appending wins by construction. The file is sourced
+        # (`. ./setenv.sh` from takserver-api.sh), so last writer wins.
+        if stripped and not stripped.endswith('\n'):
+            stripped += '\n'
+        new_setenv = stripped + block
         if new_setenv != setenv_cur:
             _write_priv(_TAK_SETENV, new_setenv)
             changed.append('setenv.sh')
 
-    # 3. The alternative itself, into MANUAL mode — this is the half that actually stops a
-    #    later `apt install openjdk-21` from winning /usr/bin/java on priority.
+    # 3. The BOX-WIDE alternative into manual mode. Defense in depth only — TAK itself is
+    #    already pinned by step 1 regardless of what /usr/bin/java points at, because the
+    #    drop-in gives takserver.service its own JAVA_HOME and prepends JDK 17 to its PATH.
+    #
+    #    This step is BEST EFFORT and is expected to fail on a hardened box: the privilege
+    #    broker denies `update-alternatives` (not on its allow-list), which is most of the
+    #    fleet going forward. Measured on test6 during the v10.1.63 T&E. We do NOT widen the
+    #    broker allow-list for it — `update-alternatives --set java <path>` would let anything
+    #    that could reach the console repoint the system java, which is a far worse primitive
+    #    than the problem it solves. So: try, verify, and report honestly. A warning here must
+    #    never read as "the JVM pin failed", because it did not.
     alt = 'update-alternatives' if fam == 'debian' else 'alternatives'
+    alt_err = ''
     try:
         r = subprocess.run(_sudo_wrap([alt, '--set', 'java', jbin]),
                            capture_output=True, text=True, timeout=30)
@@ -70547,9 +70577,12 @@ def _pin_takserver_jvm(plog=None):
         if r.returncode == 0:
             changed.append('alternative')
         else:
-            _log(f"\u26a0 could not pin the java alternative: {((r.stderr or r.stdout) or '').strip()[:160]}")
+            alt_err = ((r.stderr or r.stdout) or '').strip()[:160]
     except Exception as e:
-        _log(f"\u26a0 could not pin the java alternative: {str(e)[:160]}")
+        alt_err = str(e)[:160]
+    if alt_err:
+        _log(f"\u2139 box-wide java alternative left as-is ({alt_err}). TAK Server is still "
+             f"pinned to JDK 17 by its systemd drop-in, which does not depend on /usr/bin/java.")
 
     # 4. NOT held. `apt-mark hold` / `dnf versionlock` on the JDK 17 packages was in the
     #    plan (Tom's item 2) and it is deliberately not done: a hold also freezes JDK 17's
