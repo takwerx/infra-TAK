@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.60-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.60-alpha)**
+**Current release: [v10.1.62-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.62-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,26 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.62-alpha — 2026-09-09 — TAK Simulator: a scripted traffic engine, a CloudTAK director panel, and sensors that detect
+
+**Headline: a new TAK Simulator module puts moving, scripted units on your map for training, demos and load tests — driven live from a panel inside CloudTAK — and its sensors now *detect*: a target that is not transmitting becomes a track the moment a radar's footprint sees it.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.62-alpha
+
+**Why it matters.** Rehearsing "the sensor sees something that is not on AIS" used to need real assets in the field. Now a trainer can lay out radars, cameras, aircraft, vessels and ground units on the CloudTAK map, steer them, drop hidden targets, watch each sensor pick them up as its own track, and save the whole thing to run again in ATAK, WinTAK, iTAK or CloudTAK.
+
+**What changes.**
+- **TAK Simulator module (console).** Deploy it from the console like any other module. It logs into your TAK Server as its own identity in an isolated `simulation` channel, so fake traffic only reaches people who join that channel; sending on a real channel requires typing the channel's name to confirm, and every unit is then marked EXERCISE. Eight ready-made scenarios ship with it (wildfire, disaster EOC, drone patrol, law-enforcement perimeter, wilderness SAR, a sensor showcase, a demo, a 500-unit load test). Stopping a simulation deletes everything it put on the map.
+- **Director panel in CloudTAK.** Once the module is deployed, the console's CloudTAK plugin area offers a TAK Simulator panel. From the map: start a live session, add a unit by type, click where it goes, steer it (go to, route, orbit, course and altitude, hold, lost link), send chat, 911 and CASEVAC, draw markers, circles, polygons and routes, save the layout as a scenario, or open a saved scenario for editing. The panel can be popped out as a floating window over the map.
+- **Sensors that detect.** A unit can be marked *hidden*: it moves on its path but never reports itself. A sensor with detection on sees hidden targets inside its footprint (range, field of view, altitude band, a per-look hit probability and a position error) and reports each as an unknown-domain contact named by that sensor — "RADAR 1 T1". Two sensors seeing the same target produce two tracks, on purpose; tracks disappear when the target leaves.
+- **Ships, aircraft and sensors draw as their MIL-STD-2525 symbols.** Simulated units that are not people no longer carry the team-member tag, so TAK clients render a merchant ship as a ship and a radar site as a sensor, while simulated personnel keep their team markers.
+- **Installing a CloudTAK plugin no longer waits ten minutes for nothing.** The post-rebuild "is the API up" check accepted only one answer and could never see the healthy API; every plugin install and update sat out a ten-minute timer and then printed a false warning. It now finishes seconds after the API starts.
+- **Updating the console no longer disconnects every CloudTAK user.** The CloudTAK hardening step that runs after a console update recreated the entire CloudTAK stack every time, even when nothing had changed. It now leaves a hardened stack alone, and only recreates when the compose files changed or the API is not bound to loopback.
+- **Linking CloudTAK to the simulator is guarded against the icon crash loop.** Recreating the CloudTAK API container can trigger a known CloudTAK crash on a corrupt icon; the simulator's link step now arms the same self-heal the other paths already use.
+- **An upload named in upper case is found (#66, first half).** A TAK Server bundle uploaded as `….ZIP` or `….DEB` is now recognized; the different layout of the hardened 5.8 bundle is a separate, open item.
+
+**Availability.** The TAK Simulator tile and its CloudTAK panel appear on consoles set to the **dev** update channel in this release. Real AIS traffic as detectable targets, a harbor-watch preset and the MediaMTX editor's live-log fix are planned for the next release.
+
+**Upgrading.** Update the console as usual. Deploy the Simulator from its tile, then install the CloudTAK panel from the Simulator page (a CloudTAK rebuild of five to ten minutes, during which CloudTAK users are signed out once).
 
 ### v10.1.60-alpha — 2026-09-06 — updating TAK Portal no longer interrupts its own first start
 
