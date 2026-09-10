@@ -34566,6 +34566,9 @@ CLOUDTAK_PLUGINS = [
         # Listed only on dev-channel boxes (or wherever it is already installed, so it can
         # still be updated/removed after a channel flip) — same gate as the module's tile.
         'dev_only': True,
+        # v10.1.62: and only once the TAK Simulator module is deployed on this box — the panel
+        # is a remote control for that engine and does nothing without it (operator, 2026-09-10).
+        'requires_module': 'simulator',
     },
 ]
 
@@ -35722,12 +35725,16 @@ def _detect_cloudtak_plugins():
     ct_dir = os.path.expanduser('~/CloudTAK')
     plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
     result = []
-    _dev_box = (load_settings().get('update_channel') or 'main').strip().lower() == 'dev'
+    _settings = load_settings()
+    _dev_box = (_settings.get('update_channel') or 'main').strip().lower() == 'dev'
+    _modules_on = {'simulator': bool(_settings.get('simulator_enabled'))}
     for p in CLOUDTAK_PLUGINS:
         install_path = os.path.join(plugins_base, p['install_dir'])
         installed = os.path.isdir(install_path) or os.path.islink(install_path)
         if p.get('dev_only') and not _dev_box and not installed:
             continue        # v10.1.61: dev-only plugins stay out of a main-channel catalog
+        if p.get('requires_module') and not installed and not _modules_on.get(p['requires_module']):
+            continue        # v10.1.62: a plugin that only drives a module is listed once that module is deployed
         is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
