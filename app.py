@@ -3056,19 +3056,24 @@ def detect_modules():
             'icon_url': '/static/logos/tak-video-restreamer-logo.png',
             'route': '/tak-video-restreamer', 'priority': 13, 'conflicts': ['mediamtx']}
 
-    # TAK Simulator — registry-resident (modules/simulator.py, v10.1.61). Dev-channel gate
-    # (guide §10): the tile exists only on dev-channel boxes or where it is already installed.
+    # TAK Simulator — registry-resident (modules/simulator.py, v10.1.61). v10.1.63 W1: the
+    # dev-channel gate is gone. v10.1.62 shipped the module to the main *git branch*, which is
+    # a different thing from the main *update channel* — the two were conflated when the gate
+    # was written, so every customer on the main channel saw no tile at all. What gates the
+    # tile now is a dependency, not a channel (W2): the Director panel the module drives lives
+    # inside CloudTAK, so the card greys out until CloudTAK is deployed. The deploy route
+    # enforces the same rule server-side (modules/__init__.py) — a greyed card is presentation.
     _sim_desc = mod_registry.MODULES.get('simulator')
     if _sim_desc:
         try:
             _sim_state = _sim_desc['detect'](mod_registry.get_ctx())
         except Exception:
             _sim_state = {}
-        if _sim_state.get('installed') or (settings.get('update_channel') or 'main').strip().lower() == 'dev':
-            modules['simulator'] = {'name': _sim_desc['name'],
-                'installed': bool(_sim_state.get('installed')), 'running': bool(_sim_state.get('running')),
-                'description': _sim_desc['description'], 'icon': _sim_desc['icon'],
-                'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': []}
+        modules['simulator'] = {'name': _sim_desc['name'],
+            'installed': bool(_sim_state.get('installed')), 'running': bool(_sim_state.get('running')),
+            'description': _sim_desc['description'], 'icon': _sim_desc['icon'],
+            'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
+            'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
     # NetBird VPN
     netbird_enabled = settings.get('netbird_enabled', False)
@@ -6739,6 +6744,16 @@ def marketplace_page():
             if all_modules.get(conflict_key, {}).get('installed'):
                 mod['_conflict_with'] = all_modules[conflict_key].get('name', conflict_key)
                 break
+    # v10.1.63 W2: the symmetric edge — an uninstalled module whose REQUIRED module is not
+    # deployed is blocked the same way, with the reason (and the next action) on the card.
+    # This is presentation only; the deploy route refuses with 409 independently, because the
+    # card is reachable by direct URL and the route by curl (modules/__init__.py).
+    for key, mod in modules.items():
+        for req_key in (mod.get('requires_modules') or []):
+            req = all_modules.get(req_key) or {}
+            if not req.get('installed'):
+                mod['_requires_missing'] = req.get('name') or req_key
+                break
     resp = render_template('marketplace.html',
         settings=settings, modules=modules, metrics=get_system_metrics(), version=VERSION)
     from flask import make_response
@@ -7886,6 +7901,7 @@ def takserver_page():
     if tak.get('installed') and tak.get('running') and not deploy_status.get('running', False):
         deploy_status.update({'complete': False, 'error': False})
     tak_version = _get_takserver_version_info().get('version', '') if tak.get('installed') else ''
+    _tak_jvm = _running_tak_jvm_version() if tak.get('installed') else ''
     _settings = load_settings()
     _tak_cfg = _get_tak_deployment_config(_settings)
     _is_two_server = _tak_cfg.get('mode') == 'two_server'
@@ -7901,6 +7917,7 @@ def takserver_page():
         tak_migrate_status.update({'complete': False})
     return render_template('takserver.html',
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
+        tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
         authentik_base_url=_get_authentik_base_url(_settings),
@@ -14231,6 +14248,7 @@ def guarddog_page():
         {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Hourly', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). At 70%+ root disk it prunes cache older than 7 days (keeps recent cache so rebuilds stay fast); at 85%+ it reclaims ALL unused cache to rescue a filling disk. Never touches images, containers, or volumes.'},
         {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
         {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
+        {'name': 'JVM', 'id': 'jvm', 'interval': '15 min', 'desc': 'Reads the JVM the running TAK Server API process is actually on. TAK reaches into a JDK-internal class that Java 21 removed, so on any JVM but 17 every NEW client enrollment fails with HTTP 500 while everything else — 8089, federation, existing clients, the map — stays green. Grey means the JVM could not be read, never a silent pass.'},
     ])
     guarddog_services = [
         {'id': 'takserver', 'name': 'TAK Server', 'monitored': gd.get('installed'), 'monitors': guarddog_monitors_tak},
@@ -19031,7 +19049,7 @@ def _guarddog_service_monitor_ids(settings):
     takserver_ids = ['port8089', 'process', 'network']
     if not is_two_server:
         takserver_ids.extend(['postgresql', 'cotdb'])
-    takserver_ids.extend(['oom', 'disk', 'cert', 'intca'])
+    takserver_ids.extend(['oom', 'disk', 'cert', 'intca', 'jvm'])
     multi = {
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
@@ -19580,6 +19598,29 @@ def _monitor_health_check(monitor_id):
                 return None
             r = subprocess.run(f'openssl x509 -in {cert_path} -checkend 3456000 2>/dev/null', shell=True, capture_output=True, timeout=3)
             return r.returncode == 0
+        if monitor_id == 'jvm':
+            # v10.1.63 W4. Read the RUNNING process's JVM (/proc/<pid>/exe), not `java
+            # -version` — the process may have been started with a different JVM than the
+            # one on today's PATH, and the running one is the only one that matters.
+            # Container TAK carries its JVM in the image and cannot be moved by the host's
+            # alternatives, so there is nothing to check.
+            if _tak_is_container():
+                return None
+            # The API JVM's own flag — `takserver-api` matches TAK's launcher SHELL
+            # (/usr/bin/dash), which would have made this monitor red on every healthy box.
+            _pg = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
+                                 capture_output=True, text=True, timeout=5)
+            _pid = (_pg.stdout or '').split()
+            if not _pid:
+                return None          # TAK not running — the process monitor owns that
+            _exe = _trusted_java_exe(_pid[0])   # argv is attacker-chosen — see the helper
+            if not _exe:
+                return None          # unreadable, or not a root-owned system binary
+            _jr = subprocess.run([_exe, '-version'], capture_output=True, text=True, timeout=20)
+            _jv = (_jr.stderr or '') + (_jr.stdout or '')
+            if not _jv.strip():
+                return None          # unknown is grey, never a false red
+            return ('version "17.' in _jv) or ('version "17"' in _jv)
         if monitor_id == 'intca':
             for name in ('ca.pem', 'ca-do-not-delete.pem', 'intermediate-ca.pem'):
                 p = f'/opt/tak/certs/files/{name}'
@@ -21338,6 +21379,10 @@ def run_guarddog_deploy(alert_email):
             'tak-restart-watch.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
+            # v10.1.63 W4: the JVM the TAK API is ACTUALLY running on. Every other monitor
+            # stays green while enrollment is dead on a JDK 21 — this is the only one that
+            # would have caught Tom Endress's three-day outage on day one.
+            'tak-jvm-watch.sh',
             'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
             'tak-buildcache-reclaim.sh',
             # v10.1.0 Leg 7: relay tunnel health. Installed fleet-wide — the script
@@ -21467,6 +21512,7 @@ def run_guarddog_deploy(alert_email):
             ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takcertguard.service', '[Unit]\nDescription=TAK Certificate Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cert-watch.sh\n'),
             ('takcertguard.timer', '[Unit]\nDescription=Run TAK cert monitor daily\n\n[Timer]\nOnBootSec=1h\nOnUnitActiveSec=1d\nUnit=takcertguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            _TAK_JVM_GUARD_UNITS[0], _TAK_JVM_GUARD_UNITS[1],
             ('takintcaguard.service', '[Unit]\nDescription=TAK Intermediate CA Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-intca-watch.sh\n'),
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
@@ -21595,6 +21641,12 @@ def run_guarddog_deploy(alert_email):
             # is a no-op there. This has been broken on RHEL since 10.1.44.
             _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
+            # v10.1.63 W3: pin TAK to its own JDK 17 in the same breath. Also re-applied on
+            # every console startup — see _pin_takserver_jvm().
+            try:
+                _pin_takserver_jvm(plog)
+            except Exception as _je:
+                plog(f"\u26a0 JVM pin skipped: {_je}")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
             r = subprocess.run(_sudo_wrap(['swapon', '--show']), capture_output=True, text=True, timeout=5)
@@ -21646,7 +21698,8 @@ def run_guarddog_deploy(alert_email):
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
                   'takswapreclaim.timer', 'takbuildcachereclaim.timer',
                   'taknetguard.timer', 'takrelayguard.timer', 'takwerxsetupapwatch.timer',
-                  'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
+                  'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
+                  'takjvmguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
             timers.append('takcotdbguard.timer')
@@ -29489,10 +29542,28 @@ def _fetch_takportal_latest(*, fresh=False):
 
 
 def _get_takportal_version_info(fresh=False):
-    """Return {version: str, update_available: bool, latest: str|None} for TAK Portal.
+    """Return {version, beta_version, channel, update_available, latest} for TAK Portal.
 
     Installed version comes from package.json. The update decision comes from the
     upstream GitHub release — NOT from the container's own log.
+
+    **On the beta channel, `version` is NOT the version TAK Portal shows.** Upstream
+    added a separate `beta-version` key to package.json so its own UI reports the right
+    number while Beta Mode is on; `version` keeps carrying the last published release
+    (Justin Davis, 2026-09-10). Measured on test12 the same day: `version` 1.4.9,
+    `beta-version` 2.0.0, `BETA_MODE` true — so the console said 1.4.9 while TAK Portal
+    said 2.0.0, out of one file, and the update had worked perfectly. Anyone diagnosing
+    that as a stale checkout or a failed pull is chasing the wrong thing.
+
+    We read `beta-version` ONLY on the beta channel and fall back to `version` whenever
+    it is absent — which is exactly what happens the moment upstream publishes 2.0.0 as
+    a real release, and that has to be a non-event. It is upstream's key: we read it,
+    we never write it (see the third-party-config hard stop in CLAUDE.md).
+
+    `channel` ('beta' | 'release' | 'unknown') travels WITH the version so every surface
+    can say which one it is looking at. Before v10.1.63 only /takportal computed it, so
+    the dashboard card and every other consumer of /api/takportal/version rendered a
+    bare number with no way to tell a main-branch build from a release.
 
     Until v10.1.54 the only signal was an `[update-check]` line scraped out of
     `docker logs tak-portal --tail 200`, which made the badge depend on how chatty
@@ -29508,7 +29579,18 @@ def _get_takportal_version_info(fresh=False):
     """
     import re as _re
     portal_dir = os.path.expanduser('~/TAK-Portal')
-    out = {'version': '', 'update_available': False, 'latest': None}
+    out = {'version': '', 'beta_version': '', 'channel': 'unknown',
+           'update_available': False, 'latest': None}
+    # Which channel this box is on. Tri-state on purpose — 'unknown' must never render as
+    # a confident 'release' (see _takportal_beta_channel_state). Read ONLY when the web
+    # container is up: the reader's docker-cp fallback can spend 15s on a stopped one, and
+    # this helper runs inline in a page render and in the dashboard's version sweep.
+    _web = _takportal_web_container()
+    if _web:
+        try:
+            out['channel'] = _takportal_beta_channel_state()
+        except Exception:
+            out['channel'] = 'unknown'
     # Prefer package.json version (semantic version)
     pkg_path = os.path.join(portal_dir, 'package.json')
     if os.path.isfile(pkg_path):
@@ -29516,8 +29598,13 @@ def _get_takportal_version_info(fresh=False):
             with open(pkg_path) as f:
                 data = json.load(f)
             out['version'] = (data.get('version') or '').strip()
+            out['beta_version'] = str(data.get('beta-version') or '').strip()
         except Exception:
             pass
+    # On beta, report what TAK Portal itself reports. Only when the key is actually
+    # there — never invent a number, and never override a release-channel box.
+    if out['channel'] == 'beta' and out['beta_version']:
+        out['version'] = out['beta_version']
     if not out['version'] and os.path.isdir(os.path.join(portal_dir, '.git')):
         rv = subprocess.run(f'cd {portal_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
@@ -29526,7 +29613,7 @@ def _get_takportal_version_info(fresh=False):
     # tail window. Widened from 200 to 2000 lines — it is cheap, and at 200 the line
     # had already scrolled away on every busy box we looked at.
     log_latest, log_update = None, False
-    _web_cid = (_takportal_web_container() or {}).get('id')
+    _web_cid = (_web or {}).get('id')
     if _web_cid:
         log_r = subprocess.run(_sudo_wrap(['docker', 'logs', _web_cid, '--tail', '2000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         if log_r.stdout:
@@ -30655,9 +30742,11 @@ def takportal_page():
     # and this is an inline page render. Stable is also the correct answer when we cannot
     # look — the same fail-closed default _takportal_beta_mode() uses.
     portal_beta_mode = bool(portal.get('running')) and _takportal_beta_mode()
-    # Separate from the fail-closed value above: the badge must be able to say
-    # "unknown" instead of silently implying "release". See _takportal_beta_channel_state.
-    portal_channel = _takportal_beta_channel_state() if portal.get('running') else 'unknown'
+    # v10.1.63: the DISPLAY channel now travels with the version info, so this page and the
+    # dashboard card cannot disagree and we do not pay for two docker execs per render.
+    # Still tri-state — the badge must be able to say "unknown" rather than silently imply
+    # "release". See _takportal_beta_channel_state.
+    portal_channel = vinfo.get('channel') or 'unknown'
     takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template('takportal.html',
         settings=settings, portal=portal, container_info=container_info,
@@ -34550,23 +34639,23 @@ CLOUDTAK_PLUGINS = [
             'altitude, lost link), fire chat / CASEVAC / 911, draw shapes, save the layout as a '
             'scenario, and clear everything with one button. Drives the TAK Simulator engine on '
             'this box — everything stays on the simulation channel unless a real channel is '
-            'deliberately confirmed. Requires the TAK Simulator module (dev channel).'
+            'deliberately confirmed. Requires the TAK Simulator module.'
         ),
         # v10.1.61 W11: ships in this repo (local_path → copied, never symlinked, into
         # web/plugins/taksim; server_path → api/stateless/routes/plugin-taksim.ts). Not
         # auto-installed by the simulator deploy — a CloudTAK rebuild is 5–10 min — the
         # Simulator page offers an "Install CloudTAK panel" button that calls the plugin
-        # action route. Dev-only until the module leaves the dev channel.
+        # action route.
         'local_path': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cloudtak-plugins', 'taksim', 'plugin'),
         'server_path': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cloudtak-plugins', 'taksim', 'server'),
         'install_dir': 'taksim',
         'requires': 'CloudTAK 13.45+',
         'author': 'TAKWERX',
         'license': 'AGPL-3.0-or-later',
-        # Listed only on dev-channel boxes (or wherever it is already installed, so it can
-        # still be updated/removed after a channel flip) — same gate as the module's tile.
-        'dev_only': True,
-        # v10.1.62: and only once the TAK Simulator module is deployed on this box — the panel
+        # v10.1.63 W1: the dev-channel gate is gone (the module's tile lost the same gate —
+        # see detect_modules). The `dev_only` mechanism itself stays in _detect_cloudtak_plugins
+        # for the next dev-gated plugin; only the Simulator's use of it goes.
+        # v10.1.62: listed only once the TAK Simulator module is deployed on this box — the panel
         # is a remote control for that engine and does nothing without it (operator, 2026-09-10).
         'requires_module': 'simulator',
     },
@@ -36107,8 +36196,17 @@ def cloudtak_plugin_action():
     action = (data.get('action') or '').strip()
     if not plugin_key or action not in ('install', 'update', 'remove'):
         return jsonify({'error': 'Invalid request — provide plugin key and action (install/update/remove)'}), 400
-    if not any(p['key'] == plugin_key for p in CLOUDTAK_PLUGINS):
+    _plugin = next((p for p in CLOUDTAK_PLUGINS if p['key'] == plugin_key), None)
+    if _plugin is None:
         return jsonify({'error': f'Unknown plugin: {plugin_key}'}), 400
+    # v10.1.63 W2: enforce `requires_module` on the ACTION, not just the catalog listing.
+    # _detect_cloudtak_plugins() hides a plugin whose module is not deployed, but hiding is
+    # presentation — this route is reachable by curl with only the key. Install only; update
+    # and remove must keep working on an already-installed plugin if the module goes away.
+    _req_mod = _plugin.get('requires_module')
+    if action == 'install' and _req_mod and not load_settings().get(f'{_req_mod}_enabled'):
+        _req_name = (mod_registry.MODULES.get(_req_mod) or {}).get('name', _req_mod)
+        return jsonify({'error': f'Requires the {_req_name} module — deploy it first, then return here.'}), 409
     t = threading.Thread(target=_run_cloudtak_plugin_action, args=(plugin_key, action), daemon=True)
     t.start()
     return jsonify({'ok': True})
@@ -39500,13 +39598,15 @@ def tvr_page():
 @app.route('/simulator')
 @login_required
 def simulator_page():
-    """TAK Simulator page (v10.1.61) — registry module; dev-channel gated like its tile."""
+    """TAK Simulator page (v10.1.61). v10.1.63 W1: the dev-channel gate is gone here too —
+    the tile lost it in detect_modules, which made this condition dead anyway. The page is
+    reachable on any box that has the module registered; what gates DEPLOY is the CloudTAK
+    dependency (W2) — a preflight row below, and a 409 from the registry's deploy route."""
     from flask import make_response, abort
     settings = load_settings()
     modules = detect_modules()
     sim = modules.get('simulator', {})
-    if not mod_registry.MODULES.get('simulator') or (
-            not sim and (settings.get('update_channel') or 'main').strip().lower() != 'dev'):
+    if not mod_registry.MODULES.get('simulator'):
         abort(404)
     sim_vinfo = mod_registry.simulator.get_version_info(mod_registry.get_ctx()) if sim.get('installed') else {}
     _job = mod_registry.job_state('simulator')
@@ -39524,6 +39624,11 @@ def simulator_page():
                    or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
         _drc, _dv = _docker_probe()
         preflight = [
+            # v10.1.63 W2: the CloudTAK dependency, stated where the operator can act on it.
+            # The deploy route refuses with 409 on this same condition — this row is why.
+            {'label': 'CloudTAK deployed (it hosts the Simulator Director panel)',
+             'ok': bool(modules.get('cloudtak', {}).get('installed')),
+             'detail': 'deploy CloudTAK first, then return here'},
             {'label': 'TAK Server installed on this box', 'ok': bool(modules.get('takserver', {}).get('installed')), 'detail': ''},
             {'label': 'Authentik installed (lane identities are LDAP users)', 'ok': bool(_ak_tok), 'detail': ''},
             {'label': 'TAK Server streaming port 8089 reachable', 'ok': _tcp(8089), 'detail': '127.0.0.1:8089'},
@@ -70222,6 +70327,244 @@ def _auto_harden_guarddog_8080(settings=None, plog=None):
 
 
 # === Auto-update Guard Dog scripts on console startup ===
+
+# ── TAK Server JVM pin (v10.1.63 W3) ─────────────────────────────────────────
+
+_TAK_JVM_DROPIN_DIR = '/etc/systemd/system/takserver.service.d'
+_TAK_JVM_DROPIN = os.path.join(_TAK_JVM_DROPIN_DIR, 'jvm-pin.conf')
+_TAK_SETENV = '/opt/tak/setenv.sh'
+_TAK_SETENV_JVM_A = '# >>> infra-TAK managed JVM >>>'
+_TAK_SETENV_JVM_B = '# <<< infra-TAK managed JVM <<<'
+
+
+# Defined once: the deploy path and the startup migration below both install these, and
+# a second copy is how a watcher ends up installed-but-never-enabled (v10.1.34, test12).
+# OnBootSec is late — TAK takes 5-7 minutes to come up and we read its RUNNING process.
+_TAK_JVM_GUARD_UNITS = [
+    ('takjvmguard.service', '[Unit]\nDescription=TAK Server JVM Monitor (enrollment breaks on any JVM but 17)\nAfter=takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-jvm-watch.sh\n'),
+    ('takjvmguard.timer', '[Unit]\nDescription=Check the TAK Server JVM every 15 minutes\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=15min\nUnit=takjvmguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+]
+
+
+def _resolve_java17_home():
+    """(java_home, java_binary) for a JDK 17 that is ACTUALLY on this box, else (None, None).
+
+    Globs what exists and verifies `java -version` really reports 17 — never constructs a
+    path and trusts it. A drop-in pointing at a nonexistent JVM would keep TAK from starting
+    at all, which is far worse than the bug it is fencing off.
+    """
+    import glob as _glob
+    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+    # Debian carries the arch suffix, RHEL does not; the trailing globs cover both plus
+    # Temurin/Corretto-style layouts, and duplicates are skipped below.
+    cands = ([f'/usr/lib/jvm/java-17-openjdk-{_arch}'] +
+             sorted(_glob.glob('/usr/lib/jvm/java-17-openjdk*')) +
+             sorted(_glob.glob('/usr/lib/jvm/*-17-*')) +
+             sorted(_glob.glob('/usr/lib/jvm/*17*')))
+    seen = set()
+    for home in cands:
+        if home in seen or not os.path.isdir(home):
+            continue
+        seen.add(home)
+        jbin = os.path.join(home, 'bin', 'java')
+        if not os.path.isfile(jbin):
+            continue
+        try:
+            r = subprocess.run([jbin, '-version'], capture_output=True, text=True, timeout=20)
+        except Exception:
+            continue
+        out = (r.stderr or '') + (r.stdout or '')      # java -version writes to stderr
+        if 'version "17.' in out or 'version "17"' in out:
+            return home, jbin
+    return None, None
+
+
+def _trusted_java_exe(pid):
+    """Resolve a PID's executable and return it ONLY if it is safe to run. Else None.
+
+    We locate the TAK JVM with `pgrep -f`, which matches on ARGV — and argv
+    is attacker-chosen. Any local user can run `exec -a takserver-api /tmp/evil`, and on a
+    root-era console (still the majority of the fleet) this function would then execute
+    that binary AS ROOT to read its version. That is a local privilege escalation, and it
+    is introduced by the version check, not by anything TAK does.
+
+    So the resolved path must clear three gates before we run it:
+      * owned by root — an unprivileged attacker cannot produce a root-owned file;
+      * not group- or world-writable — otherwise root ownership means nothing;
+      * under a system JVM/binary prefix — defense in depth, and it keeps a compromised
+        root-owned binary somewhere odd (a container bind, /tmp) out of scope.
+    Anything that fails is reported as UNKNOWN, never as a wrong JVM: a false red here
+    would page someone about an outage that is not happening.
+    """
+    try:
+        exe = os.path.realpath(f'/proc/{pid}/exe')
+    except OSError:
+        return None
+    if not exe or not os.path.isfile(exe):
+        return None      # unreadable /proc entry on a non-root console — unknown, not bad
+    if os.path.basename(exe) != 'java':
+        # Measured on test6/test12 2026-09-10: TAK's launcher is a shell script, so the
+        # obvious `pgrep -f takserver-api` resolves to /usr/bin/dash, not the JVM. Running
+        # `dash -version` yields no "17" and would have emailed a WRONG-JVM alert on every
+        # healthy box in the fleet. Match the API JVM by its own flag (see the callers) and
+        # refuse anything that is not a java launcher.
+        return None
+    if not exe.startswith(('/usr/lib/jvm/', '/usr/lib64/jvm/', '/usr/local/lib/jvm/',
+                           '/usr/bin/', '/usr/local/bin/', '/opt/')):
+        return None
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return None
+    if st.st_uid != 0 or (st.st_mode & 0o022):
+        return None
+    return exe
+
+
+def _running_tak_jvm_version():
+    """Short JVM version for the TAK Server card (e.g. '17.0.11'), or '' if unknown.
+
+    v10.1.63 W4 — cheap visibility: the failure this release fences off is invisible on a
+    box that otherwise looks perfectly healthy, so put the number where an admin already
+    looks instead of waiting for an alert to fire. Reads the RUNNING process, not PATH.
+    """
+    try:
+        if _tak_is_container():
+            return ''
+        # -Dspring.profiles.active=api is the API JVM's own flag. `takserver-api` matches
+        # the launcher shell (/usr/bin/dash) instead — verified on test6 and test12.
+        pg = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
+                            capture_output=True, text=True, timeout=5)
+        pids = (pg.stdout or '').split()
+        if not pids:
+            return ''
+        exe = _trusted_java_exe(pids[0])     # argv is attacker-chosen — see the helper
+        if not exe:
+            return ''
+        r = subprocess.run([exe, '-version'], capture_output=True, text=True, timeout=20)
+        m = re.search(r'version "([^"]+)"', (r.stderr or '') + (r.stdout or ''))
+        return m.group(1) if m else ''
+    except Exception:
+        return ''
+
+
+def _pin_takserver_jvm(plog=None):
+    """Pin native TAK Server to its own JDK 17. Idempotent; safe to re-run every startup.
+
+    Field report (Tom Endress, 2026-09-09) — a three-day enrollment outage. He installed
+    `openjdk-21-jre-headless` for an unrelated tool; `update-alternatives` was in auto mode, so
+    JDK 21 won `/usr/bin/java` on priority (2111 vs 1711). TAK kept running on its already
+    loaded JVM 17. FIVE DAYS LATER a routine reboot restarted TAK, it came up on 21, and every
+    QR enrollment began returning HTTP 500:
+
+        NoSuchMethodError: sun.security.x509.X509CertInfo.set(String, Object)
+
+    TAK 5.7 reaches into JDK-internal `sun.security.x509`; JDK 21 refactored it and dropped that
+    generic setter. That is BBN's fragility, not ours — but it is ours to fence off, and it is
+    genuinely nasty for two reasons: the `apt install` and the outage are days apart so nothing
+    correlates them, and NOTHING ELSE in TAK touches that code path. 8089, federation, existing
+    clients, CloudTAK and the whole map keep working perfectly. The only symptom is that NEW
+    enrollments die — the one thing an admin does not exercise daily. Tom ran three days blind.
+
+    Our exposure was worst where the fleet is biggest: RHEL already pinned the alternative twice
+    (the takserver deploy paths), Debian/Ubuntu did nothing at all — no `--set`, no hold, no
+    JAVA_HOME — and Ubuntu 22.04 is our documented baseline and Tom's platform.
+
+    Container TAK is immune (the JVM is inside the image) and is skipped: there is no host
+    takserver.service to hang a drop-in on.
+
+    Re-applied on every console startup, not only at TAK deploy time — every box in the fleet
+    already has TAK installed, so a deploy-time-only fix protects nobody.
+    """
+    def _log(msg):
+        if plog:
+            plog(msg)
+        else:
+            print(f"[jvm-pin] {msg}", flush=True)
+    if not os.path.exists('/opt/tak'):
+        return {'skipped': 'no native TAK on this host'}
+    if _tak_is_container():
+        return {'skipped': 'container TAK — JVM lives in the image'}
+
+    home, jbin = _resolve_java17_home()
+    if not home:
+        # Never write a drop-in pointing at a JVM that is not there.
+        _log("\u26a0 JDK 17 not found under /usr/lib/jvm — JVM pin skipped (no change made)")
+        return {'skipped': 'no JDK 17 found'}
+
+    changed = []
+    fam = _distro_family()
+
+    # 1. systemd drop-in. JAVA_HOME for the scripts that honor it; the PATH prepend is what
+    #    makes a launcher's bare `java` resolve to 17 without patching BBN's own scripts.
+    dropin = ('[Service]\n'
+              f'Environment=JAVA_HOME={home}\n'
+              f'Environment=PATH={home}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n')
+    try:
+        cur = _read_priv(_TAK_JVM_DROPIN) if os.path.isfile(_TAK_JVM_DROPIN) else ''
+    except Exception:
+        cur = ''
+    if cur != dropin:
+        _makedirs_priv(_TAK_JVM_DROPIN_DIR)
+        _write_priv(_TAK_JVM_DROPIN, dropin)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+        changed.append('drop-in')
+
+    # 2. /opt/tak/setenv.sh — third-party config, so a DELIMITED managed block that is replaced
+    #    in place, never a rewrite of the file and never a blind append that duplicates on the
+    #    next startup. Operator edits outside the markers are preserved untouched
+    #    (CLAUDE.md, third-party app config is operator-owned).
+    try:
+        setenv_cur = _read_priv(_TAK_SETENV) if os.path.isfile(_TAK_SETENV) else None
+    except Exception:
+        setenv_cur = None
+    if setenv_cur:
+        block = (f"{_TAK_SETENV_JVM_A}\n"
+                 f"# TAK 5.7 reaches into JDK-internal sun.security.x509, which JDK 21 removed —\n"
+                 f"# enrollment breaks on any JVM but 17. Delete this block to unpin.\n"
+                 f"export JAVA_HOME={home}\n"
+                 f"export PATH={home}/bin:$PATH\n"
+                 f"{_TAK_SETENV_JVM_B}\n")
+        stripped = re.sub(rf'{re.escape(_TAK_SETENV_JVM_A)}.*?{re.escape(_TAK_SETENV_JVM_B)}\n?',
+                          '', setenv_cur, flags=re.DOTALL)
+        new_setenv = block + stripped
+        if new_setenv != setenv_cur:
+            _write_priv(_TAK_SETENV, new_setenv)
+            changed.append('setenv.sh')
+
+    # 3. The alternative itself, into MANUAL mode — this is the half that actually stops a
+    #    later `apt install openjdk-21` from winning /usr/bin/java on priority.
+    alt = 'update-alternatives' if fam == 'debian' else 'alternatives'
+    try:
+        r = subprocess.run(_sudo_wrap([alt, '--set', 'java', jbin]),
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 and fam == 'rhel':
+            # RHEL's jpackage registers the family name rather than the path on some builds —
+            # the form the takserver deploy paths already use.
+            _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            r = subprocess.run(_sudo_wrap([alt, '--set', 'java', f'java-17-openjdk.{_pg_arch}']),
+                               capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            changed.append('alternative')
+        else:
+            _log(f"\u26a0 could not pin the java alternative: {((r.stderr or r.stdout) or '').strip()[:160]}")
+    except Exception as e:
+        _log(f"\u26a0 could not pin the java alternative: {str(e)[:160]}")
+
+    # 4. NOT held. `apt-mark hold` / `dnf versionlock` on the JDK 17 packages was in the
+    #    plan (Tom's item 2) and it is deliberately not done: a hold also freezes JDK 17's
+    #    own SECURITY updates until a human runs an unhold, and on a CJIS-class box that
+    #    trade is not worth what it buys. Step 3 above — the alternative in MANUAL mode — is
+    #    the half that actually prevents Tom's outage; the hold would only have added
+    #    protection against JDK 17 being autoremoved, which nothing in the field report did.
+    #    (Operator decision, 2026-09-09. Recorded in PLAN-v10.1.63 §4 W3.)
+
+    if changed:
+        _log(f"\u2713 TAK Server pinned to JDK 17 at {home} ({', '.join(changed)}). "
+             f"Takes effect on the next TAK Server restart.")
+    return {'java_home': home, 'changed': changed}
+
+
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -70327,6 +70670,24 @@ def _auto_update_guarddog():
             if _bc_reload:
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
                 subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takbuildcachereclaim.timer']), capture_output=True, timeout=10)
+        # v10.1.63 W4: same treatment for the JVM watcher — a fix that needed someone to
+        # click "Update Guard Dog" would protect nobody (memory feedback-console-path-delivery).
+        if os.path.isfile('/opt/tak-guarddog/tak-jvm-watch.sh'):
+            _jv_reload = False
+            for _un, _body in _TAK_JVM_GUARD_UNITS:
+                _up = os.path.join('/etc/systemd/system', _un)
+                try:
+                    if os.path.isfile(_up) and _read_priv(_up) == _body:
+                        continue
+                except Exception:
+                    pass
+                _write_priv(_up, _body)
+                _jv_reload = True
+            if _jv_reload:
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+                subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takjvmguard.timer']),
+                               capture_output=True, timeout=15)
+                print("Guard Dog: installed takjvmguard units on startup.")
         # v10.1.46 (W1/W2): install the client-gate backstop and the session watcher
         # on a plain pull+restart. Fixes ride the console update — an operator must
         # never have to click "Update Guard Dog" to get the safety net under a gate
@@ -70394,6 +70755,14 @@ def _auto_update_guarddog():
         print(f"Guard Dog auto-update skipped: {e}")
 
 _auto_update_guarddog()
+
+# v10.1.63 W3: re-assert the TAK JVM pin on every console startup. Deliberately NOT inside
+# _auto_update_guarddog() — that returns early when /opt/tak-guarddog is absent, and a box
+# without Guard Dog is exactly as exposed to the JDK-21 enrollment outage as one with it.
+try:
+    _pin_takserver_jvm()
+except Exception as _e:
+    print(f"[jvm-pin] startup pin skipped: {_e}", flush=True)
 
 
 def _start_guarddog_background_at_boot():

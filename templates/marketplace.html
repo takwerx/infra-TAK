@@ -51,6 +51,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .module-card:hover{border-color:var(--border-hover);background:var(--bg-card-hover);transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.3)}
 .module-card.blocked{opacity:.45;cursor:not-allowed;pointer-events:none;filter:grayscale(.35);border-style:dashed}
 .conflict-banner{margin-top:10px;padding:7px 10px;border-radius:6px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.22);font-size:11px;color:#fca5a5;line-height:1.45}
+/* v10.1.63 W2: an unmet dependency is not an error — it is a "do this first", so it reads
+   amber rather than red. Same .blocked card treatment; different message and color. */
+.requires-banner{margin-top:10px;padding:7px 10px;border-radius:6px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.24);font-size:11px;color:#fcd34d;line-height:1.45}
 .module-header{display:flex;align-items:flex-end;gap:10px;margin-bottom:8px}
 .module-header--logo .module-icon{max-height:36px;width:auto;object-fit:contain}
 .module-header .module-icon{flex-shrink:0}
@@ -105,13 +108,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% else %}
 {% for key, mod in modules.items() %}
-<a class="module-card{% if mod.get('_conflict_with') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
+<a class="module-card{% if mod.get('_conflict_with') or mod.get('_requires_missing') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:{% if key == 'remote_assist' %}32px{% else %}36px{% endif %};width:auto;max-width:{% if key == 'takserver' %}72px{% elif key == 'remote_assist' %}100%{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if mod.get('_conflict_with') %}
 <div class="conflict-banner">🚫 Cannot deploy — <strong>{{ mod._conflict_with }}</strong> is already installed and uses the same ports. Uninstall it first.</div>
+{% elif mod.get('_requires_missing') %}
+<div class="requires-banner">🔗 Requires <strong>{{ mod._requires_missing }}</strong> — deploy {{ mod._requires_missing }} first, then return here.</div>
 {% else %}
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
 <span class="module-action">Deploy →</span>

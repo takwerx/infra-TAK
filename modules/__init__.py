@@ -56,7 +56,7 @@ def _validate_descriptor(desc):
             raise ValueError(f"module descriptor {key!r}: control_map[{verb!r}] must be an argv list or a callable (ctx) -> argv")
     if not isinstance(desc['priority'], int):
         raise ValueError(f"module descriptor {key!r}: priority must be an int")
-    for f in ('conflicts', 'ports', 'service_units', 'settings_keys',
+    for f in ('conflicts', 'requires_modules', 'ports', 'service_units', 'settings_keys',
               'deploy_aliases', 'extra_routes'):
         if f in desc and not isinstance(desc[f], list):
             raise ValueError(f"module descriptor {key!r}: {f} must be a list")
@@ -142,6 +142,33 @@ def _check_admin_password(ctx, data):
     return None
 
 
+# ── Dependency edge (v10.1.63 W2) ─────────────────────────────────────────────
+
+def _missing_requirement(desc, ctx):
+    """Display name of the first module this one requires that is not deployed, else None.
+
+    The marketplace greys the card and says the same thing (marketplace_page), but a greyed
+    card is presentation: the tile is reachable by direct URL and the deploy route by curl,
+    so the route refuses independently. Deploy ONLY — a box that already has this module and
+    then removes the dependency must still be able to see, stop and uninstall it.
+
+    Fails OPEN on a detection error: this is a dependency hint, not an authorization gate,
+    and a transient probe failure must never brick a deploy."""
+    reqs = desc.get('requires_modules') or []
+    if not reqs:
+        return None
+    try:
+        all_mods = ctx['detect_modules']() or {}
+    except Exception as e:
+        print(f"[{desc.get('key')}] requires-check skipped: {str(e)[:200]}", flush=True)
+        return None
+    for req_key in reqs:
+        req = all_mods.get(req_key) or {}
+        if not req.get('installed'):
+            return req.get('name') or req_key
+    return None
+
+
 # ── Generic route registrar ───────────────────────────────────────────────────
 
 def _make_views(desc, ctx):
@@ -156,6 +183,10 @@ def _make_views(desc, ctx):
         job = _job(key)
         if job['running']:
             return jsonify({'success': False, 'error': 'Deployment already in progress'})
+        missing = _missing_requirement(desc, ctx)
+        if missing:
+            return jsonify({'success': False,
+                            'error': f'Requires {missing} — deploy {missing} first, then return here.'}), 409
         data = request.get_json(silent=True) or {}
         validate = desc.get('deploy_validate')
         params = data

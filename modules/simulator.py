@@ -970,6 +970,12 @@ def register(ctx):
         'template': 'simulator.html',
         'priority': 14,
         'conflicts': [],
+        # v10.1.63 W2: the Director panel this module drives is a CloudTAK plugin, so the
+        # marketplace card greys out and /api/simulator/deploy refuses with 409 until CloudTAK
+        # is deployed. Deploy only — an existing install stays fully manageable if CloudTAK is
+        # later removed. (The engine alone can serve ATAK/iTAK clients with no CloudTAK;
+        # gating the whole tile is the operator's call — PLAN v10.1.63 §3.)
+        'requires_modules': ['cloudtak'],
         'detect': detect,
         'deploy': deploy,
         'uninstall': uninstall,

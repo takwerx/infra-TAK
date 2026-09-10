@@ -156,5 +156,34 @@ else
   fi
 fi
 
+# ── 4. JVM assert (v10.1.63 W4) ──
+# TAK 5.7 reaches into JDK-internal sun.security.x509, which JDK 21 refactored: on any JVM
+# but 17, /Marti/api/tls/signClient/v2 returns HTTP 500 (NoSuchMethodError) and EVERY new
+# QR enrollment fails. Nothing else in TAK touches that path — 8089, federation, existing
+# clients and the map all stay green — so the box looks perfectly healthy while enrollment
+# is dead. A field install ran three days that way before a user called.
+#
+# We WARN, we do not refuse. This runs as `ExecStartPre=+-`: the leading `-` means systemd
+# ignores a non-zero exit, so refusing would mean dropping the `-` — turning a check that
+# is wrong on one box into a fleet-wide failure-to-boot. Revisit once this has run clean
+# fleet-wide for a release. The console pins the JVM (_pin_takserver_jvm); this is the
+# assert that the pin actually took.
+_JAVA_BIN="${JAVA_HOME:+$JAVA_HOME/bin/java}"
+[ -x "$_JAVA_BIN" ] || _JAVA_BIN=$(command -v java 2>/dev/null)
+if [ -x "$_JAVA_BIN" ]; then
+  _JV=$("$_JAVA_BIN" -version 2>&1 | head -1)
+  case "$_JV" in
+    *'version "17.'*|*'version "17"'*)
+      _log "JVM OK: $_JV ($_JAVA_BIN)" ;;
+    *)
+      _log "*** WARNING: TAK Server is about to start on a NON-17 JVM: $_JV ($_JAVA_BIN)"
+      _log "*** New client enrollments WILL fail with HTTP 500 (NoSuchMethodError X509CertInfo.set)."
+      _log "*** Everything else keeps working, so this will NOT look like an outage."
+      _log "*** Fix: restart the infra-TAK console to re-apply the JDK 17 pin, then restart TAK." ;;
+  esac
+else
+  _log "*** WARNING: no java binary found — cannot verify TAK Server's JVM is 17"
+fi
+
 _log "Pre-start complete — TAK Server may start with full CPU"
 exit 0
