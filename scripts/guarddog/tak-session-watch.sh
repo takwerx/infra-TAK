@@ -177,18 +177,28 @@ fi
 #   - username is NOT device identity. admin legitimately holds 6 subscriptions,
 #     and one cert used across ATAK/WinTAK/iTAK/TAK Aware is expected and normal.
 #     Never key the storm check on username.
-read -r SUBS GROUPLESS UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS KEYS <<EOF
+# v10.1.64 W2: a SERVICE subscription is not a client "connected to nothing".
+# TAK Video Restreamer connects as a server-side subscription with no channel and has no
+# TAK Portal account, so it can never be given one — the condition is not actionable and
+# never will be. Reported by John Stefanini 2026-09-10, who isolated it himself: stopping
+# the restreamer took groupless 1 -> 0.
+# "Connected to nothing" is a statement about a USER'S DEVICE seeing no traffic. A service
+# that deliberately carries no channel is a different thing and must not inflate that
+# number. Device identity is already read here (takClient / takVersion); their ABSENCE is
+# the signal. Counted separately and reported, never silently dropped — if the
+# classification is ever wrong, the log shows it.
+read -r SUBS GROUPLESS SERVICE UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS KEYS <<EOF
 $(printf '%s' "$SUBS_JSON" | PEER_IPS="$PEER_IPS" python3 -c '
 import json, os, sys, collections
 def out(*a): print(" ".join(str(x) for x in a))
 try:
     rows = json.load(sys.stdin).get("data") or []
 except Exception:
-    out("ERR",0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
+    out("ERR",0,0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
 if not isinstance(rows, list):
-    out("ERR",0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
+    out("ERR",0,0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
 
-groupless = unknown = 0
+groupless = service = unknown = 0
 keys = set()
 uid_subs = collections.Counter()        # non-empty clientUid -> subscriptions
 ip_uids  = collections.defaultdict(set) # peer ip -> distinct non-empty uids
@@ -206,7 +216,28 @@ for r in rows:
         if not names and g:
             unknown += 1          # a list, but not the pinned shape
         elif not [n for n in names if "__ANON__" not in n]:
-            groupless += 1
+            # No channel. Is this a user device, or a server-side service?
+            #
+            # FAIL SAFE TOWARDS ALERTING. Getting this wrong in the quiet direction is worse
+            # than the bug being fixed: a real device on no channel that we file as "service"
+            # is an alert silently withheld from someone whose clients are transmitting to
+            # nobody. So a row is only a service when it carries NO device identity at all.
+            #
+            # clientUid is the load-bearing test, not takClient. This script already pins
+            # "empty uid is never device identity" from live fleet data (v10.1.47 W4), and a
+            # sample taken 2026-09-10 showed every non-EUD subscription on a live box with an
+            # EMPTY uid and no takClient — while we have no sample of a real EUD to prove
+            # takClient is always populated on one. Requiring BOTH to be absent means a device
+            # that reports a uid but omits takClient still alerts.
+            #
+            # Deliberately NOT keyed on a name or uid allowlist — that would fix one product
+            # and break for the next thing that connects the same way.
+            _uid  = (r.get("clientUid") or "").strip()
+            _meta = (r.get("takClient") or "").strip() or (r.get("takVersion") or "").strip()
+            if not _uid and not _meta:
+                service += 1      # server-side service with no channel: expected, not a fault
+            else:
+                groupless += 1    # anything with device identity: the thing worth alerting on
     else:
         unknown += 1              # not the pinned shape at all
 
@@ -235,7 +266,7 @@ if sock:
     top_ip, top_sock = sock.most_common(1)[0]
     top_ipuids = len(ip_uids.get(top_ip, ()))
 
-out(len(rows), groupless, unknown,
+out(len(rows), groupless, service, unknown,
     top_uid[:64] or "-", top_n, tc[:24] or "-", tv[:24] or "-",
     top_ip, top_sock, top_ipuids,
     ",".join(sorted(keys)) or "-")
@@ -269,7 +300,7 @@ if [ "${TOPIPSOCK:-0}" -ge "$STORM_IP_SOCKETS" ]; then
   [ $(( TOPIPSOCK / _d )) -ge "$STORM_IP_RATIO" ] && STORM_IP=1
 fi
 
-_log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS unknown_schema=$UNKNOWN invisible=$INVISIBLE top_uid=$TOPUID/$TOPUIDN top_ip=$TOPIP/$TOPIPSOCK sockets/$TOPIPUIDS uids storm_uid=$STORM_UID storm_ip=$STORM_IP"
+_log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS service=$SERVICE unknown_schema=$UNKNOWN invisible=$INVISIBLE top_uid=$TOPUID/$TOPUIDN top_ip=$TOPIP/$TOPIPSOCK sockets/$TOPIPUIDS uids storm_uid=$STORM_UID storm_ip=$STORM_IP"
 
 # ── 3. Verdict ──
 if [ "$INVISIBLE" -eq 0 ] && [ "$GROUPLESS" -eq 0 ] \
@@ -327,6 +358,8 @@ fi
 if [ "$GROUPLESS" -gt 0 ]; then
   FINDINGS="$FINDINGS
 - Subscriptions with no channel (__ANON__): $GROUPLESS
+  (server-side service subscriptions with no channel, which are expected and NOT counted
+   above: $SERVICE)
   Connected and authenticated, but holding no channel, so TAK routes them
   nothing."
   ACTIONS="$ACTIONS
@@ -391,7 +424,7 @@ if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   rm -f "$TMPF"
 fi
 
-_log "ALERT | external=$EXTERNAL subs=$SUBS invisible=$INVISIBLE groupless=$GROUPLESS storm_uid=$STORM_UID($TOPUID/$TOPUIDN) storm_ip=$STORM_IP($TOPIP/$TOPIPSOCK) fails=$FAILS"
+_log "ALERT | external=$EXTERNAL subs=$SUBS invisible=$INVISIBLE groupless=$GROUPLESS service=$SERVICE storm_uid=$STORM_UID($TOPUID/$TOPUIDN) storm_ip=$STORM_IP($TOPIP/$TOPIPSOCK) fails=$FAILS"
 logger -t takguard "client visibility: $INVISIBLE invisible, $GROUPLESS groupless, storm_uid=$STORM_UID storm_ip=$STORM_IP"
 echo 0 > "$FAIL_FILE"
 exit 0

@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.63-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.63-alpha)**
+**Current release: [v10.1.64-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.64-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,17 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.64-alpha — 2026-09-11 — Guard Dog stops crying wolf
+
+**Headline: three health checks that raised alarms about healthy systems — or stayed quiet about a broken one — now tell the truth.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.64-alpha
+
+**Why it matters.** A monitor that cries wolf is worse than no monitor: people learn to ignore it, and the next alert is the real one. Two of these emailed alarms about systems that were working perfectly. The third did the opposite — it reported success after a repair that had not actually worked.
+
+**What changes.**
+- **Split deployments stop being told their database is down.** If your TAK Server and PostgreSQL run on separate machines, Guard Dog was emailing "PostgreSQL service is not running" — listing "Data loss" among the consequences — about a database that was running fine on the other machine, with a suggested fix you would have run on the wrong host. It now reads where the database actually lives from TAK Server's own configuration, checks it there, names that machine in any alert, and never suggests restarting something that is not on the box you are reading about. The console's TAK Server page had the same blind spot and showed a healthy remote database as "stopped".
+- **Video restreamers and other server-side services are no longer counted as clients "connected to nothing".** That check is about a user's device sitting on no channel and therefore transmitting to nobody. A server-side service that deliberately carries no channel is a different thing, is not a fault, and no longer triggers the alert. A real device on no channel still does.
+- **A repaired identity service is now verified, not assumed.** When Guard Dog restarts the Authentik LDAP outpost, it now confirms the outpost can actually resolve channel membership before declaring success — the same real check that was added at boot time in v10.1.55, which the automatic repair paths never performed. Previously a restart could report "restarted successfully" while clients connected, stayed connected, and transmitted to nobody. If it cannot resolve after the repair, it now says so loudly instead.
 
 ### v10.1.63-alpha — 2026-09-10 — Container installs work again, TAK keeps its own Java, and the Simulator reaches everyone
 

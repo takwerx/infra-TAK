@@ -158,18 +158,51 @@ gd_psql_present() {
   fi
 }
 
-# gd_db_running    -> 0 if the database is up (native service OR db container)
+# gd_db_host  -> the host TAK Server actually talks to, read from ITS OWN config.
+#
+# GROUND TRUTH, deliberately. infra-TAK's settings.json may say "two_server", or may not:
+# a split deployment set up by hand looks single-server to the console while CoreConfig
+# points at another machine. Keying off our own flag is what produced GH-reported false
+# alerts (John Stefanini, 2026-09-10) telling an operator his database was down, on a box
+# where it was running perfectly on another host. Reproduced on our own test8 the same day:
+# takdbguard.timer enabled on a two-server box, the local check failing forever, an alert
+# marker already written. The boot sequencer has read CoreConfig this way since 10.1.44.
+gd_db_host() {
+  grep -oP 'jdbc:postgresql://\K[^:/"]+' /opt/tak/CoreConfig.xml 2>/dev/null | head -1
+}
+
+# gd_db_is_remote  -> 0 when TAK's database lives on ANOTHER machine.
+gd_db_is_remote() {
+  local _h; _h="$(gd_db_host)"
+  [ -n "$_h" ] || return 1                       # unknown -> treat as local, the old behaviour
+  case "$_h" in
+    127.0.0.1|localhost|::1|"$(hostname -s)"|"$(hostname -f)") return 1 ;;
+  esac
+  # An address that is ours is still local, however it is written.
+  ip -o addr show 2>/dev/null | grep -qw "$_h" && return 1
+  return 0
+}
+
+# gd_db_running    -> 0 if the database is up (remote host, native service, OR db container)
 gd_db_running() {
-  if gd_is_container; then
+  if gd_db_is_remote; then
+    # There is no local service to ask. Probe the machine TAK actually uses.
+    gd_tcp_up "$(gd_db_host)" 5432
+  elif gd_is_container; then
     [ "$(docker inspect -f '{{.State.Running}}' "$GD_DB_CONTAINER" 2>/dev/null)" = "true" ]
   else
     systemctl is-active --quiet postgresql 2>/dev/null || systemctl is-active --quiet postgresql-15 2>/dev/null
   fi
 }
 
-# gd_db_restart    -> bring the database back (native restart OR docker restart)
+# gd_db_restart    -> bring the database back (native restart OR docker restart).
+# NEVER on a remote DB: `systemctl restart postgresql` here would either fail or, worse,
+# bounce some unrelated local postgres while the real database sits untouched on another
+# host. Returns 1 so callers report "not restarted" instead of claiming a fix.
 gd_db_restart() {
-  if gd_is_container; then
+  if gd_db_is_remote; then
+    return 1
+  elif gd_is_container; then
     docker restart "$GD_DB_CONTAINER" >/dev/null 2>&1
   else
     systemctl restart postgresql 2>/dev/null || systemctl restart postgresql-15 2>/dev/null
