@@ -1849,6 +1849,38 @@ def _tak_install_method():
         pass
     return 'container' if _host_arch() == 'arm64' else 'native'
 
+def _tak_db_host_from_coreconfig():
+    """The database host TAK Server itself is configured to use, or '' if unreadable.
+
+    Ground truth, deliberately: a split deployment set up by hand looks single-server to
+    infra-TAK's own settings while CoreConfig points at another machine. Keying the console's
+    PostgreSQL status off our settings flag is why a healthy remote database rendered as
+    "stopped" (GH report, John Stefanini 2026-09-10). Same source the Guard Dog lib and the
+    boot sequencer read.
+    """
+    try:
+        xml = _read_priv('/opt/tak/CoreConfig.xml')
+    except Exception:
+        return ''
+    m = re.search(r'jdbc:postgresql://([^:/"]+)', xml or '')
+    return m.group(1).strip() if m else ''
+
+
+def _tak_db_is_remote(host=None):
+    """True when TAK's database lives on another machine."""
+    h = (host if host is not None else _tak_db_host_from_coreconfig()).strip()
+    if not h or h in ('127.0.0.1', 'localhost', '::1'):
+        return False
+    try:
+        if h in (socket.gethostname(), socket.getfqdn()):
+            return False
+        if h in _list_local_ipv4s():
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def _patch_tak_db_dockerfile(build_ctx, log_fn=None):
     """Make BBN's takserver-db image buildable again on an EOL Debian base. Idempotent.
 
@@ -63571,10 +63603,23 @@ def takserver_services():
                     'status': pg_status
                 })
             else:
+                # v10.1.64 W1: two_server with no recorded host — ask TAK's own config
+                # rather than rendering a hardcoded "stopped" for a database that may be
+                # perfectly healthy on another machine.
+                _h = _tak_db_host_from_coreconfig()
+                _st = 'unknown'
+                if _h:
+                    import socket as _sk
+                    try:
+                        _sk.create_connection((_h, 5432), timeout=5).close()
+                        _st = 'running'
+                    except Exception:
+                        _st = 'stopped'
                 services.append({
-                    'name': 'PostgreSQL (remote)', 'icon': '🐘', 'pid': '',
+                    'name': f'PostgreSQL ({_h})' if _h else 'PostgreSQL (remote)',
+                    'icon': '🐘', 'pid': '',
                     'cpu': '', 'mem_mb': '', 'mem_pct': '',
-                    'status': 'stopped'
+                    'status': _st
                 })
         elif _tak_is_container():
             # v10.0.1: single-server container deploy — PostgreSQL runs in the
@@ -63591,13 +63636,30 @@ def takserver_services():
             # means PG is up. Probing only `postgresql` false-reds every Rocky/RHEL
             # native box ("PostgreSQL stopped") even though postgresql-15 is serving
             # cot fine — same EL/Debian split already handled at the deploy probe.
-            pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql', 'postgresql-15']), capture_output=True, text=True, timeout=5)
-            pg_active = 'active' in (pg.stdout or '').split()
-            services.append({
-                'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
-                'cpu': '', 'mem_mb': '', 'mem_pct': '',
-                'status': 'running' if pg_active else 'stopped'
-            })
+            # v10.1.64 W1: before trusting a local probe, ask TAK where its database
+            # actually is. A box split by hand (CoreConfig pointing elsewhere) is NOT in
+            # two_server mode as far as our settings know, and this branch then reported a
+            # healthy remote database as "stopped".
+            _dbh = _tak_db_host_from_coreconfig()
+            if _tak_db_is_remote(_dbh):
+                import socket as _sk
+                try:
+                    _sk.create_connection((_dbh, 5432), timeout=5).close()
+                    _pgst = 'running'
+                except Exception:
+                    _pgst = 'stopped'
+                services.append({
+                    'name': f'PostgreSQL ({_dbh})', 'icon': '🐘', 'pid': '',
+                    'cpu': '', 'mem_mb': '', 'mem_pct': '', 'status': _pgst
+                })
+            else:
+                pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql', 'postgresql-15']), capture_output=True, text=True, timeout=5)
+                pg_active = 'active' in (pg.stdout or '').split()
+                services.append({
+                    'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
+                    'cpu': '', 'mem_mb': '', 'mem_pct': '',
+                    'status': 'running' if pg_active else 'stopped'
+                })
     except Exception as e:
         services.append({'name': 'Error', 'icon': '❌', 'status': str(e)[:200]})
     return jsonify({'services': services, 'count': len([s for s in services if s['status'] == 'running'])})
