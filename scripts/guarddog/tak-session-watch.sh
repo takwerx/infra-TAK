@@ -217,14 +217,27 @@ for r in rows:
             unknown += 1          # a list, but not the pinned shape
         elif not [n for n in names if "__ANON__" not in n]:
             # No channel. Is this a user device, or a server-side service?
-            # A device announces itself: ATAK/WinTAK/iTAK all populate takClient and
-            # takVersion. A service subscription (the video restreamer, and anything that
-            # connects the same way in future) carries neither. Deliberately NOT keyed on
-            # a name or uid allowlist — that would fix one product and break for the next.
-            if (r.get("takClient") or "").strip() or (r.get("takVersion") or "").strip():
-                groupless += 1    # a real device on no channel: the thing worth alerting on
-            else:
+            #
+            # FAIL SAFE TOWARDS ALERTING. Getting this wrong in the quiet direction is worse
+            # than the bug being fixed: a real device on no channel that we file as "service"
+            # is an alert silently withheld from someone whose clients are transmitting to
+            # nobody. So a row is only a service when it carries NO device identity at all.
+            #
+            # clientUid is the load-bearing test, not takClient. This script already pins
+            # "empty uid is never device identity" from live fleet data (v10.1.47 W4), and a
+            # sample taken 2026-09-10 showed every non-EUD subscription on a live box with an
+            # EMPTY uid and no takClient — while we have no sample of a real EUD to prove
+            # takClient is always populated on one. Requiring BOTH to be absent means a device
+            # that reports a uid but omits takClient still alerts.
+            #
+            # Deliberately NOT keyed on a name or uid allowlist — that would fix one product
+            # and break for the next thing that connects the same way.
+            _uid  = (r.get("clientUid") or "").strip()
+            _meta = (r.get("takClient") or "").strip() or (r.get("takVersion") or "").strip()
+            if not _uid and not _meta:
                 service += 1      # server-side service with no channel: expected, not a fault
+            else:
+                groupless += 1    # anything with device identity: the thing worth alerting on
     else:
         unknown += 1              # not the pinned shape at all
 
