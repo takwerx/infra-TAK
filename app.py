@@ -70817,8 +70817,13 @@ def _auto_update_guarddog():
                 continue
             if not is_two_server and 'remotedb' in name:
                 continue
-            if is_two_server and name == 'tak-db-watch.sh':
-                continue
+            # v10.1.64 W1: tak-db-watch.sh used to be skipped on two-server boxes because it
+            # was local-only — a watcher for a database that is not on this host. It is now
+            # remote-aware (gd_db_is_remote), and the skip had become actively harmful: a box
+            # carrying takdbguard.timer from before it was split kept running the OLD script
+            # forever, so the very boxes with the false-alert bug were the ones that could
+            # never receive the fix. Measured on test8, 2026-09-11. Copy it everywhere; whether
+            # the TIMER runs is a separate decision made at deploy.
             if name == 'tak-fedhub-watch.sh':
                 _au_fh_cfg = _get_fedhub_deployment_config(settings)
                 if not (_au_fh_cfg.get('deployed') and _au_fh_cfg.get('target_mode') == 'remote' and (_au_fh_cfg.get('remote', {}).get('host') or '').strip()):
