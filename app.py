@@ -37135,6 +37135,105 @@ def _cloudtak_git_prep(cloudtak_dir, plog):
         pass
 
 
+def _cloudtak_plugin_owning_route(route_filename, cloudtak_dir=None):
+    """Which installed CloudTAK plugin shipped this api/stateless/routes/<file>?
+
+    Resolved from the .plugin-src staging dirs the installer copies server routes from,
+    so it stays correct for plugins whose route filename does not match their key
+    (tak-dispatcher ships both plugin-dispatcher.ts and plugin-takcad.ts)."""
+    try:
+        base = cloudtak_dir or os.path.expanduser('~/CloudTAK')
+        src = os.path.join(base, '.plugin-src')
+        if os.path.isdir(src):
+            for d in sorted(os.listdir(src)):
+                if os.path.exists(os.path.join(src, d, 'server', route_filename)):
+                    for _p in CLOUDTAK_PLUGINS:
+                        if _p.get('install_dir') == d or _p.get('key') == d:
+                            return _p.get('name') or d
+                    return d
+    except Exception:
+        pass
+    return None
+
+
+def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
+    """Turn captured CloudTAK build output into one operator-facing "Likely cause" block.
+
+    v10.1.65 W2. A failed build used to report only "Build/restart failed with exit code 1"
+    while the decisive lines sat ~200 lines up inside buildkit output. On a production box
+    (2026-09-11) that was five TS18047 errors in plugin-takcad.ts / plugin-dispatcher.ts --
+    files infra-TAK itself had copied into the tree eight log lines earlier -- and it cost
+    20 minutes of log forensics to find. Returns a list of lines to append AFTER the
+    exit-code line (never replacing it, never truncating the log), or [] if nothing
+    decisive matched.
+
+    Never raises: a hint is a convenience, and must not turn a build failure into a
+    traceback that hides the failure it was meant to explain."""
+    try:
+        ts_plugin = {}
+        ts_other = None
+        npm_err = None
+        apt_fail = None
+        disk_full = False
+        rate_limited = False
+
+        for ln in lines:
+            if 'error TS' in ln:
+                m = re.search(r'(?:^|[\s/])(plugin-([\w.-]+)\.ts)\(', ln)
+                if m:
+                    ts_plugin.setdefault(m.group(2), ln.strip())
+                elif ts_other is None:
+                    ts_other = ln.strip()
+            elif npm_err is None and 'npm ERR!' in ln:
+                npm_err = ln.strip()
+            elif apt_fail is None and 'exit code: 100' in ln:
+                apt_fail = ln.strip()
+            elif 'no space left on device' in ln:
+                disk_full = True
+            elif 'toomanyrequests' in ln or 'pull rate limit' in ln:
+                rate_limited = True
+
+        out = []
+        if ts_plugin:
+            owners = []
+            for _n in sorted(ts_plugin):
+                _o = _cloudtak_plugin_owning_route('plugin-%s.ts' % _n, cloudtak_dir)
+                if _o and _o not in owners:
+                    owners.append(_o)
+            out.append('')
+            out.append('Likely cause: a CloudTAK PLUGIN server route failed the TypeScript check,')
+            out.append('so the api image was never built. CloudTAK itself is not the problem.')
+            for _n in sorted(ts_plugin):
+                out.append('  %s' % ts_plugin[_n][:220])
+            if owners:
+                out.append('  Plugin(s) to fix: %s' % ', '.join(owners))
+            out.append('  Fix: update (or remove) that plugin on the CloudTAK page, then retry.')
+            out.append('  Your running CloudTAK was NOT touched - the old containers kept serving.')
+        elif ts_other:
+            out.append('')
+            out.append('Likely cause: the CloudTAK TypeScript check failed.')
+            out.append('  %s' % ts_other[:220])
+        elif disk_full:
+            out.append('')
+            out.append('Likely cause: the disk filled up during the build.')
+            out.append('  Free space and retry - see the Disk card on the dashboard.')
+        elif rate_limited:
+            out.append('')
+            out.append('Likely cause: Docker Hub pull rate limit.')
+            out.append('  Wait and retry; this is per-IP and clears on its own.')
+        elif apt_fail:
+            out.append('')
+            out.append('Likely cause: a package install inside the build failed.')
+            out.append('  %s' % apt_fail[:220])
+        elif npm_err:
+            out.append('')
+            out.append('Likely cause: an npm step failed inside the build.')
+            out.append('  %s' % npm_err[:220])
+        return out
+    except Exception:
+        return []
+
+
 def run_cloudtak_deploy(cfg=None):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -37621,6 +37720,9 @@ def run_cloudtak_deploy(cfg=None):
         RETRY_WAIT = 60  # 1 min between retries
 
         build_success = False
+        # v10.1.65 W2: bounded copy of the LAST attempt's output, so a final failure can
+        # name its own cause instead of only an exit code.
+        _build_tail = deque(maxlen=4000)
         for build_attempt in range(MAX_BUILD_ATTEMPTS):
             if build_attempt > 0:
                 plog("")
@@ -37647,10 +37749,12 @@ def run_cloudtak_deploy(cfg=None):
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(BUILD_TIMEOUT)}
             )
 
+            _build_tail.clear()
             def _read_build():
                 for line in iter(proc.stdout.readline, ''):
                     line = line.rstrip()
                     if line:
+                        _build_tail.append(line)
                         plog(f"    {line}")
 
             reader = threading.Thread(target=_read_build, daemon=True)
@@ -37680,6 +37784,9 @@ def run_cloudtak_deploy(cfg=None):
         if not build_success:
             plog("")
             plog("✗ Docker build failed after all retry attempts")
+            plog("")
+            for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                plog(_hint)
             plog("")
             plog("RECOVERY STEPS:")
             plog("1. Check system resources:")
@@ -38442,10 +38549,14 @@ def run_cloudtak_update():
                 text=True, cwd=cloudtak_dir, bufsize=1,
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
             )
+            # v10.1.65 W2: keep a bounded copy of the build output so a failure can name
+            # its own cause. Bounded because a --no-cache CloudTAK build is ~10k lines.
+            _build_tail = deque(maxlen=4000)
             def _read_update_output():
                 for line in iter(proc.stdout.readline, ''):
                     line = line.rstrip()
                     if line:
+                        _build_tail.append(line)
                         plog(f"  {line}")
             reader = threading.Thread(target=_read_update_output, daemon=True)
             reader.start()
@@ -38454,6 +38565,8 @@ def run_cloudtak_update():
                 reader.join(timeout=5)
                 if proc.returncode != 0:
                     plog(f"✗ Build/restart failed with exit code {proc.returncode}")
+                    for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                        plog(_hint)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
