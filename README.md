@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.65-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.65-alpha)**
+**Current release: [v10.1.66-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.66-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.66-alpha — 2026-09-12 — Fixes a regression in v10.1.65
+
+**Headline: if you took v10.1.65 and have MediaMTX installed, take this one too.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.66-alpha
+
+**What happened.** v10.1.65 changed how the MediaMTX editor checks whether the infra-TAK privilege broker is available. The new check asked the broker a question it does not answer, so it always concluded "no broker" and fell back to `sudo` — which on a hardened box does not exist. The practical effect is that **Install GStreamer stops working on a hardened box**, which is the very thing v10.1.65 set out to fix.
+
+This only affects a box that took v10.1.65 **and** subsequently deployed or repaired MediaMTX. If you have not touched MediaMTX since updating, you were never exposed.
+
+**What changes.** The availability check now asks the broker something it permits and treats any reply as "broker present" — which is what the original code did, minus the log noise that started all this. This release also **repairs editors that v10.1.65 already modified**; you do not need to reinstall anything, just update and re-run the MediaMTX repair action if Install GStreamer was failing.
+
+**Our mistake, plainly.** The broker operation used in v10.1.65 was verified by reading the broker's source rather than by calling it. It exists in the code and is permitted — it simply is not served on the channel the editor uses. Testing confirmed the change had been applied, not that it worked. That gap is what this release closes.
 
 ### v10.1.65-alpha — 2026-09-11 — CloudTAK updates unblocked, and GStreamer installs on a hardened box
 

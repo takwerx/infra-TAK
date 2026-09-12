@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.65-alpha"
+VERSION = "10.1.66-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -25605,6 +25605,24 @@ def _mtx_patch_within_load_external_sources(src, patcher):
     return src[:start] + new_block + src[end:]
 
 
+_V2_PING_HELPER = (
+    "def _mtx_broker_ping():  # _MTX_PROBE_V2\n"
+    "    # Is the infra-TAK broker there? Ask it something it ALLOWS, and treat any\n"
+    "    # answer at all as 'broker present' -- the return code is irrelevant, only\n"
+    "    # whether the daemon replied.\n"
+    "    #\n"
+    "    # Two earlier forms were wrong. ['true'] is not in EXEC_ALLOW, so it answered\n"
+    "    # but logged a DENY on every status poll. The broker's own {'op':'ping'} looks\n"
+    "    # right in the source but is NOT served on the socket -- it never replies, so\n"
+    "    # the probe timed out, the editor concluded 'no broker' and fell back to a\n"
+    "    # sudo that cannot exist on a hardened box. `systemctl is-active` is\n"
+    "    # allowlisted, answers in ~10ms, and audits as ALLOW on both distro families.\n"
+    "    return _mtx_broker_exec(['systemctl', 'is-active', 'takwerx-broker'], timeout=5) is not None\n"
+    "\n"
+    "\n"
+)
+
+
 def _mediamtx_editor_broker_deps_patch(src):
     """GH #67: make the editor's /api/deps/* path broker-compatible on hardened boxes.
 
@@ -25632,42 +25650,31 @@ def _mediamtx_editor_broker_deps_patch(src):
     Idempotent, and each sub-patch is independent: the editor tracks its own repo at
     REF=main, so an anchor that has moved is skipped rather than failing the deploy.
     """
-    if '_mtx_broker_ping' in src:
+    if '_MTX_PROBE_V2' in src:
         return src
+
+    # An editor patched by v10.1.65 carries a _mtx_broker_ping() that asks the broker
+    # {'op':'ping'} -- an op the socket does not serve, so it timed out and the probe
+    # always said "no broker". Repair that in place before doing anything else; the
+    # plain "already has the function" guard below would otherwise skip these boxes
+    # forever and leave them falling back to sudo.
+    _v1_start = src.find('def _mtx_broker_ping():')
+    if _v1_start != -1:
+        _v1_end = src.find('def _mtx_broker_exec(', _v1_start)
+        if _v1_end > _v1_start:
+            src = src[:_v1_start] + _V2_PING_HELPER + src[_v1_end:]
+        # deliberately NOT returning here: fall through so the env / -o Dpkg fixes below
+        # are re-asserted too. They are already applied on a v10.1.65 box, and each is
+        # guarded by its own `in src` test, so re-running them is a no-op.
 
     # 1) a real capability probe: the broker's ping op, not an exec of `true`
     anchor = 'def _mtx_broker_exec(argv, timeout=90):'
-    helper = (
-        "def _mtx_broker_ping():\n"
-        "    # infra-TAK broker reachable? Uses the broker's own 'ping' op, which needs no\n"
-        "    # exec-allowlist entry. Probing with ['true'] logged a DENY on every poll and\n"
-        "    # made the editor fall back to a sudo that cannot exist on a hardened box.\n"
-        "    try:\n"
-        "        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-        "        s.settimeout(5)\n"
-        "        s.connect(MTX_BROKER_SOCKET)\n"
-        "    except OSError:\n"
-        "        return False\n"
-        "    try:\n"
-        "        s.sendall(json.dumps({'op': 'ping'}).encode())\n"
-        "        s.shutdown(socket.SHUT_WR)\n"
-        "        buf = bytearray()\n"
-        "        while True:\n"
-        "            chunk = s.recv(65536)\n"
-        "            if not chunk:\n"
-        "                break\n"
-        "            buf.extend(chunk)\n"
-        "        return bool(json.loads(bytes(buf).decode()).get('pong'))\n"
-        "    except Exception:\n"
-        "        return False\n"
-        "    finally:\n"
-        "        s.close()\n"
-        "\n"
-        "\n"
-    )
-    if anchor in src:
+    helper = _V2_PING_HELPER
+    if 'def _mtx_broker_ping():' in src:
+        anchor = None   # already present (just upgraded above) - do not insert a second copy
+    if anchor and anchor in src:
         src = src.replace(anchor, helper + anchor, 1)
-        src = src.replace("_mtx_broker_exec(['true'], timeout=5) is not None", '_mtx_broker_ping()')
+    src = src.replace("_mtx_broker_exec(['true'], timeout=5) is not None", '_mtx_broker_ping()')
 
     # 2) apt install: drop the denied `env` wrapper and the denied -o overrides.
     # The broker supplies DEBIAN_FRONTEND=noninteractive and NEEDRESTART_MODE=l for
