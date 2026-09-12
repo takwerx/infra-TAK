@@ -25821,6 +25821,107 @@ _V2_PING_HELPER = (
 )
 
 
+def _mediamtx_editor_logstream_patch(src):
+    """Live Logs: make the SSE stream survive a proxy, and say why it is empty.
+
+    v10.1.68. Two defects, both ours, diagnosed on a customer box 2026-08-24 and left
+    unfixed until now:
+
+      1. /stream_logs shells out to `journalctl -u mediamtx -f`. The editor runs as
+         takwerx which, since the non-root flip, is in no group but its own — so
+         journalctl prints a permissions hint to STDERR and nothing to stdout. The
+         generator only ever read stdout, so it yielded ZERO bytes: a blank pane with
+         no explanation. (The unit-side half of this is a systemd drop-in adding
+         SupplementaryGroups=systemd-journal — see _startup_heal_mediamtx_editor_probe.)
+      2. The generator sent no keepalive. A reverse proxy with a short idle timeout
+         (the reporting box: Azure App Gateway, requestTimeout=20) kills a response
+         that has sent nothing, EventSource fires onerror, the page reopens, and the
+         user sees "Connection lost. Reconnecting..." forever. MediaMTX itself logs
+         only every ~30s, so even WITH journal access the stream would idle out.
+
+    So: emit an immediate comment so the connection is never silent from the start, a
+    `: ping` comment every 10s while idle, and surface journalctl's own stderr as log
+    lines so a permissions failure explains itself instead of showing an empty box.
+    """
+    if '_INFRATAK_SSE_HEARTBEAT' in src:
+        return src
+
+    old = r"""    def generate():
+        # Start journalctl process
+        process = subprocess.Popen(
+            ['journalctl', '-u', SERVICE_NAME, '-f', '-n', '50'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        try:
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    # Send log line as Server-Sent Event
+                    yield f"data: {line.strip()}\n\n"
+        finally:
+            process.terminate()
+            process.wait()
+"""
+    new = r"""    def generate():  # _INFRATAK_SSE_HEARTBEAT
+        import select as _sel, time as _t
+        process = subprocess.Popen(
+            ['journalctl', '-u', SERVICE_NAME, '-f', '-n', '50'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        # Say something immediately: a response that sends nothing is what a proxy
+        # kills, and what leaves the pane blank with no explanation.
+        yield ": open\n\n"
+        _open = [process.stdout, process.stderr]
+        _last = _t.monotonic()
+        try:
+            while True:
+                # NOTE: a closed pipe stays permanently "ready" in select(), so a stream
+                # that has hit EOF must be dropped from the set -- otherwise the loop
+                # spins at 100% CPU, never idles, and therefore never heartbeats.
+                _ready = _sel.select(_open, [], [], 1.0)[0] if _open else []
+                _got = False
+                for _fh in list(_ready):
+                    _line = _fh.readline()
+                    if _line == '':
+                        _open.remove(_fh)
+                        continue
+                    _txt = _line.strip()
+                    if not _txt:
+                        continue
+                    if _fh is process.stderr:
+                        yield f"data: [log viewer] {_txt}\n\n"
+                    else:
+                        yield f"data: {_txt}\n\n"
+                    _got = True
+                    _last = _t.monotonic()
+                if _got:
+                    continue
+                if not _open and process.poll() is not None:
+                    yield "data: [log viewer] journalctl exited; stream closed.\n\n"
+                    break
+                if not _open:
+                    _t.sleep(1.0)
+                if _t.monotonic() - _last >= 10:
+                    yield ": ping\n\n"   # keep proxies from idling us out
+                    _last = _t.monotonic()
+        finally:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+"""
+    if old in src:
+        src = src.replace(old, new, 1)
+    return src
+
+
 def _mediamtx_editor_broker_deps_patch(src):
     """GH #67: make the editor's /api/deps/* path broker-compatible on hardened boxes.
 
@@ -33352,6 +33453,7 @@ def mediamtx_recovery():
                 if src:
                     src = _mediamtx_editor_endpoint_patch(src)
                     src = _mediamtx_editor_broker_deps_patch(src)   # v10.1.65 W3 (GH #67)
+                    src = _mediamtx_editor_logstream_patch(src)     # v10.1.68 Live Logs
                     _write_priv(editor_path, src)
             except Exception:
                 pass
@@ -34641,6 +34743,7 @@ WantedBy=multi-user.target
                             esrc = ef.read()
                         patched = _mediamtx_editor_endpoint_patch(esrc)
                         patched = _mediamtx_editor_broker_deps_patch(patched)   # v10.1.65 W3 (GH #67)
+                        patched = _mediamtx_editor_logstream_patch(patched)     # v10.1.68 Live Logs
                         if patched != esrc:
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched)
@@ -75028,6 +75131,38 @@ def _startup_heal_missing_le_keystore():
         print(f'Startup migration: LE keystore revive error (non-fatal): {_e}', flush=True)
 
 
+def _mediamtx_editor_grant_journal_access():
+    """Let the editor read the journal, so Live Logs is not a blank pane.
+
+    v10.1.68. The editor runs as takwerx. Since the non-root flip that account is in no
+    group but its own, so `journalctl -u mediamtx -f` returns nothing and the Live Logs
+    pane is empty — which, behind a proxy with a short idle timeout, presents as
+    "Connection lost. Reconnecting..." forever. Diagnosed on a customer box 2026-08-24;
+    the fix was written down and never shipped, so it is delivered here on console update
+    rather than waiting for a reinstall.
+
+    A systemd DROP-IN rather than editing the vendor unit: the installer owns that file
+    and would overwrite an edit on its next run. Returns True when it changed something.
+    """
+    try:
+        unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        if not os.path.exists(unit):
+            return False
+        d = '/etc/systemd/system/mediamtx-webeditor.service.d'
+        conf = os.path.join(d, '10-infratak-journal.conf')
+        want = ('# infra-TAK v10.1.68: Live Logs reads the journal as the editor user.\n'
+                '[Service]\nSupplementaryGroups=systemd-journal\n')
+        if os.path.exists(conf) and (_read_priv(conf) or '') == want:
+            return False
+        subprocess.run(_sudo_wrap(['mkdir', '-p', d]), capture_output=True, timeout=20)
+        _write_priv(conf, want)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+        return True
+    except Exception as _e:
+        print(f'Startup migration: journal-access drop-in error (non-fatal): {_e}', flush=True)
+        return False
+
+
 def _startup_heal_mediamtx_editor_probe():
     """Make the GH #67 GStreamer fix actually reach boxes, instead of waiting for a click.
 
@@ -75054,10 +75189,24 @@ def _startup_heal_mediamtx_editor_probe():
         if not os.path.exists(path):
             return
         src = _read_priv(path) or ''
-        if not src or '_MTX_PROBE_V2' in src:
-            return                      # absent, unreadable, or already current
-        out = _mediamtx_editor_broker_deps_patch(src)
+        if not src:
+            return
+        if '_MTX_PROBE_V2' in src and '_INFRATAK_SSE_HEARTBEAT' in src:
+            # source is current; the UNIT may still lack journal access, so check that
+            if _mediamtx_editor_grant_journal_access():
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, timeout=60)
+                print('Startup migration: MediaMTX editor granted systemd-journal access — '
+                      'Live Logs can read the journal again', flush=True)
+            return
+        out = _mediamtx_editor_logstream_patch(_mediamtx_editor_broker_deps_patch(src))
+        _journal = _mediamtx_editor_grant_journal_access()
         if out == src:
+            if _journal:
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, timeout=60)
+                print('Startup migration: MediaMTX editor granted systemd-journal access — '
+                      'Live Logs can read the journal again', flush=True)
             return
         try:
             import ast as _ast
