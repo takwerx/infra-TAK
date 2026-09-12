@@ -68,3 +68,72 @@ If renewal fails, clients will be unable to connect after expiration.
     rm -f "$TEMP_CERT"
   fi
 fi
+
+# --- v10.1.68: a renewal that is FAILING is a pre-outage, not a warning -------
+# Everything above watches the certificate's EXPIRY DATE, and only when the keystore
+# exists. Two states therefore went completely unreported, and together they cost a
+# box two days of silence followed by a total outage:
+#
+#   1. The keystore is MISSING. `if [ -f "$JKS" ]` skips the whole block, so the one
+#      state in which TAK's API cannot start at all was the one state nobody was told
+#      about. (A pre-v10.1.67 renewal script deleted the live keystore before a
+#      keytool import that then failed, leaving exactly this.)
+#   2. The renewal SERVICE is failing. The certificate stays valid for weeks, so the
+#      expiry check stays quiet while renewal has actually been broken for days. The
+#      damage only appears at the next restart, when TAK cannot load a keystore it can
+#      no longer rebuild.
+#
+# Both are reported here with their own rate limits, and deliberately worded as
+# "this becomes an outage later" rather than "a certificate expires later".
+
+_CERT_MISSING_FLAG="/var/lib/takguard/cert_keystore_missing_alert"
+_RENEWAL_FAIL_FLAG="/var/lib/takguard/cert_renewal_failed_alert"
+
+if [ ! -f "$JKS" ] && [ -f /opt/tak/CoreConfig.xml ] && grep -q "takserver-le.jks" /opt/tak/CoreConfig.xml 2>/dev/null; then
+  if [ ! -f "$_CERT_MISSING_FLAG" ] || [ "$(find "$_CERT_MISSING_FLAG" -mmin +360 2>/dev/null)" ]; then
+    touch "$_CERT_MISSING_FLAG"
+    SUBJ="TAK Server keystore MISSING on $SERVER_IDENTIFIER"
+    BODY="TAK Server's Let's Encrypt keystore is missing.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)
+Missing file: $JKS
+
+CoreConfig references this keystore for the 8446 connector, so TAK Server's API
+cannot start without it. If TAK is still serving, it is running on a copy loaded
+into memory before the file disappeared -- it will fail to start at the next
+restart or reboot.
+
+infra-TAK v10.1.67 and later rebuild this automatically at console startup. If you
+are on an older release, update from the console; that is the fix."
+    echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+  fi
+else
+  rm -f "$_CERT_MISSING_FLAG"
+fi
+
+if systemctl list-unit-files takserver-cert-renewal.service >/dev/null 2>&1; then
+  _RENEW_RESULT=$(systemctl show takserver-cert-renewal.service -p Result --value 2>/dev/null)
+  if [ -n "$_RENEW_RESULT" ] && [ "$_RENEW_RESULT" != "success" ]; then
+    if [ ! -f "$_RENEWAL_FAIL_FLAG" ] || [ "$(find "$_RENEWAL_FAIL_FLAG" -mmin +1440 2>/dev/null)" ]; then
+      touch "$_RENEWAL_FAIL_FLAG"
+      SUBJ="TAK Server certificate renewal is FAILING on $SERVER_IDENTIFIER"
+      BODY="The TAK Server certificate renewal job is failing.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)
+Last result: $_RENEW_RESULT
+
+The certificate itself may still be valid, so nothing is broken yet. That is why
+this is worth acting on now: a failing renewal is an outage that has not happened
+yet, and it typically surfaces at the next restart rather than at expiry.
+
+Check what it is failing on:
+  systemctl status takserver-cert-renewal.service
+  journalctl -u takserver-cert-renewal.service -n 50"
+      echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+    fi
+  else
+    rm -f "$_RENEWAL_FAIL_FLAG"
+  fi
+fi

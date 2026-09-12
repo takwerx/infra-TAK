@@ -54,6 +54,25 @@ fi
 
 SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 ${SSH_USER}@${DB_HOST}"
 
+# Distinguish "cannot reach the management path" from "the credentials are wrong".
+# These were indistinguishable: an SSH failure and an auth failure both produced an
+# empty $AUTH_OUT, so the watcher reported "DB credential drift - resync failed" on a
+# database whose credentials were perfectly fine, and then kept reporting it.
+#
+# Field report (John Stefanini, 2026-09-12): a multi-source brute force exhausted sshd
+# on the database node, the console could no longer get a session, and this watcher
+# turned that into repeating credential-drift alerts -- part of 42 emails for one root
+# cause, while RETENTION-GUARD was successfully querying that same database throughout.
+#
+# Reachability already has its own alert in tak-remotedb-watch.sh, and it is accurate.
+# So when the management path is down, log it and stand down rather than adding a
+# second, wrong story about the same outage.
+SSH_PROBE=$($SSH_CMD "echo __mgmt_ok__" 2>/dev/null)
+if [ "$SSH_PROBE" != "__mgmt_ok__" ]; then
+  echo "$(date): remote DB auth check SKIPPED - SSH to $DB_HOST is unavailable. This is the MANAGEMENT path, not the database: credentials were not tested and nothing is known to be wrong with them. Reachability is reported separately by tak-remotedb-watch.sh." >> /var/log/takguard/restarts.log
+  exit 0
+fi
+
 # Test current password
 AUTH_OUT=$($SSH_CMD \
   "PGPASSWORD='${DB_PASSWORD}' psql -h 127.0.0.1 -p ${DB_PORT} -U martiuser -d cot -tAc 'select 1' 2>/dev/null | tr -d '[:space:]'" \
