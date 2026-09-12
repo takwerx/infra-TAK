@@ -28998,6 +28998,30 @@ def _stage_le_cert_local(cert_crt, cert_key, wait_for_cert, log_fn, label='LE'):
     return local_crt, local_key
 
 
+def _tak_container_ids():
+    """(uid, gid) the TAK container actually runs as, as strings.
+
+    v10.1.67. The stock takserver image runs as uid 1000; the HARDENED image runs as
+    1001 (tak:0). Hardcoding 1000 left takserver-le.p12 owned by a uid the container is
+    not, so keytool could not read it — and combined with an import that deleted the live
+    keystore first, that destroyed TAK's 8446 keystore and stopped its API from starting.
+    Falls back to the historical 1000:0 only if the container cannot be asked.
+    """
+    uid, gid = '1000', '0'
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'id', '-u']),
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and (r.stdout or '').strip().isdigit():
+            uid = r.stdout.strip()
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'id', '-g']),
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and (r.stdout or '').strip().isdigit():
+            gid = r.stdout.strip()
+    except Exception:
+        pass
+    return uid, gid
+
+
 def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=True):
     """v10.0.1 — container variant of install_le_cert_on_8446. Same outcome (wire
     the Caddy LE / custom cert onto TAK's 8446 enrollment connector so clients
@@ -29047,15 +29071,25 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     except Exception:
         pass
     # Step B: PKCS12 → JKS via docker exec (the container has Java/keytool; host arm64 does not)
+    # The container must be able to READ the p12, so set ownership from the container's real
+    # uid FIRST — 1000 is only correct for the stock image; the hardened one runs as 1001.
+    _tuid, _tgid = _tak_container_ids()
+    subprocess.run(_sudo_wrap(['chown', f'{_tuid}:{_tgid}', p12]), capture_output=True)
+    subprocess.run(_sudo_wrap(['chmod', '0640', p12]), capture_output=True)
+    # Import into a TEMP keystore and swap it in only on success. Never delete the live one
+    # first: CoreConfig's 8446 connector references it, so a failed import used to leave TAK
+    # with no keystore and its whole API refusing to start at the next restart.
     r = subprocess.run(
-        _tak_exec('cd /opt/tak/certs/files && rm -f takserver-le.jks && '
+        _tak_exec('cd /opt/tak/certs/files && rm -f takserver-le.jks.new && '
                   f'keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} '
-                  f'-deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks '
-                  '-srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt') + ' 2>&1',
+                  f'-deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks.new '
+                  '-srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt && '
+                  'mv -f takserver-le.jks.new takserver-le.jks') + ' 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ JKS conversion failed: {(r.stderr or r.stdout).strip()[:200]}"); return False
-    subprocess.run(_sudo_wrap(['chown', '1000:1000', jks, p12]))
+        log_fn(f"  ⚠ JKS conversion failed (existing keystore left intact): "
+               f"{(r.stderr or r.stdout).strip()[:200]}"); return False
+    subprocess.run(_sudo_wrap(['chown', f'{_tuid}:{_tgid}', jks, p12]))
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
     # Step C: patch CoreConfig 8446 connector → LetsEncrypt keystore (host-side via symlink).
     # TAK-in-container preserves CoreConfig across docker restart (verified), so no stop-first.
@@ -65326,8 +65360,10 @@ def _tak_rollback(label, plog=None):
         try:
             subprocess.run(_sudo_wrap(['cp','-p',uaf_src,uaf_dst]), capture_output=True, check=True)
             # Match the ownership convention used elsewhere for /opt/tak files.
+            # v10.1.67: ask the container for its uid — the hardened image is 1001, not 1000.
+            _ru, _rg = _tak_container_ids() if _tak_is_container() else ('tak', 'tak')
             subprocess.run(
-                _sudo_wrap(['chown', ('1000:1000' if _tak_is_container() else 'tak:tak'), '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
+                _sudo_wrap(['chown', f'{_ru}:{_rg}', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
             )
             plog("  rollback: UserAuthenticationFile.xml restored")
         except Exception as e:
@@ -65352,8 +65388,11 @@ def _tak_rollback(label, plog=None):
             subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
             subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             # Restore ownership (tak:tak) on certs
+            # v10.1.67: same — a recursive chown to a hardcoded 1000 would leave the LE p12
+            # (mode 0640) unreadable by a hardened container and break the next renewal.
+            _cu, _cg = _tak_container_ids() if _tak_is_container() else ('tak', 'tak')
             subprocess.run(
-                _sudo_wrap(['chown', '-R', ('1000:1000' if _tak_is_container() else 'tak:tak'), '/opt/tak/certs/files']), capture_output=True, timeout=15
+                _sudo_wrap(['chown', '-R', f'{_cu}:{_cg}', '/opt/tak/certs/files']), capture_output=True, timeout=15
             )
             plog("  rollback: certs/ restored")
         except Exception as e:
@@ -67816,9 +67855,12 @@ def _deploy_takserver_container(config):
             log_step(f"  ✗ cert-metadata.sh patch failed: {_e}")
         _patch_openssl_string_mask(log_step)
         _patch_cert_metadata_password(cert_pass)
-        # Container TAK user is uid 1000 — chown so makeCert (run as that user
-        # inside the container) can write the cert files on the shared mount.
-        run_cmd('chown -R 1000:1000 /opt/tak/certs 2>/dev/null; true', check=False)
+        # chown so makeCert (run as the TAK user inside the container) can write the cert
+        # files on the shared mount. v10.1.67: ask the container rather than assuming 1000 —
+        # that is only true of the stock image; the hardened one runs as 1001. Falls back to
+        # 1000 when the container cannot be asked, which is the historical behaviour.
+        _mu, _mg = _tak_container_ids()
+        run_cmd(f'chown -R {_mu}:{_mg} /opt/tak/certs 2>/dev/null; true', check=False)
         # v10.0.1/v10.0.5 (ARM container): generate certs in a ONE-SHOT `docker run` container
         # that mounts the shared bundle — NOT `docker exec` into the init-pass service container.
         # The init container crash-loops until certs exist (TAK's entrypoint exits with no
