@@ -74761,12 +74761,23 @@ def _startup_heal_missing_le_keystore():
 
         def _revive():
             try:
-                r = subprocess.run(_sudo_wrap([script]), capture_output=True, text=True, timeout=600)
+                # Start the systemd UNIT, do not exec the script path. The broker refuses an
+                # arbitrary exec path ("DENIED: exec path not on trusted PATH") and rightly so
+                # -- widening that allow-list to run one repair would punch a hole in a CJIS
+                # control. `systemctl start` is already permitted, runs the same unit the
+                # nightly timer runs, and works identically on root and non-root consoles.
+                r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver-cert-renewal.service']),
+                                   capture_output=True, text=True, timeout=600)
                 if os.path.exists(jks):
                     print('Startup migration: ✓ TAK LE keystore rebuilt — TAK restarted and its '
                           'API can start again', flush=True)
                 else:
                     _err = ((r.stderr or '') + (r.stdout or '')).strip()[-300:]
+                    if not _err:
+                        _j = subprocess.run(_sudo_wrap(['journalctl', '-u', 'takserver-cert-renewal.service',
+                                                        '-n', '5', '--no-pager']),
+                                            capture_output=True, text=True, timeout=30)
+                        _err = (_j.stdout or '').strip()[-300:]
                     print(f'Startup migration: ✗ TAK LE keystore rebuild failed (rc={r.returncode}): '
                           f'{_err}', flush=True)
             except Exception as _re:
