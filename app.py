@@ -29105,8 +29105,21 @@ TAK_FP=$(docker exec {TAK_CONTAINER} keytool -list -rfc -keystore "$JKS" -storep
 [ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ] && {{ log "TAK keystore already current."; exit 0; }}
 log "Refreshing TAK keystore from Caddy's current cert..."
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" -out "$P12" -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
-docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt"
-chown 1000:1000 "$JKS" "$P12" 2>/dev/null || true
+# The container must be able to READ the p12 before keytool runs, so set ownership FIRST and
+# take the uid/gid from the container rather than assuming 1000. The hardened TAK image runs as
+# uid 1001 (tak:0); a hardcoded 1000 left the p12 at mode 0640 owned by a uid the container is
+# not, and keytool died with "takserver-le.p12 (Permission denied)".
+TAK_UID=$(docker exec {TAK_CONTAINER} id -u 2>/dev/null || echo 1000)
+TAK_GID=$(docker exec {TAK_CONTAINER} id -g 2>/dev/null || echo 0)
+chown "$TAK_UID:$TAK_GID" "$P12" 2>/dev/null || true
+chmod 0640 "$P12" 2>/dev/null || true
+# Import into a TEMP keystore and swap it in only on success. NEVER delete the live keystore
+# first: CoreConfig's 8446 connector references takserver-le.jks, so when the import failed the
+# box was left with no keystore at all and TAK's entire API refused to start at the next restart
+# ("APPLICATION FAILED TO START / connector ... port 8446 failed to start"). set -e means a
+# failed import exits here with the working keystore still in place and TAK untouched.
+docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks.new && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks.new -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt && mv -f takserver-le.jks.new takserver-le.jks"
+chown "$TAK_UID:$TAK_GID" "$JKS" 2>/dev/null || true
 docker restart {TAK_CONTAINER}
 log "TAK keystore refreshed and container restarted."
 '''
@@ -74644,6 +74657,68 @@ def _heal_takserver_coreconfig_step8():
         return f'Step-8 CoreConfig heal error (non-fatal): {e}'
 
 
+def _startup_heal_le_renewal_script():
+    """Repair an installed LE renewal script that can destroy TAK's keystore.
+
+    v10.1.67. The container-flavored script we generated before this release did:
+
+        docker exec <c> bash -c "cd .../files && rm -f takserver-le.jks && keytool -importkeystore ..."
+        chown 1000:1000 "$JKS" "$P12"
+
+    Two defects. The chown hardcodes uid 1000, but the HARDENED TAK image runs as uid
+    1001, so keytool cannot read the p12 -- and it runs AFTER the import, too late to
+    help. Worse, the import deletes the live keystore BEFORE an operation that can fail:
+    when it failed the box was left with no keystore at all, and because CoreConfig's
+    8446 connector references it, TAK's entire API refused to start at the next restart
+    ("APPLICATION FAILED TO START"). On a real box that stayed latent for two days and
+    surfaced as a total outage at reboot.
+
+    Regenerating the script properly needs the cert paths and password, which only the
+    cert-setup path has. So patch the installed file in place instead -- console-path
+    delivery ([[feedback-console-path-delivery]]): existing boxes must not have to re-run
+    cert setup to stop carrying a latent outage. Idempotent and non-fatal.
+    """
+    path = '/opt/tak/renew-letsencrypt.sh'
+    try:
+        if not os.path.exists(path):
+            return
+        src = _read_priv(path) or ''
+        if not src or 'rm -f takserver-le.jks &&' not in src:
+            return   # already healed, or a shape we do not recognise - leave it alone
+
+        out = src
+        # 1) import into a temp keystore and swap in only on success
+        out = out.replace(
+            'rm -f takserver-le.jks && keytool -importkeystore',
+            'rm -f takserver-le.jks.new && keytool -importkeystore', 1)
+        out = out.replace(
+            '-destkeystore takserver-le.jks ',
+            '-destkeystore takserver-le.jks.new ', 1)
+        out = out.replace(
+            '-srcstoretype pkcs12 -noprompt"',
+            '-srcstoretype pkcs12 -noprompt && mv -f takserver-le.jks.new takserver-le.jks"', 1)
+
+        # 2) derive the uid from the container, and set it on the p12 BEFORE the import
+        pre = ('TAK_UID=$(docker exec ' + TAK_CONTAINER + ' id -u 2>/dev/null || echo 1000)\n'
+               'TAK_GID=$(docker exec ' + TAK_CONTAINER + ' id -g 2>/dev/null || echo 0)\n'
+               'chown "$TAK_UID:$TAK_GID" "$P12" 2>/dev/null || true\n'
+               'chmod 0640 "$P12" 2>/dev/null || true\n')
+        marker = 'docker exec ' + TAK_CONTAINER + ' bash -c "cd /opt/tak/certs/files'
+        if marker in out and 'TAK_UID=' not in out:
+            out = out.replace(marker, pre + marker, 1)
+        out = out.replace('chown 1000:1000 "$JKS" "$P12" 2>/dev/null || true',
+                          'chown "$TAK_UID:$TAK_GID" "$JKS" 2>/dev/null || true', 1)
+
+        if out == src:
+            return
+        _write_priv(path, out)
+        subprocess.run(_sudo_wrap(['chmod', '+x', path]), capture_output=True)
+        print('Startup migration: LE renewal script healed — imports to a temp keystore and '
+              'no longer deletes the live one before a fallible import', flush=True)
+    except Exception as _e:
+        print(f'Startup migration: LE renewal heal error (non-fatal): {_e}', flush=True)
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -76188,6 +76263,13 @@ def _startup_migrations():
             _startup_caddy_selfheal()
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
+
+        # v10.1.67: heal an LE renewal script that deletes TAK's keystore before a
+        # fallible import (latent total outage until the next restart).
+        try:
+            _startup_heal_le_renewal_script()
+        except Exception as _lr_err:
+            print(f"Startup migration: LE renewal heal error (non-fatal): {_lr_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to
