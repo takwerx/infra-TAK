@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.64-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.64-alpha)**
+**Current release: [v10.1.65-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.65-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.65-alpha — 2026-09-11 — CloudTAK updates unblocked, and GStreamer installs on a hardened box
+
+**Headline: if you run the CloudTAK Dispatcher plugin, CloudTAK updates were failing — that is fixed, and a failed build now tells you why instead of just an exit code.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.65-alpha
+
+**Why it matters.** CloudTAK 13.85.0 changed a type in its plugin interface: a user who has been provisioned but has never logged in now holds no certificate. Our Dispatcher/TAK-CAD server routes assumed one always existed, so the CloudTAK image would not build and every update stopped at the rebuild step. It failed safely — your running CloudTAK kept serving throughout — but no update could complete, and the reason was buried two hundred lines deep in build output.
+
+**What changes.**
+
+- **CloudTAK updates complete again** on any box with the Dispatcher or TAK-CAD plugin installed. The fix travels with the plugin, so it arrives the next time the plugin is installed or updated.
+- **A failed CloudTAK build now names its own cause.** Instead of `Build/restart failed with exit code 1`, the log ends with a short "Likely cause" summary — which plugin broke the build, what to do about it, and a reminder that your running CloudTAK was never touched. It also recognises a full disk, a Docker Hub rate limit, and failed package or npm steps.
+- **Install GStreamer works on a hardened box** (GitHub #67). On a box where the console runs unprivileged behind the privilege broker, the MediaMTX editor's dependency installer was being refused in three separate places and then falling back to a `sudo` that cannot exist there — leaving GStreamer uninstallable, KLV metadata silently dropped from RTSP pushes, and a steady trickle of authentication failures in the system journal. The installer now speaks to the broker correctly. **No security policy was relaxed to do this** — the broker's allow-list is unchanged.
+
+**Upgrading.** Update from the console as usual. If a CloudTAK update failed for you previously, re-run it after this release; reinstall the Dispatcher plugin first if it was installed before today.
 
 ### v10.1.64-alpha — 2026-09-11 — Guard Dog stops crying wolf
 
