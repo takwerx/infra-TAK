@@ -15835,6 +15835,13 @@ def _f2b_install_db_node(plog):
 
     if not st.get('installed'):
         plog(f"db node ({host}): installing fail2ban")
+        # NOTE for the pkg-manager audit: this deliberately does NOT use _pkg_install.
+        # That shim is local-only — it picks the family with _pkg_mgr() (the CONSOLE
+        # host's) and shells out with subprocess on THIS machine. The database node is a
+        # different machine and may be a different distro family, so the shim would pick
+        # the wrong package manager. The family is therefore detected ON THE REMOTE HOST,
+        # and both apt and dnf are handled explicitly (with the EPEL fallback fail2ban
+        # needs on EL9) — which is what the multiplatform rule is actually protecting.
         ok, res = _ssh_probe(
             s1,
             "if command -v apt-get >/dev/null 2>&1; then "
