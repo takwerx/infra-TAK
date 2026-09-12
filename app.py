@@ -75028,6 +75028,55 @@ def _startup_heal_missing_le_keystore():
         print(f'Startup migration: LE keystore revive error (non-fatal): {_e}', flush=True)
 
 
+def _startup_heal_mediamtx_editor_probe():
+    """Make the GH #67 GStreamer fix actually reach boxes, instead of waiting for a click.
+
+    v10.1.68. The editor patch only ever ran inside mediamtx_recovery() and
+    run_mediamtx_deploy(). So:
+
+      - a box that took v10.1.65 and then ran either of those carries the BROKEN v1
+        probe (it asked the broker {'op':'ping'}, an op the socket does not serve, so
+        the editor concluded "no broker" and fell back to a sudo that cannot exist on a
+        hardened box) — and taking v10.1.66 did NOT fix it, because nothing re-ran the
+        patch;
+      - a box that never ran either still has no fix at all.
+
+    Both states persist until a human happens to click "Patch web editor". That is the
+    same delivery gap as the LE renewal script in v10.1.67, and the same answer applies:
+    heal it on console update ([[feedback-console-path-delivery]]), because a fix nobody
+    triggers is not a fix.
+
+    Idempotent — `_MTX_PROBE_V2` short-circuits. Only restarts the editor when the file
+    actually changed. Non-fatal.
+    """
+    path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    try:
+        if not os.path.exists(path):
+            return
+        src = _read_priv(path) or ''
+        if not src or '_MTX_PROBE_V2' in src:
+            return                      # absent, unreadable, or already current
+        out = _mediamtx_editor_broker_deps_patch(src)
+        if out == src:
+            return
+        try:
+            import ast as _ast
+            _ast.parse(out)             # never write a file that will not import
+        except Exception as _pe:
+            print(f'Startup migration: MediaMTX editor heal SKIPPED — patched source does '
+                  f'not parse ({_pe}); leaving the file untouched', flush=True)
+            return
+        _write_priv(path, out)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                       capture_output=True, timeout=60)
+        _was_broken = "{'op': 'ping'}" in src
+        print('Startup migration: MediaMTX editor broker probe healed '
+              f'({"replaced the broken v10.1.65 probe" if _was_broken else "GH #67 fix applied"}) '
+              '— Install GStreamer works on a hardened box again', flush=True)
+    except Exception as _e:
+        print(f'Startup migration: MediaMTX editor heal error (non-fatal): {_e}', flush=True)
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -76586,6 +76635,14 @@ def _startup_migrations():
             _startup_heal_missing_le_keystore()
         except Exception as _lk_err:
             print(f"Startup migration: LE keystore revive error (non-fatal): {_lk_err}", flush=True)
+
+        # v10.1.68 (GH #67): the editor fix only landed when someone clicked "Patch web
+        # editor". Deliver it on console update instead — including replacing the broken
+        # probe v10.1.65 left behind.
+        try:
+            _startup_heal_mediamtx_editor_probe()
+        except Exception as _mx_err:
+            print(f"Startup migration: MediaMTX editor heal error (non-fatal): {_mx_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to
