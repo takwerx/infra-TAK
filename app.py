@@ -74719,6 +74719,64 @@ def _startup_heal_le_renewal_script():
         print(f'Startup migration: LE renewal heal error (non-fatal): {_e}', flush=True)
 
 
+def _startup_heal_missing_le_keystore():
+    """Revive a box whose TAK keystore was already destroyed before the fix landed.
+
+    v10.1.67. Healing the renewal script stops the bleeding, but it does nothing for a
+    box the old script already emptied: CoreConfig's 8446 connector references
+    certs/files/takserver-le.jks, and when that file is gone TAK's entire API refuses to
+    start ("APPLICATION FAILED TO START"). Those boxes are DOWN -- no webadmin, no API --
+    and without this they would stay down until someone SSHed in and ran keytool by hand,
+    which is exactly the outcome infra-TAK exists to prevent.
+
+    The repair is simply to run the (already healed) renewal script once: with no keystore
+    its fingerprint check finds nothing to compare, so it exports a fresh p12 from Caddy's
+    current cert, imports it, and restarts TAK. Reusing that path means the recovery is the
+    same code the nightly timer exercises, not a second implementation.
+
+    Fires ONLY when the keystore is genuinely missing, so it is a no-op on every healthy
+    box. Threaded, because it restarts TAK and must not hold up console startup.
+    """
+    try:
+        script = '/opt/tak/renew-letsencrypt.sh'
+        jks = '/opt/tak/certs/files/takserver-le.jks'
+        core = '/opt/tak/CoreConfig.xml'
+        if not (os.path.exists(script) and os.path.exists(core)):
+            return
+        if os.path.exists(jks):
+            return                      # keystore present - nothing to revive
+        cfg = _read_priv(core) or ''
+        if 'takserver-le.jks' not in cfg:
+            return                      # CoreConfig does not use it; its absence is fine
+        body = _read_priv(script) or ''
+        if 'TAK_UID=' not in body:
+            # the script has not been healed yet, so running it would delete nothing but
+            # could still fail on the old permission bug - let the heal migration go first
+            print('Startup migration: TAK LE keystore is MISSING but the renewal script is '
+                  'not healed yet; skipping revive this boot', flush=True)
+            return
+
+        print('Startup migration: TAK LE keystore is MISSING (CoreConfig references it) — '
+              'TAK\'s API cannot start; rebuilding it from Caddy\'s current cert…', flush=True)
+
+        def _revive():
+            try:
+                r = subprocess.run(_sudo_wrap([script]), capture_output=True, text=True, timeout=600)
+                if os.path.exists(jks):
+                    print('Startup migration: ✓ TAK LE keystore rebuilt — TAK restarted and its '
+                          'API can start again', flush=True)
+                else:
+                    _err = ((r.stderr or '') + (r.stdout or '')).strip()[-300:]
+                    print(f'Startup migration: ✗ TAK LE keystore rebuild failed (rc={r.returncode}): '
+                          f'{_err}', flush=True)
+            except Exception as _re:
+                print(f'Startup migration: TAK LE keystore rebuild error (non-fatal): {_re}', flush=True)
+
+        threading.Thread(target=_revive, daemon=True, name='le-keystore-revive').start()
+    except Exception as _e:
+        print(f'Startup migration: LE keystore revive error (non-fatal): {_e}', flush=True)
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -76270,6 +76328,13 @@ def _startup_migrations():
             _startup_heal_le_renewal_script()
         except Exception as _lr_err:
             print(f"Startup migration: LE renewal heal error (non-fatal): {_lr_err}", flush=True)
+
+        # v10.1.67: and revive a box the OLD script already emptied — healing the script
+        # does nothing for a keystore that is already gone, and those boxes are down hard.
+        try:
+            _startup_heal_missing_le_keystore()
+        except Exception as _lk_err:
+            print(f"Startup migration: LE keystore revive error (non-fatal): {_lk_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to
