@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.64-alpha"
+VERSION = "10.1.65-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -25605,6 +25605,115 @@ def _mtx_patch_within_load_external_sources(src, patcher):
     return src[:start] + new_block + src[end:]
 
 
+def _mediamtx_editor_broker_deps_patch(src):
+    """GH #67: make the editor's /api/deps/* path broker-compatible on hardened boxes.
+
+    v10.1.65 W3. On a box where the editor runs as `takwerx` with no sudo, Install
+    GStreamer failed and the broker audit log showed THREE independent allowlist
+    mismatches -- fixing only the one the UI reported would not have made the button
+    work:
+
+      1. the capability probe ran `true`, which is not in EXEC_ALLOW, so every
+         /api/deps/status poll logged a DENY and the editor concluded "no broker",
+         then fell back to sudo -- producing a continuous stream of
+         `pam_unix(sudo:auth): auth could not identify password for [takwerx]`;
+      2. the install was prefixed with `env DEBIAN_FRONTEND=noninteractive`, and
+         `env` is in the broker's EXEC_DENY as an exec wrapper -- redundant anyway,
+         since the broker injects DEBIAN_FRONTEND/NEEDRESTART_MODE for apt itself;
+      3. the retry carried `-o Dpkg::Options::=`, rejected by _check_pkgmgr() as the
+         hook-command escalation vector (and a second check rejects any argument
+         containing `::`, so reshaping the flag cannot work).
+
+    The fix is entirely caller-side. We do NOT widen the broker allowlist: that was
+    already ruled out for this exact denial (app.py ~3737), and the reporter
+    explicitly asked us not to. The probe becomes the broker's own `ping` op, which
+    needs no exec entry and audits as ALLOW.
+
+    Idempotent, and each sub-patch is independent: the editor tracks its own repo at
+    REF=main, so an anchor that has moved is skipped rather than failing the deploy.
+    """
+    if '_mtx_broker_ping' in src:
+        return src
+
+    # 1) a real capability probe: the broker's ping op, not an exec of `true`
+    anchor = 'def _mtx_broker_exec(argv, timeout=90):'
+    helper = (
+        "def _mtx_broker_ping():\n"
+        "    # infra-TAK broker reachable? Uses the broker's own 'ping' op, which needs no\n"
+        "    # exec-allowlist entry. Probing with ['true'] logged a DENY on every poll and\n"
+        "    # made the editor fall back to a sudo that cannot exist on a hardened box.\n"
+        "    try:\n"
+        "        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "        s.settimeout(5)\n"
+        "        s.connect(MTX_BROKER_SOCKET)\n"
+        "    except OSError:\n"
+        "        return False\n"
+        "    try:\n"
+        "        s.sendall(json.dumps({'op': 'ping'}).encode())\n"
+        "        s.shutdown(socket.SHUT_WR)\n"
+        "        buf = bytearray()\n"
+        "        while True:\n"
+        "            chunk = s.recv(65536)\n"
+        "            if not chunk:\n"
+        "                break\n"
+        "            buf.extend(chunk)\n"
+        "        return bool(json.loads(bytes(buf).decode()).get('pong'))\n"
+        "    except Exception:\n"
+        "        return False\n"
+        "    finally:\n"
+        "        s.close()\n"
+        "\n"
+        "\n"
+    )
+    if anchor in src:
+        src = src.replace(anchor, helper + anchor, 1)
+        src = src.replace("_mtx_broker_exec(['true'], timeout=5) is not None", '_mtx_broker_ping()')
+
+    # 2) apt install: drop the denied `env` wrapper and the denied -o overrides.
+    # The broker supplies DEBIAN_FRONTEND=noninteractive and NEEDRESTART_MODE=l for
+    # apt/apt-get itself, so behaviour is unchanged and the command passes as-is.
+    old_apt = (
+        "                apt_args = ['apt-get', 'install', '-y', '-q',\n"
+        "                            '-o', 'Dpkg::Options::=--force-confdef',\n"
+        "                            '-o', 'Dpkg::Options::=--force-confold'] + pkgs\n"
+        "                br = _mtx_broker_exec(['env', 'DEBIAN_FRONTEND=noninteractive'] + apt_args, timeout=600)\n"
+        "                if br is None or br[0] != 0:\n"
+        "                    br = _mtx_broker_exec(apt_args, timeout=600)\n"
+    )
+    new_apt = (
+        "                # The broker injects DEBIAN_FRONTEND/NEEDRESTART_MODE for apt itself,\n"
+        "                # so no `env` wrapper (EXEC_DENY) and no -o overrides (_check_pkgmgr).\n"
+        "                apt_args = ['apt-get', 'install', '-y', '-q'] + pkgs\n"
+        "                br = _mtx_broker_exec(apt_args, timeout=600)\n"
+    )
+    if old_apt in src:
+        src = src.replace(old_apt, new_apt, 1)
+
+    # 3) the refresh in _pkg_update_available() used sudo unconditionally, so on a
+    # hardened box it could never succeed -- meaning the "up to date" verdict was
+    # unverified, and each poll added another PAM failure to the journal.
+    for _old, _new in (
+        ("            if refresh:\n"
+         "                _run_quiet(['apt-get', 'update', '-qq'], timeout=120, use_sudo=True)\n",
+         "            if refresh:\n"
+         "                if _mtx_broker_ping():\n"
+         "                    _mtx_broker_exec(['apt-get', 'update', '-qq'], timeout=120)\n"
+         "                else:\n"
+         "                    _run_quiet(['apt-get', 'update', '-qq'], timeout=120, use_sudo=True)\n"),
+        ("            if refresh:\n"
+         "                _run_quiet(['dnf', '-q', 'makecache'], timeout=120, use_sudo=True)\n",
+         "            if refresh:\n"
+         "                if _mtx_broker_ping():\n"
+         "                    _mtx_broker_exec(['dnf', '-q', 'makecache'], timeout=120)\n"
+         "                else:\n"
+         "                    _run_quiet(['dnf', '-q', 'makecache'], timeout=120, use_sudo=True)\n"),
+    ):
+        if _old in src:
+            src = src.replace(_old, _new, 1)
+
+    return src
+
+
 def _mediamtx_editor_external_sources_clear_patch(src):
     """Clear external-sources container before fill; scoped to loadExternalSources only."""
     def _patch(block):
@@ -32990,6 +33099,7 @@ def mediamtx_recovery():
                 src = _read_priv(editor_path)   # v10.0.5 non-root: broker (root-owned dir)
                 if src:
                     src = _mediamtx_editor_endpoint_patch(src)
+                    src = _mediamtx_editor_broker_deps_patch(src)   # v10.1.65 W3 (GH #67)
                     _write_priv(editor_path, src)
             except Exception:
                 pass
@@ -34278,6 +34388,7 @@ WantedBy=multi-user.target
                         with open(_editor_path, 'r') as ef:
                             esrc = ef.read()
                         patched = _mediamtx_editor_endpoint_patch(esrc)
+                        patched = _mediamtx_editor_broker_deps_patch(patched)   # v10.1.65 W3 (GH #67)
                         if patched != esrc:
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched)
@@ -37135,6 +37246,105 @@ def _cloudtak_git_prep(cloudtak_dir, plog):
         pass
 
 
+def _cloudtak_plugin_owning_route(route_filename, cloudtak_dir=None):
+    """Which installed CloudTAK plugin shipped this api/stateless/routes/<file>?
+
+    Resolved from the .plugin-src staging dirs the installer copies server routes from,
+    so it stays correct for plugins whose route filename does not match their key
+    (tak-dispatcher ships both plugin-dispatcher.ts and plugin-takcad.ts)."""
+    try:
+        base = cloudtak_dir or os.path.expanduser('~/CloudTAK')
+        src = os.path.join(base, '.plugin-src')
+        if os.path.isdir(src):
+            for d in sorted(os.listdir(src)):
+                if os.path.exists(os.path.join(src, d, 'server', route_filename)):
+                    for _p in CLOUDTAK_PLUGINS:
+                        if _p.get('install_dir') == d or _p.get('key') == d:
+                            return _p.get('name') or d
+                    return d
+    except Exception:
+        pass
+    return None
+
+
+def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
+    """Turn captured CloudTAK build output into one operator-facing "Likely cause" block.
+
+    v10.1.65 W2. A failed build used to report only "Build/restart failed with exit code 1"
+    while the decisive lines sat ~200 lines up inside buildkit output. On a production box
+    (2026-09-11) that was five TS18047 errors in plugin-takcad.ts / plugin-dispatcher.ts --
+    files infra-TAK itself had copied into the tree eight log lines earlier -- and it cost
+    20 minutes of log forensics to find. Returns a list of lines to append AFTER the
+    exit-code line (never replacing it, never truncating the log), or [] if nothing
+    decisive matched.
+
+    Never raises: a hint is a convenience, and must not turn a build failure into a
+    traceback that hides the failure it was meant to explain."""
+    try:
+        ts_plugin = {}
+        ts_other = None
+        npm_err = None
+        apt_fail = None
+        disk_full = False
+        rate_limited = False
+
+        for ln in lines:
+            if 'error TS' in ln:
+                m = re.search(r'(?:^|[\s/])(plugin-([\w.-]+)\.ts)\(', ln)
+                if m:
+                    ts_plugin.setdefault(m.group(2), ln.strip())
+                elif ts_other is None:
+                    ts_other = ln.strip()
+            elif npm_err is None and 'npm ERR!' in ln:
+                npm_err = ln.strip()
+            elif apt_fail is None and 'exit code: 100' in ln:
+                apt_fail = ln.strip()
+            elif 'no space left on device' in ln:
+                disk_full = True
+            elif 'toomanyrequests' in ln or 'pull rate limit' in ln:
+                rate_limited = True
+
+        out = []
+        if ts_plugin:
+            owners = []
+            for _n in sorted(ts_plugin):
+                _o = _cloudtak_plugin_owning_route('plugin-%s.ts' % _n, cloudtak_dir)
+                if _o and _o not in owners:
+                    owners.append(_o)
+            out.append('')
+            out.append('Likely cause: a CloudTAK PLUGIN server route failed the TypeScript check,')
+            out.append('so the api image was never built. CloudTAK itself is not the problem.')
+            for _n in sorted(ts_plugin):
+                out.append('  %s' % ts_plugin[_n][:220])
+            if owners:
+                out.append('  Plugin(s) to fix: %s' % ', '.join(owners))
+            out.append('  Fix: update (or remove) that plugin on the CloudTAK page, then retry.')
+            out.append('  Your running CloudTAK was NOT touched - the old containers kept serving.')
+        elif ts_other:
+            out.append('')
+            out.append('Likely cause: the CloudTAK TypeScript check failed.')
+            out.append('  %s' % ts_other[:220])
+        elif disk_full:
+            out.append('')
+            out.append('Likely cause: the disk filled up during the build.')
+            out.append('  Free space and retry - see the Disk card on the dashboard.')
+        elif rate_limited:
+            out.append('')
+            out.append('Likely cause: Docker Hub pull rate limit.')
+            out.append('  Wait and retry; this is per-IP and clears on its own.')
+        elif apt_fail:
+            out.append('')
+            out.append('Likely cause: a package install inside the build failed.')
+            out.append('  %s' % apt_fail[:220])
+        elif npm_err:
+            out.append('')
+            out.append('Likely cause: an npm step failed inside the build.')
+            out.append('  %s' % npm_err[:220])
+        return out
+    except Exception:
+        return []
+
+
 def run_cloudtak_deploy(cfg=None):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -37621,6 +37831,9 @@ def run_cloudtak_deploy(cfg=None):
         RETRY_WAIT = 60  # 1 min between retries
 
         build_success = False
+        # v10.1.65 W2: bounded copy of the LAST attempt's output, so a final failure can
+        # name its own cause instead of only an exit code.
+        _build_tail = deque(maxlen=4000)
         for build_attempt in range(MAX_BUILD_ATTEMPTS):
             if build_attempt > 0:
                 plog("")
@@ -37647,10 +37860,12 @@ def run_cloudtak_deploy(cfg=None):
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(BUILD_TIMEOUT)}
             )
 
+            _build_tail.clear()
             def _read_build():
                 for line in iter(proc.stdout.readline, ''):
                     line = line.rstrip()
                     if line:
+                        _build_tail.append(line)
                         plog(f"    {line}")
 
             reader = threading.Thread(target=_read_build, daemon=True)
@@ -37680,6 +37895,9 @@ def run_cloudtak_deploy(cfg=None):
         if not build_success:
             plog("")
             plog("✗ Docker build failed after all retry attempts")
+            plog("")
+            for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                plog(_hint)
             plog("")
             plog("RECOVERY STEPS:")
             plog("1. Check system resources:")
@@ -38442,10 +38660,14 @@ def run_cloudtak_update():
                 text=True, cwd=cloudtak_dir, bufsize=1,
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
             )
+            # v10.1.65 W2: keep a bounded copy of the build output so a failure can name
+            # its own cause. Bounded because a --no-cache CloudTAK build is ~10k lines.
+            _build_tail = deque(maxlen=4000)
             def _read_update_output():
                 for line in iter(proc.stdout.readline, ''):
                     line = line.rstrip()
                     if line:
+                        _build_tail.append(line)
                         plog(f"  {line}")
             reader = threading.Thread(target=_read_update_output, daemon=True)
             reader.start()
@@ -38454,6 +38676,8 @@ def run_cloudtak_update():
                 reader.join(timeout=5)
                 if proc.returncode != 0:
                     plog(f"✗ Build/restart failed with exit code {proc.returncode}")
+                    for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                        plog(_hint)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
