@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.66-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.66-alpha)**
+**Current release: [v10.1.67-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.67-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,23 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.67-alpha — 2026-09-12 — A failing certificate renewal can no longer take TAK Server down
+
+**Headline: if you run TAK Server in a container with a Let's Encrypt certificate, this closes a fault that could stop TAK from starting at all — and repairs boxes it has already affected.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.67-alpha
+
+**What was wrong.** The nightly certificate-renewal job deleted TAK's existing keystore *before* rebuilding it. If the rebuild then failed for any reason, the server was left with no keystore — and because TAK's configuration points one of its secure listeners at that file, **TAK Server would refuse to start at the next restart**. Nothing warned you in the meantime: the running server carried on using the copy already in memory, so the fault stayed invisible until something restarted, which could be days later.
+
+On hardened TAK images the rebuild failed every time, because the job assumed the wrong user account owned the certificate files.
+
+**What changes.**
+
+- **The renewal never destroys a working keystore again.** It builds the new one alongside the old and only swaps it in once the rebuild has succeeded. A failed renewal now leaves your server exactly as it was.
+- **The correct user is detected rather than assumed**, so renewals work on hardened images as well as standard ones.
+- **Boxes already affected repair themselves on update.** If your TAK Server is currently failing to start because its keystore is missing, updating rebuilds it and brings TAK back — no shell access required.
+- Boxes carrying the old renewal job have it corrected automatically at startup.
+
+**Upgrading.** Update from the console as usual. If TAK Server has been failing to start, the repair runs on its own during startup; give it a couple of minutes and check TAK again.
 
 ### v10.1.66-alpha — 2026-09-12 — Fixes a regression in v10.1.65
 
